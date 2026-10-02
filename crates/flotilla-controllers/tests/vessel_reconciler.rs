@@ -2664,6 +2664,7 @@ async fn create_running_terminal(
             inner_exit_code: None,
             message: None,
             crew: None,
+            retired_launches: Default::default(),
             launch_command: Some(command.to_string()),
             delivered_message_id: None,
             attention: None,

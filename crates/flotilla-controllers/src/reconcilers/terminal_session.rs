@@ -70,6 +70,7 @@ pub enum TerminalLiveness {
 }
 
 const LOST_RECHECK_AFTER: Duration = Duration::from_secs(5);
+const RECEIPT_RETIREMENT_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[async_trait]
 pub trait TerminalRuntime: Send + Sync {
@@ -129,6 +130,11 @@ pub trait TerminalRuntime: Send + Sync {
         Err("terminal runtime does not support crew message delivery".to_string())
     }
     async fn kill_session(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String>;
+    /// Receipt-backed runtimes remove exactly this launch. Provider-native
+    /// process observers without receipt files may keep the no-op default.
+    async fn remove_exit_receipt(&self, _spec: &flotilla_resources::TerminalSessionSpec, _launch_id: &str) -> Result<(), String> {
+        Ok(())
+    }
     async fn cleanup_session_artifacts(&self, _spec: &flotilla_resources::TerminalSessionSpec) -> Result<(), String> {
         Ok(())
     }
@@ -263,6 +269,7 @@ pub enum TerminalPrepared {
     MessageDeliveryUnconfirmed { message_id: String, message: String },
     Stopped,
     AgentExited(i32),
+    ReceiptsRetired,
     Lost(String),
     Revived,
     RecoverLost,
@@ -272,6 +279,12 @@ pub enum TerminalPrepared {
     OwnerMissing,
     OwnerTerminal,
     Failed(String),
+}
+
+fn retirement_pending(obj: &ResourceObject<TerminalSession>) -> bool {
+    obj.status.as_ref().is_some_and(|status| {
+        status.phase != TerminalSessionPhase::Starting && status.crew.is_some() && !status.retired_launches.is_empty()
+    })
 }
 
 fn launch_brief_message_id(source: &TerminalSessionSource) -> Option<&str> {
@@ -314,6 +327,21 @@ where
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
+        if retirement_pending(obj) {
+            let status = obj.status.as_ref().expect("retirement requires status");
+            let mut retired = true;
+            for launch in &status.retired_launches {
+                if let Err(error) = self.runtime.remove_exit_receipt(&obj.spec, launch).await {
+                    // Keep the durable obligation, but never let housekeeping
+                    // suppress positive exit or liveness evidence for its replacement.
+                    tracing::warn!(%error, launch, session = %obj.metadata.name, "retired exit receipt cleanup will retry");
+                    retired = false;
+                }
+            }
+            if retired {
+                return Ok(TerminalPrepared::ReceiptsRetired);
+            }
+        }
         if phase == TerminalSessionPhase::Failed {
             self.runtime.cleanup_failed_session(&obj.spec).await.map_err(ResourceError::other)?;
             return Ok(TerminalPrepared::None);
@@ -464,6 +492,7 @@ where
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
         let patch = match phase {
+            _ if matches!(prepared, TerminalPrepared::ReceiptsRetired) => Some(TerminalSessionStatusPatch::ClearRetiredLaunches),
             TerminalSessionPhase::Starting | TerminalSessionPhase::Running if matches!(prepared, TerminalPrepared::OwnerTerminal) => {
                 Some(TerminalSessionStatusPatch::MarkFailed {
                     message: "owning environment or convoy reached a terminal phase".to_string(),
@@ -491,6 +520,7 @@ where
                 | TerminalPrepared::None
                 | TerminalPrepared::Stopped
                 | TerminalPrepared::AgentExited(_)
+                | TerminalPrepared::ReceiptsRetired
                 | TerminalPrepared::Lost(_)
                 | TerminalPrepared::Revived
                 | TerminalPrepared::RecoverLost
@@ -606,6 +636,10 @@ where
         {
             outcome.requeue_after = Some(LOST_RECHECK_AFTER);
         }
+        if retirement_pending(obj) && !matches!(prepared, TerminalPrepared::ReceiptsRetired) {
+            let retry = RECEIPT_RETIREMENT_RETRY_AFTER;
+            outcome.requeue_after = Some(outcome.requeue_after.map_or(retry, |delay| delay.min(retry)));
+        }
         outcome
     }
 
@@ -626,6 +660,17 @@ where
             if let Some(session_id) = obj.status.as_ref().and_then(|status| status.session_id.as_deref()) {
                 if let Err(error) = self.runtime.kill_session(session_id, &obj.spec).await {
                     errors.push(error);
+                }
+            }
+            // A live parent shell could still write a receipt after cleanup.
+            // Retry teardown without removing receipts until kill succeeds.
+            if errors.is_empty() {
+                if let Some(status) = &obj.status {
+                    for launch in status.retired_launches.iter().chain(status.crew.iter().map(|crew| &crew.id)) {
+                        if let Err(error) = self.runtime.remove_exit_receipt(&obj.spec, launch).await {
+                            errors.push(error);
+                        }
+                    }
                 }
             }
             if let Err(error) = self.runtime.cleanup_session_artifacts(&obj.spec).await {

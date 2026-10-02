@@ -2102,3 +2102,195 @@ async fn typed_unavailability_preserves_lost_session_until_provider_recovers() {
     let prepared = reconciler.prepare(&lost).await.expect("provider recovers");
     assert!(matches!(reconciler.reconcile(&lost, &prepared, Utc::now()).patch, Some(TerminalSessionStatusPatch::MarkRevived)));
 }
+
+// The fake is the terminal launch/kill boundary. Receipt writes, reads and
+// removals use the real shell through the injected environment runner.
+#[derive(Default)]
+struct ReceiptLifecycleRuntime {
+    fail_launch: AtomicBool,
+    fail_kill: AtomicBool,
+    fail_cleanup: AtomicBool,
+    killed: AtomicBool,
+}
+
+#[async_trait]
+impl TerminalRuntime for ReceiptLifecycleRuntime {
+    async fn ensure_session(
+        &self,
+        name: &str,
+        spec: &TerminalSessionSpec,
+        _: &[flotilla_resources::TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String> {
+        if self.fail_launch.load(Ordering::SeqCst) {
+            return Err("launch failed".into());
+        }
+        use flotilla_core::providers::{ChannelLabel, CommandRunner, ProcessCommandRunner};
+        ProcessCommandRunner
+            .run(
+                "sh",
+                &["-c", &flotilla_core::agent_process::monitored_command("exit 0", "replacement")],
+                std::path::Path::new(&spec.cwd),
+                &ChannelLabel::Default,
+            )
+            .await?;
+        Ok(TerminalRuntimeState::builder()
+            .session_id(name.to_string())
+            .maybe_pid(None)
+            .started_at(Utc::now())
+            .crew(
+                flotilla_resources::CrewSessionStatus::builder()
+                    .id("replacement".into())
+                    .adapter("codex".into())
+                    .stance("trusted".into())
+                    .build(),
+            )
+            .launch_command("exit 0".into())
+            .maybe_delivered_message_id(None)
+            .build())
+    }
+    async fn agent_exit_code(
+        &self,
+        spec: &TerminalSessionSpec,
+        crew: &flotilla_resources::CrewSessionStatus,
+    ) -> Result<Option<i32>, String> {
+        use flotilla_core::{
+            agent_process::{exit_receipt, ExitReceiptObserver},
+            providers::ProcessCommandRunner,
+        };
+        ExitReceiptObserver::default()
+            .observe(&spec.env_ref, &ProcessCommandRunner, std::path::Path::new(&spec.cwd).join(exit_receipt(&crew.id)), || async {
+                Ok(Vec::new())
+            })
+            .await
+    }
+    async fn remove_exit_receipt(&self, spec: &TerminalSessionSpec, launch_id: &str) -> Result<(), String> {
+        if self.fail_cleanup.swap(false, Ordering::SeqCst) {
+            return Err("cleanup transport unavailable".into());
+        }
+        flotilla_core::agent_process::remove_exit_receipt(
+            &flotilla_core::providers::ProcessCommandRunner,
+            std::path::Path::new(&spec.cwd),
+            launch_id,
+        )
+        .await
+    }
+    async fn kill_session(&self, _: &str, _: &TerminalSessionSpec) -> Result<(), String> {
+        if self.fail_kill.load(Ordering::SeqCst) {
+            return Err("terminal kill unavailable".into());
+        }
+        self.killed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+// Resume retains the previous receipt through failed launches. A persisted
+// replacement permits retirement, including after restart or cleanup failure;
+// teardown removes its final receipt without touching another role's launch.
+#[tokio::test]
+async fn receipt_lifecycle_survives_failed_relaunch_cleanup_outage_and_restart() {
+    use flotilla_core::{
+        agent_process::exit_receipt,
+        providers::{ChannelLabel, CommandRunner, ProcessCommandRunner},
+    };
+    let cwd = tempfile::tempdir().expect("shared checkout");
+    for launch in ["old", "other-role"] {
+        ProcessCommandRunner
+            .run("sh", &["-c", &flotilla_core::agent_process::monitored_command("exit 42", launch)], cwd.path(), &ChannelLabel::Default)
+            .await
+            .expect("exit receipt");
+    }
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(&meta("receipt-session"), &TerminalSessionSpec {
+            env_ref: "env-a".into(),
+            role: "coder".into(),
+            cwd: cwd.path().display().to_string(),
+            pool: "cleat".into(),
+            source: flotilla_resources::TerminalSessionSource::Agent {
+                selector: flotilla_resources::Selector::for_capability("coding"),
+                brief: flotilla_resources::TerminalBrief {
+                    path: ".flotilla/briefs/coder.md".into(),
+                    content: "work".into(),
+                    artifact_digest: None,
+                    copies: Vec::new(),
+                },
+                context: Box::new(flotilla_resources::TerminalCrewContext {
+                    namespace: "flotilla".into(),
+                    convoy: "demo".into(),
+                    vessel_ref: "demo-work".into(),
+                }),
+                message: None,
+            },
+        })
+        .await
+        .expect("session");
+    let mut status = TerminalSessionStatus {
+        phase: TerminalSessionPhase::Stopped,
+        crew: Some(
+            flotilla_resources::CrewSessionStatus::builder().id("old".into()).adapter("codex".into()).stance("trusted".into()).build(),
+        ),
+        ..Default::default()
+    };
+    TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
+    assert!(status.retired_launches.contains("old"));
+    // Exercise the stored shape rather than keeping pending cleanup in memory.
+    let status = serde_json::from_str(&serde_json::to_string(&status).expect("serialize")).expect("restart decode");
+    let starting = sessions.update_status("receipt-session", &created.metadata.resource_version, &status).await.expect("resume");
+    let runtime = Arc::new(ReceiptLifecycleRuntime::default());
+    runtime.fail_launch.store(true, Ordering::SeqCst);
+    let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend.clone(), "flotilla");
+    let prepared = reconciler.prepare(&starting).await.expect("failed launch preparation");
+    let failed = reconciler.reconcile(&starting, &prepared, Utc::now());
+    let mut failed_status = status.clone();
+    failed.patch.expect("launch failure").apply(&mut failed_status);
+    assert_eq!(failed_status.phase, TerminalSessionPhase::Failed);
+    assert!(cwd.path().join(exit_receipt("old")).exists());
+    reconciler.run_finalizer(&ResourceObject { status: Some(failed_status), ..starting.clone() }).await.expect("failed launch teardown");
+    assert!(!cwd.path().join(exit_receipt("old")).exists());
+    assert!(cwd.path().join(exit_receipt("other-role")).exists());
+    // Re-create the old receipt to model retry of the unchanged Starting record.
+    std::fs::write(cwd.path().join(exit_receipt("old")), "42\n").expect("old receipt");
+    runtime.fail_launch.store(false, Ordering::SeqCst);
+    let prepared = reconciler.prepare(&starting).await.expect("replacement launched");
+    let mut running_status = status;
+    reconciler.reconcile(&starting, &prepared, Utc::now()).patch.expect("running patch").apply(&mut running_status);
+    assert!(cwd.path().join(exit_receipt("old")).exists(), "retain until replacement success is durable");
+    let running = sessions
+        .update_status("receipt-session", &starting.metadata.resource_version, &running_status)
+        .await
+        .expect("persist successful replacement");
+    let restarted_runtime = Arc::new(ReceiptLifecycleRuntime::default());
+    restarted_runtime.fail_cleanup.store(true, Ordering::SeqCst);
+    let restarted = TerminalSessionReconciler::new(restarted_runtime.clone(), backend, "flotilla");
+    let prepared = restarted.prepare(&running).await.expect("cleanup outage does not block positive exit observation");
+    let outcome = restarted.reconcile(&running, &prepared, Utc::now());
+    assert_eq!(outcome.requeue_after, Some(Duration::from_secs(1)), "retain a cleanup retry after process exit");
+    outcome.patch.expect("replacement exit observed").apply(&mut running_status);
+    assert_eq!(running_status.phase, TerminalSessionPhase::Stopped);
+    assert_eq!(running_status.inner_exit_code, Some(0));
+    assert!(running_status.retired_launches.contains("old"));
+    assert!(cwd.path().join(exit_receipt("old")).exists());
+    let stopped = ResourceObject { status: Some(running_status.clone()), ..running.clone() };
+    let prepared = restarted.prepare(&stopped).await.expect("cleanup retries even after replacement exits");
+    restarted.reconcile(&stopped, &prepared, Utc::now()).patch.expect("cleanup confirmed").apply(&mut running_status);
+    assert_eq!(running_status.phase, TerminalSessionPhase::Stopped);
+    assert!(running_status.retired_launches.is_empty());
+    assert!(!cwd.path().join(exit_receipt("old")).exists());
+    assert!(cwd.path().join(exit_receipt("replacement")).exists());
+    assert!(cwd.path().join(exit_receipt("other-role")).exists());
+    let finalizing = ResourceObject { status: Some(running_status), ..running };
+    restarted_runtime.fail_kill.store(true, Ordering::SeqCst);
+    assert!(restarted.run_finalizer(&finalizing).await.is_err());
+    assert!(cwd.path().join(exit_receipt("replacement")).exists(), "do not remove receipts before kill succeeds");
+    restarted_runtime.fail_kill.store(false, Ordering::SeqCst);
+    restarted_runtime.fail_cleanup.store(true, Ordering::SeqCst);
+    assert!(restarted.run_finalizer(&finalizing).await.is_err());
+    assert!(cwd.path().join(exit_receipt("replacement")).exists(), "failed cleanup keeps the finalization obligation");
+    restarted.run_finalizer(&finalizing).await.expect("teardown retry");
+    assert!(restarted_runtime.killed.load(Ordering::SeqCst));
+    assert!(!cwd.path().join(exit_receipt("replacement")).exists());
+    assert!(cwd.path().join(exit_receipt("other-role")).exists());
+}

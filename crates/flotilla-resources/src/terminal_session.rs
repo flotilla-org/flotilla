@@ -293,6 +293,10 @@ pub struct TerminalSessionStatus {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crew: Option<CrewSessionStatus>,
+    /// Old launches retained across resume until replacement succeeds and cleanup
+    /// is confirmed. Remove the decoder default after one fleet roll (ADR 0047).
+    #[serde(default)]
+    pub retired_launches: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -445,6 +449,7 @@ pub enum TerminalSessionStatusPatch {
     /// Starts a new attempt after a stopped session by clearing the previous attempt's status.
     /// Failed-session retry is not currently a legal controller transition.
     MarkStarting,
+    ClearRetiredLaunches,
     ObserveCleatEndpoint {
         endpoint: Option<flotilla_protocol::result_set::CleatEndpoint>,
     },
@@ -506,8 +511,13 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
         match self {
             Self::MarkStarting => {
                 let completion_pending = status.completion_pending.take();
-                *status = TerminalSessionStatus { completion_pending, ..Default::default() };
+                let mut retired_launches = std::mem::take(&mut status.retired_launches);
+                if let Some(crew) = status.crew.take() {
+                    retired_launches.insert(crew.id);
+                }
+                *status = TerminalSessionStatus { completion_pending, retired_launches, ..Default::default() };
             }
+            Self::ClearRetiredLaunches => status.retired_launches.clear(),
             Self::ObserveCleatEndpoint { endpoint } => status.cleat_endpoint = endpoint.clone(),
             Self::MarkRunning { session_id, pid, started_at, crew, launch_command, delivered_message_id } => {
                 status.phase = TerminalSessionPhase::Running;

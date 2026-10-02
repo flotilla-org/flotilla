@@ -372,6 +372,7 @@ pub async fn create_stopped_terminal(
             inner_exit_code: Some(1),
             message: Some(fixture.message),
             crew: None,
+            retired_launches: Default::default(),
             launch_command: Some(fixture.command),
             delivered_message_id: None,
             attention: None,

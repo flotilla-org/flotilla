@@ -280,11 +280,6 @@ impl EnvVars for TestEnvVars {
 impl CommandRunner for DiscoveryMockRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
         self.seen_cwds.lock().expect("lock poisoned").push(cwd.to_path_buf());
-        // Process boundary: interpret the exit-receipt read against this
-        // runner's in-memory files; fake terminal launches do not run a shell.
-        if cmd == "sh" && args.get(2) == Some(&"flotilla-agent-exit") && args.len() == 4 {
-            return Ok(self.files.lock().expect("lock poisoned").get(&cwd.join(args[3])).cloned().unwrap_or_default());
-        }
         if cmd == "pwd" && args == ["-P"] {
             return Ok(format!("{}\n", cwd.display()));
         }
@@ -294,6 +289,40 @@ impl CommandRunner for DiscoveryMockRunner {
             if !queue.is_empty() {
                 return queue.remove(0);
             }
+        }
+        // Process boundary: model runtime exclusion and launch-specific receipt
+        // operations against the same in-memory files used by adapter writes.
+        // Explicit canned responses above can still inject transport failures.
+        if cmd == "git" && args == ["rev-parse", "--git-path", "info/exclude"] {
+            return Ok(".git/info/exclude\n".into());
+        }
+        if cmd == "git" && args == ["check-ignore", "--quiet", "--", ".flotilla/"] {
+            return Ok(String::new());
+        }
+        if cmd == "sh" && args.iter().any(|arg| arg.starts_with("set -eu; exclude=")) {
+            self.files.lock().expect("lock poisoned").insert(cwd.join(".git/info/exclude"), ".flotilla/\n".into());
+            return Ok(String::new());
+        }
+        if cmd == "sh" && args.get(2) == Some(&"flotilla-agent-exits") {
+            let files = self.files.lock().expect("lock poisoned");
+            return Ok(args[3..]
+                .iter()
+                .enumerate()
+                .map(|(index, path)| {
+                    let value = files.get(Path::new(path)).map_or_else(
+                        || "-".to_string(),
+                        |value| value.trim().parse::<i32>().map_or_else(|_| "E".to_string(), |value| value.to_string()),
+                    );
+                    format!("{index}\t{value}\n")
+                })
+                .collect());
+        }
+        if cmd == "rm" && args.starts_with(&["-f", "--"]) {
+            let mut files = self.files.lock().expect("lock poisoned");
+            for path in &args[2..] {
+                files.remove(&cwd.join(path));
+            }
+            return Ok(String::new());
         }
         Err(format!("DiscoveryMockRunner: no response for {cmd} {}", args.join(" ")))
     }
