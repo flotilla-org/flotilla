@@ -19,7 +19,7 @@ use flotilla_core::{
     daemon::{DaemonHandle, QuerySubscription},
 };
 use flotilla_protocol::{
-    Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState, ProviderData,
+    Command, CommandAction, CommandValue, DaemonEvent, EnvironmentId, HostName, HostSummary, NodeId, PeerConnectionState,
     ProvisioningTarget, RepoIdentity, RepoInfo, RepoLabels, RepoSelector, ResourceRef, StepStatus, ViewAddress,
 };
 use indexmap::IndexMap;
@@ -102,7 +102,6 @@ pub struct TuiRepoModel {
     pub identity: RepoIdentity,
     pub repository_key: Option<flotilla_protocol::RepositoryKey>,
     pub path: PathBuf,
-    pub providers: Arc<ProviderData>,
     pub labels: RepoLabels,
     pub provider_names: HashMap<String, Vec<String>>,
     /// Health captured in RepoInfo on connect or reconnect; no live event updates this field.
@@ -145,7 +144,6 @@ impl TuiModel {
                 identity,
                 repository_key: info.repository_key,
                 path,
-                providers: Arc::new(ProviderData::default()),
                 labels: info.labels,
                 provider_names: info.provider_names,
                 provider_health: info.provider_health,
@@ -690,7 +688,6 @@ impl App {
                 if let Some(repo) = self.model.repos.get_mut(&identity) {
                     repo.repository_key = info.repository_key;
                     repo.path = path;
-                    repo.providers = Arc::new(ProviderData::default());
                     repo.labels = info.labels;
                     repo.provider_names = info.provider_names;
                     repo.provider_health = info.provider_health;
@@ -1180,7 +1177,7 @@ impl App {
 
     pub fn handle_daemon_event(&mut self, event: DaemonEvent) {
         match event {
-            DaemonEvent::RepoSnapshot(_) | DaemonEvent::RepoDelta(_) => {}
+            DaemonEvent::RepoDelta(_) => {}
             DaemonEvent::RepoRefreshCompleted { .. } => {}
             DaemonEvent::RepoTracked(info) => self.handle_repo_added(*info),
             DaemonEvent::RepoUntracked { repo_identity, .. } => self.handle_repo_removed(&repo_identity),
@@ -1460,7 +1457,6 @@ impl App {
             identity: info.identity,
             repository_key: info.repository_key.clone(),
             path: path.clone(),
-            providers: Arc::new(ProviderData::default()),
             labels: info.labels,
             provider_names: info.provider_names,
             provider_health: info.provider_health,

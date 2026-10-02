@@ -98,9 +98,9 @@ async fn project_adopted_checkout_with(
 /// Publish the checkout facts discovered for one local repository into the
 /// daemon's ephemeral observed-resource store.
 ///
-/// The legacy `ProviderData` remains the input during the observer reshape,
-/// so it can continue feeding Plane A while the same refresh projects its
-/// checkout facts into the resource store.
+/// `ProviderData` is the on-demand provider interchange input. This projection
+/// publishes its checkout facts as resources for the Aggregator; it does not
+/// feed a separate provider snapshot pipeline.
 pub async fn reconcile_checkouts(
     backend: &ResourceBackend,
     namespace: &str,

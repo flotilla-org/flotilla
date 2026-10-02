@@ -794,11 +794,7 @@ mod tests {
     }
 
     // --- palette_completions tests ---
-    use std::sync::Arc;
-
-    use flotilla_protocol::{
-        qualified_path::HostId, ChangeRequest, ChangeRequestStatus, EnvironmentId, HostName, NodeId, NodeInfo, ProviderData, RepoLabels,
-    };
+    use flotilla_protocol::{qualified_path::HostId, EnvironmentId, HostName, NodeId, NodeInfo, RepoLabels};
 
     use crate::app::test_support::repo_info;
 
@@ -884,32 +880,6 @@ mod tests {
         assert!(completions.iter().any(|item| item.value == "issues?project=flotilla%2Froad%20map"));
         assert!(completions.iter().any(|item| item.value == "checkouts?project=flotilla%2Froad%20map"));
         assert!(completions.iter().any(|item| item.value == "independents?project=flotilla%2Froad%20map"));
-    }
-
-    fn model_with_crs() -> TuiModel {
-        let info = repo_info("/tmp/test-repo", "test-repo", RepoLabels::default());
-        let mut model = TuiModel::from_repo_info(vec![info]);
-        let identity = model.repo_order[0].clone();
-        let repo = model.repos.get_mut(&identity).expect("repo exists");
-        let mut pd = ProviderData::default();
-        pd.change_requests.insert("42".into(), ChangeRequest {
-            title: "Fix bug".into(),
-            branch: "fix-bug".into(),
-            status: ChangeRequestStatus::Open,
-            body: None,
-            provider_name: String::new(),
-            provider_display_name: String::new(),
-        });
-        pd.change_requests.insert("99".into(), ChangeRequest {
-            title: "Add feature".into(),
-            branch: "add-feature".into(),
-            status: ChangeRequestStatus::Draft,
-            body: None,
-            provider_name: String::new(),
-            provider_display_name: String::new(),
-        });
-        repo.providers = Arc::new(pd);
-        model
     }
 
     fn stub_host_summary(name: &str) -> flotilla_protocol::HostSummary {
@@ -999,9 +969,11 @@ mod tests {
         assert!(!values.contains(&"checkout"), "checkout should be filtered out by 'cr' prefix");
     }
 
+    // Retired repo-page nouns offer no completions even with a tracked repository.
+    // glue: a single completion dispatch, with no provider cache on the surface.
     #[test]
-    fn legacy_noun_cannot_complete_from_unrelated_provider_data() {
-        let model = model_with_crs();
+    fn legacy_noun_cannot_complete_from_repository_context() {
+        let model = TuiModel::from_repo_info(vec![repo_info("/tmp/test-repo", "test-repo", RepoLabels::default())]);
         let completions = palette_completions("cr ", &model, &Default::default());
         let values: Vec<&str> = completions.iter().map(|c| c.value.as_str()).collect();
         assert!(values.is_empty());

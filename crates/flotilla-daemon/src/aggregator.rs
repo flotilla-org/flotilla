@@ -21,7 +21,7 @@ use flotilla_protocol::{
         SurfaceState, VesselRow, WorkPhase,
     },
     AttachableId, Change, DaemonEvent, EntryOp, FleetReplicaSnapshot, HostName, LifecycleAuthority, ManagedTerminal, PaneExitAttention,
-    ProviderData, RepoDelta, RepoIdentity, RepoSnapshot, RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
+    RepoDelta, RepoIdentity, RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{
     api_version, change_request_address, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout,
@@ -47,7 +47,6 @@ type PresentationKey = (String, String, String);
 type ConvoyKey = (String, String, Option<flotilla_protocol::NodeId>);
 type EnsureKey = (String, String, Option<flotilla_protocol::NodeId>);
 type SessionKey = (String, String, Option<flotilla_protocol::NodeId>);
-type ChangeRequestFingerprint = HashMap<String, (String, String)>;
 const CHANGE_REQUEST_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const CHANGE_REQUEST_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const CHANGE_REQUEST_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -240,8 +239,6 @@ pub struct Aggregator {
     #[builder(skip)]
     change_request_refresh_queue: ChangeRequestRefreshQueue,
     #[builder(skip)]
-    repo_change_requests: HashMap<RepoIdentity, ChangeRequestFingerprint>,
-    #[builder(skip)]
     managed_terminals_by_repo: HashMap<RepoIdentity, HashMap<AttachableId, ManagedTerminal>>,
     #[builder(skip)]
     pane_exit_as_of: HashMap<(RepoIdentity, AttachableId), (PaneExitAttention, chrono::DateTime<chrono::Utc>)>,
@@ -301,7 +298,6 @@ impl Aggregator {
             change_request_refresh_started: HashMap::new(),
             change_request_refresh_failures: HashMap::new(),
             change_request_refresh_queue: ChangeRequestRefreshQueue::default(),
-            repo_change_requests: HashMap::new(),
             managed_terminals_by_repo: HashMap::new(),
             pane_exit_as_of: HashMap::new(),
             issue_materializer: None,
@@ -494,15 +490,6 @@ impl Aggregator {
                 },
                 event = daemon_event_rx.recv() => match event {
                     Ok(DaemonEvent::RepoRefreshCompleted { .. }) => {}
-                    Ok(DaemonEvent::RepoSnapshot(snapshot)) => {
-                        let pane_attention_changed = self.replace_managed_terminals(&snapshot);
-                        if self.repo_snapshot_changed_change_requests(&snapshot) {
-                            self.refresh_repository_change_requests(&snapshot.repo_identity).await;
-                        }
-                        if pane_attention_changed && self.rebuild_salience_projection().await {
-                            self.emit_awareness_result_sets().await;
-                        }
-                    }
                     Ok(DaemonEvent::RepoDelta(delta)) => {
                         let pane_attention_changed = self.apply_managed_terminal_delta(&delta);
                         if self.repo_delta_changed_change_requests(&delta) {
@@ -1272,50 +1259,8 @@ impl Aggregator {
         }
     }
 
-    fn repo_snapshot_changed_change_requests(&mut self, snapshot: &RepoSnapshot) -> bool {
-        let current = change_request_fingerprint(&snapshot.providers);
-        match self.repo_change_requests.get(&snapshot.repo_identity) {
-            Some(previous) if previous == &current => false,
-            None if current.is_empty() => false,
-            _ => {
-                self.repo_change_requests.insert(snapshot.repo_identity.clone(), current);
-                true
-            }
-        }
-    }
-
-    fn repo_delta_changed_change_requests(&mut self, delta: &RepoDelta) -> bool {
-        let mut changed = false;
-        let fingerprint = self.repo_change_requests.entry(delta.repo_identity.clone()).or_default();
-        for change in &delta.changes {
-            let Change::ChangeRequest { key, op } = change else { continue };
-            changed = true;
-            match op {
-                EntryOp::Added(request) | EntryOp::Updated(request) => {
-                    fingerprint.insert(key.clone(), (request.branch.clone(), request.status.to_string()));
-                }
-                EntryOp::Removed => {
-                    fingerprint.remove(key);
-                }
-            }
-        }
-        changed
-    }
-
-    fn replace_managed_terminals(&mut self, snapshot: &RepoSnapshot) -> bool {
-        // Managed-terminal removals are explicit RepoDelta entries. Treat an
-        // empty/default snapshot field as absent so a future partial snapshot
-        // cannot silently wipe pane attention owned by this independent path.
-        if snapshot.providers.managed_terminals.is_empty() {
-            return false;
-        }
-        let terminals = snapshot.providers.managed_terminals.iter().map(|(id, terminal)| (id.clone(), terminal.clone())).collect();
-        if self.managed_terminals_by_repo.get(&snapshot.repo_identity) == Some(&terminals) {
-            return false;
-        }
-        self.managed_terminals_by_repo.insert(snapshot.repo_identity.clone(), terminals);
-        self.reconcile_pane_exit_timestamps();
-        true
+    fn repo_delta_changed_change_requests(&self, delta: &RepoDelta) -> bool {
+        delta.changes.iter().any(|change| matches!(change, Change::ChangeRequest { .. }))
     }
 
     fn apply_managed_terminal_delta(&mut self, delta: &RepoDelta) -> bool {
@@ -2675,10 +2620,6 @@ fn stalled_surface_state(stalled: &StalledCondition) -> SurfaceState {
     }
 }
 
-fn change_request_fingerprint(providers: &ProviderData) -> ChangeRequestFingerprint {
-    providers.change_requests.iter().map(|(key, request)| (key.clone(), (request.branch.clone(), request.status.to_string()))).collect()
-}
-
 fn convoy_references_repo(convoy: &ResourceObject<Convoy>, repo_identity: &RepoIdentity) -> bool {
     convoy
         .spec
@@ -3836,6 +3777,7 @@ mod tests {
         assert_eq!(as_of, working_at);
     }
 
+    // RepoDelta terminal exits surface once on their owning project; unrelated deltas preserve attention.
     #[tokio::test]
     async fn managed_pane_exits_surface_on_real_projects_without_checkout_entries() {
         let state = AggregatorProjectionState::new();
@@ -3881,13 +3823,9 @@ mod tests {
                 .salience
         };
 
-        let fingerprint = HashMap::from([("change-1".to_string(), ("feature".to_string(), "open".to_string()))]);
-        aggregator.repo_change_requests.insert(repo_identity.clone(), fingerprint.clone());
-
         let running = managed_terminal_delta(repo_identity.clone(), "pane-1", "/work/flotilla/app", None, false);
         assert!(aggregator.apply_managed_terminal_delta(&running));
         assert!(!aggregator.repo_delta_changed_change_requests(&running));
-        assert_eq!(aggregator.repo_change_requests.get(&repo_identity), Some(&fingerprint));
         assert!(!aggregator.rebuild_salience_projection().await);
         assert_eq!(project_salience(&state, &outer_project).await, flotilla_protocol::Salience::None);
 
@@ -3900,19 +3838,19 @@ mod tests {
         assert!(aggregator.apply_managed_terminal_delta(&exited));
         assert!(!aggregator.rebuild_salience_projection().await, "the same exit is not admitted twice");
 
-        let partial_snapshot = RepoSnapshot {
-            seq: 2,
-            repo_identity,
-            repo: Some("/work/flotilla".into()),
-            node_id: flotilla_protocol::NodeId::new("local-node"),
-            providers: ProviderData::default(),
-            provider_health: HashMap::new(),
-            errors: Vec::new(),
-        };
-        assert!(!aggregator.replace_managed_terminals(&partial_snapshot));
+        // Unrelated provider deltas preserve independently owned pane attention.
+        let unrelated = RepoDelta { seq: 2, prev_seq: 1, repo_identity, repo: None, changes: Vec::new() };
+        assert!(!aggregator.apply_managed_terminal_delta(&unrelated));
         let checkouts = state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkout result set");
         assert_eq!(checkouts.rows.as_checkouts().expect("checkout rows").len(), 2, "checkout observation remains available");
         assert_eq!(project_salience(&state, &outer_project).await, flotilla_protocol::Salience::Attention);
+
+        // Explicit terminal removal clears its project attention through RepoDelta.
+        let removed =
+            RepoDelta { changes: vec![Change::ManagedTerminal { key: AttachableId::new("pane-1"), op: EntryOp::Removed }], ..unrelated };
+        assert!(aggregator.apply_managed_terminal_delta(&removed));
+        assert!(aggregator.rebuild_salience_projection().await);
+        assert_eq!(project_salience(&state, &outer_project).await, flotilla_protocol::Salience::None);
     }
 
     #[tokio::test]
@@ -5467,8 +5405,9 @@ mod tests {
         assert_eq!(aggregator.convoy_change_requests[&aggregator.convoy_ref("flotilla", "convoy-a")].id, "2301");
     }
 
+    // RepoDelta invalidation re-resolves convoy PR state through the resource-backed resolver.
     #[tokio::test(start_paused = true)]
-    async fn repo_snapshot_refreshes_convoy_change_requests() {
+    async fn repo_delta_refreshes_convoy_change_requests() {
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(16);
         let resolver = Arc::new(ScriptedChangeRequestResolver {
@@ -5505,35 +5444,19 @@ mod tests {
         );
         tokio::pin!(run);
         tokio::select! {
-            result = &mut run => panic!("aggregator stopped before repo snapshot: {result:?}"),
+            result = &mut run => panic!("aggregator stopped before repo delta: {result:?}"),
             () = async {
                 let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial convoy result set").await;
                 assert!(matches!(initial, DaemonEvent::ResultSet(_)));
                 tokio::task::yield_now().await;
                 tokio::time::advance(CHANGE_REQUEST_MIN_REFRESH_INTERVAL).await;
-                let mut providers = flotilla_protocol::ProviderData::default();
-                providers.change_requests.insert("815".into(), flotilla_protocol::ChangeRequest {
-                    title: "Fix convoy PR refs".into(),
-                    branch: "feat/convoy".into(),
-                    status: flotilla_protocol::ChangeRequestStatus::Open,
-                    body: None,
-                    provider_name: "github".into(),
-                    provider_display_name: "GitHub".into(),
-                });
-                event_tx
-                    .send(DaemonEvent::RepoSnapshot(Box::new(flotilla_protocol::RepoSnapshot {
-                        seq: 1,
-                        repo_identity: flotilla_protocol::RepoIdentity {
-                            authority: "github.com".into(),
-                            path: "flotilla-org/flotilla".into(),
-                        },
-                        repo: Some(std::path::PathBuf::from("/virtual/kiwi/flotilla")),
-                        node_id: flotilla_protocol::NodeId::new("kiwi"),
-                        providers,
-                        provider_health: HashMap::new(),
-                        errors: Vec::new(),
-                    })))
-                    .expect("publish repo snapshot");
+                // A change-request delta triggers a repository-scoped resource resolver refresh.
+                event_tx.send(DaemonEvent::RepoDelta(Box::new(RepoDelta {
+                    seq: 1, prev_seq: 0,
+                    repo_identity: RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() },
+                    repo: None,
+                    changes: vec![Change::ChangeRequest { key: "815".into(), op: EntryOp::Removed }],
+                }))).expect("publish repo delta");
 
                 tokio::task::yield_now().await;
                 tokio::time::advance(CHANGE_REQUEST_MIN_REFRESH_INTERVAL).await;
@@ -5545,35 +5468,19 @@ mod tests {
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
     }
 
+    // Empty or unrelated deltas must not refresh convoy change requests.
+    // glue: only the ChangeRequest variant delegates to the resource resolver.
     #[test]
-    fn unchanged_repo_snapshot_does_not_refresh_convoy_change_requests() {
-        let (event_tx, _event_rx) = broadcast::channel(1);
-        let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx);
-        let repo_identity = flotilla_protocol::RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() };
-        let empty = flotilla_protocol::RepoSnapshot {
-            seq: 1,
-            repo_identity: repo_identity.clone(),
-            repo: Some(std::path::PathBuf::from("/repo")),
-            node_id: flotilla_protocol::NodeId::new("kiwi"),
-            providers: flotilla_protocol::ProviderData::default(),
-            provider_health: HashMap::new(),
-            errors: Vec::new(),
-        };
-        assert!(!aggregator.repo_snapshot_changed_change_requests(&empty));
-
-        let mut providers = flotilla_protocol::ProviderData::default();
-        providers.change_requests.insert("815".into(), flotilla_protocol::ChangeRequest {
-            title: "Fix convoy PR refs".into(),
-            branch: "feat/convoy".into(),
-            status: flotilla_protocol::ChangeRequestStatus::Open,
-            body: None,
-            provider_name: "github".into(),
-            provider_display_name: "GitHub".into(),
-        });
-        let with_change_request = flotilla_protocol::RepoSnapshot { providers, seq: 2, ..empty };
-
-        assert!(aggregator.repo_snapshot_changed_change_requests(&with_change_request));
-        assert!(!aggregator.repo_snapshot_changed_change_requests(&with_change_request));
+    fn unrelated_repo_delta_does_not_refresh_convoy_change_requests() {
+        let (event_tx, _) = broadcast::channel(1);
+        let aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("local"), event_tx);
+        let repo_identity = RepoIdentity { authority: "github.com".into(), path: "flotilla-org/flotilla".into() };
+        let empty = RepoDelta { seq: 1, prev_seq: 0, repo_identity: repo_identity.clone(), repo: None, changes: Vec::new() };
+        assert!(!aggregator.repo_delta_changed_change_requests(&empty));
+        let terminal = managed_terminal_delta(repo_identity, "pane-1", "/work/flotilla", None, false);
+        assert!(!aggregator.repo_delta_changed_change_requests(&terminal));
+        let removed = RepoDelta { changes: vec![Change::ChangeRequest { key: "815".into(), op: EntryOp::Removed }], ..empty };
+        assert!(aggregator.repo_delta_changed_change_requests(&removed));
     }
 
     fn convoy_names(rows: &Rows) -> Vec<&str> {
