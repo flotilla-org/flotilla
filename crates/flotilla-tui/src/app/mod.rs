@@ -173,12 +173,13 @@ impl TuiModel {
     }
 
     pub fn provider_status(&self, repo_identity: &RepoIdentity, category: &str, name: &str) -> Option<ProviderStatus> {
-        self.repos
-            .get(repo_identity)?
-            .provider_health
-            .get(category)?
-            .get(name)
-            .map(|healthy| if *healthy { ProviderStatus::Ok } else { ProviderStatus::Error })
+        self.repos.get(repo_identity)?.provider_health.get(category)?.get(name).map(|healthy| {
+            if *healthy {
+                ProviderStatus::Ok
+            } else {
+                ProviderStatus::Error
+            }
+        })
     }
 
     pub fn active_opt(&self) -> Option<&TuiRepoModel> {
@@ -645,25 +646,15 @@ impl App {
         theme: Theme,
         landing: Option<(RepoIdentity, ViewAddress)>,
     ) -> Self {
-        let mut model = TuiModel::from_repo_info(repos_info);
+        let model = TuiModel::from_repo_info(repos_info);
         // Open-view set: persisted if present, else seeded with overview,
         // convoys, and the resolved landing View.
         // The seed isn't written back here — it is deterministic, and any
         // tab mutation persists the set (scoped mode must never write it).
-        let mut views = match config.load_open_views() {
+        let views = match config.load_open_views() {
             Some(entries) => OpenViews::from_entries(entries),
-            None => OpenViews::seed_with_landing(
-                model
-                    .repo_order
-                    .iter()
-                    .filter_map(|identity| model.repos.get(identity).map(|repo| (identity.clone(), repo.repository_key.clone()))),
-                landing,
-            ),
+            None => OpenViews::seed_with_landing(landing),
         };
-        let repository_keys =
-            model.repos.iter().filter_map(|(identity, repo)| repo.repository_key.clone().map(|key| (identity.clone(), key))).collect();
-        views.bind_repository_keys(&repository_keys);
-        model.active_repo = views.active_repo_identity().cloned();
         let ui = UiState::new(&model.repo_order);
         let loaded_config = config.load_config();
         let keymap = Keymap::from_config(&loaded_config.ui.keys);
@@ -745,9 +736,6 @@ impl App {
             }
         }
         self.model.repo_order = repo_order;
-        let repository_keys =
-            self.model.repos.iter().filter_map(|(identity, repo)| repo.repository_key.clone().map(|key| (identity.clone(), key))).collect();
-        self.views.bind_repository_keys(&repository_keys);
         self.sync_active_view();
 
         self.model.hosts.clear();
@@ -992,12 +980,7 @@ impl App {
     /// Re-derive tab-dependent state after any change to the active tab.
     pub fn sync_active_view(&mut self) {
         self.screen.invalidate_page_layout();
-        self.model.active_repo = self.views.active_repo_identity().cloned();
-        if let Some(identity) = self.model.active_repo.clone() {
-            if let Some(rm) = self.model.repos.get_mut(&identity) {
-                rm.has_unseen_changes = false;
-            }
-        }
+        self.model.active_repo = None;
         self.report_active_view_focus();
     }
 
@@ -1542,8 +1525,7 @@ impl App {
         if let Some(existing) = self.model.repos.get_mut(&identity) {
             if existing.repository_key.is_none() {
                 if let Some(key) = info.repository_key {
-                    existing.repository_key = Some(key.clone());
-                    self.views.bind_repository_keys(&HashMap::from([(identity, key)]));
+                    existing.repository_key = Some(key);
                     self.subscriptions_dirty = true;
                 }
             }

@@ -72,18 +72,8 @@ pub struct Theme {
     pub logo_fg: Color,
     pub logo_bg: Color,
     pub logo_config_bg: Color,
-    // Work item kinds
-    pub checkout: Color,
-    pub session: Color,
-    pub change_request: Color,
-    pub issue: Color,
-    pub remote_branch: Color,
-    pub workspace: Color,
     // Semantic
     pub branch: Color,
-    pub path: Color,
-    pub source: Color,
-    pub git_status: Color,
     pub error: Color,
     pub warning: Color,
     pub info: Color,
@@ -128,18 +118,8 @@ impl Theme {
             logo_fg: p.crust.into(),
             logo_bg: p.sapphire.into(),
             logo_config_bg: p.text.into(),
-            // Work item kinds
-            checkout: p.green.into(),
-            session: p.mauve.into(),
-            change_request: p.blue.into(),
-            issue: p.yellow.into(),
-            remote_branch: p.overlay0.into(),
-            workspace: p.green.into(),
             // Semantic
             branch: p.teal.into(),
-            path: p.subtext0.into(),
-            source: p.lavender.into(),
-            git_status: p.red.into(),
             error: p.red.into(),
             warning: p.yellow.into(),
             info: p.blue.into(),
@@ -183,18 +163,8 @@ impl Theme {
             logo_fg: Color::Black,
             logo_bg: Color::Cyan,
             logo_config_bg: Color::White,
-            // Work item kinds
-            checkout: Color::Green,
-            session: Color::Magenta,
-            change_request: Color::Blue,
-            issue: Color::Yellow,
-            remote_branch: Color::DarkGray,
-            workspace: Color::Green,
             // Semantic
             branch: Color::Cyan,
-            path: Color::Indexed(245),
-            source: Color::Indexed(67),
-            git_status: Color::Red,
             error: Color::Red,
             warning: Color::Yellow,
             info: Color::DarkGray,
@@ -344,21 +314,9 @@ mod tests {
     }
 
     #[test]
-    fn classic_work_item_colours() {
-        let t = Theme::classic();
-        assert_eq!(t.checkout, Color::Green);
-        assert_eq!(t.session, Color::Magenta);
-        assert_eq!(t.change_request, Color::Blue);
-        assert_eq!(t.issue, Color::Yellow);
-        assert_eq!(t.remote_branch, Color::DarkGray);
-    }
-
-    #[test]
     fn classic_indexed_colours() {
         let t = Theme::classic();
         assert_eq!(t.multi_select_bg, Color::Indexed(236));
-        assert_eq!(t.path, Color::Indexed(245));
-        assert_eq!(t.source, Color::Indexed(67));
         assert_eq!(t.status_error, Color::Indexed(203));
         assert_eq!(t.key_hint, Color::Indexed(208));
     }

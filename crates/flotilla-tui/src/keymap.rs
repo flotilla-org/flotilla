@@ -46,9 +46,7 @@ pub enum Action {
     Describe,
     FillSelected,
     /// Open the command palette pre-filled to complete the selected convoy work.
-    CompleteConvoyWork,
     /// Attach the active workspace manager to the selected convoy vessel's workspace.
-    AttachConvoyVessel,
     /// Materialize or focus the selected convoy/vessel in the connected PM.
     OpenInPm,
 }
@@ -110,8 +108,6 @@ impl Action {
             "open_contextual_palette" => Action::OpenContextualPalette,
             "describe" => Action::Describe,
             "fill_selected" => Action::FillSelected,
-            "complete_convoy_work" => Action::CompleteConvoyWork,
-            "attach_convoy_vessel" => Action::AttachConvoyVessel,
             "open_in_pm" => Action::OpenInPm,
             _ => return None,
         };
@@ -153,8 +149,6 @@ impl Action {
             Action::OpenContextualPalette => "open_contextual_palette",
             Action::Describe => "describe",
             Action::FillSelected => "fill_selected",
-            Action::CompleteConvoyWork => "complete_convoy_work",
-            Action::AttachConvoyVessel => "attach_convoy_vessel",
             Action::OpenInPm => "open_in_pm",
         }
     }
@@ -192,8 +186,6 @@ impl Action {
             Action::OpenContextualPalette => "Open contextual palette (pre-filled)",
             Action::Describe => "Describe selected row",
             Action::FillSelected => "Fill selected item",
-            Action::CompleteConvoyWork => "Force complete work",
-            Action::AttachConvoyVessel => "Attach to vessel workspace",
             Action::OpenInPm => "Open in presentation manager",
         }
     }
@@ -254,7 +246,6 @@ impl Keymap {
             (&config.config, BindingModeId::Overview),
             (&config.convoys, BindingModeId::Convoys),
             (&config.project, BindingModeId::Project),
-            (&config.convoy_vessels, BindingModeId::ConvoyVessels),
             (&config.action_menu, BindingModeId::ActionMenu),
             (&config.delete_confirm, BindingModeId::DeleteConfirm),
             (&config.dispatch_confirm, BindingModeId::DispatchConfirm),
@@ -307,7 +298,7 @@ impl Keymap {
     pub fn help_sections(&self) -> Vec<HelpSection> {
         // Build the effective Normal-mode binding map: start with shared, then
         // TabPage (app globals) and TabShell (tab management), then Normal
-        // (repo-tab specific). This mirrors the
+        // (view-specific). This mirrors the
         // Composed([TabPage, TabShell, Normal]) resolution order so the
         // help screen accurately reflects what each key does in Normal mode.
         let mut effective: std::collections::HashMap<KeyCombination, Action> = std::collections::HashMap::new();
