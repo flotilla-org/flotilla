@@ -2838,3 +2838,123 @@ async fn remote_issue_query_returns_results() {
         other => panic!("expected IssuePage, got {other:?}"),
     }
 }
+
+// Resume admission accepts exited unfinished crew at the convoy authority,
+// through the same router whether the caller is local or across a peer session.
+async fn exited_crew_resume_scenario(remote_home: bool, interrupted: bool) {
+    let topology = spawn_in_memory_request_topology_stateful(empty_daemon_named("desk").await, empty_daemon_named("placement").await)
+        .await
+        .expect("router topology");
+    let home = if remote_home { &topology.follower } else { &topology.leader };
+    let backend = home.resource_backend();
+    let convoys = backend.clone().using::<Convoy>("flotilla");
+    let convoy = convoys.create(&convoy_meta("exited-work", "exited-work"), &convoy_spec("scratch", "exited-work")).await.expect("convoy");
+    convoys
+        .update_status("exited-work", &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ResourceConvoyPhase::Active,
+            work: BTreeMap::from([("work".into(), flotilla_resources::WorkState::builder().phase(ResourceWorkPhase::Interrupted).build())]),
+            crew_work: BTreeMap::from([(
+                "work".into(),
+                BTreeMap::from([(
+                    "coder".into(),
+                    flotilla_resources::CrewWorkState::builder()
+                        .phase(if interrupted {
+                            flotilla_resources::CrewWorkPhase::Interrupted
+                        } else {
+                            flotilla_resources::CrewWorkPhase::Working
+                        })
+                        .build(),
+                )]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("unfinished exited work");
+    let sessions = backend.using::<TerminalSession>("flotilla");
+    let session = sessions
+        .create(
+            &InputMeta::builder()
+                .name("exited-session".into())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.into(), "exited-work".into()),
+                    (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
+                    (ROLE_LABEL.into(), "coder".into()),
+                ]))
+                .build(),
+            &TerminalSessionSpec {
+                env_ref: "warm-env".into(),
+                role: "coder".into(),
+                cwd: "/warm/checkout".into(),
+                pool: "cleat".into(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("coding"),
+                    brief: TerminalBrief {
+                        path: "brief.md".into(),
+                        content: "original brief".into(),
+                        artifact_digest: None,
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "exited-work".into(),
+                        vessel_ref: "exited-work-work".into(),
+                    }),
+                    message: None,
+                },
+            },
+        )
+        .await
+        .expect("warm terminal");
+    sessions
+        .update_status("exited-session", &session.metadata.resource_version, &TerminalSessionStatus {
+            phase: flotilla_resources::TerminalSessionPhase::Stopped,
+            ..Default::default()
+        })
+        .await
+        .expect("agent exited");
+    if remote_home {
+        apply_convoy_replica_feed(&topology.leader, "flotilla", "exited-work", topology.follower_host.clone()).await;
+    }
+    let mut events = topology.leader.subscribe();
+    let id = topology
+        .client
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyResume {
+                    namespace: Some("flotilla".into()),
+                    name: "exited-work".into(),
+                    prompt: "finish the review".into(),
+                    vessel: Some("work".into()),
+                    role: Some("coder".into()),
+                })
+                .build(),
+        )
+        .await
+        .expect("routed resume");
+    let (node, result) = await_command_finished(&mut events, id).await;
+    assert_eq!(node, *home.node_id());
+    assert!(matches!(result, CommandValue::ConvoyBriefQueued { .. }), "resume rejected: {result:?}");
+    let session = sessions.get("exited-session").await.expect("same terminal");
+    assert_eq!(session.status.expect("status").phase, flotilla_resources::TerminalSessionPhase::Starting);
+    assert_eq!(session.spec.cwd, "/warm/checkout");
+    let TerminalSessionSource::Agent { message: Some(message), .. } = session.spec.source else { panic!("operator follow-up missing") };
+    assert!(message.text.contains("finish the review"));
+}
+
+#[tokio::test]
+async fn router_exited_crew_resume_pinned_rows() {
+    for remote_home in [false, true] {
+        for interrupted in [false, true] {
+            exited_crew_resume_scenario(remote_home, interrupted).await;
+        }
+    }
+}
+
+#[hegel::test]
+fn generated_router_exited_crew_resume(tc: hegel::TestCase) {
+    use tokio::runtime::Builder;
+    // Both authority locations and both sides of the exit-observation race.
+    let remote_home = tc.draw(hegel::generators::booleans());
+    let interrupted = tc.draw(hegel::generators::booleans());
+    Builder::new_current_thread().enable_all().build().expect("runtime").block_on(exited_crew_resume_scenario(remote_home, interrupted));
+}

@@ -241,10 +241,10 @@ pub use commands::{
     CliListKind, CliListResponse, CliListRow, Command, CommandAction, CommandValue, ConvoyAutoAttach, ConvoyDispatchRegard,
     ConvoyExplanation, ConvoyStartIntent, CrewSupervisionAction, EvidenceFreshness, ExplainedArtifact, ExplainedChangeRequest,
     ExplainedCheckout, ExplainedCondition, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent, ExplainedLeafFiring,
-    ExplainedLifecycleMutation, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
-    IssueSelector, ManifestResolution, PreparedTerminalCommand, PreparedWorkspace, RepoSelector, ResolvedPaneCommand, ResourceCursor,
-    ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance, ResourceRecordType, StallProposedDisposition,
-    StallReason, StepStatus,
+    ExplainedLifecycleMutation, ExplainedSettlement, ExplainedSubscription, ExplainedTerminalCondition, ExplainedUnclaimedWork,
+    ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PreparedTerminalCommand, PreparedWorkspace, RepoSelector,
+    ResolvedPaneCommand, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance,
+    ResourceRecordType, StallProposedDisposition, StallReason, StepStatus,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{

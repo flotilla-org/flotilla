@@ -4,6 +4,7 @@
 
 mod admission;
 pub mod agent_adapter;
+pub mod agent_process;
 pub mod agents;
 pub mod aggregator_projection;
 pub mod attachable;
@@ -50,6 +51,7 @@ mod scoped_store;
 mod standing_roles;
 pub mod step;
 pub mod template;
+pub mod terminal_health;
 pub mod terminal_manager;
 pub mod vcs;
 

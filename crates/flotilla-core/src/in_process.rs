@@ -1316,6 +1316,7 @@ fn pending_crew_message(sender: CrewMessageSender, body: &str) -> TerminalCrewMe
         text: frame_crew_message(&sender, body),
         sender,
         delivery: CrewMessageDelivery::Queued,
+        acknowledged: Default::default(),
         following: Vec::new(),
     }
 }
@@ -1395,6 +1396,7 @@ async fn queue_crew_message_object(
             return Err(format!("crew target `{}` is not an agent session", current.spec.role));
         };
         if let Some(head) = pending {
+            head.prune_acknowledged(current.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()));
             head.append(next.clone());
         } else {
             *pending = Some(next.clone());
@@ -7245,6 +7247,7 @@ impl InProcessDaemon {
                     text: frame_crew_message(&sender, message),
                     sender,
                     delivery: CrewMessageDelivery::Queued,
+                    acknowledged: Default::default(),
                     following: Vec::new(),
                 },
             };
@@ -7405,6 +7408,7 @@ impl InProcessDaemon {
                 matches!(
                     state.phase,
                     flotilla_resources::CrewWorkPhase::Working
+                        | flotilla_resources::CrewWorkPhase::Interrupted
                         | flotilla_resources::CrewWorkPhase::Stalled
                         | flotilla_resources::CrewWorkPhase::Done
                 ) && requested_vessel.is_none_or(|requested| requested == vessel.as_str())
@@ -7455,7 +7459,10 @@ impl InProcessDaemon {
                     && status.attention.as_ref().is_some_and(|attention| attention.state == TerminalAttentionState::Idle)
             })
         });
-        if crew_phase == flotilla_resources::CrewWorkPhase::Working && !at_turn_boundary {
+        let agent_exited = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
+            session.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped)
+        });
+        if crew_phase == flotilla_resources::CrewWorkPhase::Working && !at_turn_boundary && !agent_exited {
             let displaced = status.pending_brief().map(|brief| brief.content.clone());
             apply_resource_status_patch(
                 &convoys,
@@ -7588,6 +7595,9 @@ impl InProcessDaemon {
         let TerminalSessionSource::Agent { brief, message, .. } = &mut spec.source else {
             return Err(format!("turn-delivery target {}/{} is not an agent", request.vessel, request.role));
         };
+        if let Some(head) = message {
+            head.prune_acknowledged(session.status.as_ref().and_then(|status| status.delivered_message_id.as_deref()));
+        }
         let plan = turn_delivery_session_plan(session.status.as_ref().map(|status| status.phase), &request.vessel, &request.role)?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace);
         let previous_status = convoys
@@ -7601,6 +7611,7 @@ impl InProcessDaemon {
             text: turn_delivery_text(request, &previous_status),
             sender: request.sender.clone(),
             delivery: CrewMessageDelivery::Queued,
+            acknowledged: Default::default(),
             following: Vec::new(),
         };
         let delivered_id = session.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
@@ -7731,6 +7742,7 @@ impl InProcessDaemon {
             text: turn_delivery_text(request, status),
             sender: request.sender.clone(),
             delivery: CrewMessageDelivery::Queued,
+            acknowledged: Default::default(),
             following: Vec::new(),
         };
         let turn = flotilla_resources::PendingSupervisorTurn {

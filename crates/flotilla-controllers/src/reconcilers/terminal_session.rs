@@ -11,7 +11,8 @@ use flotilla_resources::{
     TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, Vessel, ACTUATOR_HOST_REF_ANNOTATION,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG,
-    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
+    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
+    TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -62,6 +63,9 @@ pub enum TerminalDeliveryReadiness {
 pub enum TerminalLiveness {
     Running,
     Stopped,
+    /// Provider failure supplies no evidence that the external session is gone.
+    Unavailable(String),
+    /// Positive evidence that the external session is permanently absent.
     Lost(String),
 }
 
@@ -82,7 +86,18 @@ pub trait TerminalRuntime: Send + Sync {
         Ok(true)
     }
     async fn session_liveness(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalLiveness, String> {
-        Ok(if self.session_is_running(session_id, spec).await? { TerminalLiveness::Running } else { TerminalLiveness::Stopped })
+        Ok(match self.session_is_running(session_id, spec).await {
+            Ok(true) => TerminalLiveness::Running,
+            Ok(false) => TerminalLiveness::Stopped,
+            Err(message) => TerminalLiveness::Unavailable(message),
+        })
+    }
+    async fn agent_exit_code(
+        &self,
+        _spec: &flotilla_resources::TerminalSessionSpec,
+        _crew: &flotilla_resources::CrewSessionStatus,
+    ) -> Result<Option<i32>, String> {
+        Ok(None)
     }
     async fn cleat_endpoint(
         &self,
@@ -247,6 +262,7 @@ pub enum TerminalPrepared {
     MessageDeliveryPending,
     MessageDeliveryUnconfirmed { message_id: String, message: String },
     Stopped,
+    AgentExited(i32),
     Lost(String),
     Revived,
     RecoverLost,
@@ -312,6 +328,14 @@ where
                 TerminalLiveness::Running => {}
                 TerminalLiveness::Stopped => return Ok(TerminalPrepared::Stopped),
                 TerminalLiveness::Lost(reason) => return Ok(TerminalPrepared::Lost(reason)),
+                TerminalLiveness::Unavailable(message) => return Err(ResourceError::other(message)),
+            }
+            if matches!(obj.spec.source, TerminalSessionSource::Agent { .. }) {
+                if let Some(crew) = obj.status.as_ref().and_then(|status| status.crew.as_ref()) {
+                    if let Some(code) = self.runtime.agent_exit_code(&obj.spec, crew).await.map_err(ResourceError::other)? {
+                        return Ok(TerminalPrepared::AgentExited(code));
+                    }
+                }
             }
             if let Some(message) = self.runtime.observe_failure(session_id, &obj.spec).await.map_err(ResourceError::other)? {
                 return Ok(TerminalPrepared::Failed(message));
@@ -319,7 +343,8 @@ where
             if let flotilla_resources::TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
                 if let Some(message) = head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
                     if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
-                        condition.reason == "DeliveryUnconfirmed" && condition.message_id.as_deref() == Some(message.id.as_str())
+                        condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
+                            && condition.message_id.as_deref() == Some(message.id.as_str())
                     }) {
                         return Ok(TerminalPrepared::None);
                     }
@@ -372,8 +397,10 @@ where
         }
         if phase == TerminalSessionPhase::Lost {
             if let Some(session_id) = obj.status.as_ref().and_then(|status| status.session_id.as_deref()) {
-                if self.runtime.session_liveness(session_id, &obj.spec).await.map_err(ResourceError::other)? == TerminalLiveness::Running {
-                    return Ok(TerminalPrepared::Revived);
+                match self.runtime.session_liveness(session_id, &obj.spec).await.map_err(ResourceError::other)? {
+                    TerminalLiveness::Running => return Ok(TerminalPrepared::Revived),
+                    TerminalLiveness::Unavailable(message) => return Err(ResourceError::other(message)),
+                    TerminalLiveness::Stopped | TerminalLiveness::Lost(_) => {}
                 }
             }
             let lost_at = obj.status.as_ref().and_then(|status| status.stopped_at);
@@ -463,6 +490,7 @@ where
                 | TerminalPrepared::BriefWaiting
                 | TerminalPrepared::None
                 | TerminalPrepared::Stopped
+                | TerminalPrepared::AgentExited(_)
                 | TerminalPrepared::Lost(_)
                 | TerminalPrepared::Revived
                 | TerminalPrepared::RecoverLost
@@ -475,12 +503,16 @@ where
                 | TerminalPrepared::OwnerMissing
                 | TerminalPrepared::OwnerTerminal => None,
             },
-            TerminalSessionPhase::Running if matches!(prepared, TerminalPrepared::Stopped) => {
+            TerminalSessionPhase::Running if matches!(prepared, TerminalPrepared::Stopped | TerminalPrepared::AgentExited(_)) => {
                 Some(TerminalSessionStatusPatch::MarkStopped {
                     stopped_at: now,
                     inner_command_status: Some(flotilla_resources::InnerCommandStatus::Exited),
-                    inner_exit_code: None,
-                    message: None,
+                    inner_exit_code: match prepared {
+                        TerminalPrepared::AgentExited(code) => Some(*code),
+                        _ => None,
+                    },
+                    message: matches!(prepared, TerminalPrepared::AgentExited(_))
+                        .then(|| "agent process exited; resume relaunches it in the existing checkout".to_string()),
                 })
             }
             TerminalSessionPhase::Running => match prepared {
@@ -543,13 +575,13 @@ where
             obj.status
                 .as_ref()
                 .and_then(|status| status.degraded.as_ref())
-                .is_some_and(|condition| condition.reason != "DeliveryUnconfirmed")
+                .is_some_and(|condition| condition.reason != TERMINAL_DELIVERY_UNCONFIRMED_REASON)
                 .then_some(TerminalSessionStatusPatch::ClearReconcileDegraded)
         });
 
-        let actuations = match prepared {
+        let mut actuations = match prepared {
             TerminalPrepared::Attention(observation) => vec![attention_demand_actuation(obj, observation)],
-            TerminalPrepared::Stopped | TerminalPrepared::OwnerTerminal => {
+            TerminalPrepared::Stopped | TerminalPrepared::AgentExited(_) | TerminalPrepared::OwnerTerminal => {
                 vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
             }
             TerminalPrepared::Lost(_) | TerminalPrepared::AttentionStale => {
@@ -560,6 +592,12 @@ where
             }
             _ => Vec::new(),
         };
+        if let TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
+            let delivered = obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
+            if delivered.is_some_and(|id| head.contains_id(id) && !head.acknowledged.contains(id)) {
+                actuations.push(Actuation::PruneTerminalMessages { name: obj.metadata.name.clone() });
+            }
+        }
         let mut outcome = ReconcileOutcome::with_actuations(patch, actuations);
         if matches!(prepared, TerminalPrepared::MessageDeliveryPending) {
             outcome.requeue_after = Some(Duration::from_millis(200));

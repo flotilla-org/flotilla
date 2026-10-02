@@ -1,7 +1,7 @@
 //! Resource-store and fleet-replica Aggregator maintaining named-query result sets.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
@@ -12,6 +12,7 @@ use flotilla_core::{
     ops_entry::{ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION},
     path_context::canonical_or_original,
     salience::{AttentionFact, DemandFact, PaneExitFact, RegardFact, SalienceFacts},
+    terminal_health,
 };
 use flotilla_protocol::{
     result_set::{
@@ -2481,6 +2482,18 @@ impl Aggregator {
                     )
             })
             .min_by_key(|demand| &demand.metadata.name);
+        let terminal_conditions = matching_sessions()
+            .filter_map(|session| {
+                let condition = session.object.status.as_ref().and_then(terminal_health::condition)?;
+                if matches!(condition, flotilla_protocol::ExplainedTerminalCondition::ProcessExited { .. })
+                    && state.is_some_and(|state| state.phase.is_terminal())
+                {
+                    return None;
+                }
+                Some(format!("{}: {condition}", session.object.spec.role))
+            })
+            .collect::<BTreeSet<_>>();
+        let terminal_condition = (!terminal_conditions.is_empty()).then(|| terminal_conditions.into_iter().collect::<Vec<_>>().join("; "));
         let surface_state = if credential_attention.is_some() || completion_pending.is_some() {
             SurfaceState::NeedsYou
         } else if let Some(stalled) = stalled.filter(|stalled| {
@@ -2521,6 +2534,7 @@ impl Aggregator {
                     .or_else(|| {
                         completion_pending
                             .map(|pending| format!("completion pending: {}", pending.last_error))
+                            .or_else(|| terminal_condition.clone())
                             .or_else(|| state.and_then(|state| state.message.clone()))
                     }),
             )
@@ -2792,6 +2806,7 @@ mod tests {
                     text: "Supervise the stalled crew".to_string(),
                     sender: flotilla_resources::CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
                     delivery: flotilla_resources::CrewMessageDelivery::Queued,
+                    acknowledged: Default::default(),
                     following: Vec::new(),
                 },
             }),
@@ -3134,6 +3149,49 @@ mod tests {
         let row = &result.rows.as_convoys().expect("convoys")[0];
         assert_ne!(row.surface_state, SurfaceState::NeedsYou);
         assert_eq!(row.subjects.len(), 3);
+    }
+
+    // The TUI vessel message exposes provider degradation and confirmed loss;
+    // neither is hidden behind raw-resource inspection, and recovery clears it.
+    #[tokio::test]
+    async fn vessel_projection_surfaces_terminal_degradation_loss_and_recovery() {
+        use flotilla_resources::{StatusPatch, TerminalSessionStatusPatch};
+
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy_with_vessel("health-convoy").await)).await;
+        let mut session = session_object("health-session").await;
+        session.metadata.labels =
+            BTreeMap::from([(CONVOY_LABEL.to_string(), "health-convoy".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
+        TerminalSessionStatusPatch::MarkReconcileDegraded {
+            message: "provider offline".into(),
+            consecutive_failures: 100,
+            observed_at: Utc::now(),
+        }
+        .apply(session.status.as_mut().expect("status"));
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Added(session.clone())).await;
+        let rows = state.result_set().await;
+        let vessel = &rows.rows.as_convoys().expect("convoys")[0].vessels[0];
+        assert!(vessel
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("provider unavailable") && message.contains("provider offline")));
+        TerminalSessionStatusPatch::MarkLost { reason: "generation dead".into(), lost_at: Utc::now() }
+            .apply(session.status.as_mut().expect("status"));
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(session.clone())).await;
+        let rows = state.result_set().await;
+        let vessel = &rows.rows.as_convoys().expect("convoys")[0].vessels[0];
+        assert!(vessel.message.as_deref().is_some_and(|message| message.contains("session lost") && message.contains("generation dead")));
+        TerminalSessionStatusPatch::MarkRevived.apply(session.status.as_mut().expect("status"));
+        TerminalSessionStatusPatch::ClearReconcileDegraded.apply(session.status.as_mut().expect("status"));
+        aggregator.apply_session_event_from(LocalSource::Durable, WatchEvent::Modified(session)).await;
+        let rows = state.result_set().await;
+        let vessel = &rows.rows.as_convoys().expect("convoys")[0].vessels[0];
+        assert!(!vessel
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("provider unavailable") || message.contains("session lost")));
     }
 
     #[tokio::test]

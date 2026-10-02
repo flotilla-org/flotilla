@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 pub use flotilla_protocol::{CrewMessageDelivery, CrewMessageSender};
@@ -8,6 +8,9 @@ use crate::{
     resource::define_resource, status_patch::StatusPatch, InputMeta, OwnerReference, ReplicationClass, Resource, ResourceObject, Selector,
     Vessel, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
+
+/// Stored degradation reason shared by writers, controllers and surfaces.
+pub const TERMINAL_DELIVERY_UNCONFIRMED_REASON: &str = "DeliveryUnconfirmed";
 
 define_resource!(
     TerminalSession,
@@ -155,24 +158,34 @@ pub struct TerminalCrewMessage {
     /// only the head message; remove the compatibility default after one roll.
     #[serde(default)]
     pub following: Vec<TerminalCrewMessage>,
+    /// Payload-free receipts preserve exact retry and supervisor acknowledgment
+    /// checks after pruning. Default accepts the previous generation's records;
+    /// remove the compatibility default after one fleet roll.
+    #[serde(default)]
+    pub acknowledged: BTreeSet<String>,
 }
 
 impl TerminalCrewMessage {
     pub fn contains_id(&self, id: &str) -> bool {
-        self.id == id || self.following.iter().any(|message| message.id == id)
+        self.acknowledged.contains(id) || self.id == id || self.following.iter().any(|message| message.id == id)
     }
 
     pub fn next_after(&self, delivered_id: Option<&str>) -> Option<&Self> {
         match delivered_id {
-            Some(id) if id == self.id => self.following.first(),
-            Some(id) => {
-                self.following.iter().position(|message| message.id == id).map_or(Some(self), |index| self.following.get(index + 1))
-            }
+            Some(id) if id == self.id || self.acknowledged.contains(id) => self.following.first(),
+            Some(id) => self.following.iter().position(|message| message.id == id).map_or_else(
+                || if self.acknowledged.contains(&self.id) { self.following.first() } else { Some(self) },
+                |index| self.following.get(index + 1),
+            ),
+            None if self.acknowledged.contains(&self.id) => self.following.first(),
             None => Some(self),
         }
     }
 
     pub fn pending_after(&self, delivered_id: Option<&str>) -> Vec<&Self> {
+        if self.acknowledged.contains(&self.id) && delivered_id.is_none_or(|id| !self.following.iter().any(|message| message.id == id)) {
+            return self.following.iter().collect();
+        }
         let messages = std::iter::once(self).chain(self.following.iter()).collect::<Vec<_>>();
         let start = delivered_id.and_then(|id| messages.iter().position(|message| message.id == id).map(|index| index + 1)).unwrap_or(0);
         messages[start..].to_vec()
@@ -186,8 +199,14 @@ impl TerminalCrewMessage {
 
     pub fn mark_next_for_launch(&mut self, delivered_id: Option<&str>) -> Option<String> {
         let next_index = match delivered_id {
-            Some(id) if id == self.id => Some(0),
-            Some(id) => self.following.iter().position(|message| message.id == id).map(|index| index + 1),
+            Some(id) if id == self.id || self.acknowledged.contains(id) => Some(0),
+            Some(id) => self
+                .following
+                .iter()
+                .position(|message| message.id == id)
+                .map(|index| index + 1)
+                .or_else(|| self.acknowledged.contains(&self.id).then_some(0)),
+            None if self.acknowledged.contains(&self.id) => Some(0),
             None => None,
         };
         if self.delivery == CrewMessageDelivery::LaunchBrief {
@@ -203,7 +222,32 @@ impl TerminalCrewMessage {
         Some(next.text.clone())
     }
 
+    /// Drop acknowledged payloads while retaining exact, payload-free receipts.
+    /// Pending operator briefs and nudges retain their order and attribution.
+    pub fn prune_acknowledged(&mut self, delivered_id: Option<&str>) -> bool {
+        let Some(id) = delivered_id else { return false };
+        if self.acknowledged.contains(id) {
+            return false;
+        }
+        let count = if id == self.id {
+            0
+        } else if let Some(index) = self.following.iter().position(|message| message.id == id) {
+            index + 1
+        } else {
+            return false;
+        };
+        self.acknowledged.insert(self.id.clone());
+        self.text.clear();
+        for message in self.following.drain(..count) {
+            self.acknowledged.insert(message.id);
+        }
+        true
+    }
+
     pub fn delivered_through(&self, delivered_id: Option<&str>, target_id: &str) -> bool {
+        if self.acknowledged.contains(target_id) {
+            return true;
+        }
         let messages = std::iter::once(self).chain(self.following.iter()).collect::<Vec<_>>();
         let Some(delivered_index) = messages.iter().position(|message| Some(message.id.as_str()) == delivered_id) else {
             return false;
@@ -488,7 +532,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
             Self::MarkDeliveryUnconfirmed { message_id, message, observed_at } => {
                 status.message = Some(message.clone());
                 status.degraded = Some(TerminalSessionDegradedCondition {
-                    reason: "DeliveryUnconfirmed".to_string(),
+                    reason: TERMINAL_DELIVERY_UNCONFIRMED_REASON.to_string(),
                     message: message.clone(),
                     message_id: Some(message_id.clone()),
                     consecutive_failures: 1,

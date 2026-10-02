@@ -5354,7 +5354,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     ("FLOTILLA_NAMESPACE".to_string(), context.namespace.clone()),
                     ("FLOTILLA_TERMINAL_SESSION".to_string(), name.to_string()),
                 ]);
-                (plan.command, env, Some(crew))
+                (flotilla_core::agent_process::monitored_command(&plan.command, &crew.id), env, Some(crew))
             }
         };
         env.push(("CARGO_INCREMENTAL".to_string(), "0".to_string()));
@@ -5404,8 +5404,35 @@ impl TerminalRuntime for TerminalControllerRuntime {
     }
 
     async fn session_liveness(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalLiveness, String> {
-        let pool = self.pool_for_spec(spec)?;
-        Ok(terminal_liveness_for_source(&spec.source, pool.session_liveness(session_id).await?))
+        let pool = match self.pool_for_spec(spec) {
+            Ok(pool) => pool,
+            Err(message) => return Ok(TerminalLiveness::Unavailable(message)),
+        };
+        Ok(match pool.session_liveness(session_id).await {
+            Ok(liveness) => terminal_liveness_for_source(&spec.source, liveness),
+            Err(message) => TerminalLiveness::Unavailable(message),
+        })
+    }
+
+    async fn agent_exit_code(
+        &self,
+        spec: &flotilla_resources::TerminalSessionSpec,
+        crew: &flotilla_resources::CrewSessionStatus,
+    ) -> Result<Option<i32>, String> {
+        let marker = flotilla_core::agent_process::exit_receipt(&crew.id);
+        let runner = self.runner_for_env(&spec.env_ref)?;
+        let output = runner
+            .run(
+                "sh",
+                &["-c", "if [ -f \"$1\" ]; then cat -- \"$1\"; fi", "flotilla-agent-exit", &marker],
+                Path::new(&spec.cwd),
+                &ChannelLabel::Default,
+            )
+            .await?;
+        if output.trim().is_empty() {
+            return Ok(None);
+        }
+        output.trim().parse().map(Some).map_err(|error| format!("invalid agent exit receipt: {error}"))
     }
 
     async fn observe_attention(

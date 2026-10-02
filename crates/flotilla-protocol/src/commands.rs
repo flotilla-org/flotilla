@@ -296,7 +296,37 @@ pub struct ExplainedSubscription {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExplainedTerminalCondition {
+    ProviderUnavailable { message: String },
+    SessionLost { message: String },
+    ProcessExited { exit_code: Option<i32> },
+    DeliveryUnconfirmed { message: String },
+}
+
+impl std::fmt::Display for ExplainedTerminalCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProviderUnavailable { message } => {
+                write!(f, "terminal provider unavailable: {message}; retrying without failing the crew")
+            }
+            Self::SessionLost { message } => write!(f, "terminal session lost: {message}; recovering from the durable brief"),
+            Self::ProcessExited { exit_code } => {
+                f.write_str("crew process exited")?;
+                if let Some(code) = exit_code {
+                    write!(f, " with code {code}")?;
+                }
+                f.write_str("; resume relaunches it in the existing checkout")
+            }
+            Self::DeliveryUnconfirmed { message } => write!(f, "terminal message delivery unconfirmed: {message}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainedCrewDelivery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_condition: Option<ExplainedTerminalCondition>,
     pub session: String,
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

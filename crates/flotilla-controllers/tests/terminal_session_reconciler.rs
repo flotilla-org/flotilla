@@ -118,6 +118,7 @@ async fn dead_generation_is_lost_then_recreated() {
                     text: "PR #2185 is conflicting; rebase and rerun the gates".into(),
                     sender: Default::default(),
                     delivery: flotilla_resources::CrewMessageDelivery::Queued,
+                    acknowledged: Default::default(),
                     following: Vec::new(),
                 }),
             },
@@ -1358,6 +1359,7 @@ async fn a_fresh_turn_launched_as_the_brief_is_not_delivered_again() {
                     text: text.into(),
                     sender: flotilla_resources::CrewMessageSender::FlotillaTurn { source: "conflicting".into() },
                     delivery: flotilla_resources::CrewMessageDelivery::LaunchBrief,
+                    acknowledged: Default::default(),
                     following: Vec::new(),
                 }),
             },
@@ -1442,11 +1444,13 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
                     text: "Review the amended commit".into(),
                     sender: Default::default(),
                     delivery: Default::default(),
+                    acknowledged: Default::default(),
                     following: vec![flotilla_resources::TerminalCrewMessage {
                         id: "nudge-after-brief".into(),
                         text: "Check the result".into(),
                         sender: flotilla_resources::CrewMessageSender::FlotillaNudge,
                         delivery: Default::default(),
+                        acknowledged: Default::default(),
                         following: Vec::new(),
                     }],
                 }),
@@ -1540,6 +1544,7 @@ async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
                     text: "Review the amended commit".into(),
                     sender: Default::default(),
                     delivery: Default::default(),
+                    acknowledged: Default::default(),
                     following: Vec::new(),
                 }),
             },
@@ -1888,4 +1893,212 @@ async fn fatal_runtime_observation_fails_a_running_terminal_naming_its_credentia
     let message = status.message.expect("failure reason");
     assert!(message.contains("codex-central/auth.json"), "the failure must name the central credential: {message}");
     assert!(message.contains("token_expired"), "the failure must carry the observed reason: {message}");
+}
+
+// A real controller loop acknowledges and compacts a long queue without
+// changing delivery order or leaving delivered bodies in the stored resource.
+#[tokio::test]
+async fn controller_loop_prunes_acknowledged_message_payloads() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let new_message = |id: usize| flotilla_resources::TerminalCrewMessage {
+        id: format!("turn-{id}"),
+        text: format!("operator brief {id}"),
+        sender: Default::default(),
+        delivery: Default::default(),
+        following: Vec::new(),
+        acknowledged: Default::default(),
+    };
+    let mut head = new_message(0);
+    for id in 1..=128 {
+        head.append(new_message(id));
+    }
+    let created = sessions
+        .create(&InputMeta::builder().name("history-session".into()).build(), &TerminalSessionSpec {
+            env_ref: "env-a".into(),
+            role: "coder".into(),
+            cwd: "/workspace".into(),
+            pool: "cleat".into(),
+            source: flotilla_resources::TerminalSessionSource::Agent {
+                selector: flotilla_resources::Selector::for_capability("coding"),
+                brief: flotilla_resources::TerminalBrief {
+                    path: "brief.md".into(),
+                    content: "original brief".into(),
+                    artifact_digest: None,
+                    copies: Vec::new(),
+                },
+                context: Box::new(flotilla_resources::TerminalCrewContext {
+                    namespace: "flotilla".into(),
+                    convoy: "demo".into(),
+                    vessel_ref: "demo-work".into(),
+                }),
+                message: Some(head),
+            },
+        })
+        .await
+        .expect("session");
+    sessions
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            session_id: Some("history-session".into()),
+            delivered_message_id: Some("turn-0".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("running");
+    let runtime = Arc::new(DeliveringTerminalRuntime::default());
+    let loop_task = tokio::spawn(
+        ControllerLoop {
+            primary: sessions.clone(),
+            secondaries: Vec::new(),
+            reconciler: TerminalSessionReconciler::new(runtime.clone(), backend.clone(), "flotilla"),
+            resync_interval: Duration::from_secs(3600),
+            backend,
+        }
+        .run(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let current = sessions.get("history-session").await.expect("stored session");
+            if let flotilla_resources::TerminalSessionSource::Agent { message: Some(head), .. } = &current.spec.source {
+                if head.acknowledged.contains("turn-128") {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("controller drains queue");
+    loop_task.abort();
+    let stored = sessions.get("history-session").await.expect("stored session");
+    let flotilla_resources::TerminalSessionSource::Agent { message: Some(mut head), brief, .. } = stored.spec.source else {
+        panic!("agent")
+    };
+    assert!(head.text.is_empty());
+    assert!(head.following.is_empty());
+    assert_eq!(brief.content, "original brief");
+    assert_eq!(head.acknowledged.len(), 129);
+    head.append(new_message(42));
+    assert!(head.following.is_empty(), "replaying a pruned turn cannot redeliver it");
+    let delivered = runtime.delivered.lock().expect("delivery log");
+    assert_eq!(
+        delivered.iter().map(|(_, text, _)| text.clone()).collect::<Vec<_>>(),
+        (1..=128).map(|id| format!("operator brief {id}")).collect::<Vec<_>>()
+    );
+}
+
+struct ExitedAgentRuntime(i32);
+
+#[async_trait]
+impl TerminalRuntime for ExitedAgentRuntime {
+    async fn ensure_session(
+        &self,
+        _: &str,
+        _: &TerminalSessionSpec,
+        _: &[flotilla_resources::TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String> {
+        panic!("running shell must not provision a replacement before exit is observed")
+    }
+    // Inject the process boundary: the parent shell has observed the child exit.
+    async fn agent_exit_code(&self, _: &TerminalSessionSpec, _: &flotilla_resources::CrewSessionStatus) -> Result<Option<i32>, String> {
+        Ok(Some(self.0))
+    }
+    async fn kill_session(&self, _: &str, _: &TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+// An agent's exit differs from a live persistent shell. Preserve the checkout
+// and record the actual exit so unfinished crew work can become Interrupted.
+#[tokio::test]
+async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
+    for code in [0, 42, 130, 137] {
+        let backend = ResourceBackend::InMemory(Default::default());
+        create_ready_environment(&backend, "env-a").await;
+        create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
+        let sessions = backend.clone().using::<TerminalSession>("flotilla");
+        let created = sessions
+            .create(&meta("exited-agent"), &TerminalSessionSpec {
+                env_ref: "env-a".into(),
+                role: "coder".into(),
+                cwd: "/workspace".into(),
+                pool: "cleat".into(),
+                source: flotilla_resources::TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("coding"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: "brief.md".into(),
+                        content: "original brief".into(),
+                        artifact_digest: None,
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "demo".into(),
+                        vessel_ref: "demo-work".into(),
+                    }),
+                    message: None,
+                },
+            })
+            .await
+            .expect("session");
+        let running = sessions
+            .update_status(&created.metadata.name, &created.metadata.resource_version, &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                session_id: Some("live-shell".into()),
+                crew: Some(
+                    flotilla_resources::CrewSessionStatus::builder()
+                        .id("launch-id".into())
+                        .adapter("codex".into())
+                        .stance("trusted".into())
+                        .build(),
+                ),
+                ..Default::default()
+            })
+            .await
+            .expect("running shell");
+        let reconciler = TerminalSessionReconciler::new(Arc::new(ExitedAgentRuntime(code)), backend, "flotilla");
+        let prepared = reconciler.prepare(&running).await.expect("observe process");
+        let outcome = reconciler.reconcile(&running, &prepared, Utc::now());
+        let mut status = running.status.expect("status");
+        outcome.patch.expect("exit patch").apply(&mut status);
+        assert_eq!(status.phase, TerminalSessionPhase::Stopped);
+        assert_eq!(status.inner_exit_code, Some(code));
+        assert!(status.message.expect("recovery guidance").contains("resume"));
+    }
+}
+
+// An unavailable provider is a typed observation, never proof that an elapsed
+// Lost grace permits another launch. A successful probe can still revive it.
+#[tokio::test]
+async fn typed_unavailability_preserves_lost_session_until_provider_recovers() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let spec = TerminalSessionSpec {
+        env_ref: "env-a".into(),
+        role: "shell".into(),
+        source: flotilla_resources::TerminalSessionSource::Tool { command: "sh".into() },
+        cwd: "/workspace".into(),
+        pool: "cleat".into(),
+    };
+    let created = sessions.create(&meta("lost-unavailable"), &spec).await.expect("terminal");
+    let lost = sessions
+        .update_status("lost-unavailable", &created.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Lost,
+            session_id: Some("existing-session".into()),
+            stopped_at: Some(Utc::now() - chrono::Duration::days(100)),
+            ..Default::default()
+        })
+        .await
+        .expect("lost terminal");
+    let runtime = Arc::new(UnavailableRunningRuntime::default());
+    assert!(matches!(runtime.session_liveness("existing-session", &spec).await.expect("typed outcome"), TerminalLiveness::Unavailable(_)));
+    let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend, "flotilla");
+    assert!(reconciler.prepare(&lost).await.is_err(), "outage cannot authorize recovery based only on elapsed time");
+    runtime.available.store(true, Ordering::SeqCst);
+    let prepared = reconciler.prepare(&lost).await.expect("provider recovers");
+    assert!(matches!(reconciler.reconcile(&lost, &prepared, Utc::now()).patch, Some(TerminalSessionStatusPatch::MarkRevived)));
 }

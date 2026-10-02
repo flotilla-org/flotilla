@@ -200,7 +200,7 @@ pub use terminal_session::{
     CrewMessageSender, CrewSessionStatus, InnerCommandStatus, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
     TerminalBrief, TerminalCrewContext, TerminalCrewMessage, TerminalOccupancy, TerminalSession, TerminalSessionAttachTarget,
     TerminalSessionDegradedCondition, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, TerminalSessionStatusPatch, TerminalSessionTag,
+    TerminalSessionStatus, TerminalSessionStatusPatch, TerminalSessionTag, TERMINAL_DELIVERY_UNCONFIRMED_REASON,
 };
 pub use usage::{usage_record_name, Usage, UsagePace, UsageProviderCost, UsageSpec, UsageStatus, UsageStatusPatch, UsageWindow};
 pub use vessel::{

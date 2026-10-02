@@ -916,6 +916,7 @@ impl ReadProjections<'_> {
             .into_iter()
             .filter(|source| source.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|convoy| convoy == name))
             .map(|source| ExplainedCrewDelivery {
+                terminal_condition: source.object.status.as_ref().and_then(crate::terminal_health::condition),
                 session: source.object.metadata.name,
                 role: source.object.spec.role,
                 // ADR 0028's delivery ladder has not landed yet. Keep the
@@ -1865,6 +1866,73 @@ mod tests {
         let response = fixture.projections().explain_convoy("flotilla", "finished").await.expect("explanation");
         assert_eq!(response.convoy, "finished");
         assert_eq!(response.phase, "Failed");
+    }
+
+    // Convoy explanation uses typed health evidence, so operators can distinguish
+    // provider retry from confirmed loss and see when recovery clears the issue.
+    #[tokio::test]
+    async fn convoy_explanation_reports_terminal_provider_loss_and_recovery() {
+        use flotilla_protocol::ExplainedTerminalCondition;
+        use flotilla_resources::{apply_status_patch, TerminalSessionStatus, TerminalSessionStatusPatch};
+
+        let fixture = ProjectionFixture::new();
+        fixture
+            .backend
+            .clone()
+            .using::<ResourceConvoy>("flotilla")
+            .create(
+                &InputMeta::builder().name("health-convoy".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("review".to_string()).build(),
+            )
+            .await
+            .expect("convoy");
+        let sessions = fixture.backend.clone().using::<ResourceTerminalSession>("flotilla");
+        let session = sessions
+            .create(
+                &InputMeta::builder()
+                    .name("health-session".to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "health-convoy".to_string())]))
+                    .build(),
+                &flotilla_resources::TerminalSessionSpec {
+                    env_ref: "env".into(),
+                    role: "coder".into(),
+                    cwd: "/work".into(),
+                    pool: "cleat".into(),
+                    source: TerminalSessionSource::Tool { command: "sh".into() },
+                },
+            )
+            .await
+            .expect("session");
+        sessions
+            .update_status("health-session", &session.metadata.resource_version, &TerminalSessionStatus {
+                phase: flotilla_resources::TerminalSessionPhase::Running,
+                ..Default::default()
+            })
+            .await
+            .expect("running");
+        apply_status_patch(&sessions, "health-session", &TerminalSessionStatusPatch::MarkReconcileDegraded {
+            message: "provider offline".into(),
+            consecutive_failures: 100,
+            observed_at: Utc::now(),
+        })
+        .await
+        .expect("degradation");
+        let explanation = fixture.projections().explain_convoy("flotilla", "health-convoy").await.expect("explanation");
+        assert!(
+            matches!(&explanation.crew_deliveries[0].terminal_condition, Some(ExplainedTerminalCondition::ProviderUnavailable { message }) if message == "provider offline")
+        );
+        apply_status_patch(&sessions, "health-session", &TerminalSessionStatusPatch::MarkLost {
+            reason: "daemon generation dead".into(),
+            lost_at: Utc::now(),
+        })
+        .await
+        .expect("confirmed loss");
+        let explanation = fixture.projections().explain_convoy("flotilla", "health-convoy").await.expect("explanation");
+        assert!(matches!(&explanation.crew_deliveries[0].terminal_condition, Some(ExplainedTerminalCondition::SessionLost { .. })));
+        apply_status_patch(&sessions, "health-session", &TerminalSessionStatusPatch::MarkRevived).await.expect("revive");
+        apply_status_patch(&sessions, "health-session", &TerminalSessionStatusPatch::ClearReconcileDegraded).await.expect("recovered");
+        let explanation = fixture.projections().explain_convoy("flotilla", "health-convoy").await.expect("explanation");
+        assert!(explanation.crew_deliveries[0].terminal_condition.is_none());
     }
 
     #[test]

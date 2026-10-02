@@ -1067,6 +1067,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                 delivery.delivered_message_id.as_deref().unwrap_or("-"),
                 delivery.sender.as_ref().map(|sender| sender.short_label()).unwrap_or_else(|| "-".to_string())
             );
+            if let Some(condition) = &delivery.terminal_condition {
+                let _ = writeln!(output, "    {condition}");
+            }
             for brief in &delivery.pending_briefs {
                 let _ = writeln!(output, "    pending brief: {brief}");
             }
