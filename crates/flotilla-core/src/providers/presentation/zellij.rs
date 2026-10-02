@@ -1,17 +1,11 @@
 use std::{path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use crate::providers::{run, types::*, CommandRunner};
+use crate::providers::{command_channel_label, command_timeout_message, run, types::*, CommandRunner};
 
-/// Timeout for individual `zellij action` calls.  Combined with the 1-permit
-/// semaphore this limits the blast radius when Zellij is unresponsive: at most
-/// one child process can be waiting at a time, and callers give up after the
-/// timeout.  Note that the timed-out child process itself may linger until the
-/// Zellij server recovers or is killed — the runner's `Command::output()` does
-/// not set `kill_on_drop`.
+/// Deadline for individual `zellij action` calls.
 const ZELLIJ_ACTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct ZellijPresentationManager {
@@ -19,40 +13,35 @@ pub struct ZellijPresentationManager {
     /// Optional override for the session name. When `None`, falls back to
     /// the `ZELLIJ_SESSION_NAME` environment variable.
     session_name_override: Option<String>,
-    /// Serialise all `zellij action` calls so we don't pile up child processes
-    /// when the server is slow or unresponsive.
-    action_semaphore: Semaphore,
 }
 
 impl ZellijPresentationManager {
     pub fn new(runner: Arc<dyn CommandRunner>) -> Self {
-        Self { runner, session_name_override: None, action_semaphore: Semaphore::new(1) }
+        Self { runner, session_name_override: None }
     }
 
     /// Create a manager targeting a specific session name, avoiding the need
     /// to read `ZELLIJ_SESSION_NAME` from the process environment.
     pub fn with_session_name(runner: Arc<dyn CommandRunner>, session_name: String) -> Self {
-        Self { runner, session_name_override: Some(session_name), action_semaphore: Semaphore::new(1) }
+        Self { runner, session_name_override: Some(session_name) }
     }
 
     /// Run `zellij action <args>` and return stdout, or an error on failure.
     ///
-    /// Serialised via a semaphore so at most one `zellij action` child is
-    /// outstanding at a time, and wrapped in a timeout so callers give up
-    /// rather than blocking forever.
+    /// The runner stops the child and its process group on timeout.
     async fn zellij_action(&self, args: &[&str]) -> Result<String, String> {
-        let _permit = self.action_semaphore.acquire().await.map_err(|_| "zellij action semaphore closed".to_string())?;
-
         let mut cmd_args = vec!["action"];
         cmd_args.extend_from_slice(args);
 
         let action_desc = args.first().copied().unwrap_or("unknown");
-        match tokio::time::timeout(ZELLIJ_ACTION_TIMEOUT, async { run!(self.runner, "zellij", &cmd_args, Path::new(".")) }).await {
-            Ok(result) => result.map(|s| s.trim().to_string()),
-            Err(_) => {
+        let label = command_channel_label("zellij", &cmd_args);
+        match self.runner.run_with_timeout("zellij", &cmd_args, Path::new("."), &label, ZELLIJ_ACTION_TIMEOUT).await {
+            Ok(output) => Ok(output.trim().to_string()),
+            Err(error) if error == command_timeout_message("zellij", ZELLIJ_ACTION_TIMEOUT) => {
                 warn!(action = %action_desc, timeout_secs = ZELLIJ_ACTION_TIMEOUT.as_secs(), "zellij action timed out");
                 Err(format!("zellij action '{action_desc}' timed out after {}s", ZELLIJ_ACTION_TIMEOUT.as_secs()))
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -238,5 +227,30 @@ impl super::PresentationManager for ZellijPresentationManager {
             Ok(session) => format!("{session}:"),
             Err(_) => String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use super::ZellijPresentationManager;
+    use crate::providers::{command_timeout_message, testing::TimeoutOnlyRunner};
+
+    #[tokio::test]
+    async fn action_uses_runner_deadline_and_reports_its_timeout() {
+        let inner = Arc::new(TimeoutOnlyRunner::new(Err(command_timeout_message("zellij", Duration::from_secs(5)))));
+        let manager = ZellijPresentationManager::new(inner.clone());
+        assert_eq!(manager.zellij_action(&["list-tabs"]).await.expect_err("deadline"), "zellij action 'list-tabs' timed out after 5s");
+        let calls = inner.calls.lock().expect("calls mutex");
+        assert_eq!(calls[0].0, "zellij");
+        assert_eq!(calls[0].1, ["action", "list-tabs"]);
+        assert_eq!(calls[0].3, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn action_preserves_non_deadline_stderr() {
+        let manager = ZellijPresentationManager::new(Arc::new(TimeoutOnlyRunner::new(Err("server timed out internally".into()))));
+        assert_eq!(manager.zellij_action(&["list-tabs"]).await.expect_err("command error"), "server timed out internally");
     }
 }

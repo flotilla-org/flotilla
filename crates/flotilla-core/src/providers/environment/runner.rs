@@ -1,14 +1,15 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::providers::{
-    atomic_write_script, helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner,
-    FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
+    atomic_write_script, helper_exec_script, install_managed_helper_script, rename_command_timeout, ChannelLabel, CommandOutput,
+    CommandRunner, FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
 
 /// Persistent writable base reserved inside provisioned containers. Unlike a
@@ -75,6 +76,22 @@ impl CommandRunner for DockerEnvironmentRunner {
         let docker_args = self.docker_exec_args(cmd, args, cwd, false);
         let arg_refs = docker_args.iter().map(String::as_str).collect::<Vec<_>>();
         self.inner.run("docker", &arg_refs, Path::new("/"), label).await
+    }
+
+    async fn run_with_timeout(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let docker_args = self.docker_exec_args(cmd, args, cwd, false);
+        let arg_refs = docker_args.iter().map(String::as_str).collect::<Vec<_>>();
+        self.inner
+            .run_with_timeout("docker", &arg_refs, Path::new("/"), label, timeout)
+            .await
+            .map_err(|error| rename_command_timeout(error, "docker", cmd, timeout))
     }
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
@@ -155,7 +172,35 @@ mod tests {
     use uuid::Uuid;
 
     use super::{DockerEnvironmentRunner, CONTAINED_CODEX_HOME};
-    use crate::providers::{testing::MockRunner, ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
+    use crate::providers::{
+        command_timeout_message,
+        testing::{MockRunner, TimeoutOnlyRunner},
+        ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
+    };
+
+    #[tokio::test]
+    async fn timeout_is_forwarded_to_docker_exec() {
+        let inner = Arc::new(TimeoutOnlyRunner::new(Ok("done".into())));
+        let runner = DockerEnvironmentRunner::new("container".into(), inner.clone());
+        let result = runner.run_with_timeout("cmd", &["arg"], Path::new("/work"), &ChannelLabel::Default, Duration::from_secs(3)).await;
+        assert_eq!(result.expect("command result"), "done");
+        let calls = inner.calls.lock().expect("calls mutex");
+        assert_eq!(calls.as_slice(), &[(
+            "docker".into(),
+            vec!["exec".into(), "-w".into(), "/work".into(), "container".into(), "cmd".into(), "arg".into()],
+            Path::new("/").to_path_buf(),
+            Duration::from_secs(3),
+        )]);
+    }
+
+    #[tokio::test]
+    async fn docker_timeout_names_the_requested_command() {
+        let timeout = Duration::from_millis(500);
+        let inner = Arc::new(TimeoutOnlyRunner::new(Err(command_timeout_message("docker", timeout))));
+        let runner = DockerEnvironmentRunner::new("container".into(), inner);
+        let result = runner.run_with_timeout("zellij", &["action"], Path::new("/work"), &ChannelLabel::Default, timeout).await;
+        assert_eq!(result.expect_err("deadline"), "zellij timed out after 500ms");
+    }
 
     struct DockerContainer(String);
 

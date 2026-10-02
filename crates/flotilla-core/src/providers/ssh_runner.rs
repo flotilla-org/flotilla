@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::providers::{
-    atomic_write_script, helper_exec_script, install_managed_helper_script, ChannelLabel, CommandOutput, CommandRunner,
-    FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
+    atomic_write_script, helper_exec_script, install_managed_helper_script, rename_command_timeout, ChannelLabel, CommandOutput,
+    CommandRunner, FLOTILLA_HELPER_NAME, FLOTILLA_HELPER_SCRIPT,
 };
 
 const REMOTE_WRITABLE_BASE_SCRIPT: &str = "if [ -n \"${XDG_RUNTIME_DIR:-}\" ] \
@@ -98,6 +98,22 @@ impl CommandRunner for SshCommandRunner {
         self.execute(cmd, args, cwd, label).await
     }
 
+    async fn run_with_timeout(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
+        let script = self.remote_exec_script(cmd, args, cwd);
+        let ssh_args = self.ssh_shell_args(&script);
+        self.runner
+            .run_with_timeout("ssh", &ssh_args, Path::new("/"), label, timeout)
+            .await
+            .map_err(|error| rename_command_timeout(error, "ssh", cmd, timeout))
+    }
+
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         let script = self.remote_exec_script(cmd, args, cwd);
         let ssh_args = self.ssh_shell_args(&script);
@@ -173,12 +189,41 @@ mod tests {
         collections::VecDeque,
         path::{Path, PathBuf},
         sync::Mutex,
+        time::Duration,
     };
 
     use async_trait::async_trait;
 
     use super::{SshCommandRunner, REMOTE_WRITABLE_BASE_SCRIPT};
-    use crate::providers::{ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
+    use crate::providers::{
+        command_timeout_message, testing::TimeoutOnlyRunner, ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
+    };
+
+    #[tokio::test]
+    async fn timeout_is_forwarded_to_ssh_client() {
+        let inner = std::sync::Arc::new(TimeoutOnlyRunner::new(Ok("done".into())));
+        let runner = SshCommandRunner::new("user@host", false, inner.clone());
+        let result = runner.run_with_timeout("cmd", &["arg"], Path::new("/work"), &ChannelLabel::Default, Duration::from_secs(4)).await;
+        assert_eq!(result.expect("command result"), "done");
+        let calls = inner.calls.lock().expect("calls mutex");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "ssh");
+        assert_eq!(calls[0].2, Path::new("/"));
+        assert_eq!(calls[0].3, Duration::from_secs(4));
+        let script = calls[0].1.last().expect("remote script");
+        assert!(script.contains("exec"));
+        assert!(script.contains("cmd"));
+        assert!(script.contains("arg"));
+    }
+
+    #[tokio::test]
+    async fn ssh_timeout_names_the_requested_command() {
+        let timeout = Duration::from_millis(500);
+        let inner = std::sync::Arc::new(TimeoutOnlyRunner::new(Err(command_timeout_message("ssh", timeout))));
+        let runner = SshCommandRunner::new("user@host", false, inner);
+        let result = runner.run_with_timeout("zellij", &["action"], Path::new("/work"), &ChannelLabel::Default, timeout).await;
+        assert_eq!(result.expect_err("deadline"), "zellij timed out after 500ms");
+    }
 
     struct RecordingRunner {
         calls: Mutex<Vec<(String, Vec<String>, PathBuf)>>,

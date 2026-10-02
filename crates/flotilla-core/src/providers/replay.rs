@@ -476,6 +476,18 @@ impl CommandRunner for ReplayRunner {
         }
     }
 
+    async fn run_with_timeout(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+        _timeout: std::time::Duration,
+    ) -> Result<String, String> {
+        // Replay consumes the recorded outcome immediately, independent of wall time.
+        self.run(cmd, args, cwd, label).await
+    }
+
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         let interaction = self.session.next(label);
         let Interaction::Command { cmd: expected_cmd, args: expected_args, cwd: expected_cwd, stdout, stderr, exit_code, .. } = interaction
@@ -688,22 +700,15 @@ impl RecordingRunner {
     pub fn new(session: Session, inner: Arc<dyn CommandRunner>) -> Self {
         Self { session, inner }
     }
-}
 
-#[async_trait]
-impl CommandRunner for RecordingRunner {
-    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-        let result = self.inner.run(cmd, args, cwd, label).await;
-
+    fn record_run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, result: &Result<String, String>) {
         let request = ChannelRequest::Command { cmd, args };
         let default = DefaultLabeler.label_for(&request);
         let explicit = explicit_label(label, &default);
-
-        let (stdout, stderr, exit_code) = match &result {
+        let (stdout, stderr, exit_code) = match result {
             Ok(out) => (Some(out.clone()), None, 0),
             Err(err) => (None, Some(err.clone()), 1),
         };
-
         self.session.record(Interaction::Command {
             label: explicit,
             cmd: cmd.to_string(),
@@ -713,7 +718,28 @@ impl CommandRunner for RecordingRunner {
             stderr,
             exit_code,
         });
+    }
+}
 
+#[async_trait]
+impl CommandRunner for RecordingRunner {
+    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+        let result = self.inner.run(cmd, args, cwd, label).await;
+        self.record_run(cmd, args, cwd, label, &result);
+        result
+    }
+
+    async fn run_with_timeout(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+        timeout: std::time::Duration,
+    ) -> Result<String, String> {
+        // Preserve the existing fixture shape: timeout is execution policy, not command input.
+        let result = self.inner.run_with_timeout(cmd, args, cwd, label, timeout).await;
+        self.record_run(cmd, args, cwd, label, &result);
         result
     }
 
