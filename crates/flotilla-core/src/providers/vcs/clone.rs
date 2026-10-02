@@ -183,6 +183,7 @@ impl ReferenceCloneStrategy {
             let dir_path = std::path::Path::new(&dir);
 
             // Require a checkout root; a child of another repository is not a clone.
+            // Keep the explicit gitdir aligned with GitCliBackend::checkout_root.
             let is_git = self
                 .runner
                 .run("git", &["-C", &dir, "--git-dir=.git", "rev-parse", "--is-inside-work-tree"], dir_path, &ChannelLabel::Default)

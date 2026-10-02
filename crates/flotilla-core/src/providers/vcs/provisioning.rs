@@ -39,6 +39,8 @@ impl CloneProvisioner for GitCloneProvisioner {
 
     async fn inspect_clone(&self, target_path: &ExecutionEnvironmentPath) -> Result<CloneInspection, String> {
         let cwd = target_path.as_path();
+        // Keep the explicit gitdir aligned with GitCliBackend::checkout_root:
+        // clone inspection must not discover a repository above this target.
         let default_branch = match self
             .runner
             .run(

@@ -267,6 +267,33 @@ mod git_config_guard_tests {
         assert!(error.contains("nested.git"), "{error}");
     }
 
+    // A missing explicit gitdir must fail in Git without inspecting or executing
+    // an ancestor's unsafe config. Normal discovery still rejects that config.
+    // This runner-boundary scenario complements the generated root-shape coverage.
+    #[tokio::test]
+    async fn missing_explicit_git_dir_does_not_inspect_ancestor_config() {
+        use crate::providers::{ChannelLabel, ProcessCommandRunner};
+
+        let outer = tempfile::tempdir().expect("temporary checkout");
+        git(outer.path(), &["init", "-q"]);
+        let marker = outer.path().join("fsmonitor-ran");
+        git(outer.path(), &["config", "core.fsmonitor", &format!("touch {}", marker.display())]);
+        let child = outer.path().join("not-a-checkout");
+        std::fs::create_dir(&child).expect("create non-repository child");
+        let child = child.to_str().expect("UTF-8 child path");
+        let error = guard_host_git_config("git", &["-C", child, "status"], Path::new("/"))
+            .expect_err("normal discovery must reject unsafe ancestor config");
+        assert!(error.contains("core.fsmonitor"), "{error}");
+
+        let output = ProcessCommandRunner
+            .run_output("git", &["-C", child, "--git-dir=.git", "status"], Path::new("/"), &ChannelLabel::Default)
+            .await
+            .expect("missing explicit gitdir must be reported by Git, not the config guard");
+        assert!(!output.success);
+        assert!(output.stderr.contains("not a git repository"), "{}", output.stderr);
+        assert!(!marker.exists(), "ancestor fsmonitor must never run");
+    }
+
     #[test]
     fn only_leading_global_options_change_git_config_resolution() {
         let cwd = Path::new("/safe/repo");
