@@ -1993,7 +1993,8 @@ impl InProcessDaemon {
             local_node_id.to_string(),
             observation_source.clone(),
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
-        );
+        )
+        .with_origin(host_name.to_string());
         if let Err(error) = change_request_refresher.garbage_collect_orphans().await {
             tracing::warn!(%error, "garbage collect orphaned change request observations at startup failed");
         }

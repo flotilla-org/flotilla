@@ -24,8 +24,8 @@ use flotilla_protocol::{
     ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
     FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness,
     FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListResponse, HostName, HostProvidersResponse,
-    HostStatusResponse, HostSummary, IssueSource, NodeId, PeerConnectionState, ProjectListEntry, ProjectListRepository,
-    ProjectListResponse, Subject, SubjectKind, ViewAddress,
+    HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry, ProjectListRepository, ProjectListResponse, Subject,
+    SubjectKind, ViewAddress,
 };
 use flotilla_resources::{
     bound_change_request_record_name, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves,
@@ -776,20 +776,17 @@ impl ReadProjections<'_> {
             .await
             .map_err(|error| error.to_string())?
             .items;
-        let mut selected_change_requests = BTreeMap::new();
-        for source in &change_request_sources {
-            let name = source.object.metadata.name.clone();
-            let replace = selected_change_requests.get(&name).is_none_or(
-                |existing: &&flotilla_resources::ReadResourceObject<flotilla_resources::ChangeRequest>| {
-                    !matches!(existing.provenance, ResourceProvenance::Local) && matches!(source.provenance, ResourceProvenance::Local)
-                },
-            );
-            if replace {
-                selected_change_requests.insert(name, source);
-            }
-        }
-        let change_request_objects =
-            selected_change_requests.iter().map(|(name, source)| (name.clone(), source.object.clone())).collect::<BTreeMap<_, _>>();
+        let selected_change_requests =
+            flotilla_resources::select_change_requests(change_request_sources.iter().map(|source| &source.object));
+        let change_request_objects = selected_change_requests
+            .values()
+            .map(|object| {
+                (
+                    flotilla_resources::change_request_record_name(&object.spec.service, &object.spec.scope, object.spec.number),
+                    object.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         // Match the shared catalog: any linked landed convoy makes a merged
         // request closed, even when the convoy being explained is still live.
         let landed_subjects = convoy_sources
@@ -799,20 +796,8 @@ impl ReadProjections<'_> {
             .flat_map(|source| convoy_subject_rows(&source.object, &reference_context))
             .map(|row| row.subject)
             .collect::<BTreeSet<_>>();
-        let observations_by_subject = selected_change_requests
-            .values()
-            .map(|source| {
-                let spec = &source.object.spec;
-                (
-                    Subject {
-                        kind: SubjectKind::ChangeRequest,
-                        source: IssueSource { service: spec.service.clone(), scope: spec.scope.clone() },
-                        id: spec.number.to_string(),
-                    },
-                    source.object.status.as_ref(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
+        let observations_by_subject =
+            selected_change_requests.iter().map(|(subject, object)| (subject.clone(), object.status.as_ref())).collect::<BTreeMap<_, _>>();
         let subject_observations = subjects
             .iter()
             .filter(|row| row.subject.kind == SubjectKind::ChangeRequest)
@@ -845,14 +830,23 @@ impl ReadProjections<'_> {
         let change_requests = expected_change_requests
             .iter()
             .map(|record_name| {
-                let selected = selected_change_requests.get(record_name).copied();
-                let observed_at = selected.and_then(|source| source.object.status.as_ref()).map(|status| status.state.observed_at);
+                let selected = change_request_objects.get(record_name);
+                let provenance = selected
+                    .and_then(|object| {
+                        change_request_sources.iter().find(|source| {
+                            source.object.metadata.name == object.metadata.name
+                                && source.object.status == object.status
+                                && source.object.spec.observing_authority == object.spec.observing_authority
+                        })
+                    })
+                    .map(|source| explained_provenance(&source.provenance, self.node_id));
+                let observed_at = selected.and_then(|source| source.status.as_ref()).map(|status| status.state.observed_at);
                 ExplainedChangeRequest {
                     name: record_name.clone(),
                     bound: bound_name.as_ref() == Some(record_name),
                     observed: selected.is_some(),
-                    provenance: selected.map(|source| explained_provenance(&source.provenance, self.node_id)),
-                    fields: selected.and_then(|source| serde_json::to_value(&source.object).ok()),
+                    provenance,
+                    fields: selected.and_then(|source| serde_json::to_value(source).ok()),
                     observed_at: observed_at.map(|at| at.to_rfc3339()),
                     freshness: observed_freshness(observed_at, now, change_request_stale_after),
                     observation_error: observation_errors.get(record_name).cloned(),
@@ -1213,7 +1207,7 @@ fn explain_subject_observation(
 #[cfg(test)]
 mod tests {
     use chrono::{Duration as ChronoDuration, TimeZone};
-    use flotilla_protocol::{qualified_path::HostId, EvidenceFreshness, HostSummary, NodeInfo, Relationship, SystemInfo};
+    use flotilla_protocol::{qualified_path::HostId, EvidenceFreshness, HostSummary, IssueSource, NodeInfo, Relationship, SystemInfo};
     use flotilla_resources::{
         ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ConvoyPhase, ConvoySpec, CrewWorkState, DeclaredSubject,
         DemandKind, DemandSpec, DispatchQueueEntry, FulfilmentKindSpec, HostSpec, InMemoryBackend, InputMeta, Observation,
@@ -1819,6 +1813,32 @@ mod tests {
             }
             requests.update_status(&record.metadata.name, &record.metadata.resource_version, &status).await.expect("status");
         }
+        // #2471: a newer replica under a different name beats an older local
+        // canonical record. Its Unknown checks must not inherit local Pass.
+        let remote = ResourceBackend::InMemory(InMemoryBackend::default());
+        let remote_requests = remote.using::<ChangeRequest>("flotilla");
+        let duplicate = remote_requests
+            .create(
+                &InputMeta::builder().name("aaa-duplicate".into()).build(),
+                &ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("owner/one".into())
+                    .number(42)
+                    .observing_authority("remote".into())
+                    .build(),
+            )
+            .await
+            .expect("duplicate");
+        let mut remote_status = subject_status(now + ChronoDuration::seconds(1));
+        remote_status.state.value = Some(ObservedChangeRequestState::Draft);
+        remote_status.checks.value = None;
+        remote_requests.update_status("aaa-duplicate", &duplicate.metadata.resource_version, &remote_status).await.expect("remote status");
+        fixture
+            .backend
+            .replica_writer::<ChangeRequest>(NodeId::new("remote"), "flotilla")
+            .replace(&remote_requests.list().await.expect("remote list"), now)
+            .await
+            .expect("replicate duplicate");
         let convoys = fixture.backend.using::<ResourceConvoy>("flotilla");
         let landed = convoys
             .create(
@@ -1838,7 +1858,8 @@ mod tests {
         // Subject rows preserve declaration order: one, two, missing. Resource
         // list/map order does not choose these identities or their order.
         assert_eq!(explanation.subject_observations.len(), 3);
-        assert_eq!(explanation.subject_observations[0].state.value.as_deref(), Some("open"));
+        assert_eq!(explanation.subject_observations[0].state.value.as_deref(), Some("draft"));
+        assert_eq!(explanation.subject_observations[0].checks.value, None);
         assert_eq!(explanation.subject_observations[1].state.value.as_deref(), Some("merged"));
         assert_eq!(explanation.subject_observations[2].state.value, None);
         assert_eq!(explanation.subject_observations[1].readiness.value.as_deref(), Some("closed"));

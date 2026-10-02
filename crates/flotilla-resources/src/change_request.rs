@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
+use flotilla_protocol::{IssueSource, Relationship, Subject, SubjectKind};
 use serde::{Deserialize, Serialize};
 
-use crate::{ApiPaths, ReplicationClass, Resource, ResourceError, StatusPatch};
+use crate::{ApiPaths, ReplicationClass, Resource, ResourceError, ResourceObject, StatusPatch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChangeRequest;
@@ -29,6 +32,95 @@ pub struct ChangeRequestSpec {
     pub scope: String,
     pub number: u64,
     pub observing_authority: String,
+    /// Replicated link history, independent of forge observations. Previous-generation
+    /// records have no history; remove the deserialize default after the next roll.
+    #[serde(default)]
+    #[builder(default)]
+    pub subject_of: Vec<ChangeRequestSubjectHistory>,
+}
+
+/// A convoy link retained after the convoy leaves the resource store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct ChangeRequestSubjectHistory {
+    pub namespace: String,
+    pub convoy: String,
+    pub origin: String,
+    pub relationship: Relationship,
+    pub role: String,
+    pub project: Option<String>,
+    pub last_seen: DateTime<Utc>,
+}
+
+pub fn change_request_subject(spec: &ChangeRequestSpec) -> Subject {
+    Subject {
+        kind: SubjectKind::ChangeRequest,
+        source: IssueSource { service: spec.service.clone(), scope: spec.scope.clone() },
+        id: spec.number.to_string(),
+    }
+}
+
+/// Subject identity is service/scope/number, independent of resource name and origin.
+/// Select one whole observation: freshest state timestamp, then authority, canonical
+/// name, namespace/name, and serialized status break ties. Unknown is never filled
+/// from a losing observation. Local and replicated inputs obey the same policy.
+/// History is a union, keeping the last seen timestamp for each convoy/link/role.
+/// Receiving-host resource versions and sync times never participate.
+pub fn select_change_requests<'a>(
+    records: impl IntoIterator<Item = &'a ResourceObject<ChangeRequest>>,
+) -> BTreeMap<Subject, ResourceObject<ChangeRequest>> {
+    let mut selected: BTreeMap<Subject, ResourceObject<ChangeRequest>> = BTreeMap::new();
+    let rank = |record: &ResourceObject<ChangeRequest>| {
+        (
+            record.status.as_ref().map(|status| status.state.observed_at),
+            record.spec.observing_authority.clone(),
+            record.metadata.name == change_request_record_name(&record.spec.service, &record.spec.scope, record.spec.number),
+            record.metadata.namespace.clone(),
+            record.metadata.name.clone(),
+            serde_json::to_string(&record.status).expect("ChangeRequest status serializes"),
+        )
+    };
+    for record in records {
+        let subject = change_request_subject(&record.spec);
+        if let Some(prior) = selected.get_mut(&subject) {
+            let mut history = prior.spec.subject_of.clone();
+            merge_change_request_history(&mut history, &record.spec.subject_of);
+            if rank(record) > rank(prior) {
+                *prior = record.clone();
+            }
+            prior.spec.subject_of = history;
+        } else {
+            let mut record = record.clone();
+            let history = std::mem::take(&mut record.spec.subject_of);
+            merge_change_request_history(&mut record.spec.subject_of, &history);
+            selected.insert(subject, record);
+        }
+    }
+    selected
+}
+
+pub fn merge_change_request_history(history: &mut Vec<ChangeRequestSubjectHistory>, incoming: &[ChangeRequestSubjectHistory]) {
+    let mut merged = BTreeMap::new();
+    for entry in history.iter().chain(incoming) {
+        let key = (
+            entry.namespace.clone(),
+            entry.convoy.clone(),
+            entry.origin.clone(),
+            entry.relationship,
+            entry.role.clone(),
+            entry.project.clone(),
+        );
+        if merged.get(&key).is_none_or(|prior: &&ChangeRequestSubjectHistory| prior.last_seen < entry.last_seen) {
+            merged.insert(key, entry);
+        }
+    }
+    *history = merged.into_values().cloned().collect();
+}
+
+pub fn retain_change_request(record: &ResourceObject<ChangeRequest>) -> bool {
+    record.spec.subject_of.iter().any(|entry| entry.relationship == Relationship::Produces)
+        && !record.status.as_ref().is_some_and(|status| {
+            matches!(status.state.value, Some(ObservedChangeRequestState::Merged | ObservedChangeRequestState::Closed))
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +227,15 @@ pub fn change_request_record_name(service: &str, scope: &str, number: u64) -> St
 mod tests {
     use super::*;
     use crate::{InMemoryBackend, InputMeta, ResourceBackend, SqliteBackend};
+
+    // ADR 0047: a previous-generation spec decodes with no historical links.
+    #[test]
+    fn previous_generation_spec_decodes_without_history() {
+        let spec: ChangeRequestSpec =
+            serde_json::from_str(r#"{"service":"github.com","scope":"org/repo","number":42,"observing_authority":"node"}"#)
+                .expect("previous spec");
+        assert!(spec.subject_of.is_empty());
+    }
 
     #[test]
     fn previous_generation_status_decodes_without_presentation_fields() {

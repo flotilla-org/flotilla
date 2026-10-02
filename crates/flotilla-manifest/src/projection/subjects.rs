@@ -23,9 +23,9 @@ use crate::keys::{
     KEY_ISSUE_TITLE, KEY_ISSUE_TITLE_OBSERVED_AT, KEY_ISSUE_UPDATED_AT, KEY_ISSUE_UPDATED_AT_OBSERVED_AT, KEY_ROLE_ATTEMPTS,
     KEY_ROLE_CREW_SESSIONS, KEY_ROLE_CURRENT_ATTEMPT, KEY_ROLE_DESIRED_STATE, KEY_ROLE_NEXT_ATTEMPT, KEY_ROLE_RESTART_COUNT,
     KEY_ROLE_STATE, KEY_SUBJECT_ADOPTS, KEY_SUBJECT_KIND, KEY_SUBJECT_NUMBER, KEY_SUBJECT_OF, KEY_SUBJECT_OF_ADOPTS,
-    KEY_SUBJECT_OF_PRODUCES, KEY_SUBJECT_OF_REFERENCES, KEY_SUBJECT_OF_SUPERSEDES, KEY_SUBJECT_OF_WORKS_ON, KEY_SUBJECT_PRODUCES,
-    KEY_SUBJECT_REFERENCES, KEY_SUBJECT_REPOSITORY_ALIAS, KEY_SUBJECT_SCOPE, KEY_SUBJECT_SERVICE, KEY_SUBJECT_SUPERSEDES,
-    KEY_SUBJECT_WORKS_ON, SEGMENT_PROJECT,
+    KEY_SUBJECT_OF_PRODUCES, KEY_SUBJECT_OF_REFERENCES, KEY_SUBJECT_OF_SUPERSEDES, KEY_SUBJECT_OF_WORKS_ON, KEY_SUBJECT_ORPHANED,
+    KEY_SUBJECT_PRODUCES, KEY_SUBJECT_REFERENCES, KEY_SUBJECT_REPOSITORY_ALIAS, KEY_SUBJECT_SCOPE, KEY_SUBJECT_SERVICE,
+    KEY_SUBJECT_SUPERSEDES, KEY_SUBJECT_WORKS_ON, SEGMENT_PROJECT,
 };
 
 fn subject_entity(subject: &Subject) -> EntityRef {
@@ -221,6 +221,36 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         catalog.assert_entity(role_ref, facts, None);
     }
 
+    let selected = flotilla_resources::select_change_requests(&observations.change_requests);
+    let present_convoys: BTreeSet<_> = input
+        .convoys
+        .iter()
+        .map(|convoy| entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource)))
+        .collect();
+    let mut orphaned = BTreeSet::new();
+    for (subject, record) in &selected {
+        if !flotilla_resources::retain_change_request(record)
+            || !record.status.as_ref().is_some_and(|status| {
+                matches!(status.state.value, Some(ObservedChangeRequestState::Open | ObservedChangeRequestState::Draft))
+            })
+        {
+            continue;
+        }
+        for history in &record.spec.subject_of {
+            let convoy = entity::convoy(&history.namespace, &history.convoy, &history.origin);
+            if history.relationship == Relationship::Produces && !present_convoys.contains(&convoy) {
+                orphaned.insert(subject.clone());
+            }
+            // Historical links are projected only for actual orphans below.
+        }
+        if orphaned.contains(subject) {
+            for history in &record.spec.subject_of {
+                let convoy = entity::convoy(&history.namespace, &history.convoy, &history.origin);
+                links.entry(subject.clone()).or_default().entry(history.relationship).or_default().insert(convoy);
+            }
+        }
+    }
+
     // Index once per rebuild rather than scanning context/forges for each entity.
     let mut aliases = BTreeMap::new();
     for repo in &observations.references.repositories {
@@ -263,19 +293,17 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         }
         facts
     };
-    for record in &observations.change_requests {
-        let subject = Subject {
-            kind: SubjectKind::ChangeRequest,
-            source: IssueSource { service: record.spec.service.clone(), scope: record.spec.scope.clone() },
-            id: record.spec.number.to_string(),
-        };
+    for (subject, record) in &selected {
         let status = record.status.as_ref();
-        if !links.contains_key(&subject) {
+        if !links.contains_key(subject) {
             continue;
         }
-        let mut facts = identity_facts(&subject);
-        facts.extend(change_request_facts(status, landed.contains(&subject)));
-        assert_subject(catalog, &subject, facts);
+        let mut facts = identity_facts(subject);
+        facts.extend(change_request_facts(status, landed.contains(subject)));
+        if orphaned.contains(subject) {
+            facts.push((KEY_SUBJECT_ORPHANED, MetadataValue::Bool(true)));
+        }
+        assert_subject(catalog, subject, facts);
     }
     for record in &observations.issues {
         let subject = Subject {

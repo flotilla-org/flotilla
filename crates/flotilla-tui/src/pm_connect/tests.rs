@@ -666,7 +666,7 @@ fn connector_skips_malformed_records_without_losing_valid_observations() {
 }
 
 #[test]
-fn connector_orders_replica_observations_by_time_then_origin_root() {
+fn connector_orders_replica_observations_by_time_then_authority() {
     use flotilla_protocol::{NodeId, ResourceRecordProvenance};
     fn observation(root: &str, stamp: &str, status: &str, local: bool) -> flotilla_protocol::ResourceReadEnvelope {
         fn stamps(value: &mut serde_json::Value, stamp: &str) {
@@ -688,6 +688,7 @@ fn connector_orders_replica_observations_by_time_then_origin_root() {
             ResourceRecordProvenance::Replica { origin_root: NodeId::new(root), last_synced_at: "2026-10-02T12:00:00Z".into() }
         };
         let object = record.object.as_mut().expect("object");
+        object["spec"]["observing_authority"] = serde_json::json!(root);
         stamps(&mut object["status"], stamp);
         object["status"]["state"]["value"] = serde_json::json!(status);
         object["metadata"]["resourceVersion"] = serde_json::json!(if local { "999" } else { "1" });
@@ -711,7 +712,7 @@ fn connector_orders_replica_observations_by_time_then_origin_root() {
             assert_eq!(
                 patches.iter().find(|patch| patch.target == target).expect("request").set["flotilla.change_request.state"].value,
                 MetadataValue::text("open"),
-                "same root wins regardless of timestamp spelling and which root is local"
+                "same authority wins regardless of timestamp spelling and which root is local"
             );
             let mut deleted = observation("zeta", "2026-10-02T12:00:00Z", "open", local_zeta);
             deleted.records[0].record_type = flotilla_protocol::ResourceRecordType::Deleted;

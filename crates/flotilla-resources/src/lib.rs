@@ -64,8 +64,9 @@ mod workflow_template;
 pub use artifact::{artifact_record_name, Artifact, ArtifactSpec};
 pub use backend::{ReplicaReadResolver, ReplicaWriter, ResourceBackend, TypedResolver};
 pub use change_request::{
-    change_request_record_name, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus,
-    ChangeRequestStatusPatch, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision,
+    change_request_record_name, change_request_subject, merge_change_request_history, retain_change_request, select_change_requests,
+    ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, ChangeRequestStatusPatch,
+    ChangeRequestSubjectHistory, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision,
 };
 pub use checkout::{
     latch_evidence_backed_integration, ChangeRequestMergeability, ChangeRequestObservation, ChangeRequestState, Checkout,
