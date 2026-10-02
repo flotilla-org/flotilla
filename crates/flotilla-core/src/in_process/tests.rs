@@ -17,6 +17,64 @@ use flotilla_resources::{
 
 use super::*;
 
+#[test]
+fn bound_change_request_identity_uses_matching_declared_or_discovered_subject() {
+    let requested = ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "team/repo".into(), number: 42 };
+    let subject = flotilla_protocol::Subject {
+        kind: flotilla_protocol::SubjectKind::ChangeRequest,
+        source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "team/repo".into() },
+        id: "42".into(),
+    };
+    let spec = ConvoySpec::builder().workflow_ref("review".to_string()).build();
+    let mut status = ConvoyStatus::default();
+    status.discover_subject(
+        subject.clone(),
+        flotilla_protocol::Relationship::Produces,
+        flotilla_resources::SubjectDiscoverySource::Claim,
+        Utc::now(),
+    );
+    status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        exit: None,
+        turn_delivery: Default::default(),
+        stall_nudges: Default::default(),
+        supervision: None,
+        vessels: vec![VesselRequirement::builder()
+            .name("work".to_string())
+            .crew(Vec::new())
+            .credential_refs(BTreeSet::from(["github-crew-pr".to_string()]))
+            .build()],
+    });
+    let mut convoy = ResourceObject::<ResourceConvoy> {
+        metadata: ObjectMeta {
+            name: "review-convoy".to_string(),
+            namespace: "flotilla".to_string(),
+            resource_version: "1".to_string(),
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            owner_references: Vec::new(),
+            finalizers: Vec::new(),
+            deletion_timestamp: None,
+            creation_timestamp: Utc::now(),
+            merge: None,
+        },
+        spec,
+        status: Some(status),
+    };
+    let bound = convoy_change_request_credential_refs(&convoy, &requested).expect("active PR subjects");
+    assert_eq!(bound.numbers, BTreeSet::from([42]));
+    assert_eq!(bound.credentials_by_number[&42], BTreeSet::from(["github-crew-pr".to_string()]));
+    let mut unrelated = requested.clone();
+    unrelated.scope = "team/other".into();
+    assert!(convoy_change_request_credential_refs(&convoy, &unrelated).expect("other scope").numbers.is_empty());
+    convoy.status.as_mut().expect("status").discover_subject(
+        subject,
+        flotilla_protocol::Relationship::Supersedes,
+        flotilla_resources::SubjectDiscoverySource::Operator,
+        Utc::now(),
+    );
+    assert!(convoy_change_request_credential_refs(&convoy, &requested).expect("superseded PR").numbers.is_empty());
+}
+
 #[tokio::test]
 async fn operator_brief_survives_a_racing_nudge_until_delivery() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -5827,6 +5885,7 @@ async fn grant_resolution_scopes_roles_trust_and_permissions_independently_of_is
         .definitions::<CredentialSpec>("flotilla")
         .create(&test_meta("github-app"), &CredentialSpecSpec {
             consumer: CredentialConsumer::GithubApp {
+                actor_login: None,
                 installation_id: Some(1),
                 installation_repository: None,
                 permissions: Some(BTreeMap::from([

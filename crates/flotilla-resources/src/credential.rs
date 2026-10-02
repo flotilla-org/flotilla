@@ -32,6 +32,10 @@ pub struct CredentialSpecSpec {
 pub enum CredentialConsumer {
     Gh,
     GithubApp {
+        /// REST App bot login, including `[bot]`. Old declarations decode without it
+        /// for one fleet generation; update project-map credential manifests in this roll.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor_login: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         installation_id: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -69,6 +73,18 @@ pub enum CredentialConsumer {
 }
 
 impl CredentialConsumer {
+    pub fn github_actor_login(&self) -> Option<&str> {
+        match self {
+            Self::GithubApp { actor_login, .. } => actor_login.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// GraphQL reports an App actor by its slug, without REST's `[bot]` suffix.
+    pub fn github_graphql_actor_login(&self) -> Option<&str> {
+        self.github_actor_login().map(|login| login.strip_suffix("[bot]").unwrap_or(login))
+    }
+
     pub fn adapter_name(&self) -> &'static str {
         match self {
             Self::Gh => "gh",
@@ -345,6 +361,18 @@ mod tests {
         assert_eq!(encoded, r#"{"adapter":"claude-oauth","account_email":"ops@example.com"}"#);
         assert_eq!(consumer.adapter_name(), "claude-oauth");
         assert_eq!(consumer.delivery_slot(), CredentialConsumer::Claude.delivery_slot());
+    }
+
+    #[test]
+    fn github_app_actor_login_decodes_old_declarations_and_configured_identity() {
+        let old: CredentialConsumer =
+            serde_json::from_str(r#"{"adapter":"github-app","installation_id":42}"#).expect("old App declaration");
+        assert_eq!(old.github_actor_login(), None);
+        let configured: CredentialConsumer =
+            serde_json::from_str(r#"{"adapter":"github-app","installation_id":42,"actor_login":"crew-app[bot]"}"#)
+                .expect("configured App declaration");
+        assert_eq!(configured.github_actor_login(), Some("crew-app[bot]"));
+        assert_eq!(configured.github_graphql_actor_login(), Some("crew-app"));
     }
 
     #[test]

@@ -7623,6 +7623,7 @@ mod tests {
             .definitions::<CredentialSpec>(NAMESPACE)
             .create(&empty_meta("github-skills-fork"), &CredentialSpecSpec {
                 consumer: CredentialConsumer::GithubApp {
+                    actor_login: None,
                     installation_id: Some(9876),
                     installation_repository: None,
                     permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),

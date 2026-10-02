@@ -252,7 +252,11 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
     /// The trait default converts only the presentation snapshot. Read the
     /// pull endpoint once per bound number for its author and reviewer facts,
     /// then read the review list to derive the aggregate decision.
-    async fn observe_bound(&self, numbers: &[u64]) -> Result<super::BoundObservations, String> {
+    async fn observe_bound(
+        &self,
+        numbers: &[u64],
+        _crew_logins: &super::CrewGithubLoginsByRequest,
+    ) -> Result<super::BoundObservations, String> {
         let mut statuses = std::collections::HashMap::new();
         for number in numbers {
             let result = match self.execute(reqwest::Method::GET, &format!("pulls/{number}"), &[], None).await {
@@ -557,7 +561,7 @@ mod tests {
             urls: Mutex::new(Vec::new()),
         });
         let provider = provider(http.clone()).with_operator_login("owner".into());
-        let observed = provider.observe_bound(&[7]).await.expect("observe bound request");
+        let observed = provider.observe_bound(&[7], &Default::default()).await.expect("observe bound request");
         let status = observed[&7].as_ref().expect("status");
         assert_eq!(status.title.value.as_deref(), Some("Keep metadata current"));
         assert_eq!(status.review_requested_from_owner.value, Some(true));
@@ -577,7 +581,7 @@ mod tests {
             urls: Mutex::new(Vec::new()),
         });
         let provider = provider(http.clone());
-        let observed = provider.observe_bound(&[7, 8]).await.expect("observe bound requests");
+        let observed = provider.observe_bound(&[7, 8], &Default::default()).await.expect("observe bound requests");
         assert_eq!(observed[&7].as_ref().expect("status").review_decision.value, Some(ObservedReviewDecision::Approved));
         let failed_review = observed[&8].as_ref().expect("status survives review failure");
         assert_eq!(failed_review.title.value.as_deref(), Some("Another PR"));
