@@ -4300,6 +4300,9 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         if let Some(agent_material) = &self.state.agent_material {
             let mut environment = resolved_agent_environment.environment.clone();
             environment.extend(delivered_credential_environment.iter().cloned());
+            if let Some(selection) = spec.env.get("FLOTILLA_RESOLVED_SKILLS") {
+                environment.push(("FLOTILLA_RESOLVED_SKILLS".to_string(), selection.clone()));
+            }
             let mut source_token_files = BTreeMap::new();
             let will_stage_skills =
                 match agent_material.will_stage_skills(&spec.required_agent_adapters, &environment, &*handle.runner()).await {
