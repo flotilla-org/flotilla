@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 
 use clap::Subcommand;
 use flotilla_commands::{complete::CompletionItem, NounCommand, Resolved};
-use flotilla_protocol::{CommandAction, EnvironmentInfo, ViewAddress};
+use flotilla_protocol::{EnvironmentInfo, ViewAddress};
 
 use crate::{app::TuiModel, keymap::Action};
 
@@ -223,43 +223,12 @@ pub fn palette_input_state(input: &str) -> PaletteInputState {
             PaletteInputState::Incomplete
         }
         Ok(PaletteParseResult::Local(_)) => PaletteInputState::Ready,
-        Ok(PaletteParseResult::Resolved(resolved)) if resolved_is_tui_actionable(&resolved) => PaletteInputState::Ready,
+        Ok(PaletteParseResult::Resolved(resolved)) if flotilla_commands::applicability::tui_actionable_resolved(&resolved) => {
+            PaletteInputState::Ready
+        }
         Ok(PaletteParseResult::Resolved(_)) => PaletteInputState::Unavailable,
         Err(_) => PaletteInputState::Incomplete,
     }
-}
-
-fn resolved_is_tui_actionable(resolved: &Resolved) -> bool {
-    let action = match resolved {
-        Resolved::HostQuery { .. } => return false,
-        Resolved::Ready(command) | Resolved::NeedsContext { command, .. } => &command.action,
-    };
-    // These actions produce values consumed by the CLI renderer (or an internal
-    // step), not by the TUI result handler. Keep this list aligned with
-    // `app::executor::handle_result` when a command action is added.
-    !matches!(
-        action,
-        CommandAction::FetchCheckoutStatus { .. }
-            | CommandAction::GenerateBranchName { .. }
-            | CommandAction::QueryIssues { .. }
-            | CommandAction::QueryIssueFetchByIds { .. }
-            | CommandAction::QueryRepoProviders { .. }
-            | CommandAction::QueryHostList { .. }
-            | CommandAction::QueryProjectList { .. }
-            | CommandAction::QueryDispatchQueue { .. }
-            | CommandAction::QueryHostStatus { .. }
-            | CommandAction::QueryHostProviders { .. }
-            | CommandAction::QueryFleetHealth { .. }
-            | CommandAction::QueryFulfilmentList { .. }
-            | CommandAction::QueryFleetList { .. }
-            | CommandAction::QueryCrewList { .. }
-            | CommandAction::QueryFleetReplicaSnapshot { .. }
-            | CommandAction::QueryDaemonLogs { .. }
-            | CommandAction::QueryExplainConvoy { .. }
-            | CommandAction::QueryResourceList { .. }
-            | CommandAction::QueryResourceGet { .. }
-            | CommandAction::ResourceWatch { .. }
-    )
 }
 
 /// A single completion item for the palette dropdown.
@@ -273,8 +242,6 @@ pub struct PaletteCompletion {
 
 /// Nouns that require an active repo context. Hidden on the overview tab.
 const REPO_SCOPED_NOUNS: &[&str] = &["checkout", "cr", "issue", "agent", "workspace"];
-/// These registry nouns only return data consumed by the CLI output renderer.
-const CLI_ONLY_NOUNS: &[&str] = &["dispatch", "fulfilment"];
 
 /// Compute position-aware completions for the palette input.
 ///
@@ -401,7 +368,7 @@ fn root_completions(partial: &str, has_repo_context: bool, is_available: &impl F
     // Noun names and aliases from the clap tree.
     let tmp = <NounCommand as Subcommand>::augment_subcommands(clap::Command::new("tmp"));
     for sub in tmp.get_subcommands() {
-        if sub.is_hide_set() || CLI_ONLY_NOUNS.contains(&sub.get_name()) {
+        if sub.is_hide_set() || !flotilla_commands::applicability::tui_actionable_noun(sub.get_name()) {
             continue;
         }
         let name = sub.get_name();
@@ -1176,6 +1143,15 @@ mod tests {
         assert_eq!(palette_input_state("repo example providers"), PaletteInputState::Unavailable);
         assert_eq!(palette_input_state("dispatch queue"), PaletteInputState::Unavailable);
         assert_eq!(palette_input_state("fulfilment list"), PaletteInputState::Unavailable);
+    }
+
+    #[test]
+    fn typed_query_actions_follow_the_same_palette_applicability_contract() {
+        use flotilla_commands::applicability::tui_actionable_action;
+
+        assert!(!tui_actionable_action(&CommandAction::QueryFleetReplicaSnapshot {}));
+        assert!(!tui_actionable_action(&CommandAction::QueryProjectList {}));
+        assert!(tui_actionable_action(&CommandAction::Refresh { repo: None }));
     }
 
     #[test]

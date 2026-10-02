@@ -159,7 +159,8 @@ pub struct KeysConfig {
     pub convoys: HashMap<String, String>,
     #[serde(default)]
     pub project: HashMap<String, String>,
-    #[serde(default)]
+    /// Retired TUI binding section. Deserialize one generation of stored config; remove after the next fleet roll.
+    #[serde(default, skip_serializing)]
     pub convoy_vessels: HashMap<String, String>,
     #[serde(default)]
     pub action_menu: HashMap<String, String>,

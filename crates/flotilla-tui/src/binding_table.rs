@@ -34,10 +34,6 @@ pub enum BindingModeId {
     Project,
     /// Capabilities present only on demand-backed table families.
     DemandTable,
-    /// Inner focus on the Convoys tab — the vessel tree on the right pane.
-    /// Composed with `TabPage`. `j/k` navigate vessels; `esc` returns to the
-    /// convoy list; `x` opens the palette pre-filled to complete the work.
-    ConvoyVessels,
     Help,
     ActionMenu,
     DeleteConfirm,
@@ -164,16 +160,6 @@ pub static BINDINGS: &[Binding] = &[
     b(BindingModeId::Project, "S-tab", Action::PrevPanel),
     b(BindingModeId::Project, "backtab", Action::PrevPanel),
     b(BindingModeId::Project, "S-backtab", Action::PrevPanel),
-    // Legacy mode retained only so existing user keybinding files still parse
-    // while the table slices land; no View selects it after #733.
-    // j/k/up/down come from Shared. h/left/esc mirror the vim and arrow navigation used to
-    // enter the vessel tree; the app dispatches Dismiss in Vessels focus to return to the list.
-    b(BindingModeId::ConvoyVessels, "h", Action::Dismiss),
-    b(BindingModeId::ConvoyVessels, "left", Action::Dismiss),
-    hk(BindingModeId::ConvoyVessels, "esc", "ESC", Action::Dismiss, "List"),
-    h(BindingModeId::ConvoyVessels, "x", Action::CompleteConvoyWork, "Complete"),
-    h(BindingModeId::ConvoyVessels, "a", Action::AttachConvoyVessel, "Attach"),
-    h(BindingModeId::ConvoyVessels, "r", Action::Refresh, "Refresh"),
     // ── Overview (replaces old Config) ──
     h(BindingModeId::Overview, "j", Action::SelectNext, "Down"),
     h(BindingModeId::Overview, "k", Action::SelectPrev, "Up"),

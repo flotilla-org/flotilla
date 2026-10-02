@@ -4,10 +4,8 @@
 //! active index, pinning policy, and the mapping to/from the persisted
 //! `open-views.toml` entries. It knows nothing about rendering or data.
 
-use std::collections::HashMap;
-
 use flotilla_core::config::OpenViewEntry;
-use flotilla_protocol::{QueryId, RepoIdentity, RepositoryKey, ViewAddress};
+use flotilla_protocol::{QueryId, RepoIdentity, ViewAddress};
 use serde::{Deserialize, Serialize};
 
 use crate::table_view::{AuthoritativeRowUpdate, PendingRowContext, ProjectPanelKind, ProjectTableState, TableState};
@@ -261,27 +259,14 @@ impl OpenViews {
         Self { views, active: 0, last_active: None, mode: TabSetMode::Tabbed }
     }
 
-    /// The default set for a config with no `open-views.toml`.
-    pub fn seed(repos: impl IntoIterator<Item = RepoIdentity>) -> Self {
-        Self::seed_with_keys(repos.into_iter().map(|identity| (identity, None)))
-    }
-
-    pub fn seed_with_keys(repos: impl IntoIterator<Item = (RepoIdentity, Option<RepositoryKey>)>) -> Self {
-        Self::seed_with_landing(repos, None)
-    }
-
     /// Build the fresh-config tab set, adding a composite landing View when
     /// one was resolved.
-    pub fn seed_with_landing(
-        repos: impl IntoIterator<Item = (RepoIdentity, Option<RepositoryKey>)>,
-        landing: Option<(RepoIdentity, ViewAddress)>,
-    ) -> Self {
+    pub fn seed_with_landing(landing: Option<(RepoIdentity, ViewAddress)>) -> Self {
         let mut entries = vec![OpenViewEntry { address: ViewAddress::Overview.to_string(), label: None, history: vec![] }, OpenViewEntry {
             address: ViewAddress::Convoys { namespace: "flotilla".to_string(), scope: None }.to_string(),
             label: None,
             history: vec![],
         }];
-        let _ = repos.into_iter().count();
         if let Some((_, address)) = &landing {
             if !matches!(address, ViewAddress::Repo { .. }) {
                 entries.push(OpenViewEntry { address: address.to_string(), label: None, history: vec![] });
@@ -290,15 +275,6 @@ impl OpenViews {
         let mut views = Self::from_entries(entries);
         views.active = landing.as_ref().and_then(|(_, address)| views.find(address)).unwrap_or_else(|| views.views.len() - 1);
         views
-    }
-
-    pub fn bind_repository_keys(&mut self, keys: &HashMap<RepoIdentity, RepositoryKey>) {
-        for view in &mut self.views {
-            bind_repository_key(&mut view.target, keys);
-            for frame in &mut view.history {
-                bind_repository_key(&mut frame.target, keys);
-            }
-        }
     }
 
     /// A single-View set for scoped mode (`flotilla view <address>`): no
@@ -471,14 +447,6 @@ impl OpenViews {
         self.active().address()
     }
 
-    /// The repo identity of the active tab, when it is a repo view.
-    pub fn active_repo_identity(&self) -> Option<&RepoIdentity> {
-        match self.active_address() {
-            Some(ViewAddress::Repo { identity, .. }) => Some(identity),
-            _ => None,
-        }
-    }
-
     pub fn find(&self, address: &ViewAddress) -> Option<usize> {
         self.views.iter().position(|view| view.address() == Some(address))
     }
@@ -585,13 +553,6 @@ impl OpenViews {
     }
 }
 
-fn bind_repository_key(target: &mut ViewTarget, keys: &HashMap<RepoIdentity, RepositoryKey>) {
-    let ViewTarget::View(ViewAddress::Repo { identity, repository_key }) = target else { return };
-    if repository_key.is_none() {
-        *repository_key = keys.get(identity).cloned();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use flotilla_protocol::QueryScope;
@@ -656,8 +617,7 @@ mod tests {
 
     #[test]
     fn seed_matches_the_pre_view_tab_bar() {
-        let repo = RepoIdentity { authority: "github.com".to_string(), path: "o/r".to_string() };
-        let views = OpenViews::seed(vec![repo]);
+        let views = OpenViews::seed_with_landing(None);
         let addresses: Vec<String> = views.iter().map(|view| view.address().expect("parsed").to_string()).collect();
         assert_eq!(addresses, vec!["overview", "convoys/flotilla"]);
         assert_eq!(views.active_index(), 1, "seed lands on the convoy tab");
@@ -666,10 +626,8 @@ mod tests {
     #[test]
     fn fresh_project_landing_adds_only_the_project_view() {
         let selected = RepoIdentity { authority: "github.com".to_string(), path: "o/selected".to_string() };
-        let other = RepoIdentity { authority: "github.com".to_string(), path: "o/other".to_string() };
         let project = addr("project/flotilla/selected");
-        let views =
-            OpenViews::seed_with_landing(vec![(other.clone(), None), (selected.clone(), None)], Some((selected.clone(), project.clone())));
+        let views = OpenViews::seed_with_landing(Some((selected.clone(), project.clone())));
 
         let addresses = views.iter().map(|view| view.address().expect("parsed").to_string()).collect::<Vec<_>>();
         assert_eq!(addresses, vec!["overview", "convoys/flotilla", "project/flotilla/selected"]);
@@ -680,7 +638,7 @@ mod tests {
     #[test]
     fn explicit_repo_address_is_not_openable_after_project_landing() {
         let repo = RepoIdentity { authority: "github.com".to_string(), path: "o/r".to_string() };
-        let mut views = OpenViews::seed_with_landing(vec![(repo.clone(), None)], Some((repo.clone(), addr("project/flotilla/r"))));
+        let mut views = OpenViews::seed_with_landing(Some((repo.clone(), addr("project/flotilla/r"))));
 
         assert!(!views.open_or_focus(ViewAddress::repo(repo)));
         assert_eq!(views.active_address(), Some(&addr("project/flotilla/r")));
@@ -766,7 +724,7 @@ mod tests {
     fn retired_repo_addresses_are_not_restored() {
         let views = OpenViews::from_entries(vec![entry("overview"), entry("repo/github.com/o/r")]);
         assert_eq!(views.len(), 1);
-        assert_eq!(views.active_repo_identity(), None);
+        assert!(views.iter().all(|view| !matches!(view.address(), Some(ViewAddress::Repo { .. }))));
     }
 
     #[test]

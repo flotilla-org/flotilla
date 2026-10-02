@@ -30,6 +30,8 @@ pub(crate) struct StubDaemon {
     #[builder(default = Mutex::new(None), with = |result: Result<CommandValue, String>| Mutex::new(Some(result)))]
     query_result: Mutex<Option<Result<CommandValue, String>>>,
     query_gate: Option<Arc<Semaphore>>,
+    #[builder(default)]
+    query_panics: bool,
     #[builder(default = Mutex::new(Ok(vec![])), with = |result: Result<Vec<DaemonEvent>, String>| Mutex::new(result))]
     pub(crate) subscribe_result: Mutex<Result<Vec<DaemonEvent>, String>>,
     #[builder(default = Arc::new(AtomicUsize::new(0)))]
@@ -97,6 +99,7 @@ impl DaemonHandle for StubDaemon {
 
     async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {
         self.query_calls.lock().expect("query calls lock").push((command, session_id));
+        assert!(!self.query_panics, "simulated project query panic");
         if let Some(gate) = &self.query_gate {
             gate.acquire().await.expect("query gate should remain open").forget();
         }
@@ -233,7 +236,7 @@ impl TestWidgetHarness {
     /// Make the overview the active tab (the old `is_config = true`).
     pub fn activate_overview(&mut self) {
         self.views.switch_to(0);
-        self.model.active_repo = self.views.active_repo_identity().cloned();
+        self.model.active_repo = None;
     }
 
     pub fn ctx(&mut self) -> WidgetContext<'_> {
@@ -260,7 +263,26 @@ mod tests {
     use flotilla_protocol::{CommandAction, CommandValue, ProjectListResponse};
 
     use super::*;
-    use crate::app::ProjectAddressState;
+    use crate::app::{ProjectAddressState, ProviderStatus};
+
+    #[test]
+    fn provider_health_remains_visible_after_daemon_reconnect() {
+        let mut repo = repo_info("/tmp/repo", "repo", RepoLabels::default());
+        repo.provider_names.insert("vcs".into(), vec!["git".into()]);
+        repo.provider_health.insert("vcs".into(), HashMap::from([("git".into(), false)]));
+        let identity = repo.identity.clone();
+        let mut app = stub_app_with_repo_infos(vec![repo.clone()]);
+        assert_eq!(app.model.provider_status(&identity, "vcs", "git"), Some(ProviderStatus::Error));
+
+        app.reconnect_daemon(Arc::new(StubDaemon::new()), vec![repo]);
+        assert_eq!(app.model.provider_status(&identity, "vcs", "git"), Some(ProviderStatus::Error));
+
+        let mut updated = repo_info("/tmp/repo", "repo", RepoLabels::default());
+        updated.provider_names.insert("vcs".into(), vec!["git".into()]);
+        updated.provider_health.insert("vcs".into(), HashMap::from([("git".into(), true)]));
+        app.reconnect_daemon(Arc::new(StubDaemon::new()), vec![updated]);
+        assert_eq!(app.model.provider_status(&identity, "vcs", "git"), Some(ProviderStatus::Ok));
+    }
 
     #[test]
     fn project_addresses_load_once_and_fill_the_palette_cache() {

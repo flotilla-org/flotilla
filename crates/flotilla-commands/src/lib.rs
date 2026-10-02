@@ -1,3 +1,4 @@
+pub mod applicability;
 pub mod commands;
 pub mod complete;
 pub mod noun;

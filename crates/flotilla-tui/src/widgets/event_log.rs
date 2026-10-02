@@ -273,7 +273,7 @@ fn render_global_status(model: &TuiModel, theme: &Theme, frame: &mut Frame, area
             if let Some(pnames) = rm.provider_names.get(key) {
                 let entries = by_category.entry(key).or_default();
                 for pname in pnames {
-                    let status = model.provider_statuses.get(&(repo_identity.clone(), key.to_string(), pname.clone())).copied();
+                    let status = model.provider_status(repo_identity, key, pname);
                     if let Some(existing) = entries.iter_mut().find(|e| e.name == *pname) {
                         existing.status = worse_status(existing.status, status);
                     } else {
