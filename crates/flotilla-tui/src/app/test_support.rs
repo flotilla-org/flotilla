@@ -30,6 +30,8 @@ pub(crate) struct StubDaemon {
     #[builder(default = Mutex::new(None), with = |result: Result<CommandValue, String>| Mutex::new(Some(result)))]
     query_result: Mutex<Option<Result<CommandValue, String>>>,
     query_gate: Option<Arc<Semaphore>>,
+    #[builder(default)]
+    query_panics: bool,
     #[builder(default = Mutex::new(Ok(vec![])), with = |result: Result<Vec<DaemonEvent>, String>| Mutex::new(result))]
     pub(crate) subscribe_result: Mutex<Result<Vec<DaemonEvent>, String>>,
     #[builder(default = Arc::new(AtomicUsize::new(0)))]
@@ -97,6 +99,7 @@ impl DaemonHandle for StubDaemon {
 
     async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {
         self.query_calls.lock().expect("query calls lock").push((command, session_id));
+        assert!(!self.query_panics, "simulated project query panic");
         if let Some(gate) = &self.query_gate {
             gate.acquire().await.expect("query gate should remain open").forget();
         }

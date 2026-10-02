@@ -23,7 +23,9 @@ pub fn dispatch(cmd: Command, app: &mut App, pending_ctx: Option<PendingActionCo
         let daemon = app.daemon.clone();
         let session_id = app.session_id;
         tokio::spawn(async move {
-            let result = daemon.execute_query(cmd, session_id).await;
+            let result = tokio::spawn(async move { daemon.execute_query(cmd, session_id).await })
+                .await
+                .unwrap_or_else(|error| Err(format!("Project list query task exited: {error}")));
             let _ = event_tx.send(Event::ProjectAddressesLoaded { session_id, result });
         });
         return;
@@ -276,6 +278,31 @@ mod tests {
 
     fn dispatch_channels() -> (mpsc::UnboundedSender<Event>, mpsc::UnboundedReceiver<Event>) {
         mpsc::unbounded_channel()
+    }
+
+    #[tokio::test]
+    async fn project_address_query_panic_recovers_first_load_and_refresh() {
+        for cached in [None, Some("project/flotilla/roadmap".parse::<ViewAddress>().expect("project address"))] {
+            let daemon = Arc::new(StubDaemon::builder().query_panics(true).build());
+            let mut app = stub_app_with_daemon(daemon, vec![]);
+            if let Some(address) = &cached {
+                app.model.project_address_state = super::super::ProjectAddressState::Loaded(vec![address.clone()]);
+            }
+            app.process_app_actions(vec![crate::widgets::AppAction::LoadProjectAddresses]);
+            let (command, _) = app.proto_commands.take_next().expect("project query");
+            let (event_tx, mut event_rx) = dispatch_channels();
+            dispatch(command, &mut app, None, event_tx);
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+                .await
+                .expect("query completion should be observed")
+                .expect("completion event");
+            let Event::ProjectAddressesLoaded { session_id, result } = event else { panic!("expected project completion") };
+            app.handle_project_addresses_loaded(session_id, result);
+            match cached {
+                None => assert_eq!(app.model.project_address_state, super::super::ProjectAddressState::Failed),
+                Some(address) => assert_eq!(app.model.project_address_state, super::super::ProjectAddressState::Loaded(vec![address])),
+            }
+        }
     }
 
     #[tokio::test]
