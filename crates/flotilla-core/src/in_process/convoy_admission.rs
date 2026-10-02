@@ -6,6 +6,14 @@ use crate::{
     providers::discovery::detectors::git::remote_assertion,
 };
 
+/// Routing uses replicated observations as hints; only admission may refuse on
+/// destination-owned facts, credentials, or the installed skill catalog.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlacementPurpose {
+    Routing,
+    Admission,
+}
+
 #[derive(bon::Builder)]
 pub(super) struct ConvoyCreateAdmission<'a> {
     namespace: &'a str,
@@ -473,6 +481,60 @@ impl ConvoyAdmission {
         })
     }
 
+    pub(super) async fn start_placement_host(
+        &self,
+        namespace: &str,
+        intent: &flotilla_protocol::ConvoyStartIntent,
+    ) -> Result<Option<flotilla_protocol::qualified_path::HostId>, String> {
+        let (namespace, intent) = normalize_convoy_start_intent(namespace, intent)?;
+        let project_ref = &intent.project_ref;
+        let placement = if intent.placement_policy.is_some() {
+            self.decide_capability_placement(
+                &namespace,
+                project_ref,
+                &[],
+                &WorkflowTemplateSpec::builder().build(),
+                &BTreeSet::new(),
+                &intent,
+                PlacementPurpose::Routing,
+            )
+            .await?
+            .0
+        } else {
+            let project = self
+                .backend
+                .including_replicas::<Project>(&namespace)
+                .get(project_ref)
+                .await
+                .map_err(|error| project_not_ready_error(&namespace, project_ref, error))?
+                .object;
+            let repositories = self.snapshot_project_repositories(&namespace, project_ref, None).await?;
+            let (_, mut workflow) = self
+                .load_placement_workflow(&namespace, project_ref, &project.spec, &repositories, &intent, PlacementPurpose::Routing)
+                .await?;
+            let mut roles = expand_allocation_roles(&mut workflow, &project.spec)?;
+            let mut issues = Vec::new();
+            for selector in &intent.issues {
+                issues.push(self.resolve_convoy_issue(&namespace, &project, selector).await?);
+            }
+            self.compose_placement_needs(&namespace, &project.spec, &issues, &intent, &mut workflow, PlacementPurpose::Routing).await?;
+            for (role, vessel) in roles.iter_mut().zip(&workflow.vessels) {
+                role.crew = vessel.crew[0].clone();
+            }
+            allocate_roles(&mut workflow, &roles)?;
+            self.decide_vessel_placements(&namespace, project_ref, &repositories, &mut workflow, &intent, PlacementPurpose::Routing)
+                .await?
+                .0
+        };
+        let Some(policy) = placement.selected else {
+            return Ok(None);
+        };
+        let target = placement_target_host(&self.backend, &namespace, &policy).await?;
+        let actuator = placement_actuator_host_ref(&self.backend, &namespace, &target).await?;
+        Ok((self.canonical_local_host_id().as_ref() != Some(&actuator))
+            .then(|| flotilla_protocol::qualified_path::HostId::new(actuator.as_str())))
+    }
+
     pub(super) async fn prepare_convoy_admission(
         &self,
         namespace: &str,
@@ -489,6 +551,18 @@ impl ConvoyAdmission {
         project: &ProjectSpec,
         repositories: &[ConvoyRepositorySpec],
         intent: &flotilla_protocol::ConvoyStartIntent,
+    ) -> Result<(String, WorkflowTemplateSpec), String> {
+        self.load_placement_workflow(namespace, project_ref, project, repositories, intent, PlacementPurpose::Admission).await
+    }
+
+    async fn load_placement_workflow(
+        &self,
+        namespace: &str,
+        project_ref: &str,
+        project: &ProjectSpec,
+        repositories: &[ConvoyRepositorySpec],
+        intent: &flotilla_protocol::ConvoyStartIntent,
+        purpose: PlacementPurpose,
     ) -> Result<(String, WorkflowTemplateSpec), String> {
         let workflow_ref = match intent.workflow_ref.as_deref() {
             Some(workflow_ref) => required_admission_value(workflow_ref, "workflow")?.to_string(),
@@ -509,8 +583,10 @@ impl ConvoyAdmission {
             return Err(format!("workflow template {workflow_ref} is materialized by another project"));
         }
         apply_agent_overrides(&mut workflow.spec, &intent.agent_overrides)?;
-        self.resolve_convoy_skills(namespace, project, intent, &mut workflow.spec).await?;
-        validate_fork_workflow_admission(&self.backend, namespace, repositories, &workflow_ref, &workflow.spec).await?;
+        if purpose == PlacementPurpose::Admission {
+            self.resolve_convoy_skills(namespace, project, intent, &mut workflow.spec).await?;
+            validate_fork_workflow_admission(&self.backend, namespace, repositories, &workflow_ref, &workflow.spec).await?;
+        }
         Ok((workflow_ref, workflow.spec))
     }
 
@@ -521,6 +597,18 @@ impl ConvoyAdmission {
         issues: &[ConvoyIssue],
         intent: &flotilla_protocol::ConvoyStartIntent,
         workflow: &mut WorkflowTemplateSpec,
+    ) -> Result<BTreeSet<CapabilityNeed>, String> {
+        self.compose_placement_needs(namespace, project, issues, intent, workflow, PlacementPurpose::Admission).await
+    }
+
+    async fn compose_placement_needs(
+        &self,
+        namespace: &str,
+        project: &ProjectSpec,
+        issues: &[ConvoyIssue],
+        intent: &flotilla_protocol::ConvoyStartIntent,
+        workflow: &mut WorkflowTemplateSpec,
+        purpose: PlacementPurpose,
     ) -> Result<BTreeSet<CapabilityNeed>, String> {
         let mut common = BTreeSet::new();
         for issue in issues {
@@ -543,6 +631,10 @@ impl ConvoyAdmission {
                     crew.needs.extend(standing.iter().filter(|need| **need != CapabilityNeed::matrix_placeholder()).cloned());
                 }
                 if let CrewSource::Agent { selector, .. } = &crew.source {
+                    if purpose == PlacementPurpose::Routing {
+                        vessel_needs.extend(crew.needs.iter().cloned());
+                        continue;
+                    }
                     if let (Some(adapter), Some(model)) = (&selector.adapter, &selector.model) {
                         // Only an explicit rejection refuses. Model acceptance is often
                         // unobservable (credential-less probe containers, harnesses with
@@ -601,6 +693,7 @@ impl ConvoyAdmission {
         Ok(union)
     }
 
+    #[cfg(test)]
     pub(super) async fn resolve_capability_placement(
         &self,
         namespace: &str,
@@ -610,17 +703,39 @@ impl ConvoyAdmission {
         needs: &BTreeSet<CapabilityNeed>,
         intent: &flotilla_protocol::ConvoyStartIntent,
     ) -> Result<(PlacementResolution, Vec<String>), String> {
+        self.decide_capability_placement(namespace, project_ref, repositories, workflow, needs, intent, PlacementPurpose::Admission).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn decide_capability_placement(
+        &self,
+        namespace: &str,
+        project_ref: &str,
+        repositories: &[ConvoyRepositorySpec],
+        workflow: &WorkflowTemplateSpec,
+        needs: &BTreeSet<CapabilityNeed>,
+        intent: &flotilla_protocol::ConvoyStartIntent,
+        purpose: PlacementPurpose,
+    ) -> Result<(PlacementResolution, Vec<String>), String> {
+        if purpose == PlacementPurpose::Routing && intent.placement_policy.is_some() {
+            return self
+                .decide_placement(namespace, Some(project_ref), repositories, workflow, intent.placement_policy.as_deref(), true, purpose)
+                .await
+                .map(|placement| (placement, Vec::new()));
+        }
         let pin = intent.placement_policy.as_deref();
         let escalation_reason = intent.escalation_reason.as_deref();
         let kinds = home_copy_wins_by_name(
             self.backend.including_replicas::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?.items,
         );
         if kinds.is_empty() {
-            if let Some(need) = needs.iter().next() {
-                return Err(format!("no fulfilment kind covers role need `{need}`"));
+            if purpose == PlacementPurpose::Admission {
+                if let Some(need) = needs.iter().next() {
+                    return Err(format!("no fulfilment kind covers role need `{need}`"));
+                }
             }
             return self
-                .resolve_convoy_placement(namespace, Some(project_ref), repositories, workflow, pin, false)
+                .decide_placement(namespace, Some(project_ref), repositories, workflow, pin, false, purpose)
                 .await
                 .map(|placement| (placement, Vec::new()));
         }
@@ -663,7 +778,8 @@ impl ConvoyAdmission {
                 ));
                 continue;
             }
-            if facts.is_none()
+            if purpose == PlacementPurpose::Admission
+                && facts.is_none()
                 && needs
                     .iter()
                     .any(|need| matches!(need, CapabilityNeed::GuiSession | CapabilityNeed::Toolchain(_) | CapabilityNeed::Harness { .. }))
@@ -672,7 +788,7 @@ impl ConvoyAdmission {
                 continue;
             }
             let missing = needs.iter().filter(|need| !need.covered_by(&kind.spec.grants, facts)).collect::<Vec<_>>();
-            if !missing.is_empty() {
+            if purpose == PlacementPurpose::Admission && !missing.is_empty() {
                 rejected.push(format!(
                     "{}: uncovered {}",
                     kind.metadata.name,
@@ -680,7 +796,9 @@ impl ConvoyAdmission {
                 ));
                 continue;
             }
-            match self.resolve_convoy_placement(namespace, Some(project_ref), repositories, workflow, Some(&kind.metadata.name), true).await
+            match self
+                .decide_placement(namespace, Some(project_ref), repositories, workflow, Some(&kind.metadata.name), true, purpose)
+                .await
             {
                 Ok(placement) => {
                     let policy = placement.selected.as_ref().expect("pinned placement has a policy");
@@ -715,12 +833,17 @@ impl ConvoyAdmission {
                     // A sleeping host may queue work for its wake-up time. A host
                     // that is simply not ready cannot be admitted, even when it
                     // is the only fulfilment that covers the requested needs.
-                    if let Some(reason) = unready_placement_refusal(
-                        &policy.metadata.name,
-                        &kind.spec.host_ref,
-                        host.and_then(|host| host.status.as_ref()),
-                        self.clock.now(),
-                    ) {
+                    if let Some(reason) = (purpose == PlacementPurpose::Admission)
+                        .then(|| {
+                            unready_placement_refusal(
+                                &policy.metadata.name,
+                                &kind.spec.host_ref,
+                                host.and_then(|host| host.status.as_ref()),
+                                self.clock.now(),
+                            )
+                        })
+                        .flatten()
+                    {
                         rejected.push(format!("{}: {reason}", kind.metadata.name));
                         continue;
                     }
@@ -788,13 +911,20 @@ impl ConvoyAdmission {
                 .collect(),
         };
         let mut selected = candidates.remove(index);
-        if selected_reserved && has_unreserved && escalation_reason.is_none_or(|reason| reason.trim().is_empty()) {
+        if purpose == PlacementPurpose::Admission
+            && selected_reserved
+            && has_unreserved
+            && escalation_reason.is_none_or(|reason| reason.trim().is_empty())
+        {
             return Err(format!(
                 "fulfilment `{}` reserves scarce platform capacity; supply --escalation-reason to pin it for work without a platform need",
                 selected.kind.metadata.name
             ));
         }
-        if !minimal.contains(&selected.kind.metadata.name) && escalation_reason.is_none_or(|reason| reason.trim().is_empty()) {
+        if purpose == PlacementPurpose::Admission
+            && !minimal.contains(&selected.kind.metadata.name)
+            && escalation_reason.is_none_or(|reason| reason.trim().is_empty())
+        {
             return Err(format!(
                 "fulfilment `{}` exceeds minimal alternatives {}; supply --escalation-reason",
                 selected.kind.metadata.name,
@@ -814,6 +944,149 @@ impl ConvoyAdmission {
         }
         selected.placement.allocation = Some(allocation);
         Ok((selected.placement, alternatives))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn decide_vessel_placements(
+        &self,
+        namespace: &str,
+        project_ref: &str,
+        repositories: &[ConvoyRepositorySpec],
+        workflow: &mut WorkflowTemplateSpec,
+        intent: &flotilla_protocol::ConvoyStartIntent,
+        purpose: PlacementPurpose,
+    ) -> Result<(PlacementResolution, Vec<String>, BTreeMap<String, (PlacementPolicySpec, PlacementDecision)>), String> {
+        let mut vessel_placements = BTreeMap::new();
+        let has_kinds =
+            !self.backend.including_replicas::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?.items.is_empty();
+        let (placement, minimal_alternatives) = if has_kinds && !workflow.vessels.is_empty() {
+            let mut first = None;
+            let mut index = 0;
+            while index < workflow.vessels.len() {
+                let vessel = workflow.vessels[index].clone();
+                let needs = vessel.crew.iter().flat_map(|crew| crew.needs.iter().cloned()).collect::<BTreeSet<_>>();
+                let mut one = WorkflowTemplateSpec { vessels: vec![vessel.clone()], ..workflow.clone() };
+                let (resolution, alternatives) =
+                    match self.decide_capability_placement(namespace, project_ref, repositories, &one, &needs, intent, purpose).await {
+                        Ok(result) => result,
+                        Err(error) if vessel.crew.len() > 1 => {
+                            let split = vessel
+                                .crew
+                                .iter()
+                                .map(|crew| VesselRequirement {
+                                    name: format!("{}[{}]", vessel.name, crew.role),
+                                    crew: vec![crew.clone()],
+                                    ..vessel.clone()
+                                })
+                                .collect::<Vec<_>>();
+                            let split_names = split.iter().map(|part| part.name.clone()).collect::<Vec<_>>();
+                            for other in &mut workflow.vessels {
+                                if other.depends_on.iter().any(|dependency| dependency == &vessel.name) {
+                                    other.depends_on.retain(|dependency| dependency != &vessel.name);
+                                    other.depends_on.extend(split_names.iter().cloned());
+                                }
+                            }
+                            for rule in workflow.turn_delivery.values_mut() {
+                                if rule.to.vessel == vessel.name {
+                                    if let Some(part) = split.iter().find(|part| part.crew[0].role == rule.to.role) {
+                                        rule.to.vessel = part.name.clone();
+                                    }
+                                }
+                            }
+                            for part in &split {
+                                if let Some(policy) = workflow.stall_nudges.shift_remove(&format!("{}/{}", vessel.name, part.crew[0].role))
+                                {
+                                    workflow.stall_nudges.insert(format!("{}/{}", part.name, part.crew[0].role), policy);
+                                }
+                            }
+                            if let Some(targets) = &mut workflow.supervision {
+                                for target in targets {
+                                    if let SupervisionTarget::ConvoyCrew { vessel: target_vessel, role } = target {
+                                        if *target_vessel == vessel.name {
+                                            if let Some(part) = split.iter().find(|part| part.crew[0].role == *role) {
+                                                *target_vessel = part.name.clone();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            workflow.vessels.splice(index..=index, split.clone());
+                            workflow.allocation.retain(|decision| decision.vessel != vessel.name);
+                            workflow.allocation.extend(split.iter().map(|part| AllocationDecision {
+                                vessel: part.name.clone(),
+                                roles: vec![part.crew[0].role.clone()],
+                                reason: format!("split after placement could not cover union: {error}"),
+                                crossed_handoffs: Vec::new(),
+                            }));
+                            continue;
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "no fulfilment covers role `{}` need {}: {error}",
+                                vessel.crew[0].role,
+                                needs.iter().map(ToString::to_string).collect::<Vec<_>>().join(" + ")
+                            ));
+                        }
+                    };
+                if purpose == PlacementPurpose::Admission {
+                    resolve_and_validate_workflow_credentials_for_capability_admission(
+                        &self.backend,
+                        namespace,
+                        Some(project_ref),
+                        repositories,
+                        resolution.selected.as_ref(),
+                        &mut one,
+                    )
+                    .await?;
+                }
+                workflow.vessels[index] = one.vessels.remove(0);
+                if let Some(selected) = resolution.selected.as_ref() {
+                    let decision = PlacementDecision {
+                        minimal_alternatives: alternatives.clone(),
+                        escalation_reason: intent.escalation_reason.clone(),
+                        policy_name: selected.metadata.name.clone(),
+                        target_host: placement_target_host(&self.backend, namespace, selected).await?,
+                        refused_candidates: resolution.refused_candidates.clone(),
+                        viable_not_selected: resolution.viable_not_selected.clone(),
+                        allocation: resolution.allocation.clone(),
+                    };
+                    vessel_placements.insert(vessel.name.clone(), (selected.spec.clone(), decision));
+                }
+                if first.is_none() {
+                    first = Some((resolution, alternatives));
+                }
+                index += 1;
+            }
+            first.expect("nonempty vessels")
+        } else {
+            let needs = workflow.vessels.iter().flat_map(|vessel| vessel.crew.iter()).flat_map(|crew| crew.needs.iter().cloned()).collect();
+            let result = self.decide_capability_placement(namespace, project_ref, repositories, workflow, &needs, intent, purpose).await?;
+            if purpose == PlacementPurpose::Routing {
+                // The destination resolves and validates credentials.
+            } else if has_kinds {
+                resolve_and_validate_workflow_credentials_for_capability_admission(
+                    &self.backend,
+                    namespace,
+                    Some(project_ref),
+                    repositories,
+                    result.0.selected.as_ref(),
+                    workflow,
+                )
+                .await?;
+            } else {
+                resolve_and_validate_workflow_credentials(
+                    &self.backend,
+                    namespace,
+                    Some(project_ref),
+                    repositories,
+                    result.0.selected.as_ref(),
+                    workflow,
+                )
+                .await?;
+            }
+            result
+        };
+        Ok((placement, minimal_alternatives, vessel_placements))
     }
 
     pub(super) async fn prepare_convoy_admission_with_preferences(
@@ -937,133 +1210,9 @@ impl ConvoyAdmission {
             (None, None) => required_admission_value(&generated.branch, "generated branch")?.to_string(),
         };
         validate_convoy_branch(&branch)?;
-        let mut vessel_placements = BTreeMap::new();
-        let has_kinds =
-            !self.backend.including_replicas::<FulfilmentKind>(namespace).list().await.map_err(|error| error.to_string())?.items.is_empty();
-        let (placement, minimal_alternatives) = if has_kinds && !workflow.vessels.is_empty() {
-            let mut first = None;
-            let mut index = 0;
-            while index < workflow.vessels.len() {
-                let vessel = workflow.vessels[index].clone();
-                let needs = vessel.crew.iter().flat_map(|crew| crew.needs.iter().cloned()).collect::<BTreeSet<_>>();
-                let mut one = WorkflowTemplateSpec { vessels: vec![vessel.clone()], ..workflow.clone() };
-                let (resolution, alternatives) =
-                    match self.resolve_capability_placement(namespace, project_ref, &repositories_snapshot, &one, &needs, intent).await {
-                        Ok(result) => result,
-                        Err(error) if vessel.crew.len() > 1 => {
-                            let split = vessel
-                                .crew
-                                .iter()
-                                .map(|crew| VesselRequirement {
-                                    name: format!("{}[{}]", vessel.name, crew.role),
-                                    crew: vec![crew.clone()],
-                                    ..vessel.clone()
-                                })
-                                .collect::<Vec<_>>();
-                            let split_names = split.iter().map(|part| part.name.clone()).collect::<Vec<_>>();
-                            for other in &mut workflow.vessels {
-                                if other.depends_on.iter().any(|dependency| dependency == &vessel.name) {
-                                    other.depends_on.retain(|dependency| dependency != &vessel.name);
-                                    other.depends_on.extend(split_names.iter().cloned());
-                                }
-                            }
-                            for rule in workflow.turn_delivery.values_mut() {
-                                if rule.to.vessel == vessel.name {
-                                    if let Some(part) = split.iter().find(|part| part.crew[0].role == rule.to.role) {
-                                        rule.to.vessel = part.name.clone();
-                                    }
-                                }
-                            }
-                            for part in &split {
-                                if let Some(policy) = workflow.stall_nudges.shift_remove(&format!("{}/{}", vessel.name, part.crew[0].role))
-                                {
-                                    workflow.stall_nudges.insert(format!("{}/{}", part.name, part.crew[0].role), policy);
-                                }
-                            }
-                            if let Some(targets) = &mut workflow.supervision {
-                                for target in targets {
-                                    if let SupervisionTarget::ConvoyCrew { vessel: target_vessel, role } = target {
-                                        if *target_vessel == vessel.name {
-                                            if let Some(part) = split.iter().find(|part| part.crew[0].role == *role) {
-                                                *target_vessel = part.name.clone();
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            workflow.vessels.splice(index..=index, split.clone());
-                            workflow.allocation.retain(|decision| decision.vessel != vessel.name);
-                            workflow.allocation.extend(split.iter().map(|part| AllocationDecision {
-                                vessel: part.name.clone(),
-                                roles: vec![part.crew[0].role.clone()],
-                                reason: format!("split after placement could not cover union: {error}"),
-                                crossed_handoffs: Vec::new(),
-                            }));
-                            continue;
-                        }
-                        Err(error) => {
-                            return Err(format!(
-                                "no fulfilment covers role `{}` need {}: {error}",
-                                vessel.crew[0].role,
-                                needs.iter().map(ToString::to_string).collect::<Vec<_>>().join(" + ")
-                            ));
-                        }
-                    };
-                resolve_and_validate_workflow_credentials_for_capability_admission(
-                    &self.backend,
-                    namespace,
-                    Some(project_ref),
-                    &repositories_snapshot,
-                    resolution.selected.as_ref(),
-                    &mut one,
-                )
-                .await?;
-                workflow.vessels[index] = one.vessels.remove(0);
-                if let Some(selected) = resolution.selected.as_ref() {
-                    let decision = PlacementDecision {
-                        minimal_alternatives: alternatives.clone(),
-                        escalation_reason: intent.escalation_reason.clone(),
-                        policy_name: selected.metadata.name.clone(),
-                        target_host: placement_target_host(&self.backend, namespace, selected).await?,
-                        refused_candidates: resolution.refused_candidates.clone(),
-                        viable_not_selected: resolution.viable_not_selected.clone(),
-                        allocation: resolution.allocation.clone(),
-                    };
-                    vessel_placements.insert(vessel.name.clone(), (selected.spec.clone(), decision));
-                }
-                if first.is_none() {
-                    first = Some((resolution, alternatives));
-                }
-                index += 1;
-            }
-            first.expect("nonempty vessels")
-        } else {
-            let needs = workflow.vessels.iter().flat_map(|vessel| vessel.crew.iter()).flat_map(|crew| crew.needs.iter().cloned()).collect();
-            let result =
-                self.resolve_capability_placement(namespace, project_ref, &repositories_snapshot, &workflow, &needs, intent).await?;
-            if has_kinds {
-                resolve_and_validate_workflow_credentials_for_capability_admission(
-                    &self.backend,
-                    namespace,
-                    Some(project_ref),
-                    &repositories_snapshot,
-                    result.0.selected.as_ref(),
-                    &mut workflow,
-                )
-                .await?;
-            } else {
-                resolve_and_validate_workflow_credentials(
-                    &self.backend,
-                    namespace,
-                    Some(project_ref),
-                    &repositories_snapshot,
-                    result.0.selected.as_ref(),
-                    &mut workflow,
-                )
-                .await?;
-            }
-            result
-        };
+        let (placement, minimal_alternatives, vessel_placements) = self
+            .decide_vessel_placements(namespace, project_ref, &repositories_snapshot, &mut workflow, intent, PlacementPurpose::Admission)
+            .await?;
         refresh_crossed_handoffs(&mut workflow);
         flotilla_resources::validate(&workflow).map_err(|errors| {
             format!("allocated workflow invalid: {}", errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
@@ -1451,6 +1600,21 @@ impl ConvoyAdmission {
         placement_policy: Option<&str>,
         allow_unready: bool,
     ) -> Result<PlacementResolution, String> {
+        self.decide_placement(namespace, project_ref, repositories, workflow, placement_policy, allow_unready, PlacementPurpose::Admission)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn decide_placement(
+        &self,
+        namespace: &str,
+        project_ref: Option<&str>,
+        repositories: &[ConvoyRepositorySpec],
+        workflow: &WorkflowTemplateSpec,
+        placement_policy: Option<&str>,
+        allow_unready: bool,
+        purpose: PlacementPurpose,
+    ) -> Result<PlacementResolution, String> {
         let mut placement = match placement_policy {
             Some(policy) => {
                 let policy = required_admission_value(policy, "placement policy")?;
@@ -1462,7 +1626,9 @@ impl ConvoyAdmission {
                     .await
                     .map(|source| source.object)
                     .map_err(|error| format!("placement policy {policy}: {error}"))?;
-                validate_docker_placement_host(&self.backend, namespace, &resolved).await?;
+                if purpose == PlacementPurpose::Admission {
+                    validate_docker_placement_host(&self.backend, namespace, &resolved).await?;
+                }
                 PlacementResolution {
                     selected: Some(resolved),
                     refused_candidates: Vec::new(),
@@ -1472,9 +1638,16 @@ impl ConvoyAdmission {
             }
             None => {
                 let local_host_id = self.canonical_local_host_id();
-                let placement =
-                    default_convoy_placement_policy(&self.backend, namespace, project_ref, repositories, workflow, local_host_id.as_ref())
-                        .await?;
+                let placement = decide_default_placement(
+                    &self.backend,
+                    namespace,
+                    project_ref,
+                    repositories,
+                    workflow,
+                    local_host_id.as_ref(),
+                    purpose,
+                )
+                .await?;
                 if placement.selected.is_none() && !placement.refused_candidates.is_empty() {
                     let reasons = placement
                         .refused_candidates
@@ -1487,10 +1660,12 @@ impl ConvoyAdmission {
                 placement
             }
         };
-        if let Some(docker) = placement.selected.as_mut().and_then(|policy| policy.spec.docker_per_vessel.as_mut()) {
-            docker.image = docker.image.resolve(&self.backend.definitions(namespace)).await?.into();
+        if purpose == PlacementPurpose::Admission {
+            if let Some(docker) = placement.selected.as_mut().and_then(|policy| policy.spec.docker_per_vessel.as_mut()) {
+                docker.image = docker.image.resolve(&self.backend.definitions(namespace)).await?.into();
+            }
+            validate_workflow_agent_adapters(&self.backend, namespace, workflow, placement.selected.as_ref(), allow_unready).await?;
         }
-        validate_workflow_agent_adapters(&self.backend, namespace, workflow, placement.selected.as_ref(), allow_unready).await?;
         Ok(placement)
     }
 }
@@ -2325,6 +2500,7 @@ impl PlacementCandidateOrder for PlacementTieBreak<'_> {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn default_convoy_placement_policy(
     backend: &ResourceBackend,
     namespace: &str,
@@ -2332,6 +2508,18 @@ pub(super) async fn default_convoy_placement_policy(
     repositories: &[ConvoyRepositorySpec],
     workflow: &WorkflowTemplateSpec,
     local_host_ref: Option<&CanonicalHostId>,
+) -> Result<PlacementResolution, String> {
+    decide_default_placement(backend, namespace, project_ref, repositories, workflow, local_host_ref, PlacementPurpose::Admission).await
+}
+
+async fn decide_default_placement(
+    backend: &ResourceBackend,
+    namespace: &str,
+    project_ref: Option<&str>,
+    repositories: &[ConvoyRepositorySpec],
+    workflow: &WorkflowTemplateSpec,
+    local_host_ref: Option<&CanonicalHostId>,
+    purpose: PlacementPurpose,
 ) -> Result<PlacementResolution, String> {
     let mut policies = match backend.including_replicas::<PlacementPolicy>(namespace).list().await {
         Ok(list) => home_copy_wins_by_name(list.items),
@@ -2352,8 +2540,14 @@ pub(super) async fn default_convoy_placement_policy(
     for policy in policies {
         let mut candidate_workflow = workflow.clone();
         let agentless_ssh = policy_targets_agentless_ssh(backend, namespace, &policy).await;
-        let agentless_unready = if agentless_ssh { placement_agent_adapters(backend, namespace, &policy, false).await.err() } else { None };
-        let refusal = if let Err(reason) = validate_docker_placement_host(backend, namespace, &policy).await {
+        let agentless_unready = if purpose == PlacementPurpose::Admission && agentless_ssh {
+            placement_agent_adapters(backend, namespace, &policy, false).await.err()
+        } else {
+            None
+        };
+        let refusal = if purpose == PlacementPurpose::Routing {
+            None
+        } else if let Err(reason) = validate_docker_placement_host(backend, namespace, &policy).await {
             Some(reason)
         } else if let Some(reason) = agentless_unready {
             Some(reason)

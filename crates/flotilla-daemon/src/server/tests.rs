@@ -2094,7 +2094,9 @@ async fn command_target_resolver_keeps_reads_local_and_routes_explicit_delivery(
 }
 
 #[tokio::test]
-async fn dispatch_execute_refuses_pinned_remote_host_that_is_not_ready() {
+// Behaviour (#2340): replicated readiness/status does not authorize a routing
+// refusal. A placement still needs a connected peer route for delivery.
+async fn dispatch_execute_requires_a_route_for_unready_or_statusless_placement() {
     let (_tmp, daemon) = empty_daemon().await;
     let (_remote_tmp, remote_daemon) = empty_daemon_named("stopped").await;
     let remote_backend = remote_daemon.resource_backend();
@@ -2164,8 +2166,8 @@ async fn dispatch_execute_refuses_pinned_remote_host_that_is_not_ready() {
                 .build(),
         )
         .await
-        .expect_err("not-ready remote placement must be refused before peer routing");
-    assert!(error.contains(policy_name) && error.contains("stopped-host-id") && error.contains("not ready"), "{error}");
+        .expect_err("unreachable placement must be refused by peer routing");
+    assert_eq!(error, "peer host stopped-host-id is not connected");
 
     let statusless = hosts
         .create(&InputMeta::builder().name("statusless-host-id".to_string()).build(), &HostSpec::default())
@@ -2214,8 +2216,8 @@ async fn dispatch_execute_refuses_pinned_remote_host_that_is_not_ready() {
                 .build(),
         )
         .await
-        .expect_err("remote placement without replicated status must be refused");
-    assert!(error.contains(statusless_policy) && error.contains("status is unavailable"), "{error}");
+        .expect_err("statusless placement still requires a connected route");
+    assert_eq!(error, "peer host statusless-host-id is not connected");
 }
 
 struct RunningTerminalRuntime;
