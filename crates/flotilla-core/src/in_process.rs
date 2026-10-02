@@ -9698,7 +9698,7 @@ impl InProcessDaemon {
         }
     }
 
-    async fn deliver_standing_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
+    pub async fn deliver_standing_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&request.namespace);
         let session = sessions
             .list_matching_labels(&BTreeMap::from([
