@@ -600,7 +600,7 @@ fn project_awareness_entry(
 }
 
 fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Option<(EntityRef, Vec<(&'static str, MetadataValue)>)> {
-    let label = entry.label.clone();
+    let mut label = entry.label.clone();
     let (entity, facts) = match entry.kind {
         AwarenessKind::Convoy => {
             let value = entry.id.strip_prefix("convoy/").unwrap_or(&entry.id);
@@ -614,6 +614,7 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
             if let Some(row) = row {
                 facts.push((KEY_CONVOY_PHASE, MetadataValue::text(row.phase.as_str())));
             }
+            label = semantic_label.to_owned();
             facts.extend(label_tier_facts(semantic_label));
             if let (None, Some(AwarenessPhase::Convoy(phase))) = (row, &entry.phase) {
                 facts.push((KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str())));

@@ -43,6 +43,8 @@ Raw observed facts, each with its observation time so managers can show stalenes
   - **assignees**;
   - updated-at.
 
+Short references are the subject entity's own `display.label`, `display.label.medium` and `display.label.short` tiers, computed with the project reference context (ADR 0049 §2). They are never folded into the convoy's label, which describes only its name. Repository alias, number and kind are also published as separate parts.
+
 Bold fields are new to observation.
 
 **URLs are constructable, not repeated.** Each forge appears once as a **`forge`** entity, derived from the `Forge` resources. It carries its kind (GitHub, Forgejo), its web base URL, and URL templates for change requests and issues (for example `{web_url}/{scope}/pull/{number}` for GitHub and `{web_url}/{scope}/pulls/{number}` for Forgejo). A manager builds a change request's or issue's URL from the forge plus `scope` and `number`. The stream carries only small identity facts, and facts are sent when they change, so the forge entity costs nothing after the first sync.

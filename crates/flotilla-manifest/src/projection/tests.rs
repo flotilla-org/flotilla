@@ -482,7 +482,7 @@ fn awareness_issues_are_recipe_less_entities_with_source_plus_id_identity() {
 }
 
 #[test]
-fn awareness_composed_text_is_unchanged_alongside_granular_facts() {
+fn awareness_convoy_labels_ignore_legacy_subject_annotations() {
     let convoy = AwarenessEntry::builder()
         .id("convoy/dev/landing".to_owned())
         .kind(AwarenessKind::Convoy)
@@ -522,7 +522,7 @@ fn awareness_composed_text_is_unchanged_alongside_granular_facts() {
     )
     .reassert_patches();
     let convoy = find_entity(&patches, &entity::convoy("dev", "landing", "fleet"));
-    assert_eq!(text(convoy, KEY_DISPLAY_LABEL), "landing · PR #1044");
+    assert_eq!(text(convoy, KEY_DISPLAY_LABEL), "landing");
     assert_eq!(text(convoy, KEY_DISPLAY_LABEL_MEDIUM), "landing");
     assert_eq!(text(convoy, KEY_DISPLAY_LABEL_SHORT), "l");
     assert_eq!(text(convoy, KEY_SUMMARY_TEXT), "landing · PR #1044");
