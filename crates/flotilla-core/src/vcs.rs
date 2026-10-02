@@ -386,6 +386,33 @@ pub async fn prune_checkout_archives(runner: &dyn CommandRunner, archive_root: &
     Ok(())
 }
 
+/// Bound a remote root's entire sweep in its execution environment. GNU
+/// `timeout` supervises the shell, find, and rm in one process group, including
+/// a hard kill if a child ignores TERM. A client deadline alone can orphan
+/// remote processes when an SSH or container connection is cancelled.
+pub async fn prune_remote_checkout_archives(
+    runner: &dyn CommandRunner,
+    archive_root: &Path,
+    retention_days: u64,
+    deadline: std::time::Duration,
+) -> Result<(), String> {
+    let root = archive_root.to_str().ok_or_else(|| "archive root is not UTF-8".to_string())?;
+    let minutes = retention_days.saturating_mul(24 * 60).to_string();
+    let seconds = format!("{}s", deadline.as_secs_f64());
+    let script = r#"[ -d "$1" ] || exit 0
+find "$1" ! -path "$1" -type d -prune -mmin "+$2" -exec rm -rf -- {} +"#;
+    runner
+        .run_with_timeout(
+            "timeout",
+            &["--kill-after=5s", &seconds, "sh", "-c", script, "flotilla-archive-sweep", root, &minutes],
+            Path::new("/"),
+            &crate::providers::ChannelLabel::Default,
+            deadline + std::time::Duration::from_secs(10),
+        )
+        .await
+        .map(|_| ())
+}
+
 /// Read operations needed while discovering and inspecting a checkout.
 pub enum VcsQuery<'a> {
     TopLevel,
@@ -2135,6 +2162,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archive_retention_uses_a_remote_and_client_deadline() {
+        let runner = crate::providers::testing::TimeoutOnlyRunner::new(Ok(String::new()));
+        prune_remote_checkout_archives(&runner, Path::new("/archives"), 14, std::time::Duration::from_secs(300))
+            .await
+            .expect("bounded sweep");
+        let calls = runner.calls.lock().expect("calls");
+        assert_eq!(calls.len(), 1, "one deadline covers the whole root");
+        assert_eq!(calls[0].0, "timeout", "deadline must run inside the target environment");
+        assert!(calls[0].3 > std::time::Duration::from_secs(300), "client allows remote cleanup to finish");
+    }
+
+    #[tokio::test]
     async fn archive_retention_removes_expired_directories_only() {
         let dir = tempfile::tempdir().expect("tempdir");
         let archive_root = dir.path().join(".flotilla-archives");
@@ -2148,6 +2187,68 @@ mod tests {
         prune_checkout_archives(&crate::providers::ProcessCommandRunner, &archive_root, 14).await.expect("prune archive root");
         assert!(!old.exists());
         assert!(recent.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn remote_archive_deadline_stops_find_and_rm_and_allows_the_next_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::providers::{ssh_runner::SshCommandRunner, ChannelLabel, ProcessCommandRunner};
+
+        // Execute the remote shell locally, preserving the real SSH decorator
+        // and process runner. No live host or SSH credentials are required.
+        struct LoopbackSshRunner(PathBuf);
+        #[async_trait]
+        impl CommandRunner for LoopbackSshRunner {
+            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+                assert_eq!(cmd, "ssh");
+                let script = format!(
+                    "PATH={}:\"$PATH\"; {}",
+                    flotilla_protocol::arg::shell_quote(self.0.to_str().expect("bin path")),
+                    args.last().expect("remote script")
+                );
+                ProcessCommandRunner.run("sh", &["-c", &script], cwd, label).await
+            }
+            async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+                Err("unused output seam".into())
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                false
+            }
+        }
+
+        for blocked_command in ["find", "rm"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let bin = dir.path().join("bin");
+            std::fs::create_dir(&bin).expect("bin");
+            let root = dir.path().join("archives");
+            let old = root.join("old");
+            std::fs::create_dir_all(&old).expect("old archive");
+            let marker = dir.path().join("orphan-finished");
+            let started = dir.path().join("command-started");
+            let shim = bin.join(blocked_command);
+            std::fs::write(
+                &shim,
+                format!(
+                    "#!/bin/sh\nprintf started > {}\nsleep 0.6\nprintf orphan > {}\n",
+                    flotilla_protocol::arg::shell_quote(started.to_str().expect("started path")),
+                    flotilla_protocol::arg::shell_quote(marker.to_str().expect("marker path"))
+                ),
+            )
+            .expect("blocked command");
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).expect("executable shim");
+            let past = (chrono::Utc::now() - chrono::Duration::days(20)).format("%Y%m%d%H%M.%S").to_string();
+            assert!(std::process::Command::new("touch").args(["-t", &past]).arg(&old).status().expect("age archive").success());
+            let runner = SshCommandRunner::new("loopback", false, Arc::new(LoopbackSshRunner(bin.clone())));
+            assert!(prune_remote_checkout_archives(&runner, &root, 14, std::time::Duration::from_millis(150)).await.is_err());
+            assert!(started.exists(), "the {blocked_command} command must actually have started before cancellation");
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            assert!(!marker.exists(), "timed-out {blocked_command} must not continue on the remote host");
+            std::fs::remove_file(shim).expect("unblock commands");
+            prune_remote_checkout_archives(&runner, &root, 14, std::time::Duration::from_secs(5)).await.expect("next sweep succeeds");
+            assert!(!old.exists());
+        }
     }
 
     #[tokio::test]

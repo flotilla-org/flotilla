@@ -924,9 +924,18 @@ async fn run_checkout_archive_gc(backend: ResourceBackend, namespace: String, ar
                     archive_sweep.daemon.command_runner_for_environment(&EnvironmentId::new(&root.env_ref))
                 };
                 if let Some(runner) = runner {
-                    if let Err(error) =
+                    let result = if root.env_ref == archive_sweep.host_direct_environment_name {
                         flotilla_core::vcs::prune_checkout_archives(&*runner, &root.path, archive_sweep.retention_days).await
-                    {
+                    } else {
+                        flotilla_core::vcs::prune_remote_checkout_archives(
+                            &*runner,
+                            &root.path,
+                            archive_sweep.retention_days,
+                            Duration::from_secs(5 * 60),
+                        )
+                        .await
+                    };
+                    if let Err(error) = result {
                         warn!(archive_root = %root.path.display(), env_ref = %root.env_ref, %error, "checkout archive retention sweep failed");
                     }
                 }
@@ -9224,6 +9233,59 @@ mod tests {
         }
         assert!(!expired.exists());
         assert!(recent.exists());
+    }
+
+    #[tokio::test]
+    async fn archive_sweep_continues_to_the_next_remote_root_after_a_timeout() {
+        struct SweepRunner {
+            roots: StdMutex<Vec<String>>,
+            finished: Notify,
+        }
+        #[async_trait]
+        impl CommandRunner for SweepRunner {
+            async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+                panic!("sweeps must use the deadline seam");
+            }
+            async fn run_with_timeout(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel, _: Duration) -> Result<String, String> {
+                assert_eq!(cmd, "timeout");
+                let root = args[args.len() - 2].to_string();
+                let mut roots = self.roots.lock().expect("roots");
+                roots.push(root);
+                if roots.len() == 1 {
+                    Err("remote sweep timed out".into())
+                } else {
+                    self.finished.notify_one();
+                    Ok(String::new())
+                }
+            }
+            async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+                panic!("no unbounded probe before the deadline");
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                false
+            }
+        }
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"archive-sweep-test\"\n").expect("daemon config");
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+        let runner = Arc::new(SweepRunner { roots: StdMutex::new(Vec::new()), finished: Notify::new() });
+        daemon
+            .register_direct_environment_for_test(EnvironmentId::new("remote"), runner.clone(), EnvironmentBag::new(), None)
+            .expect("register remote sweep runner");
+        let task = tokio::spawn(run_checkout_archive_gc(daemon.resource_backend(), NAMESPACE.into(), CheckoutArchiveSweep {
+            daemon,
+            catalog_path: temp.path().join("missing-catalog"),
+            host_direct_environment_name: "local".into(),
+            roots: vec![CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/a".into() }, CheckoutArchiveRoot {
+                env_ref: "remote".into(),
+                path: "/archives/b".into(),
+            }],
+            retention_days: 14,
+        }));
+        tokio::time::timeout(Duration::from_secs(5), runner.finished.notified()).await.expect("later root swept");
+        assert_eq!(*runner.roots.lock().expect("roots"), ["/archives/a", "/archives/b"]);
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]

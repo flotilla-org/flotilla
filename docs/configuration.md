@@ -154,6 +154,12 @@ Set the age in each host's `~/.config/flotilla/daemon.toml`:
 checkout_archive_retention_days = 30
 ```
 
+Each remote archive root has a five-minute sweep deadline. The remote
+environment must provide GNU `timeout`; it supervises `find` and `rm` together
+and kills remaining children after a five-second grace period. The client
+deadline is ten seconds longer. A failed or timed-out root logs a warning and
+the sweep continues with the next root. Local sweeps retain their native path.
+
 ## Event relay
 
 To receive change-request hints, configure each daemon separately in its
