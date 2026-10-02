@@ -63,9 +63,10 @@ use flotilla_resources::{
 use futures::{FutureExt, StreamExt};
 use serde_json::json;
 use tokio::{
-    sync::{Mutex, RwLock, Semaphore},
+    sync::{watch, Mutex, RwLock, Semaphore},
     task::JoinHandle,
 };
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -79,6 +80,7 @@ use crate::{
     resource_limits::file_descriptor_pressure_condition,
     resource_manifest::{manifest_root_name, materialize_manifest_root, ResourceManifestReconciler},
     sleep_inhibitor,
+    startup::phase,
     supervisor::{supervise, ControllerSupervision, RestartBudgetExhausted},
     vessel_config::{compose, crew_git_identity_environment_fragments, ComposedFile, Fragment, TargetId},
     Aggregator, AggregatorResolvers,
@@ -329,6 +331,9 @@ pub struct RuntimeOptions {
     pub controller_supervision: ControllerSupervision,
     pub start_controllers: bool,
     pub codex_central_refresh_interval: Duration,
+    /// Socket servers release restoration once their accept loop is ready.
+    /// In-process runtimes omit the gate and restore in the background immediately.
+    pub startup_ready: Option<watch::Receiver<bool>>,
 }
 
 impl Default for RuntimeOptions {
@@ -339,6 +344,7 @@ impl Default for RuntimeOptions {
             controller_resync_interval: Duration::from_secs(60),
             controller_supervision: ControllerSupervision::default(),
             start_controllers: true,
+            startup_ready: None,
             // Codex only proactively refreshes within 5 minutes of expiry; a
             // central login's access token lives far longer than that, so a
             // conservative fixed cadence comfortably inside that window
@@ -547,7 +553,7 @@ impl DaemonRuntime {
         config: Arc<ConfigStore>,
         daemon_socket_path: Option<PathBuf>,
     ) -> Result<Self, String> {
-        Self::start_with_options(daemon, config, daemon_socket_path, RuntimeOptions::default()).await
+        phase("initialize_runtime", Self::start_with_options(daemon, config, daemon_socket_path, RuntimeOptions::default())).await
     }
 
     pub async fn start_with_options(
@@ -557,23 +563,25 @@ impl DaemonRuntime {
         options: RuntimeOptions,
     ) -> Result<Self, String> {
         if let Some(path) = daemon_socket_path.as_ref() {
-            daemon.set_daemon_socket_path(path.clone()).await;
+            phase("set_daemon_socket_path", daemon.set_daemon_socket_path(path.clone())).await;
         }
-        daemon.set_provisioning_namespace(options.namespace.clone()).await;
-        let aggregator_projection_state = daemon.aggregator_projection_state().await;
+        phase("set_provisioning_namespace", daemon.set_provisioning_namespace(options.namespace.clone())).await;
+        let aggregator_projection_state = phase("aggregator_projection_state", daemon.aggregator_projection_state()).await;
         let daemon_config = config.load_daemon_config()?;
         let manifests = daemon_config.manifests;
         let relay = daemon_config.relay;
         let blob_store = Arc::new(TieredBlobStore::from_config(config.state_dir().as_path(), &daemon_config.blob_stores)?);
-        daemon
-            .set_brief_artifact_writer(Arc::new(crate::artifact::SystemBriefArtifactWriter {
+        phase(
+            "set_brief_artifact_writer",
+            daemon.set_brief_artifact_writer(Arc::new(crate::artifact::SystemBriefArtifactWriter {
                 backend: daemon.resource_backend(),
                 blobs: Arc::clone(&blob_store),
                 retention_days: daemon_config.artifact_retention_days.get("brief").copied().unwrap_or(30),
-            }))
-            .await;
+            })),
+        )
+        .await;
 
-        let local_registry = probe_local_provider_registry(&daemon, &config).await?;
+        let local_registry = phase("probe_local_provider_registry", probe_local_provider_registry(&daemon, &config)).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
         let host_direct_environment_name = format!("host-direct-{}", profile.host_id);
         let mut archive_roots = vec![CheckoutArchiveRoot {
@@ -592,7 +600,7 @@ impl DaemonRuntime {
             }
             Err(error) => warn!(%error, "checkout archive sweep could not load observation roots"),
         }
-        let ssh_profiles = discover_agentless_ssh_profiles(&daemon, &config).await;
+        let ssh_profiles = phase("discover_agentless_ssh_profiles", discover_agentless_ssh_profiles(&daemon, &config)).await;
         daemon.set_admission_free_space_path(PathBuf::from(&profile.repo_default_dir));
         let credential_store = Arc::new(CredentialStore::new(
             daemon.resource_backend(),
@@ -602,63 +610,59 @@ impl DaemonRuntime {
             daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?,
             config.state_dir().as_path().to_path_buf(),
         ));
-        if let Err(error) = credential_store.cleanup_stale_github_app_token_files().await {
+        // Cleanup must precede admitting commands that can mint new staging files.
+        if let Err(error) = phase("cleanup_stale_github_app_token_files", credential_store.cleanup_stale_github_app_token_files()).await {
             warn!(%error, "failed to clean up stale GitHub App token staging files");
-        }
-        if let Some((_, provider)) = local_registry.environment_providers.get("docker") {
-            let live = daemon.resource_backend().using::<Environment>(&options.namespace).list().await;
-            let running = provider.list().await;
-            match (live, running) {
-                (Ok(live), Ok(running)) => {
-                    let live = live.items.into_iter().map(|environment| environment.metadata.name).collect::<BTreeSet<_>>();
-                    let running = running.into_iter().map(|handle| handle.id().to_string()).collect::<BTreeSet<_>>();
-                    if let Err(error) = credential_store.sweep_orphaned_registry_configs(&live, &running).await {
-                        warn!(%error, "failed to sweep orphaned Docker credential caches");
-                    }
-                }
-                (Err(error), _) => warn!(%error, "could not list environments for Docker credential cache sweep"),
-                (_, Err(error)) => warn!(%error, "could not list running Docker backings for credential cache sweep"),
-            }
-        } else if config.state_dir().as_path().join("credential-runtime").exists() {
-            warn!("Docker credential cache sweep deferred because Docker backing liveness is unavailable");
         }
         let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::clone(&daemon.discovery_runtime().env)));
         let health = DaemonHealthIdentity {
-            generation: daemon
-                .observed_resource_backend()
-                .using::<Checkout>(&options.namespace)
-                .list()
+            generation: phase("read_observed_generation", daemon.observed_resource_backend().using::<Checkout>(&options.namespace).list())
                 .await
                 .map_err(|error| error.to_string())?
                 .generation,
             version: env!("CARGO_PKG_VERSION").to_string(),
             started_at: Utc::now(),
         };
-        daemon.set_local_placement_capabilities(&profile.available_agent_adapters, &profile.available_pools).await;
+        phase(
+            "set_local_placement_capabilities",
+            daemon.set_local_placement_capabilities(&profile.available_agent_adapters, &profile.available_pools),
+        )
+        .await;
         let runtime_health = RuntimeHealth::default().with_restart_history_dir(config.state_dir().as_path().to_path_buf());
-        flotilla_resources::quarantine_undecodable_stored_objects(&daemon.resource_backend(), &options.namespace)
-            .await
-            .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
-        register_startup_resources(&daemon, &options.namespace, &profile).await?;
+        phase(
+            "quarantine_undecodable_stored_objects",
+            flotilla_resources::quarantine_undecodable_stored_objects(&daemon.resource_backend(), &options.namespace),
+        )
+        .await
+        .map_err(|error| format!("scan stored resources for decode quarantine: {error}"))?;
+        phase("register_startup_resources", register_startup_resources(&daemon, &options.namespace, &profile)).await?;
         let mut registered_ssh_profiles = Vec::new();
         for ssh in ssh_profiles {
-            if let Err(error) =
-                register_agentless_ssh_resources(&daemon.resource_backend(), &options.namespace, &profile.host_id, &ssh).await
+            if let Err(error) = phase(
+                "register_agentless_ssh_resources",
+                register_agentless_ssh_resources(&daemon.resource_backend(), &options.namespace, &profile.host_id, &ssh),
+            )
+            .await
             {
                 warn!(host = %ssh.provisioning.host_id, %error, "failed to register agentless SSH host; continuing startup");
                 continue;
             }
-            if let Err(error) = apply_agentless_ssh_observation(&daemon, &options.namespace, &ssh, Some(&credential_store)).await {
+            if let Err(error) = phase(
+                "apply_agentless_ssh_observation",
+                apply_agentless_ssh_observation(&daemon, &options.namespace, &ssh, Some(&credential_store)),
+            )
+            .await
+            {
                 warn!(host = %ssh.provisioning.host_id, %error, "failed to observe agentless SSH host; continuing startup");
             }
             registered_ssh_profiles.push(ssh);
         }
         let ssh_profiles = registered_ssh_profiles;
-        apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health, &runtime_health)
-            .await?;
-        if let Err(error) = daemon.reconcile_adopted_checkouts(&options.namespace).await {
-            warn!(%error, "failed to restore adopted checkout observations during startup; periodic reconciliation will retry");
-        }
+        phase(
+            "publish_local_host_heartbeat",
+            apply_host_heartbeat_with_credentials(&daemon, &options.namespace, &profile, Some(&credential_store), &health, &runtime_health),
+        )
+        .await?;
 
         let mut tasks = vec![
             spawn_local_fulfilment_probe_task(
@@ -697,7 +701,6 @@ impl DaemonRuntime {
             spawn_codex_central_refresh_task(Arc::clone(&daemon.discovery_runtime().env), options.codex_central_refresh_interval),
             spawn_demand_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
             spawn_event_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
-            spawn_adopted_checkout_reconciliation_task(Arc::clone(&daemon), options.namespace.clone(), options.controller_resync_interval),
             spawn_projection_parity_task(
                 daemon.resource_backend(),
                 options.namespace.clone(),
@@ -746,9 +749,9 @@ impl DaemonRuntime {
             .filter(|declared| manifest_reconciler_enabled(&declared.reconciler_root, &profile.host_id))
             .map(|declared| manifest_root_name(&declared.reconciler_root, &declared.dir, &declared.source));
         let roots = daemon.resource_backend().using::<ManifestRoot>(&options.namespace);
-        for root in roots.list().await.map_err(|error| error.to_string())?.items {
+        for root in phase("list_manifest_roots", roots.list()).await.map_err(|error| error.to_string())?.items {
             if root.spec.host == profile.host_id && desired_manifest_root.as_deref() != Some(root.metadata.name.as_str()) {
-                roots.delete(&root.metadata.name).await.map_err(|error| error.to_string())?;
+                phase("delete_stale_manifest_root", roots.delete(&root.metadata.name)).await.map_err(|error| error.to_string())?;
             }
         }
         if let Some(manifests) = manifests.clone() {
@@ -771,14 +774,15 @@ impl DaemonRuntime {
             }
         }
 
+        let mut controller_state = None;
         if options.start_controllers {
-            tasks.push(spawn_dispatch_reconciler_task(Arc::clone(&daemon), options.namespace.clone(), options.controller_resync_interval));
-            let local_repo_root = daemon.tracked_repo_paths().await.into_iter().next().map(ExecutionEnvironmentPath::new);
+            let local_repo_root =
+                phase("tracked_repo_paths", daemon.tracked_repo_paths()).await.into_iter().next().map(ExecutionEnvironmentPath::new);
             let state = Arc::new(
                 ControllerRuntimeState::new(
                     Arc::clone(&daemon),
-                    config,
-                    local_registry,
+                    Arc::clone(&config),
+                    Arc::clone(&local_registry),
                     daemon_socket_path.map(DaemonHostPath::new),
                     profile.host_id.clone(),
                     local_repo_root,
@@ -787,53 +791,38 @@ impl DaemonRuntime {
                 .with_checkout_removal_concurrency(daemon_config.checkout_removal_concurrency)
                 .with_namespace(options.namespace.clone())
                 .with_agentless_ssh(ssh_profiles.clone())
-                .with_credential_store(credential_store)
+                .with_credential_store(Arc::clone(&credential_store))
                 .with_agent_material(agent_material)
                 .with_blob_store(Arc::clone(&blob_store)),
             );
-            daemon
-                .set_operator_reconciler(Arc::new(RuntimeOperatorReconciler {
+            phase(
+                "set_operator_reconciler",
+                daemon.set_operator_reconciler(Arc::new(RuntimeOperatorReconciler {
                     state: Arc::clone(&state),
                     manifests,
                     local_root: profile.host_id.clone(),
-                }))
-                .await;
-            daemon.set_work_credential_reconciler(Arc::new(RuntimeWorkCredentialReconciler { state: Arc::downgrade(&state) })).await;
-            if let Err(error) = reconcile_provisioned_environments(&state, &options.namespace).await {
-                warn!(%error, "failed to restore provisioned environments during startup; periodic reconciliation will retry");
-            }
-            if let Err(error) = reconcile_work_credentials(&state, &options.namespace).await {
-                warn!(%error, "failed to reconcile work credentials during startup; periodic reconciliation will retry");
-            }
-            tasks.push(spawn_convoy_ensure_reconciler_task(
-                Arc::clone(&state),
-                options.namespace.clone(),
-                options.controller_resync_interval,
-                runtime_health.clone(),
-            ));
-            tasks.push(spawn_pending_supervisor_turn_task(
-                Arc::clone(&daemon),
-                options.namespace.clone(),
-                options.controller_resync_interval,
-            ));
-            tasks.push(spawn_provisioned_environment_reconciliation_task(
-                Arc::clone(&state),
-                options.namespace.clone(),
-                options.controller_resync_interval,
-            ));
-            tasks.push(spawn_codex_credential_redelivery_task(
-                Arc::clone(&state),
-                options.namespace.clone(),
-                options.controller_resync_interval,
-            ));
-            tasks.extend(spawn_controller_loops(
-                state,
-                &options.namespace,
-                options.controller_resync_interval,
-                options.controller_supervision.clone(),
-                runtime_health,
-            ));
+                })),
+            )
+            .await;
+            phase(
+                "set_work_credential_reconciler",
+                daemon.set_work_credential_reconciler(Arc::new(RuntimeWorkCredentialReconciler { state: Arc::downgrade(&state) })),
+            )
+            .await;
+            controller_state = Some(state);
         }
+
+        tasks.push(spawn_startup_restoration(
+            StartupRestoration::builder()
+                .daemon(daemon)
+                .config(config)
+                .local_registry(local_registry)
+                .credential_store(credential_store)
+                .maybe_state(controller_state)
+                .options(options)
+                .runtime_health(runtime_health)
+                .build(),
+        ));
 
         // +1 for the watchdog's own handle, pushed below, so this count matches
         // `self.tasks.len()` at drop time.
@@ -842,6 +831,153 @@ impl DaemonRuntime {
 
         Ok(Self { tasks, blob_store, stop_expected: false })
     }
+}
+
+/// Owns deferred recovery and the controllers whose first pass depends on it.
+#[derive(bon::Builder)]
+struct StartupRestoration {
+    daemon: Arc<InProcessDaemon>,
+    config: Arc<ConfigStore>,
+    local_registry: Arc<ProviderRegistry>,
+    credential_store: Arc<CredentialStore>,
+    state: Option<Arc<ControllerRuntimeState>>,
+    options: RuntimeOptions,
+    runtime_health: RuntimeHealth,
+}
+
+impl StartupRestoration {
+    async fn restore(&self) {
+        let daemon = &self.daemon;
+        let config = &self.config;
+        let local_registry = &self.local_registry;
+        let credential_store = &self.credential_store;
+        let options = &self.options;
+        if let Some((_, provider)) = local_registry.environment_providers.get("docker") {
+            let live =
+                phase("list_environments_for_credential_sweep", daemon.resource_backend().using::<Environment>(&options.namespace).list())
+                    .await;
+            let running = phase("list_docker_backings_for_credential_sweep", provider.list()).await;
+            match (live, running) {
+                (Ok(live), Ok(running)) => {
+                    let live = live.items.into_iter().map(|environment| environment.metadata.name).collect::<BTreeSet<_>>();
+                    let running = running.into_iter().map(|handle| handle.id().to_string()).collect::<BTreeSet<_>>();
+                    if let Err(error) =
+                        phase("sweep_orphaned_registry_configs", credential_store.sweep_orphaned_registry_configs(&live, &running)).await
+                    {
+                        warn!(%error, "failed to sweep orphaned Docker credential caches");
+                    }
+                }
+                (Err(error), _) => warn!(%error, "could not list environments for Docker credential cache sweep"),
+                (_, Err(error)) => warn!(%error, "could not list running Docker backings for credential cache sweep"),
+            }
+        } else if config.state_dir().as_path().join("credential-runtime").exists() {
+            warn!("Docker credential cache sweep deferred because Docker backing liveness is unavailable");
+        }
+        if let Err(error) = phase("reconcile_adopted_checkouts", daemon.reconcile_adopted_checkouts(&options.namespace)).await {
+            warn!(%error, "failed to restore adopted checkout observations during startup; periodic reconciliation will retry");
+        }
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        if let Err(error) = phase("reconcile_provisioned_environments", reconcile_provisioned_environments(state, &options.namespace)).await
+        {
+            warn!(%error, "failed to restore provisioned environments during startup; periodic reconciliation will retry");
+        }
+        if let Err(error) = phase("reconcile_work_credentials", reconcile_work_credentials(state, &options.namespace)).await {
+            warn!(%error, "failed to reconcile work credentials during startup; periodic reconciliation will retry");
+        }
+    }
+
+    async fn run(&self) -> Result<(), ResourceError> {
+        // Preserve adoption -> credentials -> resource-controller ordering.
+        // Dispatch also waits so new work does not compete with initial recovery.
+        // Health and clients remain available while restoration is pending; the
+        // initial pass deliberately has no deadline: starting controllers after
+        // partial adoption could violate ownership and credential-staging order.
+        // Ordinary failures still let periodic reconciliation retry.
+        self.restore().await;
+        let daemon = &self.daemon;
+        let options = &self.options;
+        let runtime_health = &self.runtime_health;
+        let mut controller_tasks = vec![AbortOnDropHandle::new(spawn_adopted_checkout_reconciliation_task(
+            Arc::clone(daemon),
+            options.namespace.clone(),
+            options.controller_resync_interval,
+        ))];
+        let Some(state) = self.state.as_ref() else {
+            return futures::future::pending::<Result<(), ResourceError>>().await;
+        };
+        controller_tasks.push(AbortOnDropHandle::new(spawn_dispatch_reconciler_task(
+            Arc::clone(daemon),
+            options.namespace.clone(),
+            options.controller_resync_interval,
+        )));
+        controller_tasks.push(AbortOnDropHandle::new(spawn_convoy_ensure_reconciler_task(
+            Arc::clone(state),
+            options.namespace.clone(),
+            options.controller_resync_interval,
+            runtime_health.clone(),
+        )));
+        controller_tasks.push(AbortOnDropHandle::new(spawn_pending_supervisor_turn_task(
+            Arc::clone(daemon),
+            options.namespace.clone(),
+            options.controller_resync_interval,
+        )));
+        controller_tasks.push(AbortOnDropHandle::new(spawn_provisioned_environment_reconciliation_task(
+            Arc::clone(state),
+            options.namespace.clone(),
+            options.controller_resync_interval,
+        )));
+        controller_tasks.push(AbortOnDropHandle::new(spawn_codex_credential_redelivery_task(
+            Arc::clone(state),
+            options.namespace.clone(),
+            options.controller_resync_interval,
+        )));
+        controller_tasks.extend(
+            spawn_controller_loops(
+                Arc::clone(state),
+                &options.namespace,
+                options.controller_resync_interval,
+                options.controller_supervision.clone(),
+                runtime_health.clone(),
+            )
+            .into_iter()
+            .map(AbortOnDropHandle::new),
+        );
+        // The guards abort all owned controllers when shutdown cancels restoration.
+        futures::future::pending::<Result<(), ResourceError>>().await
+    }
+}
+
+pub(crate) async fn wait_for_listening(ready: Option<watch::Receiver<bool>>) -> Result<(), watch::error::RecvError> {
+    if let Some(mut ready) = ready {
+        ready.wait_for(|ready| *ready).await?;
+    }
+    Ok(())
+}
+
+fn spawn_startup_restoration(restoration: StartupRestoration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(error) = wait_for_listening(restoration.options.startup_ready.clone()).await {
+            debug!(%error, "startup restoration cancelled because the server did not listen");
+            return;
+        }
+        supervise_controller(
+            "startup_restoration",
+            restoration.options.controller_supervision.clone(),
+            restoration.runtime_health.clone(),
+            || async {
+                // A panic must not silently lose environment/credential recovery.
+                // Owned controller handles are aborted before supervision retries.
+                // Each retry repeats the whole restoration, including the sweep.
+                std::panic::AssertUnwindSafe(restoration.run())
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| Err(ResourceError::other("startup restoration panicked")))
+            },
+        )
+        .await;
+    })
 }
 
 pub(crate) fn manifest_reconciler_enabled(declared_root: &str, local_root: &str) -> bool {
@@ -5843,6 +5979,7 @@ mod tests {
             ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH, ENVIRONMENT_CLEAT_LIBRARY_DIR, ENVIRONMENT_CLEAT_PATH, ENVIRONMENT_CLEAT_RUNTIME_DIR,
             ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH,
         },
+        startup::test_support::GatedCredentialPreflight,
     };
 
     #[test]
@@ -10404,6 +10541,131 @@ mod tests {
             })
             .await
             .expect("mark crew session live");
+    }
+
+    // #2487: the actual work-credential pass can stall after environment adoption
+    // while fleet health remains available, then stage the live crew's material.
+    #[tokio::test(start_paused = true)]
+    async fn slow_work_credential_phase_keeps_heartbeat_available_and_completes() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"slow-credentials-test\"\n").expect("daemon identity");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let daemon = in_memory_daemon(Vec::new(), config.clone()).await;
+        let runtime = DaemonRuntime::start_with_options(daemon.clone(), config.clone(), None, RuntimeOptions {
+            start_controllers: false,
+            ..RuntimeOptions::default()
+        })
+        .await
+        .expect("publish initial heartbeat");
+        let backend = daemon.resource_backend();
+        backend
+            .definitions::<CredentialSpec>(NAMESPACE)
+            .create(&empty_meta("work-token"), &CredentialSpecSpec {
+                consumer: CredentialConsumer::Claude,
+                source: CredentialSource::Env { name: "TEST_WORK_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Issued,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("credential declaration");
+        let runner = Arc::new(GatedCredentialPreflight::new());
+        let store = Arc::new(CredentialStore::new(
+            backend.clone(),
+            NAMESPACE,
+            Arc::new(TestEnvVars::new([("TEST_WORK_TOKEN", "fake-test-token")])),
+            EnvironmentBag::new(),
+            runner.clone(),
+            temp.path().to_path_buf(),
+        ));
+        let env_id = EnvironmentId::new("env-work");
+        daemon
+            .register_provisioned_environment(
+                env_id.clone(),
+                Arc::new(TestInteriorEnvironment {
+                    id: env_id.clone(),
+                    image: ImageId::new("test-image"),
+                    runner: runner.clone(),
+                    env_vars: HashMap::new(),
+                    destroyed: Arc::new(AtomicBool::new(false)),
+                }),
+                EnvironmentBag::new(),
+                Some(passthrough_registry()),
+            )
+            .expect("adopt test environment");
+        let convoys = backend.using::<Convoy>(NAMESPACE);
+        let convoy = convoys
+            .create(&empty_meta("credential-work"), &ConvoySpec::builder().workflow_ref("test".to_string()).build())
+            .await
+            .expect("convoy");
+        convoys
+            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement::builder()
+                        .name("work".to_string())
+                        .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                        .crew(Vec::new())
+                        .build()],
+                }),
+                ..ConvoyStatus::default()
+            })
+            .await
+            .expect("live convoy");
+        let vessels = backend.using::<Vessel>(NAMESPACE);
+        let vessel = vessels
+            .create(&empty_meta("credential-work-vessel"), &VesselSpec {
+                convoy_ref: "credential-work".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "test".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            })
+            .await
+            .expect("vessel");
+        vessels
+            .update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &VesselStatus {
+                phase: flotilla_resources::VesselPhase::Ready,
+                environment_ref: Some(env_id.to_string()),
+                ..VesselStatus::default()
+            })
+            .await
+            .expect("placed vessel");
+        create_credential_test_session(&backend, "live-crew", "credential-work", "credential-work-vessel", env_id.as_str()).await;
+        let state = ControllerRuntimeState::new(
+            daemon.clone(),
+            config,
+            passthrough_registry(),
+            None,
+            "test-host".into(),
+            None,
+            "host-direct-test".into(),
+        )
+        .with_credential_store(store.clone());
+        let log = tempfile::NamedTempFile::new().expect("timing log");
+        let subscriber = tracing_subscriber::fmt().json().with_ansi(false).with_writer(log.reopen().expect("writer")).finish();
+        // The test uses Tokio's current-thread runtime, so the scoped dispatcher
+        // covers both the spawned phase and its cancellation/drop path.
+        let _logging = tracing::subscriber::set_default(subscriber);
+        let task = tokio::spawn(async move { phase("reconcile_work_credentials", reconcile_work_credentials(&state, NAMESPACE)).await });
+        tokio::time::timeout(Duration::from_secs(1), runner.entered.notified()).await.expect("work credential preflight starts");
+        tokio::time::advance(Duration::from_millis(38_650)).await;
+        assert!(!task.is_finished(), "credential preflight is still pending");
+        let health = daemon.fleet_health_internal().await.expect("fleet health while staging is blocked");
+        assert!(health.hosts.iter().any(|host| host.is_local && host.heartbeat_at.is_some()));
+        runner.release.add_permits(1);
+        task.await.expect("reconciliation task").expect("credential staging completes");
+        assert_eq!(store.tracked_work_deliveries().await.get(env_id.as_str()), Some(&BTreeSet::from(["work-token".to_string()])));
+        let records = fs::read_to_string(log.path()).expect("phase log");
+        let finish = records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON"))
+            .find(|record| record["fields"]["phase"] == "reconcile_work_credentials" && record["fields"]["status"] == "completed")
+            .unwrap_or_else(|| panic!("credential phase timing absent from log: {records}"));
+        assert!(finish["fields"]["duration_ms"].as_f64().expect("duration") >= 38_650.0);
+        runtime.shutdown();
     }
 
     #[tokio::test]

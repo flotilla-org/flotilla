@@ -20,7 +20,7 @@ flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-transport = { path = "../flotilla-transport" }
 tokio = { workspace = true }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = "0.0.12"

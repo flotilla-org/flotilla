@@ -47,6 +47,7 @@ use self::{
 };
 use crate::{
     peer::{ConnectionDirection, ConnectionMeta, InboundPeerEnvelope, PeerManager, SshTransport, SshTransportPaths},
+    startup::phase,
     DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH,
 };
 
@@ -320,6 +321,7 @@ pub struct DaemonServer {
     shutdown_request_rx: Option<mpsc::UnboundedReceiver<()>>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    startup_ready: watch::Sender<bool>,
     /// Channel for inbound peer wire messages tagged with connection authority.
     inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
     inbound_peer_rx: Option<mpsc::Receiver<InboundPeerEnvelope>>,
@@ -365,12 +367,14 @@ impl DaemonServer {
     ) -> Result<Self, String> {
         let daemon_config = config.load_daemon_config()?;
         let host_name = daemon_config.host_name.map(HostName::new).unwrap_or_else(HostName::local);
-        let resource_backend = build_embedded_resource_backend(&config).await?;
-        let daemon =
-            InProcessDaemon::new_with_resource_backend(repo_paths, Arc::clone(&config), discovery, host_name.clone(), resource_backend)
-                .await;
+        let resource_backend = phase("open_resource_backend", build_embedded_resource_backend(&config)).await?;
+        let daemon = phase(
+            "initialize_in_process_daemon",
+            InProcessDaemon::new_with_resource_backend(repo_paths, Arc::clone(&config), discovery, host_name.clone(), resource_backend),
+        )
+        .await;
         let peer_manager = build_peer_manager(&daemon, &config, &socket_path)?;
-        sync_peer_query_state(&peer_manager, &daemon).await;
+        phase("sync_peer_query_state", sync_peer_query_state(&peer_manager, &daemon)).await;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (shutdown_request_tx, shutdown_request_rx) = mpsc::unbounded_channel();
         let (inbound_peer_tx, inbound_peer_rx) = mpsc::channel(256);
@@ -389,6 +393,7 @@ impl DaemonServer {
             shutdown_request_rx: Some(shutdown_request_rx),
             shutdown_tx,
             shutdown_rx,
+            startup_ready: watch::channel(false).0,
             inbound_peer_tx,
             inbound_peer_rx: Some(inbound_peer_rx),
             peer_manager,
@@ -405,6 +410,12 @@ impl DaemonServer {
     /// consumes this to process data arriving from peer daemons.
     pub fn take_inbound_peer_rx(&mut self) -> Option<mpsc::Receiver<InboundPeerEnvelope>> {
         self.inbound_peer_rx.take()
+    }
+
+    /// Signals only after binding, publishing discovery, and preparing acceptance.
+    /// A closed channel with no readiness means the server failed to start.
+    pub fn startup_ready(&self) -> watch::Receiver<bool> {
+        self.startup_ready.subscribe()
     }
 
     pub fn daemon(&self) -> Arc<InProcessDaemon> {
@@ -454,7 +465,10 @@ impl DaemonServer {
         let remote_command_router = self.remote_command_router;
         let peer_resource_socket_dir = self.peer_resource_socket_dir;
 
-        remote_command_router.resume_pending_crew_completions().await;
+        // This only reads local pending records and registers asynchronous retry
+        // workers. Keep the snapshot before admission so replay cannot replace a
+        // newer client retry with stale completion data.
+        phase("resume_pending_crew_completions", remote_command_router.resume_pending_crew_completions()).await;
 
         let idle_client_count = Arc::clone(&client_count);
         let idle_shutdown_request_tx = shutdown_request_tx.clone();
@@ -496,6 +510,7 @@ impl DaemonServer {
         let mut accept_error_backoff = AcceptErrorBackoff::default();
         let mut accept_retry_at = None;
         let mut connection_tasks = JoinSet::new();
+        self.startup_ready.send_replace(true);
         loop {
             tokio::select! {
                 accept_result = listener.accept(), if accept_retry_at.is_none() => {

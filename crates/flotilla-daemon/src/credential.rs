@@ -18,7 +18,7 @@ use flotilla_resources::{
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, OnceCell, RwLock};
 use url::Url;
 
 use crate::vessel_config::{
@@ -263,6 +263,7 @@ pub(crate) struct CredentialStore {
     materials: Mutex<BTreeMap<(String, String), String>>,
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
+    registry_cache_maintenance: RwLock<()>,
     github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
     github_app_delivery_locks: Mutex<GithubAppDeliveryLocks>,
     github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
@@ -537,6 +538,7 @@ impl CredentialStore {
             materials: Mutex::new(BTreeMap::new()),
             git_config_fragments: Mutex::new(BTreeMap::new()),
             registry_configs: Mutex::new(BTreeMap::new()),
+            registry_cache_maintenance: RwLock::new(()),
             github_app_deliveries: Mutex::new(BTreeMap::new()),
             github_app_delivery_locks: Mutex::new(BTreeMap::new()),
             github_app_adoption_failures: Mutex::new(BTreeMap::new()),
@@ -1029,6 +1031,9 @@ impl CredentialStore {
         let CredentialConsumer::DockerRegistry { registry, username } = &spec.consumer else {
             unreachable!("matching credentials are docker-registry consumers");
         };
+        // Keep creation, preflight, and registration in the same critical section
+        // as sweeping: a fresh cache must not look orphaned before it is indexed.
+        let _maintenance = self.registry_cache_maintenance.read().await;
         let previous = self.registry_configs.lock().await.remove(environment_ref);
         if let Some(previous) = previous {
             remove_registry_config(&previous)
@@ -1171,6 +1176,10 @@ impl CredentialStore {
         live_environments: &BTreeSet<String>,
         running_backings: &BTreeSet<String>,
     ) -> Result<(), String> {
+        // Clients may begin preparing caches after the live/backing snapshots.
+        // Holding this through deletion serializes sweeping with preparation,
+        // including the interval before Docker preflight registers its cache.
+        let _maintenance = self.registry_cache_maintenance.write().await;
         let root = self.state_dir.join("credential-runtime");
         let mut entries = match tokio::fs::read_dir(&root).await {
             Ok(entries) => entries,
@@ -2796,6 +2805,8 @@ mod tests {
         writes: StdMutex<Vec<(PathBuf, String)>>,
         protected_writes: StdMutex<Vec<(PathBuf, u32)>>,
         runtime_dir_checks: StdMutex<VecDeque<bool>>,
+        // Pause the Docker login process boundary while its cache is unindexed.
+        registry_login_gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Semaphore)>>,
     }
 
     impl RecordingRunner {
@@ -2840,6 +2851,12 @@ mod tests {
                 args.iter().map(|arg| (*arg).to_string()).collect(),
                 input.to_vec(),
             ));
+            if cmd == "docker" && args.contains(&"login") {
+                if let Some(gate) = &self.registry_login_gate {
+                    gate.0.notify_one();
+                    gate.1.acquire().await.expect("release registry login").forget();
+                }
+            }
             Ok(String::new())
         }
 
@@ -5165,7 +5182,7 @@ interactions:
     }
 
     #[tokio::test]
-    async fn registry_config_survives_preflight_until_the_environment_is_forgotten() {
+    async fn registry_config_survives_concurrent_sweep_and_preflight_until_the_environment_is_forgotten() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .clone()
@@ -5179,15 +5196,31 @@ interactions:
             .await
             .expect("create credential declaration");
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_REGISTRY_TOKEN".to_string(), "registry-secret".to_string())])));
-        let runner = Arc::new(RecordingRunner::default());
+        let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Semaphore::new(0)));
+        let runner = Arc::new(RecordingRunner { registry_login_gate: Some(Arc::clone(&gate)), ..RecordingRunner::default() });
         let state = tempfile::tempdir().expect("create state directory");
-        let store = CredentialStore::new(backend, "flotilla", env, EnvironmentBag::new(), runner.clone(), state.path().to_path_buf());
+        let store =
+            Arc::new(CredentialStore::new(backend, "flotilla", env, EnvironmentBag::new(), runner.clone(), state.path().to_path_buf()));
 
-        let config_dir = store
-            .prepare_registry_pull("env-a", &BTreeSet::from(["private-registry".to_string()]), "registry.example/crew:latest")
-            .await
-            .expect("prepare registry credential")
-            .expect("matching registry credential");
+        let preparing = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                store
+                    .prepare_registry_pull("env-a", &BTreeSet::from(["private-registry".to_string()]), "registry.example/crew:latest")
+                    .await
+            })
+        };
+        gate.0.notified().await;
+        // At the process boundary the cache exists but has not been indexed.
+        // Sweeping must be excluded across this whole vulnerable lifecycle.
+        assert!(store.registry_cache_maintenance.try_write().is_err(), "sweep must wait for in-flight cache registration");
+        let sweeping = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.sweep_orphaned_registry_configs(&BTreeSet::new(), &BTreeSet::new()).await })
+        };
+        gate.1.add_permits(1);
+        let config_dir = preparing.await.expect("preparation task").expect("prepare registry credential").expect("matching credential");
+        sweeping.await.expect("sweep task").expect("sweep with stale empty owner snapshots");
 
         assert!(config_dir.is_dir(), "credential config must remain available to docker run");
         assert_eq!(
