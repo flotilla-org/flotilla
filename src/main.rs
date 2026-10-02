@@ -1667,34 +1667,38 @@ async fn run_manifest_command(cli: &Cli, command: ManifestSubCommand, format: Ou
                 .get(&key)
                 .filter(|resolution| state.resolved_token.as_deref() == Some(resolution.token.as_str()))
                 .map(|resolution| resolution.action);
-            rows.push(serde_json::json!({
-                "root": name,
-                "document": {"path": key.path, "kind": key.kind, "namespace": key.namespace, "name": key.name},
-                "state": state,
-                "resolution_action": resolution_action,
-                "pending_resolution": pending_resolution.map(|resolution| &resolution.action),
-            }));
+            rows.push((
+                serde_json::json!({
+                    "root": name,
+                    "document": {"path": key.path, "kind": key.kind, "namespace": key.namespace, "name": key.name},
+                    "state": state,
+                    "pending_resolution": pending_resolution.map(|resolution| &resolution.action),
+                }),
+                resolution_action,
+            ));
         }
     }
     if root.is_some() && !found {
         return Err(color_eyre::eyre::eyre!("ManifestRoot {} not found", root.unwrap_or_default()));
     }
     if format == OutputFormat::Json {
-        println!("{}", flotilla_protocol::output::json_pretty(&rows));
+        println!("{}", flotilla_protocol::output::json_pretty(&rows.iter().map(|(row, _)| row).collect::<Vec<_>>()));
     } else {
-        for row in rows {
-            println!("{}", format_manifest_status_row(&row));
+        for (row, resolution_action) in rows {
+            println!("{}", format_manifest_status_row(&row, resolution_action));
         }
     }
     Ok(())
 }
 
-fn format_manifest_status_row(row: &serde_json::Value) -> String {
+fn format_manifest_status_row(row: &serde_json::Value, resolution_action: Option<flotilla_resources::ResolutionAction>) -> String {
     let key = &row["document"];
     let phase = row["state"]["phase"].as_str().unwrap_or("unknown");
     let reason = row["state"]["reason"].as_str().unwrap_or("");
     let pending = row["pending_resolution"].as_str().map(|action| format!("pending {action}")).unwrap_or_default();
-    let reason = if row["resolution_action"] == "adopt" && row["state"]["resolution_outcome"].get("failed").is_some() {
+    let reason = if resolution_action == Some(flotilla_resources::ResolutionAction::Adopt)
+        && row["state"]["resolution_outcome"].get("failed").is_some()
+    {
         format!("{reason}; adoption may have rewritten the source file; inspect it before retrying with a new token")
     } else {
         reason.to_string()
@@ -3066,13 +3070,31 @@ mod tests {
                 "resolved_token": "token-1",
                 "resolution_outcome": {"failed": "live spec changed while adopting"}
             },
-            "resolution_action": "adopt",
             "pending_resolution": null
         });
 
         assert_eq!(
-            super::format_manifest_status_row(&row),
+            super::format_manifest_status_row(&row, Some(flotilla_resources::ResolutionAction::Adopt)),
             "manifest-123\tpolicy.yaml\tPlacementPolicy/flotilla/adopt-me\trefused\t\tlive spec changed while adopting; adoption may have rewritten the source file; inspect it before retrying with a new token"
+        );
+    }
+
+    #[test]
+    fn manifest_status_does_not_warn_for_failed_sync() {
+        let row = serde_json::json!({
+            "root": "manifest-123",
+            "document": {"path": "policy.yaml", "kind": "PlacementPolicy", "namespace": "flotilla", "name": "adopt-me"},
+            "state": {
+                "phase": "refused",
+                "reason": "live spec changed while syncing",
+                "resolution_outcome": {"failed": "live spec changed while syncing"}
+            },
+            "pending_resolution": null
+        });
+
+        assert_eq!(
+            super::format_manifest_status_row(&row, Some(flotilla_resources::ResolutionAction::Sync)),
+            "manifest-123\tpolicy.yaml\tPlacementPolicy/flotilla/adopt-me\trefused\t\tlive spec changed while syncing"
         );
     }
 
