@@ -4,6 +4,7 @@ use flotilla_protocol::{CommandAction, ConvoyStartIntent, HostName, IssueSelecto
 use super::{ui_state::PendingActionContext, App};
 use crate::{
     binding_table::{BindingModeId, KeyBindingMode},
+    interaction::InteractionContext,
     keymap::Action,
     table_view::{PendingRowContext, TableIntent},
     widgets::{convoy_delete_confirm::ConvoyDeleteConfirmWidget, dispatch_confirm::DispatchConfirmWidget, InteractiveWidget},
@@ -20,12 +21,8 @@ impl App {
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
         let mode = crate::app::view_kind::binding_mode(self.views.active_address(), self.views.is_scoped());
         self.keymap.resolve(&mode, crokey::KeyCombination::from(key)).filter(|action| {
-            crate::interaction::InteractionContext::for_active_view(
-                self.views.active_address(),
-                self.views.active_table_state().selected(),
-                self.model.active_repo_identity_opt().is_some(),
-            )
-            .is_available(*action)
+            InteractionContext::for_active_view(self.views.active_address(), self.views.active_table_state().selected())
+                .is_available(*action)
         })
     }
 
@@ -342,7 +339,6 @@ impl App {
 
     fn table_action_repo(&self, hint: Option<&RepoKey>) -> Option<RepoIdentity> {
         hint.and_then(|hint| self.model.repo_order.iter().find(|identity| repo_identity_matches_hint(identity, hint)).cloned())
-            .or_else(|| self.model.active_repo.clone())
             .or_else(|| (self.model.repo_order.len() == 1).then(|| self.model.repo_order[0].clone()))
     }
 

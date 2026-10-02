@@ -35,6 +35,7 @@ use crate::{
     keymap::Keymap,
     pm_open::PmConnector,
     theme::Theme,
+    widgets::file_picker::FilePickerWidget,
 };
 
 /// Per-provider auth/health status from last refresh.
@@ -107,8 +108,6 @@ pub struct TuiRepoModel {
     /// Health captured in RepoInfo on connect or reconnect; no live event updates this field.
     pub provider_health: HashMap<String, HashMap<String, bool>>,
     pub loading: bool,
-    /// Whether this inactive tab has received data updates since last viewed.
-    pub has_unseen_changes: bool,
 }
 
 /// TUI-side domain model. Mirrors the shape of core's `AppModel` but without
@@ -121,10 +120,6 @@ pub struct TuiModel {
     /// Registration/listing order of tracked repos (daemon list order).
     /// This is NOT tab order — tabs are `App::views` (`OpenViews`, ADR 0013).
     pub repo_order: Vec<RepoIdentity>,
-    /// The repo the active tab is scoped to, when the active View is a repo
-    /// view. Synced from `App::views` by `App::sync_active_view` — never set
-    /// directly.
-    pub active_repo: Option<RepoIdentity>,
     /// Per-repo, per-provider auth status from last refresh.
     /// Key: (repo_identity, provider_category, provider_name)
     pub status_message: Option<String>,
@@ -155,22 +150,16 @@ impl TuiModel {
                 provider_names: info.provider_names,
                 provider_health: info.provider_health,
                 loading: info.loading,
-                has_unseen_changes: false,
             });
         }
         Self {
             repos,
             project_address_state: ProjectAddressState::Unloaded,
             repo_order: order,
-            active_repo: None,
             status_message: None,
             hosts: HashMap::new(),
             fleet_health: flotilla_protocol::FleetHealthResponse::default(),
         }
-    }
-
-    pub fn active(&self) -> &TuiRepoModel {
-        self.active_opt().expect("active() requires the active tab to be a tracked repo view")
     }
 
     pub fn provider_status(&self, repo_identity: &RepoIdentity, category: &str, name: &str) -> Option<ProviderStatus> {
@@ -181,30 +170,6 @@ impl TuiModel {
                 ProviderStatus::Error
             }
         })
-    }
-
-    pub fn active_opt(&self) -> Option<&TuiRepoModel> {
-        self.active_repo.as_ref().and_then(|identity| self.repos.get(identity))
-    }
-
-    pub fn active_repo_root(&self) -> &PathBuf {
-        &self.active().path
-    }
-
-    pub fn active_repo_root_opt(&self) -> Option<&PathBuf> {
-        self.active_opt().map(|repo| &repo.path)
-    }
-
-    pub fn active_repo_identity(&self) -> &RepoIdentity {
-        &self.active().identity
-    }
-
-    pub fn active_repo_identity_opt(&self) -> Option<&RepoIdentity> {
-        self.active_opt().map(|repo| &repo.identity)
-    }
-
-    pub fn active_labels(&self) -> &RepoLabels {
-        &self.active().labels
     }
 
     pub fn repo_name(path: &Path) -> String {
@@ -730,7 +695,6 @@ impl App {
                     repo.provider_names = info.provider_names;
                     repo.provider_health = info.provider_health;
                     repo.loading = info.loading;
-                    repo.has_unseen_changes = false;
                 }
             } else {
                 self.handle_repo_added(info);
@@ -891,15 +855,6 @@ impl App {
         Command { node_id: None, provisioning_target: None, context_repo: None, action }
     }
 
-    pub fn repo_command(&self, action: CommandAction) -> Command {
-        Command {
-            node_id: None,
-            provisioning_target: None,
-            context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())),
-            action,
-        }
-    }
-
     pub fn repo_command_for_identity(&self, repo_identity: RepoIdentity, action: CommandAction) -> Command {
         Command { node_id: None, provisioning_target: None, context_repo: Some(RepoSelector::Identity(repo_identity)), action }
     }
@@ -934,36 +889,8 @@ impl App {
         Command { node_id: Some(node_id), provisioning_target: Some(target.clone()), context_repo: None, action }
     }
 
-    pub fn targeted_repo_command(&self, action: CommandAction) -> Command {
-        let target = &self.ui.provisioning_target;
-        let node_id = self
-            .model
-            .resolve_host(target.host())
-            .expect("validated provisioning target should resolve to a unique host")
-            .summary
-            .node
-            .node_id
-            .clone();
-        Command {
-            node_id: Some(node_id),
-            provisioning_target: Some(target.clone()),
-            context_repo: Some(RepoSelector::Identity(self.model.active_repo_identity().clone())),
-            action,
-        }
-    }
-
     pub fn repo_path_for_identity(&self, identity: &RepoIdentity) -> Option<PathBuf> {
         self.model.repos.get(identity).map(|repo| repo.path.clone())
-    }
-
-    /// Resolve the local workspace template into role→command pairs.
-    /// Used to tell the remote host what commands to prepare.
-    pub fn local_template_commands(&self) -> Vec<flotilla_protocol::PreparedTerminalCommand> {
-        flotilla_core::template::resolve_template_commands(self.model.active_repo_root(), self.config.base_path().as_path())
-    }
-
-    fn active_repo_is_remote_only(&self) -> bool {
-        self.model.active_repo_root_opt().is_some_and(|p| p.starts_with(Path::new("<remote>")))
     }
 
     pub fn visible_status_items(&self) -> Vec<VisibleStatusItem> {
@@ -981,7 +908,6 @@ impl App {
     /// Re-derive tab-dependent state after any change to the active tab.
     pub fn sync_active_view(&mut self) {
         self.screen.invalidate_page_layout();
-        self.model.active_repo = None;
         self.report_active_view_focus();
     }
 
@@ -1048,7 +974,6 @@ impl App {
     pub fn build_widget_context(&mut self) -> crate::widgets::WidgetContext<'_> {
         let my_host = self.model.my_host().cloned();
         let my_node_id = self.model.my_node_id().cloned();
-        let active_repo_is_remote_only = self.active_repo_is_remote_only();
         crate::widgets::WidgetContext {
             model: &self.model,
             keymap: &self.keymap,
@@ -1059,7 +984,6 @@ impl App {
             my_node_id,
             views: &mut self.views,
             commands: &mut self.proto_commands,
-            active_repo_is_remote_only,
             namespaces: &self.namespaces,
             query_tables: &self.query_tables,
             app_actions: Vec::new(),
@@ -1189,7 +1113,7 @@ impl App {
                     self.persist_open_views();
                 }
                 AppAction::OpenFilePicker => {
-                    self.open_file_picker_from_active_repo_parent();
+                    self.open_file_picker();
                 }
                 AppAction::PrevTab => {
                     self.prev_tab();
@@ -1214,10 +1138,8 @@ impl App {
                             self.query_seqs.remove(&query);
                         }
                         self.subscriptions_dirty = true;
-                    } else if let Some(repo) = self.model.active_repo_root_opt().cloned() {
-                        self.proto_commands.push(self.command(CommandAction::Refresh { repo: Some(RepoSelector::Path(repo)) }));
                     } else {
-                        self.set_error_message("No active repo".into());
+                        self.set_error_message("This view has no queries to refresh".into());
                     }
                 }
                 AppAction::ShowStatus(message) => {
@@ -1543,7 +1465,6 @@ impl App {
             provider_names: info.provider_names,
             provider_health: info.provider_health,
             loading: info.loading,
-            has_unseen_changes: false,
         });
         self.model.repo_order.push(identity.clone());
 
@@ -1563,9 +1484,6 @@ impl App {
     fn handle_repo_removed(&mut self, repo_identity: &RepoIdentity) {
         self.model.repos.remove(repo_identity);
         self.model.repo_order.retain(|repo| repo != repo_identity);
-        if self.model.active_repo.as_ref() == Some(repo_identity) {
-            self.dismiss_modals();
-        }
     }
 
     /// Returns convoys for a namespace in daemon-provided order.
@@ -1573,22 +1491,17 @@ impl App {
         self.namespaces.get(namespace).map(|model| model.convoys.values().collect()).unwrap_or_default()
     }
 
-    pub(super) fn open_file_picker_from_active_repo_parent(&mut self) {
-        let start_dir = file_picker_start_dir(&self.model);
+    pub(super) fn open_file_picker(&mut self) {
+        let start_dir = file_picker_start_dir();
         let input = Input::from(format!("{}/", start_dir.display()).as_str());
-        let dir_entries = crate::widgets::command_palette::refresh_dir_listing_standalone(input.value(), &self.model);
-        self.screen.modal_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(input, dir_entries)));
+        self.screen.modal_stack.push(Box::new(FilePickerWidget::open(input)));
     }
 }
 
-pub(crate) fn file_picker_start_dir(model: &TuiModel) -> PathBuf {
-    model
-        .active_repo_root_opt()
-        .and_then(|root| root.parent())
-        .map(Path::to_path_buf)
-        .or_else(|| std::env::current_dir().ok())
-        .or_else(dirs::home_dir)
-        .unwrap_or_default()
+/// Project and checkout Views can span repositories and hosts. Start local
+/// repository discovery from this surface's working directory.
+pub(crate) fn file_picker_start_dir() -> PathBuf {
+    std::env::current_dir().ok().or_else(dirs::home_dir).unwrap_or_default()
 }
 
 fn view_regard_target(address: &ViewAddress) -> Option<ResourceRef> {

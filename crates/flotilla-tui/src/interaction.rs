@@ -47,18 +47,17 @@ impl<'a> InteractionSelection<'a> {
 pub struct InteractionContext<'a> {
     active_view: Option<&'a ViewAddress>,
     selection: Option<InteractionSelection<'a>>,
-    has_repo_context: bool,
 }
 
 impl<'a> InteractionContext<'a> {
-    pub fn for_active_view(active_view: Option<&'a ViewAddress>, selected_row: Option<&'a RowId>, has_repo_context: bool) -> Self {
-        Self { active_view, selection: InteractionSelection::for_active_view(active_view, selected_row), has_repo_context }
+    pub fn for_active_view(active_view: Option<&'a ViewAddress>, selected_row: Option<&'a RowId>) -> Self {
+        Self { active_view, selection: InteractionSelection::for_active_view(active_view, selected_row) }
     }
 
     pub fn is_available(self, action: Action) -> bool {
         match action {
             Action::OpenFind => match self.active_view {
-                Some(ViewAddress::Repo { .. }) => self.has_repo_context,
+                Some(ViewAddress::Repo { .. }) => false,
                 Some(
                     ViewAddress::Convoys { .. }
                     | ViewAddress::Independents { .. }
@@ -88,14 +87,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_is_available_on_repo_and_table_views_but_not_on_overview() {
+    fn find_is_available_on_table_views_but_not_retired_repo_or_overview() {
         let repo: ViewAddress = "repo/github.com/flotilla-org/flotilla".parse().expect("repo address");
         let convoys: ViewAddress = "convoys/flotilla".parse().expect("table address");
 
-        assert!(InteractionContext::for_active_view(Some(&repo), None, true).is_available(Action::OpenFind));
-        assert!(!InteractionContext::for_active_view(Some(&repo), None, false).is_available(Action::OpenFind));
-        assert!(InteractionContext::for_active_view(Some(&convoys), None, false).is_available(Action::OpenFind));
-        assert!(!InteractionContext::for_active_view(Some(&ViewAddress::Overview), None, false).is_available(Action::OpenFind));
+        assert!(!InteractionContext::for_active_view(Some(&repo), None).is_available(Action::OpenFind));
+        assert!(InteractionContext::for_active_view(Some(&convoys), None).is_available(Action::OpenFind));
+        assert!(!InteractionContext::for_active_view(Some(&ViewAddress::Overview), None).is_available(Action::OpenFind));
     }
 
     #[test]
@@ -105,12 +103,9 @@ mod tests {
         let row = RowId::new("row-1");
 
         assert!(matches!(
-            InteractionContext::for_active_view(Some(&convoy), Some(&row), false).selection(),
+            InteractionContext::for_active_view(Some(&convoy), Some(&row)).selection(),
             Some(InteractionSelection::Convoy(_))
         ));
-        assert!(matches!(
-            InteractionContext::for_active_view(Some(&issue), Some(&row), false).selection(),
-            Some(InteractionSelection::Issue(_))
-        ));
+        assert!(matches!(InteractionContext::for_active_view(Some(&issue), Some(&row)).selection(), Some(InteractionSelection::Issue(_))));
     }
 }

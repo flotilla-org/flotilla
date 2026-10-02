@@ -8,6 +8,7 @@ pub mod cli;
 pub mod convoy_model;
 pub mod event;
 pub mod event_log;
+pub mod file_picker_model;
 pub mod interaction;
 pub mod keymap;
 pub mod palette;

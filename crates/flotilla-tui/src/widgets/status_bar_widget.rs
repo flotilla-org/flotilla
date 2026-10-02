@@ -12,7 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext};
 use crate::{
-    app::{ui_state::NotificationKind, InFlightCommand, NamespaceMap, TuiModel, UiState, VisibleStatusItem},
+    app::{ui_state::NotificationKind, InFlightCommand, NamespaceMap, UiState, VisibleStatusItem},
     binding_table::{KeyBindingMode, StatusContent, StatusFragment},
     keymap::Action,
     segment_bar::{self, BarStyle, ThemedRibbonStyle},
@@ -233,22 +233,14 @@ impl InteractiveWidget for StatusBarWidget {
 
 // ── Utility functions (pub(crate) for Screen to use) ──────────────────
 
-/// Resolve the active in-flight task description for the current repo.
-pub(crate) fn active_task(model: &TuiModel, in_flight: &HashMap<u64, InFlightCommand>) -> Option<TaskSection> {
-    let repo_cmds: Vec<(&u64, &InFlightCommand)> = in_flight
-        .iter()
-        .filter(|(_, cmd)| match model.active_repo.as_ref() {
-            Some(active_repo) => &cmd.repo_identity == active_repo,
-            None => cmd.repo_identity.authority.is_empty() && cmd.repo_identity.path.is_empty(),
-        })
-        .collect();
-
+/// Resolve global progress for the daemon's in-flight commands.
+pub(crate) fn active_task(in_flight: &HashMap<u64, InFlightCommand>) -> Option<TaskSection> {
     // Highest command ID = most recently started (IDs are monotonically increasing AtomicU64).
-    let (_, most_recent) = repo_cmds.iter().max_by_key(|(id, _)| *id)?;
-    let description = if repo_cmds.len() <= 1 {
+    let (_, most_recent) = in_flight.iter().max_by_key(|(id, _)| *id)?;
+    let description = if in_flight.len() <= 1 {
         most_recent.description.clone()
     } else {
-        format!("{} (+{})", most_recent.description, repo_cmds.len() - 1)
+        format!("{} (+{})", most_recent.description, in_flight.len() - 1)
     };
 
     Some(TaskSection::new(&description, 0))
@@ -298,7 +290,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crossterm::event::KeyCode;
-    use flotilla_protocol::{RepoIdentity, RepoLabels};
+    use flotilla_protocol::RepoIdentity;
     use ratatui::layout::Rect;
 
     use super::*;
@@ -331,7 +323,7 @@ mod tests {
         assert!(command.contains(": for commands"), "{command}");
     }
     use crate::{
-        app::{test_support::repo_info, NamespaceModel},
+        app::NamespaceModel,
         convoy_model::{ConvoyId, ConvoyPhase, ConvoySummary},
         status_bar::StatusBarAction,
     };
@@ -402,10 +394,7 @@ mod tests {
 
     #[test]
     fn active_task_shows_most_recent_command_with_count_suffix() {
-        let ri = repo_info("/tmp/test-repo", "test-repo", RepoLabels::default());
-        let mut model = TuiModel::from_repo_info(vec![ri]);
-        let repo_identity = model.repo_order[0].clone();
-        model.active_repo = Some(repo_identity.clone());
+        let repo_identity = RepoIdentity { authority: String::new(), path: String::new() };
 
         let mut in_flight = HashMap::new();
         in_flight.insert(10, InFlightCommand {
@@ -415,7 +404,7 @@ mod tests {
         });
         in_flight.insert(20, InFlightCommand { repo_identity, repo: PathBuf::from("/tmp/test-repo"), description: "newer command".into() });
 
-        let task = active_task(&model, &in_flight).expect("should have an active task");
+        let task = active_task(&in_flight).expect("should have an active task");
         assert!(
             task.description.contains("newer command"),
             "task description should show the most recent command, got: {}",
@@ -426,23 +415,17 @@ mod tests {
 
     #[test]
     fn active_task_shows_single_command_without_suffix() {
-        let ri = repo_info("/tmp/test-repo", "test-repo", RepoLabels::default());
-        let mut model = TuiModel::from_repo_info(vec![ri]);
-        let repo_identity = model.repo_order[0].clone();
-        model.active_repo = Some(repo_identity.clone());
+        let repo_identity = RepoIdentity { authority: String::new(), path: String::new() };
 
         let mut in_flight = HashMap::new();
         in_flight.insert(42, InFlightCommand { repo_identity, repo: PathBuf::from("/tmp/test-repo"), description: "only command".into() });
 
-        let task = active_task(&model, &in_flight).expect("should have an active task");
+        let task = active_task(&in_flight).expect("should have an active task");
         assert_eq!(task.description, "only command");
     }
 
     #[test]
     fn active_task_shows_context_free_command_on_project_view() {
-        let ri = repo_info("/tmp/test-repo", "test-repo", RepoLabels::default());
-        let mut model = TuiModel::from_repo_info(vec![ri]);
-        model.active_repo = None;
         let mut in_flight = HashMap::new();
         in_flight.insert(42, InFlightCommand {
             repo_identity: RepoIdentity { authority: String::new(), path: String::new() },
@@ -450,16 +433,25 @@ mod tests {
             description: "Starting convoy...".into(),
         });
 
-        let task = active_task(&model, &in_flight).expect("project view should show context-free command progress");
+        let task = active_task(&in_flight).expect("project view should show context-free command progress");
 
         assert_eq!(task.description, "Starting convoy...");
     }
 
     #[test]
+    fn command_progress_is_visible_without_an_implicit_repository() {
+        let mut in_flight = HashMap::new();
+        in_flight.insert(42, InFlightCommand {
+            repo_identity: RepoIdentity { authority: "github.com".into(), path: "org/repo".into() },
+            repo: PathBuf::from("/tmp/repo"),
+            description: "Opening workspace...".into(),
+        });
+        assert_eq!(active_task(&in_flight).expect("global status shows repository command progress").description, "Opening workspace...");
+    }
+
+    #[test]
     fn active_task_returns_none_when_no_commands() {
-        let ri = repo_info("/tmp/test-repo", "test-repo", RepoLabels::default());
-        let model = TuiModel::from_repo_info(vec![ri]);
         let in_flight: HashMap<u64, InFlightCommand> = HashMap::new();
-        assert!(active_task(&model, &in_flight).is_none());
+        assert!(active_task(&in_flight).is_none());
     }
 }

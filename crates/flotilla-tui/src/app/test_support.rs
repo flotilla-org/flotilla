@@ -155,7 +155,7 @@ pub(crate) fn enter_file_picker(app: &mut App, path: &str, entries: Vec<DirEntry
 }
 
 pub(crate) fn dir_entry(name: &str, is_git_repo: bool, is_added: bool) -> DirEntry {
-    DirEntry { name: name.to_string(), is_dir: true, is_git_repo, is_added }
+    DirEntry::builder().name(name.to_string()).path(PathBuf::from(name)).is_dir(true).is_git_repo(is_git_repo).is_added(is_added).build()
 }
 
 pub(crate) fn repo_info(path: impl Into<PathBuf>, name: impl Into<String>, labels: RepoLabels) -> RepoInfo {
@@ -209,7 +209,6 @@ pub(crate) struct TestWidgetHarness {
     pub provisioning_target: ProvisioningTarget,
     pub my_host: Option<HostName>,
     pub my_node_id: Option<NodeId>,
-    pub active_repo_is_remote_only: bool,
     pub namespaces: crate::app::NamespaceMap,
     pub query_tables: crate::app::QueryTableCache,
 }
@@ -227,7 +226,6 @@ impl TestWidgetHarness {
             provisioning_target: app.ui.provisioning_target.clone(),
             my_host: None,
             my_node_id: None,
-            active_repo_is_remote_only: false,
             namespaces: Default::default(),
             query_tables: Default::default(),
         }
@@ -236,7 +234,6 @@ impl TestWidgetHarness {
     /// Make the overview the active tab (the old `is_config = true`).
     pub fn activate_overview(&mut self) {
         self.views.switch_to(0);
-        self.model.active_repo = None;
     }
 
     pub fn ctx(&mut self) -> WidgetContext<'_> {
@@ -250,7 +247,6 @@ impl TestWidgetHarness {
             my_node_id: self.my_node_id.clone(),
             views: &mut self.views,
             commands: &mut self.commands,
-            active_repo_is_remote_only: self.active_repo_is_remote_only,
             namespaces: &self.namespaces,
             query_tables: &self.query_tables,
             app_actions: Vec::new(),

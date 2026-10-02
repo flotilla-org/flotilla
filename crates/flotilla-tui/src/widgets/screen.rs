@@ -21,6 +21,7 @@ use super::{
 use crate::{
     app::{collect_visible_status_items, ui_state::NotificationKind, view_kind, ViewTarget},
     binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
+    interaction::InteractionContext,
     keymap::Action,
     status_bar::StatusBarAction,
     ui_helpers,
@@ -471,11 +472,7 @@ impl InteractiveWidget for Screen {
 
         // 4b. Resolve key chips from binding mode via compiled binding table.
         //     Progress fragments suppress key chips (user can't interact during progress).
-        let interactions = crate::interaction::InteractionContext::for_active_view(
-            ctx.views.active_address(),
-            ctx.views.active_table_state().selected(),
-            ctx.model.active_repo_identity_opt().is_some(),
-        );
+        let interactions = InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
         let key_chips = if matches!(fragment.status, Some(crate::binding_table::StatusContent::Progress { .. })) {
             vec![]
         } else {
@@ -500,7 +497,7 @@ impl InteractiveWidget for Screen {
         //     Only Normal/Overview modes show in-flight tasks.
         let task = status_bar_widget::resolve_task_from_fragment(&fragment).or_else(|| {
             if self.modal_stack.is_empty() && !ctx.ui.notifications.expanded {
-                status_bar_widget::active_task(ctx.model, ctx.in_flight)
+                status_bar_widget::active_task(ctx.in_flight)
             } else {
                 None
             }

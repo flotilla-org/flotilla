@@ -109,7 +109,6 @@ pub struct WidgetContext<'a> {
     /// contextual commands apply.
     pub views: &'a mut OpenViews,
     pub commands: &'a mut CommandQueue,
-    pub active_repo_is_remote_only: bool,
     /// Per-namespace convoy model — used by the command palette for convoy/work completions.
     pub namespaces: &'a crate::app::NamespaceMap,
     /// Typed named-query rows consumed by reusable tables.

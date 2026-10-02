@@ -50,15 +50,14 @@ pub struct Tabs {
     drag_active: bool,
 }
 
-/// Repo tab decorations (unseen-changes and loading markers), and the
+/// Repo tab loading marker and the
 /// dangling-repo fallback name.
 fn repo_label(identity: &flotilla_protocol::RepoIdentity, model: &TuiModel, level: usize) -> String {
     match model.repos.get(identity) {
         Some(rm) => {
             let name = if level > 0 { format!("{}/{}", identity.authority, identity.path) } else { TuiModel::repo_name(&rm.path) };
             let loading = if rm.loading { " ⟳" } else { "" };
-            let changed = if rm.has_unseen_changes { "*" } else { "" };
-            format!("{name}{changed}{loading}")
+            format!("{name}{loading}")
         }
         // Dangling repo view: the repo is no longer tracked. The tab
         // stays, loudly (ADR 0013).

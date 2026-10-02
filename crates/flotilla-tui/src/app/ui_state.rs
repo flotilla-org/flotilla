@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    path::PathBuf,
+};
 
 use flotilla_protocol::{HostName, IssueRef, ProvisioningTarget, RepoIdentity, ViewAddress};
 use ratatui::layout::Rect;
@@ -9,9 +12,10 @@ use crate::{
     table_view::{PendingRowContext, RowId},
 };
 
-#[derive(Clone)]
+#[derive(Clone, bon::Builder)]
 pub struct DirEntry {
     pub name: String,
+    pub path: PathBuf,
     pub is_dir: bool,
     pub is_git_repo: bool,
     pub is_added: bool,

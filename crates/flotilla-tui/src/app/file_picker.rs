@@ -11,25 +11,22 @@ mod tests {
     use flotilla_protocol::{Command, CommandAction};
 
     use crate::{
-        app::{
-            test_support::{dir_entry, enter_file_picker, key, stub_app},
-            DirEntry,
-        },
+        app::test_support::{dir_entry, enter_file_picker, key, stub_app},
         binding_table::{BindingModeId, KeyBindingMode},
     };
 
     // ── file picker interaction tests ───────────────────────────────
 
-    #[test]
-    fn esc_returns_to_normal() {
+    #[tokio::test]
+    async fn esc_returns_to_normal() {
         let mut app = stub_app();
         enter_file_picker(&mut app, "/tmp/", vec![dir_entry("foo", false, false)]);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen.modal_stack.len(), 0, "expected no modals on stack");
     }
 
-    #[test]
-    fn down_advances_selection() {
+    #[tokio::test]
+    async fn down_advances_selection() {
         let mut app = stub_app();
         let entries = vec![dir_entry("aaa", false, false), dir_entry("bbb", false, false)];
         enter_file_picker(&mut app, "/tmp/", entries);
@@ -43,8 +40,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn down_stays_at_end() {
+    #[tokio::test]
+    async fn down_stays_at_end() {
         let mut app = stub_app();
         let entries = vec![dir_entry("aaa", false, false), dir_entry("bbb", false, false)];
         enter_file_picker(&mut app, "/tmp/", entries);
@@ -60,8 +57,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn up_decrements_selection() {
+    #[tokio::test]
+    async fn up_decrements_selection() {
         let mut app = stub_app();
         let entries = vec![dir_entry("aaa", false, false), dir_entry("bbb", false, false), dir_entry("ccc", false, false)];
         enter_file_picker(&mut app, "/tmp/", entries);
@@ -77,8 +74,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn navigation_noop_on_empty_entries() {
+    #[tokio::test]
+    async fn navigation_noop_on_empty_entries() {
         let mut app = stub_app();
         enter_file_picker(&mut app, "/tmp/", vec![]);
 
@@ -90,8 +87,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tab_completes_directory_name() {
+    #[tokio::test]
+    async fn tab_completes_directory_name() {
         let mut app = stub_app();
         let entries = vec![dir_entry("alpha", false, false), dir_entry("bar", false, false)];
         enter_file_picker(&mut app, "foo/", entries);
@@ -107,8 +104,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn j_advances_selection() {
+    #[tokio::test]
+    async fn j_advances_selection() {
         let mut app = stub_app();
         let entries = vec![dir_entry("aaa", false, false), dir_entry("bbb", false, false)];
         enter_file_picker(&mut app, "/tmp/", entries);
@@ -123,8 +120,8 @@ mod tests {
 
     // ── activate_dir_entry tests ─────────────────────────────────────
 
-    #[test]
-    fn enter_on_git_repo_pushes_add_repo() {
+    #[tokio::test]
+    async fn enter_on_git_repo_pushes_add_repo() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let repo_dir = tmp.path().join("my-repo");
         std::fs::create_dir(&repo_dir).expect("create repo dir");
@@ -132,7 +129,7 @@ mod tests {
 
         let mut app = stub_app();
         let parent_path = format!("{}/", tmp.path().to_string_lossy());
-        let entries = vec![DirEntry { name: "my-repo".to_string(), is_dir: true, is_git_repo: true, is_added: false }];
+        let entries = vec![dir_entry("my-repo", true, false)];
         enter_file_picker(&mut app, &parent_path, entries);
 
         app.handle_key(key(KeyCode::Enter));
@@ -151,8 +148,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn enter_on_added_git_repo_navigates_into_it() {
+    #[tokio::test]
+    async fn enter_on_added_git_repo_navigates_into_it() {
         // When is_git_repo=true AND is_added=true, navigates into the directory
         let tmp = tempfile::tempdir().expect("create tempdir");
         let sub = tmp.path().join("existing-repo");
@@ -161,7 +158,7 @@ mod tests {
 
         let base = format!("{}/", tmp.path().display());
         let mut app = stub_app();
-        let entries = vec![DirEntry { name: "existing-repo".to_string(), is_dir: true, is_git_repo: true, is_added: true }];
+        let entries = vec![dir_entry("existing-repo", true, true)];
         enter_file_picker(&mut app, &base, entries);
 
         app.handle_key(key(KeyCode::Enter));
@@ -175,8 +172,8 @@ mod tests {
         assert!(app.proto_commands.take_next().is_none());
     }
 
-    #[test]
-    fn enter_on_directory_navigates_into_it() {
+    #[tokio::test]
+    async fn enter_on_directory_navigates_into_it() {
         let mut app = stub_app();
         let entries = vec![dir_entry("subdir", false, false)];
         enter_file_picker(&mut app, "/base/path/", entries);
@@ -190,8 +187,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn enter_with_no_entries_does_nothing() {
+    #[tokio::test]
+    async fn enter_with_no_entries_does_nothing() {
         let mut app = stub_app();
         enter_file_picker(&mut app, "/tmp/", vec![]);
 
@@ -207,8 +204,8 @@ mod tests {
 
     // ── Base path extraction tests ───────────────────────────────────
 
-    #[test]
-    fn enter_on_entry_with_trailing_slash_path() {
+    #[tokio::test]
+    async fn enter_on_entry_with_trailing_slash_path() {
         let mut app = stub_app();
         let entries = vec![dir_entry("child", false, false)];
         enter_file_picker(&mut app, "foo/", entries);
@@ -222,8 +219,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn enter_on_entry_without_trailing_slash() {
+    #[tokio::test]
+    async fn enter_on_entry_without_trailing_slash() {
         // Path "foo/ba" means base is "foo/" (rsplit_once on '/')
         let mut app = stub_app();
         let entries = vec![dir_entry("bar", false, false)];

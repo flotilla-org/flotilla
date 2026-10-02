@@ -2,7 +2,7 @@ use std::any::Any;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use flotilla_commands::{HostResolution, RepoContext, Resolved};
-use flotilla_protocol::{Command, CommandAction, NodeId, ProvisioningTarget, RepoIdentity, RepoSelector};
+use flotilla_protocol::{Command, NodeId, ProvisioningTarget};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -17,6 +17,7 @@ use super::{AppAction, InteractiveWidget, Outcome, RenderContext, WidgetContext}
 use crate::{
     app::{file_picker_start_dir, ProjectAddressState, TuiModel},
     binding_table::{BindingModeId, KeyBindingMode, StatusContent, StatusFragment},
+    interaction::InteractionContext,
     keymap::Action,
     palette::{self, PaletteCompletion, PaletteInputState, PaletteLocalResult, PaletteParseResult, MAX_PALETTE_ROWS},
 };
@@ -28,6 +29,8 @@ pub struct CommandPaletteWidget {
     target_node_id: Option<NodeId>,
     overlay: Option<crate::ui_helpers::BottomAnchoredOverlayLayout>,
     project_load_requested: bool,
+    completion_rows: usize,
+    hint_rows: u16,
 }
 
 fn completion_display_text(completion: &PaletteCompletion, showing_addresses: bool) -> &str {
@@ -45,16 +48,43 @@ impl Default for CommandPaletteWidget {
 
 impl CommandPaletteWidget {
     pub fn new() -> Self {
-        Self { input: Input::default(), selected: 0, scroll_top: 0, target_node_id: None, overlay: None, project_load_requested: false }
+        Self {
+            input: Input::default(),
+            selected: 0,
+            scroll_top: 0,
+            target_node_id: None,
+            overlay: None,
+            project_load_requested: false,
+            completion_rows: MAX_PALETTE_ROWS,
+            hint_rows: 0,
+        }
     }
 
     /// Create a palette widget with pre-filled input text and selection.
     pub fn with_state(input: Input, selected: usize, scroll_top: usize) -> Self {
-        Self { input, selected, scroll_top, target_node_id: None, overlay: None, project_load_requested: false }
+        Self {
+            input,
+            selected,
+            scroll_top,
+            target_node_id: None,
+            overlay: None,
+            project_load_requested: false,
+            completion_rows: MAX_PALETTE_ROWS,
+            hint_rows: 0,
+        }
     }
 
     pub fn with_prefill_on_node(text: impl AsRef<str>, target_node_id: Option<NodeId>) -> Self {
-        Self { input: Input::from(text.as_ref()), selected: 0, scroll_top: 0, target_node_id, overlay: None, project_load_requested: false }
+        Self {
+            input: Input::from(text.as_ref()),
+            selected: 0,
+            scroll_top: 0,
+            target_node_id,
+            overlay: None,
+            project_load_requested: false,
+            completion_rows: MAX_PALETTE_ROWS,
+            hint_rows: 0,
+        }
     }
 
     fn request_project_addresses(&mut self, ctx: &mut WidgetContext<'_>) {
@@ -80,12 +110,9 @@ impl CommandPaletteWidget {
         &self,
         model: &TuiModel,
         namespaces: &crate::app::NamespaceMap,
-        has_repo_context: bool,
-        interactions: crate::interaction::InteractionContext<'_>,
+        interactions: InteractionContext<'_>,
     ) -> Vec<PaletteCompletion> {
-        palette::palette_completions_with_availability(self.input.value(), model, namespaces, has_repo_context, |action| {
-            interactions.is_available(action)
-        })
+        palette::palette_completions_with_availability(self.input.value(), model, namespaces, |action| interactions.is_available(action))
     }
 
     /// Fill the selected completion value into the input, appending to the
@@ -112,7 +139,7 @@ impl CommandPaletteWidget {
     }
 
     fn adjust_scroll(&mut self) {
-        let max_visible = MAX_PALETTE_ROWS;
+        let max_visible = self.completion_rows.max(1);
         if self.selected >= self.scroll_top + max_visible {
             self.scroll_top = self.selected.saturating_sub(max_visible - 1);
         } else if self.selected < self.scroll_top {
@@ -155,8 +182,7 @@ impl CommandPaletteWidget {
     }
 
     fn dispatch_resolved(&self, resolved: Resolved, ctx: &mut WidgetContext) -> Outcome {
-        let active_repo = ctx.model.active_repo_identity_opt().cloned();
-        match tui_dispatch(resolved, ctx.model, active_repo.as_ref(), ctx.provisioning_target) {
+        match tui_dispatch(resolved, ctx.model, ctx.provisioning_target) {
             Ok(mut command) => {
                 if command.node_id.is_none() {
                     command.node_id.clone_from(&self.target_node_id);
@@ -171,11 +197,7 @@ impl CommandPaletteWidget {
     }
 
     fn dispatch_palette_action(&self, action: Action, ctx: &mut WidgetContext) -> Outcome {
-        let interactions = crate::interaction::InteractionContext::for_active_view(
-            ctx.views.active_address(),
-            ctx.views.active_table_state().selected(),
-            ctx.model.active_repo_identity_opt().is_some(),
-        );
+        let interactions = InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
         if !interactions.is_available(action) {
             ctx.app_actions.push(AppAction::ShowStatus("That action is not available in this view".into()));
             return Outcome::Finished;
@@ -186,10 +208,9 @@ impl CommandPaletteWidget {
                 Outcome::Swap(Box::new(super::table_search::TableSearchWidget::find(&ctx.views.active_table_state().filter)))
             }
             Action::OpenFilePicker => {
-                let start_dir = file_picker_start_dir(ctx.model);
+                let start_dir = file_picker_start_dir();
                 let input = Input::from(format!("{}/", start_dir.display()).as_str());
-                let dir_entries = refresh_dir_listing_standalone(input.value(), ctx.model);
-                let widget = super::file_picker::FilePickerWidget::new(input.clone(), dir_entries);
+                let widget = super::file_picker::FilePickerWidget::open(input);
                 Outcome::Swap(Box::new(widget))
             }
             Action::ToggleHelp => {
@@ -219,10 +240,6 @@ impl CommandPaletteWidget {
                 Outcome::Finished
             }
             Action::Refresh => {
-                if ctx.model.active_repo_identity_opt().is_none() {
-                    ctx.app_actions.push(AppAction::ShowStatus("this command requires repository context".into()));
-                    return Outcome::Finished;
-                }
                 ctx.app_actions.push(AppAction::Refresh);
                 Outcome::Finished
             }
@@ -233,65 +250,8 @@ impl CommandPaletteWidget {
     }
 }
 
-/// Standalone directory listing that doesn't require `&mut App`.
-pub fn refresh_dir_listing_standalone(path_str: &str, model: &crate::app::TuiModel) -> Vec<crate::app::ui_state::DirEntry> {
-    use std::path::PathBuf;
-
-    use crate::app::ui_state::DirEntry;
-
-    let dir = if path_str.ends_with('/') {
-        PathBuf::from(path_str)
-    } else {
-        PathBuf::from(path_str).parent().map(|p| p.to_path_buf()).unwrap_or_default()
-    };
-
-    let filter = if !path_str.ends_with('/') {
-        PathBuf::from(path_str).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default()
-    } else {
-        String::new()
-    };
-
-    let mut entries = Vec::new();
-    if let Ok(read_dir) = std::fs::read_dir(&dir) {
-        for entry in read_dir.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                continue;
-            }
-            if !filter.is_empty() && !name.to_lowercase().starts_with(&filter) {
-                continue;
-            }
-            let path = entry.path();
-            let is_dir = path.is_dir();
-            if !is_dir {
-                continue;
-            }
-            let is_git_repo = path.join(".git").exists();
-            let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-            let is_added = model.repos.values().any(|repo| repo.path == canonical);
-            entries.push(DirEntry { name, is_dir, is_git_repo, is_added });
-        }
-    }
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    entries
-}
-
-/// Fill SENTINEL empty `RepoSelector::Query("")` fields in a `CommandAction` with a real repo selector.
-fn fill_repo_sentinels(action: &mut CommandAction, repo: RepoSelector) {
-    match action {
-        CommandAction::Checkout { repo: r, .. } if *r == RepoSelector::Query(String::new()) => *r = repo,
-        CommandAction::QueryIssues { repo: r, .. } if *r == RepoSelector::Query(String::new()) => *r = repo,
-        _ => {}
-    }
-}
-
 /// Dispatch a resolved command with ambient context from the TUI environment.
-pub(crate) fn tui_dispatch(
-    resolved: Resolved,
-    model: &TuiModel,
-    active_repo: Option<&RepoIdentity>,
-    provisioning_target: &ProvisioningTarget,
-) -> Result<Command, String> {
+pub(crate) fn tui_dispatch(resolved: Resolved, model: &TuiModel, provisioning_target: &ProvisioningTarget) -> Result<Command, String> {
     if !flotilla_commands::applicability::tui_actionable_resolved(&resolved) {
         return Err("Command has no TUI-visible effect".into());
     }
@@ -299,22 +259,8 @@ pub(crate) fn tui_dispatch(
         Resolved::HostQuery { .. } => Err("Command has no TUI-visible effect".into()),
         Resolved::Ready(cmd) => Ok(cmd),
         Resolved::NeedsContext { mut command, repo, host } => {
-            // Repo context from the active tab (None on non-repo views)
-            let tab_repo = active_repo.map(|id| RepoSelector::Identity(id.clone()));
-
-            match repo {
-                RepoContext::None => {}
-                RepoContext::Required => {
-                    let repo_sel = tab_repo.ok_or_else(|| "no active repository context".to_string())?;
-                    command.context_repo = Some(repo_sel.clone());
-                    fill_repo_sentinels(&mut command.action, repo_sel);
-                }
-                RepoContext::Inferred => {
-                    if tab_repo.is_none() {
-                        return Err("no active repository context".to_string());
-                    }
-                    command.context_repo = tab_repo;
-                }
+            if matches!(repo, RepoContext::Required | RepoContext::Inferred) {
+                return Err("This command requires an explicit repository".into());
             }
 
             // Node resolution — only fill if not already set by explicit `host <name>` routing.
@@ -348,15 +294,10 @@ pub(crate) fn tui_dispatch(
 
 impl InteractiveWidget for CommandPaletteWidget {
     fn handle_action(&mut self, action: Action, ctx: &mut WidgetContext) -> Outcome {
-        let has_repo_context = ctx.model.active_repo_identity_opt().is_some();
-        let interactions = crate::interaction::InteractionContext::for_active_view(
-            ctx.views.active_address(),
-            ctx.views.active_table_state().selected(),
-            ctx.model.active_repo_identity_opt().is_some(),
-        );
+        let interactions = InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
         match action {
             Action::SelectNext => {
-                let count = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions).len();
+                let count = self.completions(ctx.model, ctx.namespaces, interactions).len();
                 if count > 0 {
                     self.selected = (self.selected + 1) % count;
                     self.adjust_scroll();
@@ -364,7 +305,7 @@ impl InteractiveWidget for CommandPaletteWidget {
                 Outcome::Consumed
             }
             Action::SelectPrev => {
-                let count = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions).len();
+                let count = self.completions(ctx.model, ctx.namespaces, interactions).len();
                 if count > 0 {
                     self.selected = if self.selected == 0 { count - 1 } else { self.selected - 1 };
                     self.adjust_scroll();
@@ -374,7 +315,7 @@ impl InteractiveWidget for CommandPaletteWidget {
             Action::Confirm => self.confirm(ctx),
             Action::Dismiss => Outcome::Finished,
             Action::FillSelected => {
-                let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions);
+                let completions = self.completions(ctx.model, ctx.namespaces, interactions);
                 if let Some(completion) = completions.get(self.selected) {
                     self.fill_completion(completion);
                     self.request_project_addresses(ctx);
@@ -386,15 +327,10 @@ impl InteractiveWidget for CommandPaletteWidget {
     }
 
     fn handle_raw_key(&mut self, key: KeyEvent, ctx: &mut WidgetContext) -> Outcome {
-        let has_repo_context = ctx.model.active_repo_identity_opt().is_some();
-        let interactions = crate::interaction::InteractionContext::for_active_view(
-            ctx.views.active_address(),
-            ctx.views.active_table_state().selected(),
-            ctx.model.active_repo_identity_opt().is_some(),
-        );
+        let interactions = InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
         // Right arrow: fill selected completion into input (Tab goes through handle_action)
         if matches!(key.code, KeyCode::Right) {
-            let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions);
+            let completions = self.completions(ctx.model, ctx.namespaces, interactions);
             if let Some(completion) = completions.get(self.selected) {
                 self.fill_completion(completion);
             }
@@ -424,14 +360,13 @@ impl InteractiveWidget for CommandPaletteWidget {
             return Outcome::Finished;
         }
         if overlay.body.contains(position) {
-            let has_repo_context = ctx.model.active_repo_identity_opt().is_some();
-            let interactions = crate::interaction::InteractionContext::for_active_view(
-                ctx.views.active_address(),
-                ctx.views.active_table_state().selected(),
-                has_repo_context,
-            );
-            let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions);
-            let index = self.scroll_top + (mouse.row - overlay.body.y) as usize;
+            let interactions = InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
+            let completions = self.completions(ctx.model, ctx.namespaces, interactions);
+            let row = mouse.row - overlay.body.y;
+            if row < self.hint_rows {
+                return Outcome::Consumed;
+            }
+            let index = self.scroll_top + (row - self.hint_rows) as usize;
             if let Some(completion) = completions.get(index) {
                 self.selected = index;
                 self.fill_completion(completion);
@@ -443,27 +378,35 @@ impl InteractiveWidget for CommandPaletteWidget {
 
     fn render(&mut self, frame: &mut Frame, _area: Rect, ctx: &mut RenderContext) {
         let theme = ctx.theme;
-        let has_repo_context = ctx.model.active_repo_identity_opt().is_some();
-        let interactions = crate::interaction::InteractionContext::for_active_view(
-            ctx.views.active_address(),
-            ctx.views.active_table_state().selected(),
-            ctx.model.active_repo_identity_opt().is_some(),
-        );
-        let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions);
-        let overlay = crate::ui_helpers::bottom_anchored_overlay(frame.area(), 1, MAX_PALETTE_ROWS as u16);
+        let interactions = InteractionContext::for_active_view(ctx.views.active_address(), ctx.views.active_table_state().selected());
+        let completions = self.completions(ctx.model, ctx.namespaces, interactions);
+        let show_failure = palette::is_open_address_completion(self.input.value())
+            && matches!(ctx.model.project_address_state, ProjectAddressState::Failed);
+        let hint_rows = u16::from(show_failure);
+        let overlay = crate::ui_helpers::bottom_anchored_overlay(frame.area(), 1, MAX_PALETTE_ROWS as u16 + hint_rows);
+        self.hint_rows = hint_rows.min(overlay.visible_body_rows);
+        self.completion_rows = overlay.visible_body_rows.saturating_sub(self.hint_rows) as usize;
+        self.adjust_scroll();
         self.overlay = Some(overlay);
         let area = overlay.body;
 
         frame.render_widget(Clear, area);
         frame.render_widget(Block::default().style(Style::default().bg(theme.bar_bg)), area);
 
+        if self.hint_rows > 0 {
+            frame.render_widget(
+                Paragraph::new(" Projects unavailable; reopen to retry").style(Style::default().fg(theme.muted)),
+                Rect::new(area.x, area.y, area.width, 1),
+            );
+        }
+
         let showing_addresses = palette::is_open_address_completion(self.input.value());
         let name_width =
             completions.iter().map(|completion| completion_display_text(completion, showing_addresses).width()).max().unwrap_or(0).min(20);
         let hint_width: u16 = 7;
 
-        for (i, completion) in completions.iter().skip(self.scroll_top).take(overlay.visible_body_rows as usize).enumerate() {
-            let row_y = area.y + i as u16;
+        for (i, completion) in completions.iter().skip(self.scroll_top).take(self.completion_rows).enumerate() {
+            let row_y = area.y + self.hint_rows + i as u16;
             let is_selected = self.scroll_top + i == self.selected;
 
             let row_style = if is_selected {
@@ -537,21 +480,28 @@ impl InteractiveWidget for CommandPaletteWidget {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use flotilla_protocol::CommandAction;
 
     use super::*;
-    use crate::app::test_support::TestWidgetHarness;
+    use crate::{
+        app::{
+            test_support::{stub_app, TestWidgetHarness},
+            UiState,
+        },
+        theme::Theme,
+    };
 
     #[test]
     fn typed_cli_query_cannot_bypass_palette_dispatch_gate() {
         let harness = TestWidgetHarness::new();
         let command = Command::builder().action(CommandAction::QueryFleetReplicaSnapshot {}).build();
-        let result = tui_dispatch(Resolved::Ready(command), &harness.model, None, &harness.provisioning_target);
+        let result = tui_dispatch(Resolved::Ready(command), &harness.model, &harness.provisioning_target);
         assert!(result.is_err());
     }
     fn render_for_mouse(widget: &mut CommandPaletteWidget, harness: &mut TestWidgetHarness) {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("test terminal");
-        let mut ui = crate::app::UiState::new(&[]);
-        let theme = crate::theme::Theme::classic();
+        let mut ui = UiState::new(&[]);
+        let theme = Theme::classic();
         terminal
             .draw(|frame| {
                 let mut ctx = RenderContext {
@@ -571,6 +521,25 @@ mod tests {
 
     fn left_click(column: u16, row: u16) -> MouseEvent {
         MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column, row, modifiers: crossterm::event::KeyModifiers::NONE }
+    }
+
+    #[test]
+    fn refresh_uses_active_project_and_checkout_queries_without_repository_context() {
+        for address in ["project/flotilla/roadmap", "checkouts?project=flotilla%2Froadmap"] {
+            let mut app = stub_app();
+            app.views.open_or_focus(address.parse().expect("view address"));
+            app.sync_active_view();
+            app.subscriptions_dirty = false;
+            let mut widget = CommandPaletteWidget::with_state(Input::from("refresh"), 0, 0);
+            let mut ctx = app.build_widget_context();
+            assert!(matches!(widget.handle_action(Action::Confirm, &mut ctx), Outcome::Finished));
+            let actions = std::mem::take(&mut ctx.app_actions);
+            assert!(actions.iter().any(|action| matches!(action, AppAction::Refresh)), "{address}: {actions:?}");
+            drop(ctx);
+            app.process_app_actions(actions);
+            assert!(app.subscriptions_dirty, "refresh should invalidate active query subscriptions");
+            assert!(app.proto_commands.take_next().is_none(), "refresh uses queries rather than a repository command");
+        }
     }
 
     #[test]
@@ -597,12 +566,9 @@ mod tests {
     fn selection_wraps_in_both_directions() {
         let mut widget = CommandPaletteWidget::new();
         let mut harness = TestWidgetHarness::new();
-        let interactions = crate::interaction::InteractionContext::for_active_view(
-            harness.views.active_address(),
-            harness.views.active_table_state().selected(),
-            harness.model.active_repo_identity_opt().is_some(),
-        );
-        let count = widget.completions(&harness.model, &harness.namespaces, false, interactions).len();
+        let interactions =
+            InteractionContext::for_active_view(harness.views.active_address(), harness.views.active_table_state().selected());
+        let count = widget.completions(&harness.model, &harness.namespaces, interactions).len();
         assert!(count > 1);
 
         widget.handle_action(Action::SelectPrev, &mut harness.ctx());
@@ -662,14 +628,42 @@ mod tests {
     }
 
     #[test]
+    fn failed_project_completions_show_persistent_hint_and_keep_ambient_rows() {
+        let mut harness = TestWidgetHarness::new();
+        harness.model.project_address_state = ProjectAddressState::Failed;
+        let mut widget = CommandPaletteWidget::with_state(Input::from("open "), 0, 0);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("test terminal");
+        let mut ui = UiState::new(&[]);
+        let theme = Theme::classic();
+        terminal
+            .draw(|frame| {
+                let mut ctx = RenderContext {
+                    model: &harness.model,
+                    views: &mut harness.views,
+                    ui: &mut ui,
+                    theme: &theme,
+                    keymap: &harness.keymap,
+                    in_flight: &harness.in_flight,
+                    namespaces: &harness.namespaces,
+                    query_tables: &harness.query_tables,
+                };
+                widget.render(frame, frame.area(), &mut ctx);
+            })
+            .expect("render palette");
+        let rendered = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(rendered.contains("Projects unavailable; reopen to retry"));
+        assert!(rendered.contains("overview"));
+    }
+
+    #[test]
     fn open_address_rows_render_decoded_human_labels() {
         let mut harness = TestWidgetHarness::new();
         harness.model.project_address_state =
             ProjectAddressState::Loaded(vec!["project/flotilla/r%C3%A9sum%C3%A9".parse().expect("project address")]);
         let mut widget = CommandPaletteWidget::with_state(Input::from("open project/"), 0, 0);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("test terminal");
-        let mut ui = crate::app::UiState::new(&[]);
-        let theme = crate::theme::Theme::classic();
+        let mut ui = UiState::new(&[]);
+        let theme = Theme::classic();
         terminal
             .draw(|frame| {
                 let mut ctx = RenderContext {
@@ -720,12 +714,9 @@ mod tests {
         let mut widget = CommandPaletteWidget::new();
         let mut harness = TestWidgetHarness::new();
         render_for_mouse(&mut widget, &mut harness);
-        let interactions = crate::interaction::InteractionContext::for_active_view(
-            harness.views.active_address(),
-            harness.views.active_table_state().selected(),
-            false,
-        );
-        let expected = widget.completions(&harness.model, &harness.namespaces, false, interactions)[1].value.clone();
+        let interactions =
+            InteractionContext::for_active_view(harness.views.active_address(), harness.views.active_table_state().selected());
+        let expected = widget.completions(&harness.model, &harness.namespaces, interactions)[1].value.clone();
         let body = widget.overlay.expect("rendered overlay").body;
         let outcome = widget.handle_mouse(left_click(body.x + 2, body.y + 1), &mut harness.ctx());
         assert!(matches!(outcome, Outcome::Consumed));
@@ -749,12 +740,9 @@ mod tests {
         let mut widget = CommandPaletteWidget::with_state(Input::from(""), 2, 2);
         let mut harness = TestWidgetHarness::new();
         render_for_mouse(&mut widget, &mut harness);
-        let interactions = crate::interaction::InteractionContext::for_active_view(
-            harness.views.active_address(),
-            harness.views.active_table_state().selected(),
-            false,
-        );
-        let expected = widget.completions(&harness.model, &harness.namespaces, false, interactions)[2].value.clone();
+        let interactions =
+            InteractionContext::for_active_view(harness.views.active_address(), harness.views.active_table_state().selected());
+        let expected = widget.completions(&harness.model, &harness.namespaces, interactions)[2].value.clone();
         let body = widget.overlay.expect("rendered overlay").body;
         let outcome = widget.handle_mouse(left_click(body.x + 2, body.y), &mut harness.ctx());
         assert!(matches!(outcome, Outcome::Consumed));
@@ -769,8 +757,8 @@ mod tests {
             widget.handle_raw_key(KeyEvent::new(KeyCode::Left, crossterm::event::KeyModifiers::NONE), &mut harness.ctx());
         }
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("test terminal");
-        let mut ui = crate::app::UiState::new(&[]);
-        let theme = crate::theme::Theme::classic();
+        let mut ui = UiState::new(&[]);
+        let theme = Theme::classic();
         terminal
             .draw(|frame| {
                 let status_row = crate::ui_helpers::bottom_anchored_overlay(frame.area(), 1, MAX_PALETTE_ROWS as u16).status_row;
