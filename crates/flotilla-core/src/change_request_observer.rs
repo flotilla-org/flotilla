@@ -188,12 +188,13 @@ pub(crate) fn parse_gh_observation_with_crew_identity(
     // committedDate fallback for ordinary pushes; it can over-report feedback for
     // a delayed push, so callers must still handle such feedback explicitly.
     let commit = &value["commits"]["nodes"][0]["commit"];
+    let head_oid = value["headRefOid"].as_str();
     let force_push_at = value["timelineItems"]["nodes"]
         .as_array()
         .into_iter()
         .flatten()
         .rev()
-        .find(|event| event["afterCommit"]["oid"] == value["headRefOid"])
+        .find(|event| head_oid.is_some() && event["afterCommit"]["oid"].as_str() == head_oid)
         .and_then(|event| event["createdAt"].as_str());
     let head_at = force_push_at.or_else(|| commit["pushedDate"].as_str()).or_else(|| commit["committedDate"].as_str());
     let reviews = value["reviews"]["nodes"].as_array();
