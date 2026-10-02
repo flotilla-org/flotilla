@@ -55,7 +55,7 @@ pub enum VcsKind {
     Jujutsu,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EnvironmentAssertion {
     BinaryAvailable { name: String, path: ExecutionEnvironmentPath, version: Option<String> },
     EnvVarSet { key: String, value: String },

@@ -787,6 +787,42 @@ async fn host_capability_provider_is_constructed_once_for_multiple_tracked_repos
     assert_eq!(probes.load(Ordering::SeqCst), 1, "host provider construction must not scale with repository count");
 }
 
+struct FreshIssueFactory;
+
+#[async_trait]
+impl Factory for FreshIssueFactory {
+    type Descriptor = ProviderDescriptor;
+    type Output = dyn flotilla_core::providers::issue_tracker::IssueProvider;
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor::named(ProviderCategory::IssueProvider, "fresh-issues")
+    }
+    async fn probe(
+        &self,
+        _: &EnvironmentBag,
+        _: &ConfigStore,
+        _: &ExecutionEnvironmentPath,
+        _: Arc<dyn CommandRunner>,
+    ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
+        Ok(Arc::new(FakeIssueProvider::new()))
+    }
+}
+
+#[tokio::test]
+async fn demanded_host_issue_provider_keeps_its_lifetime_without_a_checkout() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut discovery = fake_discovery(false);
+    discovery.factories.issue_trackers = vec![Box::new(FreshIssueFactory)];
+    let daemon = InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+    let source = IssueSource { service: "fake".into(), scope: "owner/repo".into() };
+    let first = daemon.issue_provider_for_source(&source).await.expect("first provider");
+    let second = daemon.issue_provider_for_source(&source).await.expect("retained provider");
+    assert!(Arc::ptr_eq(&first, &second), "a live provider lease must preserve state such as ETag caches");
+    drop(first);
+    drop(second);
+    let replacement = daemon.issue_provider_for_source(&source).await.expect("new provider lifetime");
+    assert!(replacement.supports(&source));
+}
+
 #[tokio::test]
 async fn fetch_issue_by_ref_does_not_require_a_tracked_checkout() {
     let temp = tempfile::tempdir().expect("create tempdir");

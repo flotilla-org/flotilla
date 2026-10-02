@@ -279,6 +279,8 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         let observed_at = Utc::now();
         let mut statuses = HashMap::new();
         let (mut pages, mut nodes) = (0, 0);
+        // The source observer supplies a rotating priority order. Keep it here
+        // so fairness survives rediscovery of this stateless provider.
         for number in numbers {
             let request = &repository[format!("pr{number}")];
             if request.is_null() {
@@ -807,6 +809,34 @@ mod tests {
         assert!(statuses[&1].as_ref().expect_err("budget exhausted").contains("pagination budget"));
         assert_eq!(statuses[&2].as_ref().expect("healthy PR").title.value.as_deref(), Some("Healthy"));
         assert_eq!(runner.calls().len(), MAX_HISTORY_PAGE_QUERIES + 1);
+    }
+
+    #[tokio::test]
+    async fn caller_history_priority_preserves_shared_budget_and_errors() {
+        let busy = serde_json::json!({"state": "OPEN", "reviewDecision": null,
+            "comments": {"pageInfo": {"hasPreviousPage": true, "startCursor": "more"}, "nodes": []},
+            "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}});
+        let initial = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": busy, "pr2": busy}}}));
+        let page = format!(
+            "HTTP/2 200 OK\r\n\r\n{}",
+            serde_json::json!({"data": {"repository": {"pr": {"comments": {
+                "pageInfo": {"hasPreviousPage": true, "startCursor": "more"}, "nodes": []}}}}})
+        );
+        let cycle = std::iter::once(Ok(initial)).chain(std::iter::repeat_n(Ok(page), MAX_HISTORY_PAGE_QUERIES)).collect::<Vec<_>>();
+        let runner = Arc::new(MockRunner::new(cycle.iter().cloned().chain(cycle.iter().cloned()).collect()));
+        let provider =
+            GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
+        for priority in [[1, 2], [2, 1]] {
+            let statuses = provider.observe_bound(&priority, &Default::default()).await.expect("observe cycle");
+            assert!(statuses.values().all(Result::is_err), "incomplete histories remain errors");
+        }
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2 * (MAX_HISTORY_PAGE_QUERIES + 1));
+        assert!(calls[1].1.last().expect("query").contains("number:1"));
+        assert!(
+            calls[MAX_HISTORY_PAGE_QUERIES + 2].1.last().expect("query").contains("number:2"),
+            "later request must receive the next cycle's pagination budget"
+        );
     }
 
     #[tokio::test]

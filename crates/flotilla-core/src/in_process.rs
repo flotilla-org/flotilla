@@ -143,9 +143,11 @@ fn forge_service_matches(service_url: &str, service: &str) -> bool {
     service_url.split_once("://").is_some_and(|(_, authority)| authority.trim_end_matches('/').eq_ignore_ascii_case(service))
 }
 
+#[derive(bon::Builder)]
 struct CachedObservation {
     expires_at: tokio::time::Instant,
     queried: BTreeSet<u64>,
+    next_history_start: usize,
     result: Result<BoundObservations, String>,
 }
 
@@ -188,7 +190,16 @@ trait IssueQueryPort: Send + Sync {
     }
 }
 
+#[derive(bon::Builder)]
+struct HostIssueProviderLease {
+    bag: EnvironmentBag,
+    runner: Arc<dyn CommandRunner>,
+    config: serde_json::Value,
+    provider: Weak<dyn IssueProvider>,
+}
+
 struct ProviderIssueQueryPort {
+    host_providers: Mutex<HashMap<flotilla_protocol::IssueSource, HostIssueProviderLease>>,
     backend: ResourceBackend,
     repos: Arc<RwLock<HashMap<RepoIdentity, RepoState>>>,
     config: Arc<ConfigStore>,
@@ -219,10 +230,33 @@ impl IssueQueryPort for ProviderIssueQueryPort {
         if let Some(forge) = forge_for_remote(&self.backend, &namespace, &format!("{}/{}", source.service, source.scope)).await? {
             bag = bag.with(EnvironmentAssertion::origin_forge(forge));
         }
+        // Source observers retain a strong lease. Re-resolving a host-only
+        // capability must not recreate its ETag cache while that lease lives.
+        // Environment or configuration changes invalidate the old capability.
+        let config = serde_json::to_value(self.config.load_config()).map_err(|error| error.to_string())?;
+        let mut host_providers = self.host_providers.lock().await;
+        host_providers.retain(|_, lease| lease.provider.strong_count() > 0);
+        if let Some(lease) = host_providers.get(source) {
+            if lease.bag.assertions() == bag.assertions() && Arc::ptr_eq(&lease.runner, &runner) && lease.config == config {
+                if let Some(provider) = lease.provider.upgrade() {
+                    return Ok(provider);
+                }
+            }
+        }
+        host_providers.remove(source);
         let probe_root = ExecutionEnvironmentPath::new(self.config.base_path().as_ref());
         for factory in &self.discovery.factories.issue_trackers {
             if let Ok(provider) = factory.probe(&bag, &self.config, &probe_root, Arc::clone(&runner)).await {
                 if provider.supports(source) {
+                    host_providers.insert(
+                        source.clone(),
+                        HostIssueProviderLease::builder()
+                            .bag(bag.clone())
+                            .runner(runner.clone())
+                            .config(config.clone())
+                            .provider(Arc::downgrade(&provider))
+                            .build(),
+                    );
                     return Ok(provider);
                 }
             }
@@ -449,7 +483,11 @@ impl ProviderChangeRequestObservationSource {
                 }
             }
         }
-        let numbers = queried.iter().copied().collect::<Vec<_>>();
+        let mut numbers = queried.iter().copied().collect::<Vec<_>>();
+        // The provider is rediscovered per observation. Keep fair history
+        // scheduling with this source's cache rather than on that provider.
+        let history_start = cache.as_ref().map_or(0, |cached| cached.next_history_start) % numbers.len();
+        numbers.rotate_left(history_start);
         let mut crew_logins = BTreeMap::<u64, BTreeSet<String>>::new();
         let credentials = if credential_refs_by_number.is_empty() {
             Vec::new()
@@ -503,7 +541,14 @@ impl ProviderChangeRequestObservationSource {
         let status = result.as_ref().map_err(Clone::clone).and_then(|statuses| {
             statuses.get(&subject.number).cloned().unwrap_or_else(|| Err(format!("change request {} was not found", subject.number)))
         });
-        *cache = Some(CachedObservation { expires_at: tokio::time::Instant::now() + delay, queried, result });
+        *cache = Some(
+            CachedObservation::builder()
+                .expires_at(tokio::time::Instant::now() + delay)
+                .queried(queried)
+                .next_history_start((history_start + 1) % numbers.len())
+                .result(result)
+                .build(),
+        );
         status
     }
 }
@@ -1944,6 +1989,7 @@ impl InProcessDaemon {
             tracing::warn!(%error, "garbage collect orphaned change request observations at startup failed");
         }
         let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(ProviderIssueQueryPort {
+            host_providers: Mutex::new(HashMap::new()),
             backend: resource_backend.clone(),
             repos: Arc::clone(&repos),
             config: Arc::clone(&config),

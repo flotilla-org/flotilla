@@ -2180,6 +2180,84 @@ impl CommandRunner for BatchedObservationRunner {
     }
 }
 
+#[derive(Default)]
+struct BusyObservationRunner {
+    pages: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl CommandRunner for BusyObservationRunner {
+    async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        Ok("test version".into())
+    }
+    async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+        true
+    }
+    async fn run_output(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+    ) -> Result<crate::providers::CommandOutput, String> {
+        if cmd != "gh" || args.first() != Some(&"api") || args.get(1) != Some(&"graphql") {
+            return self.run(cmd, args, cwd, label).await.map(|stdout| crate::providers::CommandOutput {
+                stdout,
+                stderr: String::new(),
+                success: true,
+            });
+        }
+        let query = args.iter().find_map(|arg| arg.strip_prefix("query=")).ok_or("query")?;
+        let comments = serde_json::json!({"pageInfo": {"hasPreviousPage": true, "startCursor": "more"}, "nodes": []});
+        let document = if query.contains("pr:pullRequest") {
+            self.pages.lock().expect("pages").push(query.into());
+            serde_json::json!({"data": {"repository": {"pr": {"comments": comments}}}})
+        } else {
+            let busy = serde_json::json!({"state": "OPEN", "reviewDecision": null, "comments": comments,
+                "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}});
+            serde_json::json!({"data": {"repository": {"pr1": busy, "pr2": busy, "pr3": busy}}})
+        };
+        Ok(crate::providers::CommandOutput { stdout: format!("HTTP/2 200 OK\r\n\r\n{document}"), stderr: String::new(), success: true })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn source_pagination_fairness_survives_provider_rediscovery() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), r#"machine_id = "fair-pagination-test""#).expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repository = RepositorySpec::remote("https://github.com/team/one").expect("repository");
+    backend.using::<Repository>("flotilla").create(&test_meta(&repository.key().to_string()), &repository).await.expect("repository");
+    let runner = Arc::new(BusyObservationRunner::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery_with_runner(false, runner.clone()),
+        HostName::new("test-host"),
+        backend,
+    )
+    .await;
+    daemon
+        .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")))
+        .expect("capability");
+    let subjects = [1, 2, 3].map(|number| ChangeRequestRef {
+        namespace: "flotilla".into(),
+        service: "github.com".into(),
+        scope: "team/one".into(),
+        number,
+    });
+    for _ in 0..4 {
+        let error = daemon.change_request_observation_source.observe_group(&subjects, &subjects[0]).await.expect_err("incomplete history");
+        assert!(error.contains("pagination budget"));
+        tokio::time::advance(Duration::from_secs(10)).await;
+    }
+    let pages = runner.pages.lock().expect("pages");
+    assert_eq!(pages.len(), 32, "all four cycles retain the eight-page shared budget");
+    for (cycle, number) in [1, 2, 3, 1].into_iter().enumerate() {
+        assert!(pages[cycle * 8].contains(&format!("number:{number}")), "priority rotates through every PR and wraps across rediscovery");
+    }
+}
+
 #[tokio::test]
 async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit() {
     let runner = Arc::new(BatchedObservationRunner {
