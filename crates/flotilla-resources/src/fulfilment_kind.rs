@@ -175,6 +175,26 @@ pub enum FulfilmentCostClass {
     Metered,
 }
 
+impl FulfilmentCostClass {
+    pub const ALL: [Self; 3] = [Self::OwnedIdle, Self::SubscriptionIncluded, Self::Metered];
+
+    /// The serialized name, which `convoy explain` also displays. A contract
+    /// test keeps it equal to serde's `snake_case` name for every variant.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnedIdle => "owned_idle",
+            Self::SubscriptionIncluded => "subscription_included",
+            Self::Metered => "metered",
+        }
+    }
+}
+
+impl fmt::Display for FulfilmentCostClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "realisation", rename_all = "snake_case")]
 pub enum FulfilmentRealisation {

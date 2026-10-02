@@ -62,7 +62,7 @@ use flotilla_resources::{
     ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionClaim, CrewCompletionPending,
     CrewMessageDelivery, CrewMessageSender, CrewSource, CrewSpec, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry,
     DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, DocumentKey, Environment as ResourceEnvironment, EnvironmentPhase,
-    EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, HoldAct, Host as ResourceHost,
+    EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, HoldAct, Host as ResourceHost,
     HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
     IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectEvent, ObjectMeta, ObservedChangeRequestState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec,

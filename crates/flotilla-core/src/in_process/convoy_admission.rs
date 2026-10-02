@@ -741,12 +741,7 @@ impl ConvoyAdmission {
                 .map(|candidate| FulfilmentAllocationCandidate {
                     kind: candidate.kind.metadata.name.clone(),
                     host: candidate.kind.spec.host_ref.clone(),
-                    cost_class: match candidate.kind.spec.cost_class {
-                        FulfilmentCostClass::OwnedIdle => "owned_idle",
-                        FulfilmentCostClass::SubscriptionIncluded => "subscription_included",
-                        FulfilmentCostClass::Metered => "metered",
-                    }
-                    .to_string(),
+                    cost_class: candidate.kind.spec.cost_class.to_string(),
                     host_ready: candidate.host_ready,
                     sleeping_until: candidate.sleeping_until,
                     free_vessel_slots: candidate.free_slots,
@@ -3046,7 +3041,9 @@ pub(super) fn parse_ad_hoc_capability_need(value: &str) -> Result<CapabilityNeed
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use flotilla_resources::{FulfilmentKindSpec, FulfilmentRealisation, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec};
+    use flotilla_resources::{
+        FulfilmentCostClass, FulfilmentKindSpec, FulfilmentRealisation, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
+    };
 
     use super::*;
     use crate::providers::{
