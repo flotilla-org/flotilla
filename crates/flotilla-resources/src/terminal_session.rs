@@ -9,6 +9,9 @@ use crate::{
     Vessel, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
+/// Stored degradation reason shared by writers, controllers and surfaces.
+pub const TERMINAL_DELIVERY_UNCONFIRMED_REASON: &str = "DeliveryUnconfirmed";
+
 define_resource!(
     TerminalSession,
     "terminalsessions",
@@ -529,7 +532,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
             Self::MarkDeliveryUnconfirmed { message_id, message, observed_at } => {
                 status.message = Some(message.clone());
                 status.degraded = Some(TerminalSessionDegradedCondition {
-                    reason: "DeliveryUnconfirmed".to_string(),
+                    reason: TERMINAL_DELIVERY_UNCONFIRMED_REASON.to_string(),
                     message: message.clone(),
                     message_id: Some(message_id.clone()),
                     consecutive_failures: 1,

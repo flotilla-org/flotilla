@@ -11,7 +11,8 @@ use flotilla_resources::{
     TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, Vessel, ACTUATOR_HOST_REF_ANNOTATION,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG,
-    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
+    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
+    TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -342,7 +343,8 @@ where
             if let flotilla_resources::TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
                 if let Some(message) = head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
                     if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
-                        condition.reason == "DeliveryUnconfirmed" && condition.message_id.as_deref() == Some(message.id.as_str())
+                        condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
+                            && condition.message_id.as_deref() == Some(message.id.as_str())
                     }) {
                         return Ok(TerminalPrepared::None);
                     }
@@ -573,7 +575,7 @@ where
             obj.status
                 .as_ref()
                 .and_then(|status| status.degraded.as_ref())
-                .is_some_and(|condition| condition.reason != "DeliveryUnconfirmed")
+                .is_some_and(|condition| condition.reason != TERMINAL_DELIVERY_UNCONFIRMED_REASON)
                 .then_some(TerminalSessionStatusPatch::ClearReconcileDegraded)
         });
 

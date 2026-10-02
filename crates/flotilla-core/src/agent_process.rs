@@ -26,7 +26,7 @@ mod tests {
     #[test]
     fn parent_records_agent_exit_and_keeps_launches_independent() {
         let cwd = tempfile::tempdir().expect("checkout");
-        for code in [0, 1, 42, 137] {
+        for code in [0, 1, 42, 130, 137] {
             let crew = format!("crew-{code}");
             let result = Command::new("sh")
                 .arg("-c")
