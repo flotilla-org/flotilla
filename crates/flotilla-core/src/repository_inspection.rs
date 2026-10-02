@@ -94,21 +94,37 @@ pub trait RepositoryInspector: Send + Sync {
     }
 }
 
+/// Committed ops declarations readable on this host, for candidate-side
+/// pre-roll validation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OperationalEntryInventory {
+    pub entries: Vec<OperationalEntryFile>,
+    /// Ops members with no checkout on this host. The daemon refuses to load
+    /// these sources here, so their entries cannot change this host's behaviour;
+    /// they are validated on the hosts that hold a checkout.
+    #[serde(default)]
+    pub unavailable: Vec<String>,
+}
+
 /// Export the committed declaration inputs without parsing them with the running
 /// daemon. A pre-roll candidate applies its own parser to this inventory.
 pub async fn inspect_project_ops_entries(
     projects: &[ResourceObject<Project>],
     paths: &BTreeMap<RepositoryKey, Vec<PathBuf>>,
     inspector: &dyn RepositoryInspector,
-) -> Result<Vec<OperationalEntryFile>, String> {
+) -> Result<OperationalEntryInventory, String> {
     use crate::project_declaration::{BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION};
-    let mut files = Vec::new();
+    let mut inventory = OperationalEntryInventory::default();
     for project in projects {
         for member in project.spec.repositories.iter().filter(|member| member.roles.contains(&ProjectRepositoryRole::Ops)) {
             let mut candidates = paths.get(&member.repo).cloned().unwrap_or_default();
             if project.metadata.annotations.get(BOOTSTRAP_REPOSITORY_ANNOTATION) == Some(&member.repo.to_string()) {
-                if let Some(path) = project.metadata.annotations.get(BOOTSTRAP_PATH_ANNOTATION) {
-                    candidates.push(PathBuf::from(path));
+                // The annotation travels with the replicated Project, so it may
+                // name another host's checkout.
+                if let Some(path) = project.metadata.annotations.get(BOOTSTRAP_PATH_ANNOTATION).map(PathBuf::from) {
+                    if path.is_dir() {
+                        candidates.push(path);
+                    }
                 }
             }
             candidates.sort();
@@ -116,10 +132,12 @@ pub async fn inspect_project_ops_entries(
             let path = match candidates.as_slice() {
                 [path] => path.clone(),
                 [] => {
-                    return Err(format!(
-                        "Project/{}: ops member {} has no checkout available for candidate validation",
-                        project.metadata.name, member.repo
-                    ))
+                    inventory.unavailable.push(format!(
+                        "Project/{}: ops member {} has no checkout on this host",
+                        project.metadata.name,
+                        member.alias.as_deref().unwrap_or(&member.repo.0)
+                    ));
+                    continue;
                 }
                 _ => {
                     let mut main_paths = Vec::new();
@@ -139,11 +157,14 @@ pub async fn inspect_project_ops_entries(
                     }
                 }
             };
-            let source = inspector
-                .inspect_operational_entries(&path)
-                .await
+            // The member's identity already selected this checkout, so read its
+            // files directly. Re-deriving identity would refuse a checkout whose
+            // remotes are ambiguous without a tracked branch (a detached HEAD).
+            let mut source = Vec::new();
+            collect_operational_entry_files(&path, &path, &mut source)
                 .map_err(|error| format!("Project/{} ops member {}: {error}", project.metadata.name, member.repo))?;
-            for mut file in source.files {
+            source.sort_by(|left, right| left.path.cmp(&right.path));
+            for mut file in source {
                 file.path = format!(
                     "{}/{}/{}/{}",
                     project.metadata.namespace,
@@ -151,11 +172,11 @@ pub async fn inspect_project_ops_entries(
                     member.alias.as_deref().unwrap_or(&member.repo.0),
                     file.path
                 );
-                files.push(file);
+                inventory.entries.push(file);
             }
         }
     }
-    Ok(files)
+    Ok(inventory)
 }
 
 fn collect_operational_entry_files(root: &Path, directory: &Path, files: &mut Vec<OperationalEntryFile>) -> Result<(), String> {

@@ -9,7 +9,7 @@ use flotilla_core::{
     ops_entry::{parse_operational_entry, OperationalEntryFile},
     path_context::ExecutionEnvironmentPath,
     providers::{vcs::git_worktree::GitWorktreeStrategy, ProcessCommandRunner},
-    repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, RepositoryInspector},
+    repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector},
     vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
 };
 use flotilla_resources::{
@@ -138,12 +138,12 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
     let mut local_inventory = None;
     for (namespace, registered) in projects {
         let response = client.get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/operationalentries")).send().await?;
-        let result = if response.status().is_success() {
-            let document: Value = response.json().await?;
-            let files: Vec<OperationalEntryFile> =
-                serde_json::from_value(document.get("entries").cloned().ok_or_else(|| eyre!("ops inventory has no entries"))?)?;
-            validate_ops_files(&files)
-        } else if response.status() == reqwest::StatusCode::NOT_FOUND {
+        let status = response.status();
+        let (success, body) =
+            if status.is_success() { (Some(response.json::<Value>().await?), None) } else { (None, Some(response.text().await?)) };
+        let result = if let Some(document) = success {
+            validate_ops_inventory(&serde_json::from_value(document)?)
+        } else if ops_inventory_endpoint_absent(status, body.as_deref().unwrap_or_default()) {
             // An absent endpoint (including on older daemons) does not prove
             // a particular version. Candidate-side local inspection is still
             // mandatory; never interpret a 404 as an empty input inventory.
@@ -169,7 +169,7 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
             }
             .await
         } else {
-            Err(eyre!("{namespace}: cannot inspect operational entries: {}", response.text().await?))
+            Err(eyre!("{namespace}: cannot inspect operational entries: {}", body.unwrap_or_default()))
         };
         match result {
             Ok(0) => {}
@@ -189,6 +189,14 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
         println!("validated {count} stored records");
         Ok(count)
     }
+}
+
+/// Whether a daemon lacks the operational-entries inventory endpoint. Previous
+/// generations either have no route (404) or reject the kind as unknown (400),
+/// and both fall back to candidate-side local inspection. Other errors, such as
+/// 422 for an unavailable ops source, are real refusals.
+fn ops_inventory_endpoint_absent(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::NOT_FOUND || (status == reqwest::StatusCode::BAD_REQUEST && body.contains("unknown resource kind"))
 }
 
 fn validate_ops_files(files: &[OperationalEntryFile]) -> Result<usize> {
@@ -214,8 +222,12 @@ async fn inspect_validation_roots(
 ) -> Result<BTreeMap<flotilla_resources::RepositoryKey, Vec<PathBuf>>> {
     let mut paths = BTreeMap::new();
     for root in roots {
-        let inspection = inspector.inspect_path(root, None).await.map_err(|error| eyre!("{}: {error}", root.display()))?;
-        paths.entry(inspection.spec.key()).or_insert_with(Vec::new).push(root.clone());
+        // A root without a derivable identity cannot back any ops member. Report
+        // it and continue: a member that needed it still fails as unavailable.
+        match inspector.inspect_path(root, None).await {
+            Ok(inspection) => paths.entry(inspection.spec.key()).or_insert_with(Vec::new).push(root.clone()),
+            Err(error) => eprintln!("{}: not identified for ops validation: {error}", root.display()),
+        }
     }
     Ok(paths)
 }
@@ -225,8 +237,14 @@ async fn validate_project_ops(
     paths: &BTreeMap<flotilla_resources::RepositoryKey, Vec<PathBuf>>,
     inspector: &dyn RepositoryInspector,
 ) -> Result<usize> {
-    let files = inspect_project_ops_entries(projects, paths, inspector).await.map_err(|error| eyre!(error))?;
-    validate_ops_files(&files)
+    validate_ops_inventory(&inspect_project_ops_entries(projects, paths, inspector).await.map_err(|error| eyre!(error))?)
+}
+
+fn validate_ops_inventory(inventory: &OperationalEntryInventory) -> Result<usize> {
+    for unavailable in &inventory.unavailable {
+        println!("{unavailable}; validated on the hosts that hold it");
+    }
+    validate_ops_files(&inventory.entries)
 }
 
 pub fn validate_path(path: &Path, skill_catalog: Option<&Path>) -> Result<()> {
@@ -370,8 +388,22 @@ mod tests {
     use flotilla_test_support::TestSocketDir;
 
     use super::{
-        collect_files, inspect_validation_roots, parse_documents, validate_daemon, validate_project_ops, VALIDATION_INSPECTION_HOST,
+        collect_files, inspect_validation_roots, ops_inventory_endpoint_absent, parse_documents, validate_daemon, validate_project_ops,
+        VALIDATION_INSPECTION_HOST,
     };
+
+    #[test]
+    fn previous_generation_daemons_fall_back_to_local_ops_inspection() {
+        // A previous-generation daemon rejects the new kind as unknown (live r445 behaviour):
+        // the pre-roll check must inspect ops locally, not fail the install.
+        let unknown = "invalid resource: unknown resource kind 'operationalentries' (supported: artifacts, convoys)";
+        assert!(ops_inventory_endpoint_absent(reqwest::StatusCode::BAD_REQUEST, unknown));
+        assert!(ops_inventory_endpoint_absent(reqwest::StatusCode::NOT_FOUND, ""));
+        // Real refusals stay refusals.
+        assert!(!ops_inventory_endpoint_absent(reqwest::StatusCode::BAD_REQUEST, "invalid namespace"));
+        assert!(!ops_inventory_endpoint_absent(reqwest::StatusCode::UNPROCESSABLE_ENTITY, "unknown resource kind"));
+        assert!(!ops_inventory_endpoint_absent(reqwest::StatusCode::INTERNAL_SERVER_ERROR, ""));
+    }
 
     #[test]
     fn reports_the_nested_field_of_a_stale_manifest() {
@@ -515,16 +547,94 @@ mod tests {
             )
             .await
             .expect("project with missing ops source");
-        let refused = client
+        let reported = client
             .get("http://flotilla.local/apis/flotilla.work/v1/namespaces/missing/operationalentries")
             .send()
             .await
             .expect("missing-source endpoint");
-        assert_eq!(refused.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(refused.text().await.expect("error body").contains("unavailable-ops"));
-        assert!(validate_daemon(&socket, Some(&[]), None).await.is_err(), "missing ops source must fail the whole gate");
+        assert_eq!(reported.status(), reqwest::StatusCode::OK);
+        let reported = reported.json::<serde_json::Value>().await.expect("inventory");
+        assert_eq!(reported["entries"], serde_json::json!([]));
+        assert!(reported["unavailable"][0].as_str().expect("unavailable member").contains("unavailable-ops"), "{reported}");
+        // This host's daemon refuses to load a source it holds no checkout of, so
+        // the source is validated on the hosts that do, not refused here.
+        validate_daemon(&socket, Some(&[]), None).await.expect("a source without a local checkout is reported, not refused");
         task.abort();
         std::fs::remove_dir_all(root).expect("remove daemon directory");
+    }
+
+    #[tokio::test]
+    async fn candidate_reads_ops_entries_from_a_detached_checkout_with_ambiguous_remotes() {
+        use std::sync::Arc;
+
+        use flotilla_core::{
+            path_context::ExecutionEnvironmentPath,
+            providers::{vcs::git_worktree::GitWorktreeStrategy, ProcessCommandRunner},
+            repository_inspection::GitRepositoryInspector,
+            vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
+        };
+        use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, RepositorySpec};
+        let tmp_guard = tempfile::tempdir().expect("temporary ops repository");
+        let tmp = tmp_guard.path().to_path_buf();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git").args(args).current_dir(tmp.as_path()).status().expect("fixture git").success());
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["remote", "add", "github", "https://github.com/example/ops"]);
+        git(&["remote", "add", "lab", "https://forge.example.test/lab/ops"]);
+        std::fs::write(
+            tmp.as_path().join("governor.md"),
+            "---\nkind: ensure\nrole: governor\n---\nworkflow: govern\nunknown_option: true\n",
+        )
+        .expect("ops entry");
+        git(&["add", "."]);
+        git(&["commit", "-m", "fixture"]);
+        git(&["checkout", "--detach"]);
+        let spec = RepositorySpec::remote("https://github.com/example/ops").expect("repository");
+        let backend = flotilla_resources::ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let project = backend
+            .using::<Project>("flotilla")
+            .create(
+                &InputMeta::builder()
+                    .name("demo".to_string())
+                    .annotations(std::collections::BTreeMap::from([
+                        (
+                            flotilla_core::project_declaration::BOOTSTRAP_PATH_ANNOTATION.into(),
+                            tmp.as_path().to_string_lossy().into_owned(),
+                        ),
+                        (flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(), spec.key().to_string()),
+                    ]))
+                    .build(),
+                &ProjectSpec::builder()
+                    .display_name("Demo".to_string())
+                    .default_workflow_ref("govern".to_string())
+                    .repositories(vec![ProjectRepositorySpec {
+                        repo: spec.key(),
+                        alias: Some("ops".into()),
+                        roles: std::collections::BTreeSet::from([ProjectRepositoryRole::Ops]),
+                        subpath: None,
+                        default_branch: None,
+                    }])
+                    .build(),
+            )
+            .await
+            .expect("registered project");
+        let runner = Arc::new(ProcessCommandRunner);
+        let vcs = FlotillaVcs::new(
+            ExecutionEnvironmentPath::new(tmp.as_path()),
+            runner.clone(),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
+        );
+        let inspector = GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), VALIDATION_INSPECTION_HOST);
+        // The roots pass tolerates the unidentifiable checkout; the bootstrap
+        // annotation still selects it and its entries are parsed.
+        let paths = inspect_validation_roots(std::slice::from_ref(&tmp), &inspector).await.expect("roots inspection continues");
+        let error = validate_project_ops(std::slice::from_ref(&project), &paths, &inspector)
+            .await
+            .expect_err("candidate parses the selected checkout's entries");
+        assert!(error.to_string().contains("unknown_option"), "{error}");
     }
 
     #[tokio::test]
@@ -667,10 +777,12 @@ mod tests {
 
         let mut unavailable = project.clone();
         unavailable.metadata.annotations.clear();
-        let error = validate_project_ops(&[unavailable], &std::collections::BTreeMap::new(), &inspector)
+        // This host's daemon cannot load a source it has no checkout of; the
+        // hosts holding a checkout validate it at their own install.
+        let validated = validate_project_ops(&[unavailable], &std::collections::BTreeMap::new(), &inspector)
             .await
-            .expect_err("missing source fails the gate");
-        assert!(error.to_string().contains("no checkout available"), "{error}");
+            .expect("a source without a local checkout is reported, not refused");
+        assert_eq!(validated, 0);
         let duplicate_guard = tempfile::tempdir().expect("duplicate checkout directory");
         let duplicate = duplicate_guard.path().to_path_buf();
         assert!(std::process::Command::new("git")

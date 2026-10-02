@@ -5945,12 +5945,12 @@ impl InProcessDaemon {
     pub async fn project_operational_entry_inventory(
         &self,
         namespace: &str,
-    ) -> Result<Vec<crate::ops_entry::OperationalEntryFile>, String> {
+    ) -> Result<crate::repository_inspection::OperationalEntryInventory, String> {
         let projects = self.resource_backend.definitions::<Project>(namespace).list().await.map_err(|error| error.to_string())?;
         if !projects.iter().any(|project| {
             project.spec.repositories.iter().any(|member| member.roles.contains(&flotilla_resources::ProjectRepositoryRole::Ops))
         }) {
-            return Ok(Vec::new());
+            return Ok(Default::default());
         }
         let mut paths = BTreeMap::<RepositoryKey, Vec<PathBuf>>::new();
         for (path, key) in self.repository_keys_by_path.read().await.iter() {
