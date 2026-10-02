@@ -109,6 +109,11 @@ impl<'de> Deserialize<'de> for CapabilityNeed {
 }
 
 impl CapabilityNeed {
+    /// The role need that admission expands over the Project's platform matrix.
+    pub fn matrix_placeholder() -> Self {
+        Self::Platform(Platform::MATRIX_PLACEHOLDER.to_string())
+    }
+
     pub fn covered_by(&self, grants: &BTreeSet<FulfilmentGrant>, facts: Option<&crate::FulfilmentFacts>) -> bool {
         match self {
             Self::Platform(value) => grants.contains(&FulfilmentGrant::Platform(value.clone())),

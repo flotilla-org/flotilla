@@ -50,7 +50,7 @@ fn capability_needs_and_project_matrices_accept_exactly_the_vocabulary() {
         normalize_project_spec(project_with_matrix(&[platform.as_str()])).expect("supported platform matrix");
     }
     let matrix = format!("platform:{}", Platform::MATRIX_PLACEHOLDER).parse::<CapabilityNeed>().expect("matrix placeholder need");
-    assert_eq!(matrix, CapabilityNeed::Platform(Platform::MATRIX_PLACEHOLDER.to_string()));
+    assert_eq!(matrix, CapabilityNeed::matrix_placeholder());
 
     assert!("freebsd".parse::<Platform>().is_err());
     assert!("platform:freebsd".parse::<CapabilityNeed>().is_err());

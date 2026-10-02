@@ -1,7 +1,5 @@
 //! Convoy admission state and transaction boundary.
 
-use flotilla_resources::Platform;
-
 use super::*;
 use crate::{
     agent_adapter::{CrewAssignment, CrewBriefTemplateResolver},
@@ -499,12 +497,7 @@ impl ConvoyAdmission {
             for crew in &mut vessel.crew {
                 crew.needs.extend(common.iter().cloned());
                 if let Some(standing) = project.role_needs.get(&crew.role) {
-                    crew.needs.extend(
-                        standing
-                            .iter()
-                            .filter(|need| **need != CapabilityNeed::Platform(Platform::MATRIX_PLACEHOLDER.to_string()))
-                            .cloned(),
-                    );
+                    crew.needs.extend(standing.iter().filter(|need| **need != CapabilityNeed::matrix_placeholder()).cloned());
                 }
                 if let CrewSource::Agent { selector, .. } = &crew.source {
                     if let (Some(adapter), Some(model)) = (&selector.adapter, &selector.model) {
@@ -1646,11 +1639,8 @@ pub(super) fn expand_allocation_roles(workflow: &mut WorkflowTemplateSpec, proje
     };
     for vessel in authored {
         for crew in vessel.crew {
-            let matrix = crew.needs.contains(&CapabilityNeed::Platform(Platform::MATRIX_PLACEHOLDER.to_string()))
-                || project
-                    .role_needs
-                    .get(&crew.role)
-                    .is_some_and(|needs| needs.contains(&CapabilityNeed::Platform(Platform::MATRIX_PLACEHOLDER.to_string())));
+            let matrix = crew.needs.contains(&CapabilityNeed::matrix_placeholder())
+                || project.role_needs.get(&crew.role).is_some_and(|needs| needs.contains(&CapabilityNeed::matrix_placeholder()));
             if matrix {
                 if project.platform_matrix.is_empty() {
                     return Err(format!("role `{}` needs platform:$matrix but Project has no platform_matrix", crew.role));
@@ -1662,15 +1652,10 @@ pub(super) fn expand_allocation_roles(workflow: &mut WorkflowTemplateSpec, proje
                         continue;
                     }
                     let mut expanded = crew.clone();
-                    expanded.needs.remove(&CapabilityNeed::Platform(Platform::MATRIX_PLACEHOLDER.to_string()));
+                    expanded.needs.remove(&CapabilityNeed::matrix_placeholder());
                     expanded.needs.insert(need);
                     if let Some(standing) = project.role_needs.get(&crew.role) {
-                        expanded.needs.extend(
-                            standing
-                                .iter()
-                                .filter(|need| **need != CapabilityNeed::Platform(Platform::MATRIX_PLACEHOLDER.to_string()))
-                                .cloned(),
-                        );
+                        expanded.needs.extend(standing.iter().filter(|need| **need != CapabilityNeed::matrix_placeholder()).cloned());
                     }
                     roles.push(AllocationRole {
                         crew: expanded,
