@@ -103,3 +103,15 @@ jobs:
         with:
           shared-key: "test"
       - run: cargo test --workspace --locked
+
+  macos-peer-identity:
+    name: macOS peer identity
+    runs-on: macos-latest
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "macos-peer-identity"
+      - run: "cargo test -p flotilla-daemon --locked --lib server::caller::tests::"

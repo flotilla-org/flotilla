@@ -13,7 +13,7 @@ use flotilla_protocol::{
 use flotilla_resources::{expected_change_request_leaves, select_convoy_children, Checkout, Convoy, ResourceBackend};
 use tracing::warn;
 
-use super::{client_connection::QuerySubscriptions, remote_commands::RemoteCommandRouter};
+use super::{caller::missing_crew_message, client_connection::QuerySubscriptions, remote_commands::RemoteCommandRouter};
 use crate::{
     artifact::{ArtifactBody, ArtifactPutInput, ArtifactService},
     blob_store::BlobDigest,
@@ -338,7 +338,7 @@ impl<'a> RequestDispatcher<'a> {
             return Message::error_response(id, "ArtifactPut request selected the wrong handler");
         };
         let result = Box::pin(async {
-            let caller = self.caller.crew.as_ref().ok_or("artifact put requires a calling crew session")?;
+            let caller = self.caller.crew.as_ref().ok_or_else(|| missing_crew_message("artifact put"))?;
             let subject = if kind == "decision-ledger" && subject.is_empty() { caller.convoy.clone() } else { subject };
             let config = self.daemon.config_store();
             let settings = config.load_daemon_config()?;
@@ -483,7 +483,7 @@ impl<'a> RequestDispatcher<'a> {
             return Message::error_response(id, "ArtifactGet request selected the wrong handler");
         };
         let result = Box::pin(async {
-            let caller = self.caller.crew.as_ref().ok_or("artifact get requires a calling crew session")?;
+            let caller = self.caller.crew.as_ref().ok_or_else(|| missing_crew_message("artifact get"))?;
             let blobs = self.remote_command_router.blob_store()?;
             let backend = self.daemon.resource_backend();
             let namespace = self.daemon.provisioning_namespace().await;
