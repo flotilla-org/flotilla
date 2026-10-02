@@ -3276,14 +3276,15 @@ mod tests {
     fn human_resource_rendering_replaces_exact_host_ids_but_not_embedded_object_names() {
         let mut value = serde_json::json!({
             "spec": {"host_ref": "01HXYZ"},
-            "metadata": {"name": "host-direct-01HXYZ"},
+            "metadata": {"name": "01HXYZ", "related_name": "host-direct-01HXYZ"},
             "status": {"placement_decision": {"target_host": {"ref": "01HXYZ", "display_name": "kiwi"}}}
         });
         replace_host_ids(&mut value, &std::collections::HashMap::from([("01HXYZ".to_string(), "kiwi".to_string())]));
 
         assert_eq!(value["spec"]["host_ref"], "kiwi (01HXYZ)");
         assert_eq!(value["status"]["placement_decision"]["target_host"]["ref"], "kiwi (01HXYZ)");
-        assert_eq!(value["metadata"]["name"], "host-direct-01HXYZ");
+        assert_eq!(value["metadata"]["name"], "kiwi (01HXYZ)");
+        assert_eq!(value["metadata"]["related_name"], "host-direct-01HXYZ");
     }
 
     #[test]
