@@ -9,28 +9,31 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_protocol::{
     result_set::{
         AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, CleatEndpoint, ConvoyPhase,
-        ConvoyRow, IndependentRow, ProjectRepositoriesRow, SessionPhase, StandingRoleHold, StandingRoleRow, SurfaceState, VesselRow,
-        WorkPhase,
+        ConvoyRow, IndependentRow, ProjectRepositoriesRow, SessionPhase, StandingRoleHold, StandingRoleRow, SurfaceState, Timestamp,
+        VesselRow, WorkPhase,
     },
-    HostName, ViewAddress, AWARENESS_REL_FOR_CONVOY,
+    HostName, ReferenceContext, ViewAddress, AWARENESS_REL_FOR_CONVOY,
 };
-use flotilla_resources::{ChangeRequestStatus, ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision};
+use flotilla_resources::{
+    ChangeRequest, ChangeRequestStatus, Forge, Issue, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
+    ObservedReviewDecision, ResourceObject,
+};
 
 use crate::{
     entity::{self, EntityRef},
     keys::{
-        ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CHANGE_REQUEST_NUMBER, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY,
-        KEY_CONVOY_MESSAGE, KEY_CONVOY_NAME, KEY_CONVOY_PHASE, KEY_CONVOY_STANDING, KEY_CONVOY_SUPERSEDED, KEY_CONVOY_WORKFLOW,
-        KEY_COUNT_CHECKOUTS, KEY_COUNT_CONVOYS, KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_COUNT_VESSELS,
-        KEY_CREW_ROLES, KEY_DISPLAY_LABEL, KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND,
-        KEY_INDEPENDENT_HOST, KEY_MEMBERSHIP_PROJECT, KEY_MEMBERSHIP_REPOSITORY_KEY, KEY_MEMBERSHIP_REPOSITORY_SLUG,
-        KEY_MEMBERSHIP_SUBPATH, KEY_PRIMARY_ACTION_KEY, KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET,
-        KEY_PRIMARY_ACTION_VEHICLE, KEY_PRIMARY_DIRECT_DAEMON, KEY_PRIMARY_DIRECT_HOST, KEY_PRIMARY_DIRECT_REASON,
-        KEY_PRIMARY_DIRECT_RUNTIME_ROOT, KEY_PRIMARY_DIRECT_SESSION, KEY_PRIMARY_DIRECT_TRANSPORT, KEY_PROJECT_NAME,
-        KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE,
-        KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG, KEY_SURFACE_STATE, KEY_VESSEL, KEY_VESSEL_HOST,
-        KEY_VESSEL_NAME, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE,
-        SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
+        ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY, KEY_CONVOY_MESSAGE, KEY_CONVOY_NAME,
+        KEY_CONVOY_PHASE, KEY_CONVOY_STANDING, KEY_CONVOY_SUPERSEDED, KEY_CONVOY_WORKFLOW, KEY_COUNT_CHECKOUTS, KEY_COUNT_CONVOYS,
+        KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_COUNT_VESSELS, KEY_CREW_ROLES, KEY_DISPLAY_LABEL,
+        KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_INDEPENDENT_HOST, KEY_MEMBERSHIP_PROJECT,
+        KEY_MEMBERSHIP_REPOSITORY_KEY, KEY_MEMBERSHIP_REPOSITORY_SLUG, KEY_MEMBERSHIP_SUBPATH, KEY_PRIMARY_ACTION_KEY,
+        KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET, KEY_PRIMARY_ACTION_VEHICLE,
+        KEY_PRIMARY_DIRECT_DAEMON, KEY_PRIMARY_DIRECT_HOST, KEY_PRIMARY_DIRECT_REASON, KEY_PRIMARY_DIRECT_RUNTIME_ROOT,
+        KEY_PRIMARY_DIRECT_SESSION, KEY_PRIMARY_DIRECT_TRANSPORT, KEY_PROJECT_NAME, KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE,
+        KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE,
+        KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG, KEY_SURFACE_STATE, KEY_VESSEL, KEY_VESSEL_HOST, KEY_VESSEL_NAME, KEY_WORKSPACE_PRIMARY_STATE,
+        KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR,
+        SOURCE_FLOTILLA,
     },
     recipe::{DirectTransport, Recipe, RecipeMint},
     wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
@@ -38,11 +41,26 @@ use crate::{
 
 /// The rows the catalog is projected from.
 pub struct CatalogInput<'a> {
+    pub subjects: Option<&'a SubjectCatalogInput>,
     pub awareness: Option<&'a [AwarenessNode]>,
     pub convoys: &'a [ConvoyRow],
     pub independents: &'a [IndependentRow],
     pub standing_roles: &'a [StandingRoleRow],
     pub project_repositories: &'a [ProjectRepositoriesRow],
+}
+
+mod subjects;
+use subjects::{project_role_attempts, project_subjects};
+
+/// Replicated observation records and the fleet reference context. The clock is
+/// supplied by the connector so expiry is deterministic in replay and tests.
+#[derive(Default, bon::Builder)]
+pub struct SubjectCatalogInput {
+    pub change_requests: Vec<ResourceObject<ChangeRequest>>,
+    pub issues: Vec<ResourceObject<Issue>>,
+    pub forges: Vec<ResourceObject<Forge>>,
+    pub references: ReferenceContext,
+    pub now: Option<Timestamp>,
 }
 
 /// Derived presentation state for a change request. The raw observations remain
@@ -253,6 +271,9 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
         mark_superseded_convoys(&mut catalog, input.convoys);
         project_standing_roles(&mut catalog, input.standing_roles, input.convoys, mint);
         project_repository_memberships(&mut catalog, input.project_repositories);
+        if let Some(subjects) = input.subjects {
+            project_subjects(&mut catalog, input, subjects);
+        }
         return catalog;
     }
     for convoy in input.convoys {
@@ -264,6 +285,9 @@ pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catal
     mark_superseded_convoys(&mut catalog, input.convoys);
     project_standing_roles(&mut catalog, input.standing_roles, input.convoys, mint);
     project_repository_memberships(&mut catalog, input.project_repositories);
+    if let Some(subjects) = input.subjects {
+        project_subjects(&mut catalog, input, subjects);
+    }
     catalog
 }
 
@@ -335,6 +359,7 @@ fn project_standing_roles(catalog: &mut Catalog, roles: &[StandingRoleRow], conv
     }
     for role in roles {
         project_standing_role(catalog, role, convoys, mint);
+        project_role_attempts(catalog, role, convoys);
     }
 }
 
@@ -346,15 +371,20 @@ fn role_entity(role: &StandingRoleRow) -> EntityRef {
     entity::role(&role.resource.namespace, role_project(role), &role.role, "fleet")
 }
 
-fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys: &[ConvoyRow], mint: &dyn RecipeMint) {
-    let entity = role_entity(role);
-    let project_name = role_project(role);
-    let project = entity::project(&role.resource.namespace, project_name, "fleet");
+fn standing_attempts<'a>(role: &StandingRoleRow, convoys: &'a [ConvoyRow]) -> Vec<&'a ConvoyRow> {
     let mut attempts = convoys
         .iter()
         .filter(|convoy| convoy.resource.namespace == role.resource.namespace && convoy.ensured_from.as_ref() == Some(&role.resource.name))
         .collect::<Vec<_>>();
-    attempts.sort_by_key(|convoy| convoy.generation);
+    attempts.sort_by(|left, right| (left.generation, &left.resource.name).cmp(&(right.generation, &right.resource.name)));
+    attempts
+}
+
+fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys: &[ConvoyRow], mint: &dyn RecipeMint) {
+    let entity = role_entity(role);
+    let project_name = role_project(role);
+    let project = entity::project(&role.resource.namespace, project_name, "fleet");
+    let attempts = standing_attempts(role, convoys);
     let latest = attempts.last().copied();
     let live = attempts.iter().rev().copied().find(|convoy| !convoy.phase.is_terminal());
 
@@ -618,9 +648,6 @@ fn awareness_entry_entity(entry: &AwarenessEntry, convoys: &[ConvoyRow]) -> Opti
             facts.extend(label_tier_facts(semantic_label));
             if let (None, Some(AwarenessPhase::Convoy(phase))) = (row, &entry.phase) {
                 facts.push((KEY_CONVOY_PHASE, MetadataValue::text(phase.as_str())));
-            }
-            if let Some(number) = entry.annotations.get(KEY_CHANGE_REQUEST_NUMBER) {
-                facts.push((KEY_CHANGE_REQUEST_NUMBER, MetadataValue::text(number.clone())));
             }
             (entity, facts)
         }

@@ -53,7 +53,7 @@ fn text(patch: &MetadataPatch, key: &str) -> String {
 }
 
 fn catalog_input(convoys: &[ConvoyRow]) -> CatalogInput<'_> {
-    CatalogInput { awareness: None, convoys, independents: &[], standing_roles: &[], project_repositories: &[] }
+    CatalogInput { subjects: None, awareness: None, convoys, independents: &[], standing_roles: &[], project_repositories: &[] }
 }
 
 #[derive(bon::Builder)]
@@ -366,7 +366,14 @@ fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
         .build();
 
     let patches = project_catalog(
-        &CatalogInput { awareness: None, convoys: &[convoy], independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: None,
+            convoys: &[convoy],
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     )
     .reassert_patches();
@@ -416,7 +423,14 @@ fn long_entity_labels_publish_stable_semantic_tiers() {
         .build();
 
     let catalog = project_catalog(
-        &CatalogInput { awareness: None, convoys: &[convoy], independents: &[independent], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: None,
+            convoys: &[convoy],
+            independents: &[independent],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     );
     let first = catalog.reassert_patches();
@@ -463,7 +477,14 @@ fn awareness_issues_are_recipe_less_entities_with_source_plus_id_identity() {
         .build();
 
     let patches = project_catalog(
-        &CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: Some(&[node]),
+            convoys: &[],
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     )
     .reassert_patches();
@@ -517,7 +538,14 @@ fn awareness_convoy_labels_ignore_legacy_subject_annotations() {
         .build();
 
     let patches = project_catalog(
-        &CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: Some(&[node]),
+            convoys: &[],
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     )
     .reassert_patches();
@@ -527,7 +555,7 @@ fn awareness_convoy_labels_ignore_legacy_subject_annotations() {
     assert_eq!(text(convoy, KEY_DISPLAY_LABEL_SHORT), "l");
     assert_eq!(text(convoy, KEY_SUMMARY_TEXT), "landing · PR #1044");
     assert_eq!(text(convoy, KEY_CONVOY_NAME), "landing");
-    assert_eq!(text(convoy, KEY_CHANGE_REQUEST_NUMBER), "1044");
+    assert!(!convoy.set.contains_key(KEY_CHANGE_REQUEST_NUMBER));
 
     let checkout = find_entity(&patches, &entity::checkout("checkout/kiwi//work/flotilla"));
     assert_eq!(text(checkout, KEY_DISPLAY_LABEL), "main · /work/flotilla");
@@ -570,7 +598,14 @@ fn truncated_awareness_summary_reports_exact_omitted_count() {
         .build();
 
     let patches = project_catalog(
-        &CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: Some(&[node]),
+            convoys: &[],
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     )
     .reassert_patches();
@@ -612,7 +647,14 @@ fn same_role_remote_governors_project_as_distinct_catalog_entities() {
     let awareness = [awareness("governor-andamento-01234567", "andamento"), awareness("governor-wheelhouse-89abcdef", "wheelhouse")];
 
     let patches = project_catalog(
-        &CatalogInput { awareness: Some(&awareness), convoys: &convoys, independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: Some(&awareness),
+            convoys: &convoys,
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     )
     .reassert_patches();
@@ -656,7 +698,14 @@ fn standing_checkout_mints_a_transient_terminal_action_but_convoy_checkout_does_
         .build();
 
     let patches = project_catalog(
-        &CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: Some(&[node]),
+            convoys: &[],
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     )
     .reassert_patches();
@@ -681,7 +730,14 @@ fn empty_project_is_an_idle_zero_count_latent_that_opens_its_scoped_view() {
         .build();
 
     let patches = project_catalog(
-        &CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: Some(&[node]),
+            convoys: &[],
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     )
     .reassert_patches();
@@ -719,7 +775,14 @@ fn awareness_children_use_their_convoys_canonical_origin() {
     let convoy = ConvoyRow::builder().resource(reference).name("cutover").workflow_ref("implement").phase(ConvoyPhase::Active).build();
 
     let patches = project_catalog(
-        &CatalogInput { awareness: Some(&[node]), convoys: &[convoy], independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: Some(&[node]),
+            convoys: &[convoy],
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     )
     .reassert_patches();
@@ -748,7 +811,14 @@ fn awareness_repository_group_does_not_masquerade_as_project() {
         .build();
 
     let patches = project_catalog(
-        &CatalogInput { awareness: Some(&[node]), convoys: &[], independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: Some(&[node]),
+            convoys: &[],
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     )
     .reassert_patches();
@@ -774,7 +844,14 @@ fn independent_session_uses_the_canonical_session_ref() {
         .phase(SessionPhase::Running)
         .build();
     let patches = project_catalog(
-        &CatalogInput { awareness: None, convoys: &[], independents: &[row], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: None,
+            convoys: &[],
+            independents: &[row],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     )
     .reassert_patches();
@@ -797,11 +874,25 @@ fn catalog_diff_unsets_removed_entity_facts() {
     let without_message =
         ConvoyRow::builder().resource(reference).name("cutover").workflow_ref("implement").phase(ConvoyPhase::Active).build();
     let previous = project_catalog(
-        &CatalogInput { awareness: None, convoys: &[with_message], independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: None,
+            convoys: &[with_message],
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     );
     let current = project_catalog(
-        &CatalogInput { awareness: None, convoys: &[without_message], independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: None,
+            convoys: &[without_message],
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     );
     let diff = current.diff_patches(&previous);
@@ -830,7 +921,14 @@ fn convoy_summary_surfaces_status_message_ahead_of_progress() {
         .vessels(vec![vessel().convoy(&reference).name("coder").phase(WorkPhase::Pending).call()])
         .build();
     let patches = project_catalog(
-        &CatalogInput { awareness: None, convoys: &[convoy], independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: None,
+            convoys: &[convoy],
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     )
     .reassert_patches();
@@ -858,7 +956,14 @@ fn crew_roles_remain_a_flat_fact() {
         .vessels(vec![coder])
         .build();
     let patches = project_catalog(
-        &CatalogInput { awareness: None, convoys: &[convoy], independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: None,
+            convoys: &[convoy],
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     )
     .reassert_patches();
@@ -924,7 +1029,14 @@ fn only_older_terminal_role_generations_are_superseded() {
     })
     .collect::<Vec<_>>();
     let mut catalog = project_catalog(
-        &CatalogInput { awareness: None, convoys: &rows, independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: None,
+            convoys: &rows,
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     );
     // A detached vessel in Attention must receive the same visibility fact.
@@ -970,7 +1082,14 @@ fn raw_role_generations_keep_vessel_identity_and_activation_targets_distinct() {
         })
         .collect::<Vec<_>>();
     let patches = project_catalog(
-        &CatalogInput { awareness: None, convoys: &rows, independents: &[], standing_roles: &[], project_repositories: &[] },
+        &CatalogInput {
+            subjects: None,
+            awareness: None,
+            convoys: &rows,
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &[],
+        },
         &mint(),
     )
     .reassert_patches();
@@ -1025,7 +1144,7 @@ fn attempt(name: &str, role: &str, generation: u64, phase: ConvoyPhase, ensured_
 
 fn role_catalog(roles: &[StandingRoleRow], convoys: &[ConvoyRow]) -> Catalog {
     project_catalog(
-        &CatalogInput { awareness: None, convoys, independents: &[], standing_roles: roles, project_repositories: &[] },
+        &CatalogInput { subjects: None, awareness: None, convoys, independents: &[], standing_roles: roles, project_repositories: &[] },
         &mint(),
     )
 }
@@ -1204,7 +1323,14 @@ fn definitions_publish_multiple_shared_and_subpath_memberships_without_work() {
         membership_project("empty", &[]),
     ];
     let catalog = project_catalog(
-        &CatalogInput { awareness: None, convoys: &[], independents: &[], standing_roles: &[], project_repositories: &projects },
+        &CatalogInput {
+            subjects: None,
+            awareness: None,
+            convoys: &[],
+            independents: &[],
+            standing_roles: &[],
+            project_repositories: &projects,
+        },
         &mint(),
     );
     let patches = catalog.reassert_patches();
@@ -1247,6 +1373,7 @@ fn membership_removal_retracts_relation_while_project_remains() {
         .build();
     let first = project_catalog(
         &CatalogInput {
+            subjects: None,
             awareness: None,
             convoys: std::slice::from_ref(&workspace),
             independents: &[],
@@ -1257,6 +1384,7 @@ fn membership_removal_retracts_relation_while_project_remains() {
     );
     let second = project_catalog(
         &CatalogInput {
+            subjects: None,
             awareness: None,
             convoys: std::slice::from_ref(&workspace),
             independents: &[],
@@ -1289,7 +1417,14 @@ fn shared_repository_entity_is_independent_of_convoy_generation_order() {
     });
     let input = |rows: &[ConvoyRow]| {
         project_catalog(
-            &CatalogInput { awareness: None, convoys: rows, independents: &[], standing_roles: &[], project_repositories: &[] },
+            &CatalogInput {
+                subjects: None,
+                awareness: None,
+                convoys: rows,
+                independents: &[],
+                standing_roles: &[],
+                project_repositories: &[],
+            },
             &mint(),
         )
     };
@@ -1334,4 +1469,440 @@ fn live_role_carries_its_attempts_vessel_attention() {
     let facts = find_entity(&waiting, &role_entity_for("p", "governor"));
     assert_eq!(facts.set[KEY_STATUS_ATTENTION].value, MetadataValue::Bool(true));
     assert_eq!(text(facts, KEY_STATUS_STATE), "active", "attention does not replace the attempt's state");
+}
+
+#[test]
+fn replicated_subjects_publish_entities_edges_and_reference_labels() {
+    use flotilla_protocol::{Relationship, RepositoryAlias, Subject, SubjectKind};
+    use flotilla_resources::{ChangeRequest, ChangeRequestSpec, InMemoryBackend, InputMeta, ResourceBackend};
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+    let record = runtime.block_on(async {
+        backend
+            .using::<ChangeRequest>("flotilla")
+            .create(
+                &InputMeta::builder().name("cr-42".into()).build(),
+                &ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("org/flotilla".into())
+                    .number(42)
+                    .observing_authority("kiwi".into())
+                    .build(),
+            )
+            .await
+            .expect("record")
+    });
+    let source = IssueSource { service: "github.com".into(), scope: "org/flotilla".into() };
+    let subject = Subject { kind: SubjectKind::ChangeRequest, source: source.clone(), id: "42".into() };
+    let mut convoy = ConvoyRow::builder()
+        .resource(convoy_ref("flotilla", "ship-it"))
+        .name("ship-it")
+        .workflow_ref("workflow/dev")
+        .phase(ConvoyPhase::Active)
+        .build();
+    convoy.subjects.push(flotilla_protocol::result_set::ConvoySubjectRow {
+        subject: subject.clone(),
+        relationship: Relationship::Produces,
+        declared: false,
+        short: "flotilla!42".into(),
+        url: None,
+        repository_key: None,
+    });
+    let observations = SubjectCatalogInput {
+        change_requests: vec![record],
+        references: flotilla_protocol::ReferenceContext {
+            repositories: vec![RepositoryAlias {
+                project: Some("flotilla".into()),
+                alias: "f".into(),
+                source,
+                web_base: "https://github.com".into(),
+                forge_alias: None,
+            }],
+        },
+        ..Default::default()
+    };
+    let convoys = [convoy];
+    let mut input = catalog_input(&convoys);
+    input.awareness = Some(&[]);
+    input.subjects = Some(&observations);
+    let patches = project_catalog(&input, &mint()).reassert_patches();
+    let cr = EntityRef::new("change_request", "github.com/org/flotilla!42");
+    let patch = find_entity(&patches, &cr);
+    assert_eq!(text(patch, KEY_DISPLAY_LABEL), "f!42");
+    assert_eq!(text(patch, KEY_DISPLAY_LABEL_SHORT), "f!42");
+    assert_eq!(text(patch, "flotilla.change_request.readiness"), "awaiting_review_response");
+    let convoy = find_entity(&patches, &entity::convoy("flotilla", "ship-it", "kiwi"));
+    assert_eq!(text(convoy, KEY_DISPLAY_LABEL), "ship-it");
+    assert_eq!(convoy.set["flotilla.subject.produces"].value, MetadataValue::EntityRefs(vec![cr]));
+}
+
+#[test]
+fn subject_window_and_successive_role_attempts_exclude_unlinked_records() {
+    use flotilla_protocol::{Relationship, Subject, SubjectKind};
+    use flotilla_resources::{ChangeRequest, ChangeRequestSpec, InMemoryBackend, InputMeta, ResourceBackend};
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+    let mut record = runtime
+        .block_on(
+            backend.using::<ChangeRequest>("flotilla").create(
+                &InputMeta::builder().name("cr-42".into()).build(),
+                &ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("org/flotilla".into())
+                    .number(42)
+                    .observing_authority("kiwi".into())
+                    .build(),
+            ),
+        )
+        .expect("record");
+    let now = "2026-10-02T12:00:00Z".parse().expect("time");
+    record.status = Some(ChangeRequestStatus {
+        title: Observation::known("ship it".into(), now),
+        author: Observation::default(),
+        state: Observation::known(ObservedChangeRequestState::Open, now),
+        checks: Observation::default(),
+        mergeable: Observation::default(),
+        head_sha: Observation::default(),
+        review: ChangeRequestReviewObservation { actionable_at_head: Observation::default() },
+        review_decision: Observation::default(),
+        review_requested_from_owner: Observation::default(),
+    });
+    let subject = Subject {
+        kind: SubjectKind::ChangeRequest,
+        source: IssueSource { service: "github.com".into(), scope: "org/flotilla".into() },
+        id: "42".into(),
+    };
+    let mut old = ConvoyRow::builder()
+        .resource(convoy_ref("flotilla", "old"))
+        .name("old")
+        .workflow_ref("workflow/dev")
+        .phase(ConvoyPhase::Landed)
+        .finished_at("2026-10-01T12:00:00Z".parse().expect("time"))
+        .ensured_from("governor")
+        .generation(1)
+        .build();
+    old.subjects.push(flotilla_protocol::result_set::ConvoySubjectRow {
+        subject,
+        relationship: Relationship::Produces,
+        declared: false,
+        short: "flotilla!42".into(),
+        url: None,
+        repository_key: None,
+    });
+    let observations = SubjectCatalogInput { change_requests: vec![record.clone()], now: Some(now), ..Default::default() };
+    let mut input = catalog_input(&[]);
+    input.subjects = Some(&observations);
+    let unlinked = project_catalog(&input, &mint()).reassert_patches();
+    let cr = EntityRef::new("change_request", "github.com/org/flotilla!42");
+    assert!(
+        !unlinked.iter().any(|patch| patch.target == MetadataTarget::Entity(cr.clone())),
+        "unlinked records are outside this projection"
+    );
+    let rows = [old.clone()];
+    input.convoys = &rows;
+    let expired = project_catalog(&input, &mint()).reassert_patches();
+    assert!(!expired.iter().any(|patch| patch.target == MetadataTarget::Entity(cr.clone())));
+    let recent = SubjectCatalogInput {
+        now: Some("2026-10-02T11:59:59Z".parse().expect("within window")),
+        change_requests: vec![record.clone()],
+        ..Default::default()
+    };
+    input.subjects = Some(&recent);
+    let within_window = project_catalog(&input, &mint());
+    assert!(within_window.reassert_patches().iter().any(|patch| patch.target == MetadataTarget::Entity(cr.clone())));
+    input.subjects = Some(&observations);
+    let withdrawal = project_catalog(&input, &mint()).diff_patches(&within_window);
+    assert!(find_entity(&withdrawal, &cr).unset.contains(&"flotilla.subject_of".into()));
+    let mut current = old;
+    current.resource = convoy_ref("flotilla", "new");
+    current.name = "new".into();
+    current.phase = ConvoyPhase::Active;
+    current.generation = 2;
+    let rows = [rows[0].clone(), current];
+    let roles = [StandingRoleRow::builder()
+        .resource(ResourceRef::new("flotilla.work/v1", "ConvoyEnsure", "flotilla", "governor"))
+        .project_ref("flotilla/platform")
+        .role("governor")
+        .strikes(2)
+        .build()];
+    input.convoys = &rows;
+    input.standing_roles = &roles;
+    let patches = project_catalog(&input, &mint()).reassert_patches();
+    let role = find_entity(&patches, &entity::role("flotilla", "platform", "governor", "fleet"));
+    assert_eq!(role.set["flotilla.role.current_attempt"].value, MetadataValue::EntityRefs(vec![entity::convoy("flotilla", "new", "kiwi")]));
+    assert_eq!(role.set["flotilla.subject.produces"].value, MetadataValue::EntityRefs(vec![cr.clone()]));
+    assert_eq!(
+        find_entity(&patches, &cr).set["flotilla.subject_of"].value,
+        MetadataValue::EntityRefs(vec![
+            entity::convoy("flotilla", "new", "kiwi"),
+            entity::role("flotilla", "platform", "governor", "fleet")
+        ])
+    );
+}
+
+#[test]
+fn standing_attempt_edges_and_crew_sessions_survive_re_admission() {
+    let mut role = standing_role("p", "governor");
+    role.strikes = 2;
+    role.next_attempt = Some("2026-10-02T12:00:00Z".parse().expect("backoff time"));
+    let live_old = attempt().name("old").role("governor").generation(1).phase(ConvoyPhase::Active).ensured_from("ensure-p-governor").call();
+    let before = role_catalog(std::slice::from_ref(&role), std::slice::from_ref(&live_old));
+    let patches = before.reassert_patches();
+    let facts = find_entity(&patches, &role_entity_for("p", "governor"));
+    assert_eq!(facts.set["flotilla.role.current_attempt"].value, MetadataValue::EntityRefs(vec![entity::convoy("dev", "old", "kiwi")]));
+    assert_eq!(facts.set["flotilla.role.crew_sessions"].value, MetadataValue::EntityRefs(vec![entity::session("feta/dev/terminal-old-0")]));
+    assert_eq!(facts.set["flotilla.role.restart_count"].value, MetadataValue::Integer(2));
+    assert_eq!(text(facts, "flotilla.role.desired_state"), "running");
+    let mut old = live_old;
+    old.phase = ConvoyPhase::Failed;
+    let new = attempt().name("new").role("governor").generation(2).phase(ConvoyPhase::Active).ensured_from("ensure-p-governor").call();
+    let after = role_catalog(std::slice::from_ref(&role), &[new, old.clone()]);
+    let diff = after.diff_patches(&before);
+    let facts = find_entity(&diff, &role_entity_for("p", "governor"));
+    assert_eq!(facts.set["flotilla.role.current_attempt"].value, MetadataValue::EntityRefs(vec![entity::convoy("dev", "new", "kiwi")]));
+    assert_eq!(
+        facts.set["flotilla.role.attempts"].value,
+        MetadataValue::EntityRefs(vec![entity::convoy("dev", "old", "kiwi"), entity::convoy("dev", "new", "kiwi")])
+    );
+    let between = role_catalog(&[role], &[old]);
+    let diff = between.diff_patches(&after);
+    let facts = find_entity(&diff, &role_entity_for("p", "governor"));
+    assert!(facts.unset.contains(&"flotilla.role.current_attempt".into()));
+    assert!(facts.unset.contains(&"flotilla.role.crew_sessions".into()));
+}
+
+#[tokio::test]
+async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo_graph() {
+    use flotilla_protocol::{NodeId, ReferenceContext, Relationship, RepositoryAlias, Subject, SubjectKind};
+    use flotilla_resources::{
+        convoy_subject_rows, ChangeRequest, ChangeRequestSpec, Convoy, ConvoySpec, ConvoyStatus, DeclaredSubject, Forge, ForgeKind,
+        ForgeSpec, InMemoryBackend, InputMeta, Issue, IssueSpec, IssueStatus, ObservedIssueState, Resource, ResourceBackend,
+        ResourceObject, SubjectDiscoverySource, WatchEvent,
+    };
+    async fn create<T: Resource>(backend: &ResourceBackend, name: &str, spec: &T::Spec) -> ResourceObject<T> {
+        backend.using::<T>("flotilla").create(&InputMeta::builder().name(name.into()).build(), spec).await.expect("create fixture")
+    }
+    let author = ResourceBackend::InMemory(InMemoryBackend::default());
+    let replica = ResourceBackend::InMemory(InMemoryBackend::default());
+    let now = "2026-10-02T12:00:00Z".parse().expect("time");
+    let gh = create::<Forge>(
+        &author,
+        "github",
+        &ForgeSpec::builder()
+            .forge_id("github".into())
+            .kind(ForgeKind::Github)
+            .hosts(["github.com".into()].into_iter().collect())
+            .https_url("https://github.com".into())
+            .git_ssh_host("github.com".into())
+            .build(),
+    )
+    .await;
+    let lab = create::<Forge>(
+        &author,
+        "lab",
+        &ForgeSpec::builder()
+            .forge_id("lab".into())
+            .kind(ForgeKind::Forgejo)
+            .hosts(["forge.example".into()].into_iter().collect())
+            .https_url("https://forge.example/git/".into())
+            .git_ssh_host("forge.example".into())
+            .build(),
+    )
+    .await;
+    let first_source = IssueSource { service: "github.com".into(), scope: "org/flotilla".into() };
+    let second_source = IssueSource { service: "lab".into(), scope: "team/cleat".into() };
+    let first = Subject { kind: SubjectKind::ChangeRequest, source: first_source.clone(), id: "42".into() };
+    let second = Subject { kind: SubjectKind::ChangeRequest, source: second_source.clone(), id: "281".into() };
+    let issue = Subject { kind: SubjectKind::Issue, source: second_source.clone(), id: "7".into() };
+    let references = ReferenceContext {
+        repositories: vec![
+            RepositoryAlias {
+                project: Some("flotilla".into()),
+                alias: "c".into(),
+                source: first_source,
+                web_base: "https://github.com".into(),
+                forge_alias: None,
+            },
+            RepositoryAlias {
+                project: Some("wheelhouse".into()),
+                alias: "c".into(),
+                source: second_source,
+                web_base: "https://forge.example/git".into(),
+                forge_alias: Some("lab".into()),
+            },
+        ],
+    };
+    let mut requests = Vec::new();
+    for (name, subject) in [("first", &first), ("second", &second)] {
+        let record = create::<ChangeRequest>(
+            &author,
+            name,
+            &ChangeRequestSpec::builder()
+                .service(subject.source.service.clone())
+                .scope(subject.source.scope.clone())
+                .number(subject.id.parse().expect("number"))
+                .observing_authority("kiwi".into())
+                .build(),
+        )
+        .await;
+        let status = ChangeRequestStatus {
+            title: Observation::known(format!("Ship {name}"), now),
+            author: Observation::known("alice".into(), now),
+            state: Observation::known(ObservedChangeRequestState::Open, now),
+            checks: Observation::known(ObservedChecks::Pass, now),
+            mergeable: Observation::known(ObservedMergeability::Mergeable, now),
+            head_sha: Observation::known("abc123".into(), now),
+            review: ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, now) },
+            review_decision: Observation::known(ObservedReviewDecision::Approved, now),
+            review_requested_from_owner: Observation::known(true, now),
+        };
+        let record = author
+            .using::<ChangeRequest>("flotilla")
+            .update_status(name, &record.metadata.resource_version, &status)
+            .await
+            .expect("observe request");
+        replica
+            .replica_writer::<ChangeRequest>(NodeId::new("kiwi"), "flotilla")
+            .apply(WatchEvent::Added(record.clone()), now)
+            .await
+            .expect("replicate request");
+        requests.push(record);
+    }
+    let issue_record = create::<Issue>(
+        &author,
+        "issue",
+        &IssueSpec::builder().service("lab".into()).scope("team/cleat".into()).number(7).observing_authority("kiwi".into()).build(),
+    )
+    .await;
+    let issue_record = author
+        .using::<Issue>("flotilla")
+        .update_status("issue", &issue_record.metadata.resource_version, &IssueStatus {
+            title: Observation::known("Make it work".into(), now),
+            assignees: Observation::known(vec!["alice".into()], now),
+            state: Observation::known(ObservedIssueState::Open, now),
+            labels: Observation::known(vec!["ready".into()], now),
+            updated_at: Observation::known(now, now),
+        })
+        .await
+        .expect("observe issue");
+    replica
+        .replica_writer::<Issue>(NodeId::new("kiwi"), "flotilla")
+        .apply(WatchEvent::Added(issue_record.clone()), now)
+        .await
+        .expect("replicate issue");
+    for forge in [&gh, &lab] {
+        replica
+            .replica_writer::<Forge>(NodeId::new("kiwi"), "flotilla")
+            .apply(WatchEvent::Added(forge.clone()), now)
+            .await
+            .expect("replicate forge");
+    }
+    let convoy = create::<Convoy>(
+        &author,
+        "ship-it",
+        &ConvoySpec::builder()
+            .workflow_ref("dev".into())
+            .subjects(vec![
+                DeclaredSubject { subject: first.clone(), relationship: Relationship::Produces, issue: None, change_request: None },
+                DeclaredSubject { subject: issue.clone(), relationship: Relationship::WorksOn, issue: None, change_request: None },
+            ])
+            .build(),
+    )
+    .await;
+    let mut status = ConvoyStatus { phase: flotilla_resources::ConvoyPhase::Active, ..Default::default() };
+    status.discover_subject(first, Relationship::Produces, SubjectDiscoverySource::Claim, now);
+    status.discover_subject(second, Relationship::Produces, SubjectDiscoverySource::Branch, now);
+    let convoy = author
+        .using::<Convoy>("flotilla")
+        .update_status("ship-it", &convoy.metadata.resource_version, &status)
+        .await
+        .expect("discover subjects");
+    replica
+        .replica_writer::<Convoy>(NodeId::new("kiwi"), "flotilla")
+        .apply(WatchEvent::Added(convoy.clone()), now)
+        .await
+        .expect("replicate convoy");
+    let project = |convoy: &ResourceObject<Convoy>, observations: &SubjectCatalogInput| {
+        let rows = [ConvoyRow::builder()
+            .resource(convoy_ref("flotilla", "ship-it"))
+            .name("ship-it")
+            .workflow_ref("dev")
+            .phase(ConvoyPhase::Active)
+            .subjects(convoy_subject_rows(convoy, &references))
+            .build()];
+        let mut input = catalog_input(&rows);
+        input.subjects = Some(observations);
+        project_catalog(&input, &mint())
+    };
+    let local_observations = SubjectCatalogInput {
+        change_requests: requests,
+        issues: vec![issue_record],
+        forges: vec![gh, lab],
+        references: references.clone(),
+        now: Some(now),
+    };
+    let remote_observations = SubjectCatalogInput {
+        change_requests: replica
+            .including_replicas::<ChangeRequest>("flotilla")
+            .list()
+            .await
+            .expect("replicated requests")
+            .items
+            .into_iter()
+            .map(|item| item.object)
+            .collect(),
+        issues: replica
+            .including_replicas::<Issue>("flotilla")
+            .list()
+            .await
+            .expect("replicated issues")
+            .items
+            .into_iter()
+            .map(|item| item.object)
+            .collect(),
+        forges: replica
+            .including_replicas::<Forge>("flotilla")
+            .list()
+            .await
+            .expect("replicated forges")
+            .items
+            .into_iter()
+            .map(|item| item.object)
+            .collect(),
+        references: references.clone(),
+        now: Some(now),
+    };
+    let remote_convoy = replica.including_replicas::<Convoy>("flotilla").get("ship-it").await.expect("replicated convoy").object;
+    let local = project(&convoy, &local_observations);
+    assert_eq!(local, project(&remote_convoy, &remote_observations));
+    let patches = local.reassert_patches();
+    let convoy = find_entity(&patches, &entity::convoy("flotilla", "ship-it", "kiwi"));
+    assert_eq!(
+        convoy.set["flotilla.subject.produces"].value,
+        MetadataValue::EntityRefs(vec![
+            entity::change_request("github.com", "org/flotilla", "42"),
+            entity::change_request("lab", "team/cleat", "281")
+        ])
+    );
+    let first = find_entity(&patches, &entity::change_request("github.com", "org/flotilla", "42"));
+    assert_eq!(text(first, KEY_DISPLAY_LABEL), "flotilla/c!42");
+    assert_eq!(text(first, "flotilla.change_request.title"), "Ship first");
+    assert_eq!(text(first, "flotilla.change_request.readiness"), "ready_to_merge");
+    assert_eq!(text(first, "flotilla.change_request.checks"), "pass");
+    assert_eq!(text(first, "flotilla.change_request.author.observed_at"), "2026-10-02T12:00:00+00:00");
+    assert_eq!(first.set["flotilla.forge"].value, MetadataValue::EntityRefs(vec![entity::forge("github")]));
+    let issue = find_entity(
+        &patches,
+        &entity::issue(&IssueRef { source: IssueSource { service: "lab".into(), scope: "team/cleat".into() }, id: "7".into() }),
+    );
+    assert_eq!(text(issue, KEY_DISPLAY_LABEL_SHORT), "wheelhouse/c#7");
+    assert_eq!(issue.set["flotilla.issue.labels"].value, MetadataValue::StringList(vec!["ready".into()]));
+    assert_eq!(issue.set["flotilla.issue.assignees"].value, MetadataValue::StringList(vec!["alice".into()]));
+    assert_eq!(
+        issue.set["flotilla.subject_of.works_on"].value,
+        MetadataValue::EntityRefs(vec![entity::convoy("flotilla", "ship-it", "kiwi")])
+    );
+    let forge = find_entity(&patches, &entity::forge("lab"));
+    assert_eq!(text(forge, "flotilla.forge.web_url"), "https://forge.example/git");
+    assert_eq!(text(forge, "flotilla.forge.change_request_url_template"), "{web_url}/{scope}/pulls/{number}");
 }

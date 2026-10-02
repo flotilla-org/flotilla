@@ -165,3 +165,102 @@ pub const SEGMENT_INDEPENDENT: &str = "flotilla.independent";
 /// Checkout awareness-entry identity, never a vessel or session name.
 pub const SEGMENT_CHECKOUT: &str = "flotilla.checkout";
 pub const SEGMENT_ISSUE: &str = "flotilla.issue";
+
+// ADR 0051 replicated subjects and typed graph edges.
+// Subject entities use forge-relative ids: <service>/<scope>!<number> for a
+// change request and <service>/<scope>#<number> for an issue. All edges below
+// are EntityRefs, including single-target forge/current-attempt edges.
+// subject_of is the union; subject_of.<relationship> preserves edge typing.
+// Subject labels are ReferenceContext short references at every width tier.
+// They never decorate a convoy label. Number is text to preserve identity.
+// Raw Unknown values are absent while their observation time remains visible.
+// title, author, head_sha, state, checks, mergeable, review_decision and
+// updated_at are Text. labels/assignees are StringList, requested-from-owner
+// and actionable-at-head are Bool. CR state: open|draft|merged|closed;
+// issue state: open|closed; checks: pass|fail|pending; mergeable:
+// mergeable|conflicting; review_decision: approved|changes_requested|none.
+// Readiness: ready_to_merge|awaiting_review_response|ci_failing|conflicting|
+// draft|merged_not_landed|closed. All observed_at companions are Text.
+// Subject entities are scoped to live convoys and strictly less than 24 hours
+// after landed finished_at; failed/cancelled/abandoned links are excluded.
+// Readiness is the ADR 0051 closed vocabulary. Orphans are deferred to the
+// producer provenance/retention follow-up; unmatched observations are excluded.
+// Attempts are ordered by generation, oldest first. The current attempt is
+// the live generation; it is absent between admissions. desired_state is
+// running (ensure declaration present), state is active or held, restart_count
+// is integer, next_attempt is an optional RFC 3339 backoff deadline.
+// Forge URL templates substitute web_url, scope and number; kind is github
+// or forgejo. The forge web_url has no trailing slash.
+pub const KEY_SUBJECT_PRODUCES: &str = "flotilla.subject.produces";
+pub const KEY_SUBJECT_ADOPTS: &str = "flotilla.subject.adopts";
+pub const KEY_SUBJECT_WORKS_ON: &str = "flotilla.subject.works_on";
+pub const KEY_SUBJECT_SUPERSEDES: &str = "flotilla.subject.supersedes";
+pub const KEY_SUBJECT_REFERENCES: &str = "flotilla.subject.references";
+pub const KEY_SUBJECT_OF: &str = "flotilla.subject_of";
+pub const KEY_SUBJECT_OF_PRODUCES: &str = "flotilla.subject_of.produces";
+pub const KEY_SUBJECT_OF_ADOPTS: &str = "flotilla.subject_of.adopts";
+pub const KEY_SUBJECT_OF_WORKS_ON: &str = "flotilla.subject_of.works_on";
+pub const KEY_SUBJECT_OF_SUPERSEDES: &str = "flotilla.subject_of.supersedes";
+pub const KEY_SUBJECT_OF_REFERENCES: &str = "flotilla.subject_of.references";
+pub const KEY_SUBJECT_SERVICE: &str = "flotilla.subject.service";
+pub const KEY_SUBJECT_SCOPE: &str = "flotilla.subject.scope";
+pub const KEY_SUBJECT_NUMBER: &str = "flotilla.subject.number";
+pub const KEY_SUBJECT_KIND: &str = "flotilla.subject.kind";
+pub const KEY_SUBJECT_REPOSITORY_ALIAS: &str = "flotilla.subject.repository_alias";
+pub const KEY_FORGE: &str = "flotilla.forge";
+pub const KEY_FORGE_KIND: &str = "flotilla.forge.kind";
+pub const KEY_FORGE_WEB_URL: &str = "flotilla.forge.web_url";
+pub const KEY_FORGE_CHANGE_REQUEST_URL_TEMPLATE: &str = "flotilla.forge.change_request_url_template";
+pub const KEY_FORGE_ISSUE_URL_TEMPLATE: &str = "flotilla.forge.issue_url_template";
+pub const KEY_CHANGE_REQUEST_READINESS: &str = "flotilla.change_request.readiness";
+pub const KEY_ROLE_CURRENT_ATTEMPT: &str = "flotilla.role.current_attempt";
+/// Current attempt's observed materialize terminals, using canonical session ids.
+pub const KEY_ROLE_CREW_SESSIONS: &str = "flotilla.role.crew_sessions";
+pub const KEY_ROLE_ATTEMPTS: &str = "flotilla.role.attempts";
+pub const KEY_ROLE_DESIRED_STATE: &str = "flotilla.role.desired_state";
+pub const KEY_ROLE_STATE: &str = "flotilla.role.state";
+pub const KEY_ROLE_RESTART_COUNT: &str = "flotilla.role.restart_count";
+pub const KEY_ROLE_NEXT_ATTEMPT: &str = "flotilla.role.next_attempt";
+/// Observed value; absent when Unknown. Its companion time is RFC 3339.
+pub const KEY_CHANGE_REQUEST_TITLE: &str = "flotilla.change_request.title";
+pub const KEY_CHANGE_REQUEST_TITLE_OBSERVED_AT: &str = "flotilla.change_request.title.observed_at";
+/// Observed value; absent when Unknown. Its companion time is RFC 3339.
+pub const KEY_CHANGE_REQUEST_AUTHOR: &str = "flotilla.change_request.author";
+pub const KEY_CHANGE_REQUEST_AUTHOR_OBSERVED_AT: &str = "flotilla.change_request.author.observed_at";
+/// Observed value; absent when Unknown. Its companion time is RFC 3339.
+pub const KEY_CHANGE_REQUEST_STATE: &str = "flotilla.change_request.state";
+pub const KEY_CHANGE_REQUEST_STATE_OBSERVED_AT: &str = "flotilla.change_request.state.observed_at";
+/// Observed value; absent when Unknown. Its companion time is RFC 3339.
+pub const KEY_CHANGE_REQUEST_CHECKS: &str = "flotilla.change_request.checks";
+pub const KEY_CHANGE_REQUEST_CHECKS_OBSERVED_AT: &str = "flotilla.change_request.checks.observed_at";
+/// Observed value; absent when Unknown. Its companion time is RFC 3339.
+pub const KEY_CHANGE_REQUEST_MERGEABLE: &str = "flotilla.change_request.mergeable";
+pub const KEY_CHANGE_REQUEST_MERGEABLE_OBSERVED_AT: &str = "flotilla.change_request.mergeable.observed_at";
+/// Observed value; absent when Unknown. Its companion time is RFC 3339.
+pub const KEY_CHANGE_REQUEST_HEAD_SHA: &str = "flotilla.change_request.head_sha";
+pub const KEY_CHANGE_REQUEST_HEAD_SHA_OBSERVED_AT: &str = "flotilla.change_request.head_sha.observed_at";
+/// Observed value; absent when Unknown. Its companion time is RFC 3339.
+pub const KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD: &str = "flotilla.change_request.review.actionable_at_head";
+pub const KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD_OBSERVED_AT: &str = "flotilla.change_request.review.actionable_at_head.observed_at";
+/// Observed value; absent when Unknown. Its companion time is RFC 3339.
+pub const KEY_CHANGE_REQUEST_REVIEW_DECISION: &str = "flotilla.change_request.review_decision";
+pub const KEY_CHANGE_REQUEST_REVIEW_DECISION_OBSERVED_AT: &str = "flotilla.change_request.review_decision.observed_at";
+/// Observed value; absent when Unknown. Its companion time is RFC 3339.
+pub const KEY_CHANGE_REQUEST_REVIEW_REQUESTED_FROM_OWNER: &str = "flotilla.change_request.review_requested_from_owner";
+pub const KEY_CHANGE_REQUEST_REVIEW_REQUESTED_FROM_OWNER_OBSERVED_AT: &str =
+    "flotilla.change_request.review_requested_from_owner.observed_at";
+/// Observed value; absent when Unknown. Its companion time is RFC 3339.
+pub const KEY_ISSUE_TITLE: &str = "flotilla.issue.title";
+pub const KEY_ISSUE_TITLE_OBSERVED_AT: &str = "flotilla.issue.title.observed_at";
+/// Observed value; absent when Unknown. Its companion time is RFC 3339.
+pub const KEY_ISSUE_STATE: &str = "flotilla.issue.state";
+pub const KEY_ISSUE_STATE_OBSERVED_AT: &str = "flotilla.issue.state.observed_at";
+/// Observed value; absent when Unknown. Its companion time is RFC 3339.
+pub const KEY_ISSUE_LABELS: &str = "flotilla.issue.labels";
+pub const KEY_ISSUE_LABELS_OBSERVED_AT: &str = "flotilla.issue.labels.observed_at";
+/// Observed value; absent when Unknown. Its companion time is RFC 3339.
+pub const KEY_ISSUE_ASSIGNEES: &str = "flotilla.issue.assignees";
+pub const KEY_ISSUE_ASSIGNEES_OBSERVED_AT: &str = "flotilla.issue.assignees.observed_at";
+/// Observed value; absent when Unknown. Its companion time is RFC 3339.
+pub const KEY_ISSUE_UPDATED_AT: &str = "flotilla.issue.updated_at";
+pub const KEY_ISSUE_UPDATED_AT_OBSERVED_AT: &str = "flotilla.issue.updated_at.observed_at";

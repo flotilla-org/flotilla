@@ -73,6 +73,15 @@ pub fn issue(reference: &IssueRef) -> EntityRef {
     EntityRef::new("issue", format!("{}/{}#{}", reference.source.service, reference.source.scope, reference.id))
 }
 
+/// Forge-relative change request; independent of the host holding a replica.
+pub fn change_request(service: &str, scope: &str, number: &str) -> EntityRef {
+    EntityRef::new("change_request", format!("{service}/{scope}!{number}"))
+}
+
+pub fn forge(forge_id: &str) -> EntityRef {
+    EntityRef::new("forge", forge_id)
+}
+
 pub fn session(session_ref: &str) -> EntityRef {
     EntityRef::new("session", session_ref)
 }
