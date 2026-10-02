@@ -1012,7 +1012,11 @@ impl CredentialStore {
         let material = self.resolve_for_adapter(&name, &spec, None, None).await?;
         let material = material.value.trim_end();
         validate_scalar_material(&name, "docker-registry", material)?;
-        let config_dir = self.state_dir.join("credential-runtime").join(format!("{}-{}", safe_component(&name), uuid::Uuid::new_v4()));
+        let config_dir = self
+            .state_dir
+            .join("credential-runtime")
+            .join(registry_environment_dir(environment_ref))
+            .join(uuid::Uuid::new_v4().to_string());
         tokio::fs::create_dir_all(&config_dir)
             .await
             .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("create cache directory: {error}")))?;
@@ -1127,6 +1131,50 @@ impl CredentialStore {
         let config_dir = self.registry_configs.lock().await.remove(environment_ref);
         if let Some(config_dir) = config_dir {
             remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
+        }
+        Ok(())
+    }
+
+    /// Remove Docker login caches left by environments which no longer have
+    /// either a resource record or a running backing. Legacy flat directories
+    /// have no environment identity, so they are removed only when no live
+    /// environment or backing could own one.
+    pub(crate) async fn sweep_orphaned_registry_configs(
+        &self,
+        live_environments: &BTreeSet<String>,
+        running_backings: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        let root = self.state_dir.join("credential-runtime");
+        let mut entries = match tokio::fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("list Docker credential caches {}: {error}", root.display())),
+        };
+        let protected =
+            live_environments.iter().chain(running_backings).map(|name| registry_environment_dir(name)).collect::<BTreeSet<_>>();
+        let active_paths = self.registry_configs.lock().await.values().cloned().collect::<BTreeSet<_>>();
+        while let Some(entry) = entries.next_entry().await.map_err(|error| format!("list Docker credential cache: {error}"))? {
+            let kind = entry.file_type().await.map_err(|error| format!("inspect Docker credential cache: {error}"))?;
+            if !kind.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let owned = name
+                .strip_prefix("env-")
+                .is_some_and(|hex| !hex.is_empty() && hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+            let legacy =
+                name.len() > 37 && name.as_bytes()[name.len() - 37] == b'-' && uuid::Uuid::parse_str(&name[name.len() - 36..]).is_ok();
+            if owned && !protected.contains(&name) && !active_paths.iter().any(|path| path.starts_with(entry.path())) {
+                remove_registry_config(&entry.path())
+                    .await
+                    .map_err(|error| format!("remove orphaned Docker credential cache {}: {error}", entry.path().display()))?;
+                tracing::info!(path = %entry.path().display(), "removed orphaned Docker credential cache");
+            } else if legacy && live_environments.is_empty() && running_backings.is_empty() && !active_paths.contains(&entry.path()) {
+                remove_registry_config(&entry.path())
+                    .await
+                    .map_err(|error| format!("remove legacy Docker credential cache {}: {error}", entry.path().display()))?;
+                tracing::info!(path = %entry.path().display(), "removed legacy orphaned Docker credential cache");
+            }
         }
         Ok(())
     }
@@ -2147,6 +2195,15 @@ fn epoch_to_datetime(value: i64) -> Option<DateTime<Utc>> {
 
 fn sanitize_curl_config(value: &str) -> String {
     value.replace(['\\', '"', '\r', '\n'], "")
+}
+
+fn registry_environment_dir(environment_ref: &str) -> String {
+    let mut name = String::from("env-");
+    for byte in environment_ref.bytes() {
+        use std::fmt::Write;
+        write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    name
 }
 
 fn safe_component(name: &str) -> String {
@@ -5074,5 +5131,38 @@ interactions:
 
         store.forget_environment("env-a").await.expect("forget environment");
         assert!(!config_dir.exists(), "credential config should be deleted with the environment");
+    }
+
+    #[tokio::test]
+    async fn registry_sweep_removes_orphans_and_preserves_live_environment_directories() {
+        let state = tempfile::tempdir().expect("state directory");
+        let root = state.path().join("credential-runtime");
+        let live = root.join(registry_environment_dir("live-env")).join(uuid::Uuid::new_v4().to_string());
+        let running = root.join(registry_environment_dir("running-env")).join(uuid::Uuid::new_v4().to_string());
+        let orphan = root.join(registry_environment_dir("orphan-env")).join(uuid::Uuid::new_v4().to_string());
+        let legacy = root.join(format!("private-registry-{}", uuid::Uuid::new_v4()));
+        for path in [&live, &running, &orphan] {
+            std::fs::create_dir_all(path).expect("cache directory");
+            std::fs::write(path.join("config.json"), "secret").expect("cache file");
+        }
+        std::fs::create_dir_all(&legacy).expect("legacy cache directory");
+        let store = CredentialStore::new(
+            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            Arc::new(RecordingRunner::default()),
+            state.path().to_path_buf(),
+        );
+        store
+            .sweep_orphaned_registry_configs(&BTreeSet::from(["live-env".to_string()]), &BTreeSet::from(["running-env".to_string()]))
+            .await
+            .expect("sweep cache directories");
+        assert!(live.is_dir(), "live Environment directory must remain");
+        assert!(running.is_dir(), "running backing directory must remain");
+        assert!(!orphan.exists(), "orphan directory must be removed");
+        assert!(legacy.is_dir(), "unattributed legacy cache could belong to a live environment");
+        store.sweep_orphaned_registry_configs(&BTreeSet::new(), &BTreeSet::new()).await.expect("sweep with no live owners");
+        assert!(!legacy.exists(), "legacy orphan must be removed once no environment can own it");
     }
 }

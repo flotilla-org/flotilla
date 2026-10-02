@@ -603,6 +603,21 @@ impl DaemonRuntime {
         if let Err(error) = credential_store.cleanup_stale_github_app_token_files().await {
             warn!(%error, "failed to clean up stale GitHub App token staging files");
         }
+        if let Some((_, provider)) = local_registry.environment_providers.get("docker") {
+            let live = daemon.resource_backend().using::<Environment>(&options.namespace).list().await;
+            let running = provider.list().await;
+            match (live, running) {
+                (Ok(live), Ok(running)) => {
+                    let live = live.items.into_iter().map(|environment| environment.metadata.name).collect::<BTreeSet<_>>();
+                    let running = running.into_iter().map(|handle| handle.id().to_string()).collect::<BTreeSet<_>>();
+                    if let Err(error) = credential_store.sweep_orphaned_registry_configs(&live, &running).await {
+                        warn!(%error, "failed to sweep orphaned Docker credential caches");
+                    }
+                }
+                (Err(error), _) => warn!(%error, "could not list environments for Docker credential cache sweep"),
+                (_, Err(error)) => warn!(%error, "could not list running Docker backings for credential cache sweep"),
+            }
+        }
         let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::clone(&daemon.discovery_runtime().env)));
         let health = DaemonHealthIdentity {
             generation: daemon
@@ -7057,6 +7072,11 @@ mod tests {
         }
 
         async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+            self.0.write_file(path, content).await
+        }
+
+        async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+            assert!(matches!(mode, 0o600 | 0o700));
             self.0.write_file(path, content).await
         }
     }
