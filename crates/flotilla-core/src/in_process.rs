@@ -39,7 +39,7 @@ use flotilla_protocol::{
     ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use flotilla_resources::{
-    api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
+    active_change_request_subjects, api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
     apply_status_patch_checked as apply_resource_status_patch_checked, capped_github_app_permissions, change_request_address,
     change_request_address_with_forges, change_request_record_name, controller::delete_lifecycle_owned_matching, evaluate_crew_completion,
     expected_change_request_leaves, external_patches as convoy_external_patches, get_resource_kind, get_resource_kind_including_replicas,
@@ -224,44 +224,32 @@ impl crate::issue_observer::IssueObservationSource for ProviderIssueObservationS
     }
 }
 
-fn change_request_subject_numbers<'a>(
-    subjects: impl Iterator<Item = &'a flotilla_protocol::Subject>,
+struct BoundConvoyCredentialRefs {
+    numbers: BTreeSet<u64>,
+    credentials_by_number: BTreeMap<u64, BTreeSet<String>>,
+}
+
+fn convoy_change_request_credential_refs(
+    convoy: &ResourceObject<ResourceConvoy>,
     requested: &ChangeRequestRef,
-) -> BTreeSet<u64> {
-    subjects
+) -> Result<BoundConvoyCredentialRefs, String> {
+    let bound_numbers = active_change_request_subjects(convoy)?
+        .into_iter()
         .filter(|bound| {
             bound.kind == flotilla_protocol::SubjectKind::ChangeRequest
                 && bound.source.service == requested.service
                 && bound.source.scope == requested.scope
         })
         .filter_map(|bound| bound.id.parse().ok())
-        .collect()
-}
-
-fn convoy_change_request_credential_refs(
-    spec: &ConvoySpec,
-    status: Option<&flotilla_resources::ConvoyStatus>,
-    requested: &ChangeRequestRef,
-    repository_key: &RepositoryKey,
-) -> (BTreeSet<u64>, BTreeMap<u64, BTreeSet<String>>) {
-    let mut bound_numbers = change_request_subject_numbers(
-        spec.subjects
-            .iter()
-            .map(|entry| &entry.subject)
-            .chain(status.iter().flat_map(|status| &status.subjects).map(|entry| &entry.subject)),
-        requested,
-    );
-    if let Some(bound) = spec.change_request.as_ref().filter(|bound| &bound.repository_ref == repository_key) {
-        if let Ok(number) = bound.id.parse() {
-            bound_numbers.insert(number);
-        }
-    }
-    let refs = status
+        .collect::<BTreeSet<_>>();
+    let refs = convoy
+        .status
+        .as_ref()
         .and_then(|status| status.workflow_snapshot.as_ref())
         .map(|snapshot| snapshot.vessels.iter().flat_map(|vessel| &vessel.credential_refs).cloned().collect::<BTreeSet<_>>())
         .unwrap_or_default();
     let by_number = bound_numbers.iter().map(|number| (*number, refs.clone())).collect();
-    (bound_numbers, by_number)
+    Ok(BoundConvoyCredentialRefs { numbers: bound_numbers, credentials_by_number: by_number })
 }
 
 impl ProviderChangeRequestObservationSource {
@@ -327,12 +315,6 @@ impl ProviderChangeRequestObservationSource {
             if convoy.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
                 continue;
             }
-            let (bound_numbers, refs_by_number) = convoy_change_request_credential_refs(
-                &convoy.object.spec,
-                convoy.object.status.as_ref(),
-                subject,
-                &repository.object.spec.key(),
-            );
             if let Some(bound) =
                 convoy.object.spec.change_request.as_ref().filter(|bound| bound.repository_ref == repository.object.spec.key())
             {
@@ -340,9 +322,16 @@ impl ProviderChangeRequestObservationSource {
                     numbers.insert(number);
                 }
             }
-            if !bound_numbers.is_empty() {
+            let bound = match convoy_change_request_credential_refs(&convoy.object, subject) {
+                Ok(bound) => bound,
+                Err(error) => {
+                    tracing::warn!(convoy = %convoy.object.metadata.name, %error, "could not resolve active change request subjects for crew identity");
+                    continue;
+                }
+            };
+            if !bound.numbers.is_empty() {
                 if convoy.object.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).is_some() {
-                    for (number, refs) in refs_by_number {
+                    for (number, refs) in bound.credentials_by_number {
                         credential_refs_by_number.entry(number).or_default().extend(refs);
                     }
                 } else if self.warned_missing_snapshot.lock().await.insert((subject.namespace.clone(), convoy.object.metadata.name.clone()))

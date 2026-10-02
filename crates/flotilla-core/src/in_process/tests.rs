@@ -25,15 +25,10 @@ fn bound_change_request_identity_uses_matching_declared_or_discovered_subject() 
         source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "team/repo".into() },
         id: "42".into(),
     };
-    assert_eq!(change_request_subject_numbers([&subject].into_iter(), &requested), BTreeSet::from([42]));
-    let mut unrelated = subject.clone();
-    unrelated.source.scope = "team/other".into();
-    assert!(change_request_subject_numbers([&unrelated].into_iter(), &requested).is_empty());
-
     let spec = ConvoySpec::builder().workflow_ref("review".to_string()).build();
     let mut status = ConvoyStatus::default();
     status.discover_subject(
-        subject,
+        subject.clone(),
         flotilla_protocol::Relationship::Produces,
         flotilla_resources::SubjectDiscoverySource::Claim,
         Utc::now(),
@@ -49,9 +44,35 @@ fn bound_change_request_identity_uses_matching_declared_or_discovered_subject() 
             .credential_refs(BTreeSet::from(["github-crew-pr".to_string()]))
             .build()],
     });
-    let (bound, refs) = convoy_change_request_credential_refs(&spec, Some(&status), &requested, &RepositoryKey("team-repo".into()));
-    assert_eq!(bound, BTreeSet::from([42]));
-    assert_eq!(refs[&42], BTreeSet::from(["github-crew-pr".to_string()]));
+    let mut convoy = ResourceObject::<ResourceConvoy> {
+        metadata: ObjectMeta {
+            name: "review-convoy".to_string(),
+            namespace: "flotilla".to_string(),
+            resource_version: "1".to_string(),
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
+            owner_references: Vec::new(),
+            finalizers: Vec::new(),
+            deletion_timestamp: None,
+            creation_timestamp: Utc::now(),
+            merge: None,
+        },
+        spec,
+        status: Some(status),
+    };
+    let bound = convoy_change_request_credential_refs(&convoy, &requested).expect("active PR subjects");
+    assert_eq!(bound.numbers, BTreeSet::from([42]));
+    assert_eq!(bound.credentials_by_number[&42], BTreeSet::from(["github-crew-pr".to_string()]));
+    let mut unrelated = requested.clone();
+    unrelated.scope = "team/other".into();
+    assert!(convoy_change_request_credential_refs(&convoy, &unrelated).expect("other scope").numbers.is_empty());
+    convoy.status.as_mut().expect("status").discover_subject(
+        subject,
+        flotilla_protocol::Relationship::Supersedes,
+        flotilla_resources::SubjectDiscoverySource::Operator,
+        Utc::now(),
+    );
+    assert!(convoy_change_request_credential_refs(&convoy, &requested).expect("superseded PR").numbers.is_empty());
 }
 
 #[tokio::test]
