@@ -27,6 +27,7 @@ define_resource!(Convoy, "convoys", ConvoySpec, ConvoyStatus, ConvoyStatusPatch,
 pub const WORKFLOW_SNAPSHOT_ANNOTATION: &str = "flotilla.work/workflow-snapshot";
 pub const PLACEMENT_SNAPSHOT_ANNOTATION: &str = "flotilla.work/placement-snapshot";
 pub const VESSEL_PLACEMENTS_ANNOTATION: &str = "flotilla.work/vessel-placements";
+pub const ENSURED_FROM_ANNOTATION: &str = "flotilla.work/ensured-from";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VesselPlacementPin {

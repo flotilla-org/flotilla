@@ -1,5 +1,6 @@
 use flotilla_protocol::AgentOverride;
 use flotilla_resources::WorkflowTemplateSpec;
+pub use flotilla_resources::ENSURED_FROM_ANNOTATION;
 use serde::Deserialize;
 
 pub const MATERIALIZED_PROJECT_ANNOTATION: &str = "flotilla.work/materialized-project";
@@ -8,7 +9,6 @@ pub const SOURCE_COMMIT_ANNOTATION: &str = "flotilla.work/source-commit";
 pub const SOURCE_ENTRY_PATH_ANNOTATION: &str = "flotilla.work/source-entry-path";
 pub const VERIFICATION_PROJECT_ANNOTATION: &str = "flotilla.work/verification-command-project";
 pub const VERIFICATION_PROVENANCE_ANNOTATION: &str = "flotilla.work/verification-command-provenance";
-pub const ENSURED_FROM_ANNOTATION: &str = "flotilla.work/ensured-from";
 pub const ENSURE_PROVENANCE_ANNOTATION: &str = "flotilla.work/ensure-provenance";
 pub const PRESENTS_AS_ANNOTATION: &str = "flotilla.work/presents-as";
 

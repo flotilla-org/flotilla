@@ -1857,7 +1857,7 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
         .await
         .expect("workspace create should succeed");
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -1874,6 +1874,18 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
                     && spec.cwd == "/Users/alice/dev/flotilla-existing"
         )
     }));
+
+    flotilla_resources::apply_status_patch(
+        &backend.using::<Checkout>(NAMESPACE),
+        "adopted-checkout-convoy-adopted",
+        &flotilla_resources::CheckoutStatusPatch::MarkGone,
+    )
+    .await
+    .expect("adopted checkout gone");
+    let gone = reconciler.reconcile(&workspace, &reconciler.prepare(&workspace).await.expect("gone checkout"), Utc::now());
+    assert!(
+        matches!(gone.patch, Some(flotilla_resources::VesselStatusPatch::MarkFailed { ref message }) if message.contains("adopted checkout") && message.contains("gone"))
+    );
 }
 
 #[tokio::test]

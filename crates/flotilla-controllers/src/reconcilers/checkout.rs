@@ -227,6 +227,7 @@ fn convoy_claims_checkout(convoy: &ResourceObject<Convoy>, checkout_name: &str) 
 pub enum CheckoutPrepared {
     None,
     Gone,
+    Reappeared,
     OwnerTerminal,
     Ready { prepared: PreparedCheckout },
     Integration { status: Box<CheckoutIntegrationStatus> },
@@ -275,12 +276,17 @@ where
         }
 
         if obj.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) != CheckoutPhase::Pending {
-            if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready) {
+            if obj.status.as_ref().is_some_and(|status| matches!(status.phase, CheckoutPhase::Ready | CheckoutPhase::Gone)) {
                 if let CheckoutSpec::Worktree(worktree) = &obj.spec {
                     let path = obj.status.as_ref().and_then(|status| status.path.as_deref()).unwrap_or(&worktree.target_path);
                     match self.runtime.checkout_path_exists_in(&worktree.env_ref, path).await {
-                        Ok(Some(false)) => return Ok(CheckoutPrepared::Gone),
-                        Ok(Some(true) | None) => {}
+                        Ok(Some(false)) if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready) => {
+                            return Ok(CheckoutPrepared::Gone)
+                        }
+                        Ok(Some(true)) if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Gone) => {
+                            return Ok(CheckoutPrepared::Reappeared)
+                        }
+                        Ok(Some(_)) | Ok(None) => {}
                         Err(error) => return Ok(CheckoutPrepared::Failed(error)),
                     }
                 }
@@ -379,10 +385,26 @@ where
                     commit: prepared.commit.clone(),
                     branch_provenance: prepared.branch_provenance,
                 }),
-                CheckoutPrepared::Integration { .. } | CheckoutPrepared::OwnerTerminal | CheckoutPrepared::Gone => None,
+                CheckoutPrepared::Integration { .. }
+                | CheckoutPrepared::OwnerTerminal
+                | CheckoutPrepared::Gone
+                | CheckoutPrepared::Reappeared => None,
                 CheckoutPrepared::RetryClone { .. } => None,
                 CheckoutPrepared::Failed(message) => Some(CheckoutStatusPatch::MarkFailed { message: message.clone() }),
                 CheckoutPrepared::Waiting | CheckoutPrepared::None => None,
+            }
+        } else if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Gone) {
+            match prepared {
+                CheckoutPrepared::Reappeared => {
+                    obj.status.as_ref().and_then(|status| status.path.clone()).or_else(|| obj.spec.target_path().map(str::to_string)).map(
+                        |path| CheckoutStatusPatch::MarkReady {
+                            path,
+                            commit: obj.status.as_ref().and_then(|status| status.commit.clone()),
+                            branch_provenance: obj.status.as_ref().map(|status| status.branch_provenance).unwrap_or_default(),
+                        },
+                    )
+                }
+                _ => None,
             }
         } else if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready) {
             match prepared {
@@ -414,6 +436,7 @@ where
                 }),
                 CheckoutPrepared::None
                 | CheckoutPrepared::OwnerTerminal
+                | CheckoutPrepared::Reappeared
                 | CheckoutPrepared::Ready { .. }
                 | CheckoutPrepared::RetryClone { .. }
                 | CheckoutPrepared::Waiting => None,

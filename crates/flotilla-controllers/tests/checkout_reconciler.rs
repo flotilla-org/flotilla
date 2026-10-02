@@ -156,12 +156,21 @@ async fn missing_worktree_observed_on_its_host_becomes_gone() {
         .await
         .expect("ready checkout");
     let runtime = Arc::new(RecordingCheckoutRuntime { path_exists: Some(false), ..Default::default() });
-    let reconciler = CheckoutReconciler::new(runtime, backend, NAMESPACE);
+    let reconciler = CheckoutReconciler::new(runtime, backend.clone(), NAMESPACE);
     let prepared = reconciler.prepare(&checkout).await.expect("observe host path");
     let outcome = reconciler.reconcile(&checkout, &prepared, chrono::Utc::now());
     let mut status = checkout.status.expect("status");
     outcome.patch.expect("gone patch").apply(&mut status);
     assert_eq!(status.phase, CheckoutPhase::Gone);
+
+    let current = checkouts.get("checkout-a").await.expect("checkout");
+    let gone = checkouts.update_status("checkout-a", &current.metadata.resource_version, &status).await.expect("record Gone");
+    let reappeared =
+        CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime { path_exists: Some(true), ..Default::default() }), backend, NAMESPACE);
+    let prepared = reappeared.prepare(&gone).await.expect("recheck host path");
+    let outcome = reappeared.reconcile(&gone, &prepared, chrono::Utc::now());
+    outcome.patch.expect("ready patch").apply(&mut status);
+    assert_eq!(status.phase, CheckoutPhase::Ready);
 }
 
 #[tokio::test]

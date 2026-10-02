@@ -1271,6 +1271,8 @@ struct ControllerRuntimeState {
     agent_material: Option<Arc<AgentMaterialRegistry>>,
     blob_store: Option<Arc<TieredBlobStore>>,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
+    /// Latched after one complete post-startup local Docker adoption pass.
+    /// A fresh provider listing is still required for each absence judgement.
     local_backing_observed: AtomicBool,
     clone_flights: Arc<CloneFlights>,
     terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
@@ -1584,7 +1586,20 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
                 .or_else(|| self.local_registry.environment_providers.preferred_with_desc())
                 .ok_or_else(|| "Docker environment provider unavailable for standing-convoy liveness check".to_string())?;
             let handles = provider.list().await.map_err(|error| format!("Docker backing liveness check failed: {error}"))?;
-            if handles.iter().any(|handle| handle.id().as_str().starts_with(&format!("env-{}-", convoy.metadata.name))) {
+            let expected_environments = convoy
+                .status
+                .as_ref()
+                .and_then(|status| status.workflow_snapshot.as_ref())
+                .map(|snapshot| {
+                    snapshot
+                        .vessels
+                        .iter()
+                        .map(|requirement| format!("env-{}-{}", convoy.metadata.name, requirement.name))
+                        .collect::<BTreeSet<_>>()
+                })
+                .filter(|names| !names.is_empty())
+                .ok_or_else(|| "backing is not verifiable: convoy has no frozen vessel names".to_string())?;
+            if handles.iter().any(|handle| expected_environments.contains(handle.id().as_str())) {
                 return Err("backing is not verified dead: matching Docker container remains".to_string());
             }
             return Ok(());
@@ -4771,8 +4786,13 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         if env_ref != self.state.host_direct_environment_name {
             return Ok(None);
         }
-        let runner = self.state.daemon.local_command_runner().ok_or("local host command runner unavailable for worktree check")?;
-        runner.path_exists(Path::new(path)).await.map(Some)
+        // `test -e` conflates ENOENT with permission failures. Only the host's
+        // filesystem error can make absence authoritative for teardown.
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(_) => Ok(Some(true)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(false)),
+            Err(error) => Err(format!("inspect worktree path {path}: {error}")),
+        }
     }
 
     async fn create_worktree(
@@ -4893,10 +4913,6 @@ impl CheckoutControllerRuntime {
 
 #[async_trait]
 impl CheckoutRuntime for CheckoutControllerRuntime {
-    async fn checkout_path_exists_in(&self, _env_ref: &str, path: &str) -> Result<Option<bool>, String> {
-        self.runner.path_exists(Path::new(path)).await.map(Some)
-    }
-
     async fn create_worktree(
         &self,
         _clone_path: &str,
@@ -8371,6 +8387,13 @@ mod tests {
         let convoy = convoys
             .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &flotilla_resources::ConvoyStatus {
                 provisioning: Some(ConvoyProvisioningState::Started { started_at: Utc::now() }),
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                }),
                 placement_decision: Some(
                     PlacementDecision::builder()
                         .policy_name("docker".to_string())
@@ -8385,10 +8408,17 @@ mod tests {
             .await
             .expect("convoy status");
         let mut registry = ProviderRegistry::new();
+        let sibling: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+            id: EnvironmentId::new("env-quartermaster-extra-work"),
+            image: ImageId::new("contained-image"),
+            runner: Arc::new(DiscoveryMockRunner::builder().build()),
+            env_vars: HashMap::new(),
+            destroyed: Arc::new(AtomicBool::new(false)),
+        });
         registry.environment_providers.insert(
             "docker",
             ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "docker"),
-            Arc::new(AdoptionEnvironmentProvider { handles: Vec::new() }),
+            Arc::new(AdoptionEnvironmentProvider { handles: vec![sibling] }),
         );
         let state = Arc::new(ControllerRuntimeState::new(
             daemon,

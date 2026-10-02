@@ -2292,6 +2292,17 @@ async fn ensured_work_with_missing_vessel_observation_stalls_without_admitting_a
 }
 
 #[tokio::test]
+async fn interrupted_non_ensured_work_without_a_vessel_does_not_create_one() {
+    let mut status = bootstrapped_tool_only_convoy_status();
+    status.phase = ConvoyPhase::Interrupted;
+    status.work.get_mut("implement").expect("work").phase = WorkPhase::Interrupted;
+    let convoy = convoy_object("manual", task_provisioning_convoy_spec(), Some(status));
+
+    let outcome = reconcile_once_with_resources(&convoy, None, Vec::new(), Vec::new(), timestamp(21)).await;
+    assert!(!outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateVessel { .. })));
+}
+
+#[tokio::test]
 async fn running_agent_work_with_an_interrupted_vessel_becomes_recoverable() {
     let mut status = bootstrapped_convoy_status();
     status.phase = ConvoyPhase::Active;

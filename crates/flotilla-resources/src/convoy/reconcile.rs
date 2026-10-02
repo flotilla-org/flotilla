@@ -35,8 +35,12 @@ use crate::{
     Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Clock, ControllerRetry, DefinitionResolver, Forge, Host,
     InputMeta, InputValue, LeafMaker, OwnerReference, PlacementStatus, PreparedSnapshotGarbageCollector, ReplicaReadResolver, Resource,
     ResourceError, RetryBackoff, RetryCeiling, StallCause, StallEvidenceSource, StallRung, StalledCondition, SystemClock, ThreeValue,
-    TypedResolver,
+    TypedResolver, ENSURED_FROM_ANNOTATION,
 };
+
+fn is_ensured(convoy: &ResourceObject<Convoy>) -> bool {
+    convoy.metadata.annotations.contains_key(ENSURED_FROM_ANNOTATION)
+}
 
 #[async_trait]
 pub trait ConvoyTeardownRuntime: Send + Sync {
@@ -1428,7 +1432,7 @@ fn roll_up_crew_work_outcome(
     now: DateTime<Utc>,
 ) -> Option<ReconcileOutcome> {
     for (work, work_state) in &status.work {
-        if convoy.metadata.annotations.contains_key("flotilla.work/ensured-from")
+        if is_ensured(convoy)
             && work_state.phase == WorkPhase::Stalled
             && !vessels.contains_key(&vessel_resource_name(&convoy.metadata.name, work))
         {
@@ -1441,8 +1445,7 @@ fn roll_up_crew_work_outcome(
             continue;
         }
         if let Some((role, failed)) = crew.iter().find(|(_, state)| state.phase == CrewWorkPhase::Failed) {
-            let phase =
-                if convoy.metadata.annotations.contains_key("flotilla.work/ensured-from") { WorkPhase::Stalled } else { WorkPhase::Failed };
+            let phase = if is_ensured(convoy) { WorkPhase::Stalled } else { WorkPhase::Failed };
             if work_state.phase != phase {
                 let message = failed.message.clone().unwrap_or_else(|| format!("crew member `{role}` failed"));
                 return Some(ReconcileOutcome {
@@ -1625,7 +1628,7 @@ fn vessel_outcome(
                         }
                         _ => {}
                     }
-                } else if convoy.metadata.annotations.contains_key("flotilla.work/ensured-from") && state.phase == WorkPhase::Running {
+                } else if is_ensured(convoy) && state.phase == WorkPhase::Running {
                     return InternalReconcileOutcome {
                         patch: Some(controller_patches::roll_up_work(
                             requirement.name.clone(),
@@ -1665,7 +1668,8 @@ fn vessel_outcome(
                         }
                         _ => {}
                     }
-                } else if let Some(outcome) = create_vessel_outcome(convoy, &requirement.name, now) {
+                } else if is_ensured(convoy) {
+                    let Some(outcome) = create_vessel_outcome(convoy, &requirement.name, now) else { continue };
                     actuations.extend(outcome.actuations);
                 }
             }
@@ -1872,7 +1876,7 @@ fn failed_vessel_outcome(
     now: DateTime<Utc>,
     mut actuations: Vec<Actuation>,
 ) -> InternalReconcileOutcome {
-    if !convoy.metadata.annotations.contains_key("flotilla.work/ensured-from") {
+    if !is_ensured(convoy) {
         return work_failed_outcome(work, from, vessel_failure_message(vessel), now, actuations);
     }
     if vessel.metadata.deletion_timestamp.is_none() {

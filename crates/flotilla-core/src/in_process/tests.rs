@@ -3060,8 +3060,7 @@ async fn gone_worktree_satisfies_teardown_gate_without_integration_observation()
         .verify_convoy_teardown_gate_for_checkouts(&convoy, &[gone], false)
         .await
         .expect("host-confirmed Gone checkout is safe to tear down");
-    let unknown = checkouts.get("checkout-gone").await.expect("checkout");
-    let mut unknown = unknown;
+    let mut unknown = checkouts.get("checkout-gone").await.expect("checkout");
     unknown.status = None;
     assert!(daemon.verify_convoy_teardown_gate_for_checkouts(&convoy, &[unknown], false).await.is_err());
 }
