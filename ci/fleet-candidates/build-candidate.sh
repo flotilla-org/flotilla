@@ -110,7 +110,6 @@ manifest = {
             "name": "mattpocock-skills",
             "repository": "https://github.com/flotilla-org/mattpocock-skills.git",
             "revision": os.environ["FLEET_MATTPOCOCK_SKILLS_SHA"],
-            "credential": "github-skills-fork",
         },
         {
             "name": "rjw-skills",
