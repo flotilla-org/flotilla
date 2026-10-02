@@ -1881,6 +1881,20 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     let placed_convoys = placed.using::<Convoy>("flotilla").list().await.expect("placed convoys");
     assert_eq!(placed_convoys.items.len(), 1, "convoy is homed on the placement host");
     let convoy = &placed_convoys.items[0];
+    let snapshot = &convoy.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION];
+    placed.using::<PlacementPolicy>("flotilla").get(snapshot).await.expect("actuator owns its frozen placement");
+    assert!(
+        daemon
+            .resource_backend()
+            .using::<PlacementPolicy>("flotilla")
+            .list()
+            .await
+            .expect("origin placements")
+            .items
+            .iter()
+            .all(|policy| !policy.metadata.name.starts_with("placement-snapshot-")),
+        "routing must not leave a dispatcher-owned snapshot with an in-flight remote reference"
+    );
     let controller = ControllerLoop {
         primary: placed.using::<Convoy>("flotilla"),
         secondaries: Vec::new(),

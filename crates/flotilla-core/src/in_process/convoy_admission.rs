@@ -1162,6 +1162,14 @@ impl ConvoyAdmission {
         check_placement_capacity(target_host, capacity)
     }
 
+    /// Placement policies are home-bound, so identical content on different
+    /// origins must have distinct names. Always author an origin's own snapshot:
+    /// reusing a remote snapshot would let its GC race references in flight.
+    fn placement_snapshot_name(&self, spec: &serde_json::Value) -> Result<String, String> {
+        let root = self.backend.local_root().map_err(|error| error.to_string())?;
+        prepared_snapshot_name("placement", &serde_json::json!({ "origin": root, "spec": spec }))
+    }
+
     pub(super) async fn create_convoy_with_workflow_snapshot(
         &self,
         namespace: &str,
@@ -1179,7 +1187,7 @@ impl ConvoyAdmission {
         }
         if let Some(placement) = placement {
             let placement_value = serde_json::to_value(placement).map_err(|error| error.to_string())?;
-            let placement_name = prepared_snapshot_name("placement", &placement_value)?;
+            let placement_name = self.placement_snapshot_name(&placement_value)?;
             ensure_prepared_placement_snapshot(&self.backend, namespace, &placement_name, placement).await?;
             annotations.insert(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), placement_name);
         }
@@ -1328,7 +1336,7 @@ impl ConvoyAdmission {
         let mut pins = BTreeMap::new();
         for (vessel, (policy, decision)) in placements {
             let value = serde_json::to_value(policy).map_err(|error| error.to_string())?;
-            let name = prepared_snapshot_name("placement", &value)?;
+            let name = self.placement_snapshot_name(&value)?;
             ensure_prepared_placement_snapshot(&self.backend, namespace, &name, policy).await?;
             pins.insert(vessel.clone(), flotilla_resources::VesselPlacementPin { policy_ref: name, decision: decision.clone() });
         }
@@ -1491,7 +1499,7 @@ impl ConvoyAdmission {
         }
         if let Some(placement) = &admission.placement_policy {
             let placement_value = serde_json::to_value(placement).map_err(|error| error.to_string())?;
-            let placement_name = prepared_snapshot_name("placement", &placement_value)?;
+            let placement_name = self.placement_snapshot_name(&placement_value)?;
             ensure_prepared_placement_snapshot(&self.backend, namespace, &placement_name, placement).await?;
             annotations.insert(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION.to_string(), placement_name);
         }

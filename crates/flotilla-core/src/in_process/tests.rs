@@ -1782,50 +1782,61 @@ async fn prepared_placement_snapshot_rejects_a_different_replica_spec() {
 
 #[tokio::test]
 async fn two_origins_admit_identical_placements_without_authorship_collision() {
+    assert_independent_placement_snapshots(false).await;
+    assert_independent_placement_snapshots(true).await;
+}
+
+async fn assert_independent_placement_snapshots(replica_before_admission: bool) {
     let (first, first_backend, _first_clock, _first_temp) = standing_ensure_fixture_for("feta", true).await;
     let (second, second_backend, _second_clock, _second_temp) = standing_ensure_fixture_for("udder", true).await;
     for backend in [&first_backend, &second_backend] {
         configure_standing_ensure_agent(backend, Vec::new()).await;
     }
 
-    first.reconcile_convoy_ensures_once("flotilla").await.expect("first origin admits convoy");
+    // Exercise both simultaneous first admissions and an already-visible replica.
+    first.reconcile_convoy_ensures_once("flotilla").await.expect("first admission");
+    if replica_before_admission {
+        let mut snapshots = first.resource_backend().using::<PlacementPolicy>("flotilla").list().await.expect("first placements");
+        snapshots.items.retain(|policy| policy.metadata.name.starts_with("placement-snapshot-"));
+        second
+            .resource_backend()
+            .replica_writer::<PlacementPolicy>(first.node_id().clone(), "flotilla")
+            .replace(&snapshots, Utc::now())
+            .await
+            .expect("replicate before second admission");
+    }
+    second.reconcile_convoy_ensures_once("flotilla").await.expect("second admission");
     let first_store = first.resource_backend();
     let second_store = second.resource_backend();
-    let first_snapshot = first_store
-        .using::<PlacementPolicy>("flotilla")
-        .list()
+    for (source, destination, root) in
+        [(&first_store, &second_store, first.node_id().clone()), (&second_store, &first_store, second.node_id().clone())]
+    {
+        let mut snapshots = source.using::<PlacementPolicy>("flotilla").list().await.expect("placement log");
+        snapshots.items.retain(|policy| policy.metadata.name.starts_with("placement-snapshot-"));
+        destination
+            .replica_writer::<PlacementPolicy>(root, "flotilla")
+            .replace(&snapshots, Utc::now())
+            .await
+            .expect("exchange placement snapshots");
+    }
+    for store in [&first_store, &second_store] {
+        assert!(flotilla_resources::home_bound_authorship_collisions(store, "flotilla").await.expect("diagnostics").is_empty());
+    }
+    // A remote reference may still be in flight when the first origin releases
+    // its convoy. The second admission must retain its own frozen placement.
+    let first_convoy = first_store.using::<ResourceConvoy>("flotilla").list().await.expect("first convoys").items.remove(0);
+    flotilla_resources::PreparedSnapshotGarbageCollector::new(first_store.clone(), "flotilla")
+        .collect(Some(&first_convoy.metadata.name))
         .await
-        .expect("first placement policies")
-        .items
-        .into_iter()
-        .find(|policy| policy.metadata.name.starts_with("placement-snapshot-"))
-        .expect("first placement snapshot");
-    let first_root = first.node_id().clone();
-    let mut snapshots = first_store.using::<PlacementPolicy>("flotilla").list().await.expect("first placement log");
-    snapshots.items.retain(|policy| policy.metadata.name == first_snapshot.metadata.name);
-    second_store
-        .replica_writer::<PlacementPolicy>(first_root, "flotilla")
-        .replace(&snapshots, Utc::now())
-        .await
-        .expect("replicate first origin's placement policies");
-
-    second.reconcile_convoy_ensures_once("flotilla").await.expect("second origin admits same placement");
-    let second_convoy = second_store.using::<ResourceConvoy>("flotilla").list().await.expect("second convoys").items;
-    assert_eq!(second_convoy.len(), 1);
-    assert_eq!(
-        second_convoy[0].metadata.annotations.get(flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION),
-        Some(&first_snapshot.metadata.name)
+        .expect("collect first origin snapshots");
+    let second_convoy = second_store.using::<ResourceConvoy>("flotilla").list().await.expect("second convoys").items.remove(0);
+    assert_ne!(
+        first_convoy.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION],
+        second_convoy.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION],
+        "origins must own distinct snapshot identities even when replicas are visible"
     );
-    assert!(!second_store
-        .using::<PlacementPolicy>("flotilla")
-        .list()
-        .await
-        .expect("second local placements")
-        .items
-        .iter()
-        .any(|policy| policy.metadata.name == first_snapshot.metadata.name));
-    assert!(flotilla_resources::home_bound_authorship_collisions(&first_store, "flotilla").await.expect("first diagnostics").is_empty());
-    assert!(flotilla_resources::home_bound_authorship_collisions(&second_store, "flotilla").await.expect("second diagnostics").is_empty());
+    let snapshot = &second_convoy.metadata.annotations[flotilla_resources::PLACEMENT_SNAPSHOT_ANNOTATION];
+    second_store.using::<PlacementPolicy>("flotilla").get(snapshot).await.expect("second origin retains its placement");
 }
 
 #[tokio::test]
