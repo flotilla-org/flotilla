@@ -210,8 +210,7 @@ impl CommandPaletteWidget {
             Action::OpenFilePicker => {
                 let start_dir = file_picker_start_dir();
                 let input = Input::from(format!("{}/", start_dir.display()).as_str());
-                let dir_entries = refresh_dir_listing_standalone(input.value(), ctx.model);
-                let widget = super::file_picker::FilePickerWidget::new(input.clone(), dir_entries);
+                let widget = super::file_picker::FilePickerWidget::open(input);
                 Outcome::Swap(Box::new(widget))
             }
             Action::ToggleHelp => {
@@ -249,49 +248,6 @@ impl CommandPaletteWidget {
             _ => Outcome::Finished,
         }
     }
-}
-
-/// Standalone directory listing that doesn't require `&mut App`.
-pub fn refresh_dir_listing_standalone(path_str: &str, model: &crate::app::TuiModel) -> Vec<crate::app::ui_state::DirEntry> {
-    use std::path::PathBuf;
-
-    use crate::app::ui_state::DirEntry;
-
-    let dir = if path_str.ends_with('/') {
-        PathBuf::from(path_str)
-    } else {
-        PathBuf::from(path_str).parent().map(|p| p.to_path_buf()).unwrap_or_default()
-    };
-
-    let filter = if !path_str.ends_with('/') {
-        PathBuf::from(path_str).file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default()
-    } else {
-        String::new()
-    };
-
-    let mut entries = Vec::new();
-    if let Ok(read_dir) = std::fs::read_dir(&dir) {
-        for entry in read_dir.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                continue;
-            }
-            if !filter.is_empty() && !name.to_lowercase().starts_with(&filter) {
-                continue;
-            }
-            let path = entry.path();
-            let is_dir = path.is_dir();
-            if !is_dir {
-                continue;
-            }
-            let is_git_repo = path.join(".git").exists();
-            let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-            let is_added = model.repos.values().any(|repo| repo.path == canonical);
-            entries.push(DirEntry { name, is_dir, is_git_repo, is_added });
-        }
-    }
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    entries
 }
 
 /// Dispatch a resolved command with ambient context from the TUI environment.

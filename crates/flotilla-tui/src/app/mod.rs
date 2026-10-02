@@ -1493,8 +1493,7 @@ impl App {
     pub(super) fn open_file_picker(&mut self) {
         let start_dir = file_picker_start_dir();
         let input = Input::from(format!("{}/", start_dir.display()).as_str());
-        let dir_entries = crate::widgets::command_palette::refresh_dir_listing_standalone(input.value(), &self.model);
-        self.screen.modal_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(input, dir_entries)));
+        self.screen.modal_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::open(input)));
     }
 }
 
