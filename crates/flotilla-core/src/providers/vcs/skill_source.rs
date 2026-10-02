@@ -21,12 +21,21 @@ umask 077
 staged="${destination}.flotilla-staging.$$"
 sources="${destination}.flotilla-sources.$$"
 token_files=
+token_markers=
 succeeded=false
 retrying=false
 cache_tmp=
+for abandoned in "${destination}.flotilla-staging."* "${destination}.flotilla-sources."*; do
+  [ -d "$abandoned" ] && [ ! -L "$abandoned" ] || continue
+  owner=${abandoned##*.}
+  case "$owner" in *[!0-9]*|'') continue ;; esac
+  # A reused PID is harmless: it delays reclamation rather than touching a live stage.
+  if ! kill -0 "$owner" 2>/dev/null; then rm -rf -- "$abandoned"; fi
+done
 cleanup() {
   rm -rf "$staged" "$sources"
   if [ -n "$cache_tmp" ]; then rm -rf "$cache_tmp"; fi
+  for marker in $token_markers; do rm -f -- "$marker"; done
   if [ "$retrying" != true ] && { [ "$cleanup_tokens" = true ] || [ "$succeeded" != true ]; }; then
     for token_file in $token_files; do rm -f "$token_file"; done
   fi
@@ -76,7 +85,12 @@ while [ "$#" -gt 0 ]; do
     shift
     path_count=$((path_count - 1))
   done
-  if [ -n "$token_file" ]; then token_files="$token_files $token_file"; fi
+  if [ -n "$token_file" ]; then
+    token_files="$token_files $token_file"
+    marker="$token_file.in-use.$$"
+    : >"$marker"
+    token_markers="$token_markers $marker"
+  fi
   if [ -n "$credential" ]; then
     if [ -z "$token_file" ] || [ ! -s "$token_file" ]; then
       echo "${diagnostic_prefix}skill source $name credential $credential is unavailable at pinned revision $revision" >&2
@@ -211,4 +225,39 @@ pub async fn stage_git_skill_sources(runner: &dyn CommandRunner, args: &[String]
     // The script reads the prefix from $0, then shifts past args[0], the stage command identifier.
     let command_args = ["-c", STAGE_SCRIPT, STAGE_DIAGNOSTIC_PREFIX].into_iter().chain(args.iter().map(String::as_str)).collect::<Vec<_>>();
     runner.run("sh", &command_args, Path::new("/"), &ChannelLabel::Default).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, process::Command};
+
+    use super::*;
+
+    #[test]
+    fn staging_reaps_dead_pid_directories_without_disturbing_a_live_stage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let destination = temp.path().join("skills");
+        let dead_pid = 999_999_999;
+        let live_pid = std::process::id();
+        for suffix in ["flotilla-staging", "flotilla-sources"] {
+            fs::create_dir(format!("{}.{}.{}", destination.display(), suffix, dead_pid)).expect("dead stage dir");
+            fs::create_dir(format!("{}.{}.{}", destination.display(), suffix, live_pid)).expect("live stage dir");
+        }
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(STAGE_SCRIPT)
+            .arg(STAGE_DIAGNOSTIC_PREFIX)
+            .arg("flotilla-stage-skills")
+            .arg(temp.path().join("missing-manifest"))
+            .arg(&destination)
+            .arg("false")
+            .arg(temp.path().join("cache"))
+            .output()
+            .expect("run stage shell");
+        assert!(!output.status.success(), "missing manifest should stop after cleanup");
+        for suffix in ["flotilla-staging", "flotilla-sources"] {
+            assert!(!std::path::Path::new(&format!("{}.{}.{}", destination.display(), suffix, dead_pid)).exists());
+            assert!(std::path::Path::new(&format!("{}.{}.{}", destination.display(), suffix, live_pid)).exists());
+        }
+    }
 }

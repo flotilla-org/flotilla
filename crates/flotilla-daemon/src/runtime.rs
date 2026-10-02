@@ -7029,7 +7029,10 @@ mod tests {
                     staged.store(true, Ordering::SeqCst);
                 }
                 Ok("ok".to_string())
-            } else if cmd == "mkdir" || cmd == "chmod" || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight")))
+            } else if cmd == "mkdir"
+                || cmd == "chmod"
+                || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight")))
+                || (cmd == "sh" && args.contains(&"flotilla-prune-skill-tokens"))
             {
                 Ok(String::new())
             } else {
