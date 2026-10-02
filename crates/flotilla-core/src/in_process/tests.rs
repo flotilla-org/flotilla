@@ -136,16 +136,6 @@ fn turn_delivery_restarts_a_lost_session() {
     );
 }
 
-async fn replicate_turn_delivery_resources<T: Resource>(
-    source: &ResourceBackend,
-    destination: &ResourceBackend,
-    source_root: &str,
-    context: &str,
-) {
-    let objects = source.clone().using::<T>("flotilla").list().await.expect(context);
-    destination.replica_writer::<T>(NodeId::new(source_root), "flotilla").replace(&objects, Utc::now()).await.expect(context);
-}
-
 #[tokio::test]
 async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
     let home = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("home"));
@@ -296,188 +286,6 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
     let status = acknowledged.status.expect("governor status");
     assert!(!status.turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
     assert_eq!(status.attention, Some(existing_attention));
-}
-
-#[tokio::test]
-async fn remote_session_receives_nudge_and_resume_from_convoy_home() {
-    let home = ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open_in_memory().expect("home store"))
-        .with_local_root(NodeId::new("home"));
-    let placement = ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open_in_memory().expect("placement store"))
-        .with_local_root(NodeId::new("placement"));
-    let home_dir = tempfile::tempdir().expect("home config");
-    std::fs::write(home_dir.path().join("daemon.toml"), "machine_id = \"home\"\n").expect("home identity");
-    let home_daemon = InProcessDaemon::new_with_resource_backend(
-        Vec::new(),
-        Arc::new(ConfigStore::with_base(home_dir.path())),
-        fake_discovery(false),
-        HostName::local(),
-        home.clone(),
-    )
-    .await;
-    let placement_dir = tempfile::tempdir().expect("placement config");
-    std::fs::write(placement_dir.path().join("daemon.toml"), "machine_id = \"placement\"\n").expect("placement identity");
-    let placement_daemon = InProcessDaemon::new_with_resource_backend(
-        Vec::new(),
-        Arc::new(ConfigStore::with_base(placement_dir.path())),
-        fake_discovery(false),
-        HostName::local(),
-        placement.clone(),
-    )
-    .await;
-    let convoys = home.clone().using::<ResourceConvoy>("flotilla");
-    let created =
-        convoys.create(&test_meta("nudge-convoy"), &ConvoySpec::builder().workflow_ref("wf".to_string()).build()).await.expect("convoy");
-    convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Active,
-            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                exit: Some(flotilla_resources::ExitDeclaration::Claim(flotilla_resources::ClaimExit)),
-                turn_delivery: Default::default(),
-                stall_nudges: Default::default(),
-                supervision: None,
-                vessels: vec![VesselRequirement::builder()
-                    .name("work".to_string())
-                    .crew(vec![CrewSpec::builder()
-                        .role("coder".to_string())
-                        .source(CrewSource::Agent {
-                            selector: Selector::for_capability("coding"),
-                            prompt: Some("Initial".to_string()),
-                            brief_template: None,
-                        })
-                        .build()])
-                    .build()],
-            }),
-            work: BTreeMap::from([(
-                "work".to_string(),
-                flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
-            )]),
-            crew_work: BTreeMap::from([(
-                "work".to_string(),
-                BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-            )]),
-            ..Default::default()
-        })
-        .await
-        .expect("working crew");
-    let meta = InputMeta::builder()
-        .name("nudge-convoy-work-coder".to_string())
-        .labels(BTreeMap::from([
-            (CONVOY_LABEL.to_string(), "nudge-convoy".to_string()),
-            (VESSEL_LABEL.to_string(), "work".to_string()),
-            (ROLE_LABEL.to_string(), "coder".to_string()),
-        ]))
-        .build();
-    // Turn delivery reads the session's labels and source without resolving its environment.
-    let spec = ResourceTerminalSessionSpec {
-        env_ref: "placement-environment".to_string(),
-        role: "coder".to_string(),
-        source: TerminalSessionSource::Agent {
-            selector: Selector::for_capability("coding"),
-            brief: flotilla_resources::TerminalBrief {
-                path: "brief.md".to_string(),
-                content: "Initial".to_string(),
-                artifact_digest: None,
-                copies: Vec::new(),
-            },
-            context: Box::new(flotilla_resources::TerminalCrewContext {
-                namespace: "flotilla".to_string(),
-                convoy: "nudge-convoy".to_string(),
-                vessel_ref: "nudge-convoy-work".to_string(),
-            }),
-            message: None,
-        },
-        cwd: "/workspace".to_string(),
-        pool: "cleat".to_string(),
-    };
-    let sessions = placement.clone().using::<ResourceTerminalSession>("flotilla");
-    let session = sessions.create(&meta, &spec).await.expect("persist remote terminal");
-    let convoy = convoys.get("nudge-convoy").await.expect("working convoy");
-    let mut status = convoy.status.expect("working status");
-    status.crew_work.get_mut("work").expect("work crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Stalled;
-    convoys.update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &status).await.expect("stall crew");
-    sessions
-        .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
-            phase: ResourceTerminalSessionPhase::Running,
-            ..Default::default()
-        })
-        .await
-        .expect("running terminal");
-    replicate_turn_delivery_resources::<ResourceTerminalSession>(&placement, &home, "placement", "replicate session").await;
-
-    let request = crate::leaf_engine::TurnDeliveryRequest::builder()
-        .namespace("flotilla".to_string())
-        .convoy("nudge-convoy".to_string())
-        .source("stall-nudge-1".to_string())
-        .vessel("work".to_string())
-        .role("coder".to_string())
-        .brief("Please continue".to_string())
-        .subject_revision("stall-1".to_string())
-        .sender(CrewMessageSender::FlotillaNudge)
-        .build();
-    let mut disallowed = request.clone();
-    disallowed.sender = CrewMessageSender::OperatorResume { principal: None };
-    let error = home_daemon.deliver_standing_turn(&disallowed).await.expect_err("operator cannot queue a remote turn");
-    assert!(error.contains("sender is not permitted"), "{error}");
-    let mut missing = request.clone();
-    missing.role = "missing".to_string();
-    let error = home_daemon.deliver_standing_turn(&missing).await.expect_err("nudge requires a remote session");
-    assert!(error.contains("has no durable terminal-session record"), "{error}");
-    home_daemon.deliver_standing_turn(&request).await.expect("nudge accepted at convoy home");
-    let convoy = convoys.get("nudge-convoy").await.expect("queued convoy");
-    assert!(convoy.status.expect("status").turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
-    replicate_turn_delivery_resources::<ResourceConvoy>(&home, &placement, "home", "replicate turn").await;
-    placement_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver at placement");
-    let delivered = sessions.get(&meta.name).await.expect("delivered session");
-    let TerminalSessionSource::Agent { message: Some(message), .. } = delivered.spec.source else { panic!("nudge queued") };
-    assert!(message.text.contains("Your stall is recorded. What changed since your report?"));
-    let nudge_id = message.id.clone();
-    assert!(matches!(message.sender, CrewMessageSender::FlotillaNudge));
-    let mut delivered_status = delivered.status.expect("running terminal status");
-    delivered_status.delivered_message_id = Some(nudge_id.clone());
-    sessions.update_status(&meta.name, &delivered.metadata.resource_version, &delivered_status).await.expect("confirm nudge delivery");
-    replicate_turn_delivery_resources::<ResourceTerminalSession>(&placement, &home, "placement", "replicate nudge confirmation").await;
-    home_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("acknowledge nudge at convoy home");
-
-    let convoy = convoys.get("nudge-convoy").await.expect("convoy after nudge");
-    let mut status = convoy.status.expect("convoy status");
-    status.crew_work.get_mut("work").expect("work crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Stalled;
-    convoys.update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &status).await.expect("stall crew again");
-    let outcome = home_daemon
-        .convoy_resume_internal("flotilla", "nudge-convoy", "Resume this turn", Some("work"), Some("coder"))
-        .await
-        .expect("resume reconciled remote session");
-    assert!(matches!(outcome, ConvoyResumeOutcome::Queued { .. }));
-    let resumed_convoy = convoys.get("nudge-convoy").await.expect("resumed convoy");
-    assert!(resumed_convoy.status.as_ref().and_then(|status| status.crew_work["work"]["coder"].resumed_at).is_some());
-    let mut racing_nudge = request.clone();
-    racing_nudge.source = "stall-nudge-2".to_string();
-    racing_nudge.subject_revision = "stall-2".to_string();
-    home_daemon.deliver_standing_turn(&racing_nudge).await.expect("racing nudge accepted");
-    replicate_turn_delivery_resources::<ResourceConvoy>(&home, &placement, "home", "replicate resume").await;
-    placement_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver resume at placement");
-    let resumed = sessions.get(&meta.name).await.expect("resumed session");
-    let TerminalSessionSource::Agent { message: Some(head), .. } = resumed.spec.source else { panic!("resume queued") };
-    let resumed_message = head.next_after(Some(&nudge_id)).expect("resume follows delivered nudge");
-    assert!(resumed_message.text.contains("Resume this turn"));
-    assert!(matches!(resumed_message.sender, CrewMessageSender::OperatorResume { .. }));
-    let resume_id = resumed_message.id.clone();
-    let mut status = resumed.status.expect("terminal status");
-    status.delivered_message_id = Some(resume_id);
-    sessions.update_status(&meta.name, &resumed.metadata.resource_version, &status).await.expect("resume delivered");
-    placement_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("queue nudge after resume");
-    let after_race = sessions.get(&meta.name).await.expect("session after race");
-    let TerminalSessionSource::Agent { message: Some(head), .. } = after_race.spec.source else { panic!("resume lost") };
-    assert_eq!(head.following.len(), 2);
-    assert!(head.following[0].text.contains("Resume this turn"));
-    assert!(matches!(head.following[1].sender, CrewMessageSender::FlotillaNudge));
-    let last_id = head.following[1].id.clone();
-    let mut status = after_race.status.expect("terminal status");
-    status.delivered_message_id = Some(last_id);
-    sessions.update_status(&meta.name, &after_race.metadata.resource_version, &status).await.expect("both turns delivered");
-    replicate_turn_delivery_resources::<ResourceTerminalSession>(&placement, &home, "placement", "replicate both deliveries").await;
-    home_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("acknowledge both turns");
-    let convoy = convoys.get("nudge-convoy").await.expect("convoy after acknowledgments");
-    assert!(!convoy.status.expect("status").turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
 }
 
 #[test]
@@ -3009,6 +2817,41 @@ async fn refused_convoy_reclaim_leaves_runtime_children_untouched() {
         .expect("the refused shape must remain recoverable through convoy abandon");
     let abandoned = convoys.get(convoy_name).await.expect("abandon retains the convoy record");
     assert_eq!(abandoned.status.expect("abandoned status").phase, ConvoyPhase::Abandoned);
+}
+
+#[tokio::test]
+async fn concurrent_convoy_phase_change_prevents_operator_abandonment() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(&test_meta("abandon-race"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
+        .await
+        .expect("convoy");
+    convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            ..Default::default()
+        })
+        .await
+        .expect("active convoy");
+
+    let racing_convoys = convoys.clone();
+    let error = daemon
+        .abandon_convoy_internal_with_hook("flotilla", "abandon-race", "operator abandons", None, || async move {
+            let current = racing_convoys.get("abandon-race").await.expect("convoy before concurrent completion");
+            let mut status = current.status.expect("active status");
+            status.phase = ConvoyPhase::Landed;
+            status.message = Some("concurrent landing won".to_string());
+            racing_convoys.update_status("abandon-race", &current.metadata.resource_version, &status).await.expect("concurrent completion");
+        })
+        .await
+        .expect_err("phase change must reject abandonment");
+
+    assert_eq!(error, "convoy phase changed while abandonment was being applied; retry the command");
+    let current = convoys.get("abandon-race").await.expect("convoy after race");
+    let status = current.status.expect("status");
+    assert_eq!(status.phase, ConvoyPhase::Landed);
+    assert_eq!(status.message.as_deref(), Some("concurrent landing won"));
 }
 
 #[tokio::test]

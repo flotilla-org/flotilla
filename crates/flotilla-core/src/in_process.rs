@@ -10,6 +10,7 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
+    future::Future,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     str::FromStr,
@@ -9179,6 +9180,21 @@ impl InProcessDaemon {
         reason: &str,
         principal_ref: Option<&PrincipalRef>,
     ) -> Result<Vec<CheckoutArchiveOutcome>, String> {
+        self.abandon_convoy_internal_with_hook(namespace, name, reason, principal_ref, || async {}).await
+    }
+
+    async fn abandon_convoy_internal_with_hook<F, Fut>(
+        &self,
+        namespace: &str,
+        name: &str,
+        reason: &str,
+        principal_ref: Option<&PrincipalRef>,
+        before_update: F,
+    ) -> Result<Vec<CheckoutArchiveOutcome>, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ()>,
+    {
         if reason.trim().is_empty() {
             return Err("convoy abandon requires a non-empty reason".to_string());
         }
@@ -9194,10 +9210,11 @@ impl InProcessDaemon {
             Some(principal) => WorkCompletionAuthority::Principal(principal.clone()),
             None => WorkCompletionAuthority::Unattributed,
         };
-        apply_resource_status_patch(
+        flotilla_resources::apply_status_patch_with_before_update(
             &convoys,
             name,
             &convoy_external_patches::mark_convoy_abandoned(expected_phase, Utc::now(), authority, reason.to_string()),
+            before_update,
         )
         .await
         .map_err(|err| err.to_string())?;
@@ -9698,7 +9715,7 @@ impl InProcessDaemon {
         }
     }
 
-    async fn deliver_standing_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
+    pub async fn deliver_standing_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&request.namespace);
         let session = sessions
             .list_matching_labels(&BTreeMap::from([
