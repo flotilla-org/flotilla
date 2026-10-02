@@ -2045,7 +2045,7 @@ mod tests {
     }
 
     // Base providers discover enclosing repositories from subdirectories and accept bare
-    // repositories, while exact target addressing rejects both. This exhaustive matrix
+    // repositories, while exact target addressing rejects both. This matrix
     // covers directory roots, linked .git files, subdirectories, and nested bare repositories
     // using real Git because its discovery behavior is the contract.
     #[tokio::test]
