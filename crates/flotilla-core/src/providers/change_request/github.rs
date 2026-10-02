@@ -19,6 +19,69 @@ fn execution_root() -> &'static Path {
 }
 
 const MAX_BRANCH_LOOKUP_PAGES: usize = 10;
+const MAX_HISTORY_PAGE_QUERIES: usize = 8;
+const MAX_HISTORY_PAGE_NODES: usize = 800;
+const HISTORY_PAGE_SIZE: usize = 100;
+const THREAD_PAGE_SIZE: usize = 20;
+const THREAD_COMMENT_PREVIEW_SIZE: usize = 10;
+
+enum HistoryPage {
+    Comments,
+    Reviews,
+    Threads,
+    ThreadComments(usize),
+}
+
+impl HistoryPage {
+    fn connection<'a>(&self, request: &'a serde_json::Value) -> &'a serde_json::Value {
+        match self {
+            Self::Comments => &request["comments"],
+            Self::Reviews => &request["reviews"],
+            Self::Threads => &request["reviewThreads"],
+            Self::ThreadComments(index) => &request["reviewThreads"]["nodes"][*index]["comments"],
+        }
+    }
+
+    fn connection_mut<'a>(&self, request: &'a mut serde_json::Value) -> &'a mut serde_json::Value {
+        match self {
+            Self::Comments => &mut request["comments"],
+            Self::Reviews => &mut request["reviews"],
+            Self::Threads => &mut request["reviewThreads"],
+            Self::ThreadComments(index) => &mut request["reviewThreads"]["nodes"][*index]["comments"],
+        }
+    }
+
+    fn max_nodes(&self) -> usize {
+        match self {
+            Self::Threads => THREAD_PAGE_SIZE * (1 + THREAD_COMMENT_PREVIEW_SIZE),
+            _ => HISTORY_PAGE_SIZE,
+        }
+    }
+
+    fn field(&self) -> &'static str {
+        match self {
+            Self::Comments => "comments",
+            Self::Reviews => "reviews",
+            Self::Threads => "reviewThreads",
+            Self::ThreadComments(_) => "comments",
+        }
+    }
+
+    fn selection(&self, request: &serde_json::Value, number: u64, cursor: &str) -> Result<String, String> {
+        Ok(match self {
+            Self::Comments => format!("comments(last:{HISTORY_PAGE_SIZE},before:{cursor}) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ databaseId createdAt author {{ login __typename }} body }} }}"),
+            Self::Reviews => format!("reviews(last:{HISTORY_PAGE_SIZE},before:{cursor}) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ fullDatabaseId submittedAt author {{ login __typename }} state body }} }}"),
+            Self::Threads => format!("reviewThreads(last:{THREAD_PAGE_SIZE},before:{cursor}) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ id isResolved comments(last:{THREAD_COMMENT_PREVIEW_SIZE}) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ fullDatabaseId createdAt author {{ login __typename }} body }} }} }} }}"),
+            Self::ThreadComments(index) => {
+                let id = request["reviewThreads"]["nodes"][*index]["id"]
+                    .as_str()
+                    .ok_or_else(|| format!("change request {number} truncated thread has no id"))?;
+                let id = serde_json::to_string(id).map_err(|error| error.to_string())?;
+                format!("node(id:{id}) {{ ... on PullRequestReviewThread {{ comments(last:{HISTORY_PAGE_SIZE},before:{cursor}) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ fullDatabaseId createdAt author {{ login __typename }} body }} }} }} }}")
+            }
+        })
+    }
+}
 
 pub struct GitHubChangeRequest {
     provider_name: String,
@@ -100,6 +163,76 @@ impl GitHubChangeRequest {
             provider_display_name: "GitHub".into(),
         })
     }
+
+    fn next_history_page(request: &serde_json::Value) -> Option<HistoryPage> {
+        for (field, page) in
+            [("comments", HistoryPage::Comments), ("reviews", HistoryPage::Reviews), ("reviewThreads", HistoryPage::Threads)]
+        {
+            if request[field]["pageInfo"]["hasPreviousPage"] == true {
+                return Some(page);
+            }
+        }
+        request["reviewThreads"]["nodes"].as_array()?.iter().enumerate().find_map(|(index, thread)| {
+            (thread["comments"]["pageInfo"]["hasPreviousPage"] == true).then_some(HistoryPage::ThreadComments(index))
+        })
+    }
+
+    async fn complete_history(
+        &self,
+        number: u64,
+        request: &mut serde_json::Value,
+        pages: &mut usize,
+        nodes: &mut usize,
+    ) -> Result<(), String> {
+        while let Some(page) = Self::next_history_page(request) {
+            if *pages >= MAX_HISTORY_PAGE_QUERIES || *nodes + page.max_nodes() > MAX_HISTORY_PAGE_NODES {
+                return Err(format!("change request {number} review history exceeds per-cycle pagination budget"));
+            }
+            let cursor = page.connection(request)["pageInfo"]["startCursor"]
+                .as_str()
+                .ok_or_else(|| format!("change request {number} truncated review history has no cursor"))?;
+            let cursor = serde_json::to_string(cursor).map_err(|error| error.to_string())?;
+            let selection = page.selection(request, number, &cursor)?;
+            let query = if matches!(page, HistoryPage::ThreadComments(_)) {
+                format!("query {{ {selection} }}")
+            } else {
+                let (owner, name) = self.repo_slug.split_once('/').ok_or("GitHub repository must have owner/name scope")?;
+                let owner = serde_json::to_string(owner).map_err(|error| error.to_string())?;
+                let name = serde_json::to_string(name).map_err(|error| error.to_string())?;
+                format!("query {{ repository(owner:{owner},name:{name}) {{ pr:pullRequest(number:{number}) {{ {selection} }} }} }}")
+            };
+            let argument = format!("query={query}");
+            let output = run_output!(self.runner, "gh", &["api", "graphql", "--include", "-f", &argument], execution_root())?;
+            if let Some(error) = rate_limit_error_from_response(&output.stdout, "GraphQL") {
+                return Err(error);
+            }
+            let response = parse_gh_api_response(&output.stdout);
+            let document: serde_json::Value = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
+            if !output.success || document["errors"].as_array().is_some_and(|errors| !errors.is_empty()) {
+                return Err(format!("change request {number} review history page failed: {}", response.body));
+            }
+            let fetched = match page {
+                HistoryPage::ThreadComments(_) => &document["data"]["node"][page.field()],
+                _ => &document["data"]["repository"]["pr"][page.field()],
+            };
+            let older =
+                fetched["nodes"].as_array().ok_or_else(|| format!("change request {number} review history page is missing nodes"))?;
+            let count = older.len()
+                + if matches!(page, HistoryPage::Threads) {
+                    older.iter().map(|thread| thread["comments"]["nodes"].as_array().map_or(0, Vec::len)).sum::<usize>()
+                } else {
+                    0
+                };
+            let target = page.connection_mut(request);
+            let mut combined = older.clone();
+            combined.extend(target["nodes"].as_array().into_iter().flatten().cloned());
+            target["nodes"] = serde_json::Value::Array(combined);
+            target["pageInfo"] = fetched["pageInfo"].clone();
+            *pages += 1;
+            *nodes += count;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -120,7 +253,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         // independent of convoy count. If a repository exceeds GitHub's query
         // limits, surface the forge error instead of silently omitting CRs.
         for number in numbers {
-            query.push_str(&format!(" pr{number}: pullRequest(number:{number}) {{ title state isDraft headRefOid reviewDecision mergeable author {{ login }} reviewRequests(first:100) {{ pageInfo {{ hasNextPage }} nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} comments(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ databaseId createdAt author {{ login __typename }} body }} }} reviews(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ fullDatabaseId submittedAt author {{ login __typename }} state body }} }} reviewThreads(last:100) {{ pageInfo {{ hasPreviousPage }} nodes {{ isResolved comments(last:10) {{ pageInfo {{ hasPreviousPage }} nodes {{ fullDatabaseId createdAt author {{ login __typename }} body }} }} }} }} commits(last:1) {{ nodes {{ commit {{ committedDate statusCheckRollup {{ contexts(first:100) {{ nodes {{ ... on CheckRun {{ conclusion status }} ... on StatusContext {{ state }} }} }} }} }} }} }} }}"));
+            query.push_str(&format!(" pr{number}: pullRequest(number:{number}) {{ title state isDraft headRefOid reviewDecision mergeable author {{ login }} reviewRequests(first:100) {{ pageInfo {{ hasNextPage }} nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} comments(last:100) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ databaseId createdAt author {{ login __typename }} body }} }} reviews(last:100) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ fullDatabaseId submittedAt author {{ login __typename }} state body }} }} reviewThreads(last:20) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ id isResolved comments(last:10) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ fullDatabaseId createdAt author {{ login __typename }} body }} }} }} }} timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]) {{ nodes {{ ... on HeadRefForcePushedEvent {{ createdAt afterCommit {{ oid }} }} }} }} commits(last:1) {{ nodes {{ commit {{ committedDate pushedDate statusCheckRollup {{ contexts(first:100) {{ nodes {{ ... on CheckRun {{ conclusion status }} ... on StatusContext {{ state }} }} }} }} }} }} }} }}"));
         }
         query.push_str(" } }");
         let argument = format!("query={query}");
@@ -145,22 +278,17 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         }
         let observed_at = Utc::now();
         let mut statuses = HashMap::new();
+        let (mut pages, mut nodes) = (0, 0);
         for number in numbers {
             let request = &repository[format!("pr{number}")];
             if request.is_null() {
                 continue;
             }
-            let truncated = ["comments", "reviews", "reviewThreads"]
-                .iter()
-                .any(|connection| request[connection]["pageInfo"]["hasPreviousPage"] == true)
-                || request["reviewThreads"]["nodes"]
-                    .as_array()
-                    .is_some_and(|threads| threads.iter().any(|thread| thread["comments"]["pageInfo"]["hasPreviousPage"] == true));
-            if truncated {
-                statuses.insert(*number, Err(format!("change request {number} review history truncated by GitHub pagination")));
+            let mut request = request.clone();
+            if let Err(error) = self.complete_history(*number, &mut request, &mut pages, &mut nodes).await {
+                statuses.insert(*number, Err(error));
                 continue;
             }
-            let mut request = request.clone();
             request["statusCheckRollup"] = request["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"].clone();
             statuses.insert(
                 *number,
@@ -264,7 +392,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::providers::{change_request::ChangeRequestTracker, github_api::GhApiClient, testing::MockRunner};
+    use crate::providers::{change_request::ChangeRequestTracker, github_api::GhApiClient, replay, testing::MockRunner};
 
     fn branch_lookup_page(items: serde_json::Value, has_next: bool) -> String {
         let link = if has_next { "Link: <https://api.github.com/repos/team/one/pulls?page=2>; rel=\"next\"\r\n" } else { "" };
@@ -448,6 +576,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_push_uses_github_acceptance_time_for_feedback_cutoff() {
+        let request = serde_json::json!({
+            "state": "OPEN", "headRefOid": "head-b", "reviewDecision": null,
+            "commits": {"nodes": [{"commit": {
+                "committedDate": "2026-09-30T10:00:00Z", "pushedDate": "2026-09-30T12:00:00Z",
+                "statusCheckRollup": {"contexts": {"nodes": []}}
+            }}]},
+            "comments": {"nodes": [{
+                "databaseId": 42, "createdAt": "2026-09-30T11:00:00Z",
+                "author": {"login": "reviewer"}, "body": "Please fix"
+            }]},
+            "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}
+        });
+        let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
+        let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
+        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+        assert_eq!(statuses[&1].as_ref().expect("status").review.actionable_at_head.value, Some(false));
+    }
+
+    #[tokio::test]
+    async fn matching_force_push_event_sets_feedback_cutoff_when_pushed_date_is_missing() {
+        let request = serde_json::json!({
+            "state": "OPEN", "headRefOid": "head-b", "reviewDecision": null,
+            "timelineItems": {"nodes": [{"createdAt": "2026-09-30T12:00:00Z", "afterCommit": {"oid": "head-b"}}]},
+            "commits": {"nodes": [{"commit": {
+                "committedDate": "2026-09-30T10:00:00Z", "pushedDate": null,
+                "statusCheckRollup": {"contexts": {"nodes": []}}
+            }}]},
+            "comments": {"nodes": [{
+                "databaseId": 42, "createdAt": "2026-09-30T11:00:00Z",
+                "author": {"login": "reviewer"}, "body": "Please fix"
+            }]},
+            "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}
+        });
+        let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
+        let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
+        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+        assert_eq!(statuses[&1].as_ref().expect("status").review.actionable_at_head.value, Some(false));
+    }
+
+    #[tokio::test]
+    async fn force_push_without_after_commit_does_not_match_missing_head() {
+        let request = serde_json::json!({
+            "state": "OPEN", "reviewDecision": null,
+            "timelineItems": {"nodes": [{"createdAt": "2026-09-30T12:00:00Z", "afterCommit": null}]},
+            "commits": {"nodes": [{"commit": {
+                "pushedDate": "2026-09-30T10:00:00Z", "statusCheckRollup": {"contexts": {"nodes": []}}
+            }}]},
+            "comments": {"nodes": [{"databaseId": 42, "createdAt": "2026-09-30T11:00:00Z",
+                "author": {"login": "reviewer"}, "body": "Please fix"}]},
+            "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}
+        });
+        let response = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
+        let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
+        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+        assert_eq!(statuses[&1].as_ref().expect("status").review.actionable_at_head.value, Some(true));
+    }
+
+    #[tokio::test]
     async fn review_with_feedback_is_actionable_until_crew_marks_it_addressed() {
         let response = |addressed: bool| {
             let comments = if addressed {
@@ -526,6 +716,152 @@ mod tests {
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
         let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
         assert!(statuses[&1].as_ref().expect_err("truncated history").contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn older_comment_page_can_make_busy_request_actionable() {
+        let request = serde_json::json!({
+            "state": "OPEN", "headRefOid": "head-a", "reviewDecision": null,
+            "commits": {"nodes": [{"commit": {"pushedDate": "2026-09-30T10:00:00Z", "statusCheckRollup": {"contexts": {"nodes": []}}}}]},
+            "comments": {"pageInfo": {"hasPreviousPage": true, "startCursor": "newer"}, "nodes": []},
+            "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}
+        });
+        let first = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
+        let older = serde_json::json!({"data": {"repository": {"pr": {"comments": {
+            "pageInfo": {"hasPreviousPage": false, "startCursor": "oldest"},
+            "nodes": [{"databaseId": 42, "createdAt": "2026-09-30T11:00:00Z", "author": {"login": "reviewer"}, "body": "Please fix"}]
+        }}}}});
+        let runner = Arc::new(MockRunner::new(vec![Ok(first), Ok(format!("HTTP/2 200 OK\r\n\r\n{older}"))]));
+        let provider =
+            GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
+        let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+        assert_eq!(statuses[&1].as_ref().expect("complete history").review.actionable_at_head.value, Some(true));
+        assert_eq!(runner.calls().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn older_review_thread_and_thread_comment_pages_are_observed() {
+        for case in ["reviews", "reviewThreads", "threadComments"] {
+            let mut request = serde_json::json!({
+                "state": "OPEN", "headRefOid": "head-a", "reviewDecision": null,
+                "commits": {"nodes": [{"commit": {"pushedDate": "2026-09-30T10:00:00Z", "statusCheckRollup": {"contexts": {"nodes": []}}}}]},
+                "comments": {"nodes": []}, "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}
+            });
+            let comment = serde_json::json!({
+                "fullDatabaseId": "42", "createdAt": "2026-09-30T11:00:00Z",
+                "author": {"login": "reviewer"}, "body": "Please fix"
+            });
+            let page = serde_json::json!({"pageInfo": {"hasPreviousPage": false, "startCursor": "older"}});
+            let older = match case {
+                "reviews" => {
+                    request["reviews"]["pageInfo"] = serde_json::json!({"hasPreviousPage": true, "startCursor": "newer"});
+                    serde_json::json!({"data": {"repository": {"pr": {"reviews": {
+                        "pageInfo": page["pageInfo"], "nodes": [{"fullDatabaseId": "42", "submittedAt": "2026-09-30T11:00:00Z",
+                        "author": {"login": "reviewer"}, "body": "Please fix", "state": "COMMENTED"}]
+                    }}}}})
+                }
+                "reviewThreads" => {
+                    request["reviewThreads"]["pageInfo"] = serde_json::json!({"hasPreviousPage": true, "startCursor": "newer"});
+                    serde_json::json!({"data": {"repository": {"pr": {"reviewThreads": {
+                        "pageInfo": page["pageInfo"], "nodes": [{"id": "thread-a", "isResolved": false,
+                        "comments": {"pageInfo": {"hasPreviousPage": false}, "nodes": [comment]}}]
+                    }}}}})
+                }
+                _ => {
+                    request["reviewThreads"]["nodes"] = serde_json::json!([{"id": "thread-a", "isResolved": false,
+                        "comments": {"pageInfo": {"hasPreviousPage": true, "startCursor": "newer"}, "nodes": []}}]);
+                    serde_json::json!({"data": {"node": {"comments": {"pageInfo": page["pageInfo"], "nodes": [comment]}}}})
+                }
+            };
+            let first = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
+            let runner = Arc::new(MockRunner::new(vec![Ok(first), Ok(format!("HTTP/2 200 OK\r\n\r\n{older}"))]));
+            let provider =
+                GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
+            let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+            assert_eq!(statuses[&1].as_ref().expect(case).review.actionable_at_head.value, Some(true), "{case}");
+            assert_eq!(runner.calls().len(), 2, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pagination_budget_reports_busy_request_without_hiding_healthy_request() {
+        let busy = serde_json::json!({
+            "state": "OPEN", "headRefOid": "busy", "reviewDecision": null,
+            "comments": {"pageInfo": {"hasPreviousPage": true, "startCursor": "more"}, "nodes": []},
+            "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}
+        });
+        let healthy = serde_json::json!({"title": "Healthy", "state": "OPEN", "reviewDecision": null,
+            "comments": {"nodes": []}, "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}});
+        let first = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": busy, "pr2": healthy}}}));
+        let page = format!(
+            "HTTP/2 200 OK\r\n\r\n{}",
+            serde_json::json!({"data": {"repository": {"pr": {"comments": {
+                "pageInfo": {"hasPreviousPage": true, "startCursor": "more"}, "nodes": []
+            }}}}})
+        );
+        let responses = std::iter::once(Ok(first)).chain(std::iter::repeat_n(Ok(page), MAX_HISTORY_PAGE_QUERIES)).collect();
+        let runner = Arc::new(MockRunner::new(responses));
+        let provider =
+            GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
+        let statuses = provider.observe_bound(&[1, 2], &Default::default()).await.expect("observe both PRs");
+        assert!(statuses[&1].as_ref().expect_err("budget exhausted").contains("pagination budget"));
+        assert_eq!(statuses[&2].as_ref().expect("healthy PR").title.value.as_deref(), Some("Healthy"));
+        assert_eq!(runner.calls().len(), MAX_HISTORY_PAGE_QUERIES + 1);
+    }
+
+    #[tokio::test]
+    async fn pagination_node_budget_stops_large_thread_pages_before_query_limit() {
+        let request = serde_json::json!({"state": "OPEN", "reviewDecision": null,
+            "reviewThreads": {"pageInfo": {"hasPreviousPage": true, "startCursor": "more"}, "nodes": []}});
+        let first = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": request}}}));
+        let comments = vec![serde_json::json!({"body": "note"}); THREAD_COMMENT_PREVIEW_SIZE];
+        let threads = vec![
+            serde_json::json!({"isResolved": true,
+            "comments": {"pageInfo": {"hasPreviousPage": false}, "nodes": comments}});
+            THREAD_PAGE_SIZE
+        ];
+        let page = format!(
+            "HTTP/2 200 OK\r\n\r\n{}",
+            serde_json::json!({"data": {"repository": {"pr": {"reviewThreads": {
+                "pageInfo": {"hasPreviousPage": true, "startCursor": "more"}, "nodes": threads
+            }}}}})
+        );
+        let responses = std::iter::once(Ok(first)).chain(std::iter::repeat_n(Ok(page), 3)).collect();
+        let runner = Arc::new(MockRunner::new(responses));
+        let provider =
+            GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
+        let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
+        assert!(statuses[&1].as_ref().expect_err("node budget exhausted").contains("pagination budget"));
+        assert_eq!(runner.calls().len(), 4, "three 220-node pages leave too little budget for a fourth");
+    }
+
+    #[tokio::test]
+    async fn failed_history_page_is_local_to_its_request() {
+        let busy = serde_json::json!({"state": "OPEN", "reviewDecision": null,
+            "comments": {"pageInfo": {"hasPreviousPage": true, "startCursor": "more"}, "nodes": []}});
+        let healthy = serde_json::json!({"title": "Healthy", "state": "OPEN", "reviewDecision": null});
+        let first = format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": {"pr1": busy, "pr2": healthy}}}));
+        let failed = "HTTP/2 200 OK\r\n\r\n{\"errors\":[{\"message\":\"cursor expired\"}]}".to_string();
+        let runner = Arc::new(MockRunner::new(vec![Ok(first), Ok(failed)]));
+        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        let statuses = provider.observe_bound(&[1, 2], &Default::default()).await.expect("observe both PRs");
+        assert!(statuses[&1].as_ref().expect_err("failed page").contains("cursor expired"));
+        assert_eq!(statuses[&2].as_ref().expect("healthy PR").title.value.as_deref(), Some("Healthy"));
+    }
+
+    #[tokio::test]
+    async fn replayed_real_batched_github_observation() {
+        let fixture = crate::providers::testing::fixture_path("change_request", "github_observer_busy.yaml");
+        let session = replay::test_session(&fixture, replay::Masks::new());
+        let runner = replay::test_runner(&session);
+        let provider =
+            GitHubChangeRequest::new("github".into(), "flotilla-org/flotilla".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        let statuses = provider.observe_bound(&[2320], &Default::default()).await.expect("observe real PR");
+        let status = statuses[&2320].as_ref().expect("complete real PR observation");
+        assert_eq!(status.title.value.as_deref(), Some("fix: wake crews for unaddressed PR review feedback"));
+        assert_eq!(status.head_sha.value.as_deref(), Some("1256f96194276ce7b7c7d4fa614d6782dbf1fabf"));
+        assert_eq!(status.review.actionable_at_head.value, Some(true));
+        session.finish();
     }
 
     #[tokio::test]
