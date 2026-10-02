@@ -1040,6 +1040,7 @@ impl ReconcilerWake {
                         if changed {
                             obligation.history.clear();
                             obligation.quiet_since = None;
+                            obligation.reply_after = None;
                             progress_changed = true;
                         }
                         obligation.progress.extend(progress);
@@ -1050,9 +1051,17 @@ impl ReconcilerWake {
                         });
                         let delivered_id = session_status.and_then(|status| status.delivered_message_id.clone());
                         if message_id != obligation.message_id || delivered_id != obligation.delivered_message_id {
-                            obligation.quiet_since = None;
+                            if message_id.is_some() || delivered_id.is_some() {
+                                obligation.reply_after = Some(now);
+                            }
                             obligation.message_id = message_id.clone();
                             obligation.delivered_message_id = delivered_id;
+                        }
+                        let tool_activity = session_status.and_then(|status| status.last_tool_activity_at);
+                        if tool_activity.is_some_and(|at| obligation.last_tool_activity_at.is_none_or(|previous| at > previous)) {
+                            obligation.quiet_since = None;
+                            obligation.reply_after = None;
+                            obligation.last_tool_activity_at = tool_activity;
                         }
                         let pending_message = session.is_some_and(|session| match &session.spec.source {
                             TerminalSessionSource::Agent { message: Some(message), .. } => !message
@@ -1060,25 +1069,42 @@ impl ReconcilerWake {
                             _ => false,
                         });
                         if let Some(attention) = session_status.and_then(|status| status.attention.as_ref()) {
-                            if obligation
-                                .last_attention_at
-                                .is_some_and(|previous| attention.as_of.signed_duration_since(previous) >= TerminalAttention::FRESH_FOR)
-                            {
-                                obligation.quiet_since = None;
+                            let echo = obligation.reply_after.is_some();
+                            if !echo {
+                                if obligation
+                                    .last_attention_at
+                                    .is_some_and(|previous| attention.as_of.signed_duration_since(previous) >= TerminalAttention::FRESH_FOR)
+                                {
+                                    obligation.quiet_since = None;
+                                }
+                                if attention.source == TerminalAttentionSource::Hook && obligation.last_hook_at != Some(attention.as_of) {
+                                    obligation.quiet_since = None;
+                                }
+                                if attention.state != TerminalAttentionState::Idle || attention.is_stale_at(now) {
+                                    obligation.quiet_since = None;
+                                }
                             }
                             obligation.last_attention_at = Some(attention.as_of);
-                            if attention.source == TerminalAttentionSource::Hook && obligation.last_hook_at != Some(attention.as_of) {
-                                obligation.quiet_since = None;
+                            if attention.source == TerminalAttentionSource::Hook {
                                 obligation.last_hook_at = Some(attention.as_of);
+                                if attention.state == TerminalAttentionState::Idle
+                                    && obligation.reply_after.is_some_and(|at| attention.as_of > at)
+                                    && !pending_message
+                                {
+                                    // Consume exactly this delivered message's response end.
+                                    // It neither starts an episode nor restarts its idle clock.
+                                    obligation.reply_after = None;
+                                }
                             }
-                            if attention.state != TerminalAttentionState::Idle || attention.is_stale_at(now) || pending_message {
-                                obligation.quiet_since = None;
-                            } else {
+                            if attention.state == TerminalAttentionState::Idle && !attention.is_stale_at(now) && !pending_message {
                                 obligation.quiet_since.get_or_insert(now);
                             }
-                        } else {
+                        } else if obligation.reply_after.is_none() {
                             obligation.quiet_since = None;
                         }
+                        let awaiting_reply_observation = obligation.reply_after.is_some_and(|after| {
+                            session_status.and_then(|status| status.attention.as_ref()).is_none_or(|attention| attention.as_of <= after)
+                        });
                         let idle_grace = chrono::Duration::seconds(i64::from(
                             status
                                 .workflow_snapshot
@@ -1133,7 +1159,10 @@ impl ReconcilerWake {
                                         TerminalAttentionSource::Hook => StallEvidenceSource::Hook,
                                     };
                                     if attention.state == TerminalAttentionState::Idle {
-                                        if obligation.quiet_since.is_none_or(|since| now.signed_duration_since(since) < idle_grace) {
+                                        if pending_message
+                                            || awaiting_reply_observation
+                                            || obligation.quiet_since.is_none_or(|since| now.signed_duration_since(since) < idle_grace)
+                                        {
                                             unknown = true;
                                             continue;
                                         }
@@ -1489,7 +1518,7 @@ impl ReconcilerWake {
                                             .find(|obligation| obligation.maker == row.maker && obligation.leaves == row.leaves)
                                         {
                                             obligation.history = condition.nudge_history.clone();
-                                            obligation.quiet_since = Some(now);
+                                            obligation.reply_after = Some(now);
                                         }
                                     }
                                     Err(error) => {
@@ -2650,14 +2679,10 @@ mod tests {
     ) {
         let sessions = backend.using::<TerminalSession>("flotilla");
         let session = sessions.get("resumed-coder").await.expect("session");
-        sessions
-            .update_status("resumed-coder", &session.metadata.resource_version, &flotilla_resources::TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                attention: Some(TerminalAttention { state, as_of: now, source }),
-                ..Default::default()
-            })
-            .await
-            .expect("observe hook");
+        let mut status = session.status.unwrap_or_default();
+        status.phase = TerminalSessionPhase::Running;
+        status.attention = Some(TerminalAttention { state, as_of: now, source });
+        sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("observe hook");
         let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
         wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), now).await.expect("judge scenario");
     }
@@ -2666,10 +2691,17 @@ mod tests {
         use crate::agents::hooks::{ClaudeCodeParser, HarnessHookParser};
         let parsed = ClaudeCodeParser.parse_event(event, br#"{"session_id":"claude-scenario"}"#).expect("Claude hook");
         let state = match parsed.event_type {
-            flotilla_protocol::AgentEventType::Active => TerminalAttentionState::Working,
+            flotilla_protocol::AgentEventType::Active | flotilla_protocol::AgentEventType::ToolActive => TerminalAttentionState::Working,
             flotilla_protocol::AgentEventType::Idle => TerminalAttentionState::Idle,
             other => panic!("unexpected hook: {other:?}"),
         };
+        if parsed.event_type == flotilla_protocol::AgentEventType::ToolActive {
+            let sessions = backend.using::<TerminalSession>("flotilla");
+            let session = sessions.get("resumed-coder").await.expect("session");
+            let mut status = session.status.unwrap_or_default();
+            status.last_tool_activity_at = Some(now);
+            sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("actual tool activity");
+        }
         observe_actor_source(backend, wake, state, TerminalAttentionSource::Hook, now).await;
     }
 
@@ -2691,6 +2723,56 @@ mod tests {
         observe_claude_hook(&backend, &wake, "user-prompt-submit", start + chrono::Duration::seconds(1081)).await;
         observe_claude_hook(&backend, &wake, "stop", start + chrono::Duration::seconds(1082)).await;
         assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "reply Stop must not rearm the nudge budget");
+    }
+
+    #[tokio::test]
+    async fn nudge_reply_preserves_idle_clock_and_allows_second_nudge_after_backoff() {
+        let (backend, wake, delivery) = idle_nudge_scenario().await;
+        let start = Utc::now();
+        for second in [0, 60, 120, 180] {
+            observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        }
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
+        observe_claude_hook(&backend, &wake, "user-prompt-submit", start + chrono::Duration::seconds(181)).await;
+        for second in [240, 300] {
+            observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(second)).await;
+        }
+        observe_claude_hook(&backend, &wake, "stop", start + chrono::Duration::seconds(359)).await;
+        let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+        assert_eq!(convoy.status.expect("status").nudge_obligations[0].quiet_since, Some(start), "echo does not restart the idle clock");
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
+        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(360)).await;
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 2, "continued idle gets the second backed-off nudge");
+    }
+
+    #[tokio::test]
+    async fn actual_tool_work_after_nudge_cancels_idle_without_replenishing_budget() {
+        let (backend, wake, delivery) = idle_nudge_scenario().await;
+        let start = Utc::now();
+        for second in [0, 60, 120, 180] {
+            observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        }
+        observe_claude_hook(&backend, &wake, "user-prompt-submit", start + chrono::Duration::seconds(181)).await;
+        observe_claude_hook(&backend, &wake, "pre-tool-use", start + chrono::Duration::seconds(182)).await;
+        for second in [240, 300] {
+            observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(second)).await;
+        }
+        observe_claude_hook(&backend, &wake, "post-tool-use", start + chrono::Duration::seconds(358)).await;
+        observe_claude_hook(&backend, &wake, "stop", start + chrono::Duration::seconds(359)).await;
+        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(360)).await;
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "real work requires a new continuous idle grace");
+        let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+        assert_eq!(convoy.status.expect("status").nudge_obligations[0].quiet_since, Some(start + chrono::Duration::seconds(359)));
+        for second in [420, 480, 539] {
+            observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        }
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 2);
+        let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+        assert_eq!(
+            convoy.status.expect("status").nudge_obligations[0].history.len(),
+            2,
+            "commands alone do not reset the obligation budget"
+        );
     }
 
     #[tokio::test]
@@ -2726,7 +2808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_message_and_repeated_stop_restart_grace_without_replenishing_budget() {
+    async fn operator_message_echo_preserves_clock_without_replenishing_budget() {
         let (backend, wake, delivery) = idle_nudge_scenario().await;
         let start = Utc::now();
         for second in [0, 60, 120, 180] {
@@ -2772,9 +2854,9 @@ mod tests {
                 .await
                 .expect("response grace");
         }
-        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "hook activity extends grace");
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 2, "continued idle can receive the second nudge after owner reply");
         let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
-        assert_eq!(convoy.status.expect("status").nudge_obligations[0].history.len(), 1);
+        assert_eq!(convoy.status.expect("status").nudge_obligations[0].history.len(), 2);
     }
 
     #[tokio::test]

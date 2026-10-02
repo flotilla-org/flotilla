@@ -940,6 +940,11 @@ pub struct NudgeObligation {
     pub quiet_since: Option<DateTime<Utc>>,
     pub last_hook_at: Option<DateTime<Utc>>,
     pub last_attention_at: Option<DateTime<Utc>>,
+    // Stored-data compatibility: defaults may be removed one fleet roll later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_after: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_activity_at: Option<DateTime<Utc>>,
     pub message_id: Option<String>,
     pub delivered_message_id: Option<String>,
 }
@@ -1071,6 +1076,7 @@ fn clear_nudge_budget(status: &mut ConvoyStatus, vessel: &str, role: &str) {
         {
             obligation.history.clear();
             obligation.quiet_since = None;
+            obligation.reply_after = None;
         }
     }
 }

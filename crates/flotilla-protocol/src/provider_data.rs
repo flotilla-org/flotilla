@@ -212,6 +212,8 @@ pub enum AgentEventType {
     Started,
     Ended,
     Active,
+    /// Actual tool execution, distinct from a prompt submitted for a message reply.
+    ToolActive,
     Idle,
     WaitingForPermission,
     /// The event was informational and should not change agent status.
@@ -224,7 +226,7 @@ impl AgentEventType {
         match self {
             AgentEventType::Started => Some(AgentStatus::Idle),
             AgentEventType::Ended => None, // caller should remove the entry
-            AgentEventType::Active => Some(AgentStatus::Active),
+            AgentEventType::Active | AgentEventType::ToolActive => Some(AgentStatus::Active),
             AgentEventType::Idle => Some(AgentStatus::Idle),
             AgentEventType::WaitingForPermission => Some(AgentStatus::WaitingForPermission),
             AgentEventType::NoChange => None,

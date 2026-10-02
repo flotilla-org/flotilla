@@ -109,6 +109,7 @@ define_patch_kinds! {
     TerminalMarkMessageDelivered => NONE,
     TerminalMarkDeliveryUnconfirmed => NONE,
     TerminalObserveAttention => NONE,
+    TerminalObserveToolActivity => NONE,
     TerminalMarkCompletionPending => NONE,
     TerminalClearCompletionPending => NONE,
     TerminalMarkStopped => DUPLICATE,
@@ -187,6 +188,7 @@ fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind 
         TerminalSessionStatusPatch::MarkReconcileDegraded { .. } => PatchKind::TerminalMarkReconcileDegraded,
         TerminalSessionStatusPatch::ClearReconcileDegraded => PatchKind::TerminalClearReconcileDegraded,
         TerminalSessionStatusPatch::ObserveAttention { .. } => PatchKind::TerminalObserveAttention,
+        TerminalSessionStatusPatch::ObserveToolActivity { .. } => PatchKind::TerminalObserveToolActivity,
         TerminalSessionStatusPatch::Observe { .. } => PatchKind::TerminalObserveAttention,
         TerminalSessionStatusPatch::MarkCompletionPending { .. } => PatchKind::TerminalMarkCompletionPending,
         TerminalSessionStatusPatch::ClearCompletionPending => PatchKind::TerminalClearCompletionPending,
@@ -656,6 +658,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             kind: PatchKind::TerminalMarkRunning,
             exercise: || {
                 let mut status = TerminalSessionStatus {
+                    last_tool_activity_at: None,
                     phase: TerminalSessionPhase::Running,
                     session_id: Some("session-a".to_string()),
                     cleat_endpoint: None,

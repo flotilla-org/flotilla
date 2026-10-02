@@ -141,13 +141,15 @@ sustained quiet period; a fresh Stop restarts grace rather than bypassing it.
 `PreToolUse` and `PostToolUse` report Working, and fresh screen confirmations
 establish quiet duration. Retaining Stop avoids depending exclusively on screen
 classification and preserves the existing attention consumers. A delivered
-nudge's reply and any newly queued or delivered operator/owner message restart
-quiet grace without replenishing the obligation budget. Pending briefs remain
+nudge's reply and operator/owner message echoes preserve the existing idle
+clock and budget. Actual tool activity cancels idleness; if idle resumes after
+real work, it must satisfy grace again. Remaining continuously idle permits
+further nudges at the backed-off times, up to the obligation budget. Pending briefs remain
 protected by the existing delivery ordering.
 
 Schema authors: WorkflowTemplate manifests in the external project-map/ops
 repositories may specify `stall_nudges`; their existing field names and defaults
 remain compatible, so no companion manifest edit is required. Convoy status and
-Checkout integration status are daemon/controller-authored; no external manifest
+Checkout integration status and TerminalSession status are daemon/controller-authored; no external manifest
 source authors the new status fields. New stored fields decode with defaults
 under ADR 0047; the stored-record corpus must not be regenerated for this change.

@@ -100,7 +100,12 @@ impl HarnessHookParser for ClaudeCodeParser {
             "user-prompt-submit" | "pre-tool-use" | "post-tool-use" => {
                 let parsed: ClaudeCommonPayload =
                     serde_json::from_slice(payload).map_err(|e| format!("failed to parse UserPromptSubmit payload: {e}"))?;
-                Ok(ParsedHookEvent { event_type: AgentEventType::Active, session_id: parsed.session_id, model: None, cwd: parsed.cwd })
+                Ok(ParsedHookEvent {
+                    event_type: if event_type == "user-prompt-submit" { AgentEventType::Active } else { AgentEventType::ToolActive },
+                    session_id: parsed.session_id,
+                    model: None,
+                    cwd: parsed.cwd,
+                })
             }
             "stop" => {
                 let parsed: ClaudeCommonPayload =
@@ -241,7 +246,7 @@ mod tests {
         let payload = serde_json::json!({ "session_id": "sess-abc", "tool_name": "Bash" });
         for event in ["pre-tool-use", "post-tool-use"] {
             let result = ClaudeCodeParser.parse_event(event, payload.to_string().as_bytes()).expect("tool hook");
-            assert_eq!(result.event_type, AgentEventType::Active);
+            assert_eq!(result.event_type, AgentEventType::ToolActive);
         }
     }
 

@@ -790,7 +790,7 @@ impl<'a> RequestDispatcher<'a> {
 
         let Some(terminal) = event.terminal.as_ref() else { return Ok(()) };
         let state = match event.event_type {
-            AgentEventType::Active => flotilla_resources::TerminalAttentionState::Working,
+            AgentEventType::Active | AgentEventType::ToolActive => flotilla_resources::TerminalAttentionState::Working,
             AgentEventType::Idle | AgentEventType::Started => flotilla_resources::TerminalAttentionState::Idle,
             AgentEventType::WaitingForPermission => flotilla_resources::TerminalAttentionState::NeedsInput,
             AgentEventType::Ended | AgentEventType::NoChange => return Ok(()),
@@ -802,18 +802,23 @@ impl<'a> RequestDispatcher<'a> {
             as_of: chrono::Utc::now(),
             source: flotilla_resources::TerminalAttentionSource::Hook,
         };
-        if session
-            .status
-            .as_ref()
-            .and_then(|status| status.attention.as_ref())
-            .is_some_and(|current| !current.should_replace_with(&attention))
+        if event.event_type != AgentEventType::ToolActive
+            && session
+                .status
+                .as_ref()
+                .and_then(|status| status.attention.as_ref())
+                .is_some_and(|current| !current.should_replace_with(&attention))
         {
             return Ok(());
         }
         flotilla_resources::apply_status_patch(
             &sessions,
             &terminal.session_name,
-            &flotilla_resources::TerminalSessionStatusPatch::ObserveAttention { attention },
+            &if event.event_type == AgentEventType::ToolActive {
+                flotilla_resources::TerminalSessionStatusPatch::ObserveToolActivity { attention }
+            } else {
+                flotilla_resources::TerminalSessionStatusPatch::ObserveAttention { attention }
+            },
         )
         .await
         .map_err(|error| error.to_string())?;
