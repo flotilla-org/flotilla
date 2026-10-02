@@ -1751,6 +1751,8 @@ impl RepositoryInspector for ConcurrentCreateRepositoryInspector {
 
 /// Hold both free-space probes until both create requests have reached admission.
 /// This exercises duplicate requests without sleeps or real Git subprocesses.
+/// The probe runs under `spawn_blocking`, so this barrier never blocks an async
+/// executor thread. Keep that boundary when changing the admission probe.
 struct ConcurrentCreateSpaceProbe {
     arrivals: std::sync::Barrier,
     calls: AtomicUsize,
