@@ -14,6 +14,7 @@ use flotilla_protocol::{
     },
     HostName, ViewAddress, AWARENESS_REL_FOR_CONVOY,
 };
+use flotilla_resources::{ChangeRequestStatus, ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision};
 
 use crate::{
     entity::{self, EntityRef},
@@ -42,6 +43,70 @@ pub struct CatalogInput<'a> {
     pub independents: &'a [IndependentRow],
     pub standing_roles: &'a [StandingRoleRow],
     pub project_repositories: &'a [ProjectRepositoriesRow],
+}
+
+/// Derived presentation state for a change request. The raw observations remain
+/// available to presentation managers for more detailed displays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeRequestReadiness {
+    ReadyToMerge,
+    AwaitingReviewResponse,
+    CiFailing,
+    Conflicting,
+    Draft,
+    MergedNotLanded,
+    Closed,
+}
+
+impl ChangeRequestReadiness {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadyToMerge => "ready_to_merge",
+            Self::AwaitingReviewResponse => "awaiting_review_response",
+            Self::CiFailing => "ci_failing",
+            Self::Conflicting => "conflicting",
+            Self::Draft => "draft",
+            Self::MergedNotLanded => "merged_not_landed",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+/// Derive the single readiness fact published on a change-request entity.
+///
+/// Precedence is closed or merged, draft, conflict, failed checks, then
+/// waiting for review or incomplete evidence. `ready_to_merge` requires every
+/// positive observation to be known. Pending checks and unknown observations
+/// use the waiting state because the wire vocabulary has no pending/unknown
+/// readiness variant; consumers can distinguish them through the raw fields.
+/// A merged change request whose linked convoy has landed maps to `closed`:
+/// there is no separate landed value. `landed` means a linked convoy has
+/// reached its terminal landed phase.
+pub fn change_request_readiness(status: &ChangeRequestStatus, landed: bool) -> ChangeRequestReadiness {
+    use ChangeRequestReadiness as Readiness;
+
+    match status.state.value {
+        Some(ObservedChangeRequestState::Closed) => return Readiness::Closed,
+        Some(ObservedChangeRequestState::Merged) => return if landed { Readiness::Closed } else { Readiness::MergedNotLanded },
+        Some(ObservedChangeRequestState::Draft) => return Readiness::Draft,
+        _ => {}
+    }
+
+    if status.mergeable.value == Some(ObservedMergeability::Conflicting) {
+        return Readiness::Conflicting;
+    }
+    if status.checks.value == Some(ObservedChecks::Fail) {
+        return Readiness::CiFailing;
+    }
+    if status.state.value != Some(ObservedChangeRequestState::Open)
+        || status.checks.value != Some(ObservedChecks::Pass)
+        || status.mergeable.value != Some(ObservedMergeability::Mergeable)
+        || status.review.actionable_at_head.value != Some(false)
+        || !matches!(status.review_decision.value, Some(ObservedReviewDecision::Approved | ObservedReviewDecision::None))
+    {
+        return Readiness::AwaitingReviewResponse;
+    }
+    Readiness::ReadyToMerge
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
