@@ -319,6 +319,10 @@ impl CommandRunner for DiscoveryMockRunner {
         Ok(())
     }
 
+    async fn write_file_with_mode(&self, path: &Path, content: &str, _mode: u32) -> Result<(), String> {
+        self.write_file(path, content).await
+    }
+
     async fn read_file_to(&self, source: &Path, destination: &Path) -> Result<(), String> {
         tokio::fs::copy(source, destination).await.map(|_| ()).map_err(|error| error.to_string())
     }

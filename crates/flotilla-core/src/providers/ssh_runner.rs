@@ -142,7 +142,13 @@ impl CommandRunner for SshCommandRunner {
     }
 
     async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
-        let script = atomic_write_script(path, &Uuid::new_v4().to_string())?;
+        let script = atomic_write_script(path, &Uuid::new_v4().to_string(), None)?;
+        let ssh_args = self.ssh_shell_args(&script);
+        self.runner.run_with_input("ssh", &ssh_args, Path::new("/"), &ChannelLabel::Default, content.as_bytes()).await.map(|_| ())
+    }
+
+    async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+        let script = atomic_write_script(path, &Uuid::new_v4().to_string(), Some(mode))?;
         let ssh_args = self.ssh_shell_args(&script);
         self.runner.run_with_input("ssh", &ssh_args, Path::new("/"), &ChannelLabel::Default, content.as_bytes()).await.map(|_| ())
     }
@@ -155,7 +161,7 @@ impl CommandRunner for SshCommandRunner {
     }
 
     async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
-        let script = atomic_write_script(destination, &Uuid::new_v4().to_string())?;
+        let script = atomic_write_script(destination, &Uuid::new_v4().to_string(), None)?;
         let args = self.ssh_shell_args(&script);
         self.runner.run_from_file("ssh", &args, Path::new("/"), source).await
     }
@@ -484,6 +490,20 @@ mod tests {
         assert!(args.iter().all(|arg| !arg.contains("secret assignment")));
         assert_eq!(inner.inputs(), vec![b"secret assignment".to_vec()]);
         assert!(args.last().expect("remote script").contains("cat > \"$tmp\""));
+        assert!(!args.last().expect("remote script").contains("umask 077"), "ordinary writes retain the environment umask");
+    }
+
+    #[tokio::test]
+    async fn protected_write_sets_mode_before_remote_rename() {
+        let inner = std::sync::Arc::new(RecordingRunner::with_run_result(Ok(String::new())));
+        let runner = SshCommandRunner::new("alice@feta.local", false, inner.clone());
+        runner.write_file_with_mode(Path::new("/repo/token"), "secret token", 0o600).await.expect("write token");
+        let calls = inner.calls();
+        let args = ssh_call_args(&calls);
+        let script = args.last().expect("remote script");
+        assert!(script.contains("chmod 600 \"$tmp\"; mv"), "script: {script}");
+        assert!(args.iter().all(|arg| !arg.contains("secret token")));
+        assert_eq!(inner.inputs(), vec![b"secret token".to_vec()]);
     }
 
     #[tokio::test]

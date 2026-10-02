@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
 
 use async_trait::async_trait;
@@ -220,6 +220,7 @@ struct AmbientClaudeOauthMetadata {
 }
 
 type LedgerDeliveryRecord = BTreeMap<String, BTreeMap<String, String>>;
+type GithubAppDeliveryLocks = BTreeMap<(String, String), Weak<Mutex<()>>>;
 
 pub(crate) struct CredentialStore {
     backend: ResourceBackend,
@@ -237,6 +238,7 @@ pub(crate) struct CredentialStore {
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
     registry_configs: Mutex<BTreeMap<String, PathBuf>>,
     github_app_deliveries: Mutex<BTreeMap<(String, String), GithubAppDelivery>>,
+    github_app_delivery_locks: Mutex<GithubAppDeliveryLocks>,
     github_app_adoption_failures: Mutex<BTreeMap<String, usize>>,
     github_app_installations: Mutex<BTreeMap<GithubAppInstallationRequest, u64>>,
     cleaned_delivery_environments: Mutex<BTreeMap<String, Arc<OnceCell<()>>>>,
@@ -510,6 +512,7 @@ impl CredentialStore {
             git_config_fragments: Mutex::new(BTreeMap::new()),
             registry_configs: Mutex::new(BTreeMap::new()),
             github_app_deliveries: Mutex::new(BTreeMap::new()),
+            github_app_delivery_locks: Mutex::new(BTreeMap::new()),
             github_app_adoption_failures: Mutex::new(BTreeMap::new()),
             github_app_installations: Mutex::new(BTreeMap::new()),
             cleaned_delivery_environments: Mutex::new(BTreeMap::new()),
@@ -624,6 +627,17 @@ fn parse_ambient_claude_expiry(contents: &[u8], path: &Path) -> Option<Credentia
 }
 
 impl CredentialStore {
+    async fn github_app_delivery_lock(&self, key: &(String, String)) -> Arc<Mutex<()>> {
+        let mut locks = self.github_app_delivery_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key.clone(), Arc::downgrade(&lock));
+        lock
+    }
+
     #[cfg(test)]
     pub(crate) async fn prepare(
         &self,
@@ -745,6 +759,11 @@ impl CredentialStore {
         let mut prepared_cache_keys = Vec::new();
         for (name, spec) in &specs {
             let cache_key = (environment_ref.to_string(), name.clone());
+            let _delivery_guard = if matches!(spec.consumer, CredentialConsumer::GithubApp { .. }) {
+                Some(self.github_app_delivery_lock(&cache_key).await.lock_owned().await)
+            } else {
+                None
+            };
             if let CredentialConsumer::GithubApp { permissions: declaration, .. } = &spec.consumer {
                 let requested = capped_github_app_permissions(credential_permissions.get(name), declaration.as_ref())?;
                 if self.github_app_deliveries.lock().await.get(&cache_key).is_some_and(|existing| existing.request.permissions != requested)
@@ -778,9 +797,8 @@ impl CredentialStore {
                 self.materials.lock().await.remove(&cache_key);
                 return Err(error);
             }
-            let mut github_app_deliveries =
-                if resolved.github_app.is_some() { Some(self.github_app_deliveries.lock().await) } else { None };
-            if let (Some(deliveries), Some((request, _))) = (&github_app_deliveries, &resolved.github_app) {
+            if let Some((request, _)) = &resolved.github_app {
+                let deliveries = self.github_app_deliveries.lock().await;
                 if deliveries.get(&cache_key).is_some_and(|existing| existing.request.permissions != request.permissions) {
                     return Err(bounded_adapter_error(
                         name,
@@ -809,24 +827,21 @@ impl CredentialStore {
             env.extend(delivered.env);
             if let Some((request, expires_at)) = resolved.github_app {
                 let paths = delivery_paths.as_ref().expect("GitHub App adapter resolves delivery paths");
-                github_app_deliveries.as_mut().expect("GitHub App delivery holds the write lock").insert(
-                    cache_key.clone(),
-                    GithubAppDelivery {
-                        generation: uuid::Uuid::new_v4(),
-                        request,
-                        runner: Arc::clone(&runner),
-                        token_file: github_app_token_file(paths, name),
-                        issued_at: self.clock.now(),
-                        expires_at,
-                        refresh_failures: 0,
-                        next_refresh_attempt_at: None,
-                        installation_repository: match &spec.consumer {
-                            CredentialConsumer::GithubApp { installation_repository, .. } => installation_repository.clone(),
-                            _ => None,
-                        },
-                        scope: None,
+                self.github_app_deliveries.lock().await.insert(cache_key.clone(), GithubAppDelivery {
+                    generation: uuid::Uuid::new_v4(),
+                    request,
+                    runner: Arc::clone(&runner),
+                    token_file: github_app_token_file(paths, name),
+                    issued_at: self.clock.now(),
+                    expires_at,
+                    refresh_failures: 0,
+                    next_refresh_attempt_at: None,
+                    installation_repository: match &spec.consumer {
+                        CredentialConsumer::GithubApp { installation_repository, .. } => installation_repository.clone(),
+                        _ => None,
                     },
-                );
+                    scope: None,
+                });
             }
             if let Some(git_credential) = delivered.git_credential {
                 git_config_owner.get_or_insert_with(|| (name.clone(), spec.consumer.adapter_name().to_string(), cache_key.clone()));
@@ -997,7 +1012,11 @@ impl CredentialStore {
         let material = self.resolve_for_adapter(&name, &spec, None, None).await?;
         let material = material.value.trim_end();
         validate_scalar_material(&name, "docker-registry", material)?;
-        let config_dir = self.state_dir.join("credential-runtime").join(format!("{}-{}", safe_component(&name), uuid::Uuid::new_v4()));
+        let config_dir = self
+            .state_dir
+            .join("credential-runtime")
+            .join(registry_environment_dir(environment_ref))
+            .join(uuid::Uuid::new_v4().to_string());
         tokio::fs::create_dir_all(&config_dir)
             .await
             .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("create cache directory: {error}")))?;
@@ -1112,6 +1131,50 @@ impl CredentialStore {
         let config_dir = self.registry_configs.lock().await.remove(environment_ref);
         if let Some(config_dir) = config_dir {
             remove_registry_config(&config_dir).await.map_err(|error| format!("remove Docker credential cache: {error}"))?;
+        }
+        Ok(())
+    }
+
+    /// Remove Docker login caches left by environments which no longer have
+    /// either a resource record or a running backing. Legacy flat directories
+    /// have no environment identity, so they are removed only when no live
+    /// environment or backing could own one.
+    pub(crate) async fn sweep_orphaned_registry_configs(
+        &self,
+        live_environments: &BTreeSet<String>,
+        running_backings: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        let root = self.state_dir.join("credential-runtime");
+        let mut entries = match tokio::fs::read_dir(&root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("list Docker credential caches {}: {error}", root.display())),
+        };
+        let protected =
+            live_environments.iter().chain(running_backings).map(|name| registry_environment_dir(name)).collect::<BTreeSet<_>>();
+        let active_paths = self.registry_configs.lock().await.values().cloned().collect::<BTreeSet<_>>();
+        while let Some(entry) = entries.next_entry().await.map_err(|error| format!("list Docker credential cache: {error}"))? {
+            let kind = entry.file_type().await.map_err(|error| format!("inspect Docker credential cache: {error}"))?;
+            if !kind.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let owned = name
+                .strip_prefix("env-")
+                .is_some_and(|hex| !hex.is_empty() && hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+            let legacy =
+                name.len() > 37 && name.as_bytes()[name.len() - 37] == b'-' && uuid::Uuid::parse_str(&name[name.len() - 36..]).is_ok();
+            if owned && !protected.contains(&name) && !active_paths.iter().any(|path| path.starts_with(entry.path())) {
+                remove_registry_config(&entry.path())
+                    .await
+                    .map_err(|error| format!("remove orphaned Docker credential cache {}: {error}", entry.path().display()))?;
+                tracing::info!(path = %entry.path().display(), "removed orphaned Docker credential cache");
+            } else if legacy && live_environments.is_empty() && running_backings.is_empty() && !active_paths.contains(&entry.path()) {
+                remove_registry_config(&entry.path())
+                    .await
+                    .map_err(|error| format!("remove legacy Docker credential cache {}: {error}", entry.path().display()))?;
+                tracing::info!(path = %entry.path().display(), "removed legacy orphaned Docker credential cache");
+            }
         }
         Ok(())
     }
@@ -1274,12 +1337,14 @@ impl CredentialStore {
                 });
                 continue;
             }
-            let mut deliveries = self.github_app_deliveries.lock().await;
-            let Some(current) = deliveries.get_mut(&key).filter(|current| current.generation == delivery.generation) else {
+            let _delivery_guard = self.github_app_delivery_lock(&key).await.lock_owned().await;
+            let current =
+                { self.github_app_deliveries.lock().await.get(&key).filter(|current| current.generation == delivery.generation).cloned() };
+            let Some(current) = current else {
                 continue;
             };
             if let Err(error) = replace_github_app_token_file(&*current.runner, &current.token_file, token.value.trim_end()).await {
-                let should_surface = current.record_refresh_failure(self.clock.now());
+                let should_surface = self.record_refresh_failure(&key, delivery.generation).await;
                 errors.push(CredentialRefreshError {
                     environment_ref: key.0.clone(),
                     credential_name: Some(key.1.clone()),
@@ -1296,11 +1361,14 @@ impl CredentialStore {
                     should_surface: true,
                 });
             }
-            current.expires_at = token.expires_at;
-            current.issued_at = self.clock.now();
-            current.refresh_failures = 0;
-            current.next_refresh_attempt_at = None;
-            current.request = request;
+            let mut deliveries = self.github_app_deliveries.lock().await;
+            if let Some(current) = deliveries.get_mut(&key).filter(|current| current.generation == delivery.generation) {
+                current.expires_at = token.expires_at;
+                current.issued_at = self.clock.now();
+                current.refresh_failures = 0;
+                current.next_refresh_attempt_at = None;
+                current.request = request;
+            }
         }
         errors
     }
@@ -1700,23 +1768,18 @@ impl CredentialStore {
                 let path = credential_dir.join("token").to_string_lossy().into_owned();
                 let helper_path = credential_dir.join("git-credential-forgejo").to_string_lossy().into_owned();
                 if !already_prepared {
-                    runner.write_file(Path::new(&path), material).await.map_err(|error| format!("write token file: {error}"))?;
                     runner
-                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
+                        .write_file_with_mode(Path::new(&path), material, 0o600)
                         .await
-                        .map_err(|error| format!("protect token file: {error}"))?;
+                        .map_err(|error| format!("write token file: {error}"))?;
                     let helper = format!(
                         "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nprotocol=\nhost=\nwhile IFS='=' read -r key value; do\n  case \"$key\" in\n    protocol) protocol=$value ;;\n    host) host=$value ;;\n  esac\ndone\n[ \"$protocol\" = https ] || exit 0\n[ \"$host\" = {host}{} ] || exit 0\nprintf 'username=%s\\n' \"$FORGEJO_USERNAME\"\nprintf 'password='\ncat \"$FORGEJO_TOKEN_FILE\"\nprintf '\\n'\n",
                         parsed_url.port().map(|port| format!(":{port}")).unwrap_or_default()
                     );
                     runner
-                        .write_file(Path::new(&helper_path), &helper)
+                        .write_file_with_mode(Path::new(&helper_path), &helper, 0o700)
                         .await
                         .map_err(|error| format!("write Git credential helper: {error}"))?;
-                    runner
-                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Default)
-                        .await
-                        .map_err(|error| format!("protect Git credential helper: {error}"))?;
                     let url = format!("{server_url}/api/v1/user");
                     let curl_config = format!(
                         "silent\nshow-error\nfail\nheader = \"Authorization: token {}\"\nurl = \"{}\"\n",
@@ -1755,11 +1818,10 @@ impl CredentialStore {
                 let path = credential_dir.join("token").to_string_lossy().into_owned();
                 let helper_path = credential_dir.join("git-credential-http-token").to_string_lossy().into_owned();
                 if !already_prepared {
-                    runner.write_file(Path::new(&path), material).await.map_err(|error| format!("write token file: {error}"))?;
                     runner
-                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
+                        .write_file_with_mode(Path::new(&path), material, 0o600)
                         .await
-                        .map_err(|error| format!("protect token file: {error}"))?;
+                        .map_err(|error| format!("write token file: {error}"))?;
                     let helper = format!(
                         "#!/bin/sh\n[ \"$1\" = get ] || exit 0\nprotocol=\nrequest_host=\nwhile IFS='=' read -r key value; do\n  case \"$key\" in\n    protocol) protocol=$value ;;\n    host) request_host=$value ;;\n  esac\ndone\n[ \"$protocol\" = https ] || exit 0\n[ \"$request_host\" = {} ] || exit 0\nprintf 'username=%s\\n' {}\nprintf 'password='\ncat {}\nprintf '\\n'\n",
                         shell_single_quote(&host),
@@ -1767,13 +1829,9 @@ impl CredentialStore {
                         shell_single_quote(&path),
                     );
                     runner
-                        .write_file(Path::new(&helper_path), &helper)
+                        .write_file_with_mode(Path::new(&helper_path), &helper, 0o700)
                         .await
                         .map_err(|error| format!("write Git credential helper: {error}"))?;
-                    runner
-                        .run("chmod", &["0700", &helper_path], Path::new("/"), &ChannelLabel::Default)
-                        .await
-                        .map_err(|error| format!("protect Git credential helper: {error}"))?;
                 }
                 git_credential = Some(GitCredentialContribution {
                     fragment: git_credential_fragment(name, "git-http-token", credential_url, format!("!{helper_path}")),
@@ -1911,12 +1969,10 @@ impl CredentialStore {
                     .map_err(|error| format!("credential file must contain review-bundle access key JSON: {error}"))?;
                 let credential_file = delivery_paths.credential_dir(name).join("review-bundle.json");
                 if !already_prepared {
-                    runner.write_file(&credential_file, material).await.map_err(|error| format!("write credential file: {error}"))?;
-                    let path = credential_file.to_string_lossy();
                     runner
-                        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
+                        .write_file_with_mode(&credential_file, material, 0o600)
                         .await
-                        .map_err(|error| format!("protect credential file: {error}"))?;
+                        .map_err(|error| format!("write credential file: {error}"))?;
                 }
                 env.insert("FLOTILLA_REVIEW_STORE_CREDENTIAL_FILE".to_string(), credential_file.to_string_lossy().into_owned());
                 env.insert("FLOTILLA_REVIEW_STORE_ENDPOINT".to_string(), endpoint.clone());
@@ -2015,7 +2071,12 @@ async fn cleanup_stale_github_app_token_files_in_directory(directory: &Path) -> 
     let mut errors = Vec::new();
     while let Some(entry) = entries.next_entry().await.map_err(|error| format!("list credential staging files: {error}"))? {
         let name = entry.file_name();
-        let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix("token.tmp-")) else { continue };
+        let Some(suffix) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("token.tmp-").or_else(|| name.rsplit_once(".flotilla-tmp-").map(|(_, suffix)| suffix)))
+        else {
+            continue;
+        };
         if uuid::Uuid::parse_str(suffix).is_err() {
             continue;
         }
@@ -2048,12 +2109,13 @@ async fn cleanup_stale_github_app_token_files_with_runner(runner: &dyn CommandRu
                 "failed=0; \
                 for directory in \"$1\"/credentials/*; do \
                     [ -d \"$directory\" ] && [ ! -L \"$directory\" ] || continue; \
-                    for file in \"$directory\"/token.tmp-*; do \
+                    for file in \"$directory\"/token.tmp-* \"$directory\"/*.flotilla-tmp-*; do \
                         [ -f \"$file\" ] && [ ! -L \"$file\" ] || continue; \
                         case \"${file##*/}\" in \
-                            token.tmp-????????-????-????-????-????????????) \
+                            token.tmp-????????-????-????-????-????????????|*.flotilla-tmp-????????-????-????-????-????????????) \
                                 name=${file##*/}; \
-                                hex=$(printf '%s' \"${name#token.tmp-}\" | tr -d '-'); \
+                                suffix=${name#token.tmp-}; suffix=${suffix##*.flotilla-tmp-}; \
+                                hex=$(printf '%s' \"$suffix\" | tr -d '-'); \
                                 case \"$hex\" in \
                                     ????????????????????????????????) \
                                         case \"$hex\" in *[!0123456789abcdefABCDEF]*) continue;; esac; \
@@ -2075,42 +2137,15 @@ async fn cleanup_stale_github_app_token_files_with_runner(runner: &dyn CommandRu
 }
 
 async fn write_github_app_token_file(runner: &dyn CommandRunner, path: &Path, token: &str) -> Result<(), String> {
-    runner.write_file(path, token).await.map_err(|error| format!("write token file: {error}"))?;
-    let path = path.to_string_lossy();
-    runner
-        .run("chmod", &["0600", &path], Path::new("/"), &ChannelLabel::Default)
-        .await
-        .map(|_| ())
-        .map_err(|error| format!("protect token file: {error}"))
+    runner.write_file_with_mode(path, token, 0o600).await.map_err(|error| format!("write token file: {error}"))
 }
 
 async fn replace_github_app_token_file(runner: &dyn CommandRunner, path: &Path, token: &str) -> Result<(), String> {
-    let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-    let result = async {
-        write_github_app_token_file(runner, &temporary, token).await?;
-        runner
-            .run("mv", &["-f", "--", &temporary.to_string_lossy(), &path.to_string_lossy()], Path::new("/"), &ChannelLabel::Default)
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("replace token file: {error}"))
-    }
-    .await;
-    if result.is_err() {
-        if let Err(error) = runner.run("rm", &["-f", "--", &temporary.to_string_lossy()], Path::new("/"), &ChannelLabel::Default).await {
-            tracing::warn!(path = %temporary.display(), %error, "failed to remove incomplete GitHub App token file");
-        }
-    }
-    result
+    write_github_app_token_file(runner, path, token).await
 }
 
 async fn write_executable(runner: &dyn CommandRunner, path: &Path, contents: &str, context: &str) -> Result<(), String> {
-    runner.write_file(path, contents).await.map_err(|error| format!("write {context}: {error}"))?;
-    let path = path.to_string_lossy();
-    runner
-        .run("chmod", &["0700", &path], Path::new("/"), &ChannelLabel::Default)
-        .await
-        .map(|_| ())
-        .map_err(|error| format!("protect {context}: {error}"))
+    runner.write_file_with_mode(path, contents, 0o700).await.map_err(|error| format!("write {context}: {error}"))
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -2161,6 +2196,15 @@ fn epoch_to_datetime(value: i64) -> Option<DateTime<Utc>> {
 
 fn sanitize_curl_config(value: &str) -> String {
     value.replace(['\\', '"', '\r', '\n'], "")
+}
+
+fn registry_environment_dir(environment_ref: &str) -> String {
+    let mut name = String::from("env-");
+    for byte in environment_ref.bytes() {
+        use std::fmt::Write;
+        write!(&mut name, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    name
 }
 
 fn safe_component(name: &str) -> String {
@@ -2708,6 +2752,7 @@ mod tests {
     struct RecordingRunner {
         calls: StdMutex<Vec<RecordedCall>>,
         writes: StdMutex<Vec<(PathBuf, String)>>,
+        protected_writes: StdMutex<Vec<(PathBuf, u32)>>,
         runtime_dir_checks: StdMutex<VecDeque<bool>>,
     }
 
@@ -2763,6 +2808,12 @@ mod tests {
         async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
             self.writes.lock().expect("writes lock").push((path.to_path_buf(), content.to_string()));
             Ok(())
+        }
+
+        async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+            assert!(matches!(mode, 0o600 | 0o700));
+            self.protected_writes.lock().expect("protected writes lock").push((path.to_path_buf(), mode));
+            self.write_file(path, content).await
         }
     }
 
@@ -2831,8 +2882,8 @@ mod tests {
             false
         }
 
-        async fn write_file(&self, path: &Path, _content: &str) -> Result<(), String> {
-            tokio::fs::write(path, "partial-new-token").await.map_err(|error| error.to_string())?;
+        async fn write_file_with_mode(&self, _path: &Path, _content: &str, mode: u32) -> Result<(), String> {
+            assert_eq!(mode, 0o600);
             Err("simulated interrupted credential write".to_string())
         }
     }
@@ -2858,14 +2909,18 @@ mod tests {
         let credential_dir = state.path().join("credentials/github-app");
         tokio::fs::create_dir_all(&credential_dir).await.expect("create credential directory");
         let abandoned = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        let current_abandoned = credential_dir.join(format!("token.flotilla-tmp-{}", uuid::Uuid::new_v4()));
+        let helper_abandoned = credential_dir.join(format!("git-credential-github-app.flotilla-tmp-{}", uuid::Uuid::new_v4()));
         let live = credential_dir.join("token");
         let unrelated = credential_dir.join("token.tmp-other");
-        for path in [&abandoned, &live, &unrelated] {
+        for path in [&abandoned, &current_abandoned, &helper_abandoned, &live, &unrelated] {
             tokio::fs::write(path, "secret material").await.expect("write credential file");
         }
         cleanup_stale_github_app_token_files_in(state.path()).await.expect("clean staging files");
 
         assert!(!abandoned.exists());
+        assert!(!current_abandoned.exists());
+        assert!(!helper_abandoned.exists());
         assert!(unrelated.exists());
         assert!(live.exists());
     }
@@ -2911,15 +2966,21 @@ mod tests {
         let credential_dir = base.path().join("credentials/github-app");
         tokio::fs::create_dir_all(&credential_dir).await.expect("create credential directory");
         let abandoned = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
+        let current_abandoned = credential_dir.join(format!("token.flotilla-tmp-{}", uuid::Uuid::new_v4()));
+        let helper_abandoned = credential_dir.join(format!("gh.flotilla-tmp-{}", uuid::Uuid::new_v4()));
         let live = credential_dir.join("token");
         let malformed = credential_dir.join("token.tmp-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz");
         tokio::fs::write(&abandoned, "abandoned material").await.expect("write staging file");
+        tokio::fs::write(&current_abandoned, "abandoned material").await.expect("write current staging file");
+        tokio::fs::write(&helper_abandoned, "abandoned material").await.expect("write helper staging file");
         tokio::fs::write(&live, "live material").await.expect("write live token");
         tokio::fs::write(&malformed, "unrelated material").await.expect("write unrelated file");
 
         cleanup_stale_github_app_token_files_with_runner(&ProcessCommandRunner, base.path()).await.expect("clean delivered staging file");
 
         assert!(!abandoned.exists());
+        assert!(!current_abandoned.exists());
+        assert!(!helper_abandoned.exists());
         assert!(live.exists());
         assert!(malformed.exists());
     }
@@ -3602,10 +3663,13 @@ interactions:
         assert!(token_writes[0].1.contains("installation-token-one"));
         assert!(token_writes[1].1.contains("installation-token-two"));
         assert!(token_writes[2].1.contains("installation-token-three"));
-        assert_ne!(token_writes[0].0, token_writes[2].0, "rotation must stage at a separate path");
-        assert!(runner.calls.lock().expect("calls lock").iter().any(|(command, args, _)| {
-            command == "mv" && args == &["-f", "--", &token_writes[2].0.to_string_lossy(), &token_writes[0].0.to_string_lossy()]
-        }));
+        assert_eq!(token_writes[0].0, token_writes[2].0, "runner atomically replaces the token at its stable path");
+        assert!(runner
+            .protected_writes
+            .lock()
+            .expect("protected writes lock")
+            .iter()
+            .any(|(path, mode)| { path == &token_writes[2].0 && *mode == 0o600 }));
         {
             let writes = runner.writes.lock().expect("writes lock");
             let gh_wrapper = writes.iter().find(|(path, _)| path.file_name().is_some_and(|name| name == "gh")).expect("gh wrapper");
@@ -3716,6 +3780,121 @@ interactions:
         let token_writes =
             runner.writes.lock().expect("writes lock").iter().filter(|(path, _)| path.ends_with("token")).cloned().collect::<Vec<_>>();
         assert_eq!(token_writes.iter().map(|(_, token)| token.as_str()).collect::<Vec<_>>(), ["initial-token", "reprepared-token"]);
+    }
+
+    #[tokio::test]
+    async fn slow_github_app_preflight_does_not_delay_an_independent_environment() {
+        struct PausedPreflightRunner {
+            inner: RecordingRunner,
+            first_preflight: AtomicUsize,
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+
+        #[async_trait]
+        impl CommandRunner for PausedPreflightRunner {
+            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+                if args.iter().any(|arg| arg.contains("api installation/repositories"))
+                    && self.first_preflight.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                self.inner.run(cmd, args, cwd, label).await
+            }
+
+            async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+                self.inner.run_output(cmd, args, cwd, label).await
+            }
+
+            async fn run_with_input(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &ChannelLabel,
+                input: &[u8],
+            ) -> Result<String, String> {
+                self.inner.run_with_input(cmd, args, cwd, label, input).await
+            }
+
+            async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+                self.inner.exists(cmd, args).await
+            }
+
+            async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+                self.inner.write_file(path, content).await
+            }
+
+            async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+                self.inner.write_file_with_mode(path, content, mode).await
+            }
+        }
+
+        let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        let repository_spec = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository spec");
+        let repository_key = repository_spec.key();
+        backend
+            .clone()
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name("flotilla".to_string()).build(), &repository_spec)
+            .await
+            .expect("repository");
+        backend
+            .clone()
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GithubApp {
+                    actor_login: None,
+                    installation_id: Some(9876),
+                    installation_repository: None,
+                    permissions: None,
+                },
+                source: CredentialSource::GithubApp {
+                    app_id_path: "/host/app.id".to_string(),
+                    private_key_path: "/host/app.pem".to_string(),
+                },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("credential");
+        let minter = Arc::new(FakeGithubAppTokenMinter {
+            tokens: StdMutex::new(VecDeque::from([
+                Ok(GithubAppToken { value: "first-token".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken { value: "second-token".to_string(), expires_at: now + Duration::hours(1) }),
+            ])),
+            requests: StdMutex::new(Vec::new()),
+        });
+        let runner = Arc::new(PausedPreflightRunner {
+            inner: RecordingRunner::default(),
+            first_preflight: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let store = Arc::new(CredentialStore::new_with_github_app_minter(
+            backend,
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            runner.clone(),
+            GithubAppMinting { clock: Arc::new(VirtualClock::new(now)), minter },
+            PathBuf::from("/state"),
+        ));
+        let refs = BTreeSet::from(["github-app".to_string()]);
+        let scopes = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]);
+        let first_store = Arc::clone(&store);
+        let first_runner = Arc::clone(&runner);
+        let first_refs = refs.clone();
+        let first_scopes = scopes.clone();
+        let first = tokio::spawn(async move { first_store.prepare_scoped("env-a", &first_refs, &first_scopes, first_runner).await });
+        runner.started.notified().await;
+        let second =
+            tokio::time::timeout(std::time::Duration::from_secs(1), store.prepare_scoped("env-b", &refs, &scopes, runner.clone())).await;
+        runner.release.notify_one();
+        first.await.expect("first task").expect("first delivery");
+        second.expect("independent delivery must finish during another preflight").expect("second delivery");
     }
 
     #[tokio::test]
@@ -4574,13 +4753,10 @@ interactions:
                 "# fragment: credential/git-http-token lab-forgejo\n[credential \"https://forgejo.lab\"]\n\thelper = !/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token\n\n# fragment: vessel/crew-identity\n[user]\n\temail = 309902803+flotilla-crew[bot]@users.noreply.github.com\n\n# fragment: vessel/crew-identity\n[user]\n\tname = flotilla-crew[bot]\n".to_string()
             )
         );
+        let protected = runner.protected_writes.lock().expect("protected writes lock");
+        assert!(protected.contains(&(PathBuf::from("/tmp/flotilla-test-state/credentials/lab-forgejo/token"), 0o600)));
+        assert!(protected.contains(&(PathBuf::from("/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"), 0o700)));
         let calls = runner.calls.lock().expect("calls lock");
-        assert!(calls
-            .iter()
-            .any(|(cmd, args, _)| cmd == "chmod" && args == &["0600", "/tmp/flotilla-test-state/credentials/lab-forgejo/token"]));
-        assert!(calls.iter().any(|(cmd, args, _)| {
-            cmd == "chmod" && args == &["0700", "/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"]
-        }));
         assert!(calls.iter().any(|(cmd, args, input)| {
             cmd == "sh"
                 && args.iter().any(|arg| arg.contains("GIT_CONFIG_NOSYSTEM=1"))
@@ -4640,12 +4816,7 @@ interactions:
             .expect("writes lock")
             .iter()
             .any(|(path, contents)| path == Path::new(credential_file) && contents == material));
-        assert!(runner
-            .calls
-            .lock()
-            .expect("calls lock")
-            .iter()
-            .any(|(command, args, _)| command == "chmod" && args == &["0600", credential_file]));
+        assert!(runner.protected_writes.lock().expect("protected writes lock").contains(&(PathBuf::from(credential_file), 0o600)));
     }
 
     async fn create_git_http_token_spec(backend: &ResourceBackend, name: &str, host: &str, source_env: &str) {
@@ -4966,5 +5137,38 @@ interactions:
 
         store.forget_environment("env-a").await.expect("forget environment");
         assert!(!config_dir.exists(), "credential config should be deleted with the environment");
+    }
+
+    #[tokio::test]
+    async fn registry_sweep_removes_orphans_and_preserves_live_environment_directories() {
+        let state = tempfile::tempdir().expect("state directory");
+        let root = state.path().join("credential-runtime");
+        let live = root.join(registry_environment_dir("live-env")).join(uuid::Uuid::new_v4().to_string());
+        let running = root.join(registry_environment_dir("running-env")).join(uuid::Uuid::new_v4().to_string());
+        let orphan = root.join(registry_environment_dir("orphan-env")).join(uuid::Uuid::new_v4().to_string());
+        let legacy = root.join(format!("private-registry-{}", uuid::Uuid::new_v4()));
+        for path in [&live, &running, &orphan] {
+            std::fs::create_dir_all(path).expect("cache directory");
+            std::fs::write(path.join("config.json"), "secret").expect("cache file");
+        }
+        std::fs::create_dir_all(&legacy).expect("legacy cache directory");
+        let store = CredentialStore::new(
+            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
+            "flotilla",
+            Arc::new(TestEnv::default()),
+            EnvironmentBag::new(),
+            Arc::new(RecordingRunner::default()),
+            state.path().to_path_buf(),
+        );
+        store
+            .sweep_orphaned_registry_configs(&BTreeSet::from(["live-env".to_string()]), &BTreeSet::from(["running-env".to_string()]))
+            .await
+            .expect("sweep cache directories");
+        assert!(live.is_dir(), "live Environment directory must remain");
+        assert!(running.is_dir(), "running backing directory must remain");
+        assert!(!orphan.exists(), "orphan directory must be removed");
+        assert!(legacy.is_dir(), "unattributed legacy cache could belong to a live environment");
+        store.sweep_orphaned_registry_configs(&BTreeSet::new(), &BTreeSet::new()).await.expect("sweep with no live owners");
+        assert!(!legacy.exists(), "legacy orphan must be removed once no environment can own it");
     }
 }

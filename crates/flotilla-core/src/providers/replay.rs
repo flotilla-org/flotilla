@@ -503,6 +503,10 @@ impl CommandRunner for ReplayRunner {
     async fn write_file(&self, _path: &Path, _content: &str) -> Result<(), String> {
         Ok(())
     }
+
+    async fn write_file_with_mode(&self, _path: &Path, _content: &str, _mode: u32) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// A `GhApi` implementation that replays canned responses from a `Session`.
@@ -792,6 +796,10 @@ impl CommandRunner for RecordingRunner {
 
     async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
         self.inner.write_file(path, content).await
+    }
+
+    async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+        self.inner.write_file_with_mode(path, content, mode).await
     }
 }
 

@@ -822,6 +822,10 @@ pub(crate) mod tests {
         async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
             flotilla_core::providers::ProcessCommandRunner.write_file(path, content).await
         }
+
+        async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+            flotilla_core::providers::ProcessCommandRunner.write_file_with_mode(path, content, mode).await
+        }
     }
 
     pub(crate) fn promisor_runner(root: &Path) -> PromisorRunner {
