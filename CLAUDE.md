@@ -126,7 +126,7 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 | `crates/flotilla-protocol/src/lib.rs` | `Message` envelope, `DaemonEvent` |
 | `crates/flotilla-protocol/src/commands.rs` | `Command`, `CommandAction`, and `CommandValue` |
 | `crates/flotilla-protocol/src/result_set.rs` | Aggregator query rows, result sets, and deltas |
-| `crates/flotilla-protocol/src/snapshot.rs` | `RepoInfo`, `RepoSnapshot`, provider errors and labels |
+| `crates/flotilla-protocol/src/snapshot.rs` | `RepoInfo`, provider errors and labels |
 | `crates/flotilla-daemon/src/server.rs` | Daemon server with peer networking |
 | `crates/flotilla-daemon/src/server/` | Server submodules: client/peer connections, request dispatch, remote commands |
 | `crates/flotilla-daemon/src/aggregator.rs` | Watches durable and observed resources and maintains query result sets |
