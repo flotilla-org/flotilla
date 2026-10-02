@@ -158,7 +158,7 @@ pub struct TerminalCrewMessage {
     /// Payload-free receipts preserve exact retry and supervisor acknowledgment
     /// checks after pruning. Default accepts the previous generation's records;
     /// remove the compatibility default after one fleet roll.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    #[serde(default)]
     pub acknowledged: BTreeSet<String>,
 }
 
@@ -180,8 +180,7 @@ impl TerminalCrewMessage {
     }
 
     pub fn pending_after(&self, delivered_id: Option<&str>) -> Vec<&Self> {
-        if delivered_id.is_some_and(|id| self.acknowledged.contains(id)) || (delivered_id.is_none() && self.acknowledged.contains(&self.id))
-        {
+        if self.acknowledged.contains(&self.id) && delivered_id.is_none_or(|id| !self.following.iter().any(|message| message.id == id)) {
             return self.following.iter().collect();
         }
         let messages = std::iter::once(self).chain(self.following.iter()).collect::<Vec<_>>();
@@ -198,7 +197,12 @@ impl TerminalCrewMessage {
     pub fn mark_next_for_launch(&mut self, delivered_id: Option<&str>) -> Option<String> {
         let next_index = match delivered_id {
             Some(id) if id == self.id || self.acknowledged.contains(id) => Some(0),
-            Some(id) => self.following.iter().position(|message| message.id == id).map(|index| index + 1),
+            Some(id) => self
+                .following
+                .iter()
+                .position(|message| message.id == id)
+                .map(|index| index + 1)
+                .or_else(|| self.acknowledged.contains(&self.id).then_some(0)),
             None if self.acknowledged.contains(&self.id) => Some(0),
             None => None,
         };

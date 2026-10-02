@@ -5404,8 +5404,14 @@ impl TerminalRuntime for TerminalControllerRuntime {
     }
 
     async fn session_liveness(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalLiveness, String> {
-        let pool = self.pool_for_spec(spec)?;
-        Ok(terminal_liveness_for_source(&spec.source, pool.session_liveness(session_id).await?))
+        let pool = match self.pool_for_spec(spec) {
+            Ok(pool) => pool,
+            Err(message) => return Ok(TerminalLiveness::Unavailable(message)),
+        };
+        Ok(match pool.session_liveness(session_id).await {
+            Ok(liveness) => terminal_liveness_for_source(&spec.source, liveness),
+            Err(message) => TerminalLiveness::Unavailable(message),
+        })
     }
 
     async fn agent_exit_code(
@@ -5419,7 +5425,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .run(
                 "sh",
                 &["-c", "if [ -f \"$1\" ]; then cat -- \"$1\"; fi", "flotilla-agent-exit", &marker],
-                std::path::Path::new(&spec.cwd),
+                Path::new(&spec.cwd),
                 &ChannelLabel::Default,
             )
             .await?;

@@ -2885,12 +2885,9 @@ async fn router_exited_crew_resume_pinned_rows() {
 
 #[hegel::test]
 fn generated_router_exited_crew_resume(tc: hegel::TestCase) {
+    use tokio::runtime::Builder;
     // Both authority locations and both sides of the exit-observation race.
     let remote_home = tc.draw(hegel::generators::booleans());
     let interrupted = tc.draw(hegel::generators::booleans());
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime")
-        .block_on(exited_crew_resume_scenario(remote_home, interrupted));
+    Builder::new_current_thread().enable_all().build().expect("runtime").block_on(exited_crew_resume_scenario(remote_home, interrupted));
 }

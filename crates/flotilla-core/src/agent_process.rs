@@ -17,6 +17,8 @@ pub fn monitored_command(command: &str, crew_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::*;
 
     // The real shell is the process boundary: exit receipts must work for both
@@ -26,7 +28,7 @@ mod tests {
         let cwd = tempfile::tempdir().expect("checkout");
         for code in [0, 1, 42, 137] {
             let crew = format!("crew-{code}");
-            let result = std::process::Command::new("sh")
+            let result = Command::new("sh")
                 .arg("-c")
                 .arg(monitored_command(&format!("exit {code}"), &crew))
                 .current_dir(cwd.path())

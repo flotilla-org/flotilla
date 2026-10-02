@@ -41,6 +41,10 @@ fn long_running_acknowledgments_preserve_order_and_duplicate_retries(tc: hegel::
         assert!(head.delivered_through(delivered.as_deref(), &format!("turn-{replay}")));
         assert!(!head.delivered_through(delivered.as_deref(), &format!("turn-{}", id + 1)));
         assert_eq!(head.pending_after(delivered.as_deref()).len(), 1);
+        assert_eq!(head.pending_after(Some("unknown-old-launch")).len(), 1);
+        let mut launch = head.clone();
+        assert_eq!(launch.mark_next_for_launch(Some("unknown-old-launch")), Some(message(id + 1).text));
+        assert_eq!(launch.following[0].delivery, CrewMessageDelivery::LaunchBrief);
         assert_eq!(head.next_after(None).expect("restart pending turn").id, format!("turn-{}", id + 1));
         let stored = serde_json::to_vec(&head).expect("encode");
         head = serde_json::from_slice(&stored).expect("decode receipts after restart");

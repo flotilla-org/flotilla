@@ -280,6 +280,11 @@ impl EnvVars for TestEnvVars {
 impl CommandRunner for DiscoveryMockRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
         self.seen_cwds.lock().expect("lock poisoned").push(cwd.to_path_buf());
+        // Process boundary: interpret the exit-receipt read against this
+        // runner's in-memory files; fake terminal launches do not run a shell.
+        if cmd == "sh" && args.get(2) == Some(&"flotilla-agent-exit") && args.len() == 4 {
+            return Ok(self.files.lock().expect("lock poisoned").get(&cwd.join(args[3])).cloned().unwrap_or_default());
+        }
         if cmd == "pwd" && args == ["-P"] {
             return Ok(format!("{}\n", cwd.display()));
         }

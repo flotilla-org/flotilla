@@ -62,6 +62,9 @@ pub enum TerminalDeliveryReadiness {
 pub enum TerminalLiveness {
     Running,
     Stopped,
+    /// Provider failure supplies no evidence that the external session is gone.
+    Unavailable(String),
+    /// Positive evidence that the external session is permanently absent.
     Lost(String),
 }
 
@@ -82,7 +85,11 @@ pub trait TerminalRuntime: Send + Sync {
         Ok(true)
     }
     async fn session_liveness(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalLiveness, String> {
-        Ok(if self.session_is_running(session_id, spec).await? { TerminalLiveness::Running } else { TerminalLiveness::Stopped })
+        Ok(match self.session_is_running(session_id, spec).await {
+            Ok(true) => TerminalLiveness::Running,
+            Ok(false) => TerminalLiveness::Stopped,
+            Err(message) => TerminalLiveness::Unavailable(message),
+        })
     }
     async fn agent_exit_code(
         &self,
@@ -320,6 +327,7 @@ where
                 TerminalLiveness::Running => {}
                 TerminalLiveness::Stopped => return Ok(TerminalPrepared::Stopped),
                 TerminalLiveness::Lost(reason) => return Ok(TerminalPrepared::Lost(reason)),
+                TerminalLiveness::Unavailable(message) => return Err(ResourceError::other(message)),
             }
             if matches!(obj.spec.source, TerminalSessionSource::Agent { .. }) {
                 if let Some(crew) = obj.status.as_ref().and_then(|status| status.crew.as_ref()) {
@@ -387,8 +395,10 @@ where
         }
         if phase == TerminalSessionPhase::Lost {
             if let Some(session_id) = obj.status.as_ref().and_then(|status| status.session_id.as_deref()) {
-                if self.runtime.session_liveness(session_id, &obj.spec).await.map_err(ResourceError::other)? == TerminalLiveness::Running {
-                    return Ok(TerminalPrepared::Revived);
+                match self.runtime.session_liveness(session_id, &obj.spec).await.map_err(ResourceError::other)? {
+                    TerminalLiveness::Running => return Ok(TerminalPrepared::Revived),
+                    TerminalLiveness::Unavailable(message) => return Err(ResourceError::other(message)),
+                    TerminalLiveness::Stopped | TerminalLiveness::Lost(_) => {}
                 }
             }
             let lost_at = obj.status.as_ref().and_then(|status| status.stopped_at);

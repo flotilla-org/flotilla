@@ -2067,3 +2067,36 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
     assert_eq!(status.inner_exit_code, Some(42));
     assert!(status.message.expect("recovery guidance").contains("resume"));
 }
+
+// An unavailable provider is a typed observation, never proof that an elapsed
+// Lost grace permits another launch. A successful probe can still revive it.
+#[tokio::test]
+async fn typed_unavailability_preserves_lost_session_until_provider_recovers() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let spec = TerminalSessionSpec {
+        env_ref: "env-a".into(),
+        role: "shell".into(),
+        source: flotilla_resources::TerminalSessionSource::Tool { command: "sh".into() },
+        cwd: "/workspace".into(),
+        pool: "cleat".into(),
+    };
+    let created = sessions.create(&meta("lost-unavailable"), &spec).await.expect("terminal");
+    let lost = sessions
+        .update_status("lost-unavailable", &created.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Lost,
+            session_id: Some("existing-session".into()),
+            stopped_at: Some(Utc::now() - chrono::Duration::days(100)),
+            ..Default::default()
+        })
+        .await
+        .expect("lost terminal");
+    let runtime = Arc::new(UnavailableRunningRuntime::default());
+    assert!(matches!(runtime.session_liveness("existing-session", &spec).await.expect("typed outcome"), TerminalLiveness::Unavailable(_)));
+    let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend, "flotilla");
+    assert!(reconciler.prepare(&lost).await.is_err(), "outage cannot authorize recovery based only on elapsed time");
+    runtime.available.store(true, Ordering::SeqCst);
+    let prepared = reconciler.prepare(&lost).await.expect("provider recovers");
+    assert!(matches!(reconciler.reconcile(&lost, &prepared, Utc::now()).patch, Some(TerminalSessionStatusPatch::MarkRevived)));
+}
