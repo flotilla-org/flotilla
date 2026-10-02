@@ -2071,8 +2071,9 @@ async fn cleanup_stale_github_app_token_files_in_directory(directory: &Path) -> 
     let mut errors = Vec::new();
     while let Some(entry) = entries.next_entry().await.map_err(|error| format!("list credential staging files: {error}"))? {
         let name = entry.file_name();
-        let Some(suffix) =
-            name.to_str().and_then(|name| name.strip_prefix("token.tmp-").or_else(|| name.strip_prefix("token.flotilla-tmp-")))
+        let Some(suffix) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("token.tmp-").or_else(|| name.rsplit_once(".flotilla-tmp-").map(|(_, suffix)| suffix)))
         else {
             continue;
         };
@@ -2108,12 +2109,12 @@ async fn cleanup_stale_github_app_token_files_with_runner(runner: &dyn CommandRu
                 "failed=0; \
                 for directory in \"$1\"/credentials/*; do \
                     [ -d \"$directory\" ] && [ ! -L \"$directory\" ] || continue; \
-                    for file in \"$directory\"/token.tmp-* \"$directory\"/token.flotilla-tmp-*; do \
+                    for file in \"$directory\"/token.tmp-* \"$directory\"/*.flotilla-tmp-*; do \
                         [ -f \"$file\" ] && [ ! -L \"$file\" ] || continue; \
                         case \"${file##*/}\" in \
-                            token.tmp-????????-????-????-????-????????????|token.flotilla-tmp-????????-????-????-????-????????????) \
+                            token.tmp-????????-????-????-????-????????????|*.flotilla-tmp-????????-????-????-????-????????????) \
                                 name=${file##*/}; \
-                                suffix=${name#token.tmp-}; suffix=${suffix#token.flotilla-tmp-}; \
+                                suffix=${name#token.tmp-}; suffix=${suffix##*.flotilla-tmp-}; \
                                 hex=$(printf '%s' \"$suffix\" | tr -d '-'); \
                                 case \"$hex\" in \
                                     ????????????????????????????????) \
@@ -2909,15 +2910,17 @@ mod tests {
         tokio::fs::create_dir_all(&credential_dir).await.expect("create credential directory");
         let abandoned = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
         let current_abandoned = credential_dir.join(format!("token.flotilla-tmp-{}", uuid::Uuid::new_v4()));
+        let helper_abandoned = credential_dir.join(format!("git-credential-github-app.flotilla-tmp-{}", uuid::Uuid::new_v4()));
         let live = credential_dir.join("token");
         let unrelated = credential_dir.join("token.tmp-other");
-        for path in [&abandoned, &current_abandoned, &live, &unrelated] {
+        for path in [&abandoned, &current_abandoned, &helper_abandoned, &live, &unrelated] {
             tokio::fs::write(path, "secret material").await.expect("write credential file");
         }
         cleanup_stale_github_app_token_files_in(state.path()).await.expect("clean staging files");
 
         assert!(!abandoned.exists());
         assert!(!current_abandoned.exists());
+        assert!(!helper_abandoned.exists());
         assert!(unrelated.exists());
         assert!(live.exists());
     }
@@ -2964,10 +2967,12 @@ mod tests {
         tokio::fs::create_dir_all(&credential_dir).await.expect("create credential directory");
         let abandoned = credential_dir.join(format!("token.tmp-{}", uuid::Uuid::new_v4()));
         let current_abandoned = credential_dir.join(format!("token.flotilla-tmp-{}", uuid::Uuid::new_v4()));
+        let helper_abandoned = credential_dir.join(format!("gh.flotilla-tmp-{}", uuid::Uuid::new_v4()));
         let live = credential_dir.join("token");
         let malformed = credential_dir.join("token.tmp-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz");
         tokio::fs::write(&abandoned, "abandoned material").await.expect("write staging file");
         tokio::fs::write(&current_abandoned, "abandoned material").await.expect("write current staging file");
+        tokio::fs::write(&helper_abandoned, "abandoned material").await.expect("write helper staging file");
         tokio::fs::write(&live, "live material").await.expect("write live token");
         tokio::fs::write(&malformed, "unrelated material").await.expect("write unrelated file");
 
@@ -2975,6 +2980,7 @@ mod tests {
 
         assert!(!abandoned.exists());
         assert!(!current_abandoned.exists());
+        assert!(!helper_abandoned.exists());
         assert!(live.exists());
         assert!(malformed.exists());
     }

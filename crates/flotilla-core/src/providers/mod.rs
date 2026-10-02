@@ -183,8 +183,9 @@ pub(crate) fn atomic_write_script(path: &Path, temp_suffix: &str, mode: Option<u
         return Err("file mode must contain only permission bits".to_string());
     }
     let protect = mode.map(|mode| format!("chmod {mode:o} \"$tmp\"; ")).unwrap_or_default();
+    let private_create = if mode.is_some() { "umask 077; " } else { "" };
     Ok(format!(
-        "set -eu; mkdir -p {}; tmp={}; trap 'rm -f \"$tmp\"' EXIT; umask 077; cat > \"$tmp\"; {protect}mv \"$tmp\" {}; trap - EXIT",
+        "set -eu; mkdir -p {}; tmp={}; trap 'rm -f \"$tmp\"' EXIT; {private_create}cat > \"$tmp\"; {protect}mv \"$tmp\" {}; trap - EXIT",
         flotilla_protocol::arg::shell_quote(&parent.to_string_lossy()),
         flotilla_protocol::arg::shell_quote(&temporary),
         flotilla_protocol::arg::shell_quote(&target),
@@ -345,7 +346,8 @@ pub trait CommandRunner: Send + Sync {
     }
 
     /// Atomically publish content with its final Unix permissions. The
-    /// temporary file must be private while it is written.
+    /// temporary file must be private while it is written. Wrappers that may
+    /// deliver credentials must override this method; the default fails closed.
     async fn write_file_with_mode(&self, _path: &Path, _content: &str, _mode: u32) -> Result<(), String> {
         Err("command runner does not support protected file writes".to_string())
     }
@@ -552,7 +554,9 @@ impl CommandRunner for ProcessCommandRunner {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
         }
-        let temporary = path.with_extension(format!("flotilla-tmp-{}", uuid::Uuid::new_v4()));
+        let mut temporary = path.as_os_str().to_os_string();
+        temporary.push(format!(".flotilla-tmp-{}", uuid::Uuid::new_v4()));
+        let temporary = PathBuf::from(temporary);
         let result = async {
             let mut file = tokio::fs::OpenOptions::new()
                 .write(true)
@@ -567,6 +571,7 @@ impl CommandRunner for ProcessCommandRunner {
             file.set_permissions(std::fs::Permissions::from_mode(mode))
                 .await
                 .map_err(|e| format!("protect {}: {e}", temporary.display()))?;
+            file.sync_all().await.map_err(|e| format!("sync {}: {e}", temporary.display()))?;
             drop(file);
             tokio::fs::rename(&temporary, path).await.map_err(|e| format!("rename {} to {}: {e}", temporary.display(), path.display()))
         }

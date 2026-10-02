@@ -367,6 +367,7 @@ mod tests {
         assert!(calls[0].1.iter().all(|arg| !arg.contains("secret assignment")));
         assert!(calls[0].1.contains(&"-i".to_string()));
         assert!(calls[0].1.last().expect("write script").contains("cat > \"$tmp\""));
+        assert!(!calls[0].1.last().expect("write script").contains("umask 077"), "ordinary writes retain the environment umask");
     }
 
     #[tokio::test]

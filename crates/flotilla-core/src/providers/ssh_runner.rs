@@ -490,6 +490,7 @@ mod tests {
         assert!(args.iter().all(|arg| !arg.contains("secret assignment")));
         assert_eq!(inner.inputs(), vec![b"secret assignment".to_vec()]);
         assert!(args.last().expect("remote script").contains("cat > \"$tmp\""));
+        assert!(!args.last().expect("remote script").contains("umask 077"), "ordinary writes retain the environment umask");
     }
 
     #[tokio::test]
