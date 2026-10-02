@@ -143,9 +143,11 @@ fn forge_service_matches(service_url: &str, service: &str) -> bool {
     service_url.split_once("://").is_some_and(|(_, authority)| authority.trim_end_matches('/').eq_ignore_ascii_case(service))
 }
 
+#[derive(bon::Builder)]
 struct CachedObservation {
     expires_at: tokio::time::Instant,
     queried: BTreeSet<u64>,
+    next_history_start: usize,
     result: Result<BoundObservations, String>,
 }
 
@@ -449,7 +451,11 @@ impl ProviderChangeRequestObservationSource {
                 }
             }
         }
-        let numbers = queried.iter().copied().collect::<Vec<_>>();
+        let mut numbers = queried.iter().copied().collect::<Vec<_>>();
+        // The provider is rediscovered per observation. Keep fair history
+        // scheduling with this source's cache rather than on that provider.
+        let history_start = cache.as_ref().map_or(0, |cached| cached.next_history_start) % numbers.len();
+        numbers.rotate_left(history_start);
         let mut crew_logins = BTreeMap::<u64, BTreeSet<String>>::new();
         let credentials = if credential_refs_by_number.is_empty() {
             Vec::new()
@@ -503,7 +509,14 @@ impl ProviderChangeRequestObservationSource {
         let status = result.as_ref().map_err(Clone::clone).and_then(|statuses| {
             statuses.get(&subject.number).cloned().unwrap_or_else(|| Err(format!("change request {} was not found", subject.number)))
         });
-        *cache = Some(CachedObservation { expires_at: tokio::time::Instant::now() + delay, queried, result });
+        *cache = Some(
+            CachedObservation::builder()
+                .expires_at(tokio::time::Instant::now() + delay)
+                .queried(queried)
+                .next_history_start((history_start + 1) % numbers.len())
+                .result(result)
+                .build(),
+        );
         status
     }
 }
