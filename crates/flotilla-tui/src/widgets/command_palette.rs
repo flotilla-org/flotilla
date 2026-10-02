@@ -28,6 +28,8 @@ pub struct CommandPaletteWidget {
     target_node_id: Option<NodeId>,
     overlay: Option<crate::ui_helpers::BottomAnchoredOverlayLayout>,
     project_load_requested: bool,
+    completion_rows: usize,
+    hint_rows: u16,
 }
 
 fn completion_display_text(completion: &PaletteCompletion, showing_addresses: bool) -> &str {
@@ -45,16 +47,43 @@ impl Default for CommandPaletteWidget {
 
 impl CommandPaletteWidget {
     pub fn new() -> Self {
-        Self { input: Input::default(), selected: 0, scroll_top: 0, target_node_id: None, overlay: None, project_load_requested: false }
+        Self {
+            input: Input::default(),
+            selected: 0,
+            scroll_top: 0,
+            target_node_id: None,
+            overlay: None,
+            project_load_requested: false,
+            completion_rows: MAX_PALETTE_ROWS,
+            hint_rows: 0,
+        }
     }
 
     /// Create a palette widget with pre-filled input text and selection.
     pub fn with_state(input: Input, selected: usize, scroll_top: usize) -> Self {
-        Self { input, selected, scroll_top, target_node_id: None, overlay: None, project_load_requested: false }
+        Self {
+            input,
+            selected,
+            scroll_top,
+            target_node_id: None,
+            overlay: None,
+            project_load_requested: false,
+            completion_rows: MAX_PALETTE_ROWS,
+            hint_rows: 0,
+        }
     }
 
     pub fn with_prefill_on_node(text: impl AsRef<str>, target_node_id: Option<NodeId>) -> Self {
-        Self { input: Input::from(text.as_ref()), selected: 0, scroll_top: 0, target_node_id, overlay: None, project_load_requested: false }
+        Self {
+            input: Input::from(text.as_ref()),
+            selected: 0,
+            scroll_top: 0,
+            target_node_id,
+            overlay: None,
+            project_load_requested: false,
+            completion_rows: MAX_PALETTE_ROWS,
+            hint_rows: 0,
+        }
     }
 
     fn request_project_addresses(&mut self, ctx: &mut WidgetContext<'_>) {
@@ -112,7 +141,7 @@ impl CommandPaletteWidget {
     }
 
     fn adjust_scroll(&mut self) {
-        let max_visible = MAX_PALETTE_ROWS;
+        let max_visible = self.completion_rows.max(1);
         if self.selected >= self.scroll_top + max_visible {
             self.scroll_top = self.selected.saturating_sub(max_visible - 1);
         } else if self.selected < self.scroll_top {
@@ -431,7 +460,11 @@ impl InteractiveWidget for CommandPaletteWidget {
                 has_repo_context,
             );
             let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions);
-            let index = self.scroll_top + (mouse.row - overlay.body.y) as usize;
+            let row = mouse.row - overlay.body.y;
+            if row < self.hint_rows {
+                return Outcome::Consumed;
+            }
+            let index = self.scroll_top + (row - self.hint_rows) as usize;
             if let Some(completion) = completions.get(index) {
                 self.selected = index;
                 self.fill_completion(completion);
@@ -450,20 +483,33 @@ impl InteractiveWidget for CommandPaletteWidget {
             ctx.model.active_repo_identity_opt().is_some(),
         );
         let completions = self.completions(ctx.model, ctx.namespaces, has_repo_context, interactions);
-        let overlay = crate::ui_helpers::bottom_anchored_overlay(frame.area(), 1, MAX_PALETTE_ROWS as u16);
+        let show_failure = palette::is_open_address_completion(self.input.value())
+            && matches!(ctx.model.project_address_state, ProjectAddressState::Failed);
+        let hint_rows = u16::from(show_failure);
+        let overlay = crate::ui_helpers::bottom_anchored_overlay(frame.area(), 1, MAX_PALETTE_ROWS as u16 + hint_rows);
+        self.hint_rows = hint_rows.min(overlay.visible_body_rows);
+        self.completion_rows = overlay.visible_body_rows.saturating_sub(self.hint_rows) as usize;
+        self.adjust_scroll();
         self.overlay = Some(overlay);
         let area = overlay.body;
 
         frame.render_widget(Clear, area);
         frame.render_widget(Block::default().style(Style::default().bg(theme.bar_bg)), area);
 
+        if self.hint_rows > 0 {
+            frame.render_widget(
+                Paragraph::new(" Projects unavailable; reopen to retry").style(Style::default().fg(theme.muted)),
+                Rect::new(area.x, area.y, area.width, 1),
+            );
+        }
+
         let showing_addresses = palette::is_open_address_completion(self.input.value());
         let name_width =
             completions.iter().map(|completion| completion_display_text(completion, showing_addresses).width()).max().unwrap_or(0).min(20);
         let hint_width: u16 = 7;
 
-        for (i, completion) in completions.iter().skip(self.scroll_top).take(overlay.visible_body_rows as usize).enumerate() {
-            let row_y = area.y + i as u16;
+        for (i, completion) in completions.iter().skip(self.scroll_top).take(self.completion_rows).enumerate() {
+            let row_y = area.y + self.hint_rows + i as u16;
             let is_selected = self.scroll_top + i == self.selected;
 
             let row_style = if is_selected {
@@ -659,6 +705,34 @@ mod tests {
         let mut ctx = harness.ctx();
         widget.handle_raw_key(KeyEvent::new(KeyCode::Char(' '), crossterm::event::KeyModifiers::NONE), &mut ctx);
         assert!(ctx.app_actions.iter().any(|action| matches!(action, AppAction::LoadProjectAddresses)));
+    }
+
+    #[test]
+    fn failed_project_completions_show_persistent_hint_and_keep_ambient_rows() {
+        let mut harness = TestWidgetHarness::new();
+        harness.model.project_address_state = ProjectAddressState::Failed;
+        let mut widget = CommandPaletteWidget::with_state(Input::from("open "), 0, 0);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("test terminal");
+        let mut ui = crate::app::UiState::new(&[]);
+        let theme = crate::theme::Theme::classic();
+        terminal
+            .draw(|frame| {
+                let mut ctx = RenderContext {
+                    model: &harness.model,
+                    views: &mut harness.views,
+                    ui: &mut ui,
+                    theme: &theme,
+                    keymap: &harness.keymap,
+                    in_flight: &harness.in_flight,
+                    namespaces: &harness.namespaces,
+                    query_tables: &harness.query_tables,
+                };
+                widget.render(frame, frame.area(), &mut ctx);
+            })
+            .expect("render palette");
+        let rendered = terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(rendered.contains("Projects unavailable; reopen to retry"));
+        assert!(rendered.contains("overview"));
     }
 
     #[test]
