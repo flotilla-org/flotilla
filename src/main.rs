@@ -1740,13 +1740,27 @@ fn format_manifest_status_row(row: &serde_json::Value, resolution_action: Option
     )
 }
 
+fn drifted_ensure_names(objects: impl IntoIterator<Item = serde_json::Value>) -> Result<std::collections::BTreeSet<String>> {
+    let mut names = std::collections::BTreeSet::new();
+    for object in objects {
+        let ensure: flotilla_resources::K8sResourceObject<flotilla_resources::ConvoyEnsure> = serde_json::from_value(object)?;
+        let ensure = flotilla_resources::ResourceObject::from_k8s_object(ensure)?;
+        if ensure.status.as_ref().is_some_and(|status| status.config_drift.is_some()) {
+            // Replicas share namespace/name identity. Authority routing resolves
+            // the active generation and rejects ambiguous multiple admissions.
+            names.insert(ensure.metadata.name);
+        }
+    }
+    Ok(names)
+}
+
 async fn run_ensure_command(cli: &Cli, command: EnsureSubCommand, format: OutputFormat) -> Result<()> {
     use flotilla_client::resource::{ResourceClient, ResourceListRequest};
     let EnsureSubCommand::Roll { name, drifted, namespace, host } = command;
     let node_id = resolve_optional_host_node(cli, host.as_deref()).await?;
+    let daemon = connect_daemon(cli).await?;
     let names = if drifted {
-        let daemon = connect_daemon(cli).await?;
-        let response = ResourceClient::new(daemon)
+        let response = ResourceClient::new(daemon.clone())
             .list(
                 ResourceListRequest::builder()
                     .kind("ConvoyEnsure".to_string())
@@ -1757,22 +1771,12 @@ async fn run_ensure_command(cli: &Cli, command: EnsureSubCommand, format: Output
             )
             .await
             .map_err(|error| color_eyre::eyre::eyre!(error))?;
-        response
-            .records
-            .into_iter()
-            .filter_map(|record| record.object)
-            .filter(|object| object.pointer("/status/config_drift").is_some_and(|drift| !drift.is_null()))
-            .filter_map(|object| object.pointer("/metadata/name").and_then(serde_json::Value::as_str).map(str::to_string))
-            .collect::<std::collections::BTreeSet<_>>()
+        drifted_ensure_names(response.records.into_iter().filter_map(|record| record.object))?
     } else {
         std::collections::BTreeSet::from([name.expect("clap requires a name without --drifted")])
     };
-    if names.is_empty() {
-        println!("No drifted ensures");
-        return Ok(());
-    }
+    let total = names.len();
     let mut errors = Vec::new();
-    let daemon = connect_daemon(cli).await?;
     for name in names {
         let result = flotilla_tui::cli::run_command(
             &*daemon,
@@ -1790,6 +1794,11 @@ async fn run_ensure_command(cli: &Cli, command: EnsureSubCommand, format: Output
             Err(message) => errors.push(format!("{name}: {message}")),
             Ok(_) => {}
         }
+    }
+    // A successful request can be a no-op or a driver handoff, not an admission.
+    match format {
+        OutputFormat::Human => println!("{} successful, {} failed", total - errors.len(), errors.len()),
+        OutputFormat::Json => println!("{}", serde_json::json!({"successful": total - errors.len(), "failed": errors.len()})),
     }
     if errors.is_empty() {
         Ok(())
@@ -1825,9 +1834,9 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 } else {
                     paths.socket_path
                 };
-                resource_validate::validate_daemon(&socket, local_roots.as_deref(), skill_catalog.as_deref()).await.map(|_| ()).map_err(|error| {
-                    color_eyre::eyre::eyre!("resource validation on {}: {error:#}", host.as_deref().unwrap_or("local host"))
-                })
+                resource_validate::validate_daemon(&socket, local_roots.as_deref(), skill_catalog.as_deref()).await.map(|_| ()).map_err(
+                    |error| color_eyre::eyre::eyre!("resource validation on {}: {error:#}", host.as_deref().unwrap_or("local host")),
+                )
             } else {
                 resource_validate::validate_path(&path.expect("clap requires path without --from-daemon"), skill_catalog.as_deref())
             }
@@ -2811,6 +2820,36 @@ mod tests {
         PmSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs,
         ResourceReconcileNowArgs, ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
+
+    #[tokio::test]
+    async fn drifted_batch_selection_decodes_typed_status_and_deduplicates_replicas() {
+        use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, InMemoryBackend, InputMeta, ResourceBackend};
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let mut ensure = backend
+            .using::<ConvoyEnsure>("flotilla")
+            .create(
+                &InputMeta::builder().name("governor".to_string()).build(),
+                &ConvoyEnsureSpec::builder()
+                    .project_ref("demo".to_string())
+                    .role("governor".to_string())
+                    .workflow_ref("standing".to_string())
+                    .repositories(vec![])
+                    .build(),
+            )
+            .await
+            .expect("create ensure");
+        let healthy = serde_json::to_value(ensure.to_k8s_object()).expect("healthy record");
+        ensure.status.get_or_insert_with(Default::default).config_drift =
+            Some(flotilla_resources::ConvoyEnsureConfigDrift { changes: vec!["workflow".to_string()], observed_at: chrono::Utc::now() });
+        let drifted = serde_json::to_value(ensure.to_k8s_object()).expect("drifted record");
+        assert_eq!(
+            super::drifted_ensure_names([healthy, drifted.clone(), drifted.clone()]).expect("typed selection"),
+            std::collections::BTreeSet::from(["governor".to_string()])
+        );
+        let mut malformed = drifted;
+        malformed["status"]["config_drift"] = serde_json::json!("invalid drift condition");
+        assert!(super::drifted_ensure_names([malformed]).is_err(), "malformed records must not silently disappear");
+    }
 
     #[test]
     fn ensure_roll_cli_accepts_one_ensure_or_all_drifted() {

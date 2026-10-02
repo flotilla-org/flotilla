@@ -397,6 +397,15 @@ pub enum DeclarationAttentionKind {
     ConfigDrift,
 }
 
+impl std::fmt::Display for DeclarationAttentionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::DeclarationRefused => "DeclarationRefused",
+            Self::ConfigDrift => "ConfigDrift",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct FleetListRow {

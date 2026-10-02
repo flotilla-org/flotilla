@@ -356,6 +356,7 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
             [source] => format!("{} / {}", source.service.trim_end_matches('/'), source.scope),
             sources => format!("{} sources", sources.len()),
         };
+        let stale_marker = if project.declaration_stale { " (stale)" } else { "" };
         table.add_row(vec![
             Cell::new(format!("{}/{}", project.namespace, project.name)),
             Cell::new(&project.display_name),
@@ -363,7 +364,7 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
             Cell::new(issue_source),
             Cell::new(&project.default_workflow_ref),
             Cell::new(match &project.declaration_refused {
-                Some(message) => format!("DeclarationRefused{}: {message}", if project.declaration_stale { " (stale)" } else { "" }),
+                Some(message) => format!("DeclarationRefused{stale_marker}: {message}"),
                 None if !project.conflicts.is_empty() => format!("! {}", project.conflicts.join(", ")),
                 None => String::new(),
             }),
@@ -737,10 +738,7 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
         for row in &response.declaration_attention {
             table.add_row(vec![
                 Cell::new(format!("{}/{}/{}", row.resource.namespace, row.resource.kind, row.resource.name)),
-                Cell::new(match row.condition {
-                    flotilla_protocol::DeclarationAttentionKind::DeclarationRefused => "DeclarationRefused",
-                    flotilla_protocol::DeclarationAttentionKind::ConfigDrift => "ConfigDrift",
-                }),
+                Cell::new(row.condition.to_string()),
                 Cell::new(&row.message),
             ]);
         }

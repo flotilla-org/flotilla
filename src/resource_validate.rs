@@ -18,6 +18,8 @@ use flotilla_resources::{
 use serde::Deserialize;
 use serde_json::Value;
 
+const VALIDATION_INSPECTION_HOST: &str = "candidate-validation";
+
 /// Query JSON directly over the daemon's resource socket. The command protocol's
 /// fingerprint deliberately rejects mixed generations during a fleet roll.
 pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, skill_catalog: Option<&Path>) -> Result<usize> {
@@ -145,29 +147,35 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
             // An absent endpoint (including on older daemons) does not prove
             // a particular version. Candidate-side local inspection is still
             // mandatory; never interpret a 404 as an empty input inventory.
-            let roots =
-                local_roots.ok_or_else(|| eyre!("ops inventory endpoint not found on peer; run the candidate validation on that host"))?;
-            if local_inventory.is_none() {
-                let runner = Arc::new(ProcessCommandRunner);
-                let vcs = FlotillaVcs::new(
-                    ExecutionEnvironmentPath::new("/"),
-                    runner.clone(),
-                    GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
-                );
-                let inspector = GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), "validation");
-                let paths = inspect_validation_roots(roots, &inspector).await?;
-                local_inventory = Some((inspector, paths));
+            async {
+                let roots = local_roots
+                    .ok_or_else(|| eyre!("ops inventory endpoint not found on peer; run the candidate validation on that host"))?;
+                if local_inventory.is_none() {
+                    let runner = Arc::new(ProcessCommandRunner);
+                    // Inspection only reads absolute repository paths. The checkout
+                    // strategy is required by the resolver but never creates worktrees.
+                    let vcs = FlotillaVcs::new(
+                        ExecutionEnvironmentPath::new("/"),
+                        runner.clone(),
+                        GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
+                    );
+                    let inspector =
+                        GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), VALIDATION_INSPECTION_HOST);
+                    let paths = inspect_validation_roots(roots, &inspector).await?;
+                    local_inventory = Some((inspector, paths));
+                }
+                let (inspector, paths) = local_inventory.as_ref().expect("initialized local inventory");
+                validate_project_ops(&registered, paths, inspector).await
             }
-            let (inspector, paths) = local_inventory.as_ref().expect("initialized local inventory");
-            let files = inspect_project_ops_entries(&registered, paths, inspector).await.map_err(|error| eyre!(error))?;
-            validate_ops_files(&files)
+            .await
         } else {
             Err(eyre!("{namespace}: cannot inspect operational entries: {}", response.text().await?))
         };
         match result {
+            Ok(0) => {}
             Ok(entries) => println!("validated {entries} operational entries in {namespace}"),
             Err(error) => {
-                eprintln!("{error}");
+                eprintln!("{namespace}: {error}");
                 failed = true;
             }
         }
@@ -206,20 +214,18 @@ async fn inspect_validation_roots(
 ) -> Result<BTreeMap<flotilla_resources::RepositoryKey, Vec<PathBuf>>> {
     let mut paths = BTreeMap::new();
     for root in roots {
-        let inspection = inspector.inspect_path(root, None).await.map_err(|error| eyre!(error))?;
+        let inspection = inspector.inspect_path(root, None).await.map_err(|error| eyre!("{}: {error}", root.display()))?;
         paths.entry(inspection.spec.key()).or_insert_with(Vec::new).push(root.clone());
     }
     Ok(paths)
 }
 
-#[cfg(test)]
 async fn validate_project_ops(
     projects: &[ResourceObject<Project>],
-    roots: &[PathBuf],
+    paths: &BTreeMap<flotilla_resources::RepositoryKey, Vec<PathBuf>>,
     inspector: &dyn RepositoryInspector,
 ) -> Result<usize> {
-    let paths = inspect_validation_roots(roots, inspector).await?;
-    let files = inspect_project_ops_entries(projects, &paths, inspector).await.map_err(|error| eyre!(error))?;
+    let files = inspect_project_ops_entries(projects, paths, inspector).await.map_err(|error| eyre!(error))?;
     validate_ops_files(&files)
 }
 
@@ -363,7 +369,9 @@ mod tests {
     use flotilla_resources::{validate_resource_document, Convoy, ConvoySpec, ConvoyStatus, InputMeta, Project, ProjectSpec};
     use flotilla_test_support::TestSocketDir;
 
-    use super::{collect_files, parse_documents, validate_daemon, validate_project_ops};
+    use super::{
+        collect_files, inspect_validation_roots, parse_documents, validate_daemon, validate_project_ops, VALIDATION_INSPECTION_HOST,
+    };
 
     #[test]
     fn reports_the_nested_field_of_a_stale_manifest() {
@@ -479,6 +487,16 @@ mod tests {
             .expect("raw ops endpoint");
         assert_eq!(inventory.status(), reqwest::StatusCode::OK);
         assert_eq!(inventory.json::<serde_json::Value>().await.expect("inventory")["entries"], serde_json::json!([]));
+        let checked = validate_daemon(&socket, Some(&[]), None).await.expect("candidate decodes all served kinds and namespaces");
+        assert!(checked >= 4, "expected default, non-default, and replica-only records; got {checked}");
+        // Intended: schema compatibility alone cannot admit a Project whose
+        // skill declaration is absent from the candidate's supply catalog.
+        let catalog = root.join(".flotilla-skill-catalog.json");
+        std::fs::write(&catalog, serde_json::json!([{"source":"source", "repository":"owner/repo", "revision":"1".repeat(40), "name":"research", "path":"skills/research"}]).to_string()).expect("catalog");
+        std::fs::write(root.join(".flotilla-sources.json"), serde_json::json!({"schema_version":5,"sources":[{"name":"source","repository":"https://github.com/owner/repo.git","revision":"1".repeat(40)}]}).to_string()).expect("source manifest");
+        let error =
+            validate_daemon(&socket, Some(&[]), Some(&catalog)).await.expect_err("pre-roll checks registered projects in every namespace");
+        assert!(error.to_string().contains("ops") && error.to_string().contains("missing"), "{error}");
         backend
             .using::<Project>("missing")
             .create(
@@ -504,22 +522,14 @@ mod tests {
             .expect("missing-source endpoint");
         assert_eq!(refused.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
         assert!(refused.text().await.expect("error body").contains("unavailable-ops"));
-        backend.using::<Project>("missing").delete("unavailable").await.expect("remove refused fixture");
-        let checked = validate_daemon(&socket, Some(&[]), None).await.expect("candidate decodes all served kinds and namespaces");
-        assert!(checked >= 4, "expected default, non-default, and replica-only records; got {checked}");
-        // Intended: schema compatibility alone cannot admit a Project whose
-        // skill declaration is absent from the candidate's supply catalog.
-        let catalog = root.join(".flotilla-skill-catalog.json");
-        std::fs::write(&catalog, serde_json::json!([{"source":"source", "repository":"owner/repo", "revision":"1".repeat(40), "name":"research", "path":"skills/research"}]).to_string()).expect("catalog");
-        std::fs::write(root.join(".flotilla-sources.json"), serde_json::json!({"schema_version":5,"sources":[{"name":"source","repository":"https://github.com/owner/repo.git","revision":"1".repeat(40)}]}).to_string()).expect("source manifest");
-        let error = validate_daemon(&socket, Some(&[]), Some(&catalog)).await.expect_err("pre-roll checks registered projects in every namespace");
-        assert!(error.to_string().contains("ops") && error.to_string().contains("missing"), "{error}");
+        assert!(validate_daemon(&socket, Some(&[]), None).await.is_err(), "missing ops source must fail the whole gate");
         task.abort();
         std::fs::remove_dir_all(root).expect("remove daemon directory");
     }
 
     #[tokio::test]
     async fn candidate_checks_registered_ops_entries_and_fails_on_unknown_fields() {
+        flotilla_core::tls::install_default_provider();
         use std::sync::Arc;
 
         use flotilla_core::{
@@ -586,14 +596,80 @@ mod tests {
             runner.clone(),
             GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
         );
-        let inspector = GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), "local");
-        let error =
-            validate_project_ops(std::slice::from_ref(&project), &[], &inspector).await.expect_err("candidate rejects unknown ops field");
+        let inspector = GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), VALIDATION_INSPECTION_HOST);
+        let error = validate_project_ops(std::slice::from_ref(&project), &std::collections::BTreeMap::new(), &inspector)
+            .await
+            .expect_err("candidate rejects unknown ops field");
         assert!(error.to_string().contains("governor.md"));
         assert!(error.to_string().contains("unknown_option"));
+        // Exercise the actual candidate path against a previous-generation API,
+        // including continued checking when a peer cannot provide local roots.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::UnixListener,
+        };
+        let socket_dir = TestSocketDir::new();
+        let socket = socket_dir.socket_path("old-api.sock");
+        let listener = UnixListener::bind(&socket).expect("old daemon socket");
+        let document = serde_json::to_value(project.to_k8s_object()).expect("project API record");
+        let endpoint_reads = Arc::new(AtomicUsize::new(0));
+        let reads = endpoint_reads.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept validator");
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut bytes = [0; 1024];
+                    let count = stream.read(&mut bytes).await.expect("request bytes");
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&bytes[..count]);
+                }
+                let request = String::from_utf8(request).expect("HTTP request");
+                let path = request.split_whitespace().nth(1).expect("request path").split('?').next().expect("path");
+                let (status, body) = if path == "/apis/flotilla.work/v1" {
+                    ("200 OK", serde_json::json!({"kinds":["projects"], "namespaces":{"projects":["flotilla","other"]}}))
+                } else if path.ends_with("/projects") {
+                    let mut project = document.clone();
+                    if path.contains("/other/") {
+                        project["metadata"]["namespace"] = serde_json::json!("other");
+                    }
+                    ("200 OK", serde_json::json!({"items":[project]}))
+                } else {
+                    assert!(path.ends_with("/operationalentries"), "{path}");
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    ("404 Not Found", serde_json::json!({"error":"unknown endpoint"}))
+                };
+                let body = body.to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("old API response");
+            }
+        });
+        let error =
+            validate_daemon(&socket, Some(std::slice::from_ref(&tmp)), None).await.expect_err("candidate fallback parses invalid ops");
+        assert!(error.to_string().contains("resource validation failed"));
+        assert_eq!(endpoint_reads.load(Ordering::SeqCst), 2, "both namespaces inspected by the candidate");
+        endpoint_reads.store(0, Ordering::SeqCst);
+        let _ = validate_daemon(&socket, None, None).await.expect_err("a peer without inventory must fail closed");
+        assert_eq!(endpoint_reads.load(Ordering::SeqCst), 2, "a missing root must not skip the remaining namespace");
+        server.abort();
+
         let mut unavailable = project.clone();
         unavailable.metadata.annotations.clear();
-        let error = validate_project_ops(&[unavailable], &[], &inspector).await.expect_err("missing source fails the gate");
+        let error = validate_project_ops(&[unavailable], &std::collections::BTreeMap::new(), &inspector)
+            .await
+            .expect_err("missing source fails the gate");
         assert!(error.to_string().contains("no checkout available"), "{error}");
         let duplicate_guard = tempfile::tempdir().expect("duplicate checkout directory");
         let duplicate = duplicate_guard.path().to_path_buf();
@@ -610,9 +686,8 @@ mod tests {
             .status()
             .expect("same repository identity")
             .success());
-        let error = validate_project_ops(&[project], &[tmp.clone(), duplicate.clone()], &inspector)
-            .await
-            .expect_err("ambiguous main checkouts fail the gate");
+        let paths = inspect_validation_roots(&[tmp.clone(), duplicate.clone()], &inspector).await.expect("inspect duplicate roots");
+        let error = validate_project_ops(&[project], &paths, &inspector).await.expect_err("ambiguous main checkouts fail the gate");
         assert!(error.to_string().contains("no unambiguous main checkout"), "{error}");
     }
 
