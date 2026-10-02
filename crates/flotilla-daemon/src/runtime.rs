@@ -50,10 +50,10 @@ use flotilla_resources::{
     DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec,
     EnvironmentStatusPatch, Forge, ForgeIdentity, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
     Host, HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
-    HostSpec, HostStatus, HostStatusPatch, InputDefinition, InputMeta, ManifestRoot, ModelProbeState, PlacementPolicySpec, Presentation,
-    Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend, ResourceError,
-    ResourceObject, RetryBackoff, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel, VesselRequirement,
-    VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
+    HostSpec, HostStatus, HostStatusPatch, InputDefinition, InputMeta, ManifestRoot, ModelProbeState, PlacementPolicy, PlacementPolicySpec,
+    Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend,
+    ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionSource, Vessel,
+    VesselRequirement, VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
     CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV,
     CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
     OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, TRANSPORT_CAPABILITY,
@@ -2524,8 +2524,32 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
     let hosts = backend.clone().using::<Host>(namespace).list().await.map_err(|error| error.to_string())?;
     let policies =
         backend.clone().using::<flotilla_resources::PlacementPolicy>(namespace).list().await.map_err(|error| error.to_string())?;
+    migrate_listed_placement_policies(backend, namespace, host_ref, platform, &hosts.items, policies.items).await
+}
+
+fn kind_belongs_to_host(hosts: &[ResourceObject<Host>], kind: &ResourceObject<FulfilmentKind>, host_ref: &str) -> bool {
+    if kind.spec.host_ref == host_ref {
+        return true;
+    }
+    match canonical_host_id(hosts, &kind.spec.host_ref) {
+        Ok(id) => id.is_some_and(|id| id.as_str() == host_ref),
+        Err(error) => {
+            warn!(kind = %kind.metadata.name, %error, "skipping ambiguous fulfilment kind host");
+            false
+        }
+    }
+}
+
+async fn migrate_listed_placement_policies(
+    backend: &ResourceBackend,
+    namespace: &str,
+    host_ref: &str,
+    platform: &str,
+    hosts: &[ResourceObject<Host>],
+    policies: Vec<ResourceObject<PlacementPolicy>>,
+) -> Result<(), String> {
     let kinds = backend.clone().using::<FulfilmentKind>(namespace);
-    for policy in policies.items {
+    for policy in policies {
         let policy_host = policy
             .spec
             .host_direct
@@ -2533,7 +2557,7 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
             .map(|strategy| strategy.host_ref.as_str())
             .or_else(|| policy.spec.docker_per_vessel.as_ref().map(|strategy| strategy.host_ref.as_str()));
         let Some(policy_host) = policy_host else { continue };
-        let canonical = match canonical_host_id(&hosts.items, policy_host) {
+        let canonical = match canonical_host_id(hosts, policy_host) {
             Ok(id) => id.map(|id| id.to_string()).unwrap_or_else(|| policy_host.to_string()),
             Err(error) => {
                 warn!(policy = %policy.metadata.name, %policy_host, %error, "skipping ambiguous placement policy host");
@@ -2549,18 +2573,7 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
             // leave the policy itself for existing convoy references.
             match kinds.get(&policy.metadata.name).await {
                 Ok(kind) => {
-                    let matches = if kind.spec.host_ref == host_ref {
-                        true
-                    } else {
-                        match canonical_host_id(&hosts.items, &kind.spec.host_ref) {
-                            Ok(id) => id.is_some_and(|id| id.as_str() == host_ref),
-                            Err(error) => {
-                                warn!(kind = %kind.metadata.name, %error, "skipping ambiguous snapshot kind host");
-                                false
-                            }
-                        }
-                    };
-                    if matches {
+                    if kind_belongs_to_host(hosts, &kind, host_ref) {
                         kinds.delete(&policy.metadata.name).await.map_err(|error| format!("delete snapshot fulfilment kind: {error}"))?;
                     }
                 }
@@ -2592,12 +2605,19 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
             }
         };
         if policy_spec != policy.spec {
-            backend
+            match backend
                 .clone()
                 .using::<flotilla_resources::PlacementPolicy>(namespace)
                 .update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &policy_spec)
                 .await
-                .map_err(|error| format!("canonicalize placement policy {name}: {error}"))?;
+            {
+                Ok(_) => {}
+                Err(ResourceError::Conflict { .. }) => {
+                    warn!(policy = %name, "placement policy changed during host-ref canonicalization; retrying next pass");
+                    continue;
+                }
+                Err(error) => return Err(format!("canonicalize placement policy {name}: {error}")),
+            }
         }
         match kinds.get(name).await {
             Ok(existing) if existing.metadata.deletion_timestamp.is_some() => {}
@@ -2631,14 +2651,7 @@ async fn migrate_live_placement_policies(backend: &ResourceBackend, namespace: &
         if kind.metadata.deletion_timestamp.is_some() || kind.spec.host_ref == host_ref {
             continue;
         }
-        let matches = match canonical_host_id(&hosts.items, &kind.spec.host_ref) {
-            Ok(id) => id.is_some_and(|id| id.as_str() == host_ref),
-            Err(error) => {
-                warn!(kind = %kind.metadata.name, %error, "skipping ambiguous fulfilment kind host");
-                continue;
-            }
-        };
-        if matches {
+        if kind_belongs_to_host(hosts, &kind, host_ref) {
             let mut spec = kind.spec.clone();
             spec.host_ref = host_ref.to_string();
             kinds
@@ -2672,18 +2685,7 @@ async fn observe_fulfilment_facts(
         if kind.metadata.deletion_timestamp.is_some() {
             continue;
         }
-        let matches = if kind.spec.host_ref == host_ref {
-            true
-        } else {
-            match canonical_host_id(&hosts.items, &kind.spec.host_ref) {
-                Ok(id) => id.is_some_and(|id| id.as_str() == host_ref),
-                Err(error) => {
-                    warn!(kind = %kind.metadata.name, %error, "skipping ambiguous fulfilment kind during fact observation");
-                    continue;
-                }
-            }
-        };
-        if matches {
+        if kind_belongs_to_host(&hosts.items, &kind, host_ref) {
             kinds.push(kind);
         }
     }
@@ -12975,6 +12977,42 @@ mod tests {
             policies.get("a-collision").await.expect("ambiguous policy remains").spec.host_direct.expect("direct").host_ref,
             "collision"
         );
+    }
+
+    #[tokio::test]
+    async fn conflicting_policy_does_not_block_other_host_ref_migrations() {
+        let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let host_id = "host-id";
+        let hosts = backend.clone().using::<Host>(NAMESPACE);
+        hosts.create(&empty_meta(host_id), &HostSpec { display_name: "kiwi".into(), ..HostSpec::default() }).await.expect("seed host");
+        let policies = backend.clone().using::<PlacementPolicy>(NAMESPACE);
+        let spec = PlacementPolicySpec::builder()
+            .pool("cleat".to_string())
+            .host_direct(HostDirectPlacementPolicySpec {
+                host_ref: "kiwi".to_string(),
+                checkout: HostDirectPlacementPolicyCheckout::Worktree,
+            })
+            .build();
+        for name in ["a-conflicting", "b-healthy"] {
+            policies.create(&empty_meta(name), &spec).await.expect("seed policy");
+        }
+        let listed_hosts = hosts.list().await.expect("list hosts");
+        let listed_policies = policies.list().await.expect("list policies");
+        let conflicting = policies.get("a-conflicting").await.expect("read conflicting policy");
+        let mut edited_spec = conflicting.spec.clone();
+        edited_spec.priority = 1;
+        policies
+            .update(&InputMeta::from(&conflicting.metadata), &conflicting.metadata.resource_version, &edited_spec)
+            .await
+            .expect("concurrent policy write");
+
+        migrate_listed_placement_policies(&backend, NAMESPACE, host_id, "linux", &listed_hosts.items, listed_policies.items)
+            .await
+            .expect("healthy policy still migrates");
+
+        assert_eq!(policies.get("a-conflicting").await.expect("conflicting policy").spec.host_direct.expect("direct").host_ref, "kiwi");
+        assert_eq!(policies.get("b-healthy").await.expect("healthy policy").spec.host_direct.expect("direct").host_ref, host_id);
+        backend.clone().using::<FulfilmentKind>(NAMESPACE).get("b-healthy").await.expect("healthy kind created");
     }
 
     #[tokio::test]
