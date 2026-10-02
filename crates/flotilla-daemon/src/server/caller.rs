@@ -2,7 +2,9 @@ use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::{fs, path::Path};
 
-use flotilla_protocol::{CallerCrew, CallerProcess, CommandCaller, PrincipalRef};
+#[cfg(not(target_os = "macos"))]
+use flotilla_protocol::CallerProcess;
+use flotilla_protocol::{CallerCrew, CommandCaller, PrincipalRef};
 
 pub(super) struct PeerCredential {
     pid: Option<u32>,
@@ -269,7 +271,7 @@ mod tests {
         assert_eq!(stream.read(&mut byte).expect("wait for parent to finish"), 0);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn unix_socket_peer_credentials_identify_the_connecting_process() {
         let directory = flotilla_test_support::TestSocketDir::new();
