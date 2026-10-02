@@ -9045,6 +9045,12 @@ impl InProcessDaemon {
             .filter(|checkout| expected.contains(&checkout.metadata.name))
             .filter(|checkout| !(reclaim_sanctioned && checkout.metadata.deletion_timestamp.is_some()))
         {
+            // Gone means the checkout authority's host confirmed that the
+            // worktree no longer exists. Teardown cannot lose local work in
+            // that path, whether the checkout was managed or adopted.
+            if checkout.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::CheckoutPhase::Gone) {
+                continue;
+            }
             let is_adopted = checkout.metadata.lifecycle_authority().map_err(|err| err.to_string())? == Some(LifecycleAuthority::Adopted);
             let Some(integration) = checkout.status.as_ref().map(|status| &status.integration) else {
                 let merged_for_checkout = associated_change_request_name_without_checkout_status(convoy, checkout, &forges)?

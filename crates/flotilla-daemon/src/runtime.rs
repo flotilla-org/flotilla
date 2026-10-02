@@ -3,7 +3,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex as StdMutex, Weak,
     },
     time::Duration,
@@ -1271,6 +1271,9 @@ struct ControllerRuntimeState {
     agent_material: Option<Arc<AgentMaterialRegistry>>,
     blob_store: Option<Arc<TieredBlobStore>>,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
+    /// Latched after one complete post-startup local Docker adoption pass.
+    /// A fresh provider listing is still required for each absence judgement.
+    local_backing_observed: AtomicBool,
     clone_flights: Arc<CloneFlights>,
     terminal_deliveries: StdMutex<HashMap<String, PendingTerminalDelivery>>,
     archive_catalog_lock: Mutex<()>,
@@ -1458,6 +1461,7 @@ impl ControllerRuntimeState {
             agent_material: None,
             blob_store: None,
             provisioned_environments: Mutex::new(HashMap::new()),
+            local_backing_observed: AtomicBool::new(false),
             clone_flights: Arc::new(CloneFlights::default()),
             terminal_deliveries: StdMutex::new(HashMap::new()),
             archive_catalog_lock: Mutex::new(()),
@@ -1566,7 +1570,39 @@ impl StandingConvoyBackingInspector for ControllerRuntimeState {
             if convoy.status.as_ref().and_then(|status| status.provisioning) == Some(ConvoyProvisioningState::NotStarted) {
                 return Ok(());
             }
-            return Err("no backing environment evidence is available".to_string());
+            let local_host_id = CanonicalHostId::resolved(&self.local_host_ref);
+            let home = convoy
+                .status
+                .as_ref()
+                .and_then(|status| status.placement_decision.as_ref())
+                .map(|decision| &decision.target_host.reference);
+            if home != Some(&local_host_id) || !self.local_backing_observed.load(Ordering::Acquire) {
+                return Err("no backing environment evidence is available".to_string());
+            }
+            let (_, provider) = self
+                .local_registry
+                .environment_providers
+                .get("docker")
+                .or_else(|| self.local_registry.environment_providers.preferred_with_desc())
+                .ok_or_else(|| "Docker environment provider unavailable for standing-convoy liveness check".to_string())?;
+            let handles = provider.list().await.map_err(|error| format!("Docker backing liveness check failed: {error}"))?;
+            let expected_environments = convoy
+                .status
+                .as_ref()
+                .and_then(|status| status.workflow_snapshot.as_ref())
+                .map(|snapshot| {
+                    snapshot
+                        .vessels
+                        .iter()
+                        .map(|requirement| format!("env-{}-{}", convoy.metadata.name, requirement.name))
+                        .collect::<BTreeSet<_>>()
+                })
+                .filter(|names| !names.is_empty())
+                .ok_or_else(|| "backing is not verifiable: convoy has no frozen vessel names".to_string())?;
+            if handles.iter().any(|handle| expected_environments.contains(handle.id().as_str())) {
+                return Err("backing is not verified dead: matching Docker container remains".to_string());
+            }
+            return Ok(());
         }
         if let Some(environment) = environments.iter().find(|environment| environment.spec.docker.is_none()) {
             return Err(format!("Environment/{} has no inspectable Docker backing", environment.metadata.name));
@@ -1649,17 +1685,23 @@ async fn reconcile_provisioned_environments(state: &Arc<ControllerRuntimeState>,
             environments.push(environment);
         }
     }
-    if environments.is_empty() {
-        return Ok(());
-    }
-
-    let (_, provider) = state
+    let provider = state
         .local_registry
         .environment_providers
         .get("docker")
-        .or_else(|| state.local_registry.environment_providers.preferred_with_desc())
-        .ok_or_else(|| "docker environment provider unavailable during environment adoption".to_string())?;
+        .or_else(|| state.local_registry.environment_providers.preferred_with_desc());
+    let Some((_, provider)) = provider else {
+        return if environments.is_empty() {
+            Ok(())
+        } else {
+            Err("docker environment provider unavailable during environment adoption".to_string())
+        };
+    };
     let listed = provider.list().await?;
+    if environments.is_empty() {
+        state.local_backing_observed.store(true, Ordering::Release);
+        return Ok(());
+    }
     let mut handles = HashMap::new();
     for handle in listed {
         let Some(container_id) = handle.container_name().map(ToString::to_string) else {
@@ -1694,6 +1736,7 @@ async fn reconcile_provisioned_environments(state: &Arc<ControllerRuntimeState>,
     .await;
     let errors = results.into_iter().filter_map(Result::err).collect::<Vec<_>>();
     if errors.is_empty() {
+        state.local_backing_observed.store(true, Ordering::Release);
         Ok(())
     } else {
         Err(errors.join("; "))
@@ -4739,6 +4782,19 @@ fn removal_source_path(removal: &CheckoutRemoval) -> &str {
 
 #[async_trait]
 impl CheckoutRuntime for RoutingCheckoutRuntime {
+    async fn checkout_path_exists_in(&self, env_ref: &str, path: &str) -> Result<Option<bool>, String> {
+        if env_ref != self.state.host_direct_environment_name {
+            return Ok(None);
+        }
+        // `test -e` conflates ENOENT with permission failures. Only the host's
+        // filesystem error can make absence authoritative for teardown.
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(_) => Ok(Some(true)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(false)),
+            Err(error) => Err(format!("inspect worktree path {path}: {error}")),
+        }
+    }
+
     async fn create_worktree(
         &self,
         clone_path: &str,
@@ -8307,6 +8363,81 @@ mod tests {
         );
 
         state.verify_backing_dead(&convoy).await.expect("provisioning never started, so no backing can be live");
+    }
+
+    #[tokio::test]
+    async fn standing_backing_inspection_accepts_local_absence_only_after_startup_observation() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_base = temp.path().join("config");
+        fs::create_dir_all(&config_base).expect("config directory");
+        fs::write(config_base.join("daemon.toml"), "machine_id = \"standing-absent-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(config_base));
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::clone(&config),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            HostName::new("dinghy"),
+        )
+        .await;
+        let convoys = daemon.resource_backend().using::<Convoy>(NAMESPACE);
+        let convoy = convoys
+            .create(&empty_meta("quartermaster"), &ConvoySpec::builder().workflow_ref("standing".to_string()).build())
+            .await
+            .expect("convoy");
+        let convoy = convoys
+            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+                provisioning: Some(ConvoyProvisioningState::Started { started_at: Utc::now() }),
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                }),
+                placement_decision: Some(
+                    PlacementDecision::builder()
+                        .policy_name("docker".to_string())
+                        .target_host(PlacementTargetHost {
+                            reference: CanonicalHostId::resolved("host-test"),
+                            display_name: "host-test".to_string(),
+                        })
+                        .build(),
+                ),
+                ..Default::default()
+            })
+            .await
+            .expect("convoy status");
+        let mut registry = ProviderRegistry::new();
+        let sibling: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
+            id: EnvironmentId::new("env-quartermaster-extra-work"),
+            image: ImageId::new("contained-image"),
+            runner: Arc::new(DiscoveryMockRunner::builder().build()),
+            env_vars: HashMap::new(),
+            destroyed: Arc::new(AtomicBool::new(false)),
+        });
+        registry.environment_providers.insert(
+            "docker",
+            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "docker"),
+            Arc::new(AdoptionEnvironmentProvider { handles: vec![sibling] }),
+        );
+        let state = Arc::new(ControllerRuntimeState::new(
+            daemon,
+            config,
+            Arc::new(registry),
+            Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+            "host-test".to_string(),
+            None,
+            "host-direct-host-test".to_string(),
+        ));
+
+        assert!(state.verify_backing_dead(&convoy).await.is_err(), "startup absence alone is not evidence");
+        reconcile_provisioned_environments(&state, NAMESPACE).await.expect("complete local observation pass");
+        state.verify_backing_dead(&convoy).await.expect("observed absence on the home host proves backing dead");
+
+        let mut remote = convoy;
+        remote.status.as_mut().expect("status").placement_decision.as_mut().expect("placement").target_host.reference =
+            CanonicalHostId::resolved("remote-host");
+        assert!(state.verify_backing_dead(&remote).await.is_err(), "the local pass cannot prove absence on a remote host");
     }
 
     #[tokio::test]

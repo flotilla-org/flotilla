@@ -663,6 +663,16 @@ impl Reconciler for VesselReconciler {
                     if adopted_checkout_ref.is_some() && existing.metadata.lifecycle_authority()? != Some(LifecycleAuthority::Adopted) {
                         return Ok(VesselPrepared::failed(format!("checkout {checkout_name} is not adopted")));
                     }
+                    if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Gone) {
+                        if adopted_checkout_ref.is_some() {
+                            return Ok(VesselPrepared::failed(format!("adopted checkout {checkout_name} is gone")));
+                        }
+                        if existing.metadata.deletion_timestamp.is_none() {
+                            actuations.push(Actuation::DeleteCheckout { name: checkout_name.clone() });
+                        }
+                        waiting_for_checkouts.push(checkout_name);
+                        continue;
+                    }
                     if existing.status.as_ref().map(|status| status.phase) == Some(CheckoutPhase::Failed) {
                         let message = existing
                             .status

@@ -45,10 +45,14 @@ struct RecordingCheckoutRuntime {
     release_removal: Arc<Notify>,
     removal_blocked: Arc<Notify>,
     archive_path: Option<String>,
+    path_exists: Option<bool>,
 }
 
 #[async_trait]
 impl CheckoutRuntime for RecordingCheckoutRuntime {
+    async fn checkout_path_exists_in(&self, _env_ref: &str, _path: &str) -> Result<Option<bool>, String> {
+        Ok(self.path_exists)
+    }
     async fn create_worktree(
         &self,
         _clone_path: &str,
@@ -123,6 +127,50 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         }
         Ok(CheckoutRemovalOutcome::Removed)
     }
+}
+
+#[tokio::test]
+async fn missing_worktree_observed_on_its_host_becomes_gone() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let checkout = checkouts
+        .create(
+            &meta("checkout-a"),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-a".to_string(),
+                r#ref: "feature/a".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/checkouts/a".to_string(),
+                clone_ref: "clone-a".to_string(),
+            }),
+        )
+        .await
+        .expect("checkout");
+    let checkout = checkouts
+        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
+            phase: CheckoutPhase::Ready,
+            path: Some("/checkouts/a".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("ready checkout");
+    let runtime = Arc::new(RecordingCheckoutRuntime { path_exists: Some(false), ..Default::default() });
+    let reconciler = CheckoutReconciler::new(runtime, backend.clone(), NAMESPACE);
+    let prepared = reconciler.prepare(&checkout).await.expect("observe host path");
+    let outcome = reconciler.reconcile(&checkout, &prepared, chrono::Utc::now());
+    let mut status = checkout.status.expect("status");
+    outcome.patch.expect("gone patch").apply(&mut status);
+    assert_eq!(status.phase, CheckoutPhase::Gone);
+
+    let current = checkouts.get("checkout-a").await.expect("checkout");
+    let gone = checkouts.update_status("checkout-a", &current.metadata.resource_version, &status).await.expect("record Gone");
+    let reappeared =
+        CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime { path_exists: Some(true), ..Default::default() }), backend, NAMESPACE);
+    let prepared = reappeared.prepare(&gone).await.expect("recheck host path");
+    let outcome = reappeared.reconcile(&gone, &prepared, chrono::Utc::now());
+    outcome.patch.expect("ready patch").apply(&mut status);
+    assert_eq!(status.phase, CheckoutPhase::Ready);
 }
 
 #[tokio::test]

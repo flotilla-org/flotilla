@@ -3012,6 +3012,170 @@ async fn refused_convoy_reclaim_leaves_runtime_children_untouched() {
 }
 
 #[tokio::test]
+async fn gone_worktree_satisfies_teardown_gate_without_integration_observation() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &test_meta("gone-worktree"),
+            &ConvoySpec::builder()
+                .workflow_ref("quartermaster".to_string())
+                .adopted_checkout_refs(BTreeMap::from([(RepositoryKey("repo".to_string()), "checkout-gone".to_string())]))
+                .build(),
+        )
+        .await
+        .expect("convoy");
+    let convoy = convoys
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Failed,
+            ..Default::default()
+        })
+        .await
+        .expect("failed convoy");
+    let checkouts = backend.using::<ResourceCheckout>("flotilla");
+    let created_checkout = checkouts
+        .create(
+            &test_meta("checkout-gone"),
+            &ResourceCheckoutSpec::Worktree(flotilla_resources::CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey("repo".to_string()),
+                env_ref: "host-direct-test".to_string(),
+                r#ref: "feature/gone".to_string(),
+                base_ref: Some("main".to_string()),
+                target_path: "/missing/worktree".to_string(),
+                clone_ref: "clone".to_string(),
+            }),
+        )
+        .await
+        .expect("checkout");
+    let gone = checkouts
+        .update_status("checkout-gone", &created_checkout.metadata.resource_version, &ResourceCheckoutStatus {
+            phase: flotilla_resources::CheckoutPhase::Gone,
+            path: Some("/missing/worktree".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("gone checkout");
+
+    daemon
+        .verify_convoy_teardown_gate_for_checkouts(&convoy, &[gone], false)
+        .await
+        .expect("host-confirmed Gone checkout is safe to tear down");
+    let mut unknown = checkouts.get("checkout-gone").await.expect("checkout");
+    unknown.status = None;
+    assert!(daemon.verify_convoy_teardown_gate_for_checkouts(&convoy, &[unknown], false).await.is_err());
+}
+
+#[tokio::test]
+async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_second_convoy() {
+    use flotilla_resources::controller::{Actuation, Reconciler};
+
+    let (daemon, backend, clock, temp) = standing_ensure_fixture().await;
+    configure_standing_ensure_agent(&backend, Vec::new()).await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("admit standing governor");
+    let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+    let convoy_name = backend
+        .definitions::<ConvoyEnsure>("flotilla")
+        .get("quartermaster")
+        .await
+        .expect("ensure")
+        .status
+        .expect("ensure status")
+        .convoy_ref
+        .expect("governor convoy");
+    let admitted = convoys.get(&convoy_name).await.expect("admitted convoy");
+    let workflow = backend
+        .using::<WorkflowTemplate>("flotilla")
+        .get(&crate::ops_entry::materialized_workflow_name("standing-project", "quartermaster"))
+        .await
+        .expect("standing workflow");
+    let mut status = admitted.status.clone().unwrap_or_default();
+    status.phase = ConvoyPhase::Active;
+    status.observed_workflow_ref = Some(admitted.spec.workflow_ref.clone());
+    status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        exit: workflow.spec.exit,
+        turn_delivery: workflow.spec.turn_delivery,
+        stall_nudges: workflow.spec.stall_nudges,
+        supervision: workflow.spec.supervision,
+        vessels: workflow.spec.vessels,
+    });
+    status.work.insert("work".to_string(), flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build());
+    status.crew_work.insert(
+        "work".to_string(),
+        BTreeMap::from([("governor".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+    );
+    convoys.update_status(&convoy_name, &admitted.metadata.resource_version, &status).await.expect("running governor");
+    let vessels = backend.clone().using::<Vessel>("flotilla");
+    let vessel_name = format!("{convoy_name}-work");
+    let vessel = vessels
+        .create(
+            &InputMeta::builder()
+                .name(vessel_name.clone())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), convoy_name.clone())]))
+                .build(),
+            &VesselSpec {
+                convoy_ref: convoy_name.clone(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "docker".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("governor vessel");
+    vessels
+        .update_status(&vessel_name, &vessel.metadata.resource_version, &flotilla_resources::VesselStatus {
+            phase: flotilla_resources::VesselPhase::Failed,
+            message: Some("Docker container stopped after host reboot".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("lost container");
+    assert!(backend.using::<ResourceCheckout>("flotilla").list().await.expect("ephemeral checkout observations").items.is_empty());
+    drop(daemon);
+    let restarted = InProcessDaemon::new_with_resource_backend_and_clock(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+        clock.clone(),
+    )
+    .await;
+
+    let reconciler =
+        flotilla_resources::ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla")).with_vessels(vessels.clone());
+    let convoy = convoys.get(&convoy_name).await.expect("governor after reboot");
+    let outcome = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("reboot observations"), clock.now());
+    assert!(matches!(outcome.patch, Some(flotilla_resources::ConvoyStatusPatch::WorkInterrupted { .. })));
+    assert!(outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteVessel { name } if name == &vessel_name)));
+    flotilla_resources::apply_status_patch(&convoys, &convoy_name, &outcome.patch.expect("interrupt work")).await.expect("interrupt work");
+    vessels.delete(&vessel_name).await.expect("retire lost vessel");
+
+    let convoy = convoys.get(&convoy_name).await.expect("interrupted governor");
+    let replacement = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("lost vessel absent"), clock.now());
+    assert_eq!(
+        replacement.actuations.iter().filter(|actuation| matches!(actuation, Actuation::CreateVessel { .. })).count(),
+        1,
+        "convoy annotations: {:?}",
+        convoy.metadata.annotations
+    );
+    let (meta, spec) = replacement
+        .actuations
+        .into_iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateVessel { meta, spec } => Some((meta, spec)),
+            _ => None,
+        })
+        .expect("replacement vessel");
+    vessels.create(&meta, &spec).await.expect("admit replacement");
+    let convoy = convoys.get(&convoy_name).await.expect("standing convoy");
+    let repeated = reconciler.reconcile(&convoy, &reconciler.prepare(&convoy).await.expect("replacement observed"), clock.now());
+    assert!(!repeated.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateVessel { .. })));
+    restarted.reconcile_convoy_ensures_once("flotilla").await.expect("ensure remains steady after restart");
+    assert_eq!(convoys.list().await.expect("convoys").items.len(), 1);
+    assert_ne!(convoys.get(&convoy_name).await.expect("convoy").status.expect("status").phase, ConvoyPhase::Failed);
+}
+
+#[tokio::test]
 async fn convoy_routing_falls_back_to_a_unique_terminal_generation_and_refuses_multiple() {
     let (daemon, _backend, _clock, _temp) = standing_ensure_fixture().await;
     seed_convoy_routing_row(&daemon, "convoy-one", Some("reviewer"), Some("flotilla"), flotilla_protocol::ConvoyPhase::Landed).await;

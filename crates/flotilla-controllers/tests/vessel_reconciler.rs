@@ -388,6 +388,16 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
         "later vessels should reuse the convoy checkout"
     );
 
+    flotilla_resources::apply_status_patch(&checkouts, &checkout_meta.name, &flotilla_resources::CheckoutStatusPatch::MarkGone)
+        .await
+        .expect("observe removed worktree");
+    let gone_outcome = reconciler.reconcile(&review, &reconciler.prepare(&review).await.expect("gone checkout dependencies"), Utc::now());
+    assert!(gone_outcome
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeleteCheckout { name } if name == &checkout_meta.name)));
+    assert!(gone_outcome.actuations.iter().all(|actuation| !matches!(actuation, Actuation::CreateCheckout { .. })));
+
     reconciler.run_finalizer(&implement).await.expect("vessel finalization");
     checkouts.get(&checkout_meta.name).await.expect("vessel finalization must preserve convoy checkout");
     ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>(NAMESPACE))
@@ -1847,7 +1857,7 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
         .await
         .expect("workspace create should succeed");
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -1864,6 +1874,18 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
                     && spec.cwd == "/Users/alice/dev/flotilla-existing"
         )
     }));
+
+    flotilla_resources::apply_status_patch(
+        &backend.using::<Checkout>(NAMESPACE),
+        "adopted-checkout-convoy-adopted",
+        &flotilla_resources::CheckoutStatusPatch::MarkGone,
+    )
+    .await
+    .expect("adopted checkout gone");
+    let gone = reconciler.reconcile(&workspace, &reconciler.prepare(&workspace).await.expect("gone checkout"), Utc::now());
+    assert!(
+        matches!(gone.patch, Some(flotilla_resources::VesselStatusPatch::MarkFailed { ref message }) if message.contains("adopted checkout") && message.contains("gone"))
+    );
 }
 
 #[tokio::test]
