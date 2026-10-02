@@ -7538,3 +7538,44 @@ async fn replica_wake_engine_does_not_write_stalled_condition() {
     assert!(convoys.get("replicated").await.expect("authority convoy").status.expect("status").stalled.is_none());
     task.abort();
 }
+
+// Process exit leaves unfinished work resumable in its existing checkout. An
+// operator follow-up relaunches a stopped session instead of waiting for a hook
+// that an exited agent cannot send; both observed and not-yet-observed exits work.
+#[tokio::test]
+async fn resume_relaunches_exited_active_and_interrupted_crew() {
+    for phase in [CrewWorkPhase::Working, CrewWorkPhase::Interrupted] {
+        let (daemon, backend, probe) = resume_staging_fixture().await;
+        probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
+        let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
+        let convoy = convoys.get("resume-staging").await.expect("convoy");
+        let mut status = convoy.status.expect("status");
+        status.phase = ConvoyPhase::Active;
+        status.work.get_mut("work").expect("work").phase = flotilla_resources::WorkPhase::Interrupted;
+        status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = phase;
+        convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("unfinished work");
+        let sessions = backend.clone().using::<ResourceTerminalSession>("flotilla");
+        let session = sessions.get("resume-staging-session").await.expect("session");
+        let original_cwd = session.spec.cwd.clone();
+        sessions
+            .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
+                phase: ResourceTerminalSessionPhase::Stopped,
+                inner_command_status: Some(flotilla_resources::InnerCommandStatus::Exited),
+                ..Default::default()
+            })
+            .await
+            .expect("agent exited");
+        daemon
+            .convoy_resume_internal("flotilla", "resume-staging", "Recover the unfinished review", Some("work"), Some("coder"))
+            .await
+            .expect("resume exited agent");
+        let session = sessions.get("resume-staging-session").await.expect("same session");
+        assert_eq!(session.spec.cwd, original_cwd);
+        assert_eq!(session.status.expect("session status").phase, ResourceTerminalSessionPhase::Starting);
+        let TerminalSessionSource::Agent { message: Some(message), .. } = session.spec.source else { panic!("follow-up missing") };
+        assert!(message.text.contains("Recover the unfinished review"));
+        let status = convoys.get("resume-staging").await.expect("convoy").status.expect("status");
+        assert!(status.pending_brief().is_none(), "an exited process cannot consume a pending brief");
+        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+    }
+}

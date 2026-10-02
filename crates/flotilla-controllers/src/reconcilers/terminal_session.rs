@@ -84,6 +84,13 @@ pub trait TerminalRuntime: Send + Sync {
     async fn session_liveness(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<TerminalLiveness, String> {
         Ok(if self.session_is_running(session_id, spec).await? { TerminalLiveness::Running } else { TerminalLiveness::Stopped })
     }
+    async fn agent_exit_code(
+        &self,
+        _spec: &flotilla_resources::TerminalSessionSpec,
+        _crew: &flotilla_resources::CrewSessionStatus,
+    ) -> Result<Option<i32>, String> {
+        Ok(None)
+    }
     async fn cleat_endpoint(
         &self,
         _session_id: &str,
@@ -247,6 +254,7 @@ pub enum TerminalPrepared {
     MessageDeliveryPending,
     MessageDeliveryUnconfirmed { message_id: String, message: String },
     Stopped,
+    AgentExited(i32),
     Lost(String),
     Revived,
     RecoverLost,
@@ -312,6 +320,13 @@ where
                 TerminalLiveness::Running => {}
                 TerminalLiveness::Stopped => return Ok(TerminalPrepared::Stopped),
                 TerminalLiveness::Lost(reason) => return Ok(TerminalPrepared::Lost(reason)),
+            }
+            if matches!(obj.spec.source, TerminalSessionSource::Agent { .. }) {
+                if let Some(crew) = obj.status.as_ref().and_then(|status| status.crew.as_ref()) {
+                    if let Some(code) = self.runtime.agent_exit_code(&obj.spec, crew).await.map_err(ResourceError::other)? {
+                        return Ok(TerminalPrepared::AgentExited(code));
+                    }
+                }
             }
             if let Some(message) = self.runtime.observe_failure(session_id, &obj.spec).await.map_err(ResourceError::other)? {
                 return Ok(TerminalPrepared::Failed(message));
@@ -463,6 +478,7 @@ where
                 | TerminalPrepared::BriefWaiting
                 | TerminalPrepared::None
                 | TerminalPrepared::Stopped
+                | TerminalPrepared::AgentExited(_)
                 | TerminalPrepared::Lost(_)
                 | TerminalPrepared::Revived
                 | TerminalPrepared::RecoverLost
@@ -475,12 +491,16 @@ where
                 | TerminalPrepared::OwnerMissing
                 | TerminalPrepared::OwnerTerminal => None,
             },
-            TerminalSessionPhase::Running if matches!(prepared, TerminalPrepared::Stopped) => {
+            TerminalSessionPhase::Running if matches!(prepared, TerminalPrepared::Stopped | TerminalPrepared::AgentExited(_)) => {
                 Some(TerminalSessionStatusPatch::MarkStopped {
                     stopped_at: now,
                     inner_command_status: Some(flotilla_resources::InnerCommandStatus::Exited),
-                    inner_exit_code: None,
-                    message: None,
+                    inner_exit_code: match prepared {
+                        TerminalPrepared::AgentExited(code) => Some(*code),
+                        _ => None,
+                    },
+                    message: matches!(prepared, TerminalPrepared::AgentExited(_))
+                        .then(|| "agent process exited; resume relaunches it in the existing checkout".to_string()),
                 })
             }
             TerminalSessionPhase::Running => match prepared {
@@ -549,7 +569,7 @@ where
 
         let mut actuations = match prepared {
             TerminalPrepared::Attention(observation) => vec![attention_demand_actuation(obj, observation)],
-            TerminalPrepared::Stopped | TerminalPrepared::OwnerTerminal => {
+            TerminalPrepared::Stopped | TerminalPrepared::AgentExited(_) | TerminalPrepared::OwnerTerminal => {
                 vec![Actuation::DeleteDemand { name: attention_demand_name(obj) }]
             }
             TerminalPrepared::Lost(_) | TerminalPrepared::AttentionStale => {

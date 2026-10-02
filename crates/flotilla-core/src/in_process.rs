@@ -7442,6 +7442,7 @@ impl InProcessDaemon {
                 matches!(
                     state.phase,
                     flotilla_resources::CrewWorkPhase::Working
+                        | flotilla_resources::CrewWorkPhase::Interrupted
                         | flotilla_resources::CrewWorkPhase::Stalled
                         | flotilla_resources::CrewWorkPhase::Done
                 ) && requested_vessel.is_none_or(|requested| requested == vessel.as_str())
@@ -7492,7 +7493,10 @@ impl InProcessDaemon {
                     && status.attention.as_ref().is_some_and(|attention| attention.state == TerminalAttentionState::Idle)
             })
         });
-        if crew_phase == flotilla_resources::CrewWorkPhase::Working && !at_turn_boundary {
+        let agent_exited = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
+            session.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped)
+        });
+        if crew_phase == flotilla_resources::CrewWorkPhase::Working && !at_turn_boundary && !agent_exited {
             let displaced = status.pending_brief().map(|brief| brief.content.clone());
             apply_resource_status_patch(
                 &convoys,

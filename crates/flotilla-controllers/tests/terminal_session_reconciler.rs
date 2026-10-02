@@ -1989,3 +1989,81 @@ async fn controller_loop_prunes_acknowledged_message_payloads() {
         (1..=128).map(|id| format!("operator brief {id}")).collect::<Vec<_>>()
     );
 }
+
+struct ExitedAgentRuntime;
+
+#[async_trait]
+impl TerminalRuntime for ExitedAgentRuntime {
+    async fn ensure_session(
+        &self,
+        _: &str,
+        _: &TerminalSessionSpec,
+        _: &[flotilla_resources::TerminalSessionTag],
+    ) -> Result<TerminalRuntimeState, String> {
+        panic!("running shell must not provision a replacement before exit is observed")
+    }
+    // Inject the process boundary: the parent shell has observed the child exit.
+    async fn agent_exit_code(&self, _: &TerminalSessionSpec, _: &flotilla_resources::CrewSessionStatus) -> Result<Option<i32>, String> {
+        Ok(Some(42))
+    }
+    async fn kill_session(&self, _: &str, _: &TerminalSessionSpec) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+// An agent's exit differs from a live persistent shell. Preserve the checkout
+// and record the actual exit so unfinished crew work can become Interrupted.
+#[tokio::test]
+async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_environment(&backend, "env-a").await;
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(&meta("exited-agent"), &TerminalSessionSpec {
+            env_ref: "env-a".into(),
+            role: "coder".into(),
+            cwd: "/workspace".into(),
+            pool: "cleat".into(),
+            source: flotilla_resources::TerminalSessionSource::Agent {
+                selector: flotilla_resources::Selector::for_capability("coding"),
+                brief: flotilla_resources::TerminalBrief {
+                    path: "brief.md".into(),
+                    content: "original brief".into(),
+                    artifact_digest: None,
+                    copies: Vec::new(),
+                },
+                context: Box::new(flotilla_resources::TerminalCrewContext {
+                    namespace: "flotilla".into(),
+                    convoy: "demo".into(),
+                    vessel_ref: "demo-work".into(),
+                }),
+                message: None,
+            },
+        })
+        .await
+        .expect("session");
+    let running = sessions
+        .update_status(&created.metadata.name, &created.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            session_id: Some("live-shell".into()),
+            crew: Some(
+                flotilla_resources::CrewSessionStatus::builder()
+                    .id("launch-id".into())
+                    .adapter("codex".into())
+                    .stance("trusted".into())
+                    .build(),
+            ),
+            ..Default::default()
+        })
+        .await
+        .expect("running shell");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(ExitedAgentRuntime), backend, "flotilla");
+    let prepared = reconciler.prepare(&running).await.expect("observe process");
+    let outcome = reconciler.reconcile(&running, &prepared, Utc::now());
+    let mut status = running.status.expect("status");
+    outcome.patch.expect("exit patch").apply(&mut status);
+    assert_eq!(status.phase, TerminalSessionPhase::Stopped);
+    assert_eq!(status.inner_exit_code, Some(42));
+    assert!(status.message.expect("recovery guidance").contains("resume"));
+}
