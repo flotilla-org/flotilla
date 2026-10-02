@@ -89,13 +89,18 @@ mod macos {
     use std::collections::HashMap;
 
     use flotilla_protocol::CallerProcess;
+    use tracing::debug;
 
     pub(super) fn process_identity(pid: u32, uid: u32) -> CallerProcess {
         let mut path = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
         // SAFETY: proc_pidpath writes at most path.len() bytes to the valid buffer.
         let path_len = unsafe { libc::proc_pidpath(pid as libc::c_int, path.as_mut_ptr().cast(), path.len() as u32) };
-        let executable = (path_len > 0)
-            .then(|| String::from_utf8_lossy(path[..path_len as usize].split(|byte| *byte == 0).next().unwrap_or_default()).into_owned());
+        let executable = if path_len > 0 {
+            Some(String::from_utf8_lossy(path[..path_len as usize].split(|byte| *byte == 0).next().unwrap_or_default()).into_owned())
+        } else {
+            debug!(%pid, error = %std::io::Error::last_os_error(), "macOS peer executable path unavailable");
+            None
+        };
         let argv = proc_args(pid).map(|(argv, _)| argv).unwrap_or_default();
         CallerProcess::builder().pid(pid).uid(uid).maybe_executable(executable).argv(argv).build()
     }
@@ -106,18 +111,32 @@ mod macos {
 
     fn proc_args(pid: u32) -> Option<(Vec<String>, HashMap<String, String>)> {
         let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, libc::c_int::try_from(pid).ok()?];
-        let mut size = 0;
-        // SAFETY: sysctl writes the required buffer size through the valid size pointer.
-        if unsafe { libc::sysctl(mib.as_mut_ptr(), mib.len() as _, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) } != 0 {
+        for attempt in 0..2 {
+            let mut size = 0;
+            // SAFETY: sysctl writes the required buffer size through the valid size pointer.
+            if unsafe { libc::sysctl(mib.as_mut_ptr(), mib.len() as _, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) } != 0 {
+                debug!(%pid, error = %std::io::Error::last_os_error(), "macOS peer argument size unavailable");
+                return None;
+            }
+            let mut bytes = vec![0_u8; size];
+            // SAFETY: bytes is initialized and sysctl receives its capacity and valid pointer.
+            if unsafe { libc::sysctl(mib.as_mut_ptr(), mib.len() as _, bytes.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) } == 0
+            {
+                bytes.truncate(size);
+                let parsed = parse_proc_args(&bytes);
+                if parsed.is_none() {
+                    debug!(%pid, "macOS peer arguments malformed");
+                }
+                return parsed;
+            }
+            let error = std::io::Error::last_os_error();
+            if attempt == 0 && error.raw_os_error() == Some(libc::ENOMEM) {
+                continue;
+            }
+            debug!(%pid, %error, "macOS peer arguments unavailable");
             return None;
         }
-        let mut bytes = vec![0_u8; size];
-        // SAFETY: bytes is initialized and sysctl receives its capacity and valid pointer.
-        if unsafe { libc::sysctl(mib.as_mut_ptr(), mib.len() as _, bytes.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) } != 0 {
-            return None;
-        }
-        bytes.truncate(size);
-        parse_proc_args(&bytes)
+        None
     }
 
     fn parse_proc_args(bytes: &[u8]) -> Option<(Vec<String>, HashMap<String, String>)> {
@@ -187,6 +206,9 @@ mod tests {
             missing_crew_message_for_os("artifact get", "freebsd"),
             "artifact get requires a calling crew session: peer identity unavailable on freebsd"
         );
+        for os in ["linux", "macos"] {
+            assert_eq!(missing_crew_message_for_os("artifact put", os), "artifact put requires a calling crew session");
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -199,7 +221,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn child_socket_peer_exposes_crew_identity() {
-        use std::{os::unix::net::UnixListener, process::Command};
+        use std::{os::unix::net::UnixListener, process::Command, thread, time::Duration};
 
         let directory = flotilla_test_support::TestSocketDir::new();
         let path = directory.socket_path("peer.sock");
@@ -215,6 +237,8 @@ mod tests {
             .spawn()
             .expect("spawn crew child");
         let (stream, _) = listener.accept().expect("accept crew child");
+        thread::sleep(Duration::from_millis(650));
+        assert!(child.try_wait().expect("check crew child").is_none(), "crew child must remain alive until identity is read");
         stream.set_nonblocking(true).expect("set nonblocking");
         let stream = tokio::net::UnixStream::from_std(stream).expect("tokio stream");
         let peer = socket_peer_credential(&stream).expect("peer credentials");
@@ -230,17 +254,19 @@ mod tests {
         assert_eq!(crew.vessel, "test-vessel");
         assert_eq!(crew.role, "coder");
         assert_eq!(crew.crew_id, "test-crew");
+        drop(stream);
         assert!(child.wait().expect("wait for crew child").success());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn connect_as_crew_child() {
-        use std::{os::unix::net::UnixStream, thread, time::Duration};
+        use std::{io::Read, os::unix::net::UnixStream};
 
         let Ok(path) = std::env::var("FLOTILLA_TEST_SOCKET") else { return };
-        let _stream = UnixStream::connect(path).expect("connect to test listener");
-        thread::sleep(Duration::from_millis(500));
+        let mut stream = UnixStream::connect(path).expect("connect to test listener");
+        let mut byte = [0];
+        assert_eq!(stream.read(&mut byte).expect("wait for parent to finish"), 0);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
