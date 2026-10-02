@@ -17,6 +17,74 @@ use flotilla_resources::{
 
 use super::*;
 
+#[tokio::test]
+async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_providers() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"provider-watch-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repositories = backend.clone().using::<Repository>("flotilla");
+    let first = RepositorySpec::remote("https://github.com/example/first").expect("first repository");
+    let second = RepositorySpec::remote("https://github.com/example/second").expect("second repository");
+    for repository in [&first, &second] {
+        repositories.create(&test_meta(&repository.key().to_string()), repository).await.expect("create repository");
+    }
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend.clone(),
+    )
+    .await;
+    daemon.set_provisioning_namespace("flotilla".to_string()).await;
+    let provider: Arc<dyn ChangeRequestTracker> = Arc::new(FakeChangeRequest::new());
+    for repository in [&first, &second] {
+        daemon.repository_change_requests.write().await.insert(repository.key(), RepositoryChangeRequestProvider {
+            service_url: "https://github.com".to_string(),
+            repository: repository.key().to_string(),
+            provider: Arc::clone(&provider),
+        });
+    }
+    repositories.delete(&first.key().to_string()).await.expect("delete first repository");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !daemon.repository_change_requests.read().await.contains_key(&first.key()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("repository watch should evict provider");
+    assert!(daemon.repository_change_requests.read().await.contains_key(&second.key()), "live repository keeps its provider");
+
+    let third = RepositorySpec::remote("https://github.com/example/third").expect("third repository");
+    repositories.create(&test_meta(&third.key().to_string()), &third).await.expect("create third repository");
+    daemon.repository_change_requests.write().await.insert(third.key(), RepositoryChangeRequestProvider {
+        service_url: "https://github.com".to_string(),
+        repository: third.key().to_string(),
+        provider,
+    });
+    backend
+        .clone()
+        .using::<Repository>("alternate")
+        .create(&test_meta(&second.key().to_string()), &second)
+        .await
+        .expect("repository in replacement namespace");
+    daemon.set_provisioning_namespace("alternate".to_string()).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if !daemon.repository_change_requests.read().await.contains_key(&third.key()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("restarted watch should reconcile cached providers from the new list");
+    assert!(daemon.repository_change_requests.read().await.contains_key(&second.key()), "relist retains the live provider");
+}
+
 #[test]
 fn bound_change_request_identity_uses_matching_declared_or_discovered_subject() {
     let requested = ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "team/repo".into(), number: 42 };

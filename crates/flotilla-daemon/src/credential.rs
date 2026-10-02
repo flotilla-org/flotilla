@@ -25,6 +25,32 @@ use crate::vessel_config::{
     agent_environment_fragment, compose, crew_gitconfig_fragments, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey,
 };
 
+async fn prune_abandoned_skill_source_tokens(runner: &dyn CommandRunner, root: &Path) -> Result<(), String> {
+    const SCRIPT: &str = r#"[ -d "$1" ] || exit 0
+find "$1" -type f -name 'token-*' ! -name '*.in-use.*' -exec sh -c '
+  for token do
+    active=false
+    dead_owner=false
+    for marker in "$token".in-use.*; do
+      [ -f "$marker" ] || continue
+      pid=${marker##*.}
+      case "$pid" in *[!0-9]*|"") active=true; continue ;; esac
+      if signal_error=$(kill -0 "$pid" 2>&1); then active=true; continue; fi
+      case "$signal_error" in *[Pp]ermiss*|*permitted*) active=true; continue ;; esac
+      dead_owner=true
+      rm -f -- "$marker"
+    done
+    # A stager creates its marker before reading the token. Marker-less tokens
+    # may have just been minted, so only age can make them eligible for cleanup.
+    if [ "$active" = false ] && { [ "$dead_owner" = true ] || [ -n "$(find "$token" -prune -mtime +6 -print)" ]; }; then
+      rm -f -- "$token"
+    fi
+  done
+' _ {} +"#;
+    let path = root.to_string_lossy();
+    runner.run("sh", &["-c", SCRIPT, "flotilla-prune-skill-tokens", &path], Path::new("/"), &ChannelLabel::Default).await.map(|_| ())
+}
+
 #[derive(Serialize)]
 struct GithubAppJwtClaims {
     iat: i64,
@@ -1111,6 +1137,7 @@ impl CredentialStore {
             return Err(bounded_adapter_error(credential_name, "github-app", "installation token response was empty"));
         }
         let paths = self.delivery_paths(runner).await?;
+        prune_abandoned_skill_source_tokens(runner, &paths.base.join("skill-sources")).await?;
         // Each staging owns its token. A concurrent staging must not replace or
         // delete a token while another Git process is still reading it.
         let token_file =
@@ -3406,6 +3433,32 @@ interactions:
         assert!(runner.writes.lock().expect("writes lock").iter().any(|(path, contents)| path == &token_file && contents == "skill-token"));
         assert!(store.github_app_deliveries.lock().await.is_empty(), "one-shot skill tokens must not enter refresh registrations");
         session.assert_complete();
+    }
+
+    #[tokio::test]
+    async fn old_skill_source_tokens_are_reaped_without_touching_a_live_staging_token() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("skill-sources/source");
+        std::fs::create_dir_all(&root).expect("token directory");
+        let abandoned = root.join("token-abandoned");
+        let killed_stage = root.join("token-killed-stage");
+        let active = root.join("token-active");
+        let recent = root.join("token-recent");
+        for path in [&abandoned, &killed_stage, &active, &recent] {
+            std::fs::write(path, "test-token").expect("write token");
+        }
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 60 * 60);
+        for path in [&abandoned, &active] {
+            std::fs::File::open(path).expect("open token").set_modified(old).expect("age token");
+        }
+        std::fs::write(format!("{}.in-use.{}", active.display(), std::process::id()), "").expect("live marker");
+        std::fs::write(format!("{}.in-use.999999999", killed_stage.display()), "").expect("dead marker");
+        let runner = PathCommandRunner { bin_dir: temp.path().to_path_buf() };
+        prune_abandoned_skill_source_tokens(&runner, &temp.path().join("skill-sources")).await.expect("prune tokens");
+        assert!(!abandoned.exists(), "old abandoned token is removed");
+        assert!(!killed_stage.exists(), "token from a killed staging shell is removed on the next pass");
+        assert!(active.exists(), "old token held by a live staging shell is retained");
+        assert!(recent.exists(), "recent minted token is retained");
     }
 
     #[tokio::test]
