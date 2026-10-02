@@ -54,6 +54,7 @@ use subjects::{project_role_attempts, project_subjects};
 
 /// Replicated observation records and the fleet reference context. The clock is
 /// supplied by the connector so expiry is deterministic in replay and tests.
+/// With no clock, only live subjects are eligible; landed subjects are omitted.
 #[derive(Default, bon::Builder)]
 pub struct SubjectCatalogInput {
     pub change_requests: Vec<ResourceObject<ChangeRequest>>,
@@ -61,6 +62,30 @@ pub struct SubjectCatalogInput {
     pub forges: Vec<ResourceObject<Forge>>,
     pub references: ReferenceContext,
     pub now: Option<Timestamp>,
+}
+
+/// Resolve a subject service to a Forge: exact ID, installation URL, then
+/// host alias. Overlapping declarations at one priority use Forge ID and
+/// namespace as a deterministic tie-break, independent of input order.
+pub fn subject_forge<'a>(forges: &'a [ResourceObject<Forge>], service: &str) -> Option<&'a ResourceObject<Forge>> {
+    forges
+        .iter()
+        .filter_map(|forge| {
+            let rank = if forge.spec.forge_id == service {
+                0
+            } else if forge.spec.owns_issue_service(service) {
+                1
+            } else if forge.spec.matches_host(service) {
+                2
+            } else {
+                return None;
+            };
+            Some((rank, forge))
+        })
+        .min_by(|(a, left), (b, right)| {
+            (a, &left.spec.forge_id, &left.metadata.namespace).cmp(&(b, &right.spec.forge_id, &right.metadata.namespace))
+        })
+        .map(|(_, forge)| forge)
 }
 
 /// Derived presentation state for a change request. The raw observations remain
@@ -806,6 +831,18 @@ fn summary_text(counts: &AwarenessCounts, visible: usize) -> String {
     summary
 }
 
+fn convoy_identity_facts(convoy: &ConvoyRow) -> Vec<(&'static str, MetadataValue)> {
+    let target = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
+    let mut facts = vec![
+        (KEY_CONVOY, MetadataValue::text(target.id)),
+        (KEY_CONVOY_NAME, MetadataValue::text(&convoy.name)),
+        (KEY_DISPLAY_LABEL, MetadataValue::text(&convoy.name)),
+        (KEY_CONVOY_PHASE, MetadataValue::text(convoy.phase.as_str())),
+    ];
+    facts.extend(label_tier_facts(&convoy.name));
+    facts
+}
+
 fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMint) {
     let namespace = &convoy.resource.namespace;
     let origin = entity::resource_origin(&convoy.resource);
@@ -826,15 +863,11 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
         facts.push((SEGMENT_REPO, MetadataValue::text(repo.clone())));
         facts.push((KEY_REPO_NAME, MetadataValue::text(repo_label(repo))));
     }
+    facts.extend(convoy_identity_facts(convoy));
     facts.extend([
-        (KEY_CONVOY, MetadataValue::text(convoy_entity.id.clone())),
-        (KEY_CONVOY_NAME, MetadataValue::text(convoy.name.clone())),
-        (KEY_DISPLAY_LABEL, MetadataValue::text(convoy.name.clone())),
-        (KEY_CONVOY_PHASE, MetadataValue::text(convoy.phase.as_str())),
         (KEY_CONVOY_WORKFLOW, MetadataValue::text(convoy.workflow_ref.clone())),
         (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
     ]);
-    facts.extend(label_tier_facts(&convoy.name));
     facts.extend(surface_facts(convoy.surface_state));
     if let Some(message) = &convoy.message {
         facts.push((KEY_CONVOY_MESSAGE, MetadataValue::text(message.clone())));

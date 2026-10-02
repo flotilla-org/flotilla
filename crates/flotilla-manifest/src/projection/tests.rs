@@ -1474,7 +1474,7 @@ fn live_role_carries_its_attempts_vessel_attention() {
 #[test]
 fn replicated_subjects_publish_entities_edges_and_reference_labels() {
     use flotilla_protocol::{Relationship, RepositoryAlias, Subject, SubjectKind};
-    use flotilla_resources::{ChangeRequest, ChangeRequestSpec, InMemoryBackend, InputMeta, ResourceBackend};
+    use flotilla_resources::{ChangeRequest, ChangeRequestSpec, Forge, ForgeKind, ForgeSpec, InMemoryBackend, InputMeta, ResourceBackend};
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
     let record = runtime.block_on(async {
@@ -1483,7 +1483,7 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
             .create(
                 &InputMeta::builder().name("cr-42".into()).build(),
                 &ChangeRequestSpec::builder()
-                    .service("github.com".into())
+                    .service("github".into())
                     .scope("org/flotilla".into())
                     .number(42)
                     .observing_authority("kiwi".into())
@@ -1492,7 +1492,29 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
             .await
             .expect("record")
     });
-    let source = IssueSource { service: "github.com".into(), scope: "org/flotilla".into() };
+    let forges = runtime.block_on(async {
+        let mut forges = Vec::new();
+        // Both claim github.com. The exact Forge ID must win, irrespective of input order.
+        for id in ["aaa", "github"] {
+            let object = backend
+                .using::<Forge>("flotilla")
+                .create(
+                    &InputMeta::builder().name(id.into()).build(),
+                    &ForgeSpec::builder()
+                        .forge_id(id.into())
+                        .kind(ForgeKind::Github)
+                        .hosts(["github.com".into(), "github".into()].into_iter().collect())
+                        .https_url("https://github.com".into())
+                        .git_ssh_host("github.com".into())
+                        .build(),
+                )
+                .await
+                .expect("forge");
+            forges.push(object);
+        }
+        forges
+    });
+    let source = IssueSource { service: "github".into(), scope: "org/flotilla".into() };
     let subject = Subject { kind: SubjectKind::ChangeRequest, source: source.clone(), id: "42".into() };
     let mut convoy = ConvoyRow::builder()
         .resource(convoy_ref("flotilla", "ship-it"))
@@ -1510,6 +1532,7 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
     });
     let observations = SubjectCatalogInput {
         change_requests: vec![record],
+        forges,
         references: flotilla_protocol::ReferenceContext {
             repositories: vec![RepositoryAlias {
                 project: Some("flotilla".into()),
@@ -1526,8 +1549,10 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
     input.awareness = Some(&[]);
     input.subjects = Some(&observations);
     let patches = project_catalog(&input, &mint()).reassert_patches();
-    let cr = EntityRef::new("change_request", "github.com/org/flotilla!42");
+    let cr = EntityRef::new("change_request", "github/org/flotilla!42");
     let patch = find_entity(&patches, &cr);
+    assert_eq!(patch.set["flotilla.forge"].value, MetadataValue::EntityRefs(vec![entity::forge("github")]));
+    assert!(!patch.set.contains_key("flotilla.change_request.state"));
     assert_eq!(text(patch, KEY_DISPLAY_LABEL), "f!42");
     assert_eq!(text(patch, KEY_DISPLAY_LABEL_SHORT), "f!42");
     assert_eq!(text(patch, "flotilla.change_request.readiness"), "awaiting_review_response");

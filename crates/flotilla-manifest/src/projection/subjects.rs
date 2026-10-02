@@ -2,14 +2,31 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use flotilla_protocol::{IssueRef, IssueSource, Relationship, Subject, SubjectKind};
-use flotilla_resources::{ForgeKind, Observation};
-use serde::Serialize;
+use flotilla_resources::{
+    ForgeKind, Observation, ObservedChangeRequestState, ObservedChecks, ObservedIssueState, ObservedMergeability, ObservedReviewDecision,
+};
 
 use super::{
     entity, role_entity, standing_attempts, Catalog, CatalogInput, ConvoyPhase, ConvoyRow, EntityRef, MetadataTarget, MetadataValue,
     StandingRoleRow, SubjectCatalogInput,
 };
-use crate::keys::*;
+use crate::keys::{
+    KEY_CHANGE_REQUEST_AUTHOR, KEY_CHANGE_REQUEST_AUTHOR_OBSERVED_AT, KEY_CHANGE_REQUEST_CHECKS, KEY_CHANGE_REQUEST_CHECKS_OBSERVED_AT,
+    KEY_CHANGE_REQUEST_HEAD_SHA, KEY_CHANGE_REQUEST_HEAD_SHA_OBSERVED_AT, KEY_CHANGE_REQUEST_MERGEABLE,
+    KEY_CHANGE_REQUEST_MERGEABLE_OBSERVED_AT, KEY_CHANGE_REQUEST_READINESS, KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD,
+    KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD_OBSERVED_AT, KEY_CHANGE_REQUEST_REVIEW_DECISION,
+    KEY_CHANGE_REQUEST_REVIEW_DECISION_OBSERVED_AT, KEY_CHANGE_REQUEST_REVIEW_REQUESTED_FROM_OWNER,
+    KEY_CHANGE_REQUEST_REVIEW_REQUESTED_FROM_OWNER_OBSERVED_AT, KEY_CHANGE_REQUEST_STATE, KEY_CHANGE_REQUEST_STATE_OBSERVED_AT,
+    KEY_CHANGE_REQUEST_TITLE, KEY_CHANGE_REQUEST_TITLE_OBSERVED_AT, KEY_DISPLAY_LABEL, KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT,
+    KEY_FORGE, KEY_FORGE_CHANGE_REQUEST_URL_TEMPLATE, KEY_FORGE_ISSUE_URL_TEMPLATE, KEY_FORGE_KIND, KEY_FORGE_WEB_URL, KEY_ISSUE_ASSIGNEES,
+    KEY_ISSUE_ASSIGNEES_OBSERVED_AT, KEY_ISSUE_LABELS, KEY_ISSUE_LABELS_OBSERVED_AT, KEY_ISSUE_STATE, KEY_ISSUE_STATE_OBSERVED_AT,
+    KEY_ISSUE_TITLE, KEY_ISSUE_TITLE_OBSERVED_AT, KEY_ISSUE_UPDATED_AT, KEY_ISSUE_UPDATED_AT_OBSERVED_AT, KEY_ROLE_ATTEMPTS,
+    KEY_ROLE_CREW_SESSIONS, KEY_ROLE_CURRENT_ATTEMPT, KEY_ROLE_DESIRED_STATE, KEY_ROLE_NEXT_ATTEMPT, KEY_ROLE_RESTART_COUNT,
+    KEY_ROLE_STATE, KEY_SUBJECT_ADOPTS, KEY_SUBJECT_KIND, KEY_SUBJECT_NUMBER, KEY_SUBJECT_OF, KEY_SUBJECT_OF_ADOPTS,
+    KEY_SUBJECT_OF_PRODUCES, KEY_SUBJECT_OF_REFERENCES, KEY_SUBJECT_OF_SUPERSEDES, KEY_SUBJECT_OF_WORKS_ON, KEY_SUBJECT_PRODUCES,
+    KEY_SUBJECT_REFERENCES, KEY_SUBJECT_REPOSITORY_ALIAS, KEY_SUBJECT_SCOPE, KEY_SUBJECT_SERVICE, KEY_SUBJECT_SUPERSEDES,
+    KEY_SUBJECT_WORKS_ON,
+};
 
 fn subject_entity(subject: &Subject) -> EntityRef {
     match subject.kind {
@@ -38,19 +55,56 @@ fn reverse_key(relationship: Relationship) -> &'static str {
     }
 }
 
-fn observe<T: Serialize>(facts: &mut Vec<(&'static str, MetadataValue)>, key: &'static str, time: &'static str, value: &Observation<T>) {
-    facts.push((time, MetadataValue::text(value.observed_at.to_rfc3339())));
-    let Some(value) = value.value.as_ref() else { return };
-    let value = serde_json::to_value(value).expect("observation serializes");
-    let value = match value {
-        serde_json::Value::String(value) => MetadataValue::text(value),
-        serde_json::Value::Bool(value) => MetadataValue::Bool(value),
-        serde_json::Value::Array(values) => {
-            MetadataValue::StringList(values.into_iter().map(|value| value.as_str().expect("string observation list").to_owned()).collect())
+// Only supported observation types can enter the projection. Changes to a
+// resource field or enum require an explicit mapping here at compile time.
+trait PresentationValue {
+    fn presentation_value(&self) -> MetadataValue;
+}
+impl PresentationValue for String {
+    fn presentation_value(&self) -> MetadataValue {
+        MetadataValue::text(self)
+    }
+}
+impl PresentationValue for bool {
+    fn presentation_value(&self) -> MetadataValue {
+        MetadataValue::Bool(*self)
+    }
+}
+impl PresentationValue for Vec<String> {
+    fn presentation_value(&self) -> MetadataValue {
+        MetadataValue::StringList(self.clone())
+    }
+}
+impl PresentationValue for super::Timestamp {
+    fn presentation_value(&self) -> MetadataValue {
+        MetadataValue::text(self.to_rfc3339())
+    }
+}
+macro_rules! observation_enum {
+    ($type:ty, {$($variant:path => $text:literal),+ $(,)?}) => {
+        impl PresentationValue for $type {
+            fn presentation_value(&self) -> MetadataValue {
+                MetadataValue::text(match self { $($variant => $text),+ })
+            }
         }
-        _ => panic!("unsupported presentation observation"),
     };
-    facts.push((key, value));
+}
+observation_enum!(ObservedChangeRequestState, {ObservedChangeRequestState::Open => "open", ObservedChangeRequestState::Draft => "draft", ObservedChangeRequestState::Merged => "merged", ObservedChangeRequestState::Closed => "closed"});
+observation_enum!(ObservedChecks, {ObservedChecks::Pass => "pass", ObservedChecks::Fail => "fail", ObservedChecks::Pending => "pending"});
+observation_enum!(ObservedMergeability, {ObservedMergeability::Mergeable => "mergeable", ObservedMergeability::Conflicting => "conflicting"});
+observation_enum!(ObservedReviewDecision, {ObservedReviewDecision::Approved => "approved", ObservedReviewDecision::ChangesRequested => "changes_requested", ObservedReviewDecision::Required => "required", ObservedReviewDecision::None => "none"});
+observation_enum!(ObservedIssueState, {ObservedIssueState::Open => "open", ObservedIssueState::Closed => "closed"});
+
+fn observe<T: PresentationValue>(
+    facts: &mut Vec<(&'static str, MetadataValue)>,
+    key: &'static str,
+    time: &'static str,
+    value: &Observation<T>,
+) {
+    facts.push((time, MetadataValue::text(value.observed_at.to_rfc3339())));
+    if let Some(value) = &value.value {
+        facts.push((key, value.presentation_value()));
+    }
 }
 
 pub(super) fn project_role_attempts(catalog: &mut Catalog, role: &StandingRoleRow, convoys: &[ConvoyRow]) {
@@ -84,8 +138,11 @@ pub(super) fn project_role_attempts(catalog: &mut Catalog, role: &StandingRoleRo
 pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, observations: &SubjectCatalogInput) {
     let mut links: BTreeMap<Subject, BTreeMap<Relationship, BTreeSet<EntityRef>>> = BTreeMap::new();
     let mut landed = BTreeSet::new();
+    let mut convoy_edges = BTreeMap::new();
     for convoy in input.convoys {
         let convoy_entity = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
+        // A future finished_at from clock skew remains in the window until
+        // the local clock catches up; it must not disappear prematurely.
         let visible = !convoy.phase.is_terminal()
             || (convoy.phase == ConvoyPhase::Landed
                 && convoy.finished_at.zip(observations.now).is_some_and(|(finished, now)| (now - finished).num_seconds() < 86_400));
@@ -100,23 +157,17 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
             forward.entry(entry.relationship).or_default().insert(subject_entity(&entry.subject));
             links.entry(entry.subject.clone()).or_default().entry(entry.relationship).or_default().insert(convoy_entity.clone());
         }
-        for (relationship, targets) in forward {
-            if !catalog.facts.contains_key(&MetadataTarget::Entity(convoy_entity.clone())) {
-                let mut facts = vec![
-                    (KEY_CONVOY, MetadataValue::text(&convoy_entity.id)),
-                    (KEY_CONVOY_NAME, MetadataValue::text(&convoy.name)),
-                    (KEY_DISPLAY_LABEL, MetadataValue::text(&convoy.name)),
-                    (KEY_CONVOY_PHASE, MetadataValue::text(convoy.phase.as_str())),
-                ];
-                facts.extend(super::label_tier_facts(&convoy.name));
-                catalog.assert_entity(convoy_entity.clone(), facts, None);
-            }
-            catalog.assert_entity(
-                convoy_entity.clone(),
-                vec![(forward_key(relationship), MetadataValue::EntityRefs(targets.into_iter().collect()))],
-                None,
-            );
+        if !forward.is_empty() && !catalog.facts.contains_key(&MetadataTarget::Entity(convoy_entity.clone())) {
+            catalog.assert_entity(convoy_entity.clone(), super::convoy_identity_facts(convoy), None);
         }
+        let facts: Vec<_> = forward
+            .into_iter()
+            .map(|(relationship, targets)| (forward_key(relationship), MetadataValue::EntityRefs(targets.into_iter().collect())))
+            .collect();
+        if !facts.is_empty() {
+            catalog.assert_entity(convoy_entity.clone(), facts.clone(), None);
+        }
+        convoy_edges.insert(convoy_entity, facts);
     }
 
     for record in &observations.forges {
@@ -145,16 +196,8 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         let mut facts = Vec::new();
         if let Some(convoy) = current {
             let target = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
-            if let Some(convoy_facts) = catalog.facts.get(&MetadataTarget::Entity(target)) {
-                for (key, value) in convoy_facts {
-                    if let Some(key) =
-                        [KEY_SUBJECT_PRODUCES, KEY_SUBJECT_ADOPTS, KEY_SUBJECT_WORKS_ON, KEY_SUBJECT_SUPERSEDES, KEY_SUBJECT_REFERENCES]
-                            .into_iter()
-                            .find(|candidate| *candidate == key)
-                    {
-                        facts.push((key, value.value.clone()));
-                    }
-                }
+            if let Some(forward) = convoy_edges.get(&target) {
+                facts.extend(forward.clone());
             }
             for entry in &convoy.subjects {
                 links.entry(entry.subject.clone()).or_default().entry(entry.relationship).or_default().insert(role_ref.clone());
@@ -163,19 +206,23 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         catalog.assert_entity(role_ref, facts, None);
     }
 
+    // Index once per rebuild rather than scanning context/forges for each entity.
+    let mut aliases = BTreeMap::new();
+    for repo in &observations.references.repositories {
+        aliases.entry(&repo.source).or_insert(repo.alias.as_str());
+    }
+    let services: BTreeSet<_> = links.keys().map(|subject| subject.source.service.as_str()).collect();
+    let forges: BTreeMap<_, _> = services
+        .into_iter()
+        .filter_map(|service| super::subject_forge(&observations.forges, service).map(|forge| (service, forge)))
+        .collect();
     let identity_facts = |subject: &Subject| {
         let label = subject.short(&observations.references);
         let kind = match subject.kind {
             SubjectKind::ChangeRequest => "change_request",
             SubjectKind::Issue => "issue",
         };
-        let alias = observations
-            .references
-            .repositories
-            .iter()
-            .find(|repo| repo.source == subject.source)
-            .map(|repo| repo.alias.as_str())
-            .unwrap_or(&subject.source.scope);
+        let alias = aliases.get(&subject.source).copied().unwrap_or(&subject.source.scope);
         let mut facts = vec![
             (KEY_SUBJECT_SERVICE, MetadataValue::text(&subject.source.service)),
             (KEY_SUBJECT_SCOPE, MetadataValue::text(&subject.source.scope)),
@@ -186,11 +233,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
             (KEY_DISPLAY_LABEL_MEDIUM, MetadataValue::text(&label)),
             (KEY_DISPLAY_LABEL_SHORT, MetadataValue::text(&label)),
         ];
-        if let Some(forge) = observations.forges.iter().find(|forge| {
-            forge.spec.forge_id == subject.source.service
-                || forge.spec.owns_issue_service(&subject.source.service)
-                || forge.spec.matches_host(&subject.source.service)
-        }) {
+        if let Some(forge) = forges.get(subject.source.service.as_str()) {
             facts.push((KEY_FORGE, MetadataValue::EntityRefs(vec![entity::forge(&forge.spec.forge_id)])));
         }
         let relationships = links.get(subject);

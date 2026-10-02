@@ -1,7 +1,7 @@
 //! Replicated subject observations held by the PM connector.
 use std::collections::{BTreeMap, BTreeSet};
 
-use flotilla_manifest::projection::SubjectCatalogInput;
+use flotilla_manifest::projection::{subject_forge, SubjectCatalogInput};
 use flotilla_protocol::{IssueSource, RepositoryAlias, ResourceReadEnvelope, ResourceRecordProvenance, ResourceRecordType};
 use flotilla_resources::{
     ChangeRequest, Forge, Issue, K8sResourceObject, Project, Repository, RepositoryIdentity, Resource, ResourceObject,
@@ -126,20 +126,14 @@ impl Records {
                         (identity.service_url, identity.repository)
                     }
                 };
-                let Some(forge) = forges.iter().find(|forge| {
-                    forge.spec.forge_id == service || forge.spec.owns_issue_service(&service) || forge.spec.matches_host(&service)
-                }) else {
-                    continue;
-                };
+                let Some(forge) = subject_forge(&forges, &service) else { continue };
                 // Preserve the observation's service spelling: previous-generation
                 // records use hosts/URLs rather than the canonical Forge ID.
                 let mut observed_sources: Vec<_> = sources
                     .iter()
                     .filter(|source| {
                         source.scope == scope
-                            && (forge.spec.forge_id == source.service
-                                || forge.spec.owns_issue_service(&source.service)
-                                || forge.spec.matches_host(&source.service))
+                            && subject_forge(&forges, &source.service).is_some_and(|owner| owner.spec.forge_id == forge.spec.forge_id)
                     })
                     .cloned()
                     .collect();
@@ -149,9 +143,8 @@ impl Records {
                 for source in observed_sources {
                     let declaration = project.spec.issue_source_bindings.iter().find(|binding| {
                         binding.source.scope == scope
-                            && (forge.spec.forge_id == binding.source.service
-                                || forge.spec.owns_issue_service(&binding.source.service)
-                                || forge.spec.matches_host(&binding.source.service))
+                            && subject_forge(&forges, &binding.source.service)
+                                .is_some_and(|owner| owner.spec.forge_id == forge.spec.forge_id)
                     });
                     let alias = declaration
                         .and_then(|binding| binding.alias.clone())
@@ -175,13 +168,7 @@ impl Records {
                 {
                     continue;
                 }
-                let Some(forge) = forges.iter().find(|forge| {
-                    forge.spec.forge_id == binding.source.service
-                        || forge.spec.owns_issue_service(&binding.source.service)
-                        || forge.spec.matches_host(&binding.source.service)
-                }) else {
-                    continue;
-                };
+                let Some(forge) = subject_forge(&forges, &binding.source.service) else { continue };
                 references.repositories.push(RepositoryAlias {
                     project: Some(project.metadata.name.clone()),
                     alias: alias.clone(),

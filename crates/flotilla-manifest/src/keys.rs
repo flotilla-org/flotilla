@@ -178,11 +178,14 @@ pub const SEGMENT_ISSUE: &str = "flotilla.issue";
 // updated_at are Text. labels/assignees are StringList, requested-from-owner
 // and actionable-at-head are Bool. CR state: open|draft|merged|closed;
 // issue state: open|closed; checks: pass|fail|pending; mergeable:
-// mergeable|conflicting; review_decision: approved|changes_requested|none.
+// mergeable|conflicting; review_decision: approved|changes_requested|required|none.
 // Readiness: ready_to_merge|awaiting_review_response|ci_failing|conflicting|
 // draft|merged_not_landed|closed. All observed_at companions are Text.
 // Subject entities are scoped to live convoys and strictly less than 24 hours
 // after landed finished_at; failed/cancelled/abandoned links are excluded.
+// Missing status and incomplete observations use awaiting_review_response,
+// matching the existing readiness function and closed ADR vocabulary. This
+// means waiting for evidence; absence of raw fields distinguishes unknown.
 // Readiness is the ADR 0051 closed vocabulary. Orphans are deferred to the
 // producer provenance/retention follow-up; unmatched observations are excluded.
 // Attempts are ordered by generation, oldest first. The current attempt is
