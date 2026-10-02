@@ -2419,10 +2419,11 @@ async fn convoy_start_routes_to_placement_when_presentation_membership_is_stale(
     );
 }
 
-#[tokio::test]
-async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
+// Behaviour (#2340): explicit and automatic starts route using placement identity,
+// even when dispatcher observations lag. Destination credentials remain authoritative.
+async fn lagging_start_placement_scenario(explicit: bool, destination_holds_credential: bool, destination_has_capacity: bool) {
     let leader = empty_daemon_named("kiwi").await;
-    let follower = empty_daemon_named("feta").await;
+    let follower = empty_daemon_named_with_floor("feta", (!destination_has_capacity).then_some(1_000_000)).await;
     seed_host_capacity(&follower, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
     follower.set_local_placement_capabilities(&BTreeSet::from(["claude-code".to_string()]), &["cleat".to_string()]).await;
     let remote_host_id = follower.local_host_id().expect("follower host identity").to_string();
@@ -2431,7 +2432,10 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
     let mut remote_status = remote_host.status.expect("feta status");
     remote_status.capabilities.extend([
         (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["claude-code"])),
-        (HELD_CREDENTIALS_CAPABILITY.to_string(), serde_json::json!(["claude-max"])),
+        (
+            HELD_CREDENTIALS_CAPABILITY.to_string(),
+            serde_json::json!(if destination_holds_credential { vec!["claude-max"] } else { vec![] }),
+        ),
     ]);
     remote_status.heartbeat_at = Some(Utc::now());
     remote_status.daemon_generation = Some("feta-fresh-generation".to_string());
@@ -2462,6 +2466,7 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
                 && source.object.status.as_ref().is_some_and(|status| {
                     status.daemon_generation.as_deref() == Some("feta-fresh-generation")
                         && status.held_credentials().expect("decode replica held credentials").contains("claude-max")
+                            == destination_holds_credential
                 })
         });
         sources.len() == 1 && fresh_replica
@@ -2514,34 +2519,96 @@ async fn cross_host_convoy_start_uses_placement_hosts_credential_self_report() {
     })
     .await;
 
-    let mut events = topology.leader.subscribe();
-    let command_id = topology
-        .client
-        .execute(
-            Command::builder()
-                .action(CommandAction::ConvoyStart {
-                    intent: Box::new(
-                        ConvoyStartIntent::builder()
-                            .project_ref("flotilla".to_string())
-                            .name("kiwi-to-feta".to_string())
-                            .branch("fix/kiwi-to-feta".to_string())
-                            .workflow_ref("remote-workflow".to_string())
-                            .placement_policy(placement_policy)
-                            .escalation_reason("remote credentials required".to_string())
-                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
-                            .build(),
-                    ),
-                })
-                .build(),
-        )
+    // This is the replication boundary: replace the dispatcher's snapshot with
+    // an older self-report, without changing the authoritative destination.
+    let mut lagging = topology.follower.resource_backend().using::<Host>(namespace).list().await.expect("destination hosts");
+    let host = lagging.items.iter_mut().find(|host| host.metadata.name == remote_host_id).expect("destination host");
+    let status = host.status.as_mut().expect("host status");
+    status.disk_free_bytes = Some(0);
+    status.admission_free_space_floor_bytes = None;
+    status.ready = false;
+    status.heartbeat_at = Some(Utc::now() - chrono::Duration::hours(1));
+    status.capabilities.insert(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!([]));
+    status.capabilities.insert(
+        HELD_CREDENTIALS_CAPABILITY.to_string(),
+        serde_json::json!(if destination_holds_credential { vec![] } else { vec!["claude-max"] }),
+    );
+    topology
+        .leader
+        .resource_backend()
+        .replica_writer::<Host>(topology.follower.node_id().clone(), namespace)
+        .replace(&lagging, Utc::now())
         .await
-        .expect("dispatch kiwi-to-feta convoy start");
+        .expect("lag dispatcher host replica");
+    let action = CommandAction::ConvoyStart {
+        intent: Box::new(
+            ConvoyStartIntent::builder()
+                .project_ref("flotilla".to_string())
+                .name("kiwi-to-feta".to_string())
+                .branch("fix/kiwi-to-feta".to_string())
+                .workflow_ref("remote-workflow".to_string())
+                .maybe_placement_policy(explicit.then_some(placement_policy))
+                .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                .build(),
+        ),
+    };
+    // The router resolves the destination without accepting the stale refusal.
+    assert_eq!(
+        topology.leader.resolve_command_target(&action, None).await.expect("route lagging start").host,
+        TargetHost::Placement(flotilla_protocol::qualified_path::HostId::new(&remote_host_id))
+    );
+    let mut events = topology.leader.subscribe();
+    let command_id = topology.client.execute(Command::builder().action(action).build()).await.expect("dispatch kiwi-to-feta convoy start");
 
-    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted {
-        name: "kiwi-to-feta@flotilla".to_string(),
-        attach_plan: None,
-        binding: None
-    });
+    let result = await_command_result(&mut events, command_id).await;
+    if destination_holds_credential && destination_has_capacity {
+        assert_eq!(result, CommandValue::ConvoyStarted { name: "kiwi-to-feta@flotilla".to_string(), attach_plan: None, binding: None });
+    } else {
+        let CommandValue::Error { message } = result else {
+            panic!("expected credential refusal: {result:?}");
+        };
+        if destination_has_capacity {
+            assert!(message.contains("does not hold"), "{message}");
+        } else {
+            assert!(message.contains("below the 1000000.0 GiB floor"), "{message}");
+        }
+    }
+    for (daemon, expected) in
+        [(&topology.leader, 0), (&topology.follower, usize::from(destination_holds_credential && destination_has_capacity))]
+    {
+        assert_eq!(daemon.resource_backend().using::<Convoy>(namespace).list().await.expect("authored convoys").items.len(), expected);
+    }
+}
+
+#[tokio::test]
+async fn explicit_start_routes_with_lagging_dispatcher_observations() {
+    lagging_start_placement_scenario(true, true, true).await;
+}
+
+#[tokio::test]
+async fn automatic_start_routes_with_lagging_dispatcher_observations() {
+    lagging_start_placement_scenario(false, true, true).await;
+}
+
+#[tokio::test]
+async fn automatic_start_destination_refuses_optimistic_credential_replica() {
+    lagging_start_placement_scenario(false, false, true).await;
+}
+
+#[tokio::test]
+async fn automatic_start_destination_refuses_capacity_with_lagging_replica() {
+    lagging_start_placement_scenario(false, true, false).await;
+}
+
+// Generator spans both routing choices and destination credential/capacity boundaries.
+// Every scenario checks the router, request dispatch, result, and authored stores.
+#[hegel::test]
+fn generated_start_placement_with_lagging_replicas(tc: hegel::TestCase) {
+    let explicit = tc.draw(gs::booleans());
+    let destination_holds_credential = tc.draw(gs::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("paused runtime");
+    let destination_has_capacity = tc.draw(gs::booleans());
+    runtime.block_on(lagging_start_placement_scenario(explicit, destination_holds_credential, destination_has_capacity));
 }
 
 #[tokio::test]
