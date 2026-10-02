@@ -159,6 +159,8 @@ environment must provide GNU `timeout`; it supervises `find` and `rm` together
 and kills remaining children after a five-second grace period. The client
 deadline is ten seconds longer. A failed or timed-out root logs a warning and
 the sweep continues with the next root. Local sweeps retain their native path.
+If the environment lacks GNU `timeout`, the warning names the dependency and
+asks the operator to install coreutils; no unbounded fallback sweep starts.
 
 ## Checkout removal concurrency
 

@@ -410,6 +410,11 @@ find "$1" ! -path "$1" -type d -prune -mmin "+$2" -exec rm -rf -- {} +"#;
             deadline + std::time::Duration::from_secs(10),
         )
         .await
+        .map_err(|error| {
+            format!(
+                "remote archive retention sweep failed (requires GNU timeout with --kill-after; install coreutils in the target environment): {error}"
+            )
+        })
         .map(|_| ())
 }
 
@@ -2171,6 +2176,17 @@ mod tests {
         assert_eq!(calls.len(), 1, "one deadline covers the whole root");
         assert_eq!(calls[0].0, "timeout", "deadline must run inside the target environment");
         assert!(calls[0].3 > std::time::Duration::from_secs(300), "client allows remote cleanup to finish");
+    }
+
+    #[tokio::test]
+    async fn remote_archive_retention_failure_names_the_required_supervisor() {
+        let runner = crate::providers::testing::TimeoutOnlyRunner::new(Err("timeout: not found".into()));
+        let error = prune_remote_checkout_archives(&runner, Path::new("/archives"), 14, std::time::Duration::from_secs(300))
+            .await
+            .expect_err("missing supervisor refuses an unbounded sweep");
+        assert!(error.contains("GNU timeout"), "dependency should be named: {error}");
+        assert!(error.contains("install coreutils"), "operator should have an actionable remedy: {error}");
+        assert!(error.contains("timeout: not found"), "original command error should be preserved: {error}");
     }
 
     #[tokio::test]
