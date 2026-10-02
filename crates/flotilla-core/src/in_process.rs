@@ -2714,10 +2714,13 @@ impl InProcessDaemon {
                     }
                 };
                 drop(daemon);
+                let mut namespace_check = tokio::time::interval(Duration::from_secs(1));
+                namespace_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                namespace_check.tick().await;
                 loop {
                     let event = tokio::select! {
                         event = watch.next() => event,
-                        _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        _ = namespace_check.tick() => {
                             let Some(daemon) = weak.upgrade() else { return };
                             if daemon.provisioning_namespace().await != namespace {
                                 break;

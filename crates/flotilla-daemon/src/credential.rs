@@ -35,8 +35,13 @@ find "$1" -type f -name 'token-*' ! -name '*.in-use.*' -exec sh -c '
       [ -f "$marker" ] || continue
       pid=${marker##*.}
       case "$pid" in *[!0-9]*|"") active=true; continue ;; esac
-      if kill -0 "$pid" 2>/dev/null; then active=true; else dead_owner=true; rm -f -- "$marker"; fi
+      if signal_error=$(kill -0 "$pid" 2>&1); then active=true; continue; fi
+      case "$signal_error" in *[Pp]ermiss*|*permitted*) active=true; continue ;; esac
+      dead_owner=true
+      rm -f -- "$marker"
     done
+    # A stager creates its marker before reading the token. Marker-less tokens
+    # may have just been minted, so only age can make them eligible for cleanup.
     if [ "$active" = false ] && { [ "$dead_owner" = true ] || [ -n "$(find "$token" -prune -mtime +6 -print)" ]; }; then
       rm -f -- "$token"
     fi

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use super::{ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSessionTag, TerminalSize};
 use crate::{
     path_context::ExecutionEnvironmentPath,
-    providers::{run, CommandRunner},
+    providers::{run, ChannelLabel, CommandRunner},
 };
 
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
@@ -26,11 +26,12 @@ case "$pid" in *[!0-9]*|"") exit 0 ;; esac
 for marker in "$1/$2/sessions/"*/.flotilla-recovered; do
   [ -f "$marker" ] && [ ! -L "$marker" ] || continue
   [ -n "$(find "$marker" -prune -mtime +6 -print)" ] || continue
-  # A reused PID delays cleanup. It can never turn a live daemon into a target.
-  if ! kill -0 "$pid" 2>/dev/null; then
-    session=${marker%/.flotilla-recovered}
-    rm -rf -- "$session"
-  fi
+  # Cleat and its runner share a PID namespace. PID reuse and EPERM both
+  # conservatively retain the recording.
+  if signal_error=$(kill -0 "$pid" 2>&1); then continue; fi
+  case "$signal_error" in *[Pp]ermiss*|*permitted*) continue ;; esac
+  session=${marker%/.flotilla-recovered}
+  rm -rf -- "$session"
 done"#;
 const RECORDING_RETAIN_SCRIPT: &str = r#"session="$1/$2/sessions/$3"
 if [ -f "$session/session.cast" ]; then touch "$session/.flotilla-recovered"; fi"#;
@@ -91,20 +92,29 @@ impl CleatTerminalPool {
         }
     }
 
-    async fn prune_retained_recordings(&self) -> Result<(), String> {
-        let output = run!(self.runner, &self.binary, &["daemons", "--json"], Path::new("/"))?;
+    async fn dead_recording_daemons(runner: &dyn CommandRunner, binary: &str) -> Result<Vec<DaemonInfo>, String> {
+        let output = runner.run(binary, &["daemons", "--json"], Path::new("/"), &ChannelLabel::Default).await?;
         let daemons: Vec<DaemonInfo> = serde_json::from_str(&output).map_err(|error| format!("parse cleat daemon list: {error}"))?;
-        for daemon in daemons.into_iter().filter(|daemon| !daemon.alive && valid_recording_daemon(daemon)) {
-            self.runner
+        Ok(daemons.into_iter().filter(|daemon| !daemon.alive && valid_recording_daemon(daemon)).collect())
+    }
+
+    async fn prune_retained_recordings_with(runner: &dyn CommandRunner, binary: &str) -> Result<(), String> {
+        for daemon in Self::dead_recording_daemons(runner, binary).await? {
+            runner
                 .run(
                     "sh",
                     &["-c", RECORDING_PRUNE_SCRIPT, "flotilla-prune-cleat-recordings", &daemon.runtime_root, &daemon.name],
                     Path::new("/"),
-                    &crate::providers::ChannelLabel::Default,
+                    &ChannelLabel::Default,
                 )
                 .await?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    async fn prune_retained_recordings(&self) -> Result<(), String> {
+        Self::prune_retained_recordings_with(self.runner.as_ref(), &self.binary).await
     }
 
     async fn prune_recordings_if_due(&self) {
@@ -114,9 +124,13 @@ impl CleatTerminalPool {
         }
         *last = Instant::now();
         drop(last);
-        if let Err(error) = self.prune_retained_recordings().await {
-            tracing::warn!(%error, "prune retained cleat recordings failed");
-        }
+        let runner = Arc::clone(&self.runner);
+        let binary = self.binary.clone();
+        tokio::spawn(async move {
+            if let Err(error) = Self::prune_retained_recordings_with(runner.as_ref(), &binary).await {
+                tracing::warn!(%error, "prune retained cleat recordings failed");
+            }
+        });
     }
 
     fn parse_list_output(json: &str) -> Result<Vec<SessionInfo>, String> {
@@ -184,15 +198,14 @@ impl TerminalPool for CleatTerminalPool {
         if session_id.is_empty() || session_id == "." || session_id == ".." || session_id.contains('/') {
             return Err("invalid recovered cleat session id".to_string());
         }
-        let output = run!(self.runner, &self.binary, &["daemons", "--json"], Path::new("/"))?;
-        let daemons: Vec<DaemonInfo> = serde_json::from_str(&output).map_err(|error| format!("parse cleat daemon list: {error}"))?;
-        for daemon in daemons.into_iter().filter(|daemon| !daemon.alive && valid_recording_daemon(daemon)) {
+        // The old ID may have recordings in more than one dead generation.
+        for daemon in Self::dead_recording_daemons(self.runner.as_ref(), &self.binary).await? {
             self.runner
                 .run(
                     "sh",
                     &["-c", RECORDING_RETAIN_SCRIPT, "flotilla-retain-cleat-recording", &daemon.runtime_root, &daemon.name, session_id],
                     Path::new("/"),
-                    &crate::providers::ChannelLabel::Default,
+                    &ChannelLabel::Default,
                 )
                 .await?;
         }

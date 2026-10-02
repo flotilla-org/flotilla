@@ -5340,10 +5340,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 ("RUSTC_WORKSPACE_WRAPPER".to_string(), wrapper.display().to_string()),
             ]);
         }
-        // A dead generation may retain a recording with the old ID. Keep that
-        // recording for recovery and launch into the current generation under
-        // a fresh ID so cleat cannot resolve the name ambiguously. #2254
-        // tracks retention and cleanup of old-generation recordings.
+        // A dead generation may retain a recording with the old ID. Launch
+        // under a fresh ID so cleat cannot resolve the name ambiguously, then
+        // mark the old recording for retention after the launch succeeds.
         let recovered_from_lost = matches!(pool.session_liveness(name).await?, TerminalSessionLiveness::Lost(_));
         let session_id = if recovered_from_lost { format!("{name}-{}", uuid::Uuid::new_v4()) } else { name.to_string() };
         if is_agent_session && pool.list_sessions().await?.iter().any(|session| session.session_name == session_id) {

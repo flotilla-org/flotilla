@@ -29,8 +29,11 @@ for abandoned in "${destination}.flotilla-staging."* "${destination}.flotilla-so
   [ -d "$abandoned" ] && [ ! -L "$abandoned" ] || continue
   owner=${abandoned##*.}
   case "$owner" in *[!0-9]*|'') continue ;; esac
-  # A reused PID is harmless: it delays reclamation rather than touching a live stage.
-  if ! kill -0 "$owner" 2>/dev/null; then rm -rf -- "$abandoned"; fi
+  # Staging shells and this pass share a user and PID namespace. A reused PID
+  # delays reclamation; an EPERM response must not remove another user's work.
+  if signal_error=$(kill -0 "$owner" 2>&1); then continue; fi
+  case "$signal_error" in *[Pp]ermiss*|*permitted*) continue ;; esac
+  rm -rf -- "$abandoned"
 done
 cleanup() {
   rm -rf "$staged" "$sources"

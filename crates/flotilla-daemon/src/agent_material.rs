@@ -1107,7 +1107,7 @@ esac
         assert!(calls[0].1[1].contains("credential.helper="), "public fetches must clear the project credential helper");
         assert!(calls[0].1[1].contains("pinned revision does not exist"));
         assert!(calls[0].1[1].contains("init --quiet"));
-        assert!(!calls[0].1[1].contains("2>&1"), "git failures must retain their stderr diagnostics");
+        assert!(calls[0].1[1].contains("2>\"$sources/fetch.stderr\""), "git failures must retain their stderr diagnostics");
         assert!(calls[0].1[1].contains("sparse-checkout set --no-cone --stdin"));
         assert!(calls[0].1[1].contains("skill source $name declared path $path is missing at pinned revision $revision"));
         assert!(calls[0].1[1].contains("skill source $name declared path $path has no SKILL.md at pinned revision $revision"));
