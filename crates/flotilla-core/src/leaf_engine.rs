@@ -15,12 +15,12 @@ use flotilla_resources::{
     evaluate_leaf, expected_change_request_leaves, external_patches, instantiate_exit, instantiate_turn_delivery, select_convoy_children,
     subject_relationship_conflicts, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Checkout, CheckoutSpec,
     ControllerRetry, Convoy, ConvoyAttention, ConvoyEnsure, ConvoyLeafSubject, ConvoyPhase, ConvoyStatus, Forge, HoldAct, InstantiatedExit,
-    Issue, IssueLeafSubject, LeafMaker, Project, ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallProposedDisposition, StallRung, StallSupervisor,
-    StalledCondition, StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung,
-    Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL,
-    VESSEL_LABEL,
+    Issue, IssueLeafSubject, LeafMaker, NudgeObligation, Project, ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError,
+    ResourceObject, ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallProposedDisposition, StallRung,
+    StallSupervisor, StalledCondition, StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
+    TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::{
@@ -874,18 +874,33 @@ impl ReconcilerWake {
     }
 
     async fn judge_stalls(&self, namespace: &str, convoys: &HashMap<String, ResourceObject<Convoy>>) -> Result<(), String> {
+        self.judge_stalls_at(namespace, convoys, Utc::now()).await
+    }
+
+    async fn judge_stalls_at(
+        &self,
+        namespace: &str,
+        convoys: &HashMap<String, ResourceObject<Convoy>>,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
         let backend = &self.subscriptions.inner.backend;
         let projects = backend.including_replicas::<Project>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let available_convoys = backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let available_ensures =
             backend.including_replicas::<ConvoyEnsure>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let sessions = backend.including_replicas::<TerminalSession>(namespace).list().await.map_err(|error| error.to_string())?.items;
-        let observations = backend.including_replicas::<ChangeRequest>(namespace).list().await.map_err(|error| error.to_string())?.items;
+        let observation_list = backend.including_replicas::<ChangeRequest>(namespace).list().await.map_err(|error| error.to_string())?;
+        let progress_observations = freshest_change_requests(&change_request_sources(observation_list.clone()));
+        let observations = observation_list.items;
+        let checkouts = backend.including_replicas::<Checkout>(namespace).list().await.map_err(|error| error.to_string())?.items;
+        let vessels = backend.including_replicas::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let rows = self.subscriptions.rows().await;
-        let now = Utc::now();
         for convoy in convoys.values() {
             let Some(status) = &convoy.status else { continue };
             let selected_sessions = select_convoy_children(convoy, &sessions);
+            let selected_vessels = select_convoy_children(convoy, &vessels);
+            let selected_checkouts = select_convoy_children(convoy, &checkouts);
+            let mut obligations = status.nudge_obligations.clone();
             let holding = matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing | ConvoyPhase::Anchored);
             if let Some(stalled) =
                 status.stalled.as_ref().filter(|stalled| stalled.supervisor.is_some() && stalled.source != StallEvidenceSource::Crew)
@@ -900,6 +915,19 @@ impl ReconcilerWake {
                                 })
                         });
                     if source_working {
+                        for obligation in &mut obligations {
+                            if matches!(&obligation.maker, LeafMaker::Actor { vessel: actor_vessel, role: actor_role } if actor_vessel == vessel && actor_role == role)
+                            {
+                                obligation.quiet_since = None;
+                            }
+                        }
+                        flotilla_resources::apply_status_patch(
+                            &backend.clone().using::<Convoy>(namespace),
+                            &convoy.metadata.name,
+                            &flotilla_resources::ConvoyStatusPatch::SetNudgeObligations { obligations },
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
                         flotilla_resources::apply_status_patch(
                             &backend.clone().using::<Convoy>(namespace),
                             &convoy.metadata.name,
@@ -919,6 +947,18 @@ impl ReconcilerWake {
                     && (status.phase != ConvoyPhase::Active || !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }))
                     && matches!(&row.watcher, LeafWatcher::ReconcilerWake { convoy: name } | LeafWatcher::TurnDelivery { convoy: name, .. } if name == &convoy.metadata.name)
             }).collect::<Vec<_>>();
+            obligations.retain(|obligation| match &obligation.maker {
+                LeafMaker::Actor { vessel, role } => {
+                    !status.phase.is_terminal()
+                        && !status
+                            .crew_work
+                            .get(vessel)
+                            .and_then(|crew| crew.get(role))
+                            .is_some_and(|work| work.phase == flotilla_resources::CrewWorkPhase::Done)
+                }
+                _ => false,
+            });
+            let mut progress_changed = false;
             let mut unable = None;
             let mut able = false;
             let mut unknown = false;
@@ -945,6 +985,108 @@ impl ReconcilerWake {
                                 && session.metadata.labels.get(VESSEL_LABEL) == Some(vessel)
                                 && session.metadata.labels.get(ROLE_LABEL) == Some(role)
                         });
+                        let index =
+                            obligations.iter().position(|obligation| obligation.maker == row.maker && obligation.leaves == row.leaves);
+                        let obligation = if let Some(index) = index {
+                            &mut obligations[index]
+                        } else {
+                            let history = status
+                                .stalled
+                                .as_ref()
+                                .filter(|stall| stall.maker.as_ref() == Some(&row.maker) && stall.leaves == row.leaves)
+                                .map_or_else(Vec::new, |stall| stall.nudge_history.clone());
+                            obligations.push(
+                                NudgeObligation::builder().maker(row.maker.clone()).leaves(row.leaves.clone()).history(history).build(),
+                            );
+                            obligations.last_mut().expect("inserted obligation")
+                        };
+                        // Only observed revisions reset a budget. Missing/unknown
+                        // records and routine refresh timestamps are not progress.
+                        let checkout_refs = selected_vessels
+                            .values()
+                            .filter(|object| object.spec.vessel_name == *vessel)
+                            .flat_map(|object| object.status.iter().flat_map(|status| status.checkout_refs.values()))
+                            .collect::<HashSet<_>>();
+                        let mut progress = BTreeMap::new();
+                        for checkout in selected_checkouts.values() {
+                            if checkout_refs.contains(&checkout.metadata.name) {
+                                if let Some(commit) = checkout
+                                    .status
+                                    .as_ref()
+                                    .and_then(|status| status.integration.head_revision.as_ref().or(status.commit.as_ref()))
+                                {
+                                    progress.insert(format!("checkout/{}", checkout.metadata.name), commit.clone());
+                                }
+                                if let Some(status) = &checkout.status {
+                                    for (reference, observation) in &status.integration.remote_refs {
+                                        progress.insert(format!("push/{}/{reference}", checkout.metadata.name), observation.digest.clone());
+                                    }
+                                }
+                            }
+                        }
+                        for subject in flotilla_resources::active_change_request_subjects(convoy)? {
+                            for object in progress_observations.values() {
+                                if object.spec.service == subject.source.service
+                                    && object.spec.scope == subject.source.scope
+                                    && object.spec.number.to_string() == subject.id
+                                {
+                                    if let Some(head) = object.status.as_ref().and_then(|status| status.head_sha.value.as_ref()) {
+                                        progress.insert(format!("cr/{}", object.metadata.name), head.clone());
+                                    }
+                                }
+                            }
+                        }
+                        let changed = progress.iter().any(|(key, value)| obligation.progress.get(key).is_some_and(|prior| prior != value));
+                        if changed {
+                            obligation.history.clear();
+                            obligation.quiet_since = None;
+                            progress_changed = true;
+                        }
+                        obligation.progress.extend(progress);
+                        let session_status = session.and_then(|session| session.status.as_ref());
+                        let message_id = session.and_then(|session| match &session.spec.source {
+                            TerminalSessionSource::Agent { message, .. } => message.as_ref().map(|message| message.id.clone()),
+                            _ => None,
+                        });
+                        let delivered_id = session_status.and_then(|status| status.delivered_message_id.clone());
+                        if message_id != obligation.message_id || delivered_id != obligation.delivered_message_id {
+                            obligation.quiet_since = None;
+                            obligation.message_id = message_id.clone();
+                            obligation.delivered_message_id = delivered_id;
+                        }
+                        let pending_message = session.is_some_and(|session| match &session.spec.source {
+                            TerminalSessionSource::Agent { message: Some(message), .. } => !message
+                                .delivered_through(session_status.and_then(|status| status.delivered_message_id.as_deref()), &message.id),
+                            _ => false,
+                        });
+                        if let Some(attention) = session_status.and_then(|status| status.attention.as_ref()) {
+                            if obligation
+                                .last_attention_at
+                                .is_some_and(|previous| attention.as_of.signed_duration_since(previous) >= TerminalAttention::FRESH_FOR)
+                            {
+                                obligation.quiet_since = None;
+                            }
+                            obligation.last_attention_at = Some(attention.as_of);
+                            if attention.source == TerminalAttentionSource::Hook && obligation.last_hook_at != Some(attention.as_of) {
+                                obligation.quiet_since = None;
+                                obligation.last_hook_at = Some(attention.as_of);
+                            }
+                            if attention.state != TerminalAttentionState::Idle || attention.is_stale_at(now) || pending_message {
+                                obligation.quiet_since = None;
+                            } else {
+                                obligation.quiet_since.get_or_insert(now);
+                            }
+                        } else {
+                            obligation.quiet_since = None;
+                        }
+                        let idle_grace = chrono::Duration::seconds(i64::from(
+                            status
+                                .workflow_snapshot
+                                .as_ref()
+                                .and_then(|workflow| workflow.stall_nudges.get(&format!("{vessel}/{role}")))
+                                .and_then(|policy| policy.idle_grace_seconds)
+                                .unwrap_or(180),
+                        ));
                         let lost_reason = session
                             .and_then(|session| session.status.as_ref())
                             .filter(|status| status.phase == TerminalSessionPhase::Lost)
@@ -990,16 +1132,21 @@ impl ReconcilerWake {
                                         TerminalAttentionSource::Screen => StallEvidenceSource::Screen,
                                         TerminalAttentionSource::Hook => StallEvidenceSource::Hook,
                                     };
-                                    let debounce = match attention.source {
-                                        TerminalAttentionSource::Screen => TerminalAttention::DEBOUNCE_FOR,
-                                        TerminalAttentionSource::Hook => chrono::Duration::zero(),
-                                    };
-                                    if self
+                                    if attention.state == TerminalAttentionState::Idle {
+                                        if obligation.quiet_since.is_none_or(|since| now.signed_duration_since(since) < idle_grace) {
+                                            unknown = true;
+                                            continue;
+                                        }
+                                    } else if self
                                         .maker_debouncing(
                                             row.id,
                                             UnableEvidenceKey::Attention { state: attention.state, source: attention.source },
                                             attention.as_of,
-                                            debounce,
+                                            if attention.source == TerminalAttentionSource::Hook {
+                                                chrono::Duration::zero()
+                                            } else {
+                                                TerminalAttention::DEBOUNCE_FOR
+                                            },
                                             now,
                                         )
                                         .await
@@ -1180,6 +1327,7 @@ impl ReconcilerWake {
             }
             if status.stalled.as_ref().is_some_and(|stalled| stalled.supervision_exhausted)
                 && !able
+                && !progress_changed
                 && status.phase == ConvoyPhase::Active
                 && actionable_rows > 0
             {
@@ -1192,6 +1340,10 @@ impl ReconcilerWake {
                     (Vec::new(), None, "no armed row with an able maker".into(), StallEvidenceSource::LeafEngine)
                 };
                 let prior = status.stalled.as_ref().filter(|prior| prior.leaves == leaves && prior.maker == maker);
+                let nudge_history = obligations
+                    .iter()
+                    .find(|obligation| Some(&obligation.maker) == maker.as_ref() && obligation.leaves == leaves)
+                    .map_or_else(Vec::new, |obligation| obligation.history.clone());
                 let mut condition = StalledCondition {
                     leaves,
                     maker,
@@ -1205,7 +1357,7 @@ impl ReconcilerWake {
                     supervision_exhausted: false,
                     reason: None,
                     proposed_disposition: None,
-                    nudge_history: prior.map_or_else(Vec::new, |stalled| stalled.nudge_history.clone()),
+                    nudge_history,
                 };
                 let declared = status
                     .stalled
@@ -1268,13 +1420,23 @@ impl ReconcilerWake {
                             refusal.map_or(0, |refusal| refusal.consecutive_count),
                             refusal.map_or("", |refusal| refusal.expectation.as_str())
                         );
-                    } else if let Some(idle_at) = idle_at.filter(|_| declared.is_none() && !resume_grace) {
+                    } else if idle_at.is_some() && declared.is_none() && !resume_grace {
                         let limit = status
                             .workflow_snapshot
                             .as_ref()
                             .and_then(|workflow| workflow.stall_nudges.get(&format!("{vessel}/{role}")))
                             .map_or(2, |policy| policy.max_per_episode) as usize;
-                        let new_idle = condition.nudge_history.last().is_none_or(|nudge| idle_at > nudge.at);
+                        let grace_seconds = status
+                            .workflow_snapshot
+                            .as_ref()
+                            .and_then(|workflow| workflow.stall_nudges.get(&format!("{vessel}/{role}")))
+                            .and_then(|policy| policy.idle_grace_seconds)
+                            .unwrap_or(180);
+                        let backoff = chrono::Duration::seconds(
+                            i64::from(grace_seconds.max(1))
+                                .saturating_mul(1_i64 << condition.nudge_history.len().saturating_sub(1).min(20)),
+                        );
+                        let due = condition.nudge_history.last().is_none_or(|nudge| now.signed_duration_since(nudge.at) >= backoff);
                         if prior.is_some_and(|stalled| {
                             stalled.rung == StallRung::Operator && stalled.evidence.starts_with("nudge delivery failed:")
                         }) {
@@ -1282,7 +1444,7 @@ impl ReconcilerWake {
                             condition.evidence = prior.expect("checked above").evidence.clone();
                         } else if condition.nudge_history.len() < limit {
                             condition.rung = StallRung::Nudge;
-                            if new_idle {
+                            if due {
                                 let leaf = row.leaves.first().ok_or_else(|| "actor row has no leaf".to_string())?;
                                 let brief = if let Some(refusal) = refusal {
                                     // These text matches are temporary until typed refusal causes land in #2211.
@@ -1320,14 +1482,23 @@ impl ReconcilerWake {
                                     .sender(flotilla_resources::CrewMessageSender::FlotillaNudge)
                                     .build();
                                 match self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&request).await {
-                                    Ok(_) => condition.nudge_history.push(StallNudge { at: now, row: leaf.clone() }),
+                                    Ok(_) => {
+                                        condition.nudge_history.push(StallNudge { at: now, row: leaf.clone() });
+                                        if let Some(obligation) = obligations
+                                            .iter_mut()
+                                            .find(|obligation| obligation.maker == row.maker && obligation.leaves == row.leaves)
+                                        {
+                                            obligation.history = condition.nudge_history.clone();
+                                            obligation.quiet_since = Some(now);
+                                        }
+                                    }
                                     Err(error) => {
                                         condition.rung = StallRung::Operator;
                                         condition.evidence = format!("nudge delivery failed: {error}");
                                     }
                                 }
                             }
-                        } else if !new_idle {
+                        } else if !due {
                             condition.rung = StallRung::Nudge;
                         }
                     }
@@ -1511,6 +1682,15 @@ impl ReconcilerWake {
                     })
                     .cloned()
             };
+            if status.nudge_obligations != obligations {
+                flotilla_resources::apply_status_patch(
+                    &backend.clone().using::<Convoy>(namespace),
+                    &convoy.metadata.name,
+                    &flotilla_resources::ConvoyStatusPatch::SetNudgeObligations { obligations },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            }
             if status.stalled != next {
                 if let Err(error) = flotilla_resources::apply_status_patch(
                     &backend.clone().using::<Convoy>(namespace),
@@ -2393,6 +2573,279 @@ mod tests {
         (backend, wake, delivery)
     }
 
+    // Exercise the actor-row scenario through resource observations and the
+    // recording delivery collaborator, with explicit time rather than sleeps.
+    async fn idle_nudge_scenario() -> (ResourceBackend, ReconcilerWake, Arc<RecordingTurnDelivery>) {
+        let (backend, wake, delivery) = project_supervision_case(&[]).await;
+        let convoys = backend.using::<Convoy>("flotilla");
+        let convoy = convoys.get("stalled-work").await.expect("convoy");
+        let mut status = convoy.status.expect("status");
+        status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
+        convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.expect("working crew");
+        let sessions = backend.clone().using::<TerminalSession>("flotilla");
+        let session = sessions
+            .create(
+                &InputMeta::builder()
+                    .name("resumed-coder".into())
+                    .labels(BTreeMap::from([
+                        (CONVOY_LABEL.into(), "stalled-work".into()),
+                        (VESSEL_LABEL.into(), "work".into()),
+                        (ROLE_LABEL.into(), "coder".into()),
+                    ]))
+                    .build(),
+                &flotilla_resources::TerminalSessionSpec {
+                    env_ref: "env".into(),
+                    role: "coder".into(),
+                    source: TerminalSessionSource::Agent {
+                        selector: flotilla_resources::Selector::for_capability("coding"),
+                        brief: flotilla_resources::TerminalBrief {
+                            path: "brief.md".into(),
+                            content: "Initial".into(),
+                            artifact_digest: None,
+                            copies: Vec::new(),
+                        },
+                        context: Box::new(flotilla_resources::TerminalCrewContext {
+                            namespace: "flotilla".into(),
+                            convoy: "stalled-work".into(),
+                            vessel_ref: "work".into(),
+                        }),
+                        message: Some(flotilla_resources::TerminalCrewMessage {
+                            id: "resume-brief".into(),
+                            text: "Continue with the operator's guidance".into(),
+                            sender: flotilla_resources::CrewMessageSender::OperatorResume { principal: None },
+                            delivery: flotilla_resources::CrewMessageDelivery::Queued,
+                            following: Vec::new(),
+                        }),
+                    },
+                    cwd: "/workspace".into(),
+                    pool: "cleat".into(),
+                },
+            )
+            .await
+            .expect("crew session");
+        let mut spec = session.spec.clone();
+        let TerminalSessionSource::Agent { message, .. } = &mut spec.source else { panic!("agent") };
+        *message = None;
+        sessions
+            .update(
+                &InputMeta::builder().name(session.metadata.name.clone()).labels(session.metadata.labels.clone()).build(),
+                &session.metadata.resource_version,
+                &spec,
+            )
+            .await
+            .expect("no pending brief");
+        (backend, wake, delivery)
+    }
+
+    async fn observe_actor(backend: &ResourceBackend, wake: &ReconcilerWake, state: TerminalAttentionState, now: DateTime<Utc>) {
+        observe_actor_source(backend, wake, state, TerminalAttentionSource::Screen, now).await;
+    }
+
+    async fn observe_actor_source(
+        backend: &ResourceBackend,
+        wake: &ReconcilerWake,
+        state: TerminalAttentionState,
+        source: TerminalAttentionSource,
+        now: DateTime<Utc>,
+    ) {
+        let sessions = backend.using::<TerminalSession>("flotilla");
+        let session = sessions.get("resumed-coder").await.expect("session");
+        sessions
+            .update_status("resumed-coder", &session.metadata.resource_version, &flotilla_resources::TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                attention: Some(TerminalAttention { state, as_of: now, source }),
+                ..Default::default()
+            })
+            .await
+            .expect("observe hook");
+        let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+        wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), now).await.expect("judge scenario");
+    }
+
+    async fn observe_claude_hook(backend: &ResourceBackend, wake: &ReconcilerWake, event: &str, now: DateTime<Utc>) {
+        use crate::agents::hooks::{ClaudeCodeParser, HarnessHookParser};
+        let parsed = ClaudeCodeParser.parse_event(event, br#"{"session_id":"claude-scenario"}"#).expect("Claude hook");
+        let state = match parsed.event_type {
+            flotilla_protocol::AgentEventType::Active => TerminalAttentionState::Working,
+            flotilla_protocol::AgentEventType::Idle => TerminalAttentionState::Idle,
+            other => panic!("unexpected hook: {other:?}"),
+        };
+        observe_actor_source(backend, wake, state, TerminalAttentionSource::Hook, now).await;
+    }
+
+    #[tokio::test]
+    async fn claude_stop_flickers_and_nudge_reply_do_not_nudge_active_work() {
+        let (backend, wake, delivery) = idle_nudge_scenario().await;
+        let start = Utc::now();
+        for second in (0..900).step_by(30) {
+            observe_claude_hook(&backend, &wake, "pre-tool-use", start + chrono::Duration::seconds(second)).await;
+            observe_claude_hook(&backend, &wake, "post-tool-use", start + chrono::Duration::seconds(second + 1)).await;
+            observe_claude_hook(&backend, &wake, "stop", start + chrono::Duration::seconds(second + 2)).await;
+        }
+        assert!(delivery.requests.lock().expect("deliveries").is_empty(), "per-response Stop is not sustained idle");
+        // Finally rest long enough to receive a nudge, then reply to it.
+        for second in [900, 960, 1020, 1080] {
+            observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        }
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
+        observe_claude_hook(&backend, &wake, "user-prompt-submit", start + chrono::Duration::seconds(1081)).await;
+        observe_claude_hook(&backend, &wake, "stop", start + chrono::Duration::seconds(1082)).await;
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "reply Stop must not rearm the nudge budget");
+    }
+
+    #[tokio::test]
+    async fn genuine_idle_has_obligation_budget_backoff_and_operator_escalation() {
+        let (backend, wake, delivery) = idle_nudge_scenario().await;
+        let start = Utc::now();
+        for second in [0, 60, 120, 179] {
+            observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        }
+        assert!(delivery.requests.lock().expect("deliveries").is_empty());
+        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(180)).await;
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
+        // A brief working flicker cannot replenish the unmet claim's budget.
+        observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(181)).await;
+        for second in [182, 240, 300, 359] {
+            observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        }
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
+        for second in [362, 420, 480, 540, 600, 659] {
+            observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        }
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 2);
+        let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+        assert_eq!(convoy.status.expect("status").stalled.expect("stall").rung, StallRung::Nudge);
+        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(722)).await;
+        let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+        assert_eq!(convoy.status.expect("status").stalled.expect("stall").rung, StallRung::Operator);
+        observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(723)).await;
+        for second in [724, 780, 840, 900, 960, 1020] {
+            observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        }
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 2, "working does not reset an obligation budget");
+    }
+
+    #[tokio::test]
+    async fn operator_message_and_repeated_stop_restart_grace_without_replenishing_budget() {
+        let (backend, wake, delivery) = idle_nudge_scenario().await;
+        let start = Utc::now();
+        for second in [0, 60, 120, 180] {
+            observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        }
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
+        let sessions = backend.using::<TerminalSession>("flotilla");
+        let session = sessions.get("resumed-coder").await.expect("session");
+        let mut spec = session.spec.clone();
+        let TerminalSessionSource::Agent { message, .. } = &mut spec.source else { panic!("agent") };
+        *message = Some(flotilla_resources::TerminalCrewMessage {
+            id: "owner-guidance".into(),
+            text: "Keep working on the fix".into(),
+            sender: flotilla_resources::CrewMessageSender::OperatorResume { principal: None },
+            delivery: flotilla_resources::CrewMessageDelivery::Queued,
+            following: Vec::new(),
+        });
+        sessions.update(&InputMeta::from(&session.metadata), &session.metadata.resource_version, &spec).await.expect("owner guidance");
+        for second in [240, 300, 360, 420] {
+            observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        }
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "pending owner guidance is never displaced");
+        let session = sessions.get("resumed-coder").await.expect("session");
+        let mut status = session.status.expect("status");
+        status.delivered_message_id = Some("owner-guidance".into());
+        sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("deliver guidance");
+        // Judge delivery without replacing its receipt with the scenario helper.
+        let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+        wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), start + chrono::Duration::seconds(421))
+            .await
+            .expect("delivery grace");
+        for second in [480, 540, 600] {
+            let session = sessions.get("resumed-coder").await.expect("session");
+            let mut status = session.status.expect("status");
+            status.attention = Some(TerminalAttention {
+                state: TerminalAttentionState::Idle,
+                source: TerminalAttentionSource::Hook,
+                as_of: start + chrono::Duration::seconds(second),
+            });
+            sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("response Stop");
+            let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+            wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), start + chrono::Duration::seconds(second))
+                .await
+                .expect("response grace");
+        }
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "hook activity extends grace");
+        let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+        assert_eq!(convoy.status.expect("status").nudge_obligations[0].history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn observed_commit_resets_budget_but_refresh_does_not() {
+        let (backend, wake, delivery) = idle_nudge_scenario().await;
+        let checkouts = backend.using::<Checkout>("flotilla");
+        let checkout = checkouts
+            .create(
+                &InputMeta::builder()
+                    .name("actor-checkout".into())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.into(), "stalled-work".into())]))
+                    .build(),
+                &CheckoutSpec::Observed(
+                    flotilla_resources::ObservedCheckoutSpec::builder()
+                        .r#ref("work".into())
+                        .path("/workspace".into())
+                        .repo_ref(flotilla_protocol::RepositoryKey("repo".into()))
+                        .host_ref("host".into())
+                        .is_main(false)
+                        .build(),
+                ),
+            )
+            .await
+            .expect("checkout");
+        let mut checkout_status = flotilla_resources::CheckoutStatus::default();
+        checkout_status.integration.head_revision = Some("before".into());
+        checkouts.update_status("actor-checkout", &checkout.metadata.resource_version, &checkout_status).await.expect("initial HEAD");
+        let vessels = backend.using::<Vessel>("flotilla");
+        let vessel = vessels
+            .create(
+                &InputMeta::builder()
+                    .name("actor-vessel".into())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.into(), "stalled-work".into())]))
+                    .build(),
+                &flotilla_resources::VesselSpec {
+                    convoy_ref: "stalled-work".into(),
+                    vessel_name: "work".into(),
+                    placement_policy_ref: "policy".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
+            .await
+            .expect("vessel");
+        vessels
+            .update_status("actor-vessel", &vessel.metadata.resource_version, &flotilla_resources::VesselStatus {
+                checkout_refs: BTreeMap::from([(flotilla_protocol::RepositoryKey("repo".into()), "actor-checkout".into())]),
+                ..Default::default()
+            })
+            .await
+            .expect("checkout association");
+        let start = Utc::now();
+        for second in [0, 60, 120, 180] {
+            observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        }
+        assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
+        let checkout = checkouts.get("actor-checkout").await.expect("checkout");
+        checkouts.update_status("actor-checkout", &checkout.metadata.resource_version, &checkout_status).await.expect("same HEAD refresh");
+        observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(240)).await;
+        let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+        assert_eq!(convoy.status.expect("status").nudge_obligations[0].history.len(), 1);
+        let checkout = checkouts.get("actor-checkout").await.expect("checkout");
+        checkout_status.integration.head_revision = Some("after".into());
+        checkouts.update_status("actor-checkout", &checkout.metadata.resource_version, &checkout_status).await.expect("new commit");
+        for second in [241, 300, 360, 420, 421] {
+            observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+        }
+        let requests = delivery.requests.lock().expect("deliveries");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.source == "stall-nudge-1"), "new commit resets the obligation budget");
+    }
+
     #[tokio::test]
     async fn resumed_stalled_crew_is_not_nudged_until_its_briefed_turn_ends() {
         let (backend, wake, delivery) = project_supervision_case(&[]).await;
@@ -2486,6 +2939,25 @@ mod tests {
         sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("turn ended");
         let convoy = convoys.get("stalled-work").await.expect("resumed convoy");
         wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), convoy)])).await.expect("judge after turn");
+        assert!(delivery.requests.lock().expect("nudge requests").is_empty());
+        let quiet_at = Utc::now() + chrono::Duration::minutes(3);
+        // Fresh screen confirmations preserve quiet duration; another Stop
+        // would instead restart it because a response just happened.
+        for second in [120, 60, 0] {
+            let observed_at = quiet_at - chrono::Duration::seconds(second);
+            let session = sessions.get("resumed-coder").await.expect("session");
+            let mut status = session.status.expect("status");
+            status.attention = Some(TerminalAttention {
+                state: TerminalAttentionState::Idle,
+                as_of: observed_at,
+                source: TerminalAttentionSource::Screen,
+            });
+            sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.expect("quiet confirmation");
+            let convoy = convoys.get("stalled-work").await.expect("convoy");
+            wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), observed_at)
+                .await
+                .expect("judge quiet turn");
+        }
         assert_eq!(delivery.requests.lock().expect("nudge requests").len(), 1);
     }
 

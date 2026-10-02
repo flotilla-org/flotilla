@@ -170,6 +170,7 @@ fn checkout_integration_patch_replaces_conditions_without_latching() {
 
     CheckoutStatusPatch::UpdateIntegration {
         integration: Box::new(CheckoutIntegrationStatus {
+            head_revision: None,
             clean: IntegrationCondition::builder().value(ConditionValue::True).build(),
             pushed: IntegrationCondition::builder().value(ConditionValue::False).details(vec!["2 unpushed commits".to_string()]).build(),
             landed: IntegrationCondition::builder().value(ConditionValue::True).build(),
@@ -189,6 +190,7 @@ fn checkout_integration_patch_replaces_conditions_without_latching() {
 
     CheckoutStatusPatch::UpdateIntegration {
         integration: Box::new(CheckoutIntegrationStatus {
+            head_revision: None,
             clean: IntegrationCondition::builder().value(ConditionValue::True).build(),
             pushed: IntegrationCondition::builder().value(ConditionValue::True).build(),
             landed: IntegrationCondition::builder().value(ConditionValue::False).details(vec!["no PR found".to_string()]).build(),

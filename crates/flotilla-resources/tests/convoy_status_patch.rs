@@ -102,6 +102,7 @@ fn queue_pending_brief(status: &mut ConvoyStatus, role: &str) {
 fn crew_failure_clears_its_pending_brief() {
     let mut status = ConvoyStatus {
         stalled: None,
+        nudge_obligations: Vec::new(),
         phase: ConvoyPhase::Active,
         crew_work: BTreeMap::from([("implement".to_string(), BTreeMap::from([("coder".to_string(), crew_work(CrewWorkPhase::Working))]))]),
         ..ConvoyStatus::default()
@@ -234,6 +235,7 @@ fn abandon_convoy_stamps_convoy_and_open_work() {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
@@ -403,6 +405,7 @@ fn crew_completion_updates_only_the_calling_agent() {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
@@ -472,6 +475,7 @@ fn final_crew_completion_claim_enters_landing_idempotently() {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
@@ -549,6 +553,7 @@ fn crew_failure_records_terminal_state_and_message() {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
@@ -596,6 +601,7 @@ fn handoff_to_done_crew_reopens_target_and_marks_sender_handed_back() {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Landing,
@@ -653,6 +659,7 @@ fn resume_reopens_completed_crew_without_restarting_its_timeline() {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Landing,
@@ -701,6 +708,7 @@ fn running_vessel_work_starts_pending_agents_without_reopening_done_agents() {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
@@ -746,6 +754,7 @@ fn running_vessel_work_leaves_latent_agents_pending() {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
@@ -828,6 +837,7 @@ fn advance_work_to_ready_updates_only_selected_vessels() {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Pending,
@@ -885,6 +895,7 @@ fn fail_convoy_cancels_non_terminal_siblings_and_sets_convoy_failed() {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
@@ -950,6 +961,7 @@ fn roll_up_phase_only_touches_convoy_level_fields() {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Pending,
@@ -985,6 +997,7 @@ fn forced_work_completion_claim_enters_landing() {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
@@ -1030,6 +1043,7 @@ fn forced_work_completion_preserves_agent_owned_state() {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
@@ -1079,6 +1093,7 @@ fn convoy_lifecycle_timestamps_are_set_once_per_transition() {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Pending,
@@ -1153,4 +1168,56 @@ fn refused_claims_count_only_identical_expectations_and_decode_old_work() {
     let refusal = status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal");
     assert_eq!(refusal.consecutive_count, 1);
     assert_eq!(refusal.expectation, "PR observation missing");
+}
+
+#[test]
+fn nudge_budget_survives_stall_clear_and_resets_only_for_progress_by_that_actor() {
+    use flotilla_protocol::{Leaf, LeafAddress, LeafOperator};
+    use flotilla_resources::{LeafMaker, NudgeObligation, StallNudge, StallReason};
+
+    let obligation = |role: &str| {
+        let leaf = Leaf {
+            address: LeafAddress::Work { convoy: "convoy".into(), work: "work".into() },
+            field_path: format!(".crew.{role}.phase"),
+            operator: LeafOperator::Equal,
+            literal: "Done".into(),
+        };
+        NudgeObligation::builder()
+            .maker(LeafMaker::Actor { vessel: "work".into(), role: role.into() })
+            .leaves(vec![leaf.clone()])
+            .history(vec![StallNudge { at: ts(10), row: leaf }])
+            .quiet_since(ts(10))
+            .build()
+    };
+    let mut status = ConvoyStatus {
+        phase: ConvoyPhase::Active,
+        nudge_obligations: vec![obligation("coder"), obligation("reviewer")],
+        ..Default::default()
+    };
+    ConvoyStatusPatch::SetStalled { condition: None }.apply(&mut status);
+    let stored = serde_json::to_string(&status).expect("persist budget");
+    status = serde_json::from_str(&stored).expect("restore budget");
+    assert_eq!(status.nudge_obligations[0].history.len(), 1, "attention-driven stall clearing preserves accounting");
+    ConvoyStatusPatch::RefuseCrewCompletion {
+        vessel: "work".into(),
+        role: "coder".into(),
+        expectation: "checks pass".into(),
+        message: None,
+    }
+    .apply(&mut status);
+    assert!(status.nudge_obligations[0].history.is_empty(), "a claim is real progress even when refused");
+    assert_eq!(status.nudge_obligations[1].history.len(), 1, "another actor's obligation is independent");
+    ConvoyStatusPatch::MarkCrewStalled {
+        convoy: "convoy".into(),
+        vessel: "work".into(),
+        role: "reviewer".into(),
+        at: ts(20),
+        reason: StallReason::Decision,
+        proposed_disposition: None,
+        message: "need guidance".into(),
+    }
+    .apply(&mut status);
+    assert!(status.nudge_obligations[1].history.is_empty(), "declaring a stall resets that actor's budget");
+    let old_status: ConvoyStatus = serde_json::from_str(r#"{"phase":"Active"}"#).expect("previous-generation convoy");
+    assert!(old_status.nudge_obligations.is_empty());
 }

@@ -97,7 +97,7 @@ impl HarnessHookParser for ClaudeCodeParser {
                     serde_json::from_slice(payload).map_err(|e| format!("failed to parse SessionEnd payload: {e}"))?;
                 Ok(ParsedHookEvent { event_type: AgentEventType::Ended, session_id: parsed.session_id, model: None, cwd: parsed.cwd })
             }
-            "user-prompt-submit" => {
+            "user-prompt-submit" | "pre-tool-use" | "post-tool-use" => {
                 let parsed: ClaudeCommonPayload =
                     serde_json::from_slice(payload).map_err(|e| format!("failed to parse UserPromptSubmit payload: {e}"))?;
                 Ok(ParsedHookEvent { event_type: AgentEventType::Active, session_id: parsed.session_id, model: None, cwd: parsed.cwd })
@@ -138,6 +138,8 @@ const CLAUDE_CODE_HOOK_SUBSCRIPTIONS: &[ClaudeCodeHookSubscription] = &[
     ClaudeCodeHookSubscription { hook: "SessionStart", matcher: "", event: "session-start" },
     ClaudeCodeHookSubscription { hook: "SessionEnd", matcher: "", event: "session-end" },
     ClaudeCodeHookSubscription { hook: "UserPromptSubmit", matcher: "", event: "user-prompt-submit" },
+    ClaudeCodeHookSubscription { hook: "PreToolUse", matcher: "", event: "pre-tool-use" },
+    ClaudeCodeHookSubscription { hook: "PostToolUse", matcher: "", event: "post-tool-use" },
     ClaudeCodeHookSubscription { hook: "Stop", matcher: "", event: "stop" },
     ClaudeCodeHookSubscription { hook: "Notification", matcher: "permission_prompt", event: "notification" },
     ClaudeCodeHookSubscription { hook: "Notification", matcher: "elicitation_dialog", event: "notification" },
@@ -235,6 +237,15 @@ mod tests {
     }
 
     #[test]
+    fn claude_tool_hooks_report_activity() {
+        let payload = serde_json::json!({ "session_id": "sess-abc", "tool_name": "Bash" });
+        for event in ["pre-tool-use", "post-tool-use"] {
+            let result = ClaudeCodeParser.parse_event(event, payload.to_string().as_bytes()).expect("tool hook");
+            assert_eq!(result.event_type, AgentEventType::Active);
+        }
+    }
+
+    #[test]
     fn claude_stop_maps_to_idle() {
         let payload = serde_json::json!({ "session_id": "sess-abc", "stop_hook_active": true });
         let parser = ClaudeCodeParser;
@@ -307,7 +318,7 @@ mod tests {
         let settings = claude_code_hook_settings();
         let hooks = settings["hooks"].as_object().expect("hooks object");
 
-        assert_eq!(hooks.len(), 5);
+        assert_eq!(hooks.len(), 7);
         for subscription in CLAUDE_CODE_HOOK_SUBSCRIPTIONS {
             let entry = hooks[subscription.hook]
                 .as_array()

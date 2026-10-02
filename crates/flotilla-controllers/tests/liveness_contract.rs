@@ -71,6 +71,7 @@ impl CheckoutRuntime for HarnessRuntime {
         }
         let observed_at = self.clock.now().to_rfc3339();
         Ok(CheckoutIntegrationStatus {
+            head_revision: None,
             clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
             pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
             landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at).build(),
@@ -344,6 +345,7 @@ impl WorldBuilder for ConvoyWorldBuilder {
                 commit: Some("abc123".to_string()),
                 branch_provenance: CheckoutBranchProvenance::CreatedForConvoy,
                 integration: CheckoutIntegrationStatus {
+                    head_revision: None,
                     clean: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
                     pushed: IntegrationCondition::builder().value(ConditionValue::True).observed_at(observed_at.clone()).build(),
                     landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(observed_at.clone()).build(),

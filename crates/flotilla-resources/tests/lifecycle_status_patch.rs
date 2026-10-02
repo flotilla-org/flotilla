@@ -70,6 +70,7 @@ macro_rules! define_patch_kinds {
 
 define_patch_kinds! {
     ConvoySetStalled => NONE,
+    ConvoySetNudgeObligations => NONE,
     ConvoySetTeardownWait => NONE,
     ConvoyRecordLifecycleMutation => NONE,
     ConvoySetPlacementDecision => NONE,
@@ -136,6 +137,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
             panic!("subject patches are outside this lifecycle contract")
         }
         ConvoyStatusPatch::SetStalled { .. } => PatchKind::ConvoySetStalled,
+        ConvoyStatusPatch::SetNudgeObligations { .. } => PatchKind::ConvoySetNudgeObligations,
         ConvoyStatusPatch::SetTeardownWait { .. } => PatchKind::ConvoySetTeardownWait,
         ConvoyStatusPatch::RecordLifecycleMutation { .. } => PatchKind::ConvoyRecordLifecycleMutation,
         ConvoyStatusPatch::SetPlacementDecision { .. } => PatchKind::ConvoySetPlacementDecision,
@@ -292,6 +294,7 @@ fn active_convoy_status() -> ConvoyStatus {
         branch_subject_scan_at: None,
         branch_subject_scan_error: None,
         stalled: None,
+        nudge_obligations: Vec::new(),
         provisioning: None,
         placement_decision: None,
         phase: ConvoyPhase::Active,
