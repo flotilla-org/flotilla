@@ -1131,8 +1131,9 @@ mod tests {
         assert!(content.contains("Every item in every review is in scope"));
         assert!(content.contains("Reply to each finding with a fix and commit, concrete reasoning, or a filed follow-up issue number"));
         assert!(content.contains("wait about one minute after the last push or reply for re-review"));
-        assert!(content.contains("Re-check mergeability against current main after re-review"));
-        assert!(content.contains("Retry the rebase at most three times"));
+        assert!(content.contains("Rebase only when the forge reports a conflict with the target branch"));
+        assert!(content.contains("merely behind the target branch is ready as it is"));
+        assert!(!content.contains("three rebase attempts"));
         insta::assert_snapshot!("dispatched_crew_brief", content);
     }
 
@@ -1162,8 +1163,8 @@ mod tests {
         assert!(content.contains("Open a pull request that closes the issue"));
         assert!(content.contains("ADR carry:"));
         assert!(content.contains("yield at the turn boundary"));
-        assert!(content.contains("After three rebase attempts against a moving main, report the blockage to the operator and yield"));
-        assert!(!content.contains("Main moved during three rebase attempts"));
+        assert!(content.contains("Rebase only when the forge reports a conflict with the target branch"));
+        assert!(!content.contains("three rebase attempts"));
         insta::assert_snapshot!("standing_crew_brief", content);
     }
 
@@ -1342,9 +1343,9 @@ mod tests {
 
         assert!(brief.contains("every item in every review"));
         assert!(brief.contains("Reply to each finding with a fix and commit, concrete reasoning, or a filed follow-up issue number"));
-        assert!(brief.contains("mergeable against current main"));
+        assert!(brief.contains("Rebase only when the forge reports a conflict with the target branch"));
         assert!(brief.contains("wait about one minute after the last push or reply for re-review"));
-        assert!(brief.contains("Retry the rebase at most three times"));
+        assert!(!brief.contains("three rebase attempts"));
         assert!(brief.contains("If CI remains red for reasons outside this pull request, or a required reviewer has not responded"));
         assert!(brief.contains("`pr-shepherd` skill"));
         assert!(brief.contains("For a Forgejo destination, do not use that GitHub-only helper"));
@@ -1379,7 +1380,7 @@ mod tests {
 
             assert!(!brief.contains("wait about one minute after the last push or reply for re-review"), "{template}");
             assert!(brief.contains("every review"), "{template}");
-            assert!(brief.contains("mergeable against current main"), "{template}");
+            assert!(brief.contains("Rebase only when the forge reports a conflict with the target branch"), "{template}");
         }
     }
 
