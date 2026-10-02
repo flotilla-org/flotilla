@@ -50,6 +50,7 @@ pub struct CatalogInput<'a> {
 }
 
 mod subjects;
+pub use subjects::change_request_facts;
 use subjects::{project_role_attempts, project_subjects};
 
 /// Replicated observation records and the fleet reference context. The clock is

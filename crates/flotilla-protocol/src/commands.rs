@@ -261,6 +261,24 @@ pub struct ExplainedChangeRequest {
     pub observation_error: Option<String>,
 }
 
+/// A field from the shared subject entity, with its own observation age.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedSubjectFact {
+    pub value: Option<String>,
+    pub observed_at: Option<String>,
+    pub freshness: EvidenceFreshness,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct ExplainedSubjectObservation {
+    pub subject: crate::Subject,
+    pub state: ExplainedSubjectFact,
+    pub checks: ExplainedSubjectFact,
+    pub review: ExplainedSubjectFact,
+    pub review_actionable_at_head: ExplainedSubjectFact,
+    pub readiness: ExplainedSubjectFact,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainedLeafFiring {
     pub leaf: crate::Leaf,
@@ -359,6 +377,8 @@ pub struct ConvoyExplanation {
     pub checkouts: Vec<ExplainedCheckout>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subjects: Vec<crate::result_set::ConvoySubjectRow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subject_observations: Vec<ExplainedSubjectObservation>,
     pub change_requests: Vec<ExplainedChangeRequest>,
     pub subscriptions: Vec<ExplainedSubscription>,
     pub crew_deliveries: Vec<ExplainedCrewDelivery>,

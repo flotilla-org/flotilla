@@ -778,6 +778,28 @@ impl ReadProjections<'_> {
         }
         let change_request_objects =
             selected_change_requests.iter().map(|(name, source)| (name.clone(), source.object.clone())).collect::<BTreeMap<_, _>>();
+        let subject_observations = subjects
+            .iter()
+            .filter(|row| row.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest)
+            .map(|row| {
+                let status = selected_change_requests
+                    .values()
+                    .find(|source| {
+                        let spec = &source.object.spec;
+                        spec.service == row.subject.source.service
+                            && spec.scope == row.subject.source.scope
+                            && spec.number.to_string() == row.subject.id
+                    })
+                    .and_then(|source| source.object.status.as_ref());
+                explain_subject_observation(
+                    &row.subject,
+                    status,
+                    convoy.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Landed),
+                    now,
+                    change_request_stale_after,
+                )
+            })
+            .collect();
         let expected_change_request_leaves = expected_change_request_leaves(&convoy, &selected_checkouts)
             .map_err(|error| format!("derive expected change requests: {error}"))?;
         let expected_change_requests = expected_change_request_leaves
@@ -1020,6 +1042,7 @@ impl ReadProjections<'_> {
             change_request_stale_after_seconds: change_request_stale_after.as_secs(),
             checkouts,
             subjects,
+            subject_observations,
             change_requests,
             subscriptions,
             crew_deliveries,
@@ -1125,6 +1148,65 @@ fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDec
             })
         })
         .collect()
+}
+
+fn explain_subject_observation(
+    subject: &flotilla_protocol::Subject,
+    status: Option<&flotilla_resources::ChangeRequestStatus>,
+    landed: bool,
+    now: DateTime<Utc>,
+    change_request_stale_after: std::time::Duration,
+) -> flotilla_protocol::commands::ExplainedSubjectObservation {
+    use flotilla_manifest::{
+        keys::{
+            KEY_CHANGE_REQUEST_CHECKS, KEY_CHANGE_REQUEST_CHECKS_OBSERVED_AT, KEY_CHANGE_REQUEST_READINESS,
+            KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD, KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD_OBSERVED_AT,
+            KEY_CHANGE_REQUEST_REVIEW_DECISION, KEY_CHANGE_REQUEST_REVIEW_DECISION_OBSERVED_AT, KEY_CHANGE_REQUEST_STATE,
+            KEY_CHANGE_REQUEST_STATE_OBSERVED_AT,
+        },
+        projection::change_request_facts,
+        wire::MetadataValue,
+    };
+    use flotilla_protocol::commands::{ExplainedSubjectFact, ExplainedSubjectObservation};
+    let facts = change_request_facts(status, landed).into_iter().collect::<BTreeMap<_, _>>();
+    let text = |key| match facts.get(key) {
+        Some(MetadataValue::Text(value)) => Some(value.clone()),
+        Some(MetadataValue::Bool(value)) => Some(value.to_string()),
+        _ => None,
+    };
+    let field = |key, time| {
+        let observed_at = text(time);
+        let at = observed_at.as_deref().and_then(|at| DateTime::parse_from_rfc3339(at).ok()).map(|at| at.with_timezone(&Utc));
+        ExplainedSubjectFact { value: text(key), observed_at, freshness: observed_freshness(at, now, change_request_stale_after) }
+    };
+    // Readiness depends on every input, so its age is the oldest input age.
+    let readiness_at = status.map(|status| {
+        [
+            status.state.observed_at,
+            status.checks.observed_at,
+            status.mergeable.observed_at,
+            status.review_decision.observed_at,
+            status.review.actionable_at_head.observed_at,
+        ]
+        .into_iter()
+        .min()
+        .expect("five readiness inputs")
+    });
+    ExplainedSubjectObservation {
+        subject: subject.clone(),
+        state: field(KEY_CHANGE_REQUEST_STATE, KEY_CHANGE_REQUEST_STATE_OBSERVED_AT),
+        checks: field(KEY_CHANGE_REQUEST_CHECKS, KEY_CHANGE_REQUEST_CHECKS_OBSERVED_AT),
+        review: field(KEY_CHANGE_REQUEST_REVIEW_DECISION, KEY_CHANGE_REQUEST_REVIEW_DECISION_OBSERVED_AT),
+        review_actionable_at_head: field(
+            KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD,
+            KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD_OBSERVED_AT,
+        ),
+        readiness: ExplainedSubjectFact {
+            value: text(KEY_CHANGE_REQUEST_READINESS),
+            observed_at: readiness_at.map(|at| at.to_rfc3339()),
+            freshness: observed_freshness(readiness_at, now, change_request_stale_after),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1594,6 +1676,139 @@ mod tests {
         assert_eq!(merged_rows.len(), 1, "unmapped origin must not create a phantom host row");
         assert_eq!(merged_rows[0].host, HostName::new("remote"));
         assert!(matches!(merged_rows[0].staleness, flotilla_protocol::FleetStaleness::Stale { .. }));
+    }
+
+    fn subject_status(now: DateTime<Utc>) -> flotilla_resources::ChangeRequestStatus {
+        use flotilla_resources::{
+            ChangeRequestReviewObservation, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
+            ObservedReviewDecision,
+        };
+        flotilla_resources::ChangeRequestStatus {
+            title: Observation::unknown(now),
+            author: Observation::unknown(now),
+            state: Observation::known(ObservedChangeRequestState::Open, now),
+            checks: Observation::known(ObservedChecks::Pass, now),
+            review_decision: Observation::known(ObservedReviewDecision::Approved, now),
+            review_requested_from_owner: Observation::unknown(now),
+            head_sha: Observation::unknown(now),
+            mergeable: Observation::known(ObservedMergeability::Mergeable, now),
+            review: ChangeRequestReviewObservation { actionable_at_head: Observation::known(false, now) },
+        }
+    }
+
+    // Behaviour: explain preserves the subject entity's values, while each field
+    // ages independently and readiness uses its oldest evidence, including at TTL.
+    #[hegel::test]
+    fn subject_explanation_preserves_values_and_independent_age(tc: hegel::TestCase) {
+        use flotilla_protocol::{EvidenceFreshness, IssueSource, Subject, SubjectKind};
+        use flotilla_resources::ObservedChangeRequestState;
+        use hegel::generators as gs;
+        // All request states, unknown values, missing status, and ages either side of TTL.
+        let state_index = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+        let age = tc.draw(gs::integers::<i64>().min_value(0).max_value(61));
+        let missing = tc.draw(gs::booleans());
+        let now = Utc.with_ymd_and_hms(2026, 10, 2, 12, 0, 0).single().expect("time");
+        let subject = Subject {
+            kind: SubjectKind::ChangeRequest,
+            source: IssueSource { service: "github.com".into(), scope: "owner/repo".into() },
+            id: "42".into(),
+        };
+        // Pin the exact TTL boundary in every case as well as drawing surrounding ages.
+        for age in [age, 60] {
+            let mut status = subject_status(now);
+            let states = [
+                Some(ObservedChangeRequestState::Open),
+                Some(ObservedChangeRequestState::Draft),
+                Some(ObservedChangeRequestState::Merged),
+                Some(ObservedChangeRequestState::Closed),
+                None,
+            ];
+            status.state.value = states[state_index];
+            status.checks.observed_at = now - ChronoDuration::seconds(age);
+            let observation =
+                explain_subject_observation(&subject, (!missing).then_some(&status), false, now, std::time::Duration::from_secs(60));
+            assert_eq!(observation.subject, subject);
+            assert_eq!(
+                observation.state.value.as_deref(),
+                if missing { None } else { [Some("open"), Some("draft"), Some("merged"), Some("closed"), None][state_index] }
+            );
+            assert_eq!(observation.state.freshness, if missing { EvidenceFreshness::Missing } else { EvidenceFreshness::Fresh });
+            let aged = if missing {
+                EvidenceFreshness::Missing
+            } else if age < 60 {
+                EvidenceFreshness::Fresh
+            } else {
+                EvidenceFreshness::Stale
+            };
+            assert_eq!(observation.checks.freshness, aged);
+            assert_eq!(observation.readiness.freshness, aged);
+            assert_eq!(
+                observation.readiness.value.as_deref(),
+                Some(if missing {
+                    "awaiting_review_response"
+                } else {
+                    ["ready_to_merge", "draft", "merged_not_landed", "closed", "awaiting_review_response"][state_index]
+                })
+            );
+            assert_eq!(observation.checks.value.as_deref(), if missing { None } else { Some("pass") });
+            assert_eq!(observation.review.value.as_deref(), if missing { None } else { Some("approved") });
+            assert_eq!(observation.review_actionable_at_head.value.as_deref(), if missing { None } else { Some("false") });
+        }
+    }
+
+    // Behaviour: subjects alone determine explain identities, even across repositories;
+    // an unrelated observed request must not appear and an unobserved subject stays visible.
+    #[tokio::test]
+    async fn convoy_explanation_joins_plural_subjects_to_observations() {
+        use flotilla_protocol::{IssueSource, Relationship, Subject, SubjectKind};
+        use flotilla_resources::{ChangeRequest, ChangeRequestSpec, DeclaredSubject, ObservedChangeRequestState};
+        let fixture = ProjectionFixture::new();
+        let subject = |scope: &str| Subject {
+            kind: SubjectKind::ChangeRequest,
+            source: IssueSource { service: "github.com".into(), scope: scope.into() },
+            id: "42".into(),
+        };
+        let declared = ["owner/one", "owner/two", "owner/missing"].map(|scope| DeclaredSubject {
+            subject: subject(scope),
+            relationship: Relationship::References,
+            issue: None,
+            change_request: None,
+        });
+        fixture
+            .backend
+            .using::<ResourceConvoy>("flotilla")
+            .create(
+                &InputMeta::builder().name("subjects".to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("review".to_string()).subjects(declared.to_vec()).build(),
+            )
+            .await
+            .expect("convoy");
+        let requests = fixture.backend.using::<ChangeRequest>("flotilla");
+        for scope in ["owner/one", "owner/two", "owner/unrelated"] {
+            let record = requests
+                .create(
+                    &InputMeta::builder().name(flotilla_resources::change_request_record_name("github.com", scope, 42)).build(),
+                    &ChangeRequestSpec::builder()
+                        .service("github.com".into())
+                        .scope(scope.into())
+                        .number(42)
+                        .observing_authority("local".into())
+                        .build(),
+                )
+                .await
+                .expect("request");
+            let mut status = subject_status(Utc::now());
+            if scope == "owner/two" {
+                status.state.value = Some(ObservedChangeRequestState::Merged);
+            }
+            requests.update_status(&record.metadata.name, &record.metadata.resource_version, &status).await.expect("status");
+        }
+        let explanation = fixture.projections().explain_convoy("flotilla", "subjects").await.expect("explain");
+        assert_eq!(explanation.subject_observations.len(), 3);
+        assert_eq!(explanation.subject_observations[0].state.value.as_deref(), Some("open"));
+        assert_eq!(explanation.subject_observations[1].state.value.as_deref(), Some("merged"));
+        assert_eq!(explanation.subject_observations[2].state.value, None);
+        assert!(explanation.subject_observations.iter().all(|row| row.subject.source.scope != "owner/unrelated"));
     }
 
     #[tokio::test]

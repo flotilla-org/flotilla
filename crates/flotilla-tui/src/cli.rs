@@ -983,6 +983,32 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             let references = subjects.iter().map(|subject| subject.short.as_str()).collect::<Vec<_>>().join(", ");
             let _ = writeln!(output, "  {} {references}", relationship.as_str().replace('_', " "));
             for subject in subjects {
+                if subject.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest {
+                    let observation = explanation.subject_observations.iter().find(|observation| observation.subject == subject.subject);
+                    let fact = |value: Option<&flotilla_protocol::commands::ExplainedSubjectFact>| {
+                        value.map_or_else(
+                            || "unknown (missing)".to_string(),
+                            |fact| {
+                                let value = fact.value.as_deref().unwrap_or("unknown");
+                                match fact.freshness {
+                                    flotilla_protocol::EvidenceFreshness::Fresh => value.to_string(),
+                                    flotilla_protocol::EvidenceFreshness::Stale => format!("{value} (stale)"),
+                                    flotilla_protocol::EvidenceFreshness::Missing => format!("{value} (missing)"),
+                                }
+                            },
+                        )
+                    };
+                    let _ = writeln!(
+                        output,
+                        "    {} state={} checks={} review={} actionable_at_head={} readiness={}",
+                        subject.short,
+                        fact(observation.map(|o| &o.state)),
+                        fact(observation.map(|o| &o.checks)),
+                        fact(observation.map(|o| &o.review)),
+                        fact(observation.map(|o| &o.review_actionable_at_head)),
+                        fact(observation.map(|o| &o.readiness))
+                    );
+                }
                 if let Some(url) = &subject.url {
                     let _ = writeln!(output, "    {} {url}", subject.short);
                 }
