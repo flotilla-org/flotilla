@@ -1241,6 +1241,7 @@ dependencies = [
  "flotilla-resources",
  "futures",
  "gethostname",
+ "hegeltest",
  "http",
  "indexmap",
  "insta",

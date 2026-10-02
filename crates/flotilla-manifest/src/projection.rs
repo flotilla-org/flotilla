@@ -15,7 +15,7 @@ use flotilla_protocol::{
     HostName, ReferenceContext, ViewAddress, AWARENESS_REL_FOR_CONVOY,
 };
 use flotilla_resources::{
-    ChangeRequest, ChangeRequestStatus, Forge, Issue, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
+    ChangeRequest, ChangeRequestStatus, Forge, Issue, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
     ObservedReviewDecision, ResourceObject,
 };
 
@@ -50,6 +50,7 @@ pub struct CatalogInput<'a> {
 }
 
 mod subjects;
+pub use subjects::change_request_facts;
 use subjects::{project_role_attempts, project_subjects};
 
 /// Replicated observation records and the fleet reference context. The clock is
@@ -126,30 +127,74 @@ impl ChangeRequestReadiness {
 /// there is no separate landed value. `landed` means a linked convoy has
 /// reached its terminal landed phase.
 pub fn change_request_readiness(status: &ChangeRequestStatus, landed: bool) -> ChangeRequestReadiness {
-    use ChangeRequestReadiness as Readiness;
+    evaluate_change_request_readiness(status, landed).readiness
+}
 
-    match status.state.value {
-        Some(ObservedChangeRequestState::Closed) => return Readiness::Closed,
-        Some(ObservedChangeRequestState::Merged) => return if landed { Readiness::Closed } else { Readiness::MergedNotLanded },
-        Some(ObservedChangeRequestState::Draft) => return Readiness::Draft,
-        _ => {}
+/// A derived readiness value and the oldest observation it depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeRequestReadinessEvaluation {
+    pub readiness: ChangeRequestReadiness,
+    pub observed_at: Timestamp,
+}
+
+/// Evaluate readiness and its evidence time from the same typed input set.
+pub fn evaluate_change_request_readiness(status: &ChangeRequestStatus, landed: bool) -> ChangeRequestReadinessEvaluation {
+    let inputs = ReadinessInputs::builder()
+        .state(&status.state)
+        .checks(&status.checks)
+        .mergeable(&status.mergeable)
+        .review_decision(&status.review_decision)
+        .actionable_at_head(&status.review.actionable_at_head)
+        .build();
+    ChangeRequestReadinessEvaluation { readiness: inputs.readiness(landed), observed_at: inputs.observed_at() }
+}
+
+// Readiness logic only sees this input set. Adding a policy input requires
+// updating the exhaustive timestamp destructuring too, enforced by Rust.
+#[derive(bon::Builder)]
+struct ReadinessInputs<'a> {
+    state: &'a Observation<ObservedChangeRequestState>,
+    checks: &'a Observation<ObservedChecks>,
+    mergeable: &'a Observation<ObservedMergeability>,
+    review_decision: &'a Observation<ObservedReviewDecision>,
+    actionable_at_head: &'a Observation<bool>,
+}
+
+impl ReadinessInputs<'_> {
+    fn observed_at(&self) -> Timestamp {
+        let Self { state, checks, mergeable, review_decision, actionable_at_head } = self;
+        [state.observed_at, checks.observed_at, mergeable.observed_at, review_decision.observed_at, actionable_at_head.observed_at]
+            .into_iter()
+            .min()
+            .expect("five readiness inputs")
     }
 
-    if status.mergeable.value == Some(ObservedMergeability::Conflicting) {
-        return Readiness::Conflicting;
+    fn readiness(&self, landed: bool) -> ChangeRequestReadiness {
+        use ChangeRequestReadiness as Readiness;
+
+        match self.state.value {
+            Some(ObservedChangeRequestState::Closed) => return Readiness::Closed,
+            Some(ObservedChangeRequestState::Merged) => return if landed { Readiness::Closed } else { Readiness::MergedNotLanded },
+            Some(ObservedChangeRequestState::Draft) => return Readiness::Draft,
+            _ => {}
+        }
+
+        if self.mergeable.value == Some(ObservedMergeability::Conflicting) {
+            return Readiness::Conflicting;
+        }
+        if self.checks.value == Some(ObservedChecks::Fail) {
+            return Readiness::CiFailing;
+        }
+        if self.state.value != Some(ObservedChangeRequestState::Open)
+            || self.checks.value != Some(ObservedChecks::Pass)
+            || self.mergeable.value != Some(ObservedMergeability::Mergeable)
+            || self.actionable_at_head.value != Some(false)
+            || !matches!(self.review_decision.value, Some(ObservedReviewDecision::Approved | ObservedReviewDecision::None))
+        {
+            return Readiness::AwaitingReviewResponse;
+        }
+        Readiness::ReadyToMerge
     }
-    if status.checks.value == Some(ObservedChecks::Fail) {
-        return Readiness::CiFailing;
-    }
-    if status.state.value != Some(ObservedChangeRequestState::Open)
-        || status.checks.value != Some(ObservedChecks::Pass)
-        || status.mergeable.value != Some(ObservedMergeability::Mergeable)
-        || status.review.actionable_at_head.value != Some(false)
-        || !matches!(status.review_decision.value, Some(ObservedReviewDecision::Approved | ObservedReviewDecision::None))
-    {
-        return Readiness::AwaitingReviewResponse;
-    }
-    Readiness::ReadyToMerge
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

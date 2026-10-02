@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 
 use flotilla_protocol::{
-    CanonicalHostId, CommandValue, ConvoyExplanation, DaemonEvent, EnvironmentId, ExplainedDecisionLedger, ExplainedSettlement,
-    ExplainedUnclaimedWork, FulfilmentAllocation, HostName, HostSnapshot, HostSummary, NodeId, NodeInfo, PeerConnectionState,
-    PlacementDecision, PlacementTargetHost, StreamKey, TopologyResponse, TopologyRoute,
+    commands::{ExplainedSubjectFact, ExplainedSubjectObservation},
+    result_set::ConvoySubjectRow,
+    CanonicalHostId, CommandValue, ConvoyExplanation, DaemonEvent, EnvironmentId, EvidenceFreshness, ExplainedDecisionLedger,
+    ExplainedSettlement, ExplainedUnclaimedWork, FulfilmentAllocation, HostName, HostSnapshot, HostSummary, IssueSource, NodeId, NodeInfo,
+    PeerConnectionState, PlacementDecision, PlacementTargetHost, Relationship, StreamKey, Subject, SubjectKind, TopologyResponse,
+    TopologyRoute,
 };
 
 use super::{event_stream_seq, format_command_result, format_convoy_explanation_human, format_event_human, format_topology_dot};
@@ -200,6 +203,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         change_request_stale_after_seconds: 30,
         checkouts: Vec::new(),
         subjects: Vec::new(),
+        subject_observations: Vec::new(),
         change_requests: Vec::new(),
         subscriptions: Vec::new(),
         crew_deliveries: Vec::new(),
@@ -301,6 +305,7 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         change_request_stale_after_seconds: 30,
         checkouts: Vec::new(),
         subjects: Vec::new(),
+        subject_observations: Vec::new(),
         change_requests: Vec::new(),
         subscriptions: Vec::new(),
         crew_deliveries: Vec::new(),
@@ -473,4 +478,68 @@ fn blob_sync_diagnostics_render_in_host_list_and_status() {
     let output = super::format_host_status_human(&status);
     assert!(output.contains("Blob sync: 2 pending"));
     assert!(output.contains("Blob sync error: endpoint unavailable"));
+}
+
+// Behaviour: convoy explain keeps the plural layout and shows differing states,
+// unknown observations and stale evidence beside the corresponding subject.
+// Glue: a single formatting scenario covers the fixed presentation layout.
+#[test]
+fn convoy_explanation_subject_observations_snapshot() {
+    let mut explanation: ConvoyExplanation = serde_json::from_value(serde_json::json!({
+        "namespace": "flotilla", "convoy": "plural", "phase": "Landing",
+        "evidence_ttl_seconds": 30, "change_request_stale_after_seconds": 60,
+        "checkouts": [], "change_requests": [], "subscriptions": [], "crew_deliveries": [],
+        "decision_ledgers": [], "settlement": {"mode": "world_terminal", "satisfied": false, "unmet": []}
+    }))
+    .expect("explanation");
+    let fact = |value: Option<&str>, freshness| ExplainedSubjectFact {
+        value: value.map(str::to_owned),
+        observed_at: (freshness != EvidenceFreshness::Missing).then(|| "2026-10-02T12:00:00Z".into()),
+        freshness,
+    };
+    for (number, state, checks, review, readiness, freshness) in [
+        (1, Some("open"), Some("pass"), Some("approved"), "ready_to_merge", EvidenceFreshness::Fresh),
+        (2, Some("merged"), Some("pending"), Some("none"), "merged_not_landed", EvidenceFreshness::Stale),
+        (3, None, None, None, "awaiting_review_response", EvidenceFreshness::Missing),
+        (4, None, None, None, "awaiting_review_response", EvidenceFreshness::Fresh),
+    ] {
+        let subject = Subject {
+            kind: SubjectKind::ChangeRequest,
+            source: IssueSource { service: "github.com".into(), scope: "owner/repo".into() },
+            id: number.to_string(),
+        };
+        explanation.subjects.push(ConvoySubjectRow {
+            subject: subject.clone(),
+            relationship: Relationship::Produces,
+            declared: false,
+            short: format!("!{number}"),
+            url: Some(format!("https://github.com/owner/repo/pull/{number}")),
+            repository_key: None,
+        });
+        explanation.subject_observations.push(ExplainedSubjectObservation {
+            subject,
+            state: fact(state, freshness),
+            checks: fact(checks, freshness),
+            review: fact(review, freshness),
+            review_actionable_at_head: fact(state.map(|_| "false"), freshness),
+            readiness: fact(Some(readiness), freshness),
+        });
+    }
+    // An observation outside the convoy's subject set cannot introduce a subject.
+    let mut unrelated = explanation.subject_observations[0].clone();
+    unrelated.subject.id = "999".into();
+    explanation.subject_observations.insert(0, unrelated);
+    let output = format_convoy_explanation_human(&explanation);
+    let subjects = output.split("Subjects:\n").nth(1).expect("subjects").split("\nChange requests:").next().expect("section");
+    insta::assert_snapshot!(subjects, @r###"
+      produces !1, !2, !3, !4
+        !1 state=open checks=pass review=approved actionable_at_head=false readiness=ready_to_merge
+        !1 https://github.com/owner/repo/pull/1
+        !2 state=merged (stale) checks=pending (stale) review=none (stale) actionable_at_head=false (stale) readiness=merged_not_landed (stale)
+        !2 https://github.com/owner/repo/pull/2
+        !3 state=unknown (missing) checks=unknown (missing) review=unknown (missing) actionable_at_head=unknown (missing) readiness=awaiting_review_response (missing)
+        !3 https://github.com/owner/repo/pull/3
+        !4 state=unknown checks=unknown review=unknown actionable_at_head=unknown readiness=awaiting_review_response
+        !4 https://github.com/owner/repo/pull/4
+    "###);
 }

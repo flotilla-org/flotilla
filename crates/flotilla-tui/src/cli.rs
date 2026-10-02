@@ -8,10 +8,10 @@ use chrono::{DateTime, Utc};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    output::OutputFormat, CliListKind, CliListResponse, Command, CommandValue, CrewListResponse, DaemonEvent, EnvironmentInfo,
-    EnvironmentStatus, FleetHealthResponse, FleetHostStaleness, FleetListResponse, FleetObservationAgreement, FleetStaleness,
-    FulfilmentListResponse, FulfilmentRow, HostProvidersResponse, HostStatusResponse, NodeId, NodeInfo, PeerConnectionState,
-    ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey, TopologyResponse,
+    commands::ExplainedSubjectFact, output::OutputFormat, CliListKind, CliListResponse, Command, CommandValue, CrewListResponse,
+    DaemonEvent, EnvironmentInfo, EnvironmentStatus, EvidenceFreshness, FleetHealthResponse, FleetHostStaleness, FleetListResponse,
+    FleetObservationAgreement, FleetStaleness, FulfilmentListResponse, FulfilmentRow, HostProvidersResponse, HostStatusResponse, NodeId,
+    NodeInfo, PeerConnectionState, ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey, TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -807,6 +807,15 @@ fn explanation_provenance_label(provenance: Option<&flotilla_protocol::ResourceR
     }
 }
 
+fn format_subject_fact(fact: Option<&ExplainedSubjectFact>) -> String {
+    let value = fact.and_then(|fact| fact.value.as_deref()).unwrap_or("unknown");
+    match fact.map_or(EvidenceFreshness::Missing, |fact| fact.freshness) {
+        EvidenceFreshness::Fresh => value.to_string(),
+        EvidenceFreshness::Stale => format!("{value} (stale)"),
+        EvidenceFreshness::Missing => format!("{value} (missing)"),
+    }
+}
+
 pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::ConvoyExplanation) -> String {
     let mut output = format!("Convoy: {}/{}\nPhase: {}\n", explanation.namespace, explanation.convoy, explanation.phase);
     for mutation in &explanation.lifecycle_mutations {
@@ -983,6 +992,19 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             let references = subjects.iter().map(|subject| subject.short.as_str()).collect::<Vec<_>>().join(", ");
             let _ = writeln!(output, "  {} {references}", relationship.as_str().replace('_', " "));
             for subject in subjects {
+                if subject.subject.kind == flotilla_protocol::SubjectKind::ChangeRequest {
+                    let observation = explanation.subject_observations.iter().find(|observation| observation.subject == subject.subject);
+                    let _ = writeln!(
+                        output,
+                        "    {} state={} checks={} review={} actionable_at_head={} readiness={}",
+                        subject.short,
+                        format_subject_fact(observation.map(|o| &o.state)),
+                        format_subject_fact(observation.map(|o| &o.checks)),
+                        format_subject_fact(observation.map(|o| &o.review)),
+                        format_subject_fact(observation.map(|o| &o.review_actionable_at_head)),
+                        format_subject_fact(observation.map(|o| &o.readiness))
+                    );
+                }
                 if let Some(url) = &subject.url {
                     let _ = writeln!(output, "    {} {url}", subject.short);
                 }

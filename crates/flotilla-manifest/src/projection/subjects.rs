@@ -255,40 +255,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
             continue;
         }
         let mut facts = identity_facts(&subject);
-        facts.push((
-            KEY_CHANGE_REQUEST_READINESS,
-            MetadataValue::text(
-                status
-                    .map(|status| super::change_request_readiness(status, landed.contains(&subject)).as_str())
-                    .unwrap_or("awaiting_review_response"),
-            ),
-        ));
-        if let Some(status) = status {
-            observe(&mut facts, KEY_CHANGE_REQUEST_TITLE, KEY_CHANGE_REQUEST_TITLE_OBSERVED_AT, &status.title);
-            observe(&mut facts, KEY_CHANGE_REQUEST_AUTHOR, KEY_CHANGE_REQUEST_AUTHOR_OBSERVED_AT, &status.author);
-            observe(&mut facts, KEY_CHANGE_REQUEST_STATE, KEY_CHANGE_REQUEST_STATE_OBSERVED_AT, &status.state);
-            observe(&mut facts, KEY_CHANGE_REQUEST_CHECKS, KEY_CHANGE_REQUEST_CHECKS_OBSERVED_AT, &status.checks);
-            observe(&mut facts, KEY_CHANGE_REQUEST_MERGEABLE, KEY_CHANGE_REQUEST_MERGEABLE_OBSERVED_AT, &status.mergeable);
-            observe(&mut facts, KEY_CHANGE_REQUEST_HEAD_SHA, KEY_CHANGE_REQUEST_HEAD_SHA_OBSERVED_AT, &status.head_sha);
-            observe(
-                &mut facts,
-                KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD,
-                KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD_OBSERVED_AT,
-                &status.review.actionable_at_head,
-            );
-            observe(
-                &mut facts,
-                KEY_CHANGE_REQUEST_REVIEW_DECISION,
-                KEY_CHANGE_REQUEST_REVIEW_DECISION_OBSERVED_AT,
-                &status.review_decision,
-            );
-            observe(
-                &mut facts,
-                KEY_CHANGE_REQUEST_REVIEW_REQUESTED_FROM_OWNER,
-                KEY_CHANGE_REQUEST_REVIEW_REQUESTED_FROM_OWNER_OBSERVED_AT,
-                &status.review_requested_from_owner,
-            );
-        }
+        facts.extend(change_request_facts(status, landed.contains(&subject)));
         catalog.assert_entity(subject_entity(&subject), facts, None);
     }
     for record in &observations.issues {
@@ -310,4 +277,36 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         }
         catalog.assert_entity(subject_entity(&subject), facts, None);
     }
+}
+
+/// Observation facts shared by the subject catalog and convoy explain.
+pub fn change_request_facts(status: Option<&flotilla_resources::ChangeRequestStatus>, landed: bool) -> Vec<(&'static str, MetadataValue)> {
+    let mut facts = vec![(
+        KEY_CHANGE_REQUEST_READINESS,
+        MetadataValue::text(
+            status.map(|status| super::change_request_readiness(status, landed).as_str()).unwrap_or("awaiting_review_response"),
+        ),
+    )];
+    if let Some(status) = status {
+        observe(&mut facts, KEY_CHANGE_REQUEST_TITLE, KEY_CHANGE_REQUEST_TITLE_OBSERVED_AT, &status.title);
+        observe(&mut facts, KEY_CHANGE_REQUEST_AUTHOR, KEY_CHANGE_REQUEST_AUTHOR_OBSERVED_AT, &status.author);
+        observe(&mut facts, KEY_CHANGE_REQUEST_STATE, KEY_CHANGE_REQUEST_STATE_OBSERVED_AT, &status.state);
+        observe(&mut facts, KEY_CHANGE_REQUEST_CHECKS, KEY_CHANGE_REQUEST_CHECKS_OBSERVED_AT, &status.checks);
+        observe(&mut facts, KEY_CHANGE_REQUEST_MERGEABLE, KEY_CHANGE_REQUEST_MERGEABLE_OBSERVED_AT, &status.mergeable);
+        observe(&mut facts, KEY_CHANGE_REQUEST_HEAD_SHA, KEY_CHANGE_REQUEST_HEAD_SHA_OBSERVED_AT, &status.head_sha);
+        observe(
+            &mut facts,
+            KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD,
+            KEY_CHANGE_REQUEST_REVIEW_ACTIONABLE_AT_HEAD_OBSERVED_AT,
+            &status.review.actionable_at_head,
+        );
+        observe(&mut facts, KEY_CHANGE_REQUEST_REVIEW_DECISION, KEY_CHANGE_REQUEST_REVIEW_DECISION_OBSERVED_AT, &status.review_decision);
+        observe(
+            &mut facts,
+            KEY_CHANGE_REQUEST_REVIEW_REQUESTED_FROM_OWNER,
+            KEY_CHANGE_REQUEST_REVIEW_REQUESTED_FROM_OWNER_OBSERVED_AT,
+            &status.review_requested_from_owner,
+        );
+    }
+    facts
 }
