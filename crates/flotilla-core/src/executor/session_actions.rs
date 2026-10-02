@@ -116,15 +116,11 @@ impl<'a> ReadOnlySessionActionService<'a> {
     }
 
     async fn resolve_branch_name_issues(&self, issue_keys: &[String]) -> Vec<(String, Issue)> {
-        let mut resolved: HashMap<String, Issue> = issue_keys
-            .iter()
-            .filter_map(|key| self.providers_data.issues.get(key.as_str()).cloned().map(|issue| (key.clone(), issue)))
-            .collect();
-
-        let missing: Vec<String> = issue_keys.iter().filter(|key| !resolved.contains_key(key.as_str())).cloned().collect();
+        let mut resolved = HashMap::new();
+        let missing = issue_keys;
         if !missing.is_empty() {
             if let Some(tracker) = self.registry.issue_provider_for(&self.issue_source) {
-                match tracker.fetch_by_ids(&self.issue_source, &missing).await {
+                match tracker.fetch_by_ids(&self.issue_source, missing).await {
                     Ok(fetched) => {
                         for issue in fetched {
                             resolved.insert(issue.reference.id.clone(), issue);

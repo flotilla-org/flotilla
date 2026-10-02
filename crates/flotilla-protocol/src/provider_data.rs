@@ -372,22 +372,14 @@ pub struct Workspace {
     pub attachable_set_id: Option<AttachableSetId>,
 }
 
-/// All raw provider data for a single repo, keyed for lookup.
+/// Deliberate on-demand provider interchange for a single repository.
+///
+/// Commands use checkout/session lookup inputs; checkout observation projects this
+/// data into resources consumed by the Aggregator. This is not a snapshot stream
+/// or correlation pipeline. Providers and discovery retain their own interfaces.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderData {
     #[serde(with = "crate::qualified_path::qualified_path_map")]
     pub checkouts: IndexMap<QualifiedPath, Checkout>,
-    pub change_requests: IndexMap<String, ChangeRequest>,
-    /// Legacy Plane-A snapshot for one repository. Keys are source-local IDs;
-    /// never union this map across sources. Use each issue's canonical
-    /// `Issue::reference` for project-level collections.
-    pub issues: IndexMap<String, Issue>,
     pub sessions: IndexMap<String, CloudAgentSession>,
-    pub branches: IndexMap<String, crate::delta::Branch>,
-    pub workspaces: IndexMap<String, Workspace>,
-    #[serde(default)]
-    pub managed_terminals: IndexMap<AttachableId, ManagedTerminal>,
-    pub attachable_sets: IndexMap<AttachableSetId, AttachableSet>,
-    #[serde(default)]
-    pub agents: IndexMap<String, Agent>,
 }

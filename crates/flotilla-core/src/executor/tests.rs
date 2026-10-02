@@ -235,7 +235,7 @@ impl ChangeRequestTracker for MergeChangeRequestTracker {
     }
 }
 
-/// A mock IssueProvider provider.
+/// In-memory fake for the external issue-source API boundary.
 struct MockIssueProvider {
     fetched_by_id: tokio::sync::Mutex<Vec<Vec<String>>>,
     fetched_issues: Vec<(String, Issue)>,
@@ -330,21 +330,23 @@ impl CloudAgentService for MockCloudAgent {
 /// A mock AiUtility provider.
 struct MockAiUtility {
     result: tokio::sync::Mutex<Result<String, String>>,
+    contexts: tokio::sync::Mutex<Vec<String>>,
 }
 
 impl MockAiUtility {
     fn succeeding(name: &str) -> Self {
-        Self { result: tokio::sync::Mutex::new(Ok(name.to_string())) }
+        Self { result: tokio::sync::Mutex::new(Ok(name.to_string())), contexts: Default::default() }
     }
 
     fn failing(msg: &str) -> Self {
-        Self { result: tokio::sync::Mutex::new(Err(msg.to_string())) }
+        Self { result: tokio::sync::Mutex::new(Err(msg.to_string())), contexts: Default::default() }
     }
 }
 
 #[async_trait]
 impl AiUtility for MockAiUtility {
-    async fn generate_branch_name(&self, _context: &str) -> Result<String, String> {
+    async fn generate_branch_name(&self, context: &str) -> Result<String, String> {
+        self.contexts.lock().await.push(context.to_string());
         let result = self.result.lock().await;
         result.clone()
     }
@@ -1813,9 +1815,12 @@ async fn archive_session_agent_fails() {
 async fn generate_branch_name_ai_success() {
     let mut registry = empty_registry();
     registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/add-login")));
-    registry.issue_trackers.insert("github", desc("github"), Arc::new(MockIssueProvider::empty()));
-    let mut data = empty_data();
-    data.issues.insert("42".to_string(), TestIssue::new("Add login feature").build());
+    registry.issue_trackers.insert(
+        "github",
+        desc("github"),
+        Arc::new(MockIssueProvider::with_fetched_issues(vec![("42".into(), TestIssue::new("Add login feature").build())])),
+    );
+    let data = empty_data();
     let runner = runner_ok();
 
     let result =
@@ -1829,8 +1834,7 @@ async fn generate_branch_name_ai_success() {
 async fn generate_branch_name_ai_failure_uses_fallback() {
     let mut registry = empty_registry();
     registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::failing("API error")));
-    let mut data = empty_data();
-    data.issues.insert("42".to_string(), TestIssue::new("Add login").build());
+    let data = empty_data();
     let runner = runner_ok();
 
     let result =
@@ -1843,8 +1847,7 @@ async fn generate_branch_name_ai_failure_uses_fallback() {
 #[tokio::test]
 async fn generate_branch_name_no_ai_provider_uses_fallback() {
     let registry = empty_registry();
-    let mut data = empty_data();
-    data.issues.insert("7".to_string(), TestIssue::new("Fix bug").build());
+    let data = empty_data();
     let runner = runner_ok();
 
     let result =
@@ -1858,10 +1861,15 @@ async fn generate_branch_name_no_ai_provider_uses_fallback() {
 async fn generate_branch_name_multiple_issues() {
     let mut registry = empty_registry();
     registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/login-and-signup")));
-    registry.issue_trackers.insert("github", desc("github"), Arc::new(MockIssueProvider::empty()));
-    let mut data = empty_data();
-    data.issues.insert("1".to_string(), TestIssue::new("Login feature").build());
-    data.issues.insert("2".to_string(), TestIssue::new("Signup feature").build());
+    registry.issue_trackers.insert(
+        "github",
+        desc("github"),
+        Arc::new(MockIssueProvider::with_fetched_issues(vec![
+            ("1".into(), TestIssue::new("Login feature").build()),
+            ("2".into(), TestIssue::new("Signup feature").build()),
+        ])),
+    );
+    let data = empty_data();
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(
@@ -1878,7 +1886,8 @@ async fn generate_branch_name_multiple_issues() {
 #[tokio::test]
 async fn generate_branch_name_fetches_missing_issue_details() {
     let mut registry = empty_registry();
-    registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/from-fetched-issue")));
+    let ai = Arc::new(MockAiUtility::succeeding("feat/from-fetched-issue"));
+    registry.ai_utilities.insert("claude", desc("claude"), ai.clone());
     let fetched_issue = TestIssue::new("Fix login redirect").with_labels(vec!["bug".into(), "auth".into()]).build();
     registry.issue_trackers.insert(
         "github",
@@ -1892,6 +1901,8 @@ async fn generate_branch_name_fetches_missing_issue_details() {
         run_build_plan_to_completion(CommandAction::GenerateBranchName { issue_keys: vec!["42".to_string()] }, registry, data, runner)
             .await;
 
+    // On-demand source details (including labels) become the AI branch-naming context.
+    assert_eq!(ai.contexts.lock().await.as_slice(), ["Fix login redirect #42 [bug, auth]"]);
     assert_branch_name_generated(result, "feat/from-fetched-issue", &[("github", "42")]);
 }
 
@@ -2824,8 +2835,7 @@ async fn build_plan_archive_session_returns_steps() {
 async fn build_plan_generate_branch_name_returns_steps() {
     let mut registry = empty_registry();
     registry.ai_utilities.insert("claude", desc("claude"), Arc::new(MockAiUtility::succeeding("feat/add-login")));
-    let mut data = empty_data();
-    data.issues.insert("42".to_string(), TestIssue::new("Add login feature").build());
+    let data = empty_data();
     let runner = runner_ok();
 
     let plan = run_build_plan(CommandAction::GenerateBranchName { issue_keys: vec!["42".to_string()] }, registry, data, runner).await;
@@ -2853,8 +2863,7 @@ async fn build_plan_archive_session_missing_session_returns_error() {
 
 #[tokio::test]
 async fn build_plan_generate_branch_name_without_ai_returns_fallback() {
-    let mut data = empty_data();
-    data.issues.insert("42".to_string(), TestIssue::new("Add login feature").build());
+    let data = empty_data();
     let runner = runner_ok();
 
     let result = run_build_plan_to_completion(

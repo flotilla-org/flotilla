@@ -1,5 +1,30 @@
 # Providers And Correlation
 
+## Current provider interchange (Plane-A cull, 2026-10-02)
+
+The correlation/WorkItem/snapshot pipeline described in the historical sections
+below has been deleted (ADR 0031). `ProviderData` is deliberately retained as the
+small on-demand lookup container shared by command execution and observed checkout
+projection, not as a periodic snapshot or peer-merge payload.
+
+- `checkouts`: populated by VCS/repository inspection; consumed by executor
+  ownership/de-duplication and `observed_resources::reconcile_checkouts`.
+- `sessions`: populated by cloud-agent providers for attach/teleport commands.
+Issue details for branch naming are fetched on demand through the injected issue
+provider. The old issue-cache field was never populated in production and is removed.
+
+The Aggregator consumes projected Checkout resources and resource-backed convoy
+change-request resolution. Managed-terminal observations travel independently in
+`RepoDelta`. Discovery, provider traits, attachable storage and category resource
+types remain load-bearing. Unused container fields and the never-populated TUI
+provider cache are removed; separate category wrappers would add interface churn
+without changing these small lookup/projection boundaries. See the consumer audit
+on [#616](https://github.com/flotilla-org/flotilla/issues/616#issuecomment-5960741733).
+
+## Historical pipeline
+
+The following sections describe the retired pipeline, not current behaviour.
+
 The main architectural decision in Flotilla is to model integrations as
 providers that emit normalized data, then correlate that data into work items.
 That avoids scattering branch-matching and tool-specific glue throughout the
