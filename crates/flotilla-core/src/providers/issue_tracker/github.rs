@@ -125,8 +125,10 @@ impl super::IssueProvider for GitHubIssueProvider {
         parse_issue(&reference.source, &value, Utc::now()).ok_or_else(|| format!("failed to parse issue {}", reference.id))
     }
 
-    async fn list_changed_since(&self, source: &IssueSource, since: &str, count: usize) -> Result<IssueChangeset, String> {
-        let per_page = clamp_per_page(count);
+    async fn list_changed_since(&self, source: &IssueSource, since: &str, _count: usize) -> Result<IssueChangeset, String> {
+        // Incremental pages include PRs. Use the REST maximum independently
+        // of the demanded window size to avoid needless overflow reloads.
+        let per_page = 100;
         // Keep the URI stable so the GhApi ETag cache can validate every poll.
         // Filter the sorted page locally and reload if relevant changes may
         // continue onto another page.
@@ -174,7 +176,14 @@ impl super::IssueProvider for GitHubIssueProvider {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, path::PathBuf, sync::Mutex};
+    use std::{
+        collections::VecDeque,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
+    };
 
     use super::*;
     use crate::providers::{
@@ -197,6 +206,22 @@ mod tests {
         assert_eq!(issue.assignees, ["alice", "bob"]);
         assert_eq!(issue.observed_at, Some(observed_at));
     }
+    struct CountingGhApi {
+        inner: Arc<dyn GhApi>,
+        requests: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl GhApi for CountingGhApi {
+        async fn get(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<String, String> {
+            self.get_with_headers(endpoint, repo_root, label).await.map(|response| response.body)
+        }
+        async fn get_with_headers(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<GhApiResponse, String> {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            self.inner.get_with_headers(endpoint, repo_root, label).await
+        }
+    }
+
     struct MockGhApi {
         responses: Mutex<VecDeque<Result<GhApiResponse, String>>>,
         requests: Mutex<Vec<(String, PathBuf)>>,
@@ -251,6 +276,48 @@ mod tests {
 
         assert_provider_contract(&provider, &source, "747", "2026-07-01T00:00:00Z").await;
 
+        session.finish();
+    }
+
+    #[tokio::test]
+    async fn recorded_live_page_comparison_reduces_two_window_refresh_from_three_requests_to_one() {
+        let session = replay::test_session(&fixture("github_refresh_request_counts.yaml"), Masks::new());
+        let api = Arc::new(CountingGhApi { inner: replay::test_gh_api(&session), requests: Default::default() });
+        let runner = replay::test_runner(&session);
+        let provider = GitHubIssueProvider::new(api.clone(), runner, Path::new("/"));
+        let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+        let endpoint = format!("repos/{}/issues?state=all&sort=updated&direction=desc&per_page=100", source.scope);
+        // Choose a reproducible cutoff from the recorded live page. This setup
+        // request is excluded from each measured refresh path.
+        let sample = gh_api_get_with_headers!(api, &endpoint, Path::new("/")).expect("live sample");
+        let records: Vec<serde_json::Value> = serde_json::from_str(&sample.body).expect("records");
+        let since = records[70]["updated_at"].as_str().expect("cutoff");
+        assert!(records.iter().any(|record| record.get("pull_request").is_some()), "sample must include PR traffic");
+        api.requests.store(0, Ordering::Relaxed);
+        // Reproduce the previous 50-record endpoint and its conservative full
+        // reload of both demanded windows when the cutoff extends past it.
+        let endpoint = format!("repos/{}/issues?state=all&sort=updated&direction=desc&per_page=50", source.scope);
+        let before = gh_api_get_with_headers!(api, &endpoint, Path::new("/")).expect("previous page");
+        let before_records: Vec<serde_json::Value> = serde_json::from_str(&before.body).expect("previous records");
+        assert!(before.has_next_page && before_records.last().expect("last record")["updated_at"].as_str().expect("updated") >= since);
+        for _ in 0..2 {
+            provider.query(&source, &IssueQuery::default(), 1, 50).await.expect("previous window reload");
+        }
+        assert_eq!(api.requests.load(Ordering::Relaxed), 3);
+        api.requests.store(0, Ordering::Relaxed);
+        let after = provider.list_changed_since(&source, since, 50).await.expect("larger incremental page");
+        assert!(!after.has_more, "the maximum page contains the complete refresh interval");
+        assert_eq!(api.requests.load(Ordering::Relaxed), 1);
+        for record in records
+            .iter()
+            .filter(|record| record.get("pull_request").is_none() && record["updated_at"].as_str().is_some_and(|updated| updated >= since))
+        {
+            let id = record["number"].as_u64().expect("number").to_string();
+            assert!(
+                after.updated.iter().any(|issue| issue.reference.id == id) || after.closed.iter().any(|reference| reference.id == id),
+                "missed issue {id}"
+            );
+        }
         session.finish();
     }
 
@@ -393,6 +460,25 @@ mod tests {
         let retried = provider.list_changed_since(&source(), "2026-07-01T00:00:00Z", 50).await.expect("retry after 304");
 
         assert_eq!(retried.updated.len(), 1, "a 304 must not discard uncommitted changes");
+    }
+
+    #[tokio::test]
+    async fn pr_heavy_refresh_uses_the_largest_stable_page_without_reloading() {
+        let mut items = (1..=50)
+            .map(|number| {
+                serde_json::json!({"number": number,
+            "title": "PR", "state": "open", "pull_request": {}, "updated_at": "2026-07-01T00:00:10Z"})
+            })
+            .collect::<Vec<_>>();
+        items.push(serde_json::json!({"number": 51, "title": "Issue", "state": "open",
+            "updated_at": "2026-07-01T00:00:05Z"}));
+        let api = Arc::new(MockGhApi::new(vec![ok_response(&serde_json::to_string(&items).expect("items"), false)]));
+        let provider = GitHubIssueProvider::new(api.clone(), Arc::new(MockRunner::new(vec![])), Path::new("/neutral"));
+        let changes = provider.list_changed_since(&source(), "2026-07-01T00:00:00Z", 50).await.expect("refresh");
+        assert_eq!(changes.updated[0].reference.id, "51");
+        assert!(!changes.has_more, "the issue behind fifty PRs must not require a reload");
+        assert_eq!(api.requests().len(), 1);
+        assert!(api.requests()[0].0.ends_with("per_page=100"), "use GitHub's maximum page size independently of query window size");
     }
 
     #[tokio::test]
