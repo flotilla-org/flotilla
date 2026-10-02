@@ -178,7 +178,13 @@ Admission is validated before the previous generation is abandoned. Its record
 remains as history, and ordinary lifecycle reconciliation reclaims its backing.
 A repeated roll without drift does nothing. Generations admitted before config
 tracking report an unknown admission baseline and require an explicit roll to
-establish it.
+establish it. The first roll of this daemon generation deliberately raises
+attention for every pre-existing standing convoy: schedule a safe boundary and
+run `flotilla ensure roll --drifted` to establish their baselines. Retirement and
+admission are separate durable writes; a failure or restart after retirement can
+leave a gap. The ordinary ensure reconciliation loop recovers admission, using
+its backing verification and retry backoff. Driver moves recover on the new
+driver rather than immediately on the retiring host.
 
 Before a fleet roll, run the candidate's `resource validate --from-daemon` on
 each host. It decodes the live store and parses the registered projects' committed

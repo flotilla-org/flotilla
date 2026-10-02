@@ -3551,6 +3551,63 @@ async fn standing_ensure_fixture_for(
 }
 
 #[tokio::test]
+async fn declaration_refusal_staleness_uses_the_daemon_clock_at_the_24_hour_boundary() {
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    let projects = backend.using::<Project>("flotilla");
+    apply_resource_status_patch(&projects, "standing-project", &flotilla_resources::ProjectStatusPatch::DeclarationRefused {
+        condition: Some(flotilla_resources::DeclarationRefusedCondition {
+            entry_path: "broken.md".into(),
+            message: "invalid declaration".into(),
+            since: clock.now(),
+            observed_at: clock.now(),
+        }),
+    })
+    .await
+    .expect("record refusal");
+    backend
+        .using::<ResourceDemand>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("declaration-refused-standing-project".to_string())
+                .annotations(BTreeMap::from([
+                    (crate::ops_entry::DECLARATION_REFUSAL_REASON_ANNOTATION.into(), "invalid declaration".into()),
+                    (crate::ops_entry::DECLARATION_REFUSED_SINCE_ANNOTATION.into(), clock.now().to_rfc3339()),
+                ]))
+                .build(),
+            &DemandSpec::for_dispatching_principal(
+                ResourceRef::new("flotilla.work/v1", "Project", "flotilla", "standing-project"),
+                DemandKind::HumanGate,
+                PrincipalRef::implicit_for_namespace("flotilla"),
+            ),
+        )
+        .await
+        .expect("refusal attention");
+    let stale = || async {
+        daemon
+            .list_projects_internal()
+            .await
+            .expect("project list")
+            .projects
+            .into_iter()
+            .find(|project| project.name == "standing-project")
+            .expect("project")
+            .declaration_stale
+    };
+    assert!(!stale().await);
+    clock.advance(chrono::Duration::hours(24) - chrono::Duration::seconds(1));
+    assert!(!stale().await);
+    clock.advance(chrono::Duration::seconds(1));
+    assert!(stale().await);
+    assert!(daemon
+        .fleet_list_internal()
+        .await
+        .expect("attention without a refresh")
+        .declaration_attention
+        .iter()
+        .any(|row| row.message.ends_with("(stale)")));
+}
+
+#[tokio::test]
 async fn standing_ensure_records_admitted_config_and_surfaces_drift_without_replacing_work() {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("admit initial configuration");
@@ -3579,6 +3636,30 @@ async fn standing_ensure_records_admitted_config_and_surfaces_drift_without_repl
     assert!(fleet.declaration_attention.iter().any(|row| row.message.contains("presentation")));
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("drift attention persists across refreshes");
     assert_eq!(backend.using::<ResourceDemand>("flotilla").list().await.expect("attention").items.len(), 1);
+}
+
+#[tokio::test]
+async fn ensure_reconciliation_recovers_a_roll_interrupted_after_retirement() {
+    let (daemon, backend, clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
+    let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
+    let first = ensures.get("quartermaster").await.expect("ensure");
+    let old_ref = first.status.as_ref().and_then(|status| status.convoy_ref.clone()).expect("active generation");
+    let mut next = first.spec.clone();
+    next.presents_as = Some("project".into());
+    ensures.apply(&InputMeta::from(&first.metadata), &next).await.expect("change config");
+    let desired = ensures.get("quartermaster").await.expect("desired ensure");
+    daemon.prepare_ensured_convoy("flotilla", &desired).await.expect("prepare replacement");
+    daemon.abandon_convoy_internal("flotilla", &old_ref, "simulate crash after retirement", None).await.expect("retire old work");
+    // No successor was committed: the next ordinary passes must recover it.
+    daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("schedule recovery");
+    clock.advance(chrono::Duration::minutes(3));
+    daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &VerifiedDeadBacking).await.expect("recover admission");
+    let status = ensures.get("quartermaster").await.expect("ensure").status.expect("status");
+    assert_ne!(status.convoy_ref.as_deref(), Some(old_ref.as_str()));
+    assert!(status.convoy_ref.is_some());
+    assert!(status.config_drift.is_none());
+    assert_eq!(status.admitted_config_hash, status.observed_config_hash);
 }
 
 #[tokio::test]

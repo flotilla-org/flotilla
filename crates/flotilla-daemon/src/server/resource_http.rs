@@ -66,6 +66,10 @@ pub(super) async fn serve_resource_http_with_daemon(
         ["apis", "flotilla.work", "v1", "namespaces", namespace, kind, name] => (*namespace, *kind, Some(*name)),
         _ => return write_error(&mut stream, 404, "unknown resource API path").await,
     };
+    // Administrative read-only inventory, alongside kind discovery on the
+    // same trusted local resource socket. Return raw bytes so only the candidate
+    // applies its parser. The optional daemon is solely a resource-handler test
+    // seam; production always supplies it.
     if kind == "operationalentries" && name.is_none() {
         let Some(daemon) = daemon else {
             return write_error(&mut stream, 404, "ops inventory unavailable").await;
@@ -223,6 +227,7 @@ fn reason(status: u16) -> &'static str {
         409 => "Conflict",
         410 => "Gone",
         431 => "Request Header Fields Too Large",
+        422 => "Unprocessable Entity",
         _ => "Internal Server Error",
     }
 }

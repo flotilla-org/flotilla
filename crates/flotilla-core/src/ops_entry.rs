@@ -11,6 +11,12 @@ pub const VERIFICATION_PROJECT_ANNOTATION: &str = "flotilla.work/verification-co
 pub const VERIFICATION_PROVENANCE_ANNOTATION: &str = "flotilla.work/verification-command-provenance";
 pub const ENSURE_PROVENANCE_ANNOTATION: &str = "flotilla.work/ensure-provenance";
 pub const PRESENTS_AS_ANNOTATION: &str = "flotilla.work/presents-as";
+pub const DECLARATION_REFUSAL_ATTENTION_PREFIX: &str = "declaration-refused-";
+pub const DECLARATION_REFUSAL_REASON_ANNOTATION: &str = "flotilla.work/refusal-reason";
+pub const DECLARATION_REFUSED_SINCE_ANNOTATION: &str = "flotilla.work/refused-since";
+pub const DECLARATION_STALE_AFTER: chrono::Duration = chrono::Duration::hours(24);
+pub const ENSURE_DRIFT_ATTENTION_PREFIX: &str = "ensure-config-drift-";
+pub const ENSURE_CONFIG_DRIFT_REASON_ANNOTATION: &str = "flotilla.work/ensure-config-drift-reason";
 
 /// Store identity for a project-owned workflow template.
 ///

@@ -452,6 +452,40 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let client = reqwest::Client::builder().unix_socket(socket.as_path()).build().expect("resource socket client");
+        let inventory = client
+            .get("http://flotilla.local/apis/flotilla.work/v1/namespaces/flotilla/operationalentries")
+            .send()
+            .await
+            .expect("raw ops endpoint");
+        assert_eq!(inventory.status(), reqwest::StatusCode::OK);
+        assert_eq!(inventory.json::<serde_json::Value>().await.expect("inventory")["entries"], serde_json::json!([]));
+        backend
+            .using::<Project>("missing")
+            .create(
+                &InputMeta::builder().name("unavailable".to_string()).build(),
+                &ProjectSpec::builder()
+                    .display_name("Unavailable".to_string())
+                    .default_workflow_ref("default".to_string())
+                    .repositories(vec![flotilla_resources::ProjectRepositorySpec {
+                        repo: flotilla_resources::RepositoryKey("unavailable-ops".into()),
+                        alias: None,
+                        roles: std::collections::BTreeSet::from([flotilla_resources::ProjectRepositoryRole::Ops]),
+                        subpath: None,
+                        default_branch: None,
+                    }])
+                    .build(),
+            )
+            .await
+            .expect("project with missing ops source");
+        let refused = client
+            .get("http://flotilla.local/apis/flotilla.work/v1/namespaces/missing/operationalentries")
+            .send()
+            .await
+            .expect("missing-source endpoint");
+        assert_eq!(refused.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(refused.text().await.expect("error body").contains("unavailable-ops"));
+        backend.using::<Project>("missing").delete("unavailable").await.expect("remove refused fixture");
         let checked = validate_daemon(&socket, Some(&[]), None).await.expect("candidate decodes all served kinds and namespaces");
         assert!(checked >= 4, "expected default, non-default, and replica-only records; got {checked}");
         // Intended: schema compatibility alone cannot admit a Project whose
@@ -534,9 +568,33 @@ mod tests {
             GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
         );
         let inspector = GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), "local");
-        let error = validate_project_ops(&[project], &[], &inspector).await.expect_err("candidate rejects unknown ops field");
+        let error =
+            validate_project_ops(std::slice::from_ref(&project), &[], &inspector).await.expect_err("candidate rejects unknown ops field");
         assert!(error.to_string().contains("governor.md"));
         assert!(error.to_string().contains("unknown_option"));
+        let mut unavailable = project.clone();
+        unavailable.metadata.annotations.clear();
+        let error = validate_project_ops(&[unavailable], &[], &inspector).await.expect_err("missing source fails the gate");
+        assert!(error.to_string().contains("no checkout available"), "{error}");
+        let duplicate = tmp.with_extension("duplicate");
+        assert!(std::process::Command::new("git")
+            .args(["clone", "--local"])
+            .arg(&tmp)
+            .arg(&duplicate)
+            .status()
+            .expect("duplicate main checkout")
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["remote", "set-url", "origin", "https://github.com/example/ops"])
+            .current_dir(&duplicate)
+            .status()
+            .expect("same repository identity")
+            .success());
+        let error = validate_project_ops(&[project], &[tmp.clone(), duplicate.clone()], &inspector)
+            .await
+            .expect_err("ambiguous main checkouts fail the gate");
+        assert!(error.to_string().contains("no unambiguous main checkout"), "{error}");
+        std::fs::remove_dir_all(duplicate).expect("clean duplicate fixture");
         std::fs::remove_dir_all(tmp).expect("clean fixture");
     }
 

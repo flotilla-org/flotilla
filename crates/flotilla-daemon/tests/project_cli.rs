@@ -613,7 +613,7 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
         "---\nkind: verification_command\nname: test\nrepos: [app]\n---\ncommand: cargo test --workspace\n",
     )
     .expect("write verification command");
-    let ensure_path = tmp.path().join("quartermaster.entry");
+    let ensure_path = tmp.path().join("quartermaster: named.entry");
     std::fs::write(
         &ensure_path,
         "---\nkind: ensure\nrole: quartermaster\nrepos: [operations]\n---\nworkflow: all-code\npresents-as: fleet\n",
@@ -702,7 +702,7 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
             changes: vec![format!("ConvoyEnsure/{ensure_name}"), "WorkflowTemplate/scoped".to_string()],
             operational_entries: vec![
                 "all-code.entry: WorkflowTemplate/all-code accepted".to_string(),
-                format!("quartermaster.entry: ConvoyEnsure/{ensure_name} accepted"),
+                format!("quartermaster: named.entry: ConvoyEnsure/{ensure_name} accepted"),
                 "test-command.entry: verification command `test` accepted".to_string(),
                 "verification-commands/this-is-a-workflow.md: WorkflowTemplate/scoped accepted".to_string(),
             ],
@@ -723,11 +723,37 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let project = backend.using::<Project>("flotilla").get("demo").await.expect("project");
     let refusal = project.status.expect("status").declaration_refused.expect("visible refusal condition");
     assert!(refusal.message.contains("unknown_option"));
-    assert_eq!(refusal.entry_path, "quartermaster.entry");
+    assert_eq!(refusal.entry_path, "quartermaster: named.entry");
     let ensure = ensures.get(&ensure_name).await.expect("last accepted ensure remains");
     assert!(ensure.status.expect("ensure status").declaration_refused.is_some());
     let demands = backend.using::<flotilla_resources::Demand>("flotilla").list().await.expect("attention").items;
     assert!(demands.iter().any(|demand| demand.spec.originating_work_ref.name == "demo"));
+
+    std::fs::write(&ensure_path,
+        "---\nkind: ensure\nrole: quartermaster\nrepos: [operations]\n---\nworkflow: all-code\npresents-as: fleet\nagents: [quartermaster=claude-code:claude-fable-5-1]\n")
+        .expect("repair refused entry");
+    assert!(matches!(
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".into() }).await,
+        CommandValue::ProjectRefreshed { .. }
+    ));
+    assert!(backend
+        .using::<Project>("flotilla")
+        .get("demo")
+        .await
+        .expect("repaired project")
+        .status
+        .expect("status")
+        .declaration_refused
+        .is_none());
+    assert!(ensures.get(&ensure_name).await.expect("retained ensure").status.expect("status").declaration_refused.is_none());
+    assert!(!backend
+        .using::<flotilla_resources::Demand>("flotilla")
+        .list()
+        .await
+        .expect("attention")
+        .items
+        .iter()
+        .any(|demand| demand.metadata.name == "declaration-refused-demo"));
 
     std::fs::remove_file(ensure_path).expect("remove ensure entry");
     assert_eq!(

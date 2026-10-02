@@ -108,8 +108,9 @@ use crate::{
     leaf_engine::LeafSubscriptionTable,
     model::{provider_names_from_registry, repo_name, RepoModel},
     ops_entry::{
-        ENSURED_FROM_ANNOTATION, ENSURE_PROVENANCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION,
-        SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION, SOURCE_REPOSITORY_ANNOTATION,
+        ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX, ENSURE_PROVENANCE_ANNOTATION,
+        MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION, SOURCE_ENTRY_PATH_ANNOTATION,
+        SOURCE_REPOSITORY_ANNOTATION,
     },
     path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
@@ -1732,7 +1733,11 @@ fn record_ensure_admission_retry(
     result
 }
 
-const ENSURE_DRIFT_ATTENTION_PREFIX: &str = "ensure-config-drift-";
+#[derive(Clone, Copy)]
+enum EnsureConvoyScope {
+    Local,
+    IncludingReplicas,
+}
 
 fn ensure_config_hash(spec: &ConvoyEnsureSpec) -> Result<String, String> {
     let encoded = serde_json::to_vec(spec).map_err(|error| format!("serialize ensure config: {error}"))?;
@@ -4089,18 +4094,10 @@ impl InProcessDaemon {
         for ensure in ensures {
             if let Some(driver_ref) = &ensure.spec.driver_ref {
                 if let Some(convoy) = self
-                    .resource_backend
-                    .including_replicas::<ResourceConvoy>(namespace)
-                    .list()
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .items
+                    .active_ensured_convoys(namespace, &ensure.metadata.name, EnsureConvoyScope::IncludingReplicas)
+                    .await?
                     .into_iter()
                     .map(|source| source.object)
-                    .filter(|convoy| {
-                        convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name)
-                            && convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
-                    })
                     .max_by_key(|convoy| convoy.spec.generation)
                 {
                     self.observe_ensure_config_drift(namespace, &ensure, &convoy).await?;
@@ -4264,6 +4261,39 @@ impl InProcessDaemon {
             .map(|change| change.unwrap_or_else(|| format!("ConvoyEnsure/{name} is already reconciled")))
     }
 
+    async fn active_ensured_convoys(
+        &self,
+        namespace: &str,
+        name: &str,
+        scope: EnsureConvoyScope,
+    ) -> Result<Vec<ReadResourceObject<ResourceConvoy>>, String> {
+        // Deliberately query current state for each ensure rather than caching
+        // across admissions in the pass. This costs O(ensures * convoys); revisit
+        // with a pass-local index if fleet size warrants it.
+        let sources = match scope {
+            EnsureConvoyScope::Local => self
+                .resource_backend
+                .using::<ResourceConvoy>(namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+                .into_iter()
+                .map(|object| ReadResourceObject { object, provenance: ResourceProvenance::Local })
+                .collect(),
+            EnsureConvoyScope::IncludingReplicas => {
+                self.resource_backend.including_replicas::<ResourceConvoy>(namespace).list().await.map_err(|error| error.to_string())?.items
+            }
+        };
+        Ok(sources
+            .into_iter()
+            .filter(|source| {
+                source.object.metadata.annotations.get(ENSURED_FROM_ANNOTATION).map(String::as_str) == Some(name)
+                    && source.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
+            })
+            .collect())
+    }
+
     /// Explicitly retire a drifted running generation and admit its successor.
     /// Admission is prepared before abandonment so invalid declarations cannot
     /// interrupt the current crew. The ordinary lifecycle reclaims old backing.
@@ -4275,17 +4305,10 @@ impl InProcessDaemon {
             return Err(format!("ConvoyEnsure/{name} has a refused declaration; refresh successfully before rolling"));
         }
         let convoy = self
-            .resource_backend
-            .using::<ResourceConvoy>(namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .items
+            .active_ensured_convoys(namespace, name, EnsureConvoyScope::Local)
+            .await?
             .into_iter()
-            .filter(|convoy| {
-                convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).map(String::as_str) == Some(name)
-                    && convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
-            })
+            .map(|source| source.object)
             .max_by_key(|convoy| convoy.spec.generation)
             .ok_or_else(|| format!("ConvoyEnsure/{name} has no running convoy on this host"))?;
         self.observe_ensure_config_drift(namespace, &ensure, &convoy).await?;
@@ -4311,6 +4334,10 @@ impl InProcessDaemon {
             Some(&PrincipalRef::implicit_for_namespace(namespace)),
         )
         .await?;
+        // Retirement and admission are separate durable operations, not an
+        // atomic transaction. A crash or write failure below leaves a gap: the
+        // ordinary ensure reconciliation loop retries admission (with backing
+        // verification/backoff). A driver move is recovered by the new driver.
         self.patch_driver_ensure_status_if_local(namespace, name, ConvoyEnsureStatusPatch::ResetBackoff).await?;
         if let Some(target) = driver_target {
             if self.canonical_local_host_id().as_ref() != Some(&target.reference) {
@@ -4402,18 +4429,10 @@ impl InProcessDaemon {
         force_now: bool,
     ) -> Result<Option<String>, String> {
         let active = self
-            .resource_backend
-            .including_replicas::<ResourceConvoy>(namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .items
+            .active_ensured_convoys(namespace, &ensure.metadata.name, EnsureConvoyScope::IncludingReplicas)
+            .await?
             .into_iter()
             .map(|source| source.object)
-            .filter(|convoy| {
-                convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name)
-                    && convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
-            })
             .max_by_key(|convoy| convoy.spec.generation);
         if let Some(convoy) = active {
             self.observe_ensure_config_drift(namespace, ensure, &convoy).await?;
@@ -4605,16 +4624,11 @@ impl InProcessDaemon {
                 Err(ResourceError::NotFound { .. }) => None,
                 Err(error) => return Err(error.to_string()),
             },
-            None => convoys
-                .list()
-                .await
-                .map_err(|error| error.to_string())?
-                .items
+            None => self
+                .active_ensured_convoys(namespace, &ensure.metadata.name, EnsureConvoyScope::Local)
+                .await?
                 .into_iter()
-                .filter(|convoy| {
-                    convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION) == Some(&ensure.metadata.name)
-                        && convoy.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
-                })
+                .map(|source| source.object)
                 .max_by_key(|convoy| convoy.spec.generation),
         };
         let terminal = convoy
@@ -4924,7 +4938,7 @@ impl InProcessDaemon {
         let meta = InputMeta::builder()
             .name(name)
             .annotations(BTreeMap::from([(
-                RECLAIM_REFUSAL_REASON_ANNOTATION.to_string(),
+                ENSURE_CONFIG_DRIFT_REASON_ANNOTATION.to_string(),
                 format!("ConfigDrift: {}; run flotilla ensure roll {}", changes.join("; "), ensure.metadata.name),
             )]))
             .build();
@@ -5947,7 +5961,8 @@ impl InProcessDaemon {
     }
 
     pub async fn list_projects_internal(&self) -> Result<ProjectListResponse, String> {
-        read_projections::ReadProjections::list_projects(&self.resource_backend, &self.provisioning_namespace().await).await
+        read_projections::ReadProjections::list_projects(&self.resource_backend, &self.provisioning_namespace().await, self.clock.now())
+            .await
     }
 
     pub async fn list_cli_items_internal(&self, kind: CliListKind) -> Result<CliListResponse, String> {
@@ -7997,19 +8012,7 @@ impl InProcessDaemon {
         use flotilla_protocol::CommandAction;
 
         if let CommandAction::ConvoyEnsureRoll { namespace, name } = action {
-            let active = self
-                .resource_backend
-                .including_replicas::<ResourceConvoy>(namespace)
-                .list()
-                .await
-                .map_err(|error| error.to_string())?
-                .items
-                .into_iter()
-                .filter(|source| {
-                    source.object.metadata.annotations.get(ENSURED_FROM_ANNOTATION).map(String::as_str) == Some(name)
-                        && source.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
-                })
-                .collect::<Vec<_>>();
+            let active = self.active_ensured_convoys(namespace, name, EnsureConvoyScope::IncludingReplicas).await?;
             if active.len() > 1 {
                 return Err(format!("ConvoyEnsure/{name} has multiple running generations; resolve their ownership before rolling"));
             }
