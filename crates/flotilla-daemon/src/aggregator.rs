@@ -3058,6 +3058,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adopted_change_request_claim_does_not_raise_attention() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(4);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let mut convoy = convoy_with_vessel("adopted-pr").await;
+        let subject = flotilla_protocol::Subject {
+            kind: flotilla_protocol::SubjectKind::ChangeRequest,
+            source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+            id: "2303".into(),
+        };
+        convoy.spec.subjects.push(flotilla_resources::DeclaredSubject {
+            subject: subject.clone(),
+            relationship: flotilla_protocol::Relationship::Adopts,
+            issue: None,
+            change_request: None,
+        });
+        let status = convoy.status.as_mut().expect("status");
+        status.phase = ResourceConvoyPhase::Landed;
+        for source in [flotilla_resources::SubjectDiscoverySource::Branch, flotilla_resources::SubjectDiscoverySource::Claim] {
+            status.discover_subject(subject.clone(), flotilla_protocol::Relationship::Produces, source, Utc::now());
+        }
+        assert!(subject_relationship_conflicts(&convoy).is_empty());
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        let result = state.result_set().await;
+        let row = &result.rows.as_convoys().expect("convoys")[0];
+        assert_ne!(row.surface_state, SurfaceState::NeedsYou);
+        assert!(!row.message.as_deref().is_some_and(|message| message.contains("conflicting relationships")));
+    }
+
+    #[tokio::test]
     async fn multiple_produced_subjects_do_not_raise_attention() {
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(4);
