@@ -4,6 +4,10 @@ use flotilla_protocol::{
     result_set::{AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessLink, AwarenessNode, AwarenessState, CrewMemberSummary},
     HostName, IssueRef, IssueSource, RepoKey, RepositoryKey, ResourceRef,
 };
+use flotilla_resources::{
+    ChangeRequestReviewObservation, ChangeRequestStatus, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
+    ObservedReviewDecision,
+};
 
 use super::*;
 use crate::{
@@ -50,6 +54,219 @@ fn text(patch: &MetadataPatch, key: &str) -> String {
 
 fn catalog_input(convoys: &[ConvoyRow]) -> CatalogInput<'_> {
     CatalogInput { awareness: None, convoys, independents: &[], standing_roles: &[], project_repositories: &[] }
+}
+
+#[test]
+fn change_request_readiness_precedence_and_unknown_evidence() {
+    use ChangeRequestReadiness as Ready;
+    use ObservedChangeRequestState as State;
+    use ObservedChecks as Checks;
+    use ObservedMergeability as Mergeability;
+    use ObservedReviewDecision as Review;
+
+    let cases = [
+        (
+            "closed beats failures",
+            Some(State::Closed),
+            Some(Checks::Fail),
+            Some(Mergeability::Conflicting),
+            Some(Review::ChangesRequested),
+            Some(true),
+            false,
+            Ready::Closed,
+        ),
+        (
+            "merged awaiting landing",
+            Some(State::Merged),
+            Some(Checks::Fail),
+            Some(Mergeability::Conflicting),
+            Some(Review::ChangesRequested),
+            Some(true),
+            false,
+            Ready::MergedNotLanded,
+        ),
+        (
+            "merged and landed",
+            Some(State::Merged),
+            Some(Checks::Pass),
+            Some(Mergeability::Mergeable),
+            Some(Review::Approved),
+            Some(false),
+            true,
+            Ready::Closed,
+        ),
+        (
+            "draft beats conflict",
+            Some(State::Draft),
+            Some(Checks::Fail),
+            Some(Mergeability::Conflicting),
+            Some(Review::ChangesRequested),
+            Some(true),
+            false,
+            Ready::Draft,
+        ),
+        (
+            "conflict beats failing CI",
+            Some(State::Open),
+            Some(Checks::Fail),
+            Some(Mergeability::Conflicting),
+            Some(Review::ChangesRequested),
+            Some(true),
+            false,
+            Ready::Conflicting,
+        ),
+        (
+            "failing CI beats review",
+            Some(State::Open),
+            Some(Checks::Fail),
+            Some(Mergeability::Mergeable),
+            Some(Review::ChangesRequested),
+            Some(true),
+            false,
+            Ready::CiFailing,
+        ),
+        (
+            "actionable feedback",
+            Some(State::Open),
+            Some(Checks::Pass),
+            Some(Mergeability::Mergeable),
+            Some(Review::Approved),
+            Some(true),
+            false,
+            Ready::AwaitingReviewResponse,
+        ),
+        (
+            "changes requested",
+            Some(State::Open),
+            Some(Checks::Pass),
+            Some(Mergeability::Mergeable),
+            Some(Review::ChangesRequested),
+            Some(false),
+            false,
+            Ready::AwaitingReviewResponse,
+        ),
+        (
+            "review required",
+            Some(State::Open),
+            Some(Checks::Pass),
+            Some(Mergeability::Mergeable),
+            Some(Review::Required),
+            Some(false),
+            false,
+            Ready::AwaitingReviewResponse,
+        ),
+        (
+            "approved",
+            Some(State::Open),
+            Some(Checks::Pass),
+            Some(Mergeability::Mergeable),
+            Some(Review::Approved),
+            Some(false),
+            false,
+            Ready::ReadyToMerge,
+        ),
+        (
+            "no review required",
+            Some(State::Open),
+            Some(Checks::Pass),
+            Some(Mergeability::Mergeable),
+            Some(Review::None),
+            Some(false),
+            false,
+            Ready::ReadyToMerge,
+        ),
+        (
+            "pending checks",
+            Some(State::Open),
+            Some(Checks::Pending),
+            Some(Mergeability::Mergeable),
+            Some(Review::Approved),
+            Some(false),
+            false,
+            Ready::AwaitingReviewResponse,
+        ),
+        (
+            "unknown checks",
+            Some(State::Open),
+            None,
+            Some(Mergeability::Mergeable),
+            Some(Review::Approved),
+            Some(false),
+            false,
+            Ready::AwaitingReviewResponse,
+        ),
+        (
+            "unknown mergeability",
+            Some(State::Open),
+            Some(Checks::Pass),
+            None,
+            Some(Review::Approved),
+            Some(false),
+            false,
+            Ready::AwaitingReviewResponse,
+        ),
+        (
+            "unknown review decision",
+            Some(State::Open),
+            Some(Checks::Pass),
+            Some(Mergeability::Mergeable),
+            None,
+            Some(false),
+            false,
+            Ready::AwaitingReviewResponse,
+        ),
+        (
+            "unknown feedback",
+            Some(State::Open),
+            Some(Checks::Pass),
+            Some(Mergeability::Mergeable),
+            Some(Review::Approved),
+            None,
+            false,
+            Ready::AwaitingReviewResponse,
+        ),
+        (
+            "unknown state",
+            None,
+            Some(Checks::Pass),
+            Some(Mergeability::Mergeable),
+            Some(Review::Approved),
+            Some(false),
+            false,
+            Ready::AwaitingReviewResponse,
+        ),
+    ];
+    for (name, state, checks, mergeable, review_decision, actionable, landed, expected) in cases {
+        let status = ChangeRequestStatus {
+            title: Observation::default(),
+            author: Observation::default(),
+            review_decision: Observation { value: review_decision, ..Observation::default() },
+            review_requested_from_owner: Observation::default(),
+            state: Observation { value: state, ..Observation::default() },
+            head_sha: Observation::default(),
+            checks: Observation { value: checks, ..Observation::default() },
+            review: ChangeRequestReviewObservation { actionable_at_head: Observation { value: actionable, ..Observation::default() } },
+            mergeable: Observation { value: mergeable, ..Observation::default() },
+        };
+        assert_eq!(change_request_readiness(&status, landed), expected, "{name}");
+    }
+}
+
+#[test]
+fn change_request_readiness_uses_adr_wire_values() {
+    use ChangeRequestReadiness as Ready;
+
+    for (readiness, expected) in [
+        (Ready::ReadyToMerge, "ready_to_merge"),
+        (Ready::AwaitingReviewResponse, "awaiting_review_response"),
+        (Ready::CiFailing, "ci_failing"),
+        (Ready::Conflicting, "conflicting"),
+        (Ready::Draft, "draft"),
+        (Ready::MergedNotLanded, "merged_not_landed"),
+        (Ready::Closed, "closed"),
+    ] {
+        assert_eq!(readiness.as_str(), expected);
+    }
 }
 
 #[test]
