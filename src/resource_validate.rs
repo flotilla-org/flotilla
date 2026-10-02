@@ -335,7 +335,11 @@ mod tests {
             .using::<Project>("ops")
             .create(
                 &InputMeta::builder().name("ops-project".to_string()).build(),
-                &ProjectSpec::builder().display_name("Ops".to_string()).default_workflow_ref("default".to_string()).build(),
+                &ProjectSpec::builder()
+                    .display_name("Ops".to_string())
+                    .default_workflow_ref("default".to_string())
+                    .skills(std::collections::BTreeMap::from([("governor".to_string(), vec!["missing".to_string()])]))
+                    .build(),
             )
             .await
             .expect("create project outside default namespace");
@@ -363,6 +367,13 @@ mod tests {
         }
         let checked = validate_daemon(&socket, None).await.expect("candidate decodes all served kinds and namespaces");
         assert!(checked >= 4, "expected default, non-default, and replica-only records; got {checked}");
+        // Intended: schema compatibility alone cannot admit a Project whose
+        // skill declaration is absent from the candidate's supply catalog.
+        let catalog = root.join(".flotilla-skill-catalog.json");
+        std::fs::write(&catalog, serde_json::json!([{"source":"source", "repository":"owner/repo", "revision":"1".repeat(40), "name":"research", "path":"skills/research"}]).to_string()).expect("catalog");
+        std::fs::write(root.join(".flotilla-sources.json"), serde_json::json!({"schema_version":5,"sources":[{"name":"source","repository":"https://github.com/owner/repo.git","revision":"1".repeat(40)}]}).to_string()).expect("source manifest");
+        let error = validate_daemon(&socket, Some(&catalog)).await.expect_err("pre-roll checks registered projects in every namespace");
+        assert!(error.to_string().contains("ops") && error.to_string().contains("missing"), "{error}");
         task.abort();
         std::fs::remove_dir_all(root).expect("remove daemon directory");
     }
