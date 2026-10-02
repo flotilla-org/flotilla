@@ -47,6 +47,20 @@ spec:
             status:
               type: object
               properties:
+                declaration_refused:
+                  type: object
+                  required: [entry_path, message, since, observed_at]
+                  properties:
+                    entry_path:
+                      type: string
+                    message:
+                      type: string
+                    since:
+                      type: string
+                      format: date-time
+                    observed_at:
+                      type: string
+                      format: date-time
                 convoy_ref:
                   type: string
                 strikes:

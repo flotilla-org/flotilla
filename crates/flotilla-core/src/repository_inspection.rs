@@ -1,11 +1,11 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use async_trait::async_trait;
-use flotilla_resources::{ForgeSpec, RepositoryKey, RepositorySpec};
+use flotilla_resources::{ForgeSpec, Project, ProjectRepositoryRole, RepositoryKey, RepositorySpec, ResourceObject};
 
 use crate::{
     ops_entry::OperationalEntryFile,
@@ -92,6 +92,70 @@ pub trait RepositoryInspector: Send + Sync {
         files.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(OperationalEntriesInspection { commit: repository.checkout.git_ref.clone(), repository, files })
     }
+}
+
+/// Export the committed declaration inputs without parsing them with the running
+/// daemon. A pre-roll candidate applies its own parser to this inventory.
+pub async fn inspect_project_ops_entries(
+    projects: &[ResourceObject<Project>],
+    paths: &BTreeMap<RepositoryKey, Vec<PathBuf>>,
+    inspector: &dyn RepositoryInspector,
+) -> Result<Vec<OperationalEntryFile>, String> {
+    use crate::project_declaration::{BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION};
+    let mut files = Vec::new();
+    for project in projects {
+        for member in project.spec.repositories.iter().filter(|member| member.roles.contains(&ProjectRepositoryRole::Ops)) {
+            let mut candidates = paths.get(&member.repo).cloned().unwrap_or_default();
+            if project.metadata.annotations.get(BOOTSTRAP_REPOSITORY_ANNOTATION) == Some(&member.repo.to_string()) {
+                if let Some(path) = project.metadata.annotations.get(BOOTSTRAP_PATH_ANNOTATION) {
+                    candidates.push(PathBuf::from(path));
+                }
+            }
+            candidates.sort();
+            candidates.dedup();
+            let path = match candidates.as_slice() {
+                [path] => path.clone(),
+                [] => {
+                    return Err(format!(
+                        "Project/{}: ops member {} has no checkout available for candidate validation",
+                        project.metadata.name, member.repo
+                    ))
+                }
+                _ => {
+                    let mut main_paths = Vec::new();
+                    for path in candidates {
+                        if inspector.inspect_path(&path, None).await?.checkout.is_main {
+                            main_paths.push(path);
+                        }
+                    }
+                    match main_paths.as_slice() {
+                        [path] => path.clone(),
+                        _ => {
+                            return Err(format!(
+                                "Project/{}: ops member {} has no unambiguous main checkout",
+                                project.metadata.name, member.repo
+                            ))
+                        }
+                    }
+                }
+            };
+            let source = inspector
+                .inspect_operational_entries(&path)
+                .await
+                .map_err(|error| format!("Project/{} ops member {}: {error}", project.metadata.name, member.repo))?;
+            for mut file in source.files {
+                file.path = format!(
+                    "{}/{}/{}/{}",
+                    project.metadata.namespace,
+                    project.metadata.name,
+                    member.alias.as_deref().unwrap_or(&member.repo.0),
+                    file.path
+                );
+                files.push(file);
+            }
+        }
+    }
+    Ok(files)
 }
 
 fn collect_operational_entry_files(root: &Path, directory: &Path, files: &mut Vec<OperationalEntryFile>) -> Result<(), String> {
@@ -334,9 +398,10 @@ impl RepositoryInspector for GitRepositoryInspector {
         let mut files = Vec::new();
         for entry_path in paths.lines().filter_map(|path| path.strip_prefix(&prefix)).filter(|path| !path.is_empty()) {
             let object_ref = format!("{commit}:{entry_path}");
-            let Ok(contents) = self.read(&repository.checkout.path, RepositoryRead::FileAtRevision(&object_ref)).await else {
-                continue;
-            };
+            let contents = self
+                .read(&repository.checkout.path, RepositoryRead::FileAtRevision(&object_ref))
+                .await
+                .map_err(|error| format!("read operational entry {entry_path}: {error}"))?;
             files.push(OperationalEntryFile { path: entry_path.to_string(), contents });
         }
         Ok(OperationalEntriesInspection { repository, commit, files })

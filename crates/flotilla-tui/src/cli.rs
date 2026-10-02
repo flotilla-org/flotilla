@@ -362,7 +362,11 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
             Cell::new(repositories),
             Cell::new(issue_source),
             Cell::new(&project.default_workflow_ref),
-            Cell::new(if project.conflicts.is_empty() { String::new() } else { format!("! {}", project.conflicts.join(", ")) }),
+            Cell::new(match &project.declaration_refused {
+                Some(message) => format!("DeclarationRefused{}: {message}", if project.declaration_stale { " (stale)" } else { "" }),
+                None if !project.conflicts.is_empty() => format!("! {}", project.conflicts.join(", ")),
+                None => String::new(),
+            }),
             Cell::new(project.address.human_label()),
         ]);
     }

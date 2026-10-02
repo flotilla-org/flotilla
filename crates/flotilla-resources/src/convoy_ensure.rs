@@ -45,6 +45,8 @@ pub struct ConvoyEnsureSpec {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyEnsureStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_refused: Option<crate::DeclarationRefusedCondition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convoy_ref: Option<String>,
     /// Consecutive failed generations in the current retry episode.
     #[serde(default, rename = "strikes")]
@@ -87,6 +89,7 @@ pub enum ConvoyEnsureHoldReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyEnsureStatusPatch {
+    DeclarationRefused { condition: Option<crate::DeclarationRefusedCondition> },
     Running { convoy_ref: String, observed_at: DateTime<Utc> },
     BackingOff { retry_at: DateTime<Utc>, failure: String },
     Retrying { retry_at: DateTime<Utc>, failure: String },
@@ -102,6 +105,7 @@ pub enum ConvoyEnsureStatusPatch {
 impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
     fn apply(&self, status: &mut ConvoyEnsureStatus) {
         match self {
+            Self::DeclarationRefused { condition } => status.declaration_refused.clone_from(condition),
             Self::Running { convoy_ref, observed_at } => {
                 status.convoy_ref = Some(convoy_ref.clone());
                 status.running_since = Some(*observed_at);

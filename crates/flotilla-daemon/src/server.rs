@@ -695,7 +695,7 @@ async fn handle_client_with_caller(
         }
         Ok(Ok(_)) if first_byte[0].is_ascii_uppercase() => {
             tokio::select! {
-                result = resource_http::serve_resource_http(stream, first_byte[0], daemon.resource_backend().clone()) => {
+                result = resource_http::serve_resource_http_with_daemon(stream, first_byte[0], daemon.resource_backend().clone(), Some(Arc::clone(&daemon))) => {
                     if let Err(error) = result {
                         warn!(%error, "resource HTTP connection failed");
                     }

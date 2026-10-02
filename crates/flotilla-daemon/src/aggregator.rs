@@ -2578,7 +2578,9 @@ fn standing_role_row(ensure: &ResourceObject<ConvoyEnsure>) -> StandingRoleRow {
         }))
         .strikes(status.restart_count)
         .maybe_next_attempt(status.retry_at)
-        .maybe_last_failure(status.last_failure)
+        .maybe_last_failure(
+            status.declaration_refused.map(|refusal| format!("DeclarationRefused: {}", refusal.message)).or(status.last_failure),
+        )
         .build()
 }
 

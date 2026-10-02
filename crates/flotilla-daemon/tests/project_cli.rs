@@ -716,6 +716,19 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     };
     assert_eq!(ensures.get(&ensure_name).await.expect("refreshed ensure").spec.agent_overrides, vec![expected_override]);
 
+    std::fs::write(&ensure_path, "---\nkind: ensure\nrole: quartermaster\n---\nworkflow: all-code\nunknown_option: true\n")
+        .expect("declare invalid ensure");
+    let refused = execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".into() }).await;
+    assert!(matches!(refused, CommandValue::Error { .. }));
+    let project = backend.using::<Project>("flotilla").get("demo").await.expect("project");
+    let refusal = project.status.expect("status").declaration_refused.expect("visible refusal condition");
+    assert!(refusal.message.contains("unknown_option"));
+    assert_eq!(refusal.entry_path, "quartermaster.entry");
+    let ensure = ensures.get(&ensure_name).await.expect("last accepted ensure remains");
+    assert!(ensure.status.expect("ensure status").declaration_refused.is_some());
+    let demands = backend.using::<flotilla_resources::Demand>("flotilla").list().await.expect("attention").items;
+    assert!(demands.iter().any(|demand| demand.spec.originating_work_ref.name == "demo"));
+
     std::fs::remove_file(ensure_path).expect("remove ensure entry");
     assert_eq!(
         execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "demo".to_string() }).await,

@@ -131,12 +131,23 @@ pub struct DispatchPolicy {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_refused: Option<DeclarationRefusedCondition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dispatch_queue: Vec<DispatchQueueEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_queue_attention: Option<DispatchQueueAttention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operational_entries: Option<OperationalEntriesCondition>,
+}
+
+/// A declaration rejected by the candidate parser or materializer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclarationRefusedCondition {
+    pub entry_path: String,
+    pub message: String,
+    pub since: DateTime<Utc>,
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,11 +178,13 @@ pub struct DispatchQueueAttention {
 pub enum ProjectStatusPatch {
     ReplaceDispatchQueue { queue: Vec<DispatchQueueEntry>, attention: Option<DispatchQueueAttention> },
     ReplaceOperationalEntries { ready: bool, message: String },
+    DeclarationRefused { condition: Option<DeclarationRefusedCondition> },
 }
 
 impl StatusPatch<ProjectStatus> for ProjectStatusPatch {
     fn apply(&self, status: &mut ProjectStatus) {
         match self {
+            Self::DeclarationRefused { condition } => status.declaration_refused.clone_from(condition),
             Self::ReplaceDispatchQueue { queue, attention } => {
                 status.dispatch_queue.clone_from(queue);
                 status.dispatch_queue_attention.clone_from(attention);

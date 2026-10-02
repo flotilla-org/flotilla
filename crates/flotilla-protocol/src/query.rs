@@ -154,6 +154,11 @@ pub struct ProjectListResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ProjectListEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_refused: Option<String>,
+    #[builder(default)]
+    #[serde(default)]
+    pub declaration_stale: bool,
     pub namespace: String,
     pub name: String,
     pub display_name: String,

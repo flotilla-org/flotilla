@@ -9,13 +9,14 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::{
     qualified_path::{HostId, QualifiedPath},
-    ProviderData,
+    PrincipalRef, ProviderData, ResourceRef,
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, ensure_repository, normalize_project_spec, Clock, ConvoyEnsure, ConvoyEnsureSpec,
-    ConvoyRepositorySpec, EventRecorder, Forge, InputMeta, ObjectEvent, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
-    ProjectStatusPatch, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceBackend, ResourceError, ResourceObject,
-    WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
+    ConvoyEnsureStatusPatch, ConvoyRepositorySpec, DeclarationRefusedCondition, Demand, DemandKind, DemandSpec, EventRecorder, Forge,
+    InputMeta, ObjectEvent, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatusPatch, Repository,
+    RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceBackend, ResourceError, ResourceObject, WorkflowTemplate,
+    WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
 };
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -715,8 +716,59 @@ impl ProjectService<'_> {
             &ProjectStatusPatch::ReplaceOperationalEntries { ready, message: message.to_string() },
         )
         .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        let projects = self.resource_backend.using::<Project>(namespace);
+        let project = projects.get(project_name).await.map_err(|error| error.to_string())?;
+        let now = self.clock.now();
+        let condition = (!ready).then(|| DeclarationRefusedCondition {
+            entry_path: message.split(": ").next().unwrap_or_default().to_string(),
+            message: message.to_string(),
+            since: project.status.as_ref().and_then(|status| status.declaration_refused.as_ref()).map_or(now, |old| old.since),
+            observed_at: now,
+        });
+        apply_resource_status_patch(&projects, project_name, &ProjectStatusPatch::DeclarationRefused { condition: condition.clone() })
+            .await
+            .map_err(|error| error.to_string())?;
+        let ensures = self.resource_backend.definitions::<ConvoyEnsure>(namespace);
+        for ensure in ensures.list().await.map_err(|error| error.to_string())? {
+            if ensure.spec.project_ref == project_name {
+                apply_resource_status_patch(
+                    &self.resource_backend.using::<ConvoyEnsure>(namespace),
+                    &ensure.metadata.name,
+                    &ConvoyEnsureStatusPatch::DeclarationRefused { condition: condition.clone() },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        let demands = self.resource_backend.using::<Demand>(namespace);
+        let name = format!("declaration-refused-{project_name}");
+        if ready {
+            match demands.delete(&name).await {
+                Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        } else {
+            let target = ResourceRef::new("flotilla.work/v1", "Project", namespace, project_name);
+            let spec =
+                DemandSpec::for_dispatching_principal(target, DemandKind::HumanGate, PrincipalRef::implicit_for_namespace(namespace));
+            let mut annotations = BTreeMap::from([("flotilla.work/refusal-reason".into(), message.into())]);
+            if let Some(condition) = condition {
+                annotations.insert("flotilla.work/refused-since".into(), condition.since.to_rfc3339());
+                annotations
+                    .insert("flotilla.work/declaration-stale".into(), (now - condition.since >= chrono::Duration::hours(24)).to_string());
+            }
+            let meta = InputMeta::builder().name(name).annotations(annotations).build();
+            match demands.create(&meta, &spec).await {
+                Ok(_) => {}
+                Err(ResourceError::Conflict { .. }) => {
+                    let current = demands.get(&meta.name).await.map_err(|error| error.to_string())?;
+                    demands.update(&meta, &current.metadata.resource_version, &spec).await.map_err(|error| error.to_string())?;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

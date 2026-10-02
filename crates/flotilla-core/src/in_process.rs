@@ -5707,6 +5707,25 @@ impl InProcessDaemon {
         self.read_projections().fleet_health(&namespace, host_list, rows, self.local_host_id().map(|id| id.to_string()), now).await
     }
 
+    /// Raw ops declarations for candidate-side pre-roll validation.
+    pub async fn project_operational_entry_inventory(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::ops_entry::OperationalEntryFile>, String> {
+        let projects = self.resource_backend.definitions::<Project>(namespace).list().await.map_err(|error| error.to_string())?;
+        if !projects.iter().any(|project| {
+            project.spec.repositories.iter().any(|member| member.roles.contains(&flotilla_resources::ProjectRepositoryRole::Ops))
+        }) {
+            return Ok(Vec::new());
+        }
+        let mut paths = BTreeMap::<RepositoryKey, Vec<PathBuf>>::new();
+        for (path, key) in self.repository_keys_by_path.read().await.iter() {
+            paths.entry(key.clone()).or_default().push(path.clone());
+        }
+        let inspector = self.repository_inspector().await?;
+        crate::repository_inspection::inspect_project_ops_entries(&projects, &paths, &*inspector).await
+    }
+
     pub async fn list_projects_internal(&self) -> Result<ProjectListResponse, String> {
         read_projections::ReadProjections::list_projects(&self.resource_backend, &self.provisioning_namespace().await).await
     }

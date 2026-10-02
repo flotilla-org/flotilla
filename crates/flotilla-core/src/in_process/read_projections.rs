@@ -414,6 +414,20 @@ impl ReadProjections<'_> {
                 .collect::<Vec<_>>();
             entries.push(
                 ProjectListEntry::builder()
+                    .maybe_declaration_refused(
+                        project
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.declaration_refused.as_ref())
+                            .map(|refusal| refusal.message.clone()),
+                    )
+                    .declaration_stale(
+                        project
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.declaration_refused.as_ref())
+                            .is_some_and(|refusal| Utc::now() - refusal.since >= chrono::Duration::hours(24)),
+                    )
                     .namespace(project.metadata.namespace.clone())
                     .name(project.metadata.name.clone())
                     .display_name(project.spec.display_name)

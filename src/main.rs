@@ -1725,6 +1725,19 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
         ResourceSubCommand::Validate { path, from_daemon, host, skill_catalog } => {
             if from_daemon {
                 let paths = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
+                let local_roots = if host.is_none() {
+                    let config = ConfigStore::new(DaemonHostPath::new(&paths.config_dir), DaemonHostPath::new(&paths.state_dir));
+                    Some(
+                        config
+                            .load_observation_roots()
+                            .map_err(|error| color_eyre::eyre::eyre!(error))?
+                            .into_iter()
+                            .map(|path| path.into_path_buf())
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    None
+                };
                 let socket = if let Some(host) = host {
                     if host.is_empty() || host.contains(['/', '\\', '\0']) || host == "." || host == ".." {
                         return Err(color_eyre::eyre::eyre!("invalid peer host name: {host}"));
@@ -1733,7 +1746,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 } else {
                     paths.socket_path
                 };
-                resource_validate::validate_daemon(&socket, skill_catalog.as_deref()).await.map(|_| ())
+                resource_validate::validate_daemon(&socket, local_roots.as_deref(), skill_catalog.as_deref()).await.map(|_| ())
             } else {
                 resource_validate::validate_path(&path.expect("clap requires path without --from-daemon"), skill_catalog.as_deref())
             }

@@ -1,13 +1,26 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use color_eyre::{eyre::eyre, Result};
-use flotilla_resources::{validate_resource_document, ReplicationClass, REGISTERED_RESOURCE_KINDS};
+use flotilla_core::{
+    ops_entry::{parse_operational_entry, OperationalEntryFile},
+    path_context::ExecutionEnvironmentPath,
+    providers::{vcs::git_worktree::GitWorktreeStrategy, ProcessCommandRunner},
+    repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, RepositoryInspector},
+    vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
+};
+use flotilla_resources::{
+    validate_resource_document, K8sResourceObject, Project, ReplicationClass, ResourceObject, REGISTERED_RESOURCE_KINDS,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
 /// Query JSON directly over the daemon's resource socket. The command protocol's
 /// fingerprint deliberately rejects mixed generations during a fleet roll.
-pub async fn validate_daemon(socket: &Path, skill_catalog: Option<&Path>) -> Result<usize> {
+pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, skill_catalog: Option<&Path>) -> Result<usize> {
     let catalog = skill_catalog.map(load_catalog).transpose()?;
     let mut skill_documents = Vec::new();
     let client = reqwest::Client::builder().unix_socket(socket).build()?;
@@ -50,6 +63,7 @@ pub async fn validate_daemon(socket: &Path, skill_catalog: Option<&Path>) -> Res
 
     let mut failed = false;
     let mut count = 0;
+    let mut projects = BTreeMap::<String, Vec<ResourceObject<Project>>>::new();
     for (kind, namespaces) in kind_namespaces {
         let replication = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.plural == kind).map(|entry| entry.replication_class);
         let query = if replication.is_some_and(|class| class != ReplicationClass::None) { "?replicaSources=true" } else { "" };
@@ -80,6 +94,18 @@ pub async fn validate_daemon(socket: &Path, skill_catalog: Option<&Path>) -> Res
             for item in items {
                 count += 1;
                 let name = item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>");
+                if kind == "projects" {
+                    match serde_json::from_value::<K8sResourceObject<Project>>(item.clone())
+                        .map_err(|error| error.to_string())
+                        .and_then(|object| ResourceObject::from_k8s_object(object).map_err(|error| error.to_string()))
+                    {
+                        Ok(project) => projects.entry(namespace.clone()).or_default().push(project),
+                        Err(error) => {
+                            eprintln!("{label}/{name}: {error}");
+                            failed = true;
+                        }
+                    }
+                }
                 if let Err(error) = validate_resource_document(item) {
                     eprintln!("{label}/{name}: {error}");
                     failed = true;
@@ -106,6 +132,36 @@ pub async fn validate_daemon(socket: &Path, skill_catalog: Option<&Path>) -> Res
             }
         }
     }
+    for (namespace, registered) in projects {
+        let response = client.get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/operationalentries")).send().await?;
+        let result = if response.status().is_success() {
+            let document: Value = response.json().await?;
+            let files: Vec<OperationalEntryFile> =
+                serde_json::from_value(document.get("entries").cloned().ok_or_else(|| eyre!("ops inventory has no entries"))?)?;
+            validate_ops_files(&files)
+        } else if response.status() == reqwest::StatusCode::NOT_FOUND {
+            // Old daemons cannot export raw ops entries. On-host validation
+            // reads the same committed sources through the candidate's VCS seam.
+            let roots = local_roots.ok_or_else(|| eyre!("peer does not export ops inputs; run the candidate validation on that host"))?;
+            let runner = Arc::new(ProcessCommandRunner);
+            let vcs = FlotillaVcs::new(
+                ExecutionEnvironmentPath::new("/"),
+                runner.clone(),
+                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
+            );
+            let inspector = GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), "validation");
+            validate_project_ops(&registered, roots, &inspector).await
+        } else {
+            Err(eyre!("{namespace}: cannot inspect operational entries: {}", response.text().await?))
+        };
+        match result {
+            Ok(entries) => println!("validated {entries} operational entries in {namespace}"),
+            Err(error) => {
+                eprintln!("{error}");
+                failed = true;
+            }
+        }
+    }
     if failed {
         Err(eyre!("resource validation failed after checking {count} stored records"))
     } else {
@@ -115,6 +171,37 @@ pub async fn validate_daemon(socket: &Path, skill_catalog: Option<&Path>) -> Res
         println!("validated {count} stored records");
         Ok(count)
     }
+}
+
+fn validate_ops_files(files: &[OperationalEntryFile]) -> Result<usize> {
+    let mut count = 0;
+    let mut errors = Vec::new();
+    for file in files {
+        match parse_operational_entry(&file.contents) {
+            Ok(Some(_)) => count += 1,
+            Ok(None) => {}
+            Err(error) => errors.push(format!("{}: {error}", file.path)),
+        }
+    }
+    if errors.is_empty() {
+        Ok(count)
+    } else {
+        Err(eyre!("operational entry validation refused:\n{}", errors.join("\n")))
+    }
+}
+
+async fn validate_project_ops(
+    projects: &[ResourceObject<Project>],
+    roots: &[PathBuf],
+    inspector: &dyn RepositoryInspector,
+) -> Result<usize> {
+    let mut paths = BTreeMap::new();
+    for root in roots {
+        let inspection = inspector.inspect_path(root, None).await.map_err(|error| eyre!(error))?;
+        paths.entry(inspection.spec.key()).or_insert_with(Vec::new).push(root.clone());
+    }
+    let files = inspect_project_ops_entries(projects, &paths, inspector).await.map_err(|error| eyre!(error))?;
+    validate_ops_files(&files)
 }
 
 pub fn validate_path(path: &Path, skill_catalog: Option<&Path>) -> Result<()> {
@@ -257,7 +344,7 @@ mod tests {
     use flotilla_resources::{validate_resource_document, Convoy, ConvoySpec, ConvoyStatus, InputMeta, Project, ProjectSpec};
     use flotilla_test_support::TestSocketDir;
 
-    use super::{collect_files, parse_documents, validate_daemon};
+    use super::{collect_files, parse_documents, validate_daemon, validate_project_ops};
 
     #[test]
     fn reports_the_nested_field_of_a_stale_manifest() {
@@ -365,17 +452,92 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let checked = validate_daemon(&socket, None).await.expect("candidate decodes all served kinds and namespaces");
+        let checked = validate_daemon(&socket, Some(&[]), None).await.expect("candidate decodes all served kinds and namespaces");
         assert!(checked >= 4, "expected default, non-default, and replica-only records; got {checked}");
         // Intended: schema compatibility alone cannot admit a Project whose
         // skill declaration is absent from the candidate's supply catalog.
         let catalog = root.join(".flotilla-skill-catalog.json");
         std::fs::write(&catalog, serde_json::json!([{"source":"source", "repository":"owner/repo", "revision":"1".repeat(40), "name":"research", "path":"skills/research"}]).to_string()).expect("catalog");
         std::fs::write(root.join(".flotilla-sources.json"), serde_json::json!({"schema_version":5,"sources":[{"name":"source","repository":"https://github.com/owner/repo.git","revision":"1".repeat(40)}]}).to_string()).expect("source manifest");
-        let error = validate_daemon(&socket, Some(&catalog)).await.expect_err("pre-roll checks registered projects in every namespace");
+        let error = validate_daemon(&socket, Some(&[]), Some(&catalog)).await.expect_err("pre-roll checks registered projects in every namespace");
         assert!(error.to_string().contains("ops") && error.to_string().contains("missing"), "{error}");
         task.abort();
         std::fs::remove_dir_all(root).expect("remove daemon directory");
+    }
+
+    #[tokio::test]
+    async fn candidate_checks_registered_ops_entries_and_fails_on_unknown_fields() {
+        use std::sync::Arc;
+
+        use flotilla_core::{
+            path_context::ExecutionEnvironmentPath,
+            providers::{vcs::git_worktree::GitWorktreeStrategy, ProcessCommandRunner},
+            repository_inspection::GitRepositoryInspector,
+            vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
+        };
+        use flotilla_resources::{ProjectRepositoryRole, ProjectRepositorySpec, RepositorySpec};
+        let tmp = std::env::temp_dir().join(format!("flotilla-ops-validation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&tmp).expect("temporary ops repository");
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+            vec!["remote", "add", "origin", "https://github.com/example/ops"],
+        ] {
+            assert!(std::process::Command::new("git").args(args).current_dir(tmp.as_path()).status().expect("fixture git").success());
+        }
+        std::fs::write(
+            tmp.as_path().join("governor.md"),
+            "---\nkind: ensure\nrole: governor\n---\nworkflow: govern\nunknown_option: true\n",
+        )
+        .expect("invalid ops entry");
+        assert!(std::process::Command::new("git").args(["add", "."]).current_dir(tmp.as_path()).status().expect("stage fixture").success());
+        assert!(std::process::Command::new("git")
+            .args(["commit", "-m", "fixture"])
+            .current_dir(tmp.as_path())
+            .status()
+            .expect("commit fixture")
+            .success());
+        let spec = RepositorySpec::remote("https://github.com/example/ops").expect("repository");
+        let backend = flotilla_resources::ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let project = backend
+            .using::<Project>("flotilla")
+            .create(
+                &InputMeta::builder()
+                    .name("demo".to_string())
+                    .annotations(std::collections::BTreeMap::from([
+                        (
+                            flotilla_core::project_declaration::BOOTSTRAP_PATH_ANNOTATION.into(),
+                            tmp.as_path().to_string_lossy().into_owned(),
+                        ),
+                        (flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(), spec.key().to_string()),
+                    ]))
+                    .build(),
+                &ProjectSpec::builder()
+                    .display_name("Demo".to_string())
+                    .default_workflow_ref("govern".to_string())
+                    .repositories(vec![ProjectRepositorySpec {
+                        repo: spec.key(),
+                        alias: Some("ops".into()),
+                        roles: std::collections::BTreeSet::from([ProjectRepositoryRole::Ops]),
+                        subpath: None,
+                        default_branch: None,
+                    }])
+                    .build(),
+            )
+            .await
+            .expect("registered project");
+        let runner = Arc::new(ProcessCommandRunner);
+        let vcs = FlotillaVcs::new(
+            ExecutionEnvironmentPath::new(tmp.as_path()),
+            runner.clone(),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
+        );
+        let inspector = GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), "local");
+        let error = validate_project_ops(&[project], &[], &inspector).await.expect_err("candidate rejects unknown ops field");
+        assert!(error.to_string().contains("governor.md"));
+        assert!(error.to_string().contains("unknown_option"));
+        std::fs::remove_dir_all(tmp).expect("clean fixture");
     }
 
     #[cfg(unix)]
