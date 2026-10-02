@@ -41,13 +41,23 @@ impl CloneProvisioner for GitCloneProvisioner {
         let cwd = target_path.as_path();
         let default_branch = match self
             .runner
-            .run("git", &["-C", &cwd.to_string_lossy(), "symbolic-ref", "refs/remotes/origin/HEAD", "--short"], cwd, &ChannelLabel::Default)
+            .run(
+                "git",
+                &["-C", &cwd.to_string_lossy(), "--git-dir=.git", "symbolic-ref", "refs/remotes/origin/HEAD", "--short"],
+                cwd,
+                &ChannelLabel::Default,
+            )
             .await
         {
             Ok(head) => Some(head.trim().strip_prefix("origin/").unwrap_or(head.trim()).to_string()),
             Err(_) => match self
                 .runner
-                .run("git", &["-C", &cwd.to_string_lossy(), "rev-parse", "--abbrev-ref", "HEAD"], cwd, &ChannelLabel::Default)
+                .run(
+                    "git",
+                    &["-C", &cwd.to_string_lossy(), "--git-dir=.git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd,
+                    &ChannelLabel::Default,
+                )
                 .await
             {
                 Ok(branch) => {

@@ -9149,11 +9149,79 @@ mod tests {
             .any(|command| { command == &["git", "-C", clone.path().to_str().expect("utf-8 clone path"), "worktree", "prune"] }));
     }
 
+    // Known checkout roots must never inherit branch or status from an ancestor.
+    // Cover absent roots, standalone repositories and linked-worktree gitfiles,
+    // nested at several depths beneath both clean and dirty enclosing checkouts.
+    #[hegel::test]
+    fn checkout_root_inspection_does_not_inherit_enclosing_repository(tc: hegel::TestCase) {
+        use flotilla_core::{
+            providers::vcs::{CloneProvisioner, GitCloneProvisioner},
+            vcs::{GitCliBackend, VcsBackend},
+        };
+        use hegel::generators as gs;
+
+        let depth = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+        let kind = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+        let dirty_parent = tc.draw(gs::booleans());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = TempDir::new().expect("tempdir");
+            let parent = TestGitRepo::init(temp.path()).with_initial_commit();
+            // Ignore fixture children so the clean-ancestor cases are actually clean.
+            fs::write(parent.path().join(".git/info/exclude"), "nested/\n").expect("ignore nested fixtures");
+            let mut target = parent.path().to_path_buf();
+            for _ in 0..depth {
+                target.push("nested");
+            }
+            fs::create_dir_all(&target).expect("create target");
+            match kind {
+                0 => {}
+                1 => {
+                    TestGitRepo::init(&target).with_initial_commit();
+                }
+                2 => {
+                    assert!(ProcessCommand::new("git")
+                        .arg("-C")
+                        .arg(parent.path())
+                        .args(["worktree", "add", "-b", "inner"])
+                        .arg(&target)
+                        .output()
+                        .expect("create linked worktree")
+                        .status
+                        .success());
+                }
+                _ => unreachable!(),
+            }
+            if dirty_parent {
+                fs::write(parent.path().join("README.md"), "dirty ancestor\n").expect("dirty parent");
+            }
+            let runner = ProcessCommandRunner;
+            let vcs = GitCliBackend::checkout_root(&target, &runner);
+            let branch = vcs.current_branch().await;
+            let status = vcs.working_tree_status(false).await.expect("status process");
+            let inspection = GitCloneProvisioner::new(Arc::new(ProcessCommandRunner))
+                .inspect_clone(&ExecutionEnvironmentPath::new(&target))
+                .await
+                .expect("inspect clone");
+            if kind == 0 {
+                assert!(branch.is_err(), "a directory without its own Git entry is not a checkout");
+                assert!(!status.success, "status must not inspect the enclosing checkout");
+                assert!(inspection.default_branch.is_none(), "clone inspection must not borrow the ancestor branch");
+            } else {
+                let expected = if kind == 1 { "main" } else { "inner" };
+                assert_eq!(branch.expect("checkout branch").trim(), expected);
+                assert!(status.success && status.stdout.is_empty(), "the nested checkout itself is clean");
+                assert_eq!(inspection.default_branch.as_deref(), Some(expected));
+            }
+        });
+    }
+
     #[tokio::test]
     async fn checkout_runtime_removes_unregistered_worktree_path_with_embedded_repository() {
-        // This scenario requires a non-repository parent. A repo-local TMPDIR
-        // otherwise lets Git discover the vessel checkout above the fixture.
-        let temp = TempDir::new_in("/tmp").expect("isolated non-repository tempdir");
+        // A stale checkout has no Git entry of its own. Cleanup must not
+        // inspect the enclosing repository, even when it contains another repo.
+        let temp = TempDir::new().expect("tempdir");
+        TestGitRepo::init(temp.path()).with_initial_commit();
         let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
         let target = temp.path().join("checkout-root/convoy-a/flotilla.feature-cleanup");
         TestGitRepo::init(target.join("embedded")).with_initial_commit();

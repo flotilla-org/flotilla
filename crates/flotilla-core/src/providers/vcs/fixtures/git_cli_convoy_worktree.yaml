@@ -103,18 +103,19 @@ rounds:
     cwd: /
     stdout: |
       branch 'convoy/new' set up to track 'origin/main'.
-      HEAD is now at 49a25e9 initial
+      HEAD is now at b2dbf53 initial
     exit_code: 0
   - channel: command
     cmd: git
     args:
     - '-C'
     - '{root}/convoy-new'
+    - '--git-dir=.git'
     - rev-parse
     - HEAD
     cwd: /
     stdout: |
-      49a25e971d19c18e1d676b4fc832eafa1e0e9635
+      b2dbf53c9b58fc0a1f13fb6baf5ddc2cc8b56ddf
     exit_code: 0
   - channel: command
     cmd: git
@@ -123,7 +124,7 @@ rounds:
     - '{root}/repo'
     - update-ref
     - refs/flotilla/bootstrap/convoy/new
-    - '49a25e971d19c18e1d676b4fc832eafa1e0e9635'
+    - b2dbf53c9b58fc0a1f13fb6baf5ddc2cc8b56ddf
     cwd: /
     stdout: ''
     exit_code: 0
@@ -132,6 +133,7 @@ rounds:
     args:
     - '-C'
     - '{root}/convoy-new'
+    - '--git-dir=.git'
     - symbolic-ref
     - '--quiet'
     - '--short'
@@ -145,6 +147,7 @@ rounds:
     args:
     - '-C'
     - '{root}/convoy-new'
+    - '--git-dir=.git'
     - status
     - '--porcelain'
     cwd: /
@@ -157,6 +160,7 @@ rounds:
     args:
     - '-C'
     - '{root}/convoy-new'
+    - '--git-dir=.git'
     - symbolic-ref
     - '--quiet'
     - '--short'
@@ -169,6 +173,7 @@ rounds:
     args:
     - '-C'
     - '{root}/convoy-new'
+    - '--git-dir=.git'
     - symbolic-ref
     - '--quiet'
     - '--short'
@@ -182,6 +187,7 @@ rounds:
     args:
     - '-C'
     - '{root}/convoy-new'
+    - '--git-dir=.git'
     - status
     - '--porcelain'
     cwd: /
@@ -221,7 +227,7 @@ rounds:
     - refs/heads/convoy/new
     cwd: /
     stdout: |
-      49a25e971d19c18e1d676b4fc832eafa1e0e9635
+      b2dbf53c9b58fc0a1f13fb6baf5ddc2cc8b56ddf
     stderr: ''
     exit_code: 0
   - channel: command
@@ -234,7 +240,7 @@ rounds:
     - refs/flotilla/bootstrap/convoy/new
     cwd: /
     stdout: |
-      49a25e971d19c18e1d676b4fc832eafa1e0e9635
+      b2dbf53c9b58fc0a1f13fb6baf5ddc2cc8b56ddf
     stderr: ''
     exit_code: 0
   - channel: command
@@ -248,7 +254,7 @@ rounds:
     cwd: /
     stdout: |+
       worktree {root}/repo
-      HEAD 49a25e971d19c18e1d676b4fc832eafa1e0e9635
+      HEAD b2dbf53c9b58fc0a1f13fb6baf5ddc2cc8b56ddf
       branch refs/heads/main
 
     exit_code: 0
@@ -263,7 +269,7 @@ rounds:
     - convoy/new
     cwd: /
     stdout: |
-      Deleted branch convoy/new (was 49a25e9).
+      Deleted branch convoy/new (was b2dbf53).
     exit_code: 0
   - channel: command
     cmd: git

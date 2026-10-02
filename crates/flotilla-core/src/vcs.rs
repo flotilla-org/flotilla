@@ -47,6 +47,11 @@ pub(crate) fn guard_host_git_config(cmd: &str, args: &[&str], cwd: &Path) -> Res
     } else {
         return Ok(());
     };
+    // Let Git report a missing explicit gitdir. Do not fall back to an ancestor
+    // or turn an absent checkout into a host-config inspection failure.
+    if !git_entry.exists() {
+        return Ok(());
+    }
     let admin_dir = if git_entry.is_dir() {
         git_entry
     } else {
@@ -674,7 +679,7 @@ impl FlotillaVcs {
         if !self.runner.path_exists(Path::new(target)).await? {
             return Ok(CheckoutRemoval::Removed);
         }
-        let backend = GitCliBackend::explicit_checkout(Path::new(target), &*self.runner);
+        let backend = GitCliBackend::checkout_root(Path::new(target), &*self.runner);
         let preserve = |reason| CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason };
         match backend.branch_ownership(branch, CheckoutSharing::Independent).await? {
             CheckoutOwnership::PreExisting => return Ok(preserve(CheckoutPreservationReason::NotCreatedForConvoy)),
@@ -689,7 +694,7 @@ impl FlotillaVcs {
 
     /// Apply the same checkout-preservation policy before either storage strategy removes a path.
     async fn checkout_removal_guard(&self, branch: &str, target: &str) -> Result<Option<CheckoutRemoval>, String> {
-        let backend = GitCliBackend::explicit_checkout(Path::new(target), &*self.runner);
+        let backend = GitCliBackend::checkout_root(Path::new(target), &*self.runner);
         let preserve = |reason| Some(CheckoutRemoval::PreservedCheckout { path: target.to_string(), reason });
         let current = match backend.current_branch().await {
             Err(error) if error.contains("not a git repository") => return Ok(None),
@@ -851,7 +856,7 @@ impl Vcs for FlotillaVcs {
         let patch_path = patch.to_str().ok_or_else(|| "patch path is not UTF-8".to_string())?;
         let snapshot_path = snapshot.to_str().ok_or_else(|| "snapshot path is not UTF-8".to_string())?;
         self.runner.run("mkdir", &["-p", staging_path], Path::new("/"), &crate::providers::ChannelLabel::Default).await?;
-        let backend = GitCliBackend::explicit_checkout(path, &*self.runner);
+        let backend = GitCliBackend::checkout_root(path, &*self.runner);
         let archive_result = async {
             backend.bundle_head(bundle_path).await?;
             backend.write_patch(patch_path).await?;
@@ -1006,7 +1011,7 @@ impl Vcs for FlotillaVcs {
     }
 
     async fn clone_origin(&self, target: &Path) -> Result<String, String> {
-        GitCliBackend::explicit_checkout(target, &*self.runner).remote_url("origin").await
+        GitCliBackend::checkout_root(target, &*self.runner).remote_url("origin").await
     }
 
     async fn materialise_fresh_clone(
@@ -1029,7 +1034,7 @@ impl Vcs for FlotillaVcs {
             if !same_origin {
                 return Err(format!("checkout target {target} already exists with origin {}, expected {url}", origin.trim()));
             }
-            let target_backend = GitCliBackend::explicit_checkout(Path::new(target), &*self.runner);
+            let target_backend = GitCliBackend::checkout_root(Path::new(target), &*self.runner);
             if branch != "HEAD" {
                 let current = target_backend
                     .current_branch()
@@ -1049,7 +1054,7 @@ impl Vcs for FlotillaVcs {
         let clone_ref = base_ref.unwrap_or(branch);
         let prepare = async {
             GitCliBackend::new(Path::new("/"), &*self.runner).clone_repo(url, &staging, (clone_ref != "HEAD").then_some(clone_ref)).await?;
-            let staging_backend = GitCliBackend::explicit_checkout(Path::new(&staging), &*self.runner);
+            let staging_backend = GitCliBackend::checkout_root(Path::new(&staging), &*self.runner);
             if clone_ref != branch {
                 let remote_ref = format!("refs/remotes/origin/{branch}");
                 let track = format!("origin/{branch}");
@@ -1150,22 +1155,35 @@ async fn cleanup_clone_path(runner: &dyn CommandRunner, path: &str, error: Strin
     }
 }
 
+#[derive(Clone, Copy)]
+enum GitAddressing {
+    Discover,
+    ExplicitCheckout,
+    CheckoutRoot,
+}
+
 /// Universal Git CLI implementation. The runner determines the command transport.
 pub struct GitCliBackend<'a> {
     checkout: &'a Path,
     runner: &'a dyn CommandRunner,
     strategy: Option<&'a GitCheckoutStrategy>,
-    explicit_checkout: bool,
+    addressing: GitAddressing,
 }
 
 impl<'a> GitCliBackend<'a> {
     pub fn new(checkout: &'a Path, runner: &'a dyn CommandRunner) -> Self {
-        Self { checkout, runner, strategy: None, explicit_checkout: false }
+        Self { checkout, runner, strategy: None, addressing: GitAddressing::Discover }
     }
 
-    /// Preserve `git -C <checkout>` command addressing for existing remote runners.
+    /// Preserve `git -C <checkout>` addressing and normal repository discovery.
     pub fn explicit_checkout(checkout: &'a Path, runner: &'a dyn CommandRunner) -> Self {
-        Self { checkout, runner, strategy: None, explicit_checkout: true }
+        Self { checkout, runner, strategy: None, addressing: GitAddressing::ExplicitCheckout }
+    }
+
+    /// Address this exact non-bare checkout root, never an enclosing repository.
+    /// Git accepts both a `.git` directory and a linked-worktree `.git` file.
+    pub fn checkout_root(checkout: &'a Path, runner: &'a dyn CommandRunner) -> Self {
+        Self { checkout, runner, strategy: None, addressing: GitAddressing::CheckoutRoot }
     }
 
     fn with_strategy(mut self, strategy: &'a GitCheckoutStrategy) -> Self {
@@ -1174,9 +1192,12 @@ impl<'a> GitCliBackend<'a> {
     }
 
     async fn run(&self, args: &[&str]) -> Result<String, String> {
-        if self.explicit_checkout {
+        if !matches!(self.addressing, GitAddressing::Discover) {
             let checkout = self.checkout.to_str().ok_or_else(|| "checkout path is not valid UTF-8".to_string())?;
             let mut command = vec!["-C", checkout];
+            if matches!(self.addressing, GitAddressing::CheckoutRoot) {
+                command.push("--git-dir=.git");
+            }
             command.extend_from_slice(args);
             self.runner.run("git", &command, Path::new("/"), &command_channel_label("git", &command)).await
         } else {
@@ -1185,9 +1206,12 @@ impl<'a> GitCliBackend<'a> {
     }
 
     async fn output(&self, args: &[&str]) -> Result<CommandOutput, String> {
-        if self.explicit_checkout {
+        if !matches!(self.addressing, GitAddressing::Discover) {
             let checkout = self.checkout.to_str().ok_or_else(|| "checkout path is not valid UTF-8".to_string())?;
             let mut command = vec!["-C", checkout];
+            if matches!(self.addressing, GitAddressing::CheckoutRoot) {
+                command.push("--git-dir=.git");
+            }
             command.extend_from_slice(args);
             self.runner.run_output("git", &command, Path::new("/"), &command_channel_label("git", &command)).await
         } else {
@@ -1345,7 +1369,7 @@ impl VcsBackend for GitCliBackend<'_> {
 
     async fn create_worktree(&self, branch: &str, base_ref: Option<&str>, target: &str) -> Result<CheckoutMaterialisation, String> {
         if self.runner.path_exists(Path::new(target)).await? {
-            let target_vcs = GitCliBackend::explicit_checkout(Path::new(target), self.runner);
+            let target_vcs = GitCliBackend::checkout_root(Path::new(target), self.runner);
             let target_common_dir = target_vcs
                 .common_dir()
                 .await
@@ -1413,7 +1437,7 @@ impl VcsBackend for GitCliBackend<'_> {
             self.worktree_add(WorktreeAdd::Detached { target, branch }).await?;
         }
 
-        let commit = Some(GitCliBackend::explicit_checkout(Path::new(target), self.runner).head_commit_text().await?.trim().to_string());
+        let commit = Some(GitCliBackend::checkout_root(Path::new(target), self.runner).head_commit_text().await?.trim().to_string());
         if provenance == CheckoutBranchProvenance::CreatedForConvoy {
             let bootstrap_commit = commit.as_deref().ok_or_else(|| format!("resolve bootstrap commit for {branch}"))?;
             self.update_ref(&bootstrap_branch_ref(branch), bootstrap_commit).await?;
