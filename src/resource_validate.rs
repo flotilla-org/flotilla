@@ -161,7 +161,7 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
                     );
                     let inspector =
                         GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), VALIDATION_INSPECTION_HOST);
-                    let paths = inspect_validation_roots(roots, &inspector).await?;
+                    let paths = inspect_validation_roots(roots, &inspector).await;
                     local_inventory = Some((inspector, paths));
                 }
                 let (inspector, paths) = local_inventory.as_ref().expect("initialized local inventory");
@@ -195,6 +195,10 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
 /// generations either have no route (404) or reject the kind as unknown (400),
 /// and both fall back to candidate-side local inspection. Other errors, such as
 /// 422 for an unavailable ops source, are real refusals.
+///
+/// The 400 match is coupled to the previous generation's wire message for an
+/// unregistered kind ("unknown resource kind '<kind>' (supported: ...)").
+/// Remove it one roll after every host serves the endpoint.
 fn ops_inventory_endpoint_absent(status: reqwest::StatusCode, body: &str) -> bool {
     status == reqwest::StatusCode::NOT_FOUND || (status == reqwest::StatusCode::BAD_REQUEST && body.contains("unknown resource kind"))
 }
@@ -219,7 +223,7 @@ fn validate_ops_files(files: &[OperationalEntryFile]) -> Result<usize> {
 async fn inspect_validation_roots(
     roots: &[PathBuf],
     inspector: &dyn RepositoryInspector,
-) -> Result<BTreeMap<flotilla_resources::RepositoryKey, Vec<PathBuf>>> {
+) -> BTreeMap<flotilla_resources::RepositoryKey, Vec<PathBuf>> {
     let mut paths = BTreeMap::new();
     for root in roots {
         // A root without a derivable identity cannot back any ops member. Report
@@ -229,7 +233,7 @@ async fn inspect_validation_roots(
             Err(error) => eprintln!("{}: not identified for ops validation: {error}", root.display()),
         }
     }
-    Ok(paths)
+    paths
 }
 
 async fn validate_project_ops(
@@ -592,6 +596,17 @@ mod tests {
         git(&["add", "."]);
         git(&["commit", "-m", "fixture"]);
         git(&["checkout", "--detach"]);
+        // The daemon loads committed entries only; working-tree drafts are not inputs.
+        std::fs::write(
+            tmp.as_path().join("draft.md"),
+            "---\nkind: ensure\nrole: governor\n---\nworkflow: govern\ndraft_only_field: true\n",
+        )
+        .expect("untracked draft");
+        std::fs::write(
+            tmp.as_path().join("governor.md"),
+            "---\nkind: ensure\nrole: governor\n---\nworkflow: govern\nuncommitted_edit: true\n",
+        )
+        .expect("uncommitted edit");
         let spec = RepositorySpec::remote("https://github.com/example/ops").expect("repository");
         let backend = flotilla_resources::ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
         let project = backend
@@ -630,11 +645,13 @@ mod tests {
         let inspector = GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), VALIDATION_INSPECTION_HOST);
         // The roots pass tolerates the unidentifiable checkout; the bootstrap
         // annotation still selects it and its entries are parsed.
-        let paths = inspect_validation_roots(std::slice::from_ref(&tmp), &inspector).await.expect("roots inspection continues");
+        let paths = inspect_validation_roots(std::slice::from_ref(&tmp), &inspector).await;
         let error = validate_project_ops(std::slice::from_ref(&project), &paths, &inspector)
             .await
             .expect_err("candidate parses the selected checkout's entries");
         assert!(error.to_string().contains("unknown_option"), "{error}");
+        assert!(!error.to_string().contains("draft_only_field"), "untracked files are not validated: {error}");
+        assert!(!error.to_string().contains("uncommitted_edit"), "uncommitted edits are not validated: {error}");
     }
 
     #[tokio::test]
@@ -798,7 +815,7 @@ mod tests {
             .status()
             .expect("same repository identity")
             .success());
-        let paths = inspect_validation_roots(&[tmp.clone(), duplicate.clone()], &inspector).await.expect("inspect duplicate roots");
+        let paths = inspect_validation_roots(&[tmp.clone(), duplicate.clone()], &inspector).await;
         let error = validate_project_ops(&[project], &paths, &inspector).await.expect_err("ambiguous main checkouts fail the gate");
         assert!(error.to_string().contains("no unambiguous main checkout"), "{error}");
     }
