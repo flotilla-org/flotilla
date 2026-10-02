@@ -69,11 +69,11 @@ fn provider_lists_show_active_sessions_and_workspaces() {
     use flotilla_protocol::{CliListKind, CliListResponse, CliListRow};
 
     let row = CliListRow {
-        repo: "team/repo".into(),
+        repo: Some("team/repo".into()),
         reference: "session-42".into(),
         name: "Implement feature".into(),
         status: "running".into(),
-        provider: "Claude".into(),
+        provider: Some("Claude".into()),
     };
     let agents = CliListResponse { list_kind: CliListKind::Agent, items: vec![row] };
     let value = CommandValue::CliList(Box::new(agents.clone()));

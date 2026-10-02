@@ -179,10 +179,12 @@ async fn cli_lists_include_active_provider_sessions_and_workspaces() {
     };
 
     struct Sessions;
+    struct BrokenSessions;
 
     #[async_trait::async_trait]
     impl CloudAgentService for Sessions {
-        async fn list_sessions(&self, _criteria: &RepoCriteria) -> Result<Vec<(String, flotilla_protocol::CloudAgentSession)>, String> {
+        async fn list_sessions(&self, criteria: &RepoCriteria) -> Result<Vec<(String, flotilla_protocol::CloudAgentSession)>, String> {
+            assert_eq!(criteria.repo_slug.as_deref(), Some("team/repo"));
             let session = |title: &str, status| flotilla_protocol::CloudAgentSession {
                 title: title.into(),
                 status,
@@ -196,6 +198,21 @@ async fn cli_lists_include_active_provider_sessions_and_workspaces() {
                 ("active".into(), session("Active", flotilla_protocol::SessionStatus::Running)),
                 ("archived".into(), session("Archived", flotilla_protocol::SessionStatus::Archived)),
             ])
+        }
+
+        async fn archive_session(&self, _session_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn attach_command(&self, _session_id: &str) -> Result<String, String> {
+            Ok("true".into())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CloudAgentService for BrokenSessions {
+        async fn list_sessions(&self, _criteria: &RepoCriteria) -> Result<Vec<(String, flotilla_protocol::CloudAgentSession)>, String> {
+            Err("provider unavailable".into())
         }
 
         async fn archive_session(&self, _session_id: &str) -> Result<(), String> {
@@ -222,7 +239,15 @@ async fn cli_lists_include_active_provider_sessions_and_workspaces() {
         .add_workspaces(vec![("workspace:1".into(), flotilla_protocol::Workspace { name: "Current work".into(), attachable_set_id: None })])
         .await;
     let mut registry = ProviderRegistry::new();
+    registry.cloud_agents.insert("broken", ProviderDescriptor::named(ProviderCategory::CloudAgent, "broken"), Arc::new(BrokenSessions));
     registry.cloud_agents.insert("fake", ProviderDescriptor::named(ProviderCategory::CloudAgent, "fake"), Arc::new(Sessions));
+    let broken_workspace_provider = Arc::new(FakePresentationManager::new());
+    *broken_workspace_provider.list_error.lock().await = Some("provider unavailable".into());
+    registry.presentation_managers.insert(
+        "broken",
+        ProviderDescriptor::named(ProviderCategory::WorkspaceManager, "broken"),
+        broken_workspace_provider,
+    );
     registry.presentation_managers.insert(
         "fake",
         ProviderDescriptor::named(ProviderCategory::WorkspaceManager, "fake"),
@@ -254,6 +279,7 @@ async fn cli_lists_include_active_provider_sessions_and_workspaces() {
     };
     assert_eq!(workspaces.items.len(), 1);
     assert_eq!(workspaces.items[0].name, "Current work");
+    assert_eq!(workspaces.items[0].repo, None);
 }
 
 #[test]

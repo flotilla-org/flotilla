@@ -19,8 +19,8 @@ use flotilla_resources::{
     expected_checkout_refs, repository_display_labels, resolve_project_issue_sources, Checkout as ResourceCheckout, Clock, ConditionValue,
     Convoy as ResourceConvoy, ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState, EventRecorder, Forge,
     FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus, IssueSourceResolution,
-    ManifestRoot, Project, ReadResourceObject, Repository, RepositoryKey, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, SettlementMode, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    IssueSourceUnavailable, ManifestRoot, Project, ReadResourceObject, Repository, RepositoryKey, ResourceBackend, ResourceError,
+    ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
     CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
@@ -389,7 +389,11 @@ impl ReadProjections<'_> {
             let issue_sources =
                 match resolve_project_issue_sources(&backend.including_replicas::<Repository>(namespace), &project.spec).await {
                     IssueSourceResolution::Available { bindings } => bindings.into_iter().map(|binding| binding.source).collect(),
-                    IssueSourceResolution::Unavailable(_) => Vec::new(),
+                    IssueSourceResolution::Unavailable(IssueSourceUnavailable::NoIssueSource) => Vec::new(),
+                    IssueSourceResolution::Unavailable(error) => {
+                        warn!(project = %project.metadata.name, ?error, "could not resolve project issue sources");
+                        Vec::new()
+                    }
                 };
             let conflicts = project.metadata.merge.as_ref().map(|merge| merge.conflicts.keys().cloned().collect()).unwrap_or_default();
             let mut project_repositories = BTreeMap::<RepositoryKey, BTreeSet<String>>::new();
@@ -526,9 +530,8 @@ impl ReadProjections<'_> {
 
         for row in &mut rows {
             if let Some(replica) = replicas.iter().find(|replica| replica.host == row.host && !replica.reachable) {
-                if let Some(message) = &replica.message {
-                    row.staleness = FleetStaleness::Unreachable { last_sync: replica.last_sync, message: message.clone() };
-                }
+                let message = replica.message.clone().unwrap_or_else(|| "replica sync is stale".to_string());
+                row.staleness = FleetStaleness::Unreachable { last_sync: replica.last_sync, message };
             }
         }
         rows.sort_by(|left, right| {
@@ -1314,6 +1317,40 @@ mod tests {
             &response.rows[0].staleness,
             FleetStaleness::Unreachable { last_sync: Some(sync), message }
                 if *sync == last_sync && message.contains("convoys: connection lost")
+        ));
+    }
+
+    #[tokio::test]
+    async fn fleet_list_marks_remote_rows_unreachable_when_sync_is_stale_without_error() {
+        let fixture = ProjectionFixture::new();
+        let now = Utc::now();
+        let last_sync = now - chrono::Duration::hours(1);
+        fixture.register_remote_host("remote-node", "remote", "remote-id").await;
+        let remote_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let remote_hosts = remote_backend.using::<ResourceHost>("flotilla");
+        remote_hosts.create(&InputMeta::builder().name("remote-id".to_string()).build(), &HostSpec::default()).await.expect("host");
+        fixture
+            .backend
+            .replica_writer::<ResourceHost>(NodeId::new("remote-node"), "flotilla")
+            .replace(&remote_hosts.list().await.expect("remote hosts"), last_sync)
+            .await
+            .expect("replicate host");
+        let row = FleetListRow::builder()
+            .convoy("example")
+            .vessel("work")
+            .crew("coder")
+            .crew_state("active")
+            .host(HostName::new("remote"))
+            .namespace("flotilla")
+            .staleness(FleetStaleness::Fresh { last_sync })
+            .build();
+
+        let response = fixture.projections().fleet_list("flotilla", vec![row], now).await.expect("fleet list");
+        assert!(!response.replicas[0].reachable);
+        assert!(matches!(
+            &response.rows[0].staleness,
+            FleetStaleness::Unreachable { last_sync: Some(sync), message }
+                if *sync == last_sync && message.contains("stale")
         ));
     }
 

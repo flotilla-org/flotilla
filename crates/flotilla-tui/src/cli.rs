@@ -384,11 +384,11 @@ fn format_cli_list_human(response: &CliListResponse) -> String {
     table.set_header(vec!["Repository", "Reference", "Name", "Status", "Provider"]);
     for item in &response.items {
         table.add_row(vec![
-            Cell::new(&item.repo),
+            Cell::new(item.repo.as_deref().unwrap_or("-")),
             Cell::new(&item.reference),
             Cell::new(&item.name),
             Cell::new(&item.status),
-            Cell::new(&item.provider),
+            Cell::new(item.provider.as_deref().unwrap_or("-")),
         ]);
     }
     format!("{table}\n")

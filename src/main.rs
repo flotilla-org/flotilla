@@ -3607,7 +3607,8 @@ mod tests {
     #[test]
     fn cli_parses_agent_noun() {
         let cli = Cli::try_parse_from(["flotilla", "agent", "claude-1", "teleport"]).expect("agent cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Agent(_))));
+        let Some(SubCommand::Agent(noun)) = cli.command else { panic!("expected agent command") };
+        assert!(matches!(noun.verb, Some(flotilla_commands::commands::agent::AgentVerb::Teleport { .. })));
     }
 
     #[test]

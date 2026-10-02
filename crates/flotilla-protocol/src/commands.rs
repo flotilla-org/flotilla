@@ -30,11 +30,11 @@ pub enum CliListKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CliListRow {
-    pub repo: String,
+    pub repo: Option<String>,
     pub reference: String,
     pub name: String,
     pub status: String,
-    pub provider: String,
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
