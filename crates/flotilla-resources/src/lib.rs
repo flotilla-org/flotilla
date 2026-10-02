@@ -17,7 +17,7 @@ mod credential;
 pub mod crew_defaults;
 pub use crew_defaults::{
     resolve_skills, skill_layers, validate_skill_ref, CrewDefaults, CrewDefaultsSpec, ResolvedSkills, SkillCatalogEntry, SkillDecision,
-    SkillRefusal,
+    SkillLayer, SkillOutcome, SkillRefusal,
 };
 mod crew_image_baseline;
 mod definition;

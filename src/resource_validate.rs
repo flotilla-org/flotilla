@@ -394,6 +394,17 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("remove test directory");
     }
     #[test]
+    fn pre_roll_refuses_multiple_defaults_in_one_namespace() {
+        // Intended: the offline pre-roll gate enforces admission's singleton.
+        let first = serde_json::json!({"kind":"CrewDefaults", "metadata":{"name":"one", "namespace":"fleet"}, "spec":{}});
+        let second = serde_json::json!({"kind":"CrewDefaults", "metadata":{"name":"two", "namespace":"fleet"}, "spec":{}});
+        assert!(super::validate_skill_documents(&[], &[first, second])
+            .expect_err("ambiguous fleet defaults")
+            .to_string()
+            .contains("at most one CrewDefaults"));
+    }
+
+    #[test]
     fn pre_roll_resolves_all_projects_with_their_namespace_defaults() {
         // Intended: a valid project cannot mask another project's missing import;
         // defaults in one namespace never apply to a project in another.

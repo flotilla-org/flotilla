@@ -217,12 +217,7 @@ impl AgentMaterialRegistry {
         &self,
         environment: &[(String, String)],
     ) -> Result<Vec<SkillSourceCredentialRequest>, String> {
-        let selected: Vec<flotilla_resources::SkillCatalogEntry> = environment
-            .iter()
-            .find(|(key, _)| key == "FLOTILLA_RESOLVED_SKILLS")
-            .map(|(_, value)| serde_json::from_str(value).map_err(|error| format!("decode frozen skill selection: {error}")))
-            .transpose()?
-            .unwrap_or_default();
+        let selected: Vec<flotilla_resources::SkillCatalogEntry> = decode_selected_skills(environment)?;
         Ok(self
             .skill_source_credentials()
             .await?
@@ -434,6 +429,16 @@ async fn install_read_only_copy(contents: &[u8], destination: &Path) -> Result<b
     Ok(true)
 }
 
+fn decode_selected_skills(environment: &[(String, String)]) -> Result<Vec<flotilla_resources::SkillCatalogEntry>, String> {
+    match environment.iter().find(|(key, _)| key == "FLOTILLA_RESOLVED_SKILLS") {
+        Some((_, value)) => serde_json::from_str(value).map_err(|error| format!("decode frozen skill selection: {error}")),
+        None => {
+            tracing::debug!("no frozen skill selection forwarded; using an empty selection for legacy provisioning");
+            Ok(Vec::new())
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 struct SkillBundleManifest {
     schema_version: u32,
@@ -546,28 +551,14 @@ impl SkillBundle {
         let inspection = tokio::task::spawn_blocking(move || inspect_skill_sources(&source))
             .await
             .map_err(|error| format!("inspect generation-pinned skill sources task failed: {error}"))??;
-        let selected: Vec<flotilla_resources::SkillCatalogEntry> = environment
-            .iter()
-            .find(|(key, _)| key == "FLOTILLA_RESOLVED_SKILLS")
-            .map(|(_, value)| serde_json::from_str(value).map_err(|error| format!("decode frozen skill selection: {error}")))
-            .transpose()?
-            .unwrap_or_default();
+        let selected: Vec<flotilla_resources::SkillCatalogEntry> = decode_selected_skills(environment)?;
         for entry in &selected {
             flotilla_resources::validate_skill_ref(&entry.name)?;
-            if entry.path.is_empty()
-                || entry.path.starts_with('/')
-                || entry.path.contains(['\\', '\r', '\n', '\t'])
-                || entry.path.split('/').any(|part| matches!(part, "" | "." | ".."))
-            {
-                return Err(format!("invalid frozen skill path {}", entry.path));
-            }
+            flotilla_resources::crew_defaults::validate_skill_path(&entry.path)?;
             if !inspection.sources.iter().any(|source| {
                 source.name == entry.source
                     && source.revision == entry.revision
-                    && source
-                        .paths
-                        .iter()
-                        .any(|path| entry.path == *path || entry.path.strip_prefix(path).is_some_and(|suffix| suffix.starts_with('/')))
+                    && source.paths.iter().any(|path| flotilla_resources::crew_defaults::path_within_source(&entry.path, path))
             }) {
                 return Err(format!("frozen skill {}@{} is not supplied at revision {}", entry.repository, entry.name, entry.revision));
             }
