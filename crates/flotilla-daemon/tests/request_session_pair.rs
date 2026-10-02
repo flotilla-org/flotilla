@@ -1167,6 +1167,79 @@ fn generated_convoy_admission_is_homed_on_placement(tc: hegel::TestCase) {
 }
 
 #[tokio::test]
+async fn router_duplicate_create_scenarios_admit_one_generation_at_the_requested_host() {
+    for (name, remote) in [("duplicate-local-create", false), ("duplicate-routed-create", true)] {
+        let leader = empty_daemon_named("desk").await;
+        let follower = empty_daemon_named("placement").await;
+        for host in [&leader, &follower] {
+            seed_host_capacity(host, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
+        }
+        let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("request topology");
+        let home = if remote { &topology.follower } else { &topology.leader };
+        home.resource_backend()
+            .using::<WorkflowTemplate>("flotilla")
+            .create(&InputMeta::builder().name("empty".to_string()).build(), &WorkflowTemplateSpec::builder().vessels(Vec::new()).build())
+            .await
+            .expect("workflow at create host");
+        let placement_policy = if remote {
+            let host_id = home.local_host_id().expect("placement host identity").to_string();
+            await_host_capacity(&topology.leader, &host_id).await;
+            seed_target_placement_policy(&topology, "flotilla", "duplicate-placement").await;
+            eventually(Duration::from_secs(5), Duration::from_millis(10), "origin sees workflow", || async {
+                topology.leader.resource_backend().definitions::<WorkflowTemplate>("flotilla").get("empty").await.is_ok()
+            })
+            .await;
+            Some("duplicate-placement".to_string())
+        } else {
+            None
+        };
+        let command = Command::builder()
+            .node_id(home.node_id().clone())
+            .action(CommandAction::ConvoyCreate {
+                name: name.to_string(),
+                workflow_ref: "empty".to_string(),
+                inputs: Vec::new(),
+                repository_url: None,
+                r#ref: None,
+                project_ref: None,
+                placement_policy,
+                adopted_checkout: None,
+            })
+            .build();
+        let mut events = topology.leader.subscribe();
+        let (first, second) = tokio::join!(topology.client.execute(command.clone()), topology.client.execute(command));
+        let ids = [first.expect("first request"), second.expect("second request")];
+        let results = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut results = Vec::new();
+            while results.len() < 2 {
+                if let DaemonEvent::CommandFinished { command_id, node_id, result, .. } = events.recv().await.expect("command event") {
+                    if ids.contains(&command_id) {
+                        assert_eq!(node_id, *home.node_id(), "{name} must settle on the requested host");
+                        results.push(result);
+                    }
+                }
+            }
+            results
+        })
+        .await
+        .expect("duplicate requests settle");
+        assert_eq!(results.iter().filter(|result| matches!(result, CommandValue::ConvoyCreated { .. })).count(), 1, "{name}: {results:?}");
+        assert_eq!(
+            results.iter().filter(|result| matches!(result, CommandValue::Error { message } if message.contains("already exists"))).count(),
+            1,
+            "{name}: {results:?}"
+        );
+        for host in [&topology.leader, &topology.follower] {
+            assert_eq!(
+                host.resource_backend().using::<Convoy>("flotilla").list().await.expect("local convoys").items.len(),
+                usize::from(host.node_id() == home.node_id()),
+                "{name}: one generation on its admission host"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn router_homing_scenario_table_runs_mutations_at_the_record_home() {
     // Each row traverses the request dispatcher, an in-memory peer session
     // when needed, and the actual remote command router.

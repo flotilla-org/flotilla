@@ -1518,7 +1518,13 @@ impl ConvoyAdmission {
 }
 
 impl ConvoyAdmission {
-    pub(super) async fn admit_created_convoy(&self, request: ConvoyCreateAdmission<'_>) -> CommandValue {
+    /// The caller holds this guard from the identity check through any adopted
+    /// checkout writes, and transfers it here through the final Convoy commit.
+    pub(super) async fn admit_created_convoy(
+        &self,
+        request: ConvoyCreateAdmission<'_>,
+        _admission_guard: tokio::sync::MutexGuard<'_, ()>,
+    ) -> CommandValue {
         let ConvoyCreateAdmission {
             namespace,
             name,
@@ -1536,7 +1542,6 @@ impl ConvoyAdmission {
             dispatching_principal_ref,
         } = request;
         let address = convoy_address(role, project_ref.as_deref());
-        let _admission_guard = self.lock().await;
         let generation = match allocate_convoy_generation(&self.backend, namespace, project_ref.as_deref(), role).await {
             Ok(generation) => generation,
             Err(message) => {

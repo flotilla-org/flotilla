@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::atomic::AtomicUsize,
+};
 
 use chrono::TimeZone;
 use flotilla_resources::{
@@ -22,6 +25,10 @@ use super::{
         RepositoryChangeRequestProvider,
     },
     *,
+};
+use crate::{
+    admission::AvailableSpaceProbe,
+    repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector},
 };
 
 #[tokio::test]
@@ -1717,6 +1724,119 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
     let superseded = convoys.get("multi-repo").await.expect("convoy with superseded request");
     let leaves = flotilla_resources::expected_change_request_leaves(&superseded, &BTreeMap::new()).expect("subject leaves");
     assert_eq!(leaves.len(), 4, "supersedes releases only the replaced change request");
+}
+
+struct ConcurrentCreateRepositoryInspector;
+
+#[async_trait]
+impl RepositoryInspector for ConcurrentCreateRepositoryInspector {
+    async fn inspect_path(&self, path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
+        Ok(RepositoryInspection {
+            spec: RepositorySpec::remote("https://github.com/owner/repo")?,
+            checkout: LocalCheckoutInspection::builder()
+                .path(path.to_path_buf())
+                .host_ref("host-test".to_string())
+                .git_ref("main".to_string())
+                .is_main(true)
+                .build(),
+            transport_url: Some("https://github.com/owner/repo".to_string()),
+            replaces_prior_repository: false,
+        })
+    }
+
+    async fn verify_continuity(&self, _path: &Path, _previous: &RepositorySpec) -> RepositoryContinuity {
+        RepositoryContinuity::Continuous { evidence: "test".to_string() }
+    }
+}
+
+/// Hold both free-space probes until both create requests have reached admission.
+/// This exercises duplicate requests without sleeps or real Git subprocesses.
+struct ConcurrentCreateSpaceProbe {
+    arrivals: std::sync::Barrier,
+    calls: AtomicUsize,
+}
+
+impl AvailableSpaceProbe for ConcurrentCreateSpaceProbe {
+    fn measure(&self, _path: &Path) -> Option<u64> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) < 2 {
+            self.arrivals.wait();
+        }
+        Some(100 * 1024 * 1024 * 1024)
+    }
+}
+
+#[tokio::test]
+async fn concurrent_duplicate_adopted_convoy_creates_leave_only_the_winning_checkout() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).expect("checkout directory");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"duplicate-create\"\n").expect("daemon config");
+    let mut discovery = fake_discovery(false);
+    discovery.available_space_probe =
+        Arc::new(ConcurrentCreateSpaceProbe { arrivals: std::sync::Barrier::new(2), calls: AtomicUsize::new(0) });
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        discovery,
+        HostName::local(),
+        ResourceBackend::InMemory(InMemoryBackend::default()),
+    )
+    .await;
+    daemon.set_repository_inspector(Arc::new(ConcurrentCreateRepositoryInspector)).await;
+    let backend = daemon.resource_backend();
+    backend
+        .using::<WorkflowTemplate>("flotilla")
+        .create(
+            &InputMeta::builder().name("work".to_string()).build(),
+            &WorkflowTemplateSpec::builder()
+                .vessels(vec![VesselRequirement::builder()
+                    .name("work".to_string())
+                    .crew(vec![CrewSpec::builder()
+                        .role("coder".to_string())
+                        .source(CrewSource::Tool { command: "true".to_string() })
+                        .build()])
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("workflow");
+    let command = Command::builder()
+        .action(CommandAction::ConvoyCreate {
+            name: "duplicate".to_string(),
+            workflow_ref: "work".to_string(),
+            inputs: Vec::new(),
+            repository_url: None,
+            r#ref: None,
+            project_ref: None,
+            placement_policy: None,
+            adopted_checkout: Some(Box::new(repo)),
+        })
+        .build();
+    let mut events = daemon.subscribe();
+    let (first, second) = tokio::join!(daemon.execute(command.clone()), daemon.execute(command));
+    let ids = [first.expect("first command"), second.expect("second command")];
+    let mut results = Vec::new();
+    while results.len() < 2 {
+        if let DaemonEvent::CommandFinished { command_id, result, .. } = events.recv().await.expect("command event") {
+            if ids.contains(&command_id) {
+                results.push(result);
+            }
+        }
+    }
+    assert_eq!(results.iter().filter(|result| matches!(result, CommandValue::ConvoyCreated { .. })).count(), 1, "{results:?}");
+    assert_eq!(
+        results.iter().filter(|result| matches!(result, CommandValue::Error { message } if message.contains("already exists"))).count(),
+        1,
+        "{results:?}"
+    );
+    let convoys = backend.using::<ResourceConvoy>("flotilla").list().await.expect("convoys").items;
+    assert_eq!(convoys.len(), 1);
+    let owned = convoys[0].spec.adopted_checkout_refs.values().cloned().collect::<BTreeSet<_>>();
+    let durable = backend.using::<ResourceCheckout>("flotilla").list().await.expect("durable checkouts").items;
+    let observed = daemon.observed_resource_backend().using::<ResourceCheckout>("flotilla").list().await.expect("observed checkouts").items;
+    assert_eq!(durable.len(), 1, "loser must not author a durable checkout");
+    assert_eq!(observed.len(), 1, "loser must not publish an orphan observed checkout");
+    assert!(durable.iter().chain(&observed).all(|checkout| owned.contains(&checkout.metadata.name)));
 }
 
 #[tokio::test]

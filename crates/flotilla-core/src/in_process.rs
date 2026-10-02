@@ -8567,6 +8567,20 @@ impl InProcessDaemon {
                 });
                 return Ok(id);
             }
+            if let Err(message) = self.check_local_free_space_floor().await {
+                let result = flotilla_protocol::CommandValue::Error { message };
+                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    command_id: id,
+                    node_id: self.node_id.clone(),
+                    repo_identity: empty_identity,
+                    repo: None,
+                    result,
+                });
+                return Ok(id);
+            }
+            // Use the admission transaction before checking identity or writing
+            // adopted checkout resources. A duplicate must have no side effects.
+            let admission_guard = self.convoy_admission.lock().await;
             if let Err(message) = allocate_convoy_generation(&self.resource_backend, &namespace, project_identity, &role).await {
                 let result = flotilla_protocol::CommandValue::Error { message };
                 let _ = self.event_tx.send(DaemonEvent::CommandFinished {
@@ -8580,17 +8594,6 @@ impl InProcessDaemon {
             }
             let record_name = convoy_record_name();
             let name = &record_name;
-            if let Err(message) = self.check_local_free_space_floor().await {
-                let result = flotilla_protocol::CommandValue::Error { message };
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-                    command_id: id,
-                    node_id: self.node_id.clone(),
-                    repo_identity: empty_identity,
-                    repo: None,
-                    result,
-                });
-                return Ok(id);
-            }
             let mut workflow = match self
                 .resource_backend
                 .clone()
@@ -8855,6 +8858,7 @@ impl InProcessDaemon {
                         .maybe_adopted_checkout_ref_to_cleanup(adopted_checkout_ref_to_cleanup)
                         .maybe_dispatching_principal_ref(dispatching_principal_ref)
                         .build(),
+                    admission_guard,
                 )
                 .await;
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
