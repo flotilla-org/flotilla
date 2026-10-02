@@ -302,7 +302,7 @@ def test_04_long_transport_outage_recovers_with_capped_backoff(topology):
 
 
 def test_05_stopped_host_becomes_not_ready(topology):
-    """#976: TTL expiry is honest even before the peer route disappears."""
+    """#976: TTL expires honestly; #2340: start needs a live delivery route."""
     remote_host = replicated_peer_host()
     host_id = remote_host["metadata"]["name"]
     origin = next(
@@ -334,7 +334,6 @@ def test_05_stopped_host_becomes_not_ready(topology):
     )
     error = json.loads(refused.stdout)
     assert error["kind"] == "error"
-    assert f"host-direct-{host_id}" in error["message"]
-    assert host_id in error["message"]
-    assert "not ready" in error["message"]
+    # Destination admission owns readiness; a stopped daemon cannot receive it.
+    assert error["message"] == f"peer host {host_id} is not connected"
     assert "\n" not in error["message"]
