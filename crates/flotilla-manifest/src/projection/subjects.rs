@@ -25,7 +25,7 @@ use crate::keys::{
     KEY_ROLE_STATE, KEY_SUBJECT_ADOPTS, KEY_SUBJECT_KIND, KEY_SUBJECT_NUMBER, KEY_SUBJECT_OF, KEY_SUBJECT_OF_ADOPTS,
     KEY_SUBJECT_OF_PRODUCES, KEY_SUBJECT_OF_REFERENCES, KEY_SUBJECT_OF_SUPERSEDES, KEY_SUBJECT_OF_WORKS_ON, KEY_SUBJECT_PRODUCES,
     KEY_SUBJECT_REFERENCES, KEY_SUBJECT_REPOSITORY_ALIAS, KEY_SUBJECT_SCOPE, KEY_SUBJECT_SERVICE, KEY_SUBJECT_SUPERSEDES,
-    KEY_SUBJECT_WORKS_ON,
+    KEY_SUBJECT_WORKS_ON, SEGMENT_PROJECT,
 };
 
 fn subject_entity(subject: &Subject) -> EntityRef {
@@ -137,10 +137,14 @@ pub(super) fn project_role_attempts(catalog: &mut Catalog, role: &StandingRoleRo
 
 pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, observations: &SubjectCatalogInput) {
     let mut links: BTreeMap<Subject, BTreeMap<Relationship, BTreeSet<EntityRef>>> = BTreeMap::new();
+    let mut projects = BTreeMap::new();
     let mut landed = BTreeSet::new();
     let mut convoy_edges = BTreeMap::new();
     for convoy in input.convoys {
         let convoy_entity = entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &entity::resource_origin(&convoy.resource));
+        if let Some((project, _)) = super::project_fact(convoy.project_ref.as_deref(), "fleet") {
+            projects.insert(convoy_entity.clone(), project.id);
+        }
         // A future finished_at from clock skew remains in the window until
         // the local clock catches up; it must not disappear prematurely.
         let visible = !convoy.phase.is_terminal()
@@ -191,6 +195,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
 
     for role in input.standing_roles {
         let role_ref = role_entity(role);
+        projects.insert(role_ref.clone(), entity::project(&role.resource.namespace, super::role_project(role), "fleet").id);
         let attempts = standing_attempts(role, input.convoys);
         let current = attempts.iter().rev().find(|convoy| !convoy.phase.is_terminal()).copied();
         let mut facts = Vec::new();
@@ -238,6 +243,10 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         }
         let relationships = links.get(subject);
         let reverse: BTreeSet<_> = relationships.into_iter().flat_map(|links| links.values().flatten().cloned()).collect();
+        let linked_projects: BTreeSet<_> = reverse.iter().filter_map(|source| projects.get(source)).collect();
+        if linked_projects.len() == 1 {
+            facts.push((SEGMENT_PROJECT, MetadataValue::text(*linked_projects.first().expect("one project"))));
+        }
         facts.push((KEY_SUBJECT_OF, MetadataValue::EntityRefs(reverse.into_iter().collect())));
         for (relationship, sources) in relationships.into_iter().flatten() {
             facts.push((reverse_key(*relationship), MetadataValue::EntityRefs(sources.iter().cloned().collect())));
@@ -256,6 +265,12 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         }
         let mut facts = identity_facts(&subject);
         facts.extend(change_request_facts(status, landed.contains(&subject)));
+        // Subject links own this fact, including absence when ambiguous; an
+        // awareness entry must not leave an inherited project behind.
+        if let Some(prior) = catalog.facts.get_mut(&MetadataTarget::Entity(subject_entity(&subject))) {
+            prior.remove(SEGMENT_PROJECT);
+        }
+
         catalog.assert_entity(subject_entity(&subject), facts, None);
     }
     for record in &observations.issues {
@@ -274,6 +289,11 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
             observe(&mut facts, KEY_ISSUE_LABELS, KEY_ISSUE_LABELS_OBSERVED_AT, &status.labels);
             observe(&mut facts, KEY_ISSUE_ASSIGNEES, KEY_ISSUE_ASSIGNEES_OBSERVED_AT, &status.assignees);
             observe(&mut facts, KEY_ISSUE_UPDATED_AT, KEY_ISSUE_UPDATED_AT_OBSERVED_AT, &status.updated_at);
+        }
+        // Subject links own this fact, including absence when ambiguous; an
+        // awareness entry must not leave an inherited project behind.
+        if let Some(prior) = catalog.facts.get_mut(&MetadataTarget::Entity(subject_entity(&subject))) {
+            prior.remove(SEGMENT_PROJECT);
         }
         catalog.assert_entity(subject_entity(&subject), facts, None);
     }

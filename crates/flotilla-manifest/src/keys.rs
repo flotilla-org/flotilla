@@ -153,7 +153,8 @@ pub const KEY_VESSEL_NAME: &str = "flotilla.vessel.name";
 
 // Hierarchy fact keys used by presentation-side grouping templates.
 
-/// Project resource-name segment. Only Project knowledge may mint it.
+/// Text project entity id, derived from Project knowledge or resource project references. On issue and change_request subjects, published only
+/// when linking convoys and roles identify exactly one project; never a list.
 pub const SEGMENT_PROJECT: &str = "flotilla.project";
 /// Canonical forge slug, or the Repository's `host:path` fallback when it
 /// has no forge slug. Shared with repository observers such as git-watcher.

@@ -1318,6 +1318,7 @@ dependencies = [
  "flotilla-protocol",
  "flotilla-resources",
  "flotilla-test-support",
+ "hegeltest",
  "reqwest 0.13.2",
  "serde",
  "serde_json",
