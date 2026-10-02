@@ -816,15 +816,9 @@ impl Vcs for FlotillaVcs {
             let changed = backend.run(&["diff", "--name-only", "--diff-filter=ACMRTUXB", "-z", "HEAD"]).await?;
             let untracked = backend.run(&["ls-files", "--others", "--exclude-standard", "-z"]).await?;
             let ignored = backend.run(&["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]).await?;
-            let mut manifest = String::from("# Ignored paths excluded from checkout snapshot; sizes in KiB\n");
+            let mut manifest = String::from("# Ignored paths excluded from checkout snapshot\n");
             for ignored_path in ignored.split('\0').filter(|entry| !entry.is_empty()) {
-                match self.runner.run("du", &["-sk", "--", ignored_path], path, &crate::providers::ChannelLabel::Default).await {
-                    Ok(size) => manifest.push_str(size.trim()),
-                    Err(error) => {
-                        warn!(%error, %ignored_path, "could not measure ignored checkout path");
-                        manifest.push_str(&format!("{ignored_path} (size unavailable)"));
-                    }
-                }
+                manifest.push_str(ignored_path);
                 manifest.push('\n');
             }
             self.runner.write_file(&ignored_manifest, &manifest).await?;
@@ -1644,36 +1638,6 @@ mod tests {
     use super::*;
     use crate::providers::{replay, testing::fixture_path};
 
-    struct DuFailRunner(crate::providers::ProcessCommandRunner);
-
-    #[async_trait]
-    impl CommandRunner for DuFailRunner {
-        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &crate::providers::ChannelLabel) -> Result<String, String> {
-            if cmd == "du" {
-                return Err("permission denied reading ignored build output".to_string());
-            }
-            self.0.run(cmd, args, cwd, label).await
-        }
-
-        async fn run_output(
-            &self,
-            cmd: &str,
-            args: &[&str],
-            cwd: &Path,
-            label: &crate::providers::ChannelLabel,
-        ) -> Result<CommandOutput, String> {
-            self.0.run_output(cmd, args, cwd, label).await
-        }
-
-        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
-            self.0.exists(cmd, args).await
-        }
-
-        async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
-            self.0.write_file(path, content).await
-        }
-    }
-
     fn git(cwd: &Path, args: &[&str]) {
         let output = std::process::Command::new("git").args(args).current_dir(cwd).output().expect("spawn git");
         assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
@@ -2070,7 +2034,7 @@ mod tests {
         git(&source, &["commit", "-m", "initial"]);
         git(&source, &["remote", "add", "origin", remote.to_str().expect("remote path")]);
         git(&source, &["push", "origin", "main"]);
-        let runner: Arc<dyn CommandRunner> = Arc::new(DuFailRunner(crate::providers::ProcessCommandRunner));
+        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
         let vcs = test_fl(&source, runner, true);
         let target = target.to_str().expect("target path");
         vcs.materialise_checkout("convoy/work", Some("main"), target).await.expect("create convoy worktree");
@@ -2102,9 +2066,10 @@ mod tests {
         assert!(snapshot.status.success());
         assert!(String::from_utf8_lossy(&snapshot.stdout).contains("new.txt"));
         assert!(!String::from_utf8_lossy(&snapshot.stdout).contains("target/big.bin"));
-        assert!(std::fs::read_to_string(archive.join("excluded-ignored.txt"))
-            .expect("ignored manifest")
-            .contains("target/ (size unavailable)"));
+        assert_eq!(
+            std::fs::read_to_string(archive.join("excluded-ignored.txt")).expect("ignored manifest"),
+            "# Ignored paths excluded from checkout snapshot\ntarget/\n"
+        );
         assert!(!Path::new(target).exists());
     }
 
@@ -2161,7 +2126,10 @@ mod tests {
         let CheckoutRemoval::ArchivedAndRemoved { archive_path } = outcome else { panic!("expected archive") };
         let archive = Path::new(&archive_path);
         assert!(archive.join("history.bundle").exists());
-        assert!(std::fs::read_to_string(archive.join("excluded-ignored.txt")).expect("ignored manifest").contains("target/"));
+        assert_eq!(
+            std::fs::read_to_string(archive.join("excluded-ignored.txt")).expect("ignored manifest"),
+            "# Ignored paths excluded from checkout snapshot\ntarget/\n"
+        );
         assert!(!archive.join("worktree.tar.gz").exists());
         assert!(!Path::new(target).exists());
     }

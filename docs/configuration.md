@@ -144,8 +144,8 @@ capacity guard.
 Forced checkout removal saves a Git bundle and patch under `.flotilla-archives/`
 beside the base clone. A `worktree.tar.gz` is written only when the checkout has
 modified or untracked files that Git does not ignore. The
-`excluded-ignored.txt` manifest lists ignored top-level paths and their sizes
-in KiB. `flotilla events` shows the archive path in a `CheckoutArchived` event.
+`excluded-ignored.txt` manifest lists excluded ignored paths, one per line.
+`flotilla events` shows the archive path in a `CheckoutArchived` event.
 
 The hourly retention sweep removes archives older than 14 days by default.
 Set the age in each host's `~/.config/flotilla/daemon.toml`:
