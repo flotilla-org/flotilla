@@ -23,6 +23,16 @@ struct PlacementContext<'a> {
     purpose: PlacementPurpose,
 }
 
+#[derive(Clone, Copy, bon::Builder)]
+struct PolicyPlacementContext<'a> {
+    namespace: &'a str,
+    project_ref: Option<&'a str>,
+    repositories: &'a [ConvoyRepositorySpec],
+    placement_policy: Option<&'a str>,
+    allow_unready: bool,
+    purpose: PlacementPurpose,
+}
+
 #[derive(bon::Builder)]
 pub(super) struct ConvoyCreateAdmission<'a> {
     namespace: &'a str,
@@ -744,7 +754,17 @@ impl ConvoyAdmission {
         let PlacementContext { namespace, project_ref, repositories, intent, purpose } = *context;
         if purpose == PlacementPurpose::Routing && intent.placement_policy.is_some() {
             return self
-                .decide_placement(namespace, Some(project_ref), repositories, workflow, intent.placement_policy.as_deref(), true, purpose)
+                .decide_placement(
+                    PolicyPlacementContext::builder()
+                        .namespace(namespace)
+                        .maybe_project_ref(Some(project_ref))
+                        .repositories(repositories)
+                        .maybe_placement_policy(intent.placement_policy.as_deref())
+                        .allow_unready(true)
+                        .purpose(purpose)
+                        .build(),
+                    workflow,
+                )
                 .await
                 .map(|placement| (placement, Vec::new()));
         }
@@ -760,7 +780,17 @@ impl ConvoyAdmission {
                 }
             }
             return self
-                .decide_placement(namespace, Some(project_ref), repositories, workflow, pin, false, purpose)
+                .decide_placement(
+                    PolicyPlacementContext::builder()
+                        .namespace(namespace)
+                        .maybe_project_ref(Some(project_ref))
+                        .repositories(repositories)
+                        .maybe_placement_policy(pin)
+                        .allow_unready(false)
+                        .purpose(purpose)
+                        .build(),
+                    workflow,
+                )
                 .await
                 .map(|placement| (placement, Vec::new()));
         }
@@ -822,7 +852,17 @@ impl ConvoyAdmission {
                 continue;
             }
             match self
-                .decide_placement(namespace, Some(project_ref), repositories, workflow, Some(&kind.metadata.name), true, purpose)
+                .decide_placement(
+                    PolicyPlacementContext::builder()
+                        .namespace(namespace)
+                        .maybe_project_ref(Some(project_ref))
+                        .repositories(repositories)
+                        .maybe_placement_policy(Some(&kind.metadata.name))
+                        .allow_unready(true)
+                        .purpose(purpose)
+                        .build(),
+                    workflow,
+                )
                 .await
             {
                 Ok(placement) => {
@@ -1625,21 +1665,26 @@ impl ConvoyAdmission {
         placement_policy: Option<&str>,
         allow_unready: bool,
     ) -> Result<PlacementResolution, String> {
-        self.decide_placement(namespace, project_ref, repositories, workflow, placement_policy, allow_unready, PlacementPurpose::Admission)
-            .await
+        self.decide_placement(
+            PolicyPlacementContext::builder()
+                .namespace(namespace)
+                .maybe_project_ref(project_ref)
+                .repositories(repositories)
+                .maybe_placement_policy(placement_policy)
+                .allow_unready(allow_unready)
+                .purpose(PlacementPurpose::Admission)
+                .build(),
+            workflow,
+        )
+        .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn decide_placement(
         &self,
-        namespace: &str,
-        project_ref: Option<&str>,
-        repositories: &[ConvoyRepositorySpec],
+        context: PolicyPlacementContext<'_>,
         workflow: &WorkflowTemplateSpec,
-        placement_policy: Option<&str>,
-        allow_unready: bool,
-        purpose: PlacementPurpose,
     ) -> Result<PlacementResolution, String> {
+        let PolicyPlacementContext { namespace, project_ref, repositories, placement_policy, allow_unready, purpose } = context;
         let mut placement = match placement_policy {
             Some(policy) => {
                 let policy = required_admission_value(policy, "placement policy")?;
