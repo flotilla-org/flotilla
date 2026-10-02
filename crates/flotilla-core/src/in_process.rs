@@ -2692,6 +2692,58 @@ impl InProcessDaemon {
 
         let weak = Arc::downgrade(&daemon);
         tokio::spawn(async move {
+            while let Some(daemon) = weak.upgrade() {
+                let namespace = daemon.provisioning_namespace().await;
+                let repositories = daemon.resource_backend.clone().using::<Repository>(&namespace);
+                let listed = match repositories.list().await {
+                    Ok(listed) => listed,
+                    Err(error) => {
+                        warn!(%error, "list repositories for provider cache eviction failed");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                let live = listed.items.iter().map(|repository| repository.metadata.name.as_str()).collect::<HashSet<_>>();
+                daemon.repository_change_requests.write().await.retain(|key, _| live.contains(key.to_string().as_str()));
+                let mut watch = match repositories.watch(WatchStart::resuming_from(&listed)).await {
+                    Ok(watch) => watch,
+                    Err(error) => {
+                        warn!(%error, "watch repositories for provider cache eviction failed");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                drop(daemon);
+                loop {
+                    let event = tokio::select! {
+                        event = watch.next() => event,
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                            let Some(daemon) = weak.upgrade() else { return };
+                            if daemon.provisioning_namespace().await != namespace {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    let name = match event {
+                        Some(Ok(WatchEvent::Deleted(repository))) => repository.metadata.name,
+                        Some(Ok(WatchEvent::DeletedByName(tombstone))) => tombstone.name,
+                        Some(Ok(_)) => continue,
+                        Some(Err(error)) => {
+                            warn!(%error, "repository provider cache watch failed");
+                            break;
+                        }
+                        None => break,
+                    };
+                    let Some(daemon) = weak.upgrade() else { return };
+                    daemon.repository_change_requests.write().await.retain(|key, _| key.to_string() != name);
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+
+        let weak = Arc::downgrade(&daemon);
+        tokio::spawn(async move {
             let mut expiry = tokio::time::interval(Duration::from_secs(1));
             expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut refresh = tokio::time::interval(Duration::from_secs(DEFAULT_REGARD_REFRESH_SECONDS));

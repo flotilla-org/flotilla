@@ -17,6 +17,48 @@ use flotilla_resources::{
 
 use super::*;
 
+#[tokio::test]
+async fn deleting_a_repository_evicts_only_its_cached_change_request_provider() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"provider-watch-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let repositories = backend.clone().using::<Repository>("flotilla");
+    let first = RepositorySpec::remote("https://github.com/example/first").expect("first repository");
+    let second = RepositorySpec::remote("https://github.com/example/second").expect("second repository");
+    for repository in [&first, &second] {
+        repositories.create(&test_meta(&repository.key().to_string()), repository).await.expect("create repository");
+    }
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend,
+    )
+    .await;
+    daemon.set_provisioning_namespace("flotilla".to_string()).await;
+    let provider: Arc<dyn ChangeRequestTracker> = Arc::new(FakeChangeRequest::new());
+    for repository in [&first, &second] {
+        daemon.repository_change_requests.write().await.insert(repository.key(), RepositoryChangeRequestProvider {
+            service_url: "https://github.com".to_string(),
+            repository: repository.key().to_string(),
+            provider: Arc::clone(&provider),
+        });
+    }
+    repositories.delete(&first.key().to_string()).await.expect("delete first repository");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !daemon.repository_change_requests.read().await.contains_key(&first.key()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("repository watch should evict provider");
+    assert!(daemon.repository_change_requests.read().await.contains_key(&second.key()), "live repository keeps its provider");
+}
+
 #[test]
 fn bound_change_request_identity_uses_matching_declared_or_discovered_subject() {
     let requested = ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "team/repo".into(), number: 42 };
