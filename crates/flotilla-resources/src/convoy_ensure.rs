@@ -45,6 +45,10 @@ pub struct ConvoyEnsureSpec {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyEnsureStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_config_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_drift: Option<ConvoyEnsureConfigDrift>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declaration_refused: Option<crate::DeclarationRefusedCondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convoy_ref: Option<String>,
@@ -71,6 +75,12 @@ pub struct ConvoyEnsureStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvoyEnsureConfigDrift {
+    pub changes: Vec<String>,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyEnsureCondition {
     #[serde(rename = "type")]
     pub condition_type: String,
@@ -89,6 +99,7 @@ pub enum ConvoyEnsureHoldReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyEnsureStatusPatch {
+    ConfigDrift { admitted_hash: Option<String>, observed_hash: String, drift: Option<ConvoyEnsureConfigDrift> },
     DeclarationRefused { condition: Option<crate::DeclarationRefusedCondition> },
     Running { convoy_ref: String, observed_at: DateTime<Utc> },
     BackingOff { retry_at: DateTime<Utc>, failure: String },
@@ -105,6 +116,11 @@ pub enum ConvoyEnsureStatusPatch {
 impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
     fn apply(&self, status: &mut ConvoyEnsureStatus) {
         match self {
+            Self::ConfigDrift { admitted_hash, observed_hash, drift } => {
+                status.admitted_config_hash.clone_from(admitted_hash);
+                status.observed_config_hash = Some(observed_hash.clone());
+                status.config_drift.clone_from(drift);
+            }
             Self::DeclarationRefused { condition } => status.declaration_refused.clone_from(condition),
             Self::Running { convoy_ref, observed_at } => {
                 status.convoy_ref = Some(convoy_ref.clone());
@@ -174,7 +190,6 @@ impl StatusPatch<ConvoyEnsureStatus> for ConvoyEnsureStatusPatch {
             Self::DriverManaged => {
                 status.convoy_ref = None;
                 status.running_since = None;
-                status.observed_config_hash = None;
                 status.retry = None;
             }
             Self::DriverAdmission { condition } => {

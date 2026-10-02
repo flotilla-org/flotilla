@@ -87,6 +87,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::QueryIssueOpenInBrowser { .. }
         | CommandAction::ResourceApply { .. }
         | CommandAction::ResourceManifestResolve { .. }
+        | CommandAction::ConvoyEnsureRoll { .. }
         | CommandAction::ResourceReconcileNow { .. }
         | CommandAction::ResourceStatusPatch { .. }
         | CommandAction::ResourceDelete { .. } => true,

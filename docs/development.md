@@ -160,3 +160,30 @@ restarted. The hook client parses one payload and sends one daemon RPC, waiting
 for acknowledgement. It performs no provider refresh, but it is synchronous and
 currently has no dedicated RPC timeout. Measure the PreToolUse critical-path
 latency and daemon-unavailable behavior during host-direct acceptance testing.
+
+## Declaration convergence and standing-convoy rolls
+
+`flotilla project list` reports a refused ops declaration and flags refusals
+older than 24 hours as stale. Project and ConvoyEnsure status retain the entry
+path, parser error and first-refused timestamp. Successful refresh clears the
+condition and its attention demand.
+
+A running ConvoyEnsure keeps the configuration captured at admission. Changes
+to repositories, workflow, placement, agent overrides or presentation raise
+configuration-drift attention while its crew continues working. At a suitable
+boundary, use `flotilla ensure roll <ensure-name>` to admit the current
+configuration. `flotilla ensure roll --drifted` rolls all ensures currently
+reported as drifted in the namespace; `--namespace` selects another namespace.
+Admission is validated before the previous generation is abandoned. Its record
+remains as history, and ordinary lifecycle reconciliation reclaims its backing.
+A repeated roll without drift does nothing. Generations admitted before config
+tracking report an unknown admission baseline and require an explicit roll to
+establish it.
+
+Before a fleet roll, run the candidate's `resource validate --from-daemon` on
+each host. It decodes the live store and parses the registered projects' committed
+ops entries with the candidate parser. The resource API exports raw declaration
+inputs, so forwarded `--host` validation also uses the candidate parser. An older
+daemon without that inventory endpoint requires validation on its own host,
+where the candidate reads committed ops sources through its VCS interface.
+Missing or ambiguous ops checkouts fail validation.

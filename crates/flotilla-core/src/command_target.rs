@@ -92,6 +92,7 @@ impl InProcessDaemon {
             | A::CrewSupervise { .. }
             | A::ResourceApply { .. }
             | A::ResourceManifestResolve { .. }
+            | A::ConvoyEnsureRoll { .. }
             | A::ResourceReconcileNow { .. }
             | A::ResourceStatusPatch { .. }
             | A::ResourceDelete { .. }

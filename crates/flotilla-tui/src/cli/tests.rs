@@ -45,6 +45,7 @@ fn fleet_list_displays_replication_failure_and_last_successful_sync() {
 
     let last_sync = Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 0).single().expect("timestamp");
     let response = FleetListResponse {
+        declaration_attention: Vec::new(),
         rows: vec![],
         replicas: vec![FleetReplicaStatus {
             host: HostName::new("remote"),

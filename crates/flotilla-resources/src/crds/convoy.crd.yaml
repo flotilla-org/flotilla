@@ -149,6 +149,9 @@ spec:
             status:
               type: object
               properties:
+                ensure_admission:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
                 phase:
                   type: string
                   enum: [Pending, Active, Interrupted, Anchored, Landing, Landed, Failed, Cancelled, Abandoned]

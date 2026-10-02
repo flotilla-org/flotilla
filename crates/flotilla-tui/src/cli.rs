@@ -730,6 +730,21 @@ fn format_fleet_list_human(response: &FleetListResponse) -> String {
         out.push('\n');
     }
 
+    if !response.declaration_attention.is_empty() {
+        let mut table = Table::new();
+        table.load_preset(UTF8_FULL_CONDENSED);
+        table.set_header(vec!["Declaration", "Condition", "Attention"]);
+        for row in &response.declaration_attention {
+            table.add_row(vec![
+                Cell::new(format!("{}/{}/{}", row.resource.namespace, row.resource.kind, row.resource.name)),
+                Cell::new(format!("{:?}", row.condition)),
+                Cell::new(&row.message),
+            ]);
+        }
+        out.push_str(&table.to_string());
+        out.push('\n');
+    }
+
     if response.replicas.iter().any(|replica| !replica.reachable) {
         let mut table = Table::new();
         table.load_preset(UTF8_FULL_CONDENSED);

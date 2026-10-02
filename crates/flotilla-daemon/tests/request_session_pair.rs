@@ -1324,6 +1324,7 @@ async fn router_homing_scenario_table_runs_mutations_at_the_record_home() {
 #[tokio::test]
 async fn router_delivery_scenario_table_reaches_remote_convoy_authority() {
     let scenarios = [
+        ("ensure-roll", CommandAction::ConvoyEnsureRoll { namespace: "flotilla".into(), name: "remote-ensure".into() }),
         ("resume", CommandAction::ConvoyResume {
             namespace: Some("flotilla".into()),
             name: "remote-work".into(),
@@ -1352,14 +1353,26 @@ async fn router_delivery_scenario_table_reaches_remote_convoy_authority() {
         let leader = empty_daemon_named("desk").await;
         let follower = empty_daemon_named("placement").await;
         let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("connect scenario hosts");
+        let mut meta = convoy_meta("remote-work", "remote-work");
+        meta.annotations.insert("flotilla.work/ensured-from".into(), "remote-ensure".into());
         topology
             .follower
             .resource_backend()
             .using::<Convoy>("flotilla")
-            .create(&convoy_meta("remote-work", "remote-work"), &convoy_spec("scratch", "remote-work"))
+            .create(&meta, &convoy_spec("scratch", "remote-work"))
             .await
             .expect("seed remote authority");
         apply_convoy_replica_feed(&topology.leader, "flotilla", "remote-work", topology.follower_host.clone()).await;
+        topology
+            .leader
+            .resource_backend()
+            .replica_writer::<Convoy>(topology.follower.node_id().clone(), "flotilla")
+            .replace(
+                &topology.follower.resource_backend().using::<Convoy>("flotilla").list().await.expect("authoritative convoys"),
+                Utc::now(),
+            )
+            .await
+            .expect("replicate convoy admission and ensure ownership");
 
         let mut events = topology.leader.subscribe();
         let command_id = topology.client.execute(Command::builder().action(action).build()).await.expect("dispatch scenario");

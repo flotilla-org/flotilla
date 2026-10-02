@@ -7,12 +7,13 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
-    ConvoyExplanation, DispatchQueueResponse, DispatchQueueRow, EnvironmentId, ExplainedArtifact, ExplainedChangeRequest,
-    ExplainedCheckout, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent, ExplainedLeafFiring, ExplainedSettlement,
-    ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation, FleetHealthResponse, FleetHostRow, FleetHostStaleness,
-    FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel,
-    FulfilmentRow, HostListResponse, HostName, HostProvidersResponse, HostStatusResponse, HostSummary, NodeId, PeerConnectionState,
-    ProjectListEntry, ProjectListRepository, ProjectListResponse, ViewAddress,
+    ConvoyExplanation, DeclarationAttentionKind, DeclarationAttentionRow, DispatchQueueResponse, DispatchQueueRow, EnvironmentId,
+    ExplainedArtifact, ExplainedChangeRequest, ExplainedCheckout, ExplainedCrewDelivery, ExplainedDecisionLedger, ExplainedEvent,
+    ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
+    FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness,
+    FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListResponse, HostName, HostProvidersResponse,
+    HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry, ProjectListRepository, ProjectListResponse,
+    ViewAddress,
 };
 use flotilla_resources::{
     bound_change_request_record_name, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves,
@@ -557,7 +558,36 @@ impl ReadProjections<'_> {
             ))
         });
         replicas.sort_by(|left, right| left.host.as_str().cmp(right.host.as_str()));
-        Ok(FleetListResponse { rows, replicas })
+        let mut declaration_attention = Vec::new();
+        for source in self.backend.including_replicas::<ResourceDemand>(namespace).list().await.map_err(|error| error.to_string())?.items {
+            let demand = source.object;
+            if demand.status.as_ref().is_some_and(|status| !matches!(status.state, DemandState::Raised | DemandState::Escalated)) {
+                continue;
+            }
+            let condition = if demand.metadata.name.starts_with("declaration-refused-") {
+                DeclarationAttentionKind::DeclarationRefused
+            } else if demand.metadata.name.starts_with("ensure-config-drift-") {
+                DeclarationAttentionKind::ConfigDrift
+            } else {
+                continue;
+            };
+            let message = demand
+                .metadata
+                .annotations
+                .get("flotilla.work/refusal-reason")
+                .or_else(|| demand.metadata.annotations.get("flotilla.work/reclaim-refusal-reason"))
+                .cloned()
+                .unwrap_or_default();
+            declaration_attention.push(DeclarationAttentionRow { resource: demand.spec.originating_work_ref, condition, message });
+        }
+        declaration_attention.sort_by(|left, right| {
+            (&left.resource.namespace, &left.resource.kind, &left.resource.name).cmp(&(
+                &right.resource.namespace,
+                &right.resource.kind,
+                &right.resource.name,
+            ))
+        });
+        Ok(FleetListResponse { rows, replicas, declaration_attention })
     }
 
     pub(super) async fn scoped_fleet_list(
@@ -612,6 +642,11 @@ impl ReadProjections<'_> {
             .map(|source| source.object.metadata.name.as_str())
             .collect();
         fleet.rows.retain(|row| row.convoy_ref.as_deref().is_some_and(|reference| matching.contains(reference)));
+        fleet.declaration_attention.retain(|row| match row.resource.kind.as_str() {
+            "Project" => row.resource.name == selected_project,
+            "Convoy" => matching.contains(row.resource.name.as_str()),
+            _ => false,
+        });
         fleet.replicas.clear();
         Ok(fleet)
     }

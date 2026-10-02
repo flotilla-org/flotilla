@@ -79,6 +79,19 @@ spec:
                   enum: [backing_unverified, restart_limit]
                 observed_config_hash:
                   type: string
+                admitted_config_hash:
+                  type: string
+                config_drift:
+                  type: object
+                  required: [changes, observed_at]
+                  properties:
+                    changes:
+                      type: array
+                      items:
+                        type: string
+                    observed_at:
+                      type: string
+                      format: date-time
                 retry:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true

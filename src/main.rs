@@ -190,6 +190,11 @@ enum SubCommand {
         #[command(subcommand)]
         command: PmSubCommand,
     },
+    /// Roll changed standing-convoy declarations at an operator-chosen boundary
+    Ensure {
+        #[command(subcommand)]
+        command: EnsureSubCommand,
+    },
     /// Inspect raw daemon resources
     Resource {
         #[command(subcommand)]
@@ -394,6 +399,21 @@ enum ManifestSubCommand {
     /// List document states for all roots or one root
     Status {
         root: Option<String>,
+        #[arg(long, default_value = "flotilla")]
+        namespace: String,
+        #[arg(long)]
+        host: Option<String>,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum EnsureSubCommand {
+    /// Replace one drifted running generation, or all drifted ensures
+    Roll {
+        #[arg(required_unless_present = "drifted", conflicts_with = "drifted")]
+        name: Option<String>,
+        #[arg(long)]
+        drifted: bool,
         #[arg(long, default_value = "flotilla")]
         namespace: String,
         #[arg(long)]
@@ -766,6 +786,7 @@ async fn main() -> Result<()> {
         Some(SubCommand::Hook { harness, event_type, payload }) => run_hook(&cli, &harness, &event_type, payload.as_deref()).await,
         Some(SubCommand::Hooks { command }) => run_hooks_command(&command).await,
         Some(SubCommand::Pm { command }) => run_pm_command(&cli, command).await,
+        Some(SubCommand::Ensure { command }) => run_ensure_command(&cli, command, format).await,
         Some(SubCommand::Resource { command }) => run_resource_command(&cli, command, format).await,
         Some(SubCommand::Manifest { command }) => run_manifest_command(&cli, command, format).await,
         Some(SubCommand::Artifact { command }) => run_artifact_command(&cli, command, format).await,
@@ -1717,6 +1738,64 @@ fn format_manifest_status_row(row: &serde_json::Value, resolution_action: Option
         pending,
         reason
     )
+}
+
+async fn run_ensure_command(cli: &Cli, command: EnsureSubCommand, format: OutputFormat) -> Result<()> {
+    use flotilla_client::resource::{ResourceClient, ResourceListRequest};
+    let EnsureSubCommand::Roll { name, drifted, namespace, host } = command;
+    let node_id = resolve_optional_host_node(cli, host.as_deref()).await?;
+    let names = if drifted {
+        let daemon = connect_daemon(cli).await?;
+        let response = ResourceClient::new(daemon)
+            .list(
+                ResourceListRequest::builder()
+                    .kind("ConvoyEnsure".to_string())
+                    .namespace(namespace.clone())
+                    .maybe_node_id(node_id.clone())
+                    .include_replicas(true)
+                    .build(),
+            )
+            .await
+            .map_err(|error| color_eyre::eyre::eyre!(error))?;
+        response
+            .records
+            .into_iter()
+            .filter_map(|record| record.object)
+            .filter(|object| object.pointer("/status/config_drift").is_some_and(|drift| !drift.is_null()))
+            .filter_map(|object| object.pointer("/metadata/name").and_then(serde_json::Value::as_str).map(str::to_string))
+            .collect::<std::collections::BTreeSet<_>>()
+    } else {
+        std::collections::BTreeSet::from([name.expect("clap requires a name without --drifted")])
+    };
+    if names.is_empty() {
+        println!("No drifted ensures");
+        return Ok(());
+    }
+    let mut errors = Vec::new();
+    let daemon = connect_daemon(cli).await?;
+    for name in names {
+        let result = flotilla_tui::cli::run_command(
+            &*daemon,
+            Command {
+                node_id: node_id.clone(),
+                provisioning_target: None,
+                context_repo: None,
+                action: CommandAction::ConvoyEnsureRoll { namespace: namespace.clone(), name: name.clone() },
+            },
+            format,
+        )
+        .await;
+        match result {
+            Ok(CommandValue::Error { message }) => errors.push(format!("{name}: {message}")),
+            Err(message) => errors.push(format!("{name}: {message}")),
+            Ok(_) => {}
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(color_eyre::eyre::eyre!(errors.join("\n")))
+    }
 }
 
 async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: OutputFormat) -> Result<()> {
@@ -2730,6 +2809,15 @@ mod tests {
         PmSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs,
         ResourceReconcileNowArgs, ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
+
+    #[test]
+    fn ensure_roll_cli_accepts_one_ensure_or_all_drifted() {
+        for args in [vec!["flotilla", "ensure", "roll", "demo--governor"], vec!["flotilla", "ensure", "roll", "--drifted"]] {
+            Cli::try_parse_from(args).expect("explicit ensure roll should parse");
+        }
+        assert!(Cli::try_parse_from(["flotilla", "ensure", "roll"]).is_err());
+        assert!(Cli::try_parse_from(["flotilla", "ensure", "roll", "demo--governor", "--drifted"]).is_err());
+    }
 
     #[test]
     fn crew_cli_surface_identifies_the_agent_role() {

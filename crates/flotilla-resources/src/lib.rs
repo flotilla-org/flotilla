@@ -95,8 +95,8 @@ pub use convoy::{
     VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use convoy_ensure::{
-    ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus, ConvoyEnsureStatusPatch,
-    DRIVER_ADMISSION_CONDITION_TYPE,
+    ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureConfigDrift, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyEnsureStatus,
+    ConvoyEnsureStatusPatch, DRIVER_ADMISSION_CONDITION_TYPE,
 };
 pub use credential::{
     capped_github_app_permissions, permission_level_rank, CredentialConsumer, CredentialGrant, CredentialGrantSelector,

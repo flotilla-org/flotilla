@@ -3550,6 +3550,143 @@ async fn standing_ensure_fixture_for(
     (daemon, backend, clock, temp)
 }
 
+#[tokio::test]
+async fn standing_ensure_records_admitted_config_and_surfaces_drift_without_replacing_work() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("admit initial configuration");
+    let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
+    let first = ensures.get("quartermaster").await.expect("ensure");
+    let first_status = first.status.clone().expect("admitted status");
+    assert_eq!(first_status.admitted_config_hash, first_status.observed_config_hash);
+    let mut changed = first.spec.clone();
+    changed.presents_as = Some("project".into());
+    ensures.apply(&InputMeta::from(&first.metadata), &changed).await.expect("change declaration");
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("observe drift");
+    let drifted = ensures.get("quartermaster").await.expect("drifted ensure").status.expect("status");
+    assert_eq!(drifted.convoy_ref, first_status.convoy_ref, "running work must remain intact");
+    assert_eq!(drifted.admitted_config_hash, first_status.admitted_config_hash);
+    assert_ne!(drifted.admitted_config_hash, drifted.observed_config_hash);
+    assert!(drifted.config_drift.expect("typed drift").changes.iter().any(|change| change.contains("presentation")));
+    assert!(backend
+        .using::<ResourceDemand>("flotilla")
+        .list()
+        .await
+        .expect("attention")
+        .items
+        .iter()
+        .any(|demand| demand.metadata.name == "ensure-config-drift-quartermaster"));
+    let fleet = daemon.fleet_list_internal().await.expect("public fleet listing");
+    assert!(fleet.declaration_attention.iter().any(|row| row.message.contains("presentation")));
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("drift attention persists across refreshes");
+    assert_eq!(backend.using::<ResourceDemand>("flotilla").list().await.expect("attention").items.len(), 1);
+}
+
+#[tokio::test]
+async fn explicit_ensure_roll_readmits_current_config_and_retains_the_previous_generation() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
+    let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
+    let old = ensures.get("quartermaster").await.expect("ensure");
+    let old_ref = old.status.as_ref().and_then(|status| status.convoy_ref.clone()).expect("running convoy");
+    let mut next = old.spec.clone();
+    next.presents_as = Some("project".into());
+    ensures.apply(&InputMeta::from(&old.metadata), &next).await.expect("desired configuration");
+    daemon.roll_convoy_ensure("flotilla", "quartermaster").await.expect("operator rolls drifted ensure");
+    let status = ensures.get("quartermaster").await.expect("ensure").status.expect("readmitted status");
+    let next_ref = status.convoy_ref.expect("replacement convoy");
+    assert_ne!(next_ref, old_ref);
+    assert_eq!(status.admitted_config_hash, status.observed_config_hash);
+    assert!(status.config_drift.is_none());
+    let previous = backend.using::<ResourceConvoy>("flotilla").get(&old_ref).await.expect("retained history");
+    assert_eq!(previous.status.expect("terminal history").phase, ConvoyPhase::Abandoned);
+    let replacement = backend.using::<ResourceConvoy>("flotilla").get(&next_ref).await.expect("replacement");
+    assert_eq!(replacement.spec.generation, previous.spec.generation + 1);
+    assert_eq!(replacement.metadata.annotations.get(PRESENTS_AS_ANNOTATION).map(String::as_str), Some("project"));
+    assert_eq!(
+        replacement.status.as_ref().and_then(|status| status.ensure_admission.as_ref()).map(|config| config.presents_as.as_deref()),
+        Some(Some("project"))
+    );
+    daemon.roll_convoy_ensure("flotilla", "quartermaster").await.expect("repeated roll is a no-op without drift");
+    assert_eq!(ensures.get("quartermaster").await.expect("ensure").status.expect("status").convoy_ref.as_deref(), Some(next_ref.as_str()));
+    assert!(backend.using::<ResourceDemand>("flotilla").list().await.expect("attention cleared").items.is_empty());
+}
+
+#[tokio::test]
+async fn ensure_roll_targets_the_running_convoy_home_over_an_explicit_other_host() {
+    use crate::command_target::{RemoteDelivery, TargetHost, TargetReason};
+    let (driver, driver_backend, _clock, _temp) = standing_ensure_fixture().await;
+    driver.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
+    let (observer, observer_backend, _observer_clock, _observer_temp) = standing_ensure_fixture_for("observer", false).await;
+    let driver_root = NodeId::new("driver-root");
+    observer_backend
+        .replica_writer::<ResourceConvoy>(driver_root.clone(), "flotilla")
+        .replace(&driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("driver convoys"), Utc::now())
+        .await
+        .expect("replicate driver history");
+    let target = observer
+        .resolve_command_target(
+            &CommandAction::ConvoyEnsureRoll { namespace: "flotilla".into(), name: "quartermaster".into() },
+            Some(&NodeId::new("unrelated")),
+        )
+        .await
+        .expect("resolve roll target");
+    assert_eq!(target.host, TargetHost::Node(driver_root));
+    assert_eq!(target.reason, TargetReason::RecordHome);
+    assert_eq!(target.delivery, RemoteDelivery::Command);
+}
+
+#[tokio::test]
+async fn changed_ensure_driver_waits_for_operator_roll_of_the_running_remote_generation() {
+    let (old_driver, old_backend, _clock, _temp) = standing_ensure_fixture().await;
+    old_driver.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
+    let (new_driver, new_backend, _new_clock, _new_temp) = standing_ensure_fixture_for("new-driver", true).await;
+    new_backend
+        .replica_writer::<ResourceConvoy>(NodeId::new("old-driver"), "flotilla")
+        .replace(&old_backend.using::<ResourceConvoy>("flotilla").list().await.expect("old generations"), Utc::now())
+        .await
+        .expect("replicate active generation");
+    let ensures = new_backend.definitions::<ConvoyEnsure>("flotilla");
+    let ensure = ensures.get("quartermaster").await.expect("ensure");
+    let mut next = ensure.spec.clone();
+    next.driver_ref = Some(new_driver.local_host_id().expect("new driver's host identity").to_string());
+    ensures.apply(&InputMeta::from(&ensure.metadata), &next).await.expect("declare new driver");
+    new_driver.reconcile_convoy_ensures_once("flotilla").await.expect("observe driver drift");
+    new_driver
+        .reconcile_convoy_ensure_now("flotilla", "quartermaster", &RecordlessBacking)
+        .await
+        .expect("explicit reconcile does not substitute for a roll");
+    assert!(
+        new_backend.using::<ResourceConvoy>("flotilla").list().await.expect("local generations").items.is_empty(),
+        "driver drift must not start overlapping work"
+    );
+    assert!(ensures.get("quartermaster").await.expect("ensure").status.expect("drift status").config_drift.is_some());
+}
+
+#[tokio::test]
+async fn ensure_drift_names_config_changes_and_invalid_roll_keeps_the_current_generation() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("initial admission");
+    let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
+    let first = ensures.get("quartermaster").await.expect("ensure");
+    let first_ref = first.status.as_ref().and_then(|status| status.convoy_ref.clone()).expect("convoy");
+    let mut changed = first.spec.clone();
+    changed.workflow_ref = "missing-workflow".into();
+    changed.placement_policy = Some("missing-policy".into());
+    changed.repositories.push(RepositoryKey("missing-repository".into()));
+    changed.agent_overrides =
+        vec![flotilla_protocol::AgentOverride { capability: "governor".into(), adapter: "codex".into(), model: Some("new-model".into()) }];
+    ensures.apply(&InputMeta::from(&first.metadata), &changed).await.expect("change declaration");
+    daemon.reconcile_convoy_ensures_once("flotilla").await.expect("report drift while keeping running work");
+    let changes = ensures.get("quartermaster").await.expect("ensure").status.expect("status").config_drift.expect("drift").changes;
+    for expected in ["repository added", "workflow", "placement", "agents"] {
+        assert!(changes.iter().any(|change| change.contains(expected)), "missing {expected} in {changes:?}");
+    }
+    assert!(daemon.roll_convoy_ensure("flotilla", "quartermaster").await.is_err());
+    let current = backend.using::<ResourceConvoy>("flotilla").get(&first_ref).await.expect("original generation remains");
+    assert!(!current.status.expect("status").phase.is_terminal(), "invalid replacement must not end current work");
+    assert_eq!(backend.using::<ResourceConvoy>("flotilla").list().await.expect("generations").items.len(), 1);
+}
+
 struct VerifiedDeadBacking;
 
 #[async_trait]
@@ -5032,6 +5169,8 @@ async fn operator_reap_restarts_immediately_without_burning_budget_and_past_due_
             hold_reason: None,
             observed_config_hash: None,
             declaration_refused: None,
+            admitted_config_hash: None,
+            config_drift: None,
             conditions: Vec::new(),
             retry: None,
             stalled: None,
