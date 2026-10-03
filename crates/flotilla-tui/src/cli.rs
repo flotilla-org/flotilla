@@ -1543,6 +1543,10 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
                     // JSON mode retains one final stdout document; wait progress
                     // is diagnostic output, just like lag/disconnection notices.
                     eprintln!("{}", format_command_result(result));
+                    // Remote clock skew may shift this sleep; the daemon checks
+                    // its own cooldown and all gates again on every re-claim.
+                    // This live wait lasts until evidence recovers or the caller
+                    // cancels; dropping it leaves no queued retry in the daemon.
                     let delay = retry_at.signed_duration_since(Utc::now()).to_std().unwrap_or_default();
                     tokio::time::sleep(delay.max(Duration::from_millis(10))).await;
                     command_id = daemon.execute(command.clone()).await?;

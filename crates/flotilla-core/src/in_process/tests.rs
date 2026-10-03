@@ -2418,17 +2418,22 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
 
 #[tokio::test]
 async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates() {
-    completion_claim_observation_case(false).await;
+    completion_claim_observation_case(false, false).await;
 }
 
 // #2499: a timed observation limit waits without increasing refusal strikes,
 // then admits the same claim after fresh readiness is actually observed.
 #[tokio::test(start_paused = true)]
 async fn rate_limited_completion_waits_then_requires_fresh_ready_observation() {
-    completion_claim_observation_case(true).await;
+    completion_claim_observation_case(true, false).await;
 }
 
-async fn completion_claim_observation_case(rate_limited: bool) {
+#[tokio::test(start_paused = true)]
+async fn rate_limited_completion_defers_but_preserves_non_forge_gate() {
+    completion_claim_observation_case(true, true).await;
+}
+
+async fn completion_claim_observation_case(rate_limited: bool, missing_artifact: bool) {
     #[derive(Default)]
     struct DeliveredTurns(std::sync::Mutex<Vec<crate::leaf_engine::TurnDeliveryRequest>>);
     #[async_trait]
@@ -2495,10 +2500,18 @@ async fn completion_claim_observation_case(rate_limited: bool) {
         literal: "true".to_string(),
         optional_when_absent: false,
     });
+    let mut conditions = vec![ready];
+    if missing_artifact {
+        conditions.push(flotilla_resources::CrewCompletionExpectation::artifact_exists(
+            "coder",
+            "review-bundle",
+            flotilla_resources::ArtifactSubjectBinding::Convoy,
+        ));
+    }
     let coder = CrewSpec::builder()
         .role("coder".to_string())
         .source(CrewSource::Tool { command: "test".to_string() })
-        .completion_conditions(vec![ready])
+        .completion_conditions(conditions)
         .build();
     let bosun = CrewSpec::builder().role("bosun".to_string()).source(CrewSource::Tool { command: "test".to_string() }).build();
     convoys
@@ -2634,6 +2647,13 @@ async fn completion_claim_observation_case(rate_limited: bool) {
         tokio::time::advance(Duration::from_secs(60)).await;
         assert!(claim().await.expect_err("fresh conflict still refuses").contains(".ready"));
         runner.conflicting.store(false, std::sync::atomic::Ordering::SeqCst);
+        if missing_artifact {
+            assert!(claim().await.expect_err("non-forge gate still refuses").contains("review-bundle"));
+            let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
+            assert_ne!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
+            assert!(status.crew_work["work"]["coder"].completion_refusal.is_some());
+            return;
+        }
         assert_eq!(claim().await.expect("fresh ready claim"), flotilla_protocol::CommandValue::Ok);
         let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
         assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);

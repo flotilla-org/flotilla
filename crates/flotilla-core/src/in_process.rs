@@ -153,8 +153,10 @@ struct CachedObservation {
 }
 
 impl CachedObservation {
-    // A classified GitHub quota is identity-wide, even when a paginated
-    // subject reports it. Ordinary per-subject errors do not enter this path.
+    // A classified quota can affect every subject even when encountered in
+    // one history page. This repository's cache pauses all its subjects,
+    // including successful entries in an Ok batch; other scopes are independent.
+    // Ordinary per-subject errors do not enter this path.
     fn rate_limit_error(&self) -> Option<&str> {
         observation_rate_limit_error(&self.result)
     }
@@ -6614,6 +6616,9 @@ impl InProcessDaemon {
             // Missing fresh forge evidence is a timed wait, not a crew refusal.
             // Keep all declared completion gates: neither stale readiness nor a
             // rate-limit response is permission to mark the crew Done.
+            // Defer even independent unmet gates until observation recovers:
+            // waiting does not accept the claim, and every gate is re-evaluated
+            // on retry before either Done or a substantive refusal is recorded.
             if observation_errors.is_empty() && !observation_waits.is_empty() {
                 let retry_at = observation_waits.iter().map(|(at, _)| *at).max().expect("nonempty waits");
                 let reason = observation_waits.into_iter().map(|(_, reason)| reason).collect::<Vec<_>>().join("; ");

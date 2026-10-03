@@ -548,6 +548,15 @@ fn convoy_explanation_subject_observations_snapshot() {
 // retry the original claim only when GitHub's advertised cooldown has elapsed.
 #[tokio::test(start_paused = true)]
 async fn crew_completion_wait_retries_same_claim_after_deadline() {
+    completion_wait_case(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_completion_wait_stops_future_claims() {
+    completion_wait_case(true).await;
+}
+
+async fn completion_wait_case(cancel: bool) {
     use std::sync::{Arc, Mutex};
 
     use flotilla_protocol::{Command, CommandAction, CrewCommandContext};
@@ -574,8 +583,7 @@ async fn crew_completion_wait_retries_same_claim_after_deadline() {
             force: false,
         },
     };
-    let run = super::run_command(&daemon, command.clone(), super::OutputFormat::Json);
-    tokio::pin!(run);
+    let mut run = Box::pin(super::run_command(&daemon, command.clone(), super::OutputFormat::Json));
     // Drive subscription/dispatch before emitting the fake daemon event.
     assert!(futures::poll!(&mut run).is_pending());
     let event = |result| DaemonEvent::CommandFinished {
@@ -594,6 +602,12 @@ async fn crew_completion_wait_retries_same_claim_after_deadline() {
     tokio::time::advance(std::time::Duration::from_secs(59)).await;
     assert!(futures::poll!(&mut run).is_pending());
     assert_eq!(calls.lock().expect("calls").len(), 1);
+    if cancel {
+        drop(run);
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        assert_eq!(calls.lock().expect("calls").len(), 1, "cancelled caller must not submit another claim");
+        return;
+    }
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     assert!(futures::poll!(&mut run).is_pending());
     assert_eq!(*calls.lock().expect("calls"), vec![command.clone(), command]);
