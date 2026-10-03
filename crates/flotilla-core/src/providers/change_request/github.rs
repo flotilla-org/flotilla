@@ -5,15 +5,16 @@ use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
 use async_trait::async_trait;
 use chrono::Utc;
 
-use self::observation::ObservationTelemetry;
+use self::observation::{ObservationTelemetry, ParsedObservationResponse, QueryShape};
+use super::ObservationError;
 use crate::{
-    change_request_observer::{parse_gh_observation_with_crew_identity, DEFAULT_REVIEW_BOT_LOGIN},
+    change_request_observer::{parse_gh_observation_value_with_crew_identity, DEFAULT_REVIEW_BOT_LOGIN},
     providers::{
         gh_api_get, gh_api_get_with_headers,
-        github_api::{clamp_per_page, parse_gh_api_response, rate_limit_error_from_response, rate_limit_reset, GhApi},
+        github_api::{clamp_per_page, GhApi},
         run, run_output,
         types::*,
-        CommandOutput, CommandRunner,
+        CommandRunner,
     },
 };
 
@@ -125,19 +126,27 @@ impl GitHubChangeRequest {
     async fn observation_call(
         &self,
         query: &str,
-        shape: &'static str,
+        shape: QueryShape,
         subjects: usize,
         telemetry: &mut ObservationTelemetry<'_>,
-    ) -> Result<CommandOutput, String> {
+    ) -> Result<ParsedObservationResponse, ObservationError> {
         let argument = format!("query={query}");
         let started = Instant::now();
         let output = run_output!(self.runner, "gh", &["api", "graphql", "--include", "-f", &argument], execution_root());
-        telemetry.record(shape, subjects, output.as_ref().ok().map(|output| output.stdout.as_str()), started.elapsed());
-        let output = output?;
-        if let Some(error) = rate_limit_error_from_response(&output.stdout, "GraphQL") {
-            return Err(error);
+        let elapsed = started.elapsed();
+        let parsed = output.as_ref().ok().map(|output| {
+            let mut parsed = ParsedObservationResponse::new(&output.stdout);
+            parsed.success = output.success;
+            parsed.stderr = output.stderr.clone();
+            parsed
+        });
+        telemetry.record(shape, subjects, output.as_ref().ok().map(|output| output.stdout.as_str()), parsed.as_ref(), elapsed);
+        output?;
+        let parsed = parsed.expect("received output has a parsed response");
+        if let Some(limit) = &parsed.limit {
+            return Err(ObservationError::RateLimited { budget: "GraphQL".into(), limit: limit.clone() });
         }
-        Ok(output)
+        Ok(parsed)
     }
 
     fn parse_state(state: &str) -> ChangeRequestStatus {
@@ -205,10 +214,10 @@ impl GitHubChangeRequest {
         pages: &mut usize,
         nodes: &mut usize,
         telemetry: &mut ObservationTelemetry<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ObservationError> {
         while let Some(page) = Self::next_history_page(request) {
             if *pages >= MAX_HISTORY_PAGE_QUERIES || *nodes + page.max_nodes() > MAX_HISTORY_PAGE_NODES {
-                return Err(format!("change request {number} review history exceeds per-cycle pagination budget"));
+                return Err(format!("change request {number} review history exceeds per-cycle pagination budget").into());
             }
             let cursor = page.connection(request)["pageInfo"]["startCursor"]
                 .as_str()
@@ -224,18 +233,19 @@ impl GitHubChangeRequest {
                 format!("query {{ rateLimit {{ cost }} repository(owner:{owner},name:{name}) {{ pr:pullRequest(number:{number}) {{ {selection} }} }} }}")
             };
             let shape = match page {
-                HistoryPage::Comments => "history-comments",
-                HistoryPage::Reviews => "history-reviews",
-                HistoryPage::Threads => "history-threads",
-                HistoryPage::ThreadComments(_) => "history-thread-comments",
+                HistoryPage::Comments => QueryShape::HistoryComments,
+                HistoryPage::Reviews => QueryShape::HistoryReviews,
+                HistoryPage::Threads => QueryShape::HistoryThreads,
+                HistoryPage::ThreadComments(_) => QueryShape::HistoryThreadComments,
             };
             let output = self.observation_call(&query, shape, 1, telemetry).await?;
-            let response = parse_gh_api_response(&output.stdout);
-            let document: serde_json::Value = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
-            if !output.success || document["errors"].as_array().is_some_and(|errors| !errors.is_empty()) {
+            let status = output.response.status;
+            let success = output.success;
+            let document = output.into_document()?;
+            if !success || document["errors"].as_array().is_some_and(|errors| !errors.is_empty()) {
                 let messages =
                     document["errors"].as_array().into_iter().flatten().filter_map(|error| error["message"].as_str()).collect::<Vec<_>>();
-                return Err(format!("change request {number} review history page failed (HTTP {}): {messages:?}", response.status));
+                return Err(format!("change request {number} review history page failed (HTTP {}): {messages:?}", status).into());
             }
             let fetched = match page {
                 HistoryPage::ThreadComments(_) => &document["data"]["node"][page.field()],
@@ -267,7 +277,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         &self,
         numbers: &[u64],
         crew_logins: &super::CrewGithubLoginsByRequest,
-    ) -> Result<super::BoundObservations, String> {
+    ) -> Result<super::BoundObservations, ObservationError> {
         if numbers.is_empty() {
             return Ok(HashMap::new());
         }
@@ -283,26 +293,26 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         }
         query.push_str(" } }");
         let mut telemetry = ObservationTelemetry::new(&self.repo_slug, numbers.len());
-        let output = self.observation_call(&query, "bound-batch", numbers.len(), &mut telemetry).await?;
-        let response = parse_gh_api_response(&output.stdout);
-        let document: serde_json::Value =
-            serde_json::from_str(&response.body).map_err(|error| format!("decode GitHub GraphQL observation: {error}"))?;
+        let output = self.observation_call(&query, QueryShape::BoundBatch, numbers.len(), &mut telemetry).await?;
+        let success = output.success;
+        let stderr = output.stderr.clone();
+        let document = output.into_document()?;
         if let Some(errors) = document["errors"].as_array() {
             let unexpected = errors.iter().filter(|error| error["type"] != "NOT_FOUND").collect::<Vec<_>>();
             if !unexpected.is_empty() {
-                return Err(format!("GitHub GraphQL observation: {unexpected:?}"));
+                return Err(format!("GitHub GraphQL observation: {unexpected:?}").into());
             }
-        } else if !output.success {
-            return Err(format!("GitHub GraphQL observation failed: {}", output.stderr));
+        } else if !success {
+            return Err(format!("GitHub GraphQL observation failed: {stderr}").into());
         }
         let repository = &document["data"]["repository"];
         if !repository.is_object() {
-            return Err(format!("GitHub GraphQL repository {} unavailable", self.repo_slug));
+            return Err(format!("GitHub GraphQL repository {} unavailable", self.repo_slug).into());
         }
         let observed_at = Utc::now();
         let mut statuses = HashMap::new();
         let (mut pages, mut nodes) = (0, 0);
-        let mut cooldown: Option<String> = None;
+        let mut cooldown: Option<ObservationError> = None;
         // The caller's order determines which PR receives history pagination
         // priority when the shared follow-up budget is exhausted.
         for number in numbers {
@@ -318,7 +328,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
             }
             let mut request = request.clone();
             if let Err(error) = self.complete_history(*number, &mut request, &mut pages, &mut nodes, &mut telemetry).await {
-                if rate_limit_reset(&error).is_some() {
+                if error.retry_at().is_some() {
                     cooldown = Some(error.clone());
                 }
                 statuses.insert(*number, Err(error));
@@ -327,13 +337,13 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
             request["statusCheckRollup"] = request["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"].clone();
             statuses.insert(
                 *number,
-                Ok(parse_gh_observation_with_crew_identity(
-                    &request.to_string(),
+                Ok(parse_gh_observation_value_with_crew_identity(
+                    &request,
                     observed_at,
                     &self.review_bot_login,
                     self.operator_login.as_deref(),
                     crew_logins.get(number).map(Vec::as_slice).unwrap_or(&[]),
-                )?),
+                )),
             );
         }
         Ok(statuses)
@@ -491,7 +501,7 @@ mod tests {
             GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
 
         let error = provider.find_change_request_by_branch("feature/wanted").await.expect_err("lookup cannot prove absence");
-        assert!(error.contains("exceeded 10 pages"), "{error}");
+        assert!(error.to_string().contains("exceeded 10 pages"), "{error}");
         assert_eq!(runner.calls().len(), MAX_BRANCH_LOOKUP_PAGES);
     }
 
@@ -755,7 +765,7 @@ mod tests {
         let runner = Arc::new(MockRunner::new(vec![Ok(response)]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
         let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
-        assert!(statuses[&1].as_ref().expect_err("truncated history").contains("truncated"));
+        assert!(statuses[&1].as_ref().expect_err("truncated history").to_string().contains("truncated"));
     }
 
     #[tokio::test]
@@ -858,7 +868,7 @@ mod tests {
         let numbers = (1..=count as u64).collect::<Vec<_>>();
         let statuses = runtime.block_on(provider.observe_bound(&numbers, &Default::default())).expect("batch results");
         assert_eq!(statuses.len(), count);
-        assert!(statuses.values().all(|status| status.as_ref().is_err_and(|error| error.contains("kind=secondary"))));
+        assert!(statuses.values().all(|status| status.as_ref().is_err_and(|error| error.to_string().contains("kind=secondary"))));
         assert_eq!(runner.calls().len(), if count == 0 { 0 } else { 2 }, "no further history calls during a cooldown");
     }
 
@@ -883,7 +893,7 @@ mod tests {
         let provider =
             GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
         let statuses = provider.observe_bound(&[1, 2], &Default::default()).await.expect("observe both PRs");
-        assert!(statuses[&1].as_ref().expect_err("budget exhausted").contains("pagination budget"));
+        assert!(statuses[&1].as_ref().expect_err("budget exhausted").to_string().contains("pagination budget"));
         assert_eq!(statuses[&2].as_ref().expect("healthy PR").title.value.as_deref(), Some("Healthy"));
         assert_eq!(runner.calls().len(), MAX_HISTORY_PAGE_QUERIES + 1);
     }
@@ -938,7 +948,7 @@ mod tests {
         let provider =
             GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
         let statuses = provider.observe_bound(&[1], &Default::default()).await.expect("observe PR");
-        assert!(statuses[&1].as_ref().expect_err("node budget exhausted").contains("pagination budget"));
+        assert!(statuses[&1].as_ref().expect_err("node budget exhausted").to_string().contains("pagination budget"));
         assert_eq!(runner.calls().len(), 4, "three 220-node pages leave too little budget for a fourth");
     }
 
@@ -952,7 +962,7 @@ mod tests {
         let runner = Arc::new(MockRunner::new(vec![Ok(first), Ok(failed)]));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
         let statuses = provider.observe_bound(&[1, 2], &Default::default()).await.expect("observe both PRs");
-        assert!(statuses[&1].as_ref().expect_err("failed page").contains("cursor expired"));
+        assert!(statuses[&1].as_ref().expect_err("failed page").to_string().contains("cursor expired"));
         assert_eq!(statuses[&2].as_ref().expect("healthy PR").title.value.as_deref(), Some("Healthy"));
     }
 
@@ -1011,12 +1021,12 @@ mod tests {
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), api, runner);
         let error = provider.observe_bound(&[1], &Default::default()).await.expect_err("rate limited");
         assert!(
-            error.contains(
+            error.to_string().contains(
                 "rate limited (budget=GraphQL, identity=host gh login, kind=primary, retry_source=x-ratelimit-reset, retry_at=2026-"
             ),
             "{error}"
         );
-        assert!(crate::providers::github_api::rate_limit_reset(&error).is_some());
+        assert!(error.retry_at().is_some());
     }
 
     #[tokio::test]

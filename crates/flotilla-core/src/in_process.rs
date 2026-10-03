@@ -116,12 +116,11 @@ use crate::{
     path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
         ai_utility::{AiUtility, ConvoyNames},
-        change_request::{BoundObservations, ChangeRequestTracker},
+        change_request::{BoundObservations, ChangeRequestTracker, ObservationError},
         discovery::{
             discover_providers_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion,
             EnvironmentBag,
         },
-        github_api::rate_limit_reset,
         issue_tracker::IssueProvider,
         registry::ProviderRegistry,
         ssh_runner::SshCommandRunner,
@@ -150,15 +149,15 @@ struct CachedObservation {
     expires_at: tokio::time::Instant,
     queried: BTreeSet<u64>,
     next_history_start: usize,
-    result: Result<BoundObservations, String>,
+    result: Result<BoundObservations, ObservationError>,
 }
 
 impl CachedObservation {
     // A classified quota can affect every subject even when encountered in
     // one history page. This repository's cache pauses all its subjects,
     // including successful entries in an Ok batch; other scopes are independent.
-    // Ordinary per-subject errors do not enter this path.
-    fn rate_limit_error(&self) -> Option<&str> {
+    // Cached hard errors keep their per-subject refusal during this cooldown.
+    fn rate_limit_error(&self) -> Option<&ObservationError> {
         observation_rate_limit_error(&self.result)
     }
 }
@@ -174,13 +173,10 @@ fn observation_cache_delay(retry_at: Option<chrono::DateTime<Utc>>, now: chrono:
         .unwrap_or(Duration::from_secs(9))
 }
 
-fn observation_rate_limit_error(result: &Result<BoundObservations, String>) -> Option<&str> {
+fn observation_rate_limit_error(result: &Result<BoundObservations, ObservationError>) -> Option<&ObservationError> {
     match result {
-        Err(error) => rate_limit_reset(error).map(|_| error.as_str()),
-        Ok(statuses) => statuses.values().find_map(|status| {
-            let error = status.as_ref().err()?;
-            rate_limit_reset(error).map(|_| error.as_str())
-        }),
+        Err(error) => error.retry_at().map(|_| error),
+        Ok(statuses) => statuses.values().filter_map(|status| status.as_ref().err()).find(|error| error.retry_at().is_some()),
     }
 }
 
@@ -435,7 +431,7 @@ impl ProviderChangeRequestObservationSource {
         subjects: &[ChangeRequestRef],
         subject: &ChangeRequestRef,
         fresh: bool,
-    ) -> Result<flotilla_resources::ChangeRequestStatus, String> {
+    ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         let key = (subject.namespace.clone(), subject.service.clone(), subject.scope.clone());
         let mut numbers = subjects.iter().map(|subject| subject.number).collect::<BTreeSet<_>>();
         numbers.insert(subject.number);
@@ -450,7 +446,16 @@ impl ProviderChangeRequestObservationSource {
         // cooldown too. Check before discovery and regardless of the cached batch.
         if let Some(entry) = cache.as_ref().filter(|entry| tokio::time::Instant::now() < entry.expires_at) {
             if let Some(error) = entry.rate_limit_error() {
-                return Err(error.to_string());
+                // Preserve an already-observed hard failure for this subject. A scope
+                // cooldown must not conceal a substantive completion refusal.
+                if let Ok(statuses) = &entry.result {
+                    if let Some(Err(hard_error)) = statuses.get(&subject.number) {
+                        if hard_error.retry_at().is_none() {
+                            return Err(hard_error.clone());
+                        }
+                    }
+                }
+                return Err(error.clone());
             }
         }
 
@@ -499,6 +504,7 @@ impl ProviderChangeRequestObservationSource {
                     continue;
                 }
             };
+            numbers.extend(&bound.numbers);
             if !bound.numbers.is_empty() {
                 if convoy.object.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).is_some() {
                     for (number, refs) in bound.credentials_by_number {
@@ -520,7 +526,7 @@ impl ProviderChangeRequestObservationSource {
                         .map_err(Clone::clone)?
                         .get(&subject.number)
                         .cloned()
-                        .unwrap_or_else(|| Err(format!("change request {} was not found", subject.number)));
+                        .unwrap_or_else(|| Err(format!("change request {} was not found", subject.number).into()));
                 }
             }
         }
@@ -573,9 +579,9 @@ impl ProviderChangeRequestObservationSource {
         let provider = self.query_port.discover_repository_change_request(&subject.namespace, &repository.object.spec).await?;
         let crew_logins = crew_logins.into_iter().map(|(number, logins)| (number, logins.into_iter().collect())).collect();
         let result = provider.observe_bound(&numbers, &crew_logins).await;
-        let delay = observation_cache_delay(observation_rate_limit_error(&result).and_then(rate_limit_reset), Utc::now());
+        let delay = observation_cache_delay(observation_rate_limit_error(&result).and_then(ObservationError::retry_at), Utc::now());
         let status = result.as_ref().map_err(Clone::clone).and_then(|statuses| {
-            statuses.get(&subject.number).cloned().unwrap_or_else(|| Err(format!("change request {} was not found", subject.number)))
+            statuses.get(&subject.number).cloned().unwrap_or_else(|| Err(format!("change request {} was not found", subject.number).into()))
         });
         *cache = Some(
             CachedObservation::builder()
@@ -591,7 +597,7 @@ impl ProviderChangeRequestObservationSource {
 
 #[async_trait]
 impl ChangeRequestObservationSource for ProviderChangeRequestObservationSource {
-    async fn observe(&self, subject: &ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, String> {
+    async fn observe(&self, subject: &ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         self.query(std::slice::from_ref(subject), subject, false).await
     }
 
@@ -599,11 +605,14 @@ impl ChangeRequestObservationSource for ProviderChangeRequestObservationSource {
         &self,
         subjects: &[ChangeRequestRef],
         subject: &ChangeRequestRef,
-    ) -> Result<flotilla_resources::ChangeRequestStatus, String> {
+    ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         self.query(subjects, subject, false).await
     }
 
-    async fn observe_for_completion(&self, subject: &ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, String> {
+    async fn observe_for_completion(
+        &self,
+        subject: &ChangeRequestRef,
+    ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
         self.query(std::slice::from_ref(subject), subject, true).await
     }
 }
@@ -6665,7 +6674,7 @@ impl InProcessDaemon {
                     let subject =
                         crate::change_request_observer::ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
                     if let Err(error) = self.leaf_subscriptions.refresh_change_request_once(&subject).await {
-                        if let Some(retry_at) = rate_limit_reset(&error).filter(|retry_at| *retry_at > Utc::now()) {
+                        if let Some(retry_at) = error.retry_at().filter(|retry_at| *retry_at > Utc::now()) {
                             observation_waits.push((retry_at, format!("PR {} observation: {error}", subject.number)));
                         } else {
                             observation_errors.push(format!("could not observe PR {}: {error}", subject.number));

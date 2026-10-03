@@ -22,7 +22,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::providers::{github_api::rate_limit_reset, run, CommandRunner};
+use crate::providers::{change_request::ObservationError, run, CommandRunner};
 
 const RETAINED_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const HISTORY_REFRESH_INTERVAL_SECS: i64 = 60 * 60;
@@ -56,14 +56,18 @@ impl ChangeRequestRef {
 
 #[async_trait]
 pub trait ChangeRequestObservationSource: Send + Sync {
-    async fn observe(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String>;
+    async fn observe(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError>;
 
-    async fn observe_group(&self, subjects: &[ChangeRequestRef], subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+    async fn observe_group(
+        &self,
+        subjects: &[ChangeRequestRef],
+        subject: &ChangeRequestRef,
+    ) -> Result<ChangeRequestStatus, ObservationError> {
         let _ = subjects;
         self.observe(subject).await
     }
 
-    async fn observe_for_completion(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+    async fn observe_for_completion(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
         self.observe(subject).await
     }
 }
@@ -80,9 +84,9 @@ impl GhChangeRequestObservationSource {
 
 #[async_trait]
 impl ChangeRequestObservationSource for GhChangeRequestObservationSource {
-    async fn observe(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+    async fn observe(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
         if subject.service != "github.com" {
-            return Err(format!("change request observation service `{}` is not available on this host", subject.service));
+            return Err(format!("change request observation service `{}` is not available on this host", subject.service).into());
         }
         let number = subject.number.to_string();
         let output = run!(
@@ -91,12 +95,12 @@ impl ChangeRequestObservationSource for GhChangeRequestObservationSource {
             &["pr", "view", &number, "--repo", &subject.scope, "--json", "state,headRefOid,statusCheckRollup,reviewDecision,mergeable",],
             Path::new("/"),
         )?;
-        parse_gh_observation(&output, Utc::now())
+        parse_gh_observation(&output, Utc::now()).map_err(Into::into)
     }
 
-    async fn observe_for_completion(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+    async fn observe_for_completion(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
         if subject.service != "github.com" {
-            return Err(format!("change request observation service `{}` is not available on this host", subject.service));
+            return Err(format!("change request observation service `{}` is not available on this host", subject.service).into());
         }
         let number = subject.number.to_string();
         let output = run!(
@@ -113,7 +117,7 @@ impl ChangeRequestObservationSource for GhChangeRequestObservationSource {
             ],
             Path::new("/"),
         )?;
-        parse_gh_observation(&output, Utc::now())
+        parse_gh_observation(&output, Utc::now()).map_err(Into::into)
     }
 }
 
@@ -145,8 +149,18 @@ pub(crate) fn parse_gh_observation_with_crew_identity(
     operator_login: Option<&str>,
     crew_logins: &[String],
 ) -> Result<ChangeRequestStatus, String> {
-    let crew_logins = crew_logins.iter().map(String::as_str).collect::<HashSet<_>>();
     let value: serde_json::Value = serde_json::from_str(json).map_err(|error| format!("decode gh pr observation: {error}"))?;
+    Ok(parse_gh_observation_value_with_crew_identity(&value, observed_at, review_bot_login, operator_login, crew_logins))
+}
+
+pub(crate) fn parse_gh_observation_value_with_crew_identity(
+    value: &serde_json::Value,
+    observed_at: DateTime<Utc>,
+    review_bot_login: &str,
+    operator_login: Option<&str>,
+    crew_logins: &[String],
+) -> ChangeRequestStatus {
+    let crew_logins = crew_logins.iter().map(String::as_str).collect::<HashSet<_>>();
     let state = match value["state"].as_str() {
         Some("OPEN") if value["isDraft"] == true => Some(ObservedChangeRequestState::Draft),
         Some("OPEN") => Some(ObservedChangeRequestState::Open),
@@ -275,7 +289,7 @@ pub(crate) fn parse_gh_observation_with_crew_identity(
         }
         (!unidentified_reviewer).then_some(false)
     });
-    Ok(ChangeRequestStatus {
+    ChangeRequestStatus {
         title: Observation { value: value["title"].as_str().map(str::to_string), observed_at },
         author: Observation { value: value["author"]["login"].as_str().map(str::to_string), observed_at },
         review_decision: Observation { value: review_decision, observed_at },
@@ -285,7 +299,7 @@ pub(crate) fn parse_gh_observation_with_crew_identity(
         checks: Observation { value: checks, observed_at },
         review: ChangeRequestReviewObservation { actionable_at_head: Observation { value: actionable_at_head, observed_at } },
         mergeable: Observation { value: mergeable, observed_at },
-    })
+    }
 }
 
 fn actionable_author(item: &serde_json::Value, pr_author: Option<&str>, review_bot_login: &str, crew_logins: &HashSet<&str>) -> bool {
@@ -358,7 +372,7 @@ struct ChangeRequestRefresherInner {
     source: Arc<dyn ChangeRequestObservationSource>,
     cadence: ChangeRequestRefreshCadence,
     active: Mutex<HashMap<ChangeRequestRef, ActiveRefresh>>,
-    observation_errors: Mutex<HashMap<ChangeRequestRef, String>>,
+    observation_errors: Mutex<HashMap<ChangeRequestRef, ObservationError>>,
     subject_locks: Mutex<HashMap<ChangeRequestRef, Weak<Mutex<()>>>>,
     relay_healthy: std::sync::atomic::AtomicBool,
     relay_wake: Notify,
@@ -403,17 +417,17 @@ impl ChangeRequestRefresher {
         self.inner.cadence.stale_after
     }
 
-    pub async fn observation_error(&self, subject: &ChangeRequestRef) -> Option<String> {
+    pub async fn observation_error(&self, subject: &ChangeRequestRef) -> Option<ObservationError> {
         self.inner.observation_errors.lock().await.get(subject).cloned()
     }
 
     /// Refresh a claim-time observation even before Landing has armed its
     /// standing leaf subscriptions.
-    pub async fn refresh_once(&self, subject: &ChangeRequestRef) -> Result<(), String> {
+    pub async fn refresh_once(&self, subject: &ChangeRequestRef) -> Result<(), ObservationError> {
         self.refresh_once_with_creation(subject, true).await
     }
 
-    async fn refresh_once_with_creation(&self, subject: &ChangeRequestRef, create_missing: bool) -> Result<(), String> {
+    async fn refresh_once_with_creation(&self, subject: &ChangeRequestRef, create_missing: bool) -> Result<(), ObservationError> {
         let subject = &subject.clone().normalized();
         let lock = self.subject_lock(subject).await;
         let _guard = lock.lock().await;
@@ -446,7 +460,7 @@ impl ChangeRequestRefresher {
                 return Err(error);
             }
         };
-        self.publish(subject, &subject.record_name(), status, true, false, create_missing).await
+        self.publish(subject, &subject.record_name(), status, true, false, create_missing).await.map_err(Into::into)
     }
 
     pub async fn demand(
@@ -578,7 +592,7 @@ impl ChangeRequestRefresher {
                 first_error.get_or_insert(error);
             }
         }
-        first_error.map_or(Ok(()), Err)
+        first_error.map_or(Ok(()), |error| Err(error.to_string()))
     }
 
     pub async fn refresh_demanded_owned(&self) -> Result<(), String> {
@@ -588,7 +602,7 @@ impl ChangeRequestRefresher {
                 first_error.get_or_insert(error);
             }
         }
-        first_error.map_or(Ok(()), Err)
+        first_error.map_or(Ok(()), |error| Err(error.to_string()))
     }
 
     pub fn set_relay_healthy(&self, healthy: bool) {
@@ -798,7 +812,7 @@ impl ChangeRequestRefresher {
                     continue;
                 }
                 Err(error) => {
-                    self.inner.observation_errors.lock().await.insert(subject.clone(), error);
+                    self.inner.observation_errors.lock().await.insert(subject.clone(), error.into());
                     if !self.wait_for_next(&subject, self.refresh_delay(&subject, self.inner.cadence.checks_pending).await).await {
                         break;
                     }
@@ -822,7 +836,7 @@ impl ChangeRequestRefresher {
                     let demanded =
                         self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.values().any(Option::is_some));
                     if let Err(error) = self.publish(&subject, &record_name, status.clone(), demanded, true, true).await {
-                        self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
+                        self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone().into());
                         tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "publish change request observation failed");
                     } else {
                         self.inner.observation_errors.lock().await.remove(&subject);
@@ -858,7 +872,8 @@ impl ChangeRequestRefresher {
                     tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "change request observation failed");
                     let retained = self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.is_empty());
                     let ordinary_delay = if retained { RETAINED_REFRESH_INTERVAL } else { self.inner.cadence.checks_pending };
-                    let delay = rate_limit_reset(&error)
+                    let delay = error
+                        .retry_at()
                         .and_then(|retry_at| retry_at.signed_duration_since(Utc::now()).to_std().ok())
                         .filter(|delay| !delay.is_zero())
                         .unwrap_or(ordinary_delay);
@@ -1041,28 +1056,38 @@ mod tests {
     use flotilla_resources::{HttpBackend, InMemoryBackend, ResourceBackend, TypedResolver};
 
     use super::*;
-    use crate::tls;
+    use crate::{
+        providers::github_api::{GithubRateLimit, GithubRateLimitKind},
+        tls,
+    };
 
     struct UnavailableSource;
 
     #[async_trait]
     impl ChangeRequestObservationSource for UnavailableSource {
-        async fn observe(&self, _subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
-            Err("unavailable".to_string())
+        async fn observe(&self, _subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
+            Err("unavailable".into())
         }
     }
 
     #[tokio::test]
     async fn claim_time_recovery_clears_rate_limit_error() {
-        struct RecoveringSource(Mutex<Result<ChangeRequestStatus, String>>);
+        struct RecoveringSource(Mutex<Result<ChangeRequestStatus, ObservationError>>);
         #[async_trait]
         impl ChangeRequestObservationSource for RecoveringSource {
-            async fn observe(&self, _: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+            async fn observe(&self, _: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
                 self.0.lock().await.clone()
             }
         }
-        let error = "github rate limited (budget=GraphQL, identity=host gh login, kind=secondary, retry_source=retry-after, retry_at=2026-10-03T12:00:00Z)";
-        let source = Arc::new(RecoveringSource(Mutex::new(Err(error.into()))));
+        let error = ObservationError::RateLimited {
+            budget: "GraphQL".into(),
+            limit: GithubRateLimit {
+                kind: GithubRateLimitKind::Secondary,
+                retry_source: "retry-after",
+                retry_at: Some("2026-10-03T12:00:00Z".parse().expect("deadline")),
+            },
+        };
+        let source = Arc::new(RecoveringSource(Mutex::new(Err(error.clone()))));
         let refresher = ChangeRequestRefresher::new(
             "fleet".into(),
             ResourceBackend::InMemory(InMemoryBackend::default()),
@@ -1072,7 +1097,7 @@ mod tests {
         );
         let subject = ChangeRequestRef { namespace: "ops".into(), service: "github.com".into(), scope: "org/repo".into(), number: 42 };
         assert_eq!(refresher.refresh_once(&subject).await.unwrap_err(), error);
-        assert_eq!(refresher.observation_error(&subject).await.as_deref(), Some(error));
+        assert_eq!(refresher.observation_error(&subject).await, Some(error.clone()));
         *source.0.lock().await = Ok(parse_gh_observation(
             r#"{"state":"OPEN","headRefOid":"head","statusCheckRollup":[],"reviewDecision":"APPROVED","mergeable":"MERGEABLE"}"#,
             Utc::now(),
@@ -1227,7 +1252,7 @@ mod tests {
 
     #[async_trait]
     impl ChangeRequestObservationSource for CountingSource {
-        async fn observe(&self, _subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+        async fn observe(&self, _subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
             self.0.fetch_add(1, Ordering::SeqCst);
             let observed_at = Utc::now();
             Ok(ChangeRequestStatus {
@@ -1468,7 +1493,7 @@ mod tests {
     struct MutableSource(Mutex<ChangeRequestStatus>, AtomicUsize);
     #[async_trait]
     impl ChangeRequestObservationSource for MutableSource {
-        async fn observe(&self, _: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+        async fn observe(&self, _: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
             let status = self.0.lock().await.clone();
             self.1.fetch_add(1, Ordering::SeqCst);
             Ok(status)
@@ -1921,7 +1946,7 @@ mod tests {
         })
         .await
         .expect("failed observation should become diagnostic evidence");
-        assert_eq!(refresher.observation_error(&subject).await.as_deref(), Some("unavailable"));
+        assert_eq!(refresher.observation_error(&subject).await, Some(ObservationError::Forge("unavailable".into())));
 
         refresher.release(demand).await;
         assert_eq!(refresher.observation_error(&subject).await, None);

@@ -32,7 +32,7 @@ use crate::{
     change_request_observer::{ChangeRequestRef, ChangeRequestRefresher},
     event_sink::EventSink,
     issue_observer::{IssueObservationSource, IssueRef, IssueRefreshCadence, IssueRefresher},
-    providers::github_api::rate_limit_reset,
+    providers::change_request::ObservationError,
 };
 
 struct UnavailableIssues;
@@ -318,11 +318,11 @@ impl LeafSubscriptionTable {
         self.inner.issues.stale_after()
     }
 
-    pub async fn change_request_observation_error(&self, subject: &ChangeRequestRef) -> Option<String> {
+    pub async fn change_request_observation_error(&self, subject: &ChangeRequestRef) -> Option<ObservationError> {
         self.inner.change_requests.observation_error(subject).await
     }
 
-    pub async fn refresh_change_request_once(&self, subject: &ChangeRequestRef) -> Result<(), String> {
+    pub async fn refresh_change_request_once(&self, subject: &ChangeRequestRef) -> Result<(), ObservationError> {
         self.inner.change_requests.refresh_once(subject).await
     }
 
@@ -1354,7 +1354,7 @@ impl ReconcilerWake {
                                         number: *number,
                                     };
                                     let refresh_error = self.subscriptions.change_request_observation_error(&subject).await;
-                                    if refresh_error.as_deref().and_then(rate_limit_reset).is_some_and(|retry_at| retry_at > now) {
+                                    if refresh_error.as_ref().and_then(ObservationError::retry_at).is_some_and(|retry_at| retry_at > now) {
                                         // A known forge retry deadline keeps the observed
                                         // maker pending; missing evidence is not a crew stall.
                                         // Deliberately defer every leaf in this row until
@@ -1365,7 +1365,7 @@ impl ReconcilerWake {
                                     reason = Some(match (observation.is_some(), has_value, refresh_error) {
                                         (true, true, Some(error)) => format!("stale; refresh failed: {error}"),
                                         (true, true, None) => "stale".into(),
-                                        (_, _, Some(error)) => error,
+                                        (_, _, Some(error)) => error.to_string(),
                                         _ => "not refreshed".into(),
                                     });
                                     break;
@@ -2506,6 +2506,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::providers::github_api::{GithubRateLimit, GithubRateLimitKind};
 
     #[test]
     fn reconciler_row_identity_ignores_regenerated_freshness_instant() {
@@ -2533,8 +2534,8 @@ mod tests {
         async fn observe(
             &self,
             _subject: &crate::change_request_observer::ChangeRequestRef,
-        ) -> Result<flotilla_resources::ChangeRequestStatus, String> {
-            Err("unavailable in non-CR leaf contract".to_string())
+        ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
+            Err("unavailable in non-CR leaf contract".into())
         }
     }
 
@@ -2577,7 +2578,7 @@ mod tests {
         async fn observe(
             &self,
             _subject: &crate::change_request_observer::ChangeRequestRef,
-        ) -> Result<flotilla_resources::ChangeRequestStatus, String> {
+        ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
             let observed_at = Utc::now();
             let state = if self.merged.load(Ordering::SeqCst) {
                 flotilla_resources::ObservedChangeRequestState::Merged
@@ -2605,7 +2606,7 @@ mod tests {
         async fn observe(
             &self,
             _subject: &crate::change_request_observer::ChangeRequestRef,
-        ) -> Result<flotilla_resources::ChangeRequestStatus, String> {
+        ) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let observed_at = Utc::now();
             Ok(flotilla_resources::ChangeRequestStatus {
@@ -4267,19 +4268,20 @@ mod tests {
     // known forge deadline. Only an expired deadline without recovery can stall.
     #[tokio::test]
     async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
-        struct LimitedSource(String);
+        struct LimitedSource(ObservationError);
         #[async_trait]
         impl crate::change_request_observer::ChangeRequestObservationSource for LimitedSource {
-            async fn observe(&self, _: &ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, String> {
+            async fn observe(&self, _: &ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
                 Err(self.0.clone())
             }
         }
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let now = Utc::now();
         let retry_at = now + chrono::Duration::seconds(60);
-        let error = format!(
-            "github rate limited (budget=GraphQL, identity=host gh login, kind=secondary, retry_source=retry-after, retry_at={retry_at})"
-        );
+        let error = ObservationError::RateLimited {
+            budget: "GraphQL".into(),
+            limit: GithubRateLimit { kind: GithubRateLimitKind::Secondary, retry_source: "retry-after", retry_at: Some(retry_at) },
+        };
         let refresher = ChangeRequestRefresher::new(
             "fleet".into(),
             backend.clone(),

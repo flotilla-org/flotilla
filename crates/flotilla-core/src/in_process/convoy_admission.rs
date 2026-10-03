@@ -309,7 +309,7 @@ impl ConvoyAdmission {
                         };
                         return Ok(Some(ConvoyChangeRequest { id: id.to_string(), status, repository_key: repository_key.clone() }));
                     }
-                    Err(error) => failures.push(error),
+                    Err(error) => failures.push(error.to_string()),
                 }
             }
             if let Some(error) = failures.iter().find(|error| error.contains("rate limited")) {

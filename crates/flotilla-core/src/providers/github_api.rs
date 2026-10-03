@@ -29,9 +29,8 @@ pub(crate) fn response_header<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
 /// A secondary deadline is distinct from the primary window reset. Legacy
 /// `reset_at` errors remain readable alongside the classified `retry_at` shape.
 ///
-/// Provider traits intentionally expose string errors. Keep the wire format
-/// small and private to the provider layer while giving polling callers a
-/// reliable way to distinguish a rate limit from an ordinary failure.
+/// REST providers retain this external string interface. Change request
+/// observation carries typed errors internally and does not use this parser.
 pub fn rate_limit_reset(error: &str) -> Option<DateTime<Utc>> {
     let fields = error.strip_prefix(RATE_LIMIT_PREFIX)?.strip_suffix(')')?;
     let deadline = fields.rsplit_once("retry_at=").or_else(|| fields.rsplit_once("reset_at="))?.1;
@@ -111,7 +110,7 @@ pub(crate) fn rate_limit_error(reset: &str) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GithubRateLimitKind {
+pub enum GithubRateLimitKind {
     Primary,
     Secondary,
 }
@@ -125,8 +124,8 @@ impl GithubRateLimitKind {
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct GithubRateLimit {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubRateLimit {
     pub kind: GithubRateLimitKind,
     pub retry_at: Option<DateTime<Utc>>,
     pub retry_source: &'static str,
@@ -138,8 +137,17 @@ pub(crate) struct GithubRateLimit {
 pub(crate) fn github_rate_limit(raw: &str, received_at: DateTime<Utc>) -> Option<GithubRateLimit> {
     let response = parse_gh_api_response(raw);
     let document: serde_json::Value = serde_json::from_str(&response.body).ok()?;
+    github_rate_limit_from_document(raw, response.status, &document, received_at)
+}
+
+pub(crate) fn github_rate_limit_from_document(
+    raw: &str,
+    status: u16,
+    document: &serde_json::Value,
+    received_at: DateTime<Utc>,
+) -> Option<GithubRateLimit> {
     let errors = document["errors"].as_array();
-    let failed = matches!(response.status, 403 | 429) || errors.is_some_and(|errors| !errors.is_empty());
+    let failed = matches!(status, 403 | 429) || errors.is_some_and(|errors| !errors.is_empty());
     if !failed {
         return None;
     }
@@ -154,7 +162,7 @@ pub(crate) fn github_rate_limit(raw: &str, received_at: DateTime<Utc>) -> Option
     let rate_limited = messages.contains("rate limit")
         || messages.contains("abuse")
         || errors.into_iter().flatten().any(|error| error["type"] == "RATE_LIMITED")
-        || response.status == 429;
+        || status == 429;
     if !rate_limited {
         return None;
     }
