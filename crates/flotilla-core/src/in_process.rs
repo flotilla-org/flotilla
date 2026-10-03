@@ -53,9 +53,9 @@ use flotilla_resources::{
     apply_status_patch_checked as apply_resource_status_patch_checked, capped_github_app_permissions, change_request_address,
     change_request_address_with_forges, change_request_record_name, controller::delete_lifecycle_owned_matching, evaluate_crew_completion,
     expected_change_request_leaves, external_patches as convoy_external_patches, get_resource_kind, get_resource_kind_including_replicas,
-    list_resource_kind, list_resource_kind_including_replicas, normalize_issue_source, normalize_project_spec,
-    observed_change_request_subjects, resolve_project_issue_sources, AllocationDecision, BoundChangeRequest, CapabilityNeed,
-    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
+    host_direct_environment_name, list_resource_kind, list_resource_kind_including_replicas, normalize_issue_source,
+    normalize_project_spec, observed_change_request_subjects, resolve_project_issue_sources, AllocationDecision, BoundChangeRequest,
+    CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutIntegrationStatus,
     CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
     ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason,
     ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec,
@@ -94,7 +94,7 @@ use crate::{
     },
     config::{ConfigStore, StaticEnvironmentConfig},
     daemon::{DaemonHandle, QuerySubscription},
-    environment_manager::EnvironmentManager,
+    environment_manager::{EnvironmentManager, ResolvedEnvironment},
     event_sink::{BroadcastEventSink, EventSink},
     executor,
     executor::checkout::{checkout_matches_scope, CheckoutResolutionScope},
@@ -650,7 +650,7 @@ async fn register_static_ssh_direct_environment(
     let host_id = resolve_or_create_remote_host_id(&*runner, &remote_env).await?;
     let env_id = if host_direct {
         let host_id = host_id.as_ref().ok_or_else(|| format!("SSH host {} has no writable stable host identity", environment.hostname))?;
-        EnvironmentId::new(format!("host-direct-{host_id}"))
+        EnvironmentId::new(host_direct_environment_name(host_id.as_str()))
     } else {
         resolve_or_create_remote_environment_id(&*runner, &remote_env, fallback_env_id).await?
     };
@@ -2722,8 +2722,14 @@ impl InProcessDaemon {
         }
     }
 
-    pub fn command_runner_for_environment(&self, env_id: &EnvironmentId) -> Option<Arc<dyn CommandRunner>> {
-        self.environment_manager.environment_runner(env_id)
+    /// Resolve a session or checkout's environment resource reference to its runner.
+    pub fn command_runner_for_environment_ref(&self, env_ref: &str) -> Option<Arc<dyn CommandRunner>> {
+        self.resolve_environment_ref(env_ref).map(|environment| environment.runner)
+    }
+
+    /// Resolve once when a caller needs both the runner and its registered identity.
+    pub fn resolve_environment_ref(&self, env_ref: &str) -> Option<ResolvedEnvironment> {
+        self.environment_manager.resolve_environment_ref(env_ref)
     }
 
     /// Resolve the VCS through the registered discovery factories once per checkout.
@@ -2769,7 +2775,7 @@ impl InProcessDaemon {
             .into_iter()
             .filter_map(|(id, managed)| match managed {
                 crate::environment_manager::ManagedEnvironmentKind::Direct(state)
-                    if state.host_id.as_ref().is_some_and(|host| id.as_str() == format!("host-direct-{host}")) =>
+                    if state.host_id.as_ref().is_some_and(|host| id.as_str() == host_direct_environment_name(host.as_str())) =>
                 {
                     Some((id, state))
                 }

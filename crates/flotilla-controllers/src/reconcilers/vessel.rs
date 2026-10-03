@@ -20,15 +20,15 @@ use flotilla_resources::{
     controller::{
         delete_lifecycle_owned_matching, Actuation, LabelJoinWatch, LabelMappedWatch, ReconcileOutcome, Reconciler, SecondaryWatch,
     },
-    is_prepared_snapshot, repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutWorktreeSpec, Clone,
-    CloneSpec, Convoy, CrewImageBaseline, CrewSource, CrewWorkPhase, DefinitionResolver, DockerCheckoutStrategy, DockerEnvironmentSpec,
-    DockerImagePullPolicy, DockerImageSource, Environment, EnvironmentMount, EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec,
-    FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority,
-    OwnerReference, PlacementPolicy, PlacementPolicySpec, ReplicaReadResolver, Repository, RepositoryKey, RepositorySpec, Resource,
-    ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity,
-    TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel, VesselPhase, VesselStatusPatch, WorkPhase,
-    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL,
-    CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
+    host_direct_environment_name, is_prepared_snapshot, repository_workspace_slugs, Artifact, Checkout, CheckoutPhase, CheckoutSpec,
+    CheckoutWorktreeSpec, Clone, CloneSpec, Convoy, CrewImageBaseline, CrewSource, CrewWorkPhase, DefinitionResolver,
+    DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerImageSource, Environment, EnvironmentMount,
+    EnvironmentMountMode, EnvironmentPhase, EnvironmentSpec, FreshCloneCheckoutSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, InputMeta, LifecycleAuthority, OwnerReference, PlacementPolicy, PlacementPolicySpec,
+    ReplicaReadResolver, Repository, RepositoryKey, RepositorySpec, Resource, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, Stance, TerminalSession, TerminalSessionIdentity, TerminalSessionPhase, TerminalSessionSpec, TypedResolver, Vessel,
+    VesselPhase, VesselStatusPatch, WorkPhase, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CHANGE_REQUEST_ID_LABEL,
+    CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REFS_ENV,
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_ENV, PLACEMENT_SNAPSHOT_KIND, VESSEL_REF_LABEL,
 };
 use sha2::{Digest, Sha256};
@@ -1328,10 +1328,6 @@ fn provisioning_stuck_message(obj: &ResourceObject<Vessel>, waiting_for: &str, n
     let started_at = obj.status.as_ref().filter(|status| status.phase == VesselPhase::Provisioning).and_then(|status| status.started_at)?;
     (now.signed_duration_since(started_at) >= chrono::Duration::seconds(VESSEL_PROVISIONING_STUCK_SECONDS))
         .then(|| format!("provisioning is stalled while waiting for {waiting_for}; reconciliation will continue retrying"))
-}
-
-fn host_direct_environment_name(host_ref: &str) -> String {
-    format!("host-direct-{host_ref}")
 }
 
 fn legible_waiting_for(mut waiting_for: String, placement_decision: Option<&PlacementDecision>) -> String {

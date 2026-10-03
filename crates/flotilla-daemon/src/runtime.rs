@@ -47,20 +47,20 @@ use flotilla_core::{
 use flotilla_protocol::{CanonicalHostId, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus};
 use flotilla_resources::{
     canonical_host_id, canonicalize_repo_url, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions,
-    is_prepared_snapshot, watch_resource_kind, watch_resource_kind_including_replicas, ChangeRequest, ChangeRequestStatus, Checkout,
-    CheckoutIntegrationStatus, Clone, ClonePhase, CloneSpec, ConditionValue, ControllerRetry, ControllerRetryDisposition, Convoy,
-    ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource, CrewSpec, Demand, DemandKind,
-    DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec,
-    EnvironmentStatusPatch, Forge, ForgeIdentity, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
-    Host, HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
-    HostSpec, HostStatus, HostStatusPatch, InputDefinition, InputMeta, ManifestRoot, ModelProbeState, PlacementPolicy, PlacementPolicySpec,
-    Platform, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend,
-    ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalOccupancy, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY,
-    AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG,
-    CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY,
-    MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS,
-    TRANSPORT_CAPABILITY,
+    host_direct_environment_name, is_prepared_snapshot, watch_resource_kind, watch_resource_kind_including_replicas, ChangeRequest,
+    ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Clone, ClonePhase, CloneSpec, ConditionValue, ControllerRetry,
+    ControllerRetryDisposition, Convoy, ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource,
+    CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase,
+    EnvironmentSpec, EnvironmentStatusPatch, Forge, ForgeIdentity, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec,
+    FulfilmentRealisation, Host, HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch, InputDefinition, InputMeta, ManifestRoot, ModelProbeState,
+    PlacementPolicy, PlacementPolicySpec, Platform, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository,
+    RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalOccupancy,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch, WorkflowTemplate,
+    WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
+    CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
+    CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
+    PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, TRANSPORT_CAPABILITY,
 };
 use futures::{FutureExt, StreamExt};
 use serde_json::json;
@@ -585,7 +585,7 @@ impl DaemonRuntime {
 
         let local_registry = phase("probe_local_provider_registry", probe_local_provider_registry(&daemon, &config)).await?;
         let profile = build_local_profile(&daemon, &local_registry)?;
-        let host_direct_environment_name = format!("host-direct-{}", profile.host_id);
+        let host_direct_environment_name = host_direct_environment_name(&profile.host_id);
         let mut archive_roots = vec![CheckoutArchiveRoot {
             env_ref: host_direct_environment_name.clone(),
             path: PathBuf::from(&profile.repo_default_dir).join(".flotilla-archives"),
@@ -678,7 +678,6 @@ impl DaemonRuntime {
             tokio::spawn(run_checkout_archive_gc(daemon.resource_backend(), options.namespace.clone(), CheckoutArchiveSweep {
                 daemon: Arc::clone(&daemon),
                 catalog_path: config.state_dir().as_path().join("checkout-archive-roots.json"),
-                host_direct_environment_name,
                 roots: archive_roots,
                 retention_days: daemon_config.checkout_archive_retention_days,
             })),
@@ -995,7 +994,6 @@ struct CheckoutArchiveRoot {
 struct CheckoutArchiveSweep {
     daemon: Arc<InProcessDaemon>,
     catalog_path: PathBuf,
-    host_direct_environment_name: String,
     roots: Vec<CheckoutArchiveRoot>,
     retention_days: u64,
 }
@@ -1059,13 +1057,9 @@ async fn run_checkout_archive_gc(backend: ResourceBackend, namespace: String, ar
                 Err(error) => warn!(%error, "checkout archive sweep could not list checkouts"),
             }
             for root in roots {
-                let runner = if root.env_ref == archive_sweep.host_direct_environment_name {
-                    archive_sweep.daemon.local_command_runner()
-                } else {
-                    archive_sweep.daemon.command_runner_for_environment(&EnvironmentId::new(&root.env_ref))
-                };
-                if let Some(runner) = runner {
-                    let result = if root.env_ref == archive_sweep.host_direct_environment_name {
+                if let Some(environment) = archive_sweep.daemon.resolve_environment_ref(&root.env_ref) {
+                    let runner = environment.runner;
+                    let result = if environment.id == *archive_sweep.daemon.local_environment_id() {
                         flotilla_core::vcs::prune_checkout_archives(&*runner, &root.path, archive_sweep.retention_days).await
                     } else {
                         flotilla_core::vcs::prune_remote_checkout_archives(
@@ -1412,11 +1406,11 @@ async fn apply_agentless_ssh_observation(
 
 impl LocalProvisioningProfile {
     fn host_direct_environment_name(&self) -> String {
-        format!("host-direct-{}", self.host_id)
+        host_direct_environment_name(&self.host_id)
     }
 
     fn host_direct_policy_name(&self) -> String {
-        format!("host-direct-{}", self.host_id)
+        host_direct_environment_name(&self.host_id)
     }
 
     fn docker_policy_name(&self) -> String {
@@ -2187,19 +2181,15 @@ async fn reconcile_work_credentials_filtered(
             continue;
         }
         let result = async {
-            let runner = if environment_ref == state.host_direct_environment_name {
-                state.daemon.local_command_runner().ok_or_else(|| "local command runner unavailable for credential delivery".to_string())?
-            } else {
-                match state.daemon.command_runner_for_environment(&EnvironmentId::new(environment_ref.clone())) {
-                    Some(runner) => runner,
-                    None if !current_environments.contains(&environment_ref) => {
-                        // The vessel and its contained filesystem are gone. Clear
-                        // refresh registrations and cached material as well.
-                        store.forget_environment(&environment_ref).await?;
-                        return Ok(());
-                    }
-                    None => return Err(format!("command runner unavailable for credential delivery to environment {environment_ref}")),
+            let runner = match state.daemon.command_runner_for_environment_ref(&environment_ref) {
+                Some(runner) => runner,
+                None if !current_environments.contains(&environment_ref) => {
+                    // The vessel and its contained filesystem are gone. Clear
+                    // refresh registrations and cached material as well.
+                    store.forget_environment(&environment_ref).await?;
+                    return Ok(());
                 }
+                None => return Err(format!("command runner unavailable for credential delivery to environment {environment_ref}")),
             };
             if !running.is_empty() {
                 store
@@ -4790,17 +4780,13 @@ struct RoutingCloneRuntime {
 
 impl RoutingCloneRuntime {
     async fn runtime_for(&self, env_ref: &str, checkout: &str) -> Result<CloneControllerRuntime, String> {
-        let runner = if env_ref == self.state.host_direct_environment_name {
-            self.state.daemon.local_command_runner()
-        } else {
-            self.state.daemon.command_runner_for_environment(&EnvironmentId::new(env_ref))
-        }
-        .ok_or_else(|| format!("command runner unavailable for clone environment {env_ref}"))?;
-        let vcs = if env_ref == self.state.host_direct_environment_name {
-            self.state.daemon.local_vcs_for_checkout(Path::new(checkout)).await?
-        } else {
-            self.state.daemon.vcs_for_checkout(&EnvironmentId::new(env_ref), Path::new(checkout)).await?
-        };
+        let environment = self
+            .state
+            .daemon
+            .resolve_environment_ref(env_ref)
+            .ok_or_else(|| format!("command runner unavailable for clone environment {env_ref}"))?;
+        let vcs = self.state.daemon.vcs_for_checkout(&environment.id, Path::new(checkout)).await?;
+        let runner = environment.runner;
         let namespace = self.state.daemon.provisioning_namespace().await;
         let forges = self
             .state
@@ -4935,17 +4921,13 @@ struct RoutingCheckoutRuntime {
 
 impl RoutingCheckoutRuntime {
     async fn runtime_for(&self, env_ref: &str, checkout: &str) -> Result<CheckoutControllerRuntime, String> {
-        let runner = if env_ref == self.state.host_direct_environment_name {
-            self.state.daemon.local_command_runner()
-        } else {
-            self.state.daemon.command_runner_for_environment(&EnvironmentId::new(env_ref))
-        }
-        .ok_or_else(|| format!("command runner unavailable for checkout environment {env_ref}"))?;
-        let vcs = if env_ref == self.state.host_direct_environment_name {
-            self.state.daemon.local_vcs_for_checkout(Path::new(checkout)).await?
-        } else {
-            self.state.daemon.vcs_for_checkout(&EnvironmentId::new(env_ref), Path::new(checkout)).await?
-        };
+        let environment = self
+            .state
+            .daemon
+            .resolve_environment_ref(env_ref)
+            .ok_or_else(|| format!("command runner unavailable for checkout environment {env_ref}"))?;
+        let vcs = self.state.daemon.vcs_for_checkout(&environment.id, Path::new(checkout)).await?;
+        let runner = environment.runner;
         let namespace = self.state.daemon.provisioning_namespace().await;
         let forges = self
             .state
@@ -5773,12 +5755,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
 
 impl TerminalControllerRuntime {
     fn runner_for_env(&self, env_ref: &str) -> Result<Arc<dyn CommandRunner>, String> {
-        if env_ref == self.state.host_direct_environment_name {
-            return self.state.daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string());
-        }
         self.state
             .daemon
-            .command_runner_for_environment(&EnvironmentId::new(env_ref.to_string()))
+            .command_runner_for_environment_ref(env_ref)
             .ok_or_else(|| format!("command runner unavailable for environment {env_ref}"))
     }
 
@@ -9646,7 +9625,6 @@ mod tests {
         let task = tokio::spawn(run_checkout_archive_gc(daemon.resource_backend(), NAMESPACE.into(), CheckoutArchiveSweep {
             daemon,
             catalog_path: temp.path().join("missing-catalog"),
-            host_direct_environment_name: "local".into(),
             roots: vec![CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/a".into() }, CheckoutArchiveRoot {
                 env_ref: "remote".into(),
                 path: "/archives/b".into(),
@@ -11129,7 +11107,10 @@ mod tests {
         reconcile_provisioned_environments(&state, NAMESPACE).await.expect("readopt running environment");
 
         assert!(restarted.environment_registry_for_environment(&env_id).is_some(), "interior provider registry should be restored");
-        assert!(restarted.command_runner_for_environment(&env_id).is_some(), "environment runner should be restored for attach resolution");
+        assert!(
+            restarted.command_runner_for_environment_ref(env_id.as_str()).is_some(),
+            "environment runner should be restored for attach resolution"
+        );
         assert!(state.provisioned_environments.lock().await.contains_key("test-interior"));
     }
 

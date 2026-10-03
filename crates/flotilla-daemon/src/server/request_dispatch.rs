@@ -7,8 +7,7 @@ use flotilla_core::{
     providers::{ChannelLabel, CommandRunner},
 };
 use flotilla_protocol::{
-    AgentHookEvent, Command, CommandAction, CommandCaller, CommandValue, DaemonEvent, EnvironmentId, LeafAddress, Message, RepoSelector,
-    Request, Response,
+    AgentHookEvent, Command, CommandAction, CommandCaller, CommandValue, DaemonEvent, LeafAddress, Message, RepoSelector, Request, Response,
 };
 use flotilla_resources::{expected_change_request_leaves, select_convoy_children, Checkout, Convoy, ResourceBackend};
 use tracing::warn;
@@ -349,7 +348,7 @@ impl<'a> RequestDispatcher<'a> {
             let session = service.caller_session(caller).await?;
             let runner = self
                 .daemon
-                .command_runner_for_environment(&EnvironmentId::new(session.spec.env_ref.clone()))
+                .command_runner_for_environment_ref(&session.spec.env_ref)
                 .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
             let source_path = absolute_crew_path(&source_path, &session.spec.cwd);
             let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
@@ -499,7 +498,7 @@ impl<'a> RequestDispatcher<'a> {
                 });
             let runner = self
                 .daemon
-                .command_runner_for_environment(&EnvironmentId::new(session.spec.env_ref.clone()))
+                .command_runner_for_environment_ref(&session.spec.env_ref)
                 .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
             let destination_path = absolute_crew_path(&destination_path, &session.spec.cwd);
             let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
