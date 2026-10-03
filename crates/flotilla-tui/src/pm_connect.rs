@@ -131,7 +131,7 @@ pub struct ConnectorState {
     seqs: HashMap<QueryId, u64>,
     catalog: Arc<Mutex<Catalog>>,
     subscriber_id: uuid::Uuid,
-    uncovered_services: std::collections::BTreeSet<String>,
+    uncovered_services: BTreeSet<String>,
 }
 
 impl Default for ConnectorState {

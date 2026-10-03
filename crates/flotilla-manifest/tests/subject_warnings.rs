@@ -133,11 +133,13 @@ fn uncovered_subject_service_warns_with_service() {
         // A persistent gap stays silent; an independent connector warns separately.
         let repeated = catalog.warn_new_uncovered_services(&first);
         assert_eq!(first, repeated);
-        catalog.warn_new_uncovered_services(&Default::default());
+        let independent_connector = catalog.warn_new_uncovered_services(&Default::default());
+        assert_eq!(independent_connector, first);
         // Recovery clears suppression, allowing the next occurrence to warn.
         let recovered = flotilla_manifest::projection::Catalog::default().warn_new_uncovered_services(&repeated);
         assert!(recovered.is_empty());
-        catalog.warn_new_uncovered_services(&recovered);
+        let recurring_gap = catalog.warn_new_uncovered_services(&recovered);
+        assert_eq!(recurring_gap, first);
         catalog.reassert_patches()
     });
     let warnings = warnings.0.lock().expect("warnings");
