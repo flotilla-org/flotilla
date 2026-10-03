@@ -175,6 +175,8 @@ impl InProcessDaemon {
                 .unmet(unmet)
                 .build(),
         );
+        // Concurrent misses may probe twice; last writer wins, and every later
+        // lookup validates its inputs before reuse. Commands retain their lease.
         self.repository_providers.lock().await.insert(key, Arc::clone(&lease));
         Ok(lease)
     }
