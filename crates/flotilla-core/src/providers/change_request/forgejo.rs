@@ -6,7 +6,7 @@ use flotilla_resources::{
     ChangeRequestReviewObservation, ChangeRequestStatus as ObservedStatus, Observation, ObservedChangeRequestState, ObservedReviewDecision,
 };
 
-use super::{ChangeRequestAdmission, ChangeRequestTracker};
+use super::{ChangeRequestAdmission, ChangeRequestTracker, ObservationError};
 use crate::providers::{
     http_execute,
     issue_tracker::forgejo::ForgejoIssueProviderConfig,
@@ -282,7 +282,7 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
         Ok(self.list("open", limit).await?.iter().filter_map(|value| self.parse(value)).collect())
     }
 
-    async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, String> {
+    async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, ObservationError> {
         Ok(self.list("all", 100).await?.iter().filter_map(|value| self.parse(value)).find(|(_, request)| request.branch == branch))
     }
 
@@ -291,7 +291,7 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
         self.parse(&value).ok_or_else(|| format!("malformed Forgejo pull request {id}"))
     }
 
-    async fn get_change_request_for_admission(&self, id: &str) -> Result<ChangeRequestAdmission, String> {
+    async fn get_change_request_for_admission(&self, id: &str) -> Result<ChangeRequestAdmission, ObservationError> {
         let value = self.execute(reqwest::Method::GET, &format!("pulls/{id}"), &[], None).await?;
         let (id, change_request) = self.parse(&value).ok_or_else(|| format!("malformed Forgejo pull request {id}"))?;
         Ok(ChangeRequestAdmission { id, change_request, base_ref: value["base"]["ref"].as_str().map(str::to_string) })

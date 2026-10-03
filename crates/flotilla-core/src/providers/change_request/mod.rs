@@ -112,7 +112,7 @@ pub trait ChangeRequestTracker: Send + Sync {
     /// Provider overrides may include terminal requests so callers can
     /// distinguish open, merged, and closed work. The default implementation
     /// inherits the visibility of [`Self::list_change_requests`].
-    async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, String> {
+    async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, ObservationError> {
         Ok(self.list_change_requests(100).await?.into_iter().find(|(_, request)| request.branch == branch))
     }
     #[allow(dead_code)]
@@ -120,7 +120,7 @@ pub trait ChangeRequestTracker: Send + Sync {
     /// Resolve the immutable identity required to admit an existing change
     /// request as a convoy. Providers that expose the base ref should
     /// override this method so admission can provision the exact PR shape.
-    async fn get_change_request_for_admission(&self, id: &str) -> Result<ChangeRequestAdmission, String> {
+    async fn get_change_request_for_admission(&self, id: &str) -> Result<ChangeRequestAdmission, ObservationError> {
         let (id, change_request) = self.get_change_request(id).await?;
         Ok(ChangeRequestAdmission { id, change_request, base_ref: None })
     }

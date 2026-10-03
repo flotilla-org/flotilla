@@ -2332,6 +2332,187 @@ async fn source_pagination_fairness_survives_provider_rediscovery() {
     }
 }
 
+// GitHub subprocess boundary: retain failed stdout headers as the real CLI does.
+struct AdmissionRestRunner {
+    responses: BTreeMap<String, crate::providers::CommandOutput>,
+}
+
+#[async_trait::async_trait]
+impl CommandRunner for AdmissionRestRunner {
+    async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &crate::providers::ChannelLabel) -> Result<String, String> {
+        panic!("admission REST reads use run_output")
+    }
+
+    async fn run_output(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        _cwd: &Path,
+        _label: &crate::providers::ChannelLabel,
+    ) -> Result<crate::providers::CommandOutput, String> {
+        assert_eq!(cmd, "gh");
+        let endpoint = args.iter().find(|arg| arg.starts_with("repos/")).expect("REST endpoint");
+        let scope = endpoint.strip_prefix("repos/").expect("repository path").split("/pulls").next().expect("scope");
+        let response = self.responses.get(scope).expect("configured repository");
+        Ok(crate::providers::CommandOutput { stdout: response.stdout.clone(), stderr: response.stderr.clone(), success: response.success })
+    }
+
+    async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+        true
+    }
+}
+
+// #2541: both REST lookup paths choose classified limits over ordinary text,
+// preserve ordinary diagnostics, and retain successful/ambiguous repo selection.
+// This finite matrix exhausts ordinary, absent, primary (with/without deadline),
+// secondary, missing-base and successful reads in both repository orders.
+#[tokio::test]
+async fn rest_admission_lookup_selection_matrix() {
+    use crate::providers::{change_request::github::GitHubChangeRequest, github_api::GhApiClient, CommandOutput};
+    let cases = [
+        (["ordinary", "limited"], "limited"),
+        (["limited", "ordinary"], "limited"),
+        (["ordinary", "no-deadline"], "no-deadline"),
+        (["ordinary", "secondary"], "secondary"),
+        (["ordinary", "ordinary"], "ordinary"),
+        (["absent", "ordinary"], "ordinary"),
+        (["absent", "absent"], "absent"),
+        (["missing-base", "ordinary"], "missing-base"),
+        (["limited", "success"], "success"),
+        (["success", "limited"], "success"),
+        (["success", "success"], "ambiguous"),
+    ];
+    for (outcomes, expected) in cases {
+        for branch_lookup in [false, true] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"rest-admission-test\"\n").expect("daemon config");
+            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let responses = outcomes.iter().enumerate().map(|(index, outcome)| {
+                let (status, headers, body, success) = match *outcome {
+                    "limited" => (403, "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1893456000\r\n", serde_json::json!({"message":"API rate limit exceeded"}), false),
+                    "no-deadline" => (403, "X-RateLimit-Remaining: 0\r\n", serde_json::json!({"message":"API rate limit exceeded"}), false),
+                    "secondary" => (403, "X-RateLimit-Remaining: 4989\r\nRetry-After: 30\r\n", serde_json::json!({"message":"secondary rate limit"}), false),
+                    "ordinary" => (403, "X-RateLimit-Remaining: 4989\r\nX-RateLimit-Reset: 1893456000\r\n", serde_json::json!({"message":"Resource not accessible by integration"}), false),
+                    "absent" if branch_lookup => (200, "", serde_json::json!([]), true),
+                    "absent" => (404, "", serde_json::json!({"message":"Not Found"}), false),
+                    _ => {
+                        let pr = serde_json::json!({"number":7,"title":"Wanted","head":{"ref":"feature/wanted"},"base":{"ref": if *outcome == "missing-base" { serde_json::Value::Null } else { serde_json::json!("main") }},"state":"open"});
+                        (200, "", if branch_lookup { serde_json::json!([pr]) } else { pr }, true)
+                    }
+                };
+                (format!("team/repo{index}"), CommandOutput {
+                    stdout: format!("HTTP/2 {status}\r\n{headers}\r\n{body}"),
+                    stderr: if *outcome == "ordinary" { "rate limited diagnostics unavailable".into() } else { "gh: Not Found".into() }, success,
+                })
+            }).collect();
+            let runner = Arc::new(AdmissionRestRunner { responses });
+            let daemon = InProcessDaemon::new_with_resource_backend(
+                Vec::new(),
+                Arc::new(ConfigStore::with_base(temp.path())),
+                fake_discovery(false),
+                HostName::new("test-host"),
+                backend.clone(),
+            )
+            .await;
+            daemon.set_provisioning_namespace("flotilla".into()).await;
+            let mut keys = Vec::new();
+            for index in 0..2 {
+                let scope = format!("team/repo{index}");
+                let repository = RepositorySpec::remote(format!("https://github.com/{scope}")).expect("repository");
+                let key = repository.key();
+                backend.using::<Repository>("flotilla").create(&test_meta(&key.to_string()), &repository).await.expect("repository");
+                daemon.convoy_admission.repository_change_requests.write().await.insert(key.clone(), RepositoryChangeRequestProvider {
+                    service_url: repository.forge().expect("forge").service_url.clone(),
+                    repository: scope.clone(),
+                    provider: Arc::new(GitHubChangeRequest::new(
+                        "github".into(),
+                        scope,
+                        Arc::new(GhApiClient::new(runner.clone())),
+                        runner.clone(),
+                    )),
+                });
+                keys.push(key);
+            }
+            let result = if branch_lookup {
+                daemon
+                    .resolve_convoy_change_request(&keys, "feature/wanted", None)
+                    .await
+                    .map(|found| found.map(|found| found.repository_key))
+            } else {
+                daemon.convoy_admission.resolve_convoy_change_request_admission(&keys, "7").await.map(|found| {
+                    assert_eq!(found.branch, "feature/wanted");
+                    assert_eq!(found.base_ref, "main");
+                    Some(found.binding.repository_ref)
+                })
+            };
+            match expected {
+                "success" | "ambiguous" if branch_lookup || expected == "success" => {
+                    let index = outcomes.iter().position(|outcome| *outcome == "success").expect("success repository");
+                    assert_eq!(result.expect("successful lookup"), Some(keys[index].clone()));
+                }
+                "missing-base" if branch_lookup => assert_eq!(result.expect("branch read needs no base"), Some(keys[0].clone())),
+                "absent" if branch_lookup => assert!(result.expect("no matching request").is_none()),
+                _ => {
+                    let error = result.expect_err("lookup refused");
+                    match expected {
+                        "limited" | "no-deadline" | "secondary" => {
+                            assert!(error.contains("budget=REST core"), "{outcomes:?}: {error}");
+                            assert!(error.contains(if expected == "secondary" { "kind=secondary" } else { "kind=primary" }), "{error}");
+                            if expected == "no-deadline" {
+                                assert!(error.contains("retry_at=unavailable"), "{error}");
+                            }
+                            if expected == "limited" {
+                                assert!(error.contains("retry_source=x-ratelimit-reset, retry_at=2030-01-01T00:00:00+00:00"), "{error}");
+                            }
+                            if !branch_lookup {
+                                let ordinary_index =
+                                    outcomes.iter().position(|outcome| *outcome == "ordinary").expect("ordinary repository");
+                                assert!(
+                                    error.contains(&format!("repository team/repo{ordinary_index}: rate limited diagnostics unavailable")),
+                                    "{error}"
+                                );
+                            }
+                            if branch_lookup {
+                                assert!(!error.contains("diagnostics unavailable"), "{error}");
+                            }
+                        }
+                        "ordinary" => {
+                            if branch_lookup {
+                                assert_eq!(error, "rate limited diagnostics unavailable");
+                            } else {
+                                let diagnostics = outcomes
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, outcome)| {
+                                        let message =
+                                            if *outcome == "absent" { "gh: Not Found" } else { "rate limited diagnostics unavailable" };
+                                        format!("repository team/repo{index}: {message}")
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("; ");
+                                assert_eq!(
+                                    error,
+                                    format!(
+                                        "change request 7 was not found in consulted repositories [team/repo0, team/repo1]: {diagnostics}"
+                                    )
+                                );
+                            }
+                        }
+                        "ambiguous" => {
+                            assert_eq!(error, "change request 7 is ambiguous across 2 consulted repositories [team/repo0, team/repo1]")
+                        }
+                        "missing-base" => {
+                            assert!(error.contains("repository team/repo0: change request 7 did not report a base ref"), "{error}")
+                        }
+                        "absent" => assert!(error.contains("repository team/repo0: gh: Not Found"), "{error}"),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+}
+
 // #2510: admission must prioritize a classified limit over an ordinary error
 // whose diagnostic happens to mention rate limiting. Exercise real discovery,
 // provider classification and admission; fake only the GitHub subprocess boundary.

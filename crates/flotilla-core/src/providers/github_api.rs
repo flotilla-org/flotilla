@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 
-use crate::providers::{run_output, ChannelLabel, CommandRunner};
+use crate::providers::{change_request::ObservationError, run_output, ChannelLabel, CommandRunner};
 
 const MAX_PER_PAGE: usize = 100;
 const MIN_REMAINING_BUDGET: u32 = 100;
@@ -29,8 +29,8 @@ pub(crate) fn response_header<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
 /// A secondary deadline is distinct from the primary window reset. Legacy
 /// `reset_at` errors remain readable alongside the classified `retry_at` shape.
 ///
-/// REST providers retain this external string interface. Change request
-/// observation carries typed errors internally and does not use this parser.
+/// Legacy REST consumers retain this external string interface. Change request
+/// observation and admission lookups carry typed errors and do not use this parser.
 pub fn rate_limit_reset(error: &str) -> Option<DateTime<Utc>> {
     let fields = error.strip_prefix(RATE_LIMIT_PREFIX)?.strip_suffix(')')?;
     let deadline = fields.rsplit_once("retry_at=").or_else(|| fields.rsplit_once("reset_at="))?.1;
@@ -238,6 +238,16 @@ fn low_budget_from_response(raw: &str) -> Option<(DateTime<Utc>, String)> {
 pub trait GhApi: Send + Sync {
     async fn get(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<String, String>;
     async fn get_with_headers(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<GhApiResponse, String>;
+    /// Admission reads preserve REST classification through repository selection.
+    /// Legacy adapters report ordinary failures unless they override this seam.
+    async fn get_classified_with_headers(
+        &self,
+        endpoint: &str,
+        repo_root: &Path,
+        label: &ChannelLabel,
+    ) -> Result<GhApiResponse, ObservationError> {
+        self.get_with_headers(endpoint, repo_root, label).await.map_err(ObservationError::Forge)
+    }
 }
 
 /// Cache entry: ETag + the JSON response body from last 200.
@@ -245,6 +255,11 @@ struct CacheEntry {
     etag: String,
     body: String,
     has_next_page: bool,
+}
+
+enum RestErrorMode {
+    LegacyDiagnostic,
+    Classified,
 }
 
 /// Client that wraps `gh api` with ETag-based conditional request caching.
@@ -269,10 +284,25 @@ impl GhApi for GhApiClient {
     }
 
     async fn get_with_headers(&self, endpoint: &str, repo_root: &Path, _label: &ChannelLabel) -> Result<GhApiResponse, String> {
+        self.fetch(endpoint, repo_root, RestErrorMode::LegacyDiagnostic).await.map_err(|error| error.to_string())
+    }
+
+    async fn get_classified_with_headers(
+        &self,
+        endpoint: &str,
+        repo_root: &Path,
+        _label: &ChannelLabel,
+    ) -> Result<GhApiResponse, ObservationError> {
+        self.fetch(endpoint, repo_root, RestErrorMode::Classified).await
+    }
+}
+
+impl GhApiClient {
+    async fn fetch(&self, endpoint: &str, repo_root: &Path, error_mode: RestErrorMode) -> Result<GhApiResponse, ObservationError> {
         if is_issue_observation(endpoint) {
             if let Some((reset, message)) = self.budget_backoff.lock().expect("GitHub budget lock poisoned").as_ref() {
                 if *reset > Utc::now() {
-                    return Err(message.clone());
+                    return Err(message.clone().into());
                 }
             }
         }
@@ -307,14 +337,23 @@ impl GhApi for GhApiClient {
                     total_count: None,
                 });
             }
-            return Err("304 but no cached response".to_string());
+            return Err("304 but no cached response".into());
         }
 
         if !output.success {
-            if let Some(error) = rate_limit_error_from_response(&output.stdout, "REST core") {
-                return Err(error);
+            if matches!(error_mode, RestErrorMode::Classified) {
+                if let Some(limit) = github_rate_limit(&output.stdout, Utc::now()) {
+                    let budget = response_header(&output.stdout, "x-ratelimit-resource")
+                        .map(|resource| format!("REST {resource}"))
+                        .unwrap_or_else(|| "REST core".into());
+                    return Err(ObservationError::RateLimited { budget, limit });
+                }
+                return Err(output.stderr.into());
             }
-            return Err(output.stderr);
+            if let Some(error) = rate_limit_error_from_response(&output.stdout, "REST core") {
+                return Err(error.into());
+            }
+            return Err(output.stderr.into());
         }
 
         if let Some(ref etag) = parsed.etag {
@@ -331,7 +370,7 @@ impl GhApi for GhApiClient {
                 *self.budget_backoff.lock().expect("GitHub budget lock poisoned") = Some((reset, message.clone()));
                 // Keep the ETag and body for a conditional retry after reset, but
                 // report the exhausted budget now so the host condition is visible.
-                return Err(message);
+                return Err(message.into());
             }
         }
 

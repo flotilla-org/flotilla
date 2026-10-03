@@ -1084,7 +1084,10 @@ impl ChangeRequestTracker for FakeChangeRequest {
         store.iter().find(|(cr_id, _)| cr_id == id).cloned().ok_or_else(|| format!("change request {id} not found"))
     }
 
-    async fn get_change_request_for_admission(&self, id: &str) -> Result<super::super::change_request::ChangeRequestAdmission, String> {
+    async fn get_change_request_for_admission(
+        &self,
+        id: &str,
+    ) -> Result<super::super::change_request::ChangeRequestAdmission, super::super::change_request::ObservationError> {
         let (id, change_request) = self.get_change_request(id).await?;
         Ok(super::super::change_request::ChangeRequestAdmission { id, change_request, base_ref: Some(self.admission_base_ref.clone()) })
     }

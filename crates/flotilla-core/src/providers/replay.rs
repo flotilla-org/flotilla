@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::{
-    github_api::{rate_limit_error, rate_limit_reset, GhApi, GhApiResponse},
+    change_request::ObservationError,
+    github_api::{github_rate_limit, rate_limit_error, rate_limit_reset, GhApi, GhApiResponse, GithubRateLimit, GithubRateLimitKind},
     ChannelLabel, ChannelLabeler, ChannelRequest, CommandOutput, CommandRunner, DefaultLabeler,
 };
 
@@ -541,6 +542,43 @@ fn replay_gh_error(status: u16, body: &str, headers: &HashMap<String, String>) -
     format!("HTTP {status}: {body}")
 }
 
+// Classified recordings store explicit metadata, never classify Display text.
+fn replay_classified_gh_error(status: u16, body: &str, headers: &HashMap<String, String>) -> ObservationError {
+    if let Some(kind) = headers.get("observation-error-kind") {
+        let kind = match kind.as_str() {
+            "forge" => return ObservationError::Forge(body.to_string()),
+            "primary" => GithubRateLimitKind::Primary,
+            "secondary" => GithubRateLimitKind::Secondary,
+            other => panic!("unknown recorded observation error kind: {other}"),
+        };
+        let retry_source = match headers.get("observation-retry-source").map(String::as_str) {
+            Some("x-ratelimit-reset") => "x-ratelimit-reset",
+            Some("retry-after") => "retry-after",
+            Some("secondary-fallback-60s") => "secondary-fallback-60s",
+            Some("unavailable") => "unavailable",
+            other => panic!("unknown recorded retry source: {other:?}"),
+        };
+        return ObservationError::RateLimited {
+            budget: headers.get("observation-budget").expect("recorded budget").clone(),
+            limit: GithubRateLimit {
+                kind,
+                retry_source,
+                retry_at: headers.get("observation-retry-at").map(|at| at.parse().expect("recorded retry deadline")),
+            },
+        };
+    }
+    let raw =
+        format!("HTTP/2 {status}\r\n{}\r\n{body}", headers.iter().map(|(name, value)| format!("{name}: {value}\r\n")).collect::<String>());
+    if let Some(limit) = github_rate_limit(&raw, chrono::Utc::now()) {
+        let budget = headers
+            .iter()
+            .find_map(|(name, value)| name.eq_ignore_ascii_case("x-ratelimit-resource").then(|| format!("REST {value}")))
+            .unwrap_or_else(|| "REST core".into());
+        return ObservationError::RateLimited { budget, limit };
+    }
+    ObservationError::Forge(replay_gh_error(status, body, headers))
+}
+
 fn recorded_gh_error(error: &str) -> (u16, HashMap<String, String>) {
     let Some(reset) = rate_limit_reset(error) else {
         return (500, HashMap::new());
@@ -637,6 +675,29 @@ impl GhApi for ReplayGhApi {
         } else {
             Err(replay_gh_error(status, &body, &headers))
         }
+    }
+
+    async fn get_classified_with_headers(
+        &self,
+        endpoint: &str,
+        _repo_root: &Path,
+        label: &ChannelLabel,
+    ) -> Result<GhApiResponse, ObservationError> {
+        let interaction = self.session.next(label);
+        let Interaction::GhApi { endpoint: expected_endpoint, status, body, headers, .. } = interaction else {
+            panic!("ReplayGhApi: expected gh_api interaction");
+        };
+        assert_eq!(endpoint, expected_endpoint, "ReplayGhApi: endpoint mismatch");
+        if (200..300).contains(&status) || status == 304 {
+            return Ok(GhApiResponse {
+                status,
+                etag: headers.get("etag").cloned(),
+                body,
+                has_next_page: headers.get("has_next_page").is_some_and(|value| value == "true"),
+                total_count: headers.get("total_count").and_then(|value| value.parse().ok()),
+            });
+        }
+        Err(replay_classified_gh_error(status, &body, &headers))
     }
 }
 
@@ -918,6 +979,56 @@ impl GhApi for RecordingGhApi {
             }
         }
 
+        result
+    }
+
+    async fn get_classified_with_headers(
+        &self,
+        endpoint: &str,
+        repo_root: &Path,
+        label: &ChannelLabel,
+    ) -> Result<GhApiResponse, ObservationError> {
+        let result = self.inner.get_classified_with_headers(endpoint, repo_root, label).await;
+        let default = DefaultLabeler.label_for(&ChannelRequest::GhApi { method: "GET", endpoint });
+        let mut headers = HashMap::new();
+        let (status, body) = match &result {
+            Ok(response) => {
+                if let Some(etag) = &response.etag {
+                    headers.insert("etag".into(), etag.clone());
+                }
+                if response.has_next_page {
+                    headers.insert("has_next_page".into(), "true".into());
+                }
+                if let Some(count) = response.total_count {
+                    headers.insert("total_count".into(), count.to_string());
+                }
+                (response.status, response.body.clone())
+            }
+            Err(error) => {
+                match error {
+                    ObservationError::Forge(_) => {
+                        headers.insert("observation-error-kind".into(), "forge".into());
+                    }
+                    ObservationError::RateLimited { budget, limit } => {
+                        headers.insert("observation-error-kind".into(), limit.kind.as_str().into());
+                        headers.insert("observation-budget".into(), budget.clone());
+                        headers.insert("observation-retry-source".into(), limit.retry_source.into());
+                        if let Some(at) = limit.retry_at {
+                            headers.insert("observation-retry-at".into(), at.to_rfc3339());
+                        }
+                    }
+                }
+                (500, error.to_string())
+            }
+        };
+        self.session.record(Interaction::GhApi {
+            label: explicit_label(label, &default),
+            method: "GET".into(),
+            endpoint: endpoint.into(),
+            status,
+            body,
+            headers,
+        });
         result
     }
 }

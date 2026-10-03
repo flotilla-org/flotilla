@@ -885,3 +885,85 @@ rounds:
     assert_eq!(status.unwrap().trim(), "M file.txt");
     session.finish();
 }
+
+// Network boundary for record/replay: return a classified REST outcome directly.
+struct ClassifiedTestApi(Result<GhApiResponse, ObservationError>);
+
+#[async_trait]
+impl GhApi for ClassifiedTestApi {
+    async fn get(&self, _endpoint: &str, _root: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        panic!("classified reads only")
+    }
+    async fn get_with_headers(&self, _endpoint: &str, _root: &Path, _label: &ChannelLabel) -> Result<GhApiResponse, String> {
+        panic!("classified reads only")
+    }
+    async fn get_classified_with_headers(
+        &self,
+        _endpoint: &str,
+        _root: &Path,
+        _label: &ChannelLabel,
+    ) -> Result<GhApiResponse, ObservationError> {
+        match &self.0 {
+            Ok(response) => Ok(GhApiResponse {
+                status: response.status,
+                etag: response.etag.clone(),
+                body: response.body.clone(),
+                has_next_page: response.has_next_page,
+                total_count: response.total_count,
+            }),
+            Err(error) => Err(error.clone()),
+        }
+    }
+}
+
+// #2541: recordings round-trip classification and diagnostics without parsing Display.
+#[hegel::test]
+fn classified_rest_recording_round_trips(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    // Exhaust error variants, both kinds, every retry source and absent/present
+    // deadlines in each case; generate timestamps across zero and modern dates,
+    // pagination boundaries and counts across the empty/100-item page boundary.
+    let timestamp = tc.draw(gs::integers::<i64>().min_value(0).max_value(1893456000));
+    let has_next_page = tc.draw(gs::booleans());
+    let total_count = tc.draw(gs::integers::<u32>().min_value(0).max_value(101));
+    let mut outcomes = vec![
+        Err(ObservationError::Forge("rate limited diagnostics unavailable".into())),
+        Ok(GhApiResponse { status: 200, etag: Some("etag".into()), body: "[]".into(), has_next_page, total_count: Some(total_count) }),
+    ];
+    for kind in [GithubRateLimitKind::Primary, GithubRateLimitKind::Secondary] {
+        for retry_source in ["unavailable", "retry-after", "x-ratelimit-reset", "secondary-fallback-60s"] {
+            for retry_at in [None, Some(chrono::DateTime::from_timestamp(timestamp, 0).expect("deadline"))] {
+                outcomes.push(Err(ObservationError::RateLimited {
+                    budget: "REST core".into(),
+                    limit: GithubRateLimit { kind, retry_at, retry_source },
+                }));
+            }
+        }
+    }
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("recording.yaml");
+        for expected in outcomes {
+            let recording = Session::recording(&path, Masks::new());
+            let api = RecordingGhApi::new(recording.clone(), Arc::new(ClassifiedTestApi(expected)));
+            let endpoint = "repos/team/one/pulls";
+            let label = super::super::gh_api_channel_label("GET", endpoint);
+            let recorded = api.get_classified_with_headers(endpoint, Path::new("/"), &label).await;
+            recording.finish();
+            let replay = Session::replaying(&path, Masks::new());
+            let replayed = ReplayGhApi::new(replay.clone()).get_classified_with_headers(endpoint, Path::new("/"), &label).await;
+            match (recorded, replayed) {
+                (Err(expected), Err(actual)) => assert_eq!(actual, expected),
+                (Ok(expected), Ok(actual)) => {
+                    assert_eq!(actual.status, expected.status);
+                    assert_eq!(actual.body, expected.body);
+                    assert_eq!(actual.etag, expected.etag);
+                    assert_eq!(actual.has_next_page, expected.has_next_page);
+                    assert_eq!(actual.total_count, expected.total_count);
+                }
+                outcomes => panic!("record/replay outcomes differ: {outcomes:?}"),
+            }
+            replay.finish();
+        }
+    });
+}

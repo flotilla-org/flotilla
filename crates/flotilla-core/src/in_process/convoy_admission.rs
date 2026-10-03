@@ -172,7 +172,8 @@ impl ConvoyAdmission {
         repository_keys: &[RepositoryKey],
         requested_id: &str,
     ) -> Result<ResolvedConvoyChangeRequestAdmission, String> {
-        let (candidates, mut failures) = self.repository_change_request_candidates(repository_keys).await;
+        let (candidates, setup_failures) = self.repository_change_request_candidates(repository_keys).await;
+        let mut failures = setup_failures.into_iter().map(|error| (String::new(), ObservationError::Forge(error))).collect::<Vec<_>>();
         let consulted = candidates.iter().map(|(_, scope, _)| scope.clone()).collect::<Vec<_>>();
 
         let mut matches = Vec::new();
@@ -181,7 +182,10 @@ impl ConvoyAdmission {
             match provider.get_change_request_for_admission(requested_id).await {
                 Ok(admission) => {
                     let Some(base_ref) = admission.base_ref else {
-                        failures.push(format!("repository {scope}: change request {} did not report a base ref", admission.id));
+                        failures.push((
+                            format!("repository {scope}: "),
+                            ObservationError::Forge(format!("change request {} did not report a base ref", admission.id)),
+                        ));
                         continue;
                     };
                     matches.push(ResolvedConvoyChangeRequestAdmission {
@@ -191,15 +195,15 @@ impl ConvoyAdmission {
                     });
                     matched_repositories.push(scope);
                 }
-                Err(error) => failures.push(format!("repository {scope}: {error}")),
+                Err(error) => failures.push((format!("repository {scope}: "), error)),
             }
         }
 
+        let limited = failures.iter().any(|(_, error)| matches!(error, ObservationError::RateLimited { .. }));
+        let failures = failures.into_iter().map(|(context, error)| format!("{context}{error}")).collect::<Vec<_>>();
         match matches.len() {
             1 => Ok(matches.remove(0)),
-            0 if failures.iter().any(|failure| failure.contains("rate limited")) => {
-                Err(format!("change request {requested_id} lookup was rate limited: {}", failures.join("; ")))
-            }
+            0 if limited => Err(format!("change request {requested_id} lookup was rate limited: {}", failures.join("; "))),
             0 if consulted.is_empty() => Err(format!(
                 "change request {requested_id} could not be resolved because no project repository could be consulted{}",
                 if failures.is_empty() { String::new() } else { format!(": {}", failures.join("; ")) }
@@ -321,7 +325,7 @@ impl ConvoyAdmission {
 
         let (live_candidates, setup_failures) = self.repository_change_request_candidates(repository_keys).await;
 
-        let mut failures = setup_failures;
+        let mut failures = setup_failures.into_iter().map(ObservationError::Forge).collect::<Vec<_>>();
         for (repository, _, provider) in live_candidates {
             match provider.find_change_request_by_branch(branch).await {
                 Ok(Some((id, request))) => {
@@ -333,10 +337,10 @@ impl ConvoyAdmission {
                 }
             }
         }
-        if let Some(error) = failures.iter().find(|error| error.contains("rate limited")) {
-            return Err(error.clone());
+        if let Some(error) = failures.iter().find(|error| matches!(error, ObservationError::RateLimited { .. })) {
+            return Err(error.to_string());
         }
-        failures.into_iter().next().map_or(Ok(None), Err)
+        failures.into_iter().next().map_or(Ok(None), |error| Err(error.to_string()))
     }
 
     pub(super) async fn resolve_observed_convoy_change_request(
