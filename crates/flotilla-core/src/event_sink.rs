@@ -1,13 +1,13 @@
 //! Event publication port for in-process services.
 
 #[cfg(test)]
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use flotilla_protocol::DaemonEvent;
 use tokio::sync::broadcast;
 
-/// Publishes synchronously in call order; delivery failures are discarded by the broadcast adapter.
+/// Publishes synchronously. Sequential emissions to the same sink preserve their call order.
+/// The broadcast adapter discards delivery failures.
 pub trait EventSink: Send + Sync {
     fn emit(&self, event: DaemonEvent);
 }
@@ -18,12 +18,12 @@ pub struct BroadcastEventSink {
 }
 
 impl BroadcastEventSink {
-    pub fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
-        self.sender.subscribe()
-    }
-
     pub fn new(sender: broadcast::Sender<DaemonEvent>) -> Self {
         Self { sender }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
+        self.sender.subscribe()
     }
 }
 
@@ -39,18 +39,21 @@ pub(crate) fn broadcast_test_sink(sender: broadcast::Sender<DaemonEvent>) -> Arc
     Arc::new(BroadcastEventSink::new(sender))
 }
 
-/// A test sink that retains events in emission order without requiring subscribers.
+/// Retains events in this sink's emission order without requiring subscribers.
+#[cfg(test)]
 #[derive(Default)]
-pub struct RecordingEventSink {
+pub(crate) struct RecordingEventSink {
     events: Mutex<Vec<DaemonEvent>>,
 }
 
+#[cfg(test)]
 impl RecordingEventSink {
     pub fn events(&self) -> Vec<DaemonEvent> {
         self.events.lock().expect("recording event sink lock poisoned").clone()
     }
 }
 
+#[cfg(test)]
 impl EventSink for RecordingEventSink {
     fn emit(&self, event: DaemonEvent) {
         self.events.lock().expect("recording event sink lock poisoned").push(event);
@@ -92,6 +95,7 @@ mod tests {
 
         assert!(matches!(receiver.recv().await.expect("broadcast event"), DaemonEvent::RepoUntracked { .. }));
     }
+
     // Behaviour (#2255): publication preserves order and duplicates, including
     // empty batches and batches crossing the daemon channel's 256-event capacity.
     #[hegel::test]
