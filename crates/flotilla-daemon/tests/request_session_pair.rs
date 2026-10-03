@@ -28,10 +28,10 @@ use flotilla_daemon::{
     blob_store::TieredBlobStore,
     runtime::{DaemonRuntime, RuntimeOptions},
     server::test_support::{
-        apply_convoy_replica_feed, seed_trusted_remote_convoy_project, spawn_in_memory_request_mesh, spawn_in_memory_request_topology,
-        spawn_in_memory_request_topology_stateful, spawn_in_memory_request_topology_stateful_with_caller,
-        spawn_in_memory_request_topology_stateful_with_caller_and_blob_store, spawn_in_memory_request_topology_stateful_with_surface,
-        InMemoryRequestTopology,
+        apply_convoy_replica_feed, seed_trusted_remote_convoy_project, spawn_in_memory_request_mesh,
+        spawn_in_memory_request_mesh_with_replication_kinds, spawn_in_memory_request_topology, spawn_in_memory_request_topology_stateful,
+        spawn_in_memory_request_topology_stateful_with_caller, spawn_in_memory_request_topology_stateful_with_caller_and_blob_store,
+        spawn_in_memory_request_topology_stateful_with_surface, InMemoryRequestMesh, InMemoryRequestTopology,
     },
 };
 use flotilla_protocol::{
@@ -684,6 +684,47 @@ fn partition_heal_and_request_runtime_restart_keep_deleted_resource_absent() {
     });
 }
 
+async fn spawn_tombstone_mesh(hosts: Vec<Arc<InProcessDaemon>>) -> Result<InMemoryRequestMesh, String> {
+    // This scenario authors only Host records. Keep their real routed origin and
+    // relay watches, without unrelated resource-watch fanout on every restart.
+    spawn_in_memory_request_mesh_with_replication_kinds(hosts, Some(&[Host::API_PATHS.kind])).await
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn tombstone_mesh_replicates_hosts_without_unrelated_watch_commands() {
+    // The focused fixture must replicate its selected kind through the real
+    // router, while leaving unrelated kinds local. The default mesh stays broad.
+    for focused in [true, false] {
+        let hosts = vec![empty_daemon_named("scope-home").await, empty_daemon_named("scope-peer").await];
+        let mesh = if focused { spawn_tombstone_mesh(hosts.clone()).await } else { spawn_in_memory_request_mesh(hosts.clone()).await }
+            .expect("scope mesh");
+        hosts[0]
+            .resource_backend()
+            .using::<Convoy>("flotilla")
+            .create(&InputMeta::builder().name("unrelated".to_string()).build(), &convoy_spec("scratch", "unrelated"))
+            .await
+            .expect("create unrelated kind");
+        hosts[0]
+            .resource_backend()
+            .using::<Host>("flotilla")
+            .create(&InputMeta::builder().name("selected".to_string()).build(), &HostSpec::default())
+            .await
+            .expect("create selected kind");
+        wait_for_host_resource_visibility(&hosts, "selected", true).await;
+        let convoys = hosts[1].resource_backend().including_replicas::<Convoy>("flotilla");
+        if focused {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(matches!(convoys.get("unrelated").await, Err(ResourceError::NotFound { .. })));
+        } else {
+            eventually(Duration::from_secs(5), Duration::from_millis(10), "default mesh replicates unrelated kinds", || async {
+                convoys.get("unrelated").await.is_ok()
+            })
+            .await;
+        }
+        drop(mesh);
+    }
+}
+
 #[hegel::test]
 fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
     // Each drawn step authors and deletes a new record across either a cut
@@ -699,7 +740,7 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
             empty_daemon_named("transition-b").await,
             empty_daemon_named("transition-c").await,
         ];
-        let mut mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("initial mesh");
+        let mut mesh = spawn_tombstone_mesh(hosts.clone()).await.expect("initial mesh");
         let name = "transition-tombstone";
         hosts[home_index]
             .resource_backend()
@@ -710,12 +751,12 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
         wait_for_host_resource_visibility(&hosts, name, true).await;
         if restart_before_delete {
             drop(mesh);
-            mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart before delete");
+            mesh = spawn_tombstone_mesh(hosts.clone()).await.expect("restart before delete");
         }
         drop(mesh);
-        let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[home_index])]).await.expect("isolate home");
+        let isolated = spawn_tombstone_mesh(vec![Arc::clone(&hosts[home_index])]).await.expect("isolate home");
         let others = hosts.iter().enumerate().filter(|(index, _)| *index != home_index).map(|(_, host)| Arc::clone(host)).collect();
-        let other_component = spawn_in_memory_request_mesh(others).await.expect("other component");
+        let other_component = spawn_tombstone_mesh(others).await.expect("other component");
         let mut events = hosts[home_index].subscribe();
         let id = isolated.clients[0]
             .execute(
@@ -733,7 +774,7 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
         assert!(matches!(await_command_result(&mut events, id).await, CommandValue::ResourceDeleted(_)));
         drop(isolated);
         drop(other_component);
-        let mut mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal");
+        let mut mesh = spawn_tombstone_mesh(hosts.clone()).await.expect("heal");
         wait_for_host_resource_visibility(&hosts, name, false).await;
         for (step, partition_again) in transitions.into_iter().enumerate() {
             let step_name = format!("transition-step-{step}");
@@ -746,9 +787,9 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
             wait_for_host_resource_visibility(&hosts, &step_name, true).await;
             drop(mesh);
             if partition_again {
-                let isolated = spawn_in_memory_request_mesh(vec![Arc::clone(&hosts[home_index])]).await.expect("repeat partition");
+                let isolated = spawn_tombstone_mesh(vec![Arc::clone(&hosts[home_index])]).await.expect("repeat partition");
                 let others = hosts.iter().enumerate().filter(|(index, _)| *index != home_index).map(|(_, host)| Arc::clone(host)).collect();
-                let other_component = spawn_in_memory_request_mesh(others).await.expect("repeat other component");
+                let other_component = spawn_tombstone_mesh(others).await.expect("repeat other component");
                 let mut events = hosts[home_index].subscribe();
                 let id = isolated.clients[0]
                     .execute(
@@ -766,9 +807,9 @@ fn generated_partition_heal_restart_preserves_tombstones(tc: hegel::TestCase) {
                 assert!(matches!(await_command_result(&mut events, id).await, CommandValue::ResourceDeleted(_)));
                 drop(isolated);
                 drop(other_component);
-                mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("heal repeated partition");
+                mesh = spawn_tombstone_mesh(hosts.clone()).await.expect("heal repeated partition");
             } else {
-                mesh = spawn_in_memory_request_mesh(hosts.clone()).await.expect("restart full mesh");
+                mesh = spawn_tombstone_mesh(hosts.clone()).await.expect("restart full mesh");
                 let mut events = hosts[home_index].subscribe();
                 let id = mesh.clients[home_index]
                     .execute(

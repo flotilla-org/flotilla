@@ -72,9 +72,41 @@ struct RetryBackoff {
     reset_after: Duration,
 }
 
+/// Production always replicates every kind; generated fixtures can select their
+/// authored kinds without adding production state or changing the wire protocol.
+#[derive(Clone, Copy, Default)]
+pub(super) struct ReplicationKindFilter {
+    #[cfg(feature = "test-support")]
+    kinds: Option<&'static [&'static str]>,
+}
+
+impl ReplicationKindFilter {
+    #[cfg(feature = "test-support")]
+    pub(super) fn new(kinds: Option<&'static [&'static str]>) -> Self {
+        Self { kinds }
+    }
+
+    fn includes<T: Resource>(self) -> bool {
+        #[cfg(feature = "test-support")]
+        if self.kinds.is_some_and(|kinds| !kinds.contains(&T::API_PATHS.kind)) {
+            return false;
+        }
+        true
+    }
+}
+
 #[derive(Default)]
 pub(super) struct PeerReplicatorSupervisors {
     generations: HashMap<NodeId, ActiveGeneration>,
+    kind_filter: ReplicationKindFilter,
+}
+
+impl Drop for PeerReplicatorSupervisors {
+    fn drop(&mut self) {
+        for active in self.generations.values() {
+            active.cancellation.cancel();
+        }
+    }
 }
 
 struct ActiveGeneration {
@@ -119,6 +151,10 @@ impl SocketPathSource {
 }
 
 impl PeerReplicatorSupervisors {
+    pub(super) fn new(kind_filter: ReplicationKindFilter) -> Self {
+        Self { generations: HashMap::new(), kind_filter }
+    }
+
     pub(super) async fn peer_connected(
         &mut self,
         _router: RemoteCommandRouter,
@@ -148,10 +184,27 @@ impl PeerReplicatorSupervisors {
             generation,
             &transport,
             &cancellation,
-            ReplicationStore::Durable
+            ReplicationStore::Durable,
+            self.kind_filter
         );
-        spawn_kind::<flotilla_resources::Checkout>(&daemon, &peer, generation, &transport, &cancellation, ReplicationStore::Observed);
-        spawn_kind::<flotilla_resources::TerminalSession>(&daemon, &peer, generation, &transport, &cancellation, ReplicationStore::Observed)
+        spawn_kind::<flotilla_resources::Checkout>(
+            &daemon,
+            &peer,
+            generation,
+            &transport,
+            &cancellation,
+            ReplicationStore::Observed,
+            self.kind_filter,
+        );
+        spawn_kind::<flotilla_resources::TerminalSession>(
+            &daemon,
+            &peer,
+            generation,
+            &transport,
+            &cancellation,
+            ReplicationStore::Observed,
+            self.kind_filter,
+        )
     }
 
     /// Cancel and drop a peer's resource replicators, but only if `generation`
@@ -224,7 +277,11 @@ fn spawn_kind<T: Resource>(
     transport: &ReplicationTransport,
     cancellation: &CancellationToken,
     store: ReplicationStore,
+    kind_filter: ReplicationKindFilter,
 ) {
+    if !kind_filter.includes::<T>() {
+        return;
+    }
     if T::REPLICATION_CLASS == ReplicationClass::None {
         return;
     }
@@ -1070,6 +1127,18 @@ mod tests {
             applications += 1;
         }
         assert_eq!(applications, 2, "a newer generation starts exactly one new application stream");
+    }
+
+    #[test]
+    fn dropping_supervisors_cancels_all_peer_generations() {
+        // Runtime teardown ends every replication generation, including watches
+        // and retry backoffs, rather than leaving them to work on dead sessions.
+        let mut supervisors = PeerReplicatorSupervisors::default();
+        let (first, _) = supervisors.begin_generation(&NodeId::new("first"), 1, None).expect("first generation");
+        let (second, _) = supervisors.begin_generation(&NodeId::new("second"), 2, None).expect("second generation");
+        drop(supervisors);
+        assert!(first.is_cancelled(), "first peer generation survived teardown");
+        assert!(second.is_cancelled(), "second peer generation survived teardown");
     }
 
     #[test]

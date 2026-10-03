@@ -69,6 +69,48 @@ use crate::{
 };
 
 #[tokio::test(start_paused = true)]
+async fn aborting_peer_runtime_releases_connection_and_replication_owners() {
+    use flotilla_resources::Resource;
+
+    use super::{build_remote_command_router, peer_runtime::PeerRuntime};
+    use crate::peer::{channel_transport::channel_transport_pair_with_nodes, PeerTransport};
+
+    // Runtime teardown must release both a live connection loop and the outbound
+    // replication supervisor, even while its peer and notification sender live.
+    let (_tmp, daemon) = empty_daemon().await;
+    let manager = Arc::new(Mutex::new(crate::peer::PeerManager::new(daemon.node_id().clone())));
+    let weak_manager = Arc::downgrade(&manager);
+    let remote = NodeInfo::new(NodeId::new("remote"), "remote".to_string());
+    let (local_transport, mut remote_transport) =
+        channel_transport_pair_with_nodes(NodeInfo::new(daemon.node_id().clone(), daemon.host_name().to_string()), remote);
+    remote_transport.connect().await.expect("connect peer transport");
+    let _remote_messages = remote_transport.subscribe().await.expect("subscribe peer transport");
+    manager.lock().await.add_configured_target(ConfigLabel("remote".to_string()), HostName::new("remote"), None, Box::new(local_transport));
+    let router = build_remote_command_router(&daemon, &manager);
+    let (inbound_tx, inbound_rx) = mpsc::channel(256);
+    let (runtime, _connected_tx) = PeerRuntime::new(Arc::clone(&daemon), Arc::clone(&manager), Some(inbound_rx), inbound_tx, router, None)
+        .with_replication_kinds(Some(&[Host::API_PATHS.kind]))
+        .spawn();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !daemon.get_topology().await.expect("topology").routes.iter().any(|route| route.connected) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("peer connected before teardown");
+    drop(manager);
+    runtime.abort();
+    assert!(runtime.await.expect_err("aborted runtime").is_cancelled());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while weak_manager.upgrade().is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("runtime left connection or replication owners alive");
+}
+
+#[tokio::test(start_paused = true)]
 async fn peer_reconnect_survives_sustained_failures_and_recovers() {
     const OBSERVED_STALL_ATTEMPT: usize = 732;
 
