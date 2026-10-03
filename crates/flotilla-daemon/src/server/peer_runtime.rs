@@ -15,8 +15,10 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use super::{
-    remote_commands::RemoteCommandRouter, replicator::PeerReplicatorSupervisors, shared::sync_peer_query_state, PeerConnectedNotice,
-    PeerConnectionEvent, SshTransport,
+    remote_commands::RemoteCommandRouter,
+    replicator::{PeerReplicatorSupervisors, ReplicationKindFilter},
+    shared::sync_peer_query_state,
+    PeerConnectedNotice, PeerConnectionEvent, SshTransport,
 };
 use crate::peer::{dispatch_pending_sends, peer_resource_socket_path, HandleResult, InboundPeerEnvelope, PeerManager, PeerSender};
 
@@ -158,8 +160,7 @@ pub(super) struct PeerRuntime {
     inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
     remote_command_router: RemoteCommandRouter,
     resource_socket_dir: Option<PathBuf>,
-    #[cfg(feature = "test-support")]
-    replication_kinds: Option<&'static [&'static str]>,
+    replication_kind_filter: ReplicationKindFilter,
 }
 
 impl PeerRuntime {
@@ -178,14 +179,13 @@ impl PeerRuntime {
             inbound_peer_tx,
             remote_command_router,
             resource_socket_dir,
-            #[cfg(feature = "test-support")]
-            replication_kinds: None,
+            replication_kind_filter: ReplicationKindFilter::default(),
         }
     }
 
     #[cfg(feature = "test-support")]
     pub(super) fn with_replication_kinds(mut self, kinds: Option<&'static [&'static str]>) -> Self {
-        self.replication_kinds = kinds;
+        self.replication_kind_filter = ReplicationKindFilter::new(kinds);
         self
     }
 
@@ -399,6 +399,11 @@ impl PeerRuntime {
 
                 loop {
                     tokio::select! {
+                        Some(Err(error)) = connections.join_next(), if !connections.is_empty() => {
+                            if error.is_panic() {
+                                warn!(%error, "peer connection task panicked");
+                            }
+                        }
                         maybe_env = rx.recv() => {
                             let Some(env) = maybe_env else { break };
                             let (post_handle_action, pending_sends) = {
@@ -574,16 +579,12 @@ impl PeerRuntime {
             }
         });
 
-        #[cfg(feature = "test-support")]
-        let replication_kinds = self.replication_kinds;
+        let replication_kind_filter = self.replication_kind_filter;
         let outbound_daemon = Arc::clone(&self.daemon);
         let outbound_remote_command_router = self.remote_command_router.clone();
         let mut peer_connected_rx = peer_connected_rx;
         tasks.spawn(async move {
-            #[cfg(feature = "test-support")]
-            let mut peer_replicators = PeerReplicatorSupervisors::with_replication_kinds(replication_kinds);
-            #[cfg(not(feature = "test-support"))]
-            let mut peer_replicators = PeerReplicatorSupervisors::default();
+            let mut peer_replicators = PeerReplicatorSupervisors::new(replication_kind_filter);
 
             while let Some(event) = peer_connected_rx.recv().await {
                 match event {
@@ -607,7 +608,15 @@ impl PeerRuntime {
             }
         });
 
-        let handle = tokio::spawn(async move { while tasks.join_next().await.is_some() {} });
+        let handle = tokio::spawn(async move {
+            while let Some(result) = tasks.join_next().await {
+                if let Err(error) = result {
+                    if error.is_panic() {
+                        warn!(%error, "peer runtime task panicked");
+                    }
+                }
+            }
+        });
         (handle, peer_connected_tx)
     }
 }

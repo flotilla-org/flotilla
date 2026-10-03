@@ -72,11 +72,33 @@ struct RetryBackoff {
     reset_after: Duration,
 }
 
+/// Production always replicates every kind; generated fixtures can select their
+/// authored kinds without adding production state or changing the wire protocol.
+#[derive(Clone, Copy, Default)]
+pub(super) struct ReplicationKindFilter {
+    #[cfg(feature = "test-support")]
+    kinds: Option<&'static [&'static str]>,
+}
+
+impl ReplicationKindFilter {
+    #[cfg(feature = "test-support")]
+    pub(super) fn new(kinds: Option<&'static [&'static str]>) -> Self {
+        Self { kinds }
+    }
+
+    fn includes<T: Resource>(self) -> bool {
+        #[cfg(feature = "test-support")]
+        if self.kinds.is_some_and(|kinds| !kinds.contains(&T::API_PATHS.kind)) {
+            return false;
+        }
+        true
+    }
+}
+
 #[derive(Default)]
 pub(super) struct PeerReplicatorSupervisors {
     generations: HashMap<NodeId, ActiveGeneration>,
-    #[cfg(feature = "test-support")]
-    replication_kinds: Option<&'static [&'static str]>,
+    kind_filter: ReplicationKindFilter,
 }
 
 impl Drop for PeerReplicatorSupervisors {
@@ -129,9 +151,8 @@ impl SocketPathSource {
 }
 
 impl PeerReplicatorSupervisors {
-    #[cfg(feature = "test-support")]
-    pub(super) fn with_replication_kinds(replication_kinds: Option<&'static [&'static str]>) -> Self {
-        Self { generations: HashMap::new(), replication_kinds }
+    pub(super) fn new(kind_filter: ReplicationKindFilter) -> Self {
+        Self { generations: HashMap::new(), kind_filter }
     }
 
     pub(super) async fn peer_connected(
@@ -164,9 +185,17 @@ impl PeerReplicatorSupervisors {
             &transport,
             &cancellation,
             ReplicationStore::Durable,
-            self
+            self.kind_filter
         );
-        spawn_kind::<flotilla_resources::Checkout>(&daemon, &peer, generation, &transport, &cancellation, ReplicationStore::Observed, self);
+        spawn_kind::<flotilla_resources::Checkout>(
+            &daemon,
+            &peer,
+            generation,
+            &transport,
+            &cancellation,
+            ReplicationStore::Observed,
+            self.kind_filter,
+        );
         spawn_kind::<flotilla_resources::TerminalSession>(
             &daemon,
             &peer,
@@ -174,7 +203,7 @@ impl PeerReplicatorSupervisors {
             &transport,
             &cancellation,
             ReplicationStore::Observed,
-            self,
+            self.kind_filter,
         )
     }
 
@@ -248,10 +277,9 @@ fn spawn_kind<T: Resource>(
     transport: &ReplicationTransport,
     cancellation: &CancellationToken,
     store: ReplicationStore,
-    _supervisors: &PeerReplicatorSupervisors,
+    kind_filter: ReplicationKindFilter,
 ) {
-    #[cfg(feature = "test-support")]
-    if _supervisors.replication_kinds.is_some_and(|kinds| !kinds.contains(&T::API_PATHS.kind)) {
+    if !kind_filter.includes::<T>() {
         return;
     }
     if T::REPLICATION_CLASS == ReplicationClass::None {
