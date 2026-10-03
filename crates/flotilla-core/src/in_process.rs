@@ -1902,7 +1902,17 @@ impl InProcessDaemon {
             .await
             .expect("failed to resolve local node id");
         let resource_backend = resource_backend.with_local_root(local_node_id.clone());
-        let observed_resource_backend = ResourceBackend::InMemory(InMemoryBackend::observed()).with_local_root(local_node_id.clone());
+        let observed = if matches!(&resource_backend, ResourceBackend::Sqlite(_)) {
+            let path = config.state_dir().as_path().join("observation-replicas.sqlite");
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await.expect("create observation replica directory");
+            }
+            let replicas = flotilla_resources::SqliteBackend::open_async(&path).await.expect("open durable observation replicas");
+            InMemoryBackend::observed_with_durable_replicas(replicas)
+        } else {
+            InMemoryBackend::observed()
+        };
+        let observed_resource_backend = ResourceBackend::InMemory(observed).with_local_root(local_node_id.clone());
         let local_environment_id =
             resolve_or_create_environment_id(&local_environment_state_dir).expect("failed to resolve local direct environment id");
         let local_host_id = resolve_local_host_id(config.state_dir().as_path(), config_machine_id, &*discovery.runner)

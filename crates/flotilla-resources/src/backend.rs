@@ -104,7 +104,8 @@ impl ResourceBackend {
     pub(crate) async fn delete_decode_quarantine<T: Resource>(&self, namespace: &str, name: &str) -> Result<bool, ResourceError> {
         match self {
             Self::Sqlite(backend) => backend.delete_decode_quarantine_typed::<T>(namespace, name).await,
-            Self::InMemory(_) | Self::Http(_) => Ok(false),
+            Self::InMemory(backend) => backend.delete_decode_quarantine_typed::<T>(namespace, name).await,
+            Self::Http(_) => Ok(false),
         }
     }
 
