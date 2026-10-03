@@ -1386,6 +1386,7 @@ async fn reuses_existing_clone_by_deterministic_name() {
 }
 
 #[tokio::test]
+// Contained worktrees receive tracking defaults while the shared config and hooks stay read-only.
 async fn docker_worktree_waits_for_checkout_before_creating_environment() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-c", "implement", REPO_URL, GIT_REF).await;
@@ -1463,6 +1464,88 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
                 ])
         )
     }));
+
+    let docker = outcome
+        .actuations
+        .iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateEnvironment { spec, .. } => spec.docker.as_ref(),
+            _ => None,
+        })
+        .expect("contained environment");
+    #[cfg(unix)]
+    assert_contained_tracking(&docker.env);
+}
+
+#[cfg(unix)]
+fn assert_contained_tracking(env: &BTreeMap<String, String>) {
+    use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+
+    // Real Git is required here: tracking writes and lock/rename are the process boundary behind #2516.
+    let temp = tempfile::tempdir().expect("Git fixture");
+    let root = temp.path();
+    let git = |cwd: &Path, args: &[&str], contained: bool| {
+        let mut command = Command::new("git");
+        command
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com");
+        if contained {
+            command.envs(env);
+        }
+        let output = command.output().expect("run Git");
+        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).expect("Git UTF-8 output")
+    };
+    git(root, &["init", "--bare", "remote"], false);
+    git(root, &["clone", "remote", "clone"], false);
+    let clone = root.join("clone");
+    git(&clone, &["commit", "--allow-empty", "-m", "base"], false);
+    git(&clone, &["worktree", "add", "-b", GIT_REF, "../work"], false);
+    let work = root.join("work");
+    let config = clone.join(".git/config");
+    let hooks = clone.join(".git/hooks");
+    let hook = hooks.join("protected");
+    fs::write(&hook, "host hook").expect("host hook");
+    let original_config = fs::read(&config).expect("shared config");
+    // Directory permissions model the mount's lock/rename refusal; the existing
+    // reconciliation assertion separately verifies the actual read-only overlays.
+    for path in [&config, &hook] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o444)).expect("protect file");
+    }
+    for path in [clone.join(".git"), hooks.clone()] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o555)).expect("protect directory");
+    }
+    assert!(fs::write(&config, "changed").is_err(), "shared config is unwritable");
+    assert!(fs::write(&hook, "changed").is_err(), "shared hook is unwritable");
+    assert!(fs::write(hooks.join("new-hook"), "changed").is_err(), "new hooks are refused");
+
+    // The chosen equivalent to push -u is provisioned tracking plus plain push,
+    // including the first publication of a branch that does not exist remotely.
+    git(&work, &["push"], true);
+    assert_eq!(git(&work, &["rev-parse", "--abbrev-ref", "@{upstream}"], true).trim(), format!("origin/{GIT_REF}"));
+    git(&work, &["commit", "--allow-empty", "-m", "crew change"], true);
+    git(&work, &["push"], true);
+    git(root, &["clone", "--branch", GIT_REF, "remote", "peer"], false);
+    let peer = root.join("peer");
+    git(&peer, &["commit", "--allow-empty", "-m", "peer change"], false);
+    git(&peer, &["push"], false);
+    git(&work, &["pull", "--ff-only"], true);
+    assert_eq!(git(&work, &["rev-parse", "HEAD"], true), git(&peer, &["rev-parse", "HEAD"], false));
+    assert_eq!(fs::read(&config).expect("read protected config"), original_config);
+    assert_eq!(fs::read_to_string(&hook).expect("read protected hook"), "host hook");
+    for path in [clone.join(".git"), hooks] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("restore directories");
+    }
 }
 
 #[tokio::test]

@@ -546,6 +546,7 @@ impl Reconciler for VesselReconciler {
         let mut checkout_refs = BTreeMap::new();
         let mut checkout_paths = BTreeMap::new();
         let mut contained_worktree_checkouts = Vec::new();
+        let mut contained_branches = BTreeSet::new();
         let mut waiting_for_checkouts = Vec::new();
         let mut fork_stance = false;
         for convoy_repository in convoy_repositories {
@@ -701,6 +702,9 @@ impl Reconciler for VesselReconciler {
                             return Ok(VesselPrepared::failed(format!("checkout {checkout_name} is ready but has no target path")));
                         };
                         if matches!(&strategy, PlacementStrategy::DockerWorktreeOnHostAndMount { .. }) {
+                            if let CheckoutSpec::Worktree(spec) = &existing.spec {
+                                contained_branches.insert(spec.r#ref.strip_prefix("refs/heads/").unwrap_or(&spec.r#ref).to_string());
+                            }
                             contained_worktree_checkouts.push((checkout_name.clone(), match &existing.spec {
                                 CheckoutSpec::Worktree(spec) => Some(spec.clone_ref.clone()),
                                 CheckoutSpec::FreshClone(_) | CheckoutSpec::Observed(_) => None,
@@ -887,6 +891,10 @@ impl Reconciler for VesselReconciler {
                                     mode: EnvironmentMountMode::Ro,
                                 });
                             }
+                        }
+                        let mut env = env.clone();
+                        if let Err(message) = configure_contained_tracking(&mut env, &contained_branches) {
+                            return Ok(VesselPrepared::failed(message));
                         }
                         let image = match image.resolve(&self.image_baselines).await {
                             Ok(image) => image,
@@ -1262,6 +1270,34 @@ fn image_stamp(environment: &ResourceObject<Environment>) -> Result<ImageStamp, 
     Ok(ImageStamp { image_ref, image_digest })
 }
 
+/// Git's ordinary upstream writes target the common config, even with
+/// extensions.worktreeConfig. Supply branch tracking at process scope instead:
+/// plain push publishes the current branch and pull follows that same branch.
+/// This leaves the host-owned remotes, hooks, and config overlays untouched and
+/// does not enable an extension that the host config guard deliberately rejects.
+fn configure_contained_tracking(env: &mut BTreeMap<String, String>, branches: &BTreeSet<String>) -> Result<(), String> {
+    if branches.is_empty() {
+        return Ok(());
+    }
+    let mut count = env
+        .get("GIT_CONFIG_COUNT")
+        .map_or(Ok(0), |value| value.parse::<usize>())
+        .map_err(|_| "invalid GIT_CONFIG_COUNT in contained vessel environment".to_string())?;
+    let mut settings = vec![("push.default".to_string(), "current".to_string())];
+    for branch in branches {
+        settings.push((format!("branch.{branch}.remote"), "origin".to_string()));
+        settings.push((format!("branch.{branch}.merge"), format!("refs/heads/{branch}")));
+    }
+    for (key, value) in settings {
+        let next = count.checked_add(1).ok_or("GIT_CONFIG_COUNT overflow in contained vessel environment")?;
+        env.insert(format!("GIT_CONFIG_KEY_{count}"), key);
+        env.insert(format!("GIT_CONFIG_VALUE_{count}"), value);
+        count = next;
+    }
+    env.insert("GIT_CONFIG_COUNT".to_string(), count.to_string());
+    Ok(())
+}
+
 fn environment_with_credentials(
     mut env: BTreeMap<String, String>,
     credentials: &std::collections::BTreeSet<String>,
@@ -1491,9 +1527,41 @@ mod tests {
     };
 
     use super::{
-        checkout_name, checkout_placement_scope, environment_with_credentials, legible_waiting_for, placement_strategy, PlacementStrategy,
-        VesselReconciler,
+        checkout_name, checkout_placement_scope, configure_contained_tracking, environment_with_credentials, legible_waiting_for,
+        placement_strategy, PlacementStrategy, VesselReconciler,
     };
+
+    // Glue: append Git's fixed settings without replacing policy or credential environment.
+    #[test]
+    fn contained_tracking_appends_policy_config_and_deduplicates_branches() {
+        let mut env = BTreeMap::from([
+            ("GIT_CONFIG_COUNT".into(), "1".into()),
+            ("GIT_CONFIG_KEY_0".into(), "pull.ff".into()),
+            ("GIT_CONFIG_VALUE_0".into(), "only".into()),
+            ("GIT_CONFIG_GLOBAL".into(), "/credentials/gitconfig".into()),
+        ]);
+        configure_contained_tracking(&mut env, &BTreeSet::from(["fix/a".into(), "fix/b".into(), "fix/a".into()])).expect("tracking config");
+        assert_eq!(env["GIT_CONFIG_COUNT"], "6");
+        assert_eq!(env["GIT_CONFIG_KEY_0"], "pull.ff");
+        assert_eq!(env["GIT_CONFIG_VALUE_0"], "only");
+        assert_eq!(env["GIT_CONFIG_GLOBAL"], "/credentials/gitconfig");
+        assert_eq!(env["GIT_CONFIG_KEY_2"], "branch.fix/a.remote");
+        assert_eq!(env["GIT_CONFIG_VALUE_3"], "refs/heads/fix/a");
+        assert_eq!(env["GIT_CONFIG_KEY_4"], "branch.fix/b.remote");
+        assert_eq!(env["GIT_CONFIG_VALUE_5"], "refs/heads/fix/b");
+    }
+
+    // Empty vessels keep their environment; malformed/overflowing policy counts fail closed.
+    #[test]
+    fn contained_tracking_handles_empty_and_invalid_config_counts() {
+        let mut env = BTreeMap::new();
+        configure_contained_tracking(&mut env, &BTreeSet::new()).expect("empty vessel");
+        assert!(env.is_empty());
+        for count in ["", "-1", "invalid", &usize::MAX.to_string()] {
+            let mut env = BTreeMap::from([("GIT_CONFIG_COUNT".into(), count.into())]);
+            assert!(configure_contained_tracking(&mut env, &BTreeSet::from(["main".into()])).is_err());
+        }
+    }
 
     #[derive(Clone)]
     struct LogCaptureWriter(Arc<Mutex<Vec<u8>>>);

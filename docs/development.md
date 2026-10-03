@@ -193,3 +193,16 @@ inputs, so forwarded `--host` validation also uses the candidate parser. An olde
 daemon without that inventory endpoint requires validation on its own host,
 where the candidate reads committed ops sources through its VCS interface.
 Missing or ambiguous ops checkouts fail validation.
+
+## Git in contained host worktrees
+
+Contained host-worktree vessels receive process-scoped tracking settings for their
+provisioned branches: `branch.<branch>.remote=origin`,
+`branch.<branch>.merge=refs/heads/<branch>`, and `push.default=current`.
+Use plain `git push` to publish the branch, including its first push; later
+`git push` and `git pull` follow the same branch on origin. These settings are
+scoped to the vessel environment and coexist with the injected global credential
+config. The shared clone config and hooks retain their read-only mounts, and the
+host config guard continues to reject `extensions.worktreeConfig` and executable
+configuration. Branches created manually after provisioning can be published with
+an explicit branch.
