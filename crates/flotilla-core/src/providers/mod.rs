@@ -620,40 +620,49 @@ impl CommandRunner for ProcessCommandRunner {
     }
 
     async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
-        use std::os::unix::fs::PermissionsExt;
-
         if mode > 0o777 {
             return Err("file mode must contain only permission bits".to_string());
         }
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
+        #[cfg(not(unix))]
+        {
+            // Windows has no POSIX permission bits. ACL policy can be added here
+            // when Windows hosts start materializing daemon credentials.
+            self.write_file(path, content).await
         }
-        let mut temporary = path.as_os_str().to_os_string();
-        temporary.push(format!(".flotilla-tmp-{}", uuid::Uuid::new_v4()));
-        let temporary = PathBuf::from(temporary);
-        let result = async {
-            let mut file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temporary)
-                .await
-                .map_err(|e| format!("open {}: {e}", temporary.display()))?;
-            use tokio::io::AsyncWriteExt;
-            file.write_all(content.as_bytes()).await.map_err(|e| format!("write {}: {e}", temporary.display()))?;
-            file.flush().await.map_err(|e| format!("flush {}: {e}", temporary.display()))?;
-            file.set_permissions(std::fs::Permissions::from_mode(mode))
-                .await
-                .map_err(|e| format!("protect {}: {e}", temporary.display()))?;
-            file.sync_all().await.map_err(|e| format!("sync {}: {e}", temporary.display()))?;
-            drop(file);
-            tokio::fs::rename(&temporary, path).await.map_err(|e| format!("rename {} to {}: {e}", temporary.display(), path.display()))
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
+            }
+            let mut temporary = path.as_os_str().to_os_string();
+            temporary.push(format!(".flotilla-tmp-{}", uuid::Uuid::new_v4()));
+            let temporary = PathBuf::from(temporary);
+            let result = async {
+                let mut file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&temporary)
+                    .await
+                    .map_err(|e| format!("open {}: {e}", temporary.display()))?;
+                use tokio::io::AsyncWriteExt;
+                file.write_all(content.as_bytes()).await.map_err(|e| format!("write {}: {e}", temporary.display()))?;
+                file.flush().await.map_err(|e| format!("flush {}: {e}", temporary.display()))?;
+                file.set_permissions(std::fs::Permissions::from_mode(mode))
+                    .await
+                    .map_err(|e| format!("protect {}: {e}", temporary.display()))?;
+                file.sync_all().await.map_err(|e| format!("sync {}: {e}", temporary.display()))?;
+                drop(file);
+                tokio::fs::rename(&temporary, path).await.map_err(|e| format!("rename {} to {}: {e}", temporary.display(), path.display()))
+            }
+            .await;
+            if result.is_err() {
+                let _ = tokio::fs::remove_file(&temporary).await;
+            }
+            result
         }
-        .await;
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(&temporary).await;
-        }
-        result
     }
 }
 

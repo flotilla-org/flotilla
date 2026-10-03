@@ -1,10 +1,9 @@
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::{collections::BTreeMap, sync::Arc};
 
 use color_eyre::{eyre::eyre, Result};
+#[cfg(unix)]
 use flotilla_core::{
     ops_entry::{parse_operational_entry, OperationalEntryFile},
     path_context::ExecutionEnvironmentPath,
@@ -12,16 +11,23 @@ use flotilla_core::{
     repository_inspection::{inspect_project_ops_entries, GitRepositoryInspector, OperationalEntryInventory, RepositoryInspector},
     vcs::{FixedVcsResolver, FlotillaVcs, GitCheckoutStrategy},
 };
-use flotilla_resources::{
-    validate_resource_document, K8sResourceObject, Project, ReplicationClass, ResourceObject, REGISTERED_RESOURCE_KINDS,
-};
+use flotilla_resources::validate_resource_document;
+#[cfg(unix)]
+use flotilla_resources::{K8sResourceObject, Project, ReplicationClass, ResourceObject, REGISTERED_RESOURCE_KINDS};
 use serde::Deserialize;
 use serde_json::Value;
 
+#[cfg(unix)]
 const VALIDATION_INSPECTION_HOST: &str = "candidate-validation";
+
+#[cfg(not(unix))]
+pub async fn validate_daemon(_socket: &Path, _local_roots: Option<&[PathBuf]>, _skill_catalog: Option<&Path>) -> Result<usize> {
+    Err(eyre!("daemon resource-socket validation is only supported on Unix"))
+}
 
 /// Query JSON directly over the daemon's resource socket. The command protocol's
 /// fingerprint deliberately rejects mixed generations during a fleet roll.
+#[cfg(unix)]
 pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, skill_catalog: Option<&Path>) -> Result<usize> {
     let catalog = skill_catalog.map(load_catalog).transpose()?;
     let mut skill_documents = Vec::new();
@@ -199,10 +205,12 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
 /// The 400 match is coupled to the previous generation's wire message for an
 /// unregistered kind ("unknown resource kind '<kind>' (supported: ...)").
 /// Remove it one roll after every host serves the endpoint.
+#[cfg(unix)]
 fn ops_inventory_endpoint_absent(status: reqwest::StatusCode, body: &str) -> bool {
     status == reqwest::StatusCode::NOT_FOUND || (status == reqwest::StatusCode::BAD_REQUEST && body.contains("unknown resource kind"))
 }
 
+#[cfg(unix)]
 fn validate_ops_files(files: &[OperationalEntryFile]) -> Result<usize> {
     let mut count = 0;
     let mut errors = Vec::new();
@@ -220,6 +228,7 @@ fn validate_ops_files(files: &[OperationalEntryFile]) -> Result<usize> {
     }
 }
 
+#[cfg(unix)]
 async fn inspect_validation_roots(
     roots: &[PathBuf],
     inspector: &dyn RepositoryInspector,
@@ -236,6 +245,7 @@ async fn inspect_validation_roots(
     paths
 }
 
+#[cfg(unix)]
 async fn validate_project_ops(
     projects: &[ResourceObject<Project>],
     paths: &BTreeMap<flotilla_resources::RepositoryKey, Vec<PathBuf>>,
@@ -244,6 +254,7 @@ async fn validate_project_ops(
     validate_ops_inventory(&inspect_project_ops_entries(projects, paths, inspector).await.map_err(|error| eyre!(error))?)
 }
 
+#[cfg(unix)]
 fn validate_ops_inventory(inventory: &OperationalEntryInventory) -> Result<usize> {
     for unavailable in &inventory.unavailable {
         println!("{unavailable}; validated on the hosts that hold it");
@@ -381,7 +392,7 @@ fn parse_documents(path: &Path, content: &str) -> Result<Vec<Value>> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::{path::Path, sync::Arc, time::Duration};
 

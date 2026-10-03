@@ -1,7 +1,7 @@
 //! Transport: how a patch reaches a PM's metadata plane.
 //!
 //! Per the manifest architecture, producers swap only their send function —
-//! the same projection drives zellij (CLI pipe) and wheelhouse (unix socket).
+//! the same projection drives zellij (CLI pipe) and wheelhouse (Unix socket or Windows named pipe).
 
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
@@ -189,17 +189,21 @@ impl PatchSink for ZellijPipeSink {
     }
 }
 
-/// Wheelhouse's HTTP/UDS metadata endpoint. The payload is shared with Zellij.
+/// Wheelhouse's HTTP metadata endpoint over a Unix socket or Windows named pipe. The payload is shared with Zellij.
 /// Contract: wheelhouse/docs/protocol/pm-connect.md (wheelhouse #22).
-pub struct UnixSocketSink {
+pub struct WheelhouseHttpSink {
     client: Result<reqwest::Client, String>,
     serial: Mutex<()>,
 }
 
-impl UnixSocketSink {
+impl WheelhouseHttpSink {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        let client = flotilla_resources::tls::client_builder()
-            .unix_socket(path.into())
+        let builder = flotilla_resources::tls::client_builder();
+        #[cfg(unix)]
+        let builder = builder.unix_socket(path.into());
+        #[cfg(windows)]
+        let builder = builder.windows_named_pipe(path.into());
+        let client = builder
             .no_proxy()
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(6))
@@ -210,7 +214,7 @@ impl UnixSocketSink {
 }
 
 #[async_trait]
-impl PatchSink for UnixSocketSink {
+impl PatchSink for WheelhouseHttpSink {
     async fn send(&self, patch: &MetadataPatch) -> Result<(), String> {
         let _serial = self.serial.lock().await;
         let client = self.client.as_ref().map_err(Clone::clone)?;
@@ -248,8 +252,9 @@ impl PatchSink for UnixSocketSink {
 
 #[cfg(test)]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, path::Path, time::Duration};
-
+    #[cfg(windows)]
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+    #[cfg(unix)]
     use tokio::net::UnixListener;
 
     use super::*;
@@ -280,38 +285,44 @@ mod tests {
         patch
     }
 
-    fn write_fake_zellij(dir: &Path, script: &str) -> String {
-        let script_path = dir.join("zellij");
-        std::fs::write(&script_path, script).expect("write fake zellij");
-        let mut permissions = std::fs::metadata(&script_path).expect("fake zellij metadata").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script_path, permissions).expect("make fake zellij executable");
-        script_path.to_string_lossy().into_owned()
-    }
+    #[cfg(unix)]
+    mod zellij {
+        use std::{os::unix::fs::PermissionsExt, path::Path};
 
-    enum FakeZellijMode {
-        Stream,
-        CloseFirstChildStdin,
-        ExitFirstChild,
-        BlockStdin,
-    }
+        use super::*;
 
-    impl FakeZellijMode {
-        fn as_str(&self) -> &'static str {
-            match self {
-                FakeZellijMode::Stream => "stream",
-                FakeZellijMode::CloseFirstChildStdin => "close-first-child-stdin",
-                FakeZellijMode::ExitFirstChild => "exit-first-child",
-                FakeZellijMode::BlockStdin => "block-stdin",
+        fn write_fake_zellij(dir: &Path, script: &str) -> String {
+            let script_path = dir.join("zellij");
+            std::fs::write(&script_path, script).expect("write fake zellij");
+            let mut permissions = std::fs::metadata(&script_path).expect("fake zellij metadata").permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script_path, permissions).expect("make fake zellij executable");
+            script_path.to_string_lossy().into_owned()
+        }
+
+        enum FakeZellijMode {
+            Stream,
+            CloseFirstChildStdin,
+            ExitFirstChild,
+            BlockStdin,
+        }
+
+        impl FakeZellijMode {
+            fn as_str(&self) -> &'static str {
+                match self {
+                    FakeZellijMode::Stream => "stream",
+                    FakeZellijMode::CloseFirstChildStdin => "close-first-child-stdin",
+                    FakeZellijMode::ExitFirstChild => "exit-first-child",
+                    FakeZellijMode::BlockStdin => "block-stdin",
+                }
             }
         }
-    }
 
-    fn fake_zellij(dir: &Path, mode: FakeZellijMode) -> String {
-        std::fs::write(dir.join("mode"), mode.as_str()).expect("write fake zellij mode");
-        write_fake_zellij(
-            dir,
-            r#"#!/bin/sh
+        fn fake_zellij(dir: &Path, mode: FakeZellijMode) -> String {
+            std::fs::write(dir.join("mode"), mode.as_str()).expect("write fake zellij mode");
+            write_fake_zellij(
+                dir,
+                r#"#!/bin/sh
 set -eu
 dir=$(dirname "$0")
 mode=$(cat "$dir/mode")
@@ -347,112 +358,146 @@ while IFS= read -r line; do
     printf '%s\n' "$line" >> "$dir/lines"
 done
 "#,
-        )
-    }
+            )
+        }
 
-    async fn wait_for_line_count(path: &Path, expected: usize) -> Vec<String> {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let lines = std::fs::read_to_string(path).unwrap_or_default().lines().map(str::to_owned).collect::<Vec<_>>();
-                if lines.len() >= expected {
-                    return lines;
+        async fn wait_for_line_count(path: &Path, expected: usize) -> Vec<String> {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let lines = std::fs::read_to_string(path).unwrap_or_default().lines().map(str::to_owned).collect::<Vec<_>>();
+                    if lines.len() >= expected {
+                        return lines;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("fake zellij output timeout")
+            })
+            .await
+            .expect("fake zellij output timeout")
+        }
+
+        async fn wait_for_path(path: &Path) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("fake zellij marker timeout");
+        }
+
+        #[tokio::test]
+        async fn zellij_pipe_sink_streams_multiple_patches_through_one_child() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let sink = ZellijPipeSink::new(fake_zellij(dir.path(), FakeZellijMode::Stream)).with_plugin_url("file:/plugins/andamento.wasm");
+            let first = stamp_patch();
+            let mut second = stamp_patch();
+            second.source_id = "second-source".to_owned();
+
+            sink.send(&first).await.expect("send first patch");
+            sink.send(&second).await.expect("send second patch");
+
+            let lines = wait_for_line_count(&dir.path().join("lines"), 2).await;
+            assert_eq!(std::fs::read_to_string(dir.path().join("spawns")).expect("spawn log"), "spawn\n");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("args")).expect("argument log"),
+                "pipe\n--name\nandamento-apply-metadata-patch\n--plugin\nfile:/plugins/andamento.wasm\n"
+            );
+            assert_eq!(lines, vec![first.to_pipe_payload(), second.to_pipe_payload()]);
+        }
+
+        #[tokio::test]
+        async fn zellij_pipe_sink_keeps_new_values_separate() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let sink = ZellijPipeSink::new(fake_zellij(dir.path(), FakeZellijMode::Stream));
+            let patch = mixed_patch();
+            sink.send(&patch).await.expect("send mixed patch");
+            let lines = wait_for_line_count(&dir.path().join("lines"), 2).await;
+            assert_eq!(lines, patch.compatibility_patches().iter().map(MetadataPatch::to_pipe_payload).collect::<Vec<_>>());
+        }
+
+        #[tokio::test]
+        async fn zellij_pipe_sink_retries_patch_after_child_stdin_closes() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let sink = ZellijPipeSink::new(fake_zellij(dir.path(), FakeZellijMode::CloseFirstChildStdin));
+            let first = stamp_patch();
+            sink.send(&first).await.expect("start first pipe child");
+            wait_for_path(&dir.path().join("stdin-closed")).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let mut retried = stamp_patch();
+            retried.source_id = "retried-source".to_owned();
+            let retry_started = tokio::time::Instant::now();
+            sink.send(&retried).await.expect("retry patch through replacement child");
+
+            assert!(retry_started.elapsed() >= Duration::from_millis(450), "child respawn should be paced by the initial backoff");
+            assert_eq!(wait_for_line_count(&dir.path().join("lines"), 1).await, vec![retried.to_pipe_payload()]);
+            assert_eq!(std::fs::read_to_string(dir.path().join("spawns")).expect("spawn log"), "spawn\nspawn\n");
+        }
+
+        #[tokio::test]
+        async fn zellij_pipe_sink_respawns_child_that_exits_between_patches() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let sink = ZellijPipeSink::new(fake_zellij(dir.path(), FakeZellijMode::ExitFirstChild));
+            sink.send(&stamp_patch()).await.expect("send through first child");
+            wait_for_path(&dir.path().join("first-child-exited")).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let mut after_restart = stamp_patch();
+            after_restart.source_id = "after-zellij-restart".to_owned();
+            sink.send(&after_restart).await.expect("send through replacement child");
+
+            assert_eq!(wait_for_line_count(&dir.path().join("lines"), 1).await, vec![after_restart.to_pipe_payload()]);
+            assert_eq!(std::fs::read_to_string(dir.path().join("spawns")).expect("spawn log"), "spawn\nspawn\n");
+        }
+
+        #[tokio::test]
+        async fn zellij_pipe_sink_propagates_child_backpressure() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let sink = ZellijPipeSink::new(fake_zellij(dir.path(), FakeZellijMode::BlockStdin));
+            let mut patch = stamp_patch();
+            patch.source_id = "x".repeat(2 * 1024 * 1024);
+
+            let mut send = tokio::spawn(async move { sink.send(&patch).await });
+            wait_for_path(&dir.path().join("blocked")).await;
+            assert!(tokio::time::timeout(Duration::from_millis(50), &mut send).await.is_err(), "send should remain paced by child stdin");
+            std::fs::write(dir.path().join("unblock"), "").expect("unblock fake zellij");
+            send.await.expect("send task").expect("send after backpressure lifts");
+
+            assert_eq!(std::fs::read_to_string(dir.path().join("spawns")).expect("spawn log"), "spawn\n");
+        }
     }
 
-    async fn wait_for_path(path: &Path) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !path.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("fake zellij marker timeout");
+    // A real named-pipe listener stands in for Wheelhouse's HTTP ingress.
+    // Keep one unconnected instance alive before handing off each connection,
+    // so retries never race a moment where the pipe name disappears.
+    #[cfg(windows)]
+    struct PipeListener {
+        path: PathBuf,
+        next: NamedPipeServer,
     }
 
-    #[tokio::test]
-    async fn zellij_pipe_sink_streams_multiple_patches_through_one_child() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sink = ZellijPipeSink::new(fake_zellij(dir.path(), FakeZellijMode::Stream)).with_plugin_url("file:/plugins/andamento.wasm");
-        let first = stamp_patch();
-        let mut second = stamp_patch();
-        second.source_id = "second-source".to_owned();
-
-        sink.send(&first).await.expect("send first patch");
-        sink.send(&second).await.expect("send second patch");
-
-        let lines = wait_for_line_count(&dir.path().join("lines"), 2).await;
-        assert_eq!(std::fs::read_to_string(dir.path().join("spawns")).expect("spawn log"), "spawn\n");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("args")).expect("argument log"),
-            "pipe\n--name\nandamento-apply-metadata-patch\n--plugin\nfile:/plugins/andamento.wasm\n"
-        );
-        assert_eq!(lines, vec![first.to_pipe_payload(), second.to_pipe_payload()]);
+    #[cfg(windows)]
+    impl PipeListener {
+        fn bind(path: PathBuf) -> Self {
+            let next = ServerOptions::new().first_pipe_instance(true).create(&path).expect("create test pipe");
+            Self { path, next }
+        }
     }
 
-    #[tokio::test]
-    async fn zellij_pipe_sink_keeps_new_values_separate() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sink = ZellijPipeSink::new(fake_zellij(dir.path(), FakeZellijMode::Stream));
-        let patch = mixed_patch();
-        sink.send(&patch).await.expect("send mixed patch");
-        let lines = wait_for_line_count(&dir.path().join("lines"), 2).await;
-        assert_eq!(lines, patch.compatibility_patches().iter().map(MetadataPatch::to_pipe_payload).collect::<Vec<_>>());
-    }
+    #[cfg(windows)]
+    impl axum::serve::Listener for PipeListener {
+        type Io = NamedPipeServer;
+        type Addr = ();
 
-    #[tokio::test]
-    async fn zellij_pipe_sink_retries_patch_after_child_stdin_closes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sink = ZellijPipeSink::new(fake_zellij(dir.path(), FakeZellijMode::CloseFirstChildStdin));
-        let first = stamp_patch();
-        sink.send(&first).await.expect("start first pipe child");
-        wait_for_path(&dir.path().join("stdin-closed")).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            self.next.connect().await.expect("accept pipe client");
+            let next = ServerOptions::new().create(&self.path).expect("create next pipe instance");
+            (std::mem::replace(&mut self.next, next), ())
+        }
 
-        let mut retried = stamp_patch();
-        retried.source_id = "retried-source".to_owned();
-        let retry_started = tokio::time::Instant::now();
-        sink.send(&retried).await.expect("retry patch through replacement child");
-
-        assert!(retry_started.elapsed() >= Duration::from_millis(450), "child respawn should be paced by the initial backoff");
-        assert_eq!(wait_for_line_count(&dir.path().join("lines"), 1).await, vec![retried.to_pipe_payload()]);
-        assert_eq!(std::fs::read_to_string(dir.path().join("spawns")).expect("spawn log"), "spawn\nspawn\n");
-    }
-
-    #[tokio::test]
-    async fn zellij_pipe_sink_respawns_child_that_exits_between_patches() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sink = ZellijPipeSink::new(fake_zellij(dir.path(), FakeZellijMode::ExitFirstChild));
-        sink.send(&stamp_patch()).await.expect("send through first child");
-        wait_for_path(&dir.path().join("first-child-exited")).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        let mut after_restart = stamp_patch();
-        after_restart.source_id = "after-zellij-restart".to_owned();
-        sink.send(&after_restart).await.expect("send through replacement child");
-
-        assert_eq!(wait_for_line_count(&dir.path().join("lines"), 1).await, vec![after_restart.to_pipe_payload()]);
-        assert_eq!(std::fs::read_to_string(dir.path().join("spawns")).expect("spawn log"), "spawn\nspawn\n");
-    }
-
-    #[tokio::test]
-    async fn zellij_pipe_sink_propagates_child_backpressure() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sink = ZellijPipeSink::new(fake_zellij(dir.path(), FakeZellijMode::BlockStdin));
-        let mut patch = stamp_patch();
-        patch.source_id = "x".repeat(2 * 1024 * 1024);
-
-        let mut send = tokio::spawn(async move { sink.send(&patch).await });
-        wait_for_path(&dir.path().join("blocked")).await;
-        assert!(tokio::time::timeout(Duration::from_millis(50), &mut send).await.is_err(), "send should remain paced by child stdin");
-        std::fs::write(dir.path().join("unblock"), "").expect("unblock fake zellij");
-        send.await.expect("send task").expect("send after backpressure lifts");
-
-        assert_eq!(std::fs::read_to_string(dir.path().join("spawns")).expect("spawn log"), "spawn\n");
+        fn local_addr(&self) -> std::io::Result<Self::Addr> {
+            Ok(())
+        }
     }
 
     async fn http_sink_case(
@@ -469,15 +514,26 @@ done
             calls.1.push(body.to_vec());
             calls.0.pop_front().expect("expected request count")
         }
+        #[cfg(unix)]
         let dir = flotilla_test_support::TestSocketDir::new();
+        #[cfg(unix)]
         let path = dir.socket_path("manifest.sock");
-        let listener = UnixListener::bind(&path).expect("bind test socket");
+        #[cfg(unix)]
+        let mut listener = UnixListener::bind(&path).expect("bind test socket");
+        #[cfg(windows)]
+        let path = PathBuf::from(format!(
+            r"\\.\pipe\flotilla-manifest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_nanos()
+        ));
+        #[cfg(windows)]
+        let mut listener = PipeListener::bind(path.clone());
         let calls: Calls = Arc::new(Mutex::new((statuses.into(), Vec::new())));
         let app = Router::new().route("/v1/metadata/patch", post(receive)).with_state(Arc::clone(&calls));
         let server = tokio::spawn(async move {
             if disconnect {
                 use tokio::io::AsyncReadExt;
-                let (mut stream, _) = listener.accept().await.expect("first connection");
+                let (mut stream, _) = axum::serve::Listener::accept(&mut listener).await;
                 let mut bytes = [0; 4096];
                 let received = stream.read(&mut bytes).await.expect("read before lost acknowledgement");
                 assert!(received > 0);
@@ -485,21 +541,33 @@ done
             }
             axum::serve(listener, app).await.expect("HTTP server");
         });
-        let result = UnixSocketSink::new(&path).send(&patch).await;
+        let result = WheelhouseHttpSink::new(&path).send(&patch).await;
         server.abort();
         let bodies = calls.lock().await.1.clone();
         (result, bodies)
     }
 
-    #[tokio::test]
-    async fn unix_socket_sink_uses_http_and_preserves_shared_payload() {
+    // Glue: the transport must POST the shared payload and accept HTTP 204 (#2469).
+    async fn assert_http_payload_preserved() {
         let (result, bodies) = http_sink_case(stamp_patch(), vec![axum::http::StatusCode::NO_CONTENT], false).await;
         result.expect("acknowledged patch");
         assert_eq!(bodies, vec![stamp_patch().to_pipe_payload().into_bytes()]);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn unix_socket_sink_retries_transient_response_with_identical_patch() {
+    async fn unix_socket_sink_uses_http_and_preserves_shared_payload() {
+        assert_http_payload_preserved().await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_named_pipe_sink_uses_http_and_preserves_shared_payload() {
+        assert_http_payload_preserved().await;
+    }
+
+    #[tokio::test]
+    async fn wheelhouse_http_sink_retries_transient_response_with_identical_patch() {
         let (result, bodies) =
             http_sink_case(stamp_patch(), vec![axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::http::StatusCode::NO_CONTENT], false)
                 .await;
@@ -508,20 +576,20 @@ done
     }
 
     #[tokio::test]
-    async fn unix_socket_sink_does_not_retry_invalid_patch() {
+    async fn wheelhouse_http_sink_does_not_retry_invalid_patch() {
         let (result, bodies) = http_sink_case(stamp_patch(), vec![axum::http::StatusCode::UNPROCESSABLE_ENTITY], false).await;
         assert!(result.expect_err("rejected patch").contains("422"));
         assert_eq!(bodies.len(), 1);
     }
     #[tokio::test]
-    async fn unix_socket_sink_reconnects_after_lost_acknowledgement() {
+    async fn wheelhouse_http_sink_reconnects_after_lost_acknowledgement() {
         let (result, bodies) = http_sink_case(stamp_patch(), vec![axum::http::StatusCode::NO_CONTENT], true).await;
         result.expect("reconnected patch acknowledged");
         assert_eq!(bodies, vec![stamp_patch().to_pipe_payload().into_bytes()]);
     }
 
     #[tokio::test]
-    async fn unix_socket_sink_keeps_new_values_separate() {
+    async fn wheelhouse_http_sink_keeps_new_values_separate() {
         let patch = mixed_patch();
         let (result, bodies) = http_sink_case(patch.clone(), vec![axum::http::StatusCode::NO_CONTENT; 2], false).await;
         result.expect("both patches acknowledged");
@@ -529,10 +597,11 @@ done
         assert_eq!(bodies, expected);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires a running native Wheelhouse HTTP endpoint"]
     async fn unix_socket_sink_live_wheelhouse() {
         let path = std::env::var("WHEELHOUSE_TEST_SOCKET").expect("explicit integration socket");
-        UnixSocketSink::new(path).send(&stamp_patch()).await.expect("native UI acknowledged patch");
+        WheelhouseHttpSink::new(path).send(&stamp_patch()).await.expect("native UI acknowledged patch");
     }
 }
