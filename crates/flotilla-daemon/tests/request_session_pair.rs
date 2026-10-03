@@ -1852,12 +1852,20 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
     assert!(error.contains("artifact address cannot change"), "unexpected routed error: {error}");
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactEnvironment {
+    LocalHostDirect,
+    RemoteHostDirect,
+    Provisioned,
+}
+
 // #2503: enumerate all production environment-reference variants through the
 // request dispatcher. Each must transfer artifacts and admit completion only
 // after storing a decision ledger. No transport concurrency is involved here.
 #[tokio::test]
 async fn artifact_environment_reference_contract() {
-    for environment_kind in ["local", "remote", "provisioned"] {
+    for environment_kind in [ArtifactEnvironment::LocalHostDirect, ArtifactEnvironment::RemoteHostDirect, ArtifactEnvironment::Provisioned]
+    {
         let leader = empty_daemon_named("artifact-crew-host").await;
         // Install the real credential collaborator while keeping automatic
         // resource reconciliation gated; this contract drives requests itself.
@@ -1882,13 +1890,12 @@ async fn artifact_environment_reference_contract() {
             .await
             .expect("create home convoy");
         let env_ref = match environment_kind {
-            "local" => format!("host-direct-{}", leader.local_host_id().expect("local host")),
-            "remote" => "host-direct-remote-artifact-host".to_string(),
-            "provisioned" => "env-artifact-vessel".to_string(),
-            _ => unreachable!(),
+            ArtifactEnvironment::LocalHostDirect => format!("host-direct-{}", leader.local_host_id().expect("local host")),
+            ArtifactEnvironment::RemoteHostDirect => "host-direct-remote-artifact-host".to_string(),
+            ArtifactEnvironment::Provisioned => "env-artifact-vessel".to_string(),
         };
         let runner: Arc<dyn CommandRunner> = Arc::new(ArtifactContractRunner { root: workspace.path().to_path_buf() });
-        if environment_kind == "remote" {
+        if environment_kind == ArtifactEnvironment::RemoteHostDirect {
             leader
                 .register_direct_environment_for_test(
                     EnvironmentId::new(&env_ref),
@@ -1897,7 +1904,7 @@ async fn artifact_environment_reference_contract() {
                     Some(HostId::new("remote-artifact-host")),
                 )
                 .expect("register remote direct environment");
-        } else if environment_kind == "provisioned" {
+        } else if environment_kind == ArtifactEnvironment::Provisioned {
             leader
                 .register_provisioned_environment(
                     EnvironmentId::new(&env_ref),
@@ -1907,6 +1914,14 @@ async fn artifact_environment_reference_contract() {
                 )
                 .expect("register provisioned handle");
         }
+        // The resolved identity must accompany the runner so VCS and archive
+        // operations use the same environment as artifact transfers.
+        let resolved = leader.resolve_environment_ref(&env_ref).expect("registered environment");
+        let expected_id = match environment_kind {
+            ArtifactEnvironment::LocalHostDirect => leader.local_environment_id().clone(),
+            ArtifactEnvironment::RemoteHostDirect | ArtifactEnvironment::Provisioned => EnvironmentId::new(&env_ref),
+        };
+        assert_eq!(resolved.id, expected_id);
         let convoys = leader.resource_backend().using::<Convoy>(namespace);
         let created = convoys.get(convoy).await.expect("convoy");
         convoys
@@ -1974,7 +1989,11 @@ async fn artifact_environment_reference_contract() {
                         }),
                         message: None,
                     })
-                    .cwd(if environment_kind == "local" { workspace.path().to_string_lossy().into_owned() } else { "/crew".into() })
+                    .cwd(if environment_kind == ArtifactEnvironment::LocalHostDirect {
+                        workspace.path().to_string_lossy().into_owned()
+                    } else {
+                        "/crew".into()
+                    })
                     .pool("cleat".to_string())
                     .build(),
             )
@@ -2028,7 +2047,7 @@ async fn artifact_environment_reference_contract() {
             .client
             .artifact_put("review-round".into(), "head-1".into(), BTreeMap::new(), "application/octet-stream".into(), "source.bin".into())
             .await
-            .unwrap_or_else(|error| panic!("{environment_kind} put: {error}"));
+            .unwrap_or_else(|error| panic!("{environment_kind:?} put: {error}"));
         for reference in [address, digest] {
             assert_eq!(topology.client.artifact_get(reference, "result.bin".into()).await.expect("get"), (bytes.len() as u64, None));
             assert_eq!(tokio::fs::read(&destination).await.expect("destination"), bytes);

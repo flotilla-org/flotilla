@@ -6,6 +6,11 @@ use crate::{placement_policy::DockerImagePullPolicy, resource::define_resource, 
 
 define_resource!(Environment, "environments", EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch);
 
+/// Resource reference for a host's direct execution environment.
+pub fn host_direct_environment_name(host_ref: &str) -> String {
+    format!("host-direct-{host_ref}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
