@@ -38,6 +38,8 @@ jobs:
           scripts/test-fleet-install.sh
       - name: Test crew image workflow contract
         run: ci/crew-image/test-workflow.sh
+      - name: Test platform job classification
+        run: ci/platform-changes/test-classify.sh
       - name: Check Rust formatting
         run: cargo +nightly-2026-03-12 fmt --check
 
@@ -104,9 +106,52 @@ jobs:
           shared-key: "test"
       - run: cargo test --workspace --locked
 
+  changes:
+    name: Platform changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      windows: ${{ steps.classify.outputs.windows }}
+      macos: ${{ steps.classify.outputs.macos }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: classify
+        name: Classify Windows and macOS job inputs
+        env:
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          # Read labels live rather than from the event payload, so re-running
+          # the workflow after adding ci:full honours the label. A failed
+          # lookup fails safe by running both jobs.
+          full_label=false
+          if [ -n "$PR" ]; then
+            if labels=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name'); then
+              if printf '%s\n' "$labels" | grep -qx 'ci:full'; then full_label=true; fi
+            else
+              full_label=true
+            fi
+          fi
+          if [ -n "$BASE" ]; then
+            git diff --name-only "$BASE" HEAD > "$RUNNER_TEMP/changed-files"
+            git diff "$BASE" HEAD -- '*.rs' > "$RUNNER_TEMP/changes.diff"
+          else
+            : > "$RUNNER_TEMP/changed-files"
+            : > "$RUNNER_TEMP/changes.diff"
+          fi
+          ci/platform-changes/classify.sh "$EVENT" "$full_label" "$RUNNER_TEMP/changed-files" "$RUNNER_TEMP/changes.diff" | tee -a "$GITHUB_OUTPUT"
+
   windows-client:
     name: Windows client
     runs-on: windows-latest
+    needs: changes
+    if: needs.changes.outputs.windows == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -115,7 +160,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "windows-client"
-      - run: cargo check --bin flotilla --locked
       - run: cargo clippy -p flotilla-client -p flotilla-manifest -p flotilla-transport --locked
       - run: cargo build --bin flotilla --locked
       - run: "cargo test -p flotilla-client --locked --lib windows_tests::"
@@ -125,7 +169,8 @@ jobs:
   macos-peer-identity:
     name: macOS peer identity
     runs-on: macos-latest
-    needs: fmt
+    needs: [fmt, changes]
+    if: needs.changes.outputs.macos == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
