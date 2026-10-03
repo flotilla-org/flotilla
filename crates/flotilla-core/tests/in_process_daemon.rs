@@ -6272,16 +6272,19 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     });
     assert_eq!(successor.spec.repositories[0].repo_ref, inspected.key());
 
+    // #2159: refuse the overlapping declaration before it can poison namespace
+    // consumers, and retain the previously resolved repository identity.
     let mut overlap = lab_forge_spec();
     overlap.forge_id = "other-lab".to_string();
-    daemon
+    let error = daemon
         .resource_backend()
         .definitions::<Forge>("flotilla")
         .create(&InputMeta::builder().name("other-lab".to_string()).build(), &overlap)
         .await
-        .expect("declare overlapping forge");
-    let error = daemon.inspect_repository_path(&repo, None).await.expect_err("overlapping Forge hosts must be ambiguous");
-    assert!(error.contains("multiple Forge definitions"), "{error}");
+        .expect_err("overlapping Forge ownership must be refused at admission");
+    assert!(error.to_string().contains("overlaps issue-service ownership"), "{error}");
+    let unchanged = daemon.inspect_repository_path(&repo, None).await.expect("refused declaration leaves namespace usable");
+    assert_eq!(unchanged.key(), inspected.key());
 }
 
 #[tokio::test]
