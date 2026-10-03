@@ -1465,6 +1465,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
         )
     }));
 
+    #[cfg(unix)]
     let docker = outcome
         .actuations
         .iter()
@@ -1479,7 +1480,12 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
 
 #[cfg(unix)]
 fn assert_contained_tracking(env: &BTreeMap<String, String>) {
-    use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+        path::Path,
+        process::Command,
+    };
 
     // Real Git is required here: tracking writes and lock/rename are the process boundary behind #2516.
     let temp = tempfile::tempdir().expect("Git fixture");
@@ -1525,9 +1531,14 @@ fn assert_contained_tracking(env: &BTreeMap<String, String>) {
     for path in [clone.join(".git"), hooks.clone()] {
         fs::set_permissions(path, fs::Permissions::from_mode(0o555)).expect("protect directory");
     }
-    assert!(fs::write(&config, "changed").is_err(), "shared config is unwritable");
-    assert!(fs::write(&hook, "changed").is_err(), "shared hook is unwritable");
-    assert!(fs::write(hooks.join("new-hook"), "changed").is_err(), "new hooks are refused");
+    // A newly created file has the test process's effective uid. Root can bypass
+    // permission bits, so its protection coverage comes from the read-only mount
+    // contract above; tracking and unchanged-content checks still run below.
+    if fs::metadata(&config).expect("fixture owner").uid() != 0 {
+        assert!(fs::write(&config, "changed").is_err(), "shared config is unwritable");
+        assert!(fs::write(&hook, "changed").is_err(), "shared hook is unwritable");
+        assert!(fs::write(hooks.join("new-hook"), "changed").is_err(), "new hooks are refused");
+    }
 
     // The chosen equivalent to push -u is provisioned tracking plus plain push,
     // including the first publication of a branch that does not exist remotely.

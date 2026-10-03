@@ -546,6 +546,7 @@ impl Reconciler for VesselReconciler {
         let mut checkout_refs = BTreeMap::new();
         let mut checkout_paths = BTreeMap::new();
         let mut contained_worktree_checkouts = Vec::new();
+        // The vessel shares one environment; Git ignores tracking entries for branches absent from a checkout.
         let mut contained_branches = BTreeSet::new();
         let mut waiting_for_checkouts = Vec::new();
         let mut fork_stance = false;
