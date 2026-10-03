@@ -96,6 +96,11 @@ impl<T: Resource> DefinitionResolver<T> {
         ensure_definitions::<T>()?;
         T::validate_spec(meta, spec)?;
         if T::VALIDATE_NAMESPACE_SPEC {
+            // This pass includes merged replicas. Embedded stores repeat the local
+            // check under their lock/transaction to serialize local admissions.
+            // No-op reapplies intentionally refuse legacy overlaps until repaired.
+            // list() excludes resolved tombstones; deletion conflicts stay visible
+            // and must continue reserving ownership for namespace consumers.
             let siblings = self
                 .list()
                 .await?

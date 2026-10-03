@@ -96,6 +96,31 @@ async fn admission_contract(backend: ResourceBackend) {
         .create(&InputMeta::builder().name("local-collision".into()).build(), &collision)
         .await
         .is_err());
+    // Resolved tombstones, including legacy deletion markers, are excluded by
+    // the merged definitions read and must not retain issue-service ownership.
+    let retiring = declaration("retiring", "retired.example", "/installation");
+    remote
+        .definitions::<Forge>("dev")
+        .create(&InputMeta::builder().name("retiring".into()).build(), &retiring)
+        .await
+        .expect("retiring forge");
+    remote.definitions::<Forge>("dev").delete("retiring").await.expect("causal deletion");
+    let mut tombstones = remote.using::<Forge>("dev").list().await.expect("remote tombstones");
+    let retiring_record = tombstones.items.iter_mut().find(|object| object.metadata.name == "retiring").expect("retiring record");
+    retiring_record.metadata.merge = None; // Previous-generation deletion metadata is synthesised on read.
+    backend
+        .replica_writer::<Forge>(NodeId::new("remote-root"), "dev")
+        .replace(&tombstones, chrono::Utc::now())
+        .await
+        .expect("replicate deletion");
+    assert!(backend.definitions::<Forge>("dev").list().await.expect("definitions").iter().all(|object| object.metadata.name != "retiring"));
+    let mut replacement = retiring;
+    replacement.forge_id = "replacement".into();
+    backend
+        .definitions::<Forge>("dev")
+        .create(&InputMeta::builder().name("replacement".into()).build(), &replacement)
+        .await
+        .expect("tombstone releases ownership");
     // Two concurrent local admissions cannot both acquire the same service.
     let a = declaration("race-a", "race.example", "");
     let b = declaration("race-b", "race.example", "");

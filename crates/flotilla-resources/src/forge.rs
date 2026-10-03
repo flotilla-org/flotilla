@@ -80,10 +80,13 @@ impl ForgeSpec {
     /// Ownership is exact at the installation path, not a textual prefix.
     pub fn overlaps_issue_service(&self, other: &Self) -> bool {
         let canonical_host = self.https_url.strip_prefix("https://").and_then(|front| front.split('/').next());
-        self.hosts.iter().map(String::as_str).chain(std::iter::once(self.git_ssh_host.as_str())).chain(canonical_host).any(|host| {
-            let path = self.https_url.strip_prefix("https://").and_then(|front| front.split_once('/')).map_or("", |(_, path)| path);
-            other.owns_issue_service(&format!("https://{host}/{path}"))
-        })
+        let path = self.https_url.strip_prefix("https://").and_then(|front| front.split_once('/')).map_or("", |(_, path)| path);
+        self.hosts
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(self.git_ssh_host.as_str()))
+            .chain(canonical_host)
+            .any(|host| other.owns_issue_service(&format!("https://{host}/{path}")))
     }
 
     /// Whether an issue service URL names this installation, including a
