@@ -3007,7 +3007,7 @@ async fn repository_identity_resolution_is_a_local_resource_read() {
             )
             .await
             .expect("resolve through router");
-        assert_eq!(result, CommandValue::RepositoryResolved { key: key.clone() });
+        assert_eq!(result, CommandValue::RepositoryResolved { key: Some(key.clone()) });
     }
     assert!(topology.leader.tracked_repo_paths().await.is_empty());
     assert!(topology.follower.tracked_repo_paths().await.is_empty());

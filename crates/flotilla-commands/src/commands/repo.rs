@@ -21,7 +21,10 @@ pub enum RepoVerb {
     /// Adopt a checkout path and start observing it
     Add { path: PathBuf },
     /// Stop observing a checkout; retain Repository and Project resources
-    Remove { repo: String },
+    Remove {
+        /// Project member alias, forge slug, absolute path, or explicitly relative path (./checkout)
+        repo: String,
+    },
     /// Refresh repository data (use subject for specific repo, or `repo all refresh` for all)
     Refresh,
     /// Check out a branch in a repository

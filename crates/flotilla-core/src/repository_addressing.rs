@@ -14,17 +14,15 @@ pub(crate) async fn resolve_repository(
     namespace: &str,
     local_host: &str,
     selector: &RepoSelector,
-) -> Result<RepositoryKey, String> {
+) -> Result<Option<RepositoryKey>, String> {
     let selector = match selector {
+        // Legacy TUI/provider callers encode a local checkout root in RepoIdentity.
+        // Resolve it only through checkout facts. Remove when the Plane-A callers
+        // all carry Repository keys (the path-identity retirement slice of #1721).
         RepoSelector::Identity(identity) if identity.authority == "local" => RepoSelector::Path(identity.path.clone().into()),
         selector => selector.clone(),
     };
-    let label = match &selector {
-        RepoSelector::Query(query) => query.clone(),
-        RepoSelector::Path(path) => path.display().to_string(),
-        RepoSelector::Repository(key) => key.to_string(),
-        RepoSelector::Identity(identity) => identity.to_string(),
-    };
+    let label = selector.to_string();
     let repositories = backend.including_replicas::<Repository>(namespace).list().await.map_err(|error| error.to_string())?;
     let mut candidates = BTreeSet::new();
     match &selector {
@@ -115,11 +113,11 @@ pub(crate) async fn resolve_repository(
         }
     }
     match candidates.len() {
-        0 => Err(format!("no Repository matches '{label}'; adopt a checkout with `flotilla repo add <path>` or declare a Project member")),
+        0 => Ok(None),
         1 => {
             let key = candidates.into_iter().next().expect("one candidate");
             if repositories.items.iter().any(|source| source.object.metadata.name == key.0) {
-                Ok(key)
+                Ok(Some(key))
             } else {
                 Err(format!("Repository {key} is unavailable; adopt a checkout with `flotilla repo add <path>` or declare the Repository"))
             }
@@ -201,7 +199,7 @@ mod tests {
                 2 => RepoSelector::Repository(key.clone()),
                 _ => RepoSelector::Identity(RepoIdentity::from_remote_url("https://github.com/acme/widgets").expect("legacy identity")),
             };
-            assert_eq!(resolve_repository(&durable, &observed, "test", "local", &selector).await, Ok(key));
+            assert_eq!(resolve_repository(&durable, &observed, "test", "local", &selector).await, Ok(Some(key)));
         });
     }
 
@@ -238,11 +236,12 @@ mod tests {
                     }
                 )
                 .await,
-                Ok(expected)
+                Ok(Some(expected))
             );
-            assert!(resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path("/work/widgets-other".into()))
-                .await
-                .is_err());
+            assert_eq!(
+                resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path("/work/widgets-other".into())).await,
+                Ok(None)
+            );
         });
     }
 
@@ -257,9 +256,12 @@ mod tests {
         project(&durable, "b", second, "primary").await;
         project(&durable, "dangling", RepositoryKey("absent".into()), "missing").await;
         for query in ["", "unknown", "primary", "missing", "/work/widgets", "widgets-other"] {
-            let error =
-                resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Query(query.into())).await.expect_err("refusal");
-            assert!(!error.contains("tracked"));
+            let result = resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Query(query.into())).await;
+            if matches!(query, "unknown" | "/work/widgets" | "widgets-other") {
+                assert_eq!(result, Ok(None), "unknown selector is a typed no-match");
+            } else {
+                assert!(!result.expect_err("refused selector").contains("tracked"));
+            }
         }
         assert!(resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Repository(RepositoryKey("absent".into())))
             .await
@@ -296,7 +298,10 @@ mod tests {
         );
         let checkouts = durable.using::<Checkout>("test");
         let current = checkouts.create(&InputMeta::builder().name("created".into()).build(), &spec).await.expect("checkout");
-        assert!(resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path("/desired/widgets".into())).await.is_err());
+        assert_eq!(
+            resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path("/desired/widgets".into())).await,
+            Ok(None)
+        );
         let current = checkouts
             .update_status(
                 "created",
@@ -307,11 +312,12 @@ mod tests {
             .expect("ready checkout");
         assert_eq!(
             resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path("/actual/widgets/src".into())).await,
-            Ok(key.clone())
+            Ok(Some(key.clone()))
         );
-        assert!(resolve_repository(&durable, &observed, "test", "remote", &RepoSelector::Path("/actual/widgets/src".into()))
-            .await
-            .is_err());
+        assert_eq!(
+            resolve_repository(&durable, &observed, "test", "remote", &RepoSelector::Path("/actual/widgets/src".into())).await,
+            Ok(None)
+        );
         // A stale ephemeral record cannot resurrect a durable Gone checkout.
         checkout().backend(&observed).name("created").path("/actual/widgets").key(key).call().await;
         checkouts
@@ -322,6 +328,6 @@ mod tests {
             )
             .await
             .expect("gone checkout");
-        assert!(resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path("/actual/widgets".into())).await.is_err());
+        assert_eq!(resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path("/actual/widgets".into())).await, Ok(None));
     }
 }

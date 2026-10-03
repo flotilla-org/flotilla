@@ -2302,42 +2302,38 @@ async fn resolve_environment_target(
     Err(color_eyre::eyre::eyre!("unknown environment: {target_environment_id}"))
 }
 
-async fn resolve_cli_repository(daemon: &dyn DaemonHandle, selector: RepoSelector) -> Result<RepoSelector, String> {
+async fn lookup_cli_repository(daemon: &dyn DaemonHandle, selector: RepoSelector) -> Result<Option<RepoSelector>, String> {
     if matches!(selector, RepoSelector::Repository(_)) {
-        return Ok(selector);
+        return Ok(Some(selector));
     }
     match daemon
         .execute_query(Command::builder().action(CommandAction::QueryResolveRepository { repo: selector }).build(), uuid::Uuid::new_v4())
         .await?
     {
-        CommandValue::RepositoryResolved { key } => Ok(RepoSelector::Repository(key)),
+        CommandValue::RepositoryResolved { key } => Ok(key.map(RepoSelector::Repository)),
         CommandValue::Error { message } => Err(message),
         _ => Err("unexpected repository resolution response".into()),
     }
 }
 
+async fn resolve_cli_repository(daemon: &dyn DaemonHandle, selector: RepoSelector) -> Result<RepoSelector, String> {
+    let label = selector.to_string();
+    lookup_cli_repository(daemon, selector).await?.ok_or_else(|| {
+        format!("no Repository matches '{label}'; adopt a checkout with `flotilla repo add <path>` or declare a Project member")
+    })
+}
+
 async fn resolve_optional_cwd_repository(daemon: &dyn DaemonHandle, path: PathBuf) -> Result<Option<RepoSelector>, String> {
-    match resolve_cli_repository(daemon, RepoSelector::Path(path)).await {
-        Ok(selector) => Ok(Some(selector)),
-        // Cwd only scopes commands when inside an observed checkout. Global
-        // commands (such as attach by session id) still work outside one.
-        Err(error) if error.starts_with("no Repository matches") => Ok(None),
-        Err(error) => Err(error),
-    }
+    lookup_cli_repository(daemon, RepoSelector::Path(path)).await
 }
 
 async fn resolve_command_repositories(daemon: &dyn DaemonHandle, command: &mut Command) -> Result<(), String> {
     let original_context = command.context_repo.clone();
     if let Some(selector) = command.context_repo.take() {
         command.context_repo = match selector {
-            RepoSelector::Path(path)
-                if matches!(
-                    command.action,
-                    CommandAction::RemoveCheckout { .. } | CommandAction::Attach { .. } | CommandAction::AttachTransient { .. }
-                ) =>
-            {
-                resolve_optional_cwd_repository(daemon, path).await?
-            }
+            // CLI Path context only comes from inferred cwd. Explicit --repo
+            // and FLOTILLA_REPO use Query and refuse when they do not match.
+            RepoSelector::Path(path) => resolve_optional_cwd_repository(daemon, path).await?,
             selector => Some(resolve_cli_repository(daemon, selector).await?),
         };
     }
@@ -2354,7 +2350,7 @@ async fn resolve_command_repositories(daemon: &dyn DaemonHandle, command: &mut C
             if let RepoSelector::Query(query) = repo {
                 let path = Path::new(query);
                 if path.is_absolute() || query == "." || query == ".." || query.starts_with("./") || query.starts_with("../") {
-                    *repo = RepoSelector::Path(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+                    *repo = RepoSelector::Path(tokio::fs::canonicalize(path).await.unwrap_or_else(|_| path.to_path_buf()));
                     return Ok(());
                 }
             }
@@ -2363,10 +2359,15 @@ async fn resolve_command_repositories(daemon: &dyn DaemonHandle, command: &mut C
         _ => None,
     };
     if let Some(selector) = selector {
-        *selector = match command.context_repo.as_ref().filter(|_| original_context.as_ref() == Some(selector)) {
-            Some(resolved) => resolved.clone(),
-            None => resolve_cli_repository(daemon, selector.clone()).await?,
-        };
+        if original_context.as_ref() == Some(selector) {
+            if let Some(resolved) = &command.context_repo {
+                *selector = resolved.clone();
+                return Ok(());
+            }
+        }
+        // An action's own repository selector is required, even when its
+        // envelope contains no optional cwd context.
+        *selector = resolve_cli_repository(daemon, selector.clone()).await?;
     }
     Ok(())
 }
@@ -3100,6 +3101,14 @@ mod tests {
             landing,
             Some((repos[1].identity.clone(), ViewAddress::Project { namespace: "flotilla".into(), name: "flotilla".into() },))
         );
+    }
+
+    #[test]
+    fn fresh_unadopted_cwd_lands_on_the_global_convoy_view() {
+        let landing = default_project_landing(&[], &[PathBuf::from("/unadopted")], &ProjectListResponse { projects: vec![] });
+        assert_eq!(landing, None);
+        let views = flotilla_tui::app::open_views::OpenViews::seed_with_landing(landing);
+        assert_eq!(views.active_address(), Some(&ViewAddress::Convoys { namespace: "flotilla".into(), scope: None }));
     }
 
     #[test]
@@ -3839,6 +3848,39 @@ mod tests {
             assert_eq!(command.context_repo, Some(RepoSelector::Repository(key.clone())));
         }
         assert_eq!(super::resolve_optional_cwd_repository(&*daemon, "/unobserved".into()).await.expect("optional cwd"), None);
+        for args in [vec!["flotilla", "cr"], vec!["flotilla", "agent"], vec!["flotilla", "cr", "123", "open"], vec![
+            "flotilla", "agent", "session", "archive",
+        ]] {
+            let cli = Cli::try_parse_from(args).expect("CLI");
+            let resolved = match cli.command.as_ref().expect("noun") {
+                SubCommand::Cr(noun) => noun.clone().resolve(),
+                SubCommand::Agent(noun) => noun.clone().resolve(),
+                _ => unreachable!(),
+            }
+            .expect("command");
+            let mut command = match resolved {
+                flotilla_commands::Resolved::Ready(command) => command,
+                flotilla_commands::Resolved::NeedsContext { mut command, .. } => {
+                    super::inject_repo_context(&mut command, &cli).expect("cwd");
+                    command
+                }
+                _ => panic!("expected command or inferred command"),
+            };
+            super::resolve_command_repositories(&*daemon, &mut command).await.expect("optional inferred cwd");
+            assert_eq!(command.context_repo, None);
+            command.context_repo = Some(RepoSelector::Query("missing-explicit-repo".into()));
+            assert!(super::resolve_command_repositories(&*daemon, &mut command).await.is_err());
+        }
+        let mut required = Command::builder()
+            .context_repo(RepoSelector::Path("/unobserved".into()))
+            .action(CommandAction::QueryIssues {
+                repo: RepoSelector::Path("/unobserved".into()),
+                params: Default::default(),
+                page: 0,
+                count: 10,
+            })
+            .build();
+        assert!(super::resolve_command_repositories(&*daemon, &mut required).await.is_err());
         let observed = daemon.observed_resource_backend();
         let checkout = CheckoutSpec::Observed(
             ObservedCheckoutSpec::builder()

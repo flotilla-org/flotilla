@@ -57,6 +57,17 @@ pub enum RepoSelector {
     Identity(RepoIdentity),
 }
 
+impl std::fmt::Display for RepoSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Repository(key) => write!(f, "Repository/{key}"),
+            Self::Path(path) => write!(f, "{}", path.display()),
+            Self::Query(query) => f.write_str(query),
+            Self::Identity(identity) => write!(f, "{identity}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheckoutSelector {
     Path(PathBuf),
@@ -1239,7 +1250,8 @@ pub enum CommandValue {
         path: PathBuf,
     },
     RepositoryResolved {
-        key: crate::RepositoryKey,
+        /// No match is distinct from a refused or failed lookup.
+        key: Option<crate::RepositoryKey>,
     },
     RepoProviders(Box<RepoProvidersResponse>),
     HostList(Box<HostListResponse>),
@@ -1677,7 +1689,8 @@ mod tests {
             CommandValue::Cancelled,
             CommandValue::AttachCommandResolved { plan: crate::ResolvedAttachPlan::shell_command("bash --login"), binding: None },
             CommandValue::CheckoutPathResolved { path: PathBuf::from("/repos/project/wt-1") },
-            CommandValue::RepositoryResolved { key: crate::RepositoryKey("widgets".into()) },
+            CommandValue::RepositoryResolved { key: Some(crate::RepositoryKey("widgets".into())) },
+            CommandValue::RepositoryResolved { key: None },
             CommandValue::RepoProviders(Box::new(RepoProvidersResponse {
                 path: PathBuf::from("/repo"),
                 slug: Some("owner/repo".into()),

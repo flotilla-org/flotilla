@@ -159,22 +159,23 @@ impl<'a> AttachResolver<'a> {
             return Ok(None);
         };
         let namespace = self.provisioning_namespace().await;
-        let repository_key = match crate::repository_addressing::resolve_repository(
+        let repository_key = crate::repository_addressing::resolve_repository(
             self.resource_backend,
             self.observed_resource_backend,
             &namespace,
             self.environment_manager.local_host_id().as_str(),
             selector,
         )
-        .await
-        {
-            Ok(key) => key,
-            // Cwd scopes attach when it matches a known checkout. A global
-            // session identifier remains usable outside an observed checkout.
-            Err(error) if matches!(selector, flotilla_protocol::RepoSelector::Path(_)) && error.starts_with("no Repository matches") => {
-                return Ok(None)
-            }
-            Err(error) => return Err(error),
+        .await?;
+        let Some(repository_key) = repository_key else {
+            // Cwd is optional context for global session identifiers.
+            return if matches!(selector, flotilla_protocol::RepoSelector::Path(_)) {
+                Ok(None)
+            } else {
+                Err(format!(
+                    "no Repository matches '{selector}'; adopt a checkout with `flotilla repo add <path>` or declare a Project member"
+                ))
+            };
         };
         let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
         let mut matches = projects

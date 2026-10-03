@@ -65,6 +65,8 @@ Use `--repo <selector>` with a Project member alias or an exact forge slug such 
 `acme/widgets`. Without an explicit selector (or `FLOTILLA_REPO`), commands that
 need repository context infer it inside an observed checkout, including its
 worktrees. Lookup never adopts a checkout; use `repo add <path>` for adoption.
+For path removal, use an absolute path or an explicitly relative path such as
+`./checkout`; unprefixed selectors are aliases, forge slugs, or Repository keys.
 Ambiguous aliases or slugs require a unique selector; Repository keys also work.
 
 Forge execution, issue linking, and the providers view still need an available

@@ -3396,7 +3396,10 @@ impl InProcessDaemon {
         self.repos.read().await.values().flat_map(RepoState::local_paths).collect()
     }
 
-    pub(crate) async fn resolve_repository_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<RepositoryKey, String> {
+    pub(crate) async fn resolve_repository_selector(
+        &self,
+        selector: &flotilla_protocol::RepoSelector,
+    ) -> Result<Option<RepositoryKey>, String> {
         crate::repository_addressing::resolve_repository(
             &self.resource_backend,
             &self.observed_resource_backend,
@@ -8106,7 +8109,9 @@ impl InProcessDaemon {
         &self,
         selector: &flotilla_protocol::RepoSelector,
     ) -> Result<(Arc<dyn IssueProvider>, flotilla_protocol::IssueSource), String> {
-        let key = self.resolve_repository_selector(selector).await?;
+        let key = self.resolve_repository_selector(selector).await?.ok_or_else(|| {
+            format!("no Repository matches '{selector}'; adopt a checkout with `flotilla repo add <path>` or declare a Project member")
+        })?;
         let namespace = self.provisioning_namespace().await;
         let repository = self
             .resource_backend

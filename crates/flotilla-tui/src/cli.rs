@@ -1152,7 +1152,8 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::PreparedWorkspace(_) | CommandValue::AttachCommandResolved { .. } | CommandValue::CheckoutPathResolved { .. } => {
             "internal step result".to_string()
         }
-        CommandValue::RepositoryResolved { key } => format!("Repository/{key}"),
+        CommandValue::RepositoryResolved { key: Some(key) } => format!("Repository/{key}"),
+        CommandValue::RepositoryResolved { key: None } => "no matching Repository".into(),
         CommandValue::RepoProviders(providers) => format_repo_providers_human(providers),
         // HostList remains a protocol-level query used by host/environment
         // target resolution; keep its formatter for direct query diagnostics

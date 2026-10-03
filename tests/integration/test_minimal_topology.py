@@ -109,16 +109,22 @@ def test_repository_federates_by_canonical_remote(topology):
 
 def test_remote_prepare_terminal_returns_attachable_set_id(topology):
     """Remote prepare-terminal returns a Flotilla-owned attachable set id."""
+    repositories = flotilla_json(topology["node-b"], "resource list repositories")["records"]
+    repository_key = next(
+        record["object"]["metadata"]["name"]
+        for record in repositories
+        if record["object"]["spec"]["identity"].get("git_common_dir") == "/home/flotilla/repo/.git"
+    )
     checkout = flotilla_json(
         topology["node-b"],
-        "repo /home/flotilla/repo checkout --fresh feat-prepare",
+        f"repo {repository_key} checkout --fresh feat-prepare",
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
 
     prepared = flotilla_json(
         topology["node-a"],
-        f"host node-b repo /home/flotilla/repo prepare-terminal {checkout_path}",
+        f"host node-b repo {repository_key} prepare-terminal {checkout_path}",
         timeout=60,
     )
     assert prepared["kind"] == "terminal_prepared"
