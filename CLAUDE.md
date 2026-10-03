@@ -55,6 +55,7 @@ cargo test -p flotilla-core --locked --features test-support --test in_process_d
 ```
 
 `flotilla-resources` and `flotilla-controllers` collect their integration tests in `tests/integration/main.rs`.
+The resources `watch_allocations` target stays separate because it installs a process-wide counting allocator.
 `flotilla-daemon` uses that target for general integration tests and `tests/request_session_pair/main.rs` for routing scenarios.
 Run `cargo test -p <package> --locked --test integration` for the integration target, and
 `cargo test -p flotilla-daemon --locked --test request_session_pair` for routing scenarios. Append a former target's module name or a test name

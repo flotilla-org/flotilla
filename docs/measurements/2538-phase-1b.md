@@ -1,6 +1,7 @@
 # Integration-test consolidation: phase 1b of #2538
 
-Measured on 2026-10-03 in the same crew vessel, starting from commit `84912025`.
+Measured on 2026-10-03 in the same crew vessel, starting from commit `84912025`,
+before rebasing onto newer main.
 Each build used an empty `/tmp/phase1b-target` with the same environment and command:
 
 ```bash
@@ -44,3 +45,10 @@ root's module prefix where consolidated, preserves exactly 475 resources tests, 
 and 119 daemon tests. The workspace total stays at 3,949 listed tests.
 Use `--test integration <module>::` (or daemon `--test request_session_pair <test-name>`)
 to select an area previously selected with `--test <module>`. The core `in_process_daemon` target remains unchanged.
+
+The delivery rebase picked up #2533's tombstone generation-budget fix and #2535's
+new `watch_allocations` target. That target stays separate because its process-wide
+counting allocator must not instrument unrelated tests. The rebased tree therefore
+has five integration binaries across these packages (resources two, controllers
+one, daemon two); the table compares the original workload before those upstream
+changes. Workspace gates are rerun after the rebase.
