@@ -8,7 +8,10 @@ use std::{
 
 use flotilla_core::{in_process::InProcessDaemon, path_context::ExecutionEnvironmentPath, step::RemoteStepBatchRequest};
 use flotilla_protocol::{ConfigLabel, NodeId, NodeInfo, PeerConnectionState, PeerWireMessage, RepoIdentity};
-use tokio::sync::{mpsc, Mutex};
+use tokio::{
+    sync::{mpsc, Mutex},
+    task::JoinSet,
+};
 use tracing::{debug, info, warn};
 
 use super::{
@@ -155,6 +158,8 @@ pub(super) struct PeerRuntime {
     inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
     remote_command_router: RemoteCommandRouter,
     resource_socket_dir: Option<PathBuf>,
+    #[cfg(feature = "test-support")]
+    replication_kinds: Option<&'static [&'static str]>,
 }
 
 impl PeerRuntime {
@@ -166,7 +171,22 @@ impl PeerRuntime {
         remote_command_router: RemoteCommandRouter,
         resource_socket_dir: Option<PathBuf>,
     ) -> Self {
-        Self { daemon, peer_manager, inbound_peer_rx, inbound_peer_tx, remote_command_router, resource_socket_dir }
+        Self {
+            daemon,
+            peer_manager,
+            inbound_peer_rx,
+            inbound_peer_tx,
+            remote_command_router,
+            resource_socket_dir,
+            #[cfg(feature = "test-support")]
+            replication_kinds: None,
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(super) fn with_replication_kinds(mut self, kinds: Option<&'static [&'static str]>) -> Self {
+        self.replication_kinds = kinds;
+        self
     }
 
     pub(super) fn spawn(self) -> (tokio::task::JoinHandle<()>, mpsc::UnboundedSender<PeerConnectionEvent>) {
@@ -180,7 +200,10 @@ impl PeerRuntime {
         let resource_socket_dir = self.resource_socket_dir;
         let inbound_peer_rx = self.inbound_peer_rx;
 
-        let inbound_handle = tokio::spawn(async move {
+        // Aborting the runtime must also stop connection loops and the outbound
+        // supervisor; detached tasks otherwise outlive partitions and restarts.
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             if let Some(mut rx) = inbound_peer_rx {
                 let mut initial_connections = HashMap::new();
                 let configured_targets = {
@@ -197,6 +220,7 @@ impl PeerRuntime {
                 }
                 sync_peer_query_state(&peer_manager_task, &peer_daemon).await;
 
+                let mut connections = JoinSet::new();
                 for target in configured_targets {
                     let tx = inbound_peer_tx_for_ssh.clone();
                     let pm = Arc::clone(&peer_manager_task);
@@ -207,7 +231,7 @@ impl PeerRuntime {
                     let target_label = target.label.clone();
                     let resource_socket_dir = resource_socket_dir.clone();
 
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         let mut current_peer: Option<NodeInfo> = None;
                         let mut last_known_session_id: Option<uuid::Uuid> = None;
 
@@ -550,10 +574,15 @@ impl PeerRuntime {
             }
         });
 
+        #[cfg(feature = "test-support")]
+        let replication_kinds = self.replication_kinds;
         let outbound_daemon = Arc::clone(&self.daemon);
         let outbound_remote_command_router = self.remote_command_router.clone();
         let mut peer_connected_rx = peer_connected_rx;
-        tokio::spawn(async move {
+        tasks.spawn(async move {
+            #[cfg(feature = "test-support")]
+            let mut peer_replicators = PeerReplicatorSupervisors::with_replication_kinds(replication_kinds);
+            #[cfg(not(feature = "test-support"))]
             let mut peer_replicators = PeerReplicatorSupervisors::default();
 
             while let Some(event) = peer_connected_rx.recv().await {
@@ -578,7 +607,8 @@ impl PeerRuntime {
             }
         });
 
-        (inbound_handle, peer_connected_tx)
+        let handle = tokio::spawn(async move { while tasks.join_next().await.is_some() {} });
+        (handle, peer_connected_tx)
     }
 }
 

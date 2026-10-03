@@ -9,7 +9,7 @@ use flotilla_protocol::{
 use flotilla_resources::{api_version, Convoy, InputMeta, Project, ProjectSpec, Resource, WorkflowTemplate};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 
-use super::{build_remote_command_router, spawn_peer_networking_runtime};
+use super::{build_remote_command_router, peer_runtime::PeerRuntime, spawn_peer_networking_runtime};
 use crate::{
     blob_store::TieredBlobStore,
     peer::{channel_transport::channel_transport_pair_with_nodes, PeerManager},
@@ -80,6 +80,16 @@ impl Drop for InMemoryRequestMesh {
 }
 
 pub async fn spawn_in_memory_request_mesh(hosts: Vec<Arc<InProcessDaemon>>) -> Result<InMemoryRequestMesh, String> {
+    spawn_in_memory_request_mesh_with_replication_kinds(hosts, None).await
+}
+
+/// Exercise the production router and replicators for the kinds a scenario authors.
+/// `None` preserves full-fleet replication; a selected set avoids starting unrelated
+/// watch commands on every connection in generated, repeatedly rebuilt meshes.
+pub async fn spawn_in_memory_request_mesh_with_replication_kinds(
+    hosts: Vec<Arc<InProcessDaemon>>,
+    replication_kinds: Option<&'static [&'static str]>,
+) -> Result<InMemoryRequestMesh, String> {
     if hosts.is_empty() {
         return Err("request mesh needs at least one host".into());
     }
@@ -118,14 +128,16 @@ pub async fn spawn_in_memory_request_mesh(hosts: Vec<Arc<InProcessDaemon>>) -> R
     for (host, peer_manager) in hosts.iter().zip(&peer_managers) {
         let (inbound_peer_tx, inbound_peer_rx) = mpsc::channel(256);
         let router = build_remote_command_router(host, peer_manager);
-        let (runtime, _connected_tx) = spawn_peer_networking_runtime(
+        let (runtime, _connected_tx) = PeerRuntime::new(
             Arc::clone(host),
             Arc::clone(peer_manager),
             Some(inbound_peer_rx),
             inbound_peer_tx.clone(),
             router.clone(),
             None,
-        );
+        )
+        .with_replication_kinds(replication_kinds)
+        .spawn();
         tasks.push(runtime);
 
         let (client_session, server_session) = flotilla_transport::message::message_session_pair();

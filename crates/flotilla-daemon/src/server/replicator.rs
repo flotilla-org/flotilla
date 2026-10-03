@@ -75,6 +75,16 @@ struct RetryBackoff {
 #[derive(Default)]
 pub(super) struct PeerReplicatorSupervisors {
     generations: HashMap<NodeId, ActiveGeneration>,
+    #[cfg(feature = "test-support")]
+    replication_kinds: Option<&'static [&'static str]>,
+}
+
+impl Drop for PeerReplicatorSupervisors {
+    fn drop(&mut self) {
+        for active in self.generations.values() {
+            active.cancellation.cancel();
+        }
+    }
 }
 
 struct ActiveGeneration {
@@ -119,6 +129,11 @@ impl SocketPathSource {
 }
 
 impl PeerReplicatorSupervisors {
+    #[cfg(feature = "test-support")]
+    pub(super) fn with_replication_kinds(replication_kinds: Option<&'static [&'static str]>) -> Self {
+        Self { generations: HashMap::new(), replication_kinds }
+    }
+
     pub(super) async fn peer_connected(
         &mut self,
         _router: RemoteCommandRouter,
@@ -148,10 +163,19 @@ impl PeerReplicatorSupervisors {
             generation,
             &transport,
             &cancellation,
-            ReplicationStore::Durable
+            ReplicationStore::Durable,
+            self
         );
-        spawn_kind::<flotilla_resources::Checkout>(&daemon, &peer, generation, &transport, &cancellation, ReplicationStore::Observed);
-        spawn_kind::<flotilla_resources::TerminalSession>(&daemon, &peer, generation, &transport, &cancellation, ReplicationStore::Observed)
+        spawn_kind::<flotilla_resources::Checkout>(&daemon, &peer, generation, &transport, &cancellation, ReplicationStore::Observed, self);
+        spawn_kind::<flotilla_resources::TerminalSession>(
+            &daemon,
+            &peer,
+            generation,
+            &transport,
+            &cancellation,
+            ReplicationStore::Observed,
+            self,
+        )
     }
 
     /// Cancel and drop a peer's resource replicators, but only if `generation`
@@ -224,7 +248,12 @@ fn spawn_kind<T: Resource>(
     transport: &ReplicationTransport,
     cancellation: &CancellationToken,
     store: ReplicationStore,
+    _supervisors: &PeerReplicatorSupervisors,
 ) {
+    #[cfg(feature = "test-support")]
+    if _supervisors.replication_kinds.is_some_and(|kinds| !kinds.contains(&T::API_PATHS.kind)) {
+        return;
+    }
     if T::REPLICATION_CLASS == ReplicationClass::None {
         return;
     }
@@ -1070,6 +1099,18 @@ mod tests {
             applications += 1;
         }
         assert_eq!(applications, 2, "a newer generation starts exactly one new application stream");
+    }
+
+    #[test]
+    fn dropping_supervisors_cancels_all_peer_generations() {
+        // Runtime teardown ends every replication generation, including watches
+        // and retry backoffs, rather than leaving them to work on dead sessions.
+        let mut supervisors = PeerReplicatorSupervisors::default();
+        let (first, _) = supervisors.begin_generation(&NodeId::new("first"), 1, None).expect("first generation");
+        let (second, _) = supervisors.begin_generation(&NodeId::new("second"), 2, None).expect("second generation");
+        drop(supervisors);
+        assert!(first.is_cancelled(), "first peer generation survived teardown");
+        assert!(second.is_cancelled(), "second peer generation survived teardown");
     }
 
     #[test]
