@@ -1751,7 +1751,7 @@ mod tests {
         let reset = Utc::now().timestamp();
         let runner = Arc::new(ApiRunner::new(vec![
             CommandOutput {
-                stdout: format!("HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: {reset}\r\n\r\n{{\"message\":\"API rate limit exceeded\"}}"),
+                stdout: format!("HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {reset}\r\n\r\n{{\"message\":\"API rate limit exceeded\"}}"),
                 stderr: "gh: API rate limit exceeded".into(),
                 success: false,
             },

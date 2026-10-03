@@ -152,6 +152,37 @@ struct CachedObservation {
     result: Result<BoundObservations, String>,
 }
 
+impl CachedObservation {
+    // A classified quota can affect every subject even when encountered in
+    // one history page. This repository's cache pauses all its subjects,
+    // including successful entries in an Ok batch; other scopes are independent.
+    // Ordinary per-subject errors do not enter this path.
+    fn rate_limit_error(&self) -> Option<&str> {
+        observation_rate_limit_error(&self.result)
+    }
+}
+
+// Header deadlines use UTC; translate their remaining duration once into a
+// monotonic cache TTL. Completion and Landing still compare the original UTC
+// deadline. Expired headers retain the ordinary short cache TTL to avoid a burst
+// of simultaneous fresh claims, without advertising a fabricated forge reset.
+fn observation_cache_delay(retry_at: Option<chrono::DateTime<Utc>>, now: chrono::DateTime<Utc>) -> Duration {
+    retry_at
+        .and_then(|retry_at| retry_at.signed_duration_since(now).to_std().ok())
+        .filter(|delay| !delay.is_zero())
+        .unwrap_or(Duration::from_secs(9))
+}
+
+fn observation_rate_limit_error(result: &Result<BoundObservations, String>) -> Option<&str> {
+    match result {
+        Err(error) => rate_limit_reset(error).map(|_| error.as_str()),
+        Ok(statuses) => statuses.values().find_map(|status| {
+            let error = status.as_ref().err()?;
+            rate_limit_reset(error).map(|_| error.as_str())
+        }),
+    }
+}
+
 struct ProviderChangeRequestObservationSource {
     backend: ResourceBackend,
     query_port: Arc<dyn ChangeRequestQueryPort>,
@@ -414,6 +445,14 @@ impl ProviderChangeRequestObservationSource {
         // Hold only this repository's lock through its forge read. Other
         // repositories can continue observing even when one query is slow.
         let mut cache = scope_cache.lock().await;
+        // A completion read and a newly admitted subject must respect a forge
+        // cooldown too. Check before discovery and regardless of the cached batch.
+        if let Some(entry) = cache.as_ref().filter(|entry| tokio::time::Instant::now() < entry.expires_at) {
+            if let Some(error) = entry.rate_limit_error() {
+                return Err(error.to_string());
+            }
+        }
+
         let repositories =
             self.backend.including_replicas::<Repository>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
         let repository =
@@ -533,12 +572,7 @@ impl ProviderChangeRequestObservationSource {
         let provider = self.query_port.discover_repository_change_request(&subject.namespace, &repository.object.spec).await?;
         let crew_logins = crew_logins.into_iter().map(|(number, logins)| (number, logins.into_iter().collect())).collect();
         let result = provider.observe_bound(&numbers, &crew_logins).await;
-        let delay = result
-            .as_ref()
-            .err()
-            .and_then(|error| rate_limit_reset(error))
-            .and_then(|reset| reset.signed_duration_since(Utc::now()).to_std().ok())
-            .unwrap_or(Duration::from_secs(9));
+        let delay = observation_cache_delay(observation_rate_limit_error(&result).and_then(rate_limit_reset), Utc::now());
         let status = result.as_ref().map_err(Clone::clone).and_then(|statuses| {
             statuses.get(&subject.number).cloned().unwrap_or_else(|| Err(format!("change request {} was not found", subject.number)))
         });
@@ -6530,6 +6564,7 @@ impl InProcessDaemon {
                     })
                 });
             let mut observation_errors = Vec::new();
+            let mut observation_waits = Vec::new();
             if requires_change_request {
                 let mut subjects = BTreeSet::new();
                 for leaf in expected_change_request_leaves(&convoy, &checkouts)? {
@@ -6541,7 +6576,11 @@ impl InProcessDaemon {
                     let subject =
                         crate::change_request_observer::ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
                     if let Err(error) = self.leaf_subscriptions.refresh_change_request_once(&subject).await {
-                        observation_errors.push(format!("could not observe PR {}: {error}", subject.number));
+                        if let Some(retry_at) = rate_limit_reset(&error).filter(|retry_at| *retry_at > Utc::now()) {
+                            observation_waits.push((retry_at, format!("PR {} observation: {error}", subject.number)));
+                        } else {
+                            observation_errors.push(format!("could not observe PR {}: {error}", subject.number));
+                        }
                     }
                 }
             }
@@ -6580,6 +6619,17 @@ impl InProcessDaemon {
                 self.change_request_stale_after(),
                 self.clock.now(),
             )?;
+            // Missing fresh forge evidence is a timed wait, not a crew refusal.
+            // Keep all declared completion gates: neither stale readiness nor a
+            // rate-limit response is permission to mark the crew Done.
+            // Defer even independent unmet gates until observation recovers:
+            // waiting does not accept the claim, and every gate is re-evaluated
+            // on retry before either Done or a substantive refusal is recorded.
+            if observation_errors.is_empty() && !observation_waits.is_empty() {
+                let retry_at = observation_waits.iter().map(|(at, _)| *at).max().expect("nonempty waits");
+                let reason = observation_waits.into_iter().map(|(_, reason)| reason).collect::<Vec<_>>().join("; ");
+                return Ok(flotilla_protocol::CommandValue::CrewCompletionWaiting { reason, retry_at });
+            }
             if !unmet.is_empty() || !observation_errors.is_empty() {
                 let mut reasons = unmet
                     .into_iter()

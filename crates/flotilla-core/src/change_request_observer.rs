@@ -22,7 +22,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::providers::{run, CommandRunner};
+use crate::providers::{github_api::rate_limit_reset, run, CommandRunner};
 
 const RETAINED_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const HISTORY_REFRESH_INTERVAL_SECS: i64 = 60 * 60;
@@ -421,7 +421,7 @@ impl ChangeRequestRefresher {
             return Ok(());
         }
         let status = if create_missing {
-            self.inner.source.observe_for_completion(subject).await?
+            self.inner.source.observe_for_completion(subject).await
         } else {
             let group = self
                 .inner
@@ -434,7 +434,17 @@ impl ChangeRequestRefresher {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            self.inner.source.observe_group(&group, subject).await?
+            self.inner.source.observe_group(&group, subject).await
+        };
+        let status = match status {
+            Ok(status) => {
+                self.inner.observation_errors.lock().await.remove(subject);
+                status
+            }
+            Err(error) => {
+                self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
+                return Err(error);
+            }
         };
         self.publish(subject, &subject.record_name(), status, true, false, create_missing).await
     }
@@ -847,7 +857,11 @@ impl ChangeRequestRefresher {
                     self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
                     tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "change request observation failed");
                     let retained = self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.is_empty());
-                    let delay = if retained { RETAINED_REFRESH_INTERVAL } else { self.inner.cadence.checks_pending };
+                    let ordinary_delay = if retained { RETAINED_REFRESH_INTERVAL } else { self.inner.cadence.checks_pending };
+                    let delay = rate_limit_reset(&error)
+                        .and_then(|retry_at| retry_at.signed_duration_since(Utc::now()).to_std().ok())
+                        .filter(|delay| !delay.is_zero())
+                        .unwrap_or(ordinary_delay);
                     if !self.wait_for_next(&subject, delay).await {
                         break;
                     }
@@ -1036,6 +1050,36 @@ mod tests {
         async fn observe(&self, _subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
             Err("unavailable".to_string())
         }
+    }
+
+    #[tokio::test]
+    async fn claim_time_recovery_clears_rate_limit_error() {
+        struct RecoveringSource(Mutex<Result<ChangeRequestStatus, String>>);
+        #[async_trait]
+        impl ChangeRequestObservationSource for RecoveringSource {
+            async fn observe(&self, _: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+                self.0.lock().await.clone()
+            }
+        }
+        let error = "github rate limited (budget=GraphQL, identity=host gh login, kind=secondary, retry_source=retry-after, retry_at=2026-10-03T12:00:00Z)";
+        let source = Arc::new(RecoveringSource(Mutex::new(Err(error.into()))));
+        let refresher = ChangeRequestRefresher::new(
+            "fleet".into(),
+            ResourceBackend::InMemory(InMemoryBackend::default()),
+            "node".into(),
+            source.clone(),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let subject = ChangeRequestRef { namespace: "ops".into(), service: "github.com".into(), scope: "org/repo".into(), number: 42 };
+        assert_eq!(refresher.refresh_once(&subject).await.unwrap_err(), error);
+        assert_eq!(refresher.observation_error(&subject).await.as_deref(), Some(error));
+        *source.0.lock().await = Ok(parse_gh_observation(
+            r#"{"state":"OPEN","headRefOid":"head","statusCheckRollup":[],"reviewDecision":"APPROVED","mergeable":"MERGEABLE"}"#,
+            Utc::now(),
+        )
+        .expect("healthy observation"));
+        refresher.refresh_once(&subject).await.expect("recovered observation");
+        assert!(refresher.observation_error(&subject).await.is_none());
     }
 
     struct CountingSource(Arc<AtomicUsize>);
