@@ -18,9 +18,9 @@ pub struct RepoNoun {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum RepoVerb {
-    /// Track a new repository by path
+    /// Adopt a checkout path and start observing it
     Add { path: PathBuf },
-    /// Stop tracking a repository
+    /// Stop observing a checkout; retain Repository and Project resources
     Remove { repo: String },
     /// Refresh repository data (use subject for specific repo, or `repo all refresh` for all)
     Refresh,
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn repo_without_verb_lists_tracked_repositories() {
+    fn repo_without_verb_lists_declared_repositories() {
         let resolved = parse(&["repo"]).resolve().expect("default list");
         crate::test_utils::assert_ready(resolved, CommandAction::QueryCliList { kind: flotilla_protocol::CliListKind::Repo });
     }

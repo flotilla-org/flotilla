@@ -18,7 +18,7 @@ use crate::socket::SocketDaemon;
 
 fn format_status_response_human(status: &StatusResponse) -> String {
     if status.repos.is_empty() {
-        return "No repos tracked.\n".into();
+        return "No repository provider status available.\n".into();
     }
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
@@ -377,7 +377,7 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
 fn format_cli_list_human(response: &CliListResponse) -> String {
     if response.items.is_empty() {
         return match response.list_kind {
-            CliListKind::Repo => "No repos tracked.\n".into(),
+            CliListKind::Repo => "No repositories available.\n".into(),
             CliListKind::Checkout => "No active checkouts found.\n".into(),
             CliListKind::Cr => "No open change requests found.\n".into(),
             CliListKind::Agent => "No active agent sessions found.\n".into(),
@@ -1108,15 +1108,15 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::ConvoyBriefWithdrawn { withdrawn: None } => "no pending brief to withdraw".to_string(),
         CommandValue::RepoTracked { path, resolved_from, identity_change } => {
             let mut output = match resolved_from {
-                Some(original) => format!("repo tracked: {} (resolved from {})", path.display(), original.display()),
-                None => format!("repo tracked: {}", path.display()),
+                Some(original) => format!("observing checkout: {} (resolved from {})", path.display(), original.display()),
+                None => format!("observing checkout: {}", path.display()),
             };
             if let Some(change) = identity_change {
                 output.push_str(&format!("\nrepository identity changed: {} → {}", change.previous_display, change.current_display));
             }
             output
         }
-        CommandValue::RepoUntracked { path } => format!("repo untracked: {}", path.display()),
+        CommandValue::RepoUntracked { path } => format!("stopped observing checkout: {}", path.display()),
         CommandValue::Refreshed { repos, identity_changes } => {
             let mut output = format!("refreshed {} repo(s)", repos.len());
             for change in identity_changes {
@@ -1152,6 +1152,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::PreparedWorkspace(_) | CommandValue::AttachCommandResolved { .. } | CommandValue::CheckoutPathResolved { .. } => {
             "internal step result".to_string()
         }
+        CommandValue::RepositoryResolved { key } => format!("Repository/{key}"),
         CommandValue::RepoProviders(providers) => format_repo_providers_human(providers),
         // HostList remains a protocol-level query used by host/environment
         // target resolution; keep its formatter for direct query diagnostics
@@ -1253,10 +1254,10 @@ pub(crate) fn format_event_human(event: &flotilla_protocol::DaemonEvent) -> Stri
             format!("[refresh]  {}: completed", repo_label(repo.as_deref(), repo_identity))
         }
         DaemonEvent::RepoTracked(info) => {
-            format!("[repo]     {}: tracked", info.name)
+            format!("[repo]     {}: observing checkout", info.name)
         }
         DaemonEvent::RepoUntracked { repo_identity, path } => {
-            format!("[repo]     {}: untracked", repo_label(path.as_deref(), repo_identity))
+            format!("[repo]     {}: stopped observing checkout", repo_label(path.as_deref(), repo_identity))
         }
         DaemonEvent::CommandStarted { repo_identity, repo, description, .. } => {
             if repo.is_none() && repo_identity.authority.is_empty() && repo_identity.path.is_empty() {
@@ -1458,7 +1459,7 @@ async fn run_watch_connection(daemon: std::sync::Arc<dyn DaemonHandle>, format: 
     let mut rx = daemon.subscribe();
 
     // Replay current state so the user sees an initial snapshot for every
-    // tracked repo, matching how the TUI bootstraps.
+    // observed repository, matching how the TUI bootstraps.
     let mut replay_seqs: HashMap<StreamKey, u64> = HashMap::new();
     match daemon.replay_since(&HashMap::new()).await {
         Ok(events) => print_bootstrap_events(&events, &mut replay_seqs, format),

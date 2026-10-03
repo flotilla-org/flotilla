@@ -43,6 +43,7 @@ pub mod providers;
 pub mod query_registry;
 pub mod regard_lifecycle;
 pub(crate) mod repo_state;
+pub(crate) mod repository_addressing;
 pub mod repository_inspection;
 pub mod resolve;
 mod resource_explain;

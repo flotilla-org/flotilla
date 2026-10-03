@@ -28,6 +28,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::GenerateBranchName { .. }
         | CommandAction::QueryIssues { .. }
         | CommandAction::QueryIssueFetchByIds { .. }
+        | CommandAction::QueryResolveRepository { .. }
         | CommandAction::QueryRepoProviders { .. }
         | CommandAction::QueryHostList {}
         | CommandAction::QueryProjectList {}

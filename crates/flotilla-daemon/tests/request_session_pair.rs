@@ -14,7 +14,7 @@ use flotilla_core::{
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
     providers::{
-        discovery::test_support::{fake_discovery, fake_discovery_with_provider_set, init_git_repo_with_remote, FakeDiscoveryProviders},
+        discovery::test_support::{fake_discovery, fake_discovery_with_provider_set, FakeDiscoveryProviders},
         issue_tracker::IssueProvider,
     },
 };
@@ -2793,20 +2793,28 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
     );
 }
 
-/// A stateless remote issue query should return results end-to-end.
+/// A Repository-addressed remote issue query returns results without a tracked root.
 #[tokio::test]
 async fn remote_issue_query_returns_results() {
+    use flotilla_resources::{Repository, RepositorySpec};
+    // Mock provider stands in for the external issue tracker API.
     let mock_service = Arc::new(MockIssueProvider);
 
     let follower_tmp = tempfile::tempdir().expect("tempdir");
-    let follower_repo = follower_tmp.path().join("repo");
-    init_git_repo_with_remote(&follower_repo, "git@github.com:owner/repo.git");
     let follower_config = test_config_store(follower_tmp.path().join("config"));
     let follower_discovery = fake_discovery_with_provider_set(
         FakeDiscoveryProviders::new().with_issue_tracker(Arc::clone(&mock_service) as Arc<dyn IssueProvider>),
     );
-    let follower = InProcessDaemon::new(vec![follower_repo.clone()], follower_config, follower_discovery, HostName::new("follower")).await;
-    follower.refresh(&RepoSelector::Path(follower_repo.clone())).await.expect("refresh follower repo");
+    let follower = InProcessDaemon::new(vec![], follower_config, follower_discovery, HostName::new("follower")).await;
+    let repository = RepositorySpec::remote("https://github.com/owner/repo").expect("repository");
+    let key = repository.key();
+    follower
+        .resource_backend()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(key.to_string()).build(), &repository)
+        .await
+        .expect("declare repository");
+    assert!(follower.tracked_repo_paths().await.is_empty());
 
     let leader = empty_daemon_named("leader").await;
 
@@ -2818,7 +2826,7 @@ async fn remote_issue_query_returns_results() {
         .execute_query(
             Command::builder()
                 .action(CommandAction::QueryIssues {
-                    repo: RepoSelector::Path(follower_repo.clone()),
+                    repo: RepoSelector::Repository(key),
                     params: IssueQuery::default(),
                     page: 1,
                     count: 10,
@@ -2957,4 +2965,50 @@ fn generated_router_exited_crew_resume(tc: hegel::TestCase) {
     let remote_home = tc.draw(hegel::generators::booleans());
     let interrupted = tc.draw(hegel::generators::booleans());
     Builder::new_current_thread().enable_all().build().expect("runtime").block_on(exited_crew_resume_scenario(remote_home, interrupted));
+}
+
+// #1769: identity resolution is a local read through the request router and works
+// for a declared Repository with no checkout or observation-root membership.
+#[tokio::test]
+async fn repository_identity_resolution_is_a_local_resource_read() {
+    use flotilla_resources::{Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec};
+
+    let topology = spawn_in_memory_request_topology_stateful(empty_daemon_named("leader").await, empty_daemon_named("follower").await)
+        .await
+        .expect("in-memory router");
+    let backend = topology.leader.resource_backend();
+    let spec = RepositorySpec::remote("https://github.com/acme/widgets").expect("repository");
+    let key = spec.key();
+    backend
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
+        .await
+        .expect("declare Repository");
+    let project = ProjectSpec::builder()
+        .display_name("Widgets".into())
+        .default_workflow_ref("single-agent".into())
+        .repositories(vec![ProjectRepositorySpec::builder()
+            .repo(key.clone())
+            .alias("primary".into())
+            .roles([ProjectRepositoryRole::Code].into())
+            .build()])
+        .build();
+    backend
+        .using::<Project>("flotilla")
+        .create(&InputMeta::builder().name("widgets".into()).build(), &project)
+        .await
+        .expect("declare Project");
+    for query in ["primary", "acme/widgets"] {
+        let result = topology
+            .client
+            .execute_query(
+                Command::builder().action(CommandAction::QueryResolveRepository { repo: RepoSelector::Query(query.into()) }).build(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("resolve through router");
+        assert_eq!(result, CommandValue::RepositoryResolved { key: key.clone() });
+    }
+    assert!(topology.leader.tracked_repo_paths().await.is_empty());
+    assert!(topology.follower.tracked_repo_paths().await.is_empty());
 }

@@ -121,7 +121,7 @@ use crate::{
             EnvironmentBag,
         },
         github_api::rate_limit_reset,
-        issue_tracker::{forge_issue_source, IssueProvider},
+        issue_tracker::IssueProvider,
         registry::ProviderRegistry,
         ssh_runner::SshCommandRunner,
         types::RepoCriteria,
@@ -3396,14 +3396,45 @@ impl InProcessDaemon {
         self.repos.read().await.values().flat_map(RepoState::local_paths).collect()
     }
 
+    pub(crate) async fn resolve_repository_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<RepositoryKey, String> {
+        crate::repository_addressing::resolve_repository(
+            &self.resource_backend,
+            &self.observed_resource_backend,
+            &self.provisioning_namespace().await,
+            self.environment_manager.local_host_id().as_str(),
+            selector,
+        )
+        .await
+    }
+
     async fn resolve_repo_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
         match selector {
+            // #2500 owns replacing this compatibility bridge and its consumers.
+            // Preserve their preferred checkout and provider-registry semantics.
+            flotilla_protocol::RepoSelector::Repository(key) => {
+                let paths = self
+                    .repository_keys_by_path
+                    .read()
+                    .await
+                    .iter()
+                    .filter(|(_, candidate)| *candidate == key)
+                    .map(|(path, _)| path.clone())
+                    .collect::<Vec<_>>();
+                self.repos
+                    .read()
+                    .await
+                    .values()
+                    .filter(|state| paths.iter().any(|path| state.contains_path(path)))
+                    .min_by_key(|state| (state.local_paths().is_empty(), state.preferred_path()))
+                    .map(|state| state.preferred_path().to_path_buf())
+                    .ok_or_else(|| format!("Repository {key} has no available checkout on this host"))
+            }
             flotilla_protocol::RepoSelector::Path(path) => {
                 let identities = self.path_identities.read().await;
                 if identities.contains_key(path) {
                     Ok(path.clone())
                 } else {
-                    Err(format!("repo not tracked: {}", path.display()))
+                    Err(format!("no observed checkout at {}", path.display()))
                 }
             }
             flotilla_protocol::RepoSelector::Query(query) => {
@@ -3417,7 +3448,7 @@ impl InProcessDaemon {
                 .await
                 .get(identity)
                 .map(|state| state.preferred_path().to_path_buf())
-                .ok_or_else(|| format!("repo not tracked: {identity}")),
+                .ok_or_else(|| format!("no available checkout for {identity}")),
         }
     }
 
@@ -3429,7 +3460,8 @@ impl InProcessDaemon {
             flotilla_protocol::RepoSelector::Query(query) => {
                 crate::resolve::resolve_repo(query, roots.iter().map(|root| (root.as_path(), None))).map_err(|error| error.to_string())
             }
-            flotilla_protocol::RepoSelector::Identity(identity) => Err(format!("repo not tracked: {identity}")),
+            flotilla_protocol::RepoSelector::Identity(identity) => Err(format!("no observation root matches {identity}")),
+            flotilla_protocol::RepoSelector::Repository(key) => Err(format!("no observation root matches Repository {key}")),
         }
     }
 
@@ -5478,7 +5510,8 @@ impl InProcessDaemon {
         failure_policy: RepositoryRefreshFailurePolicy,
     ) -> Result<Option<RepositoryIdentityChange>, String> {
         let repo = self.resolve_repo_selector(repo).await?;
-        let identity = self.tracked_repo_identity_for_path(&repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
+        let identity =
+            self.tracked_repo_identity_for_path(&repo).await.ok_or_else(|| format!("no observed checkout at {}", repo.display()))?;
         let identity_change = match self.inspect_repository_path(&repo, None).await {
             Ok(inspection) => {
                 let key_changed = self.repository_keys_by_path.read().await.get(&repo) != Some(&inspection.key());
@@ -5494,7 +5527,7 @@ impl InProcessDaemon {
                     {
                         let _reconciliation = self.observed_checkout_reconciliation.lock().await;
                         if self.tracked_repo_identity_for_path(&repo).await.as_ref() != Some(&identity) {
-                            return Err(format!("repo not tracked: {}", repo.display()));
+                            return Err(format!("no observed checkout at {}", repo.display()));
                         }
                         self.repository_keys_by_path.write().await.insert(repo.clone(), inspection.key());
                     }
@@ -5658,7 +5691,7 @@ impl InProcessDaemon {
         let repository_inspection = self
             .inspect_repository_path(&path, None)
             .await
-            .map_err(|error| format!("cannot track repository {}: {error}", path.display()))?;
+            .map_err(|error| format!("cannot adopt checkout {}: {error}", path.display()))?;
         self.config.set_repository_spec(&ExecutionEnvironmentPath::new(&path), repository_inspection.spec.clone());
 
         // Create the model outside the lock (spawns provider detection and refresh)
@@ -5785,11 +5818,11 @@ impl InProcessDaemon {
             let mut repos = self.repos.write().await;
             let mut order = self.repo_order.write().await;
             let Some(state) = repos.get_mut(&repo_identity) else {
-                return Err(format!("repo not tracked: {}", path.display()));
+                return Err(format!("no observed checkout at {}", path.display()));
             };
             let previous_preferred = state.preferred_path().to_path_buf();
             if !state.remove_root(&path) {
-                return Err(format!("repo not tracked: {}", path.display()));
+                return Err(format!("no observed checkout at {}", path.display()));
             }
             removed_final_local_root = state.local_paths().is_empty();
             if state.roots.is_empty() {
@@ -5953,7 +5986,7 @@ impl InProcessDaemon {
                         repo: Some(name.clone()),
                         reference,
                         name,
-                        status: "tracked".into(),
+                        status: "declared".into(),
                         provider: None,
                     });
                 }
@@ -7929,9 +7962,6 @@ impl InProcessDaemon {
             host_name: &self.host_name,
             namespace: &self.provisioning_namespace,
             fleet_rows: Box::new(CachedFleetRows { fleet: &self.fleet }),
-            repository_keys_by_path: &self.repository_keys_by_path,
-            path_identities: &self.path_identities,
-            repos: &self.repos,
         }
     }
 
@@ -8072,15 +8102,22 @@ impl InProcessDaemon {
         summary
     }
 
-    async fn get_issue_provider_for_repo(&self, repo: &Path) -> Result<(Arc<dyn IssueProvider>, flotilla_protocol::IssueSource), String> {
-        let identity = self.tracked_repo_identity_for_path(repo).await.ok_or_else(|| "no tracked repo for path".to_string())?;
-        let repos = self.repos.read().await;
-        let state = repos.get(&identity).ok_or_else(|| "repo not found".to_string())?;
-        let source = forge_issue_source(state.identity());
-        let provider = state
-            .registry()
-            .issue_provider_for(&source)
-            .ok_or_else(|| format!("no issue provider available for {} {}", source.service, source.scope))?;
+    async fn get_issue_provider_for_repository(
+        &self,
+        selector: &flotilla_protocol::RepoSelector,
+    ) -> Result<(Arc<dyn IssueProvider>, flotilla_protocol::IssueSource), String> {
+        let key = self.resolve_repository_selector(selector).await?;
+        let namespace = self.provisioning_namespace().await;
+        let repository = self
+            .resource_backend
+            .including_replicas::<Repository>(&namespace)
+            .get(&key.to_string())
+            .await
+            .map_err(|error| error.to_string())?
+            .object;
+        let forge = repository.spec.issue_source_forge().ok_or_else(|| format!("Repository {key} has no forge issue source"))?;
+        let source = flotilla_protocol::IssueSource { service: forge.service_url, scope: forge.repository };
+        let provider = self.issue_provider_for_source(&source).await?;
         Ok((provider, source))
     }
 
@@ -9850,6 +9887,10 @@ impl DaemonHandle for InProcessDaemon {
     async fn execute_query(&self, command: Command, session_id: uuid::Uuid) -> Result<flotilla_protocol::CommandValue, String> {
         use flotilla_protocol::CommandAction;
         match &command.action {
+            CommandAction::QueryResolveRepository { repo } => {
+                let key = self.resolve_repository_selector(repo).await?;
+                Ok(CommandValue::RepositoryResolved { key })
+            }
             CommandAction::QueryRepoProviders { repo } => match self.get_repo_providers_internal(repo).await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::RepoProviders(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
@@ -10055,20 +10096,17 @@ impl DaemonHandle for InProcessDaemon {
                 }
             }
             CommandAction::QueryIssues { repo, params, page, count } => {
-                let repo_path = self.resolve_repo_selector(repo).await?;
-                let (provider, source) = self.get_issue_provider_for_repo(&repo_path).await?;
+                let (provider, source) = self.get_issue_provider_for_repository(repo).await?;
                 let page = provider.query(&source, params, *page, *count).await?;
                 Ok(flotilla_protocol::CommandValue::IssuePage(page))
             }
             CommandAction::QueryIssueFetchByIds { repo, ids } => {
-                let repo_path = self.resolve_repo_selector(repo).await?;
-                let (provider, source) = self.get_issue_provider_for_repo(&repo_path).await?;
+                let (provider, source) = self.get_issue_provider_for_repository(repo).await?;
                 let items = provider.fetch_by_ids(&source, ids).await?;
                 Ok(flotilla_protocol::CommandValue::IssuesByIds { items })
             }
             CommandAction::QueryIssueOpenInBrowser { repo, id } => {
-                let repo_path = self.resolve_repo_selector(repo).await?;
-                let (provider, source) = self.get_issue_provider_for_repo(&repo_path).await?;
+                let (provider, source) = self.get_issue_provider_for_repository(repo).await?;
                 provider.open_in_browser(&flotilla_protocol::IssueRef { source, id: id.clone() }).await?;
                 Ok(flotilla_protocol::CommandValue::Ok)
             }

@@ -44,7 +44,7 @@ pub enum ProjectVerb {
     },
     /// Register a project from project.yaml in a bootstrap repository
     Register {
-        /// Local bootstrap repository path or tracked repository catalog slug
+        /// Local bootstrap checkout path or Repository forge slug
         target: String,
     },
     /// Re-read and converge a registered project's declaration
