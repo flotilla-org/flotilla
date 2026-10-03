@@ -239,7 +239,7 @@ impl GitHubChangeRequest {
             if !success || document["errors"].as_array().is_some_and(|errors| !errors.is_empty()) {
                 let messages =
                     document["errors"].as_array().into_iter().flatten().filter_map(|error| error["message"].as_str()).collect::<Vec<_>>();
-                return Err(format!("change request {number} review history page failed (HTTP {}): {messages:?}", status).into());
+                return Err(format!("change request {number} review history page failed (HTTP {status}): {messages:?}").into());
             }
             let fetched = match page {
                 HistoryPage::ThreadComments(_) => &document["data"]["node"][page.field()],
