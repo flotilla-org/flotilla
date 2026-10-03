@@ -1,5 +1,3 @@
-mod common;
-
 use std::{
     sync::{mpsc as std_mpsc, Arc},
     thread,
@@ -41,6 +39,8 @@ use futures::StreamExt;
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 use tempfile::tempdir;
 use tokio::time::{timeout, Duration};
+
+use crate::common;
 
 fn backend() -> ResourceBackend {
     ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("sqlite backend should open"))
@@ -495,7 +495,7 @@ async fn raw_delete_preserves_finalization_then_prevents_relay_resurrection() {
     // The fixture preserves the stored row shape and values; only the opaque
     // brief body was elided because it has no resource-store semantics.
     const NAME: &str = "terminal-checkout-cascade-work-coder";
-    const BODY: &str = include_str!("fixtures/terminal_session_pending_finalization.json");
+    const BODY: &str = include_str!("../fixtures/terminal_session_pending_finalization.json");
 
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("resources.sqlite");

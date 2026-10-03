@@ -9,6 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use common::{create_convoy_with_single_task, meta};
 use flotilla_controllers::reconcilers::{
     TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime,
     TerminalRuntimeState, TerminalSessionReconciler,
@@ -26,8 +27,7 @@ use flotilla_resources::{
     CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
 };
 
-mod common;
-use common::{create_convoy_with_single_task, meta};
+use crate::common;
 
 async fn create_ready_environment(backend: &ResourceBackend, name: &str) {
     let environments = backend.clone().using::<flotilla_resources::Environment>("flotilla");

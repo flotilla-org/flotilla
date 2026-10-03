@@ -20,7 +20,7 @@ fn kubeconfig_path() -> PathBuf {
 }
 
 fn workflow_template_spec() -> WorkflowTemplateSpec {
-    let yaml = include_str!("../examples/review-and-fix.yaml");
+    let yaml = include_str!("../../examples/review-and-fix.yaml");
     let document: WorkflowTemplateDocument = serde_yml::from_str(yaml).expect("parse workflow template fixture");
     document.spec
 }
@@ -80,8 +80,8 @@ async fn convoy_controller_roundtrip_and_cel_validation() -> Result<(), Box<dyn 
     let backend = HttpBackend::from_kubeconfig(kubeconfig_path())?;
     let namespace = "flotilla";
     ensure_namespace(&backend, namespace).await?;
-    ensure_crd(&backend, include_str!("../src/crds/workflow_template.crd.yaml")).await?;
-    ensure_crd(&backend, include_str!("../src/crds/convoy.crd.yaml")).await?;
+    ensure_crd(&backend, include_str!("../../src/crds/workflow_template.crd.yaml")).await?;
+    ensure_crd(&backend, include_str!("../../src/crds/convoy.crd.yaml")).await?;
 
     let backend = ResourceBackend::Http(backend);
     let templates = backend.clone().using::<WorkflowTemplate>(namespace);

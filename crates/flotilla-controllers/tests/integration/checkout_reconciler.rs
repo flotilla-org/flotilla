@@ -1,8 +1,6 @@
 // Happy-path checkout reconciler coverage lives in provisioning_in_memory.rs.
 // Keep unit tests here only for edge cases, validation, or failure-mapping
 // behavior that is clearer to assert directly than through controller-loop tests.
-mod common;
-
 use std::{
     collections::BTreeMap,
     sync::{
@@ -30,6 +28,8 @@ use tokio::{
     sync::{watch, Notify},
     time::timeout,
 };
+
+use crate::common;
 
 const NAMESPACE: &str = "flotilla";
 const REPO_URL: &str = "https://github.com/flotilla-org/flotilla";

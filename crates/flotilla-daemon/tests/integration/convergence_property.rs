@@ -271,7 +271,7 @@ impl Harness {
 
     fn failure(&self, step: usize, ops: &[Op], error: String) -> String {
         format!(
-            "convergence schedule failed: backend={}, seed={}, step={step}, error={error}\nreplay: FLOTILLA_CONVERGENCE_SEEDS={} cargo test -p flotilla-daemon --test convergence_property\nschedule={ops:#?}",
+            "convergence schedule failed: backend={}, seed={}, step={step}, error={error}\nreplay: FLOTILLA_CONVERGENCE_SEEDS={} cargo test -p flotilla-daemon --test integration convergence_property::\nschedule={ops:#?}",
             self.backend_kind, self.seed, self.seed
         )
     }
@@ -567,7 +567,7 @@ fn configured_steps() -> usize {
 
 #[tokio::test]
 // Blocked by #1474. Replay with:
-// FLOTILLA_CONVERGENCE_SEEDS=1 cargo test -p flotilla-daemon --test convergence_property
+// FLOTILLA_CONVERGENCE_SEEDS=1 cargo test -p flotilla-daemon --test integration convergence_property::
 // The fix PR for #1474 must remove this ignore as its regression proof.
 #[ignore = "blocked by #1474; its fix must remove this ignore"]
 async fn seeded_schedules_converge_on_both_backends() {

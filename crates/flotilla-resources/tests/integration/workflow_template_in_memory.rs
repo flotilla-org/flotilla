@@ -1,5 +1,3 @@
-mod common;
-
 use common::{
     contract::{
         assert_metadata_roundtrip, assert_namespace_isolation, assert_stale_resource_version_conflicts, in_memory_backend,
@@ -9,6 +7,8 @@ use common::{
 };
 use flotilla_resources::WorkflowTemplate;
 use rstest::rstest;
+
+use crate::common;
 
 // Keep the rstest shape even with a single fixture so this suite can grow into
 // shared backend contract coverage without restructuring each test.

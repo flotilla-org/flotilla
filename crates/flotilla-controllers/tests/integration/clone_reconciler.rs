@@ -4,11 +4,11 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
+use common::meta;
 use flotilla_controllers::reconcilers::{CloneReconciler, CloneRuntime};
 use flotilla_resources::{clone_key, controller::Reconciler, CloneSpec, Repository, RepositorySpec, ResourceBackend};
 
-mod common;
-use common::meta;
+use crate::common;
 
 #[derive(Default)]
 struct FakeCloneRuntime;

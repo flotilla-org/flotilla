@@ -1,5 +1,3 @@
-mod common;
-
 use std::{
     collections::BTreeMap,
     sync::{
@@ -28,6 +26,8 @@ use flotilla_resources::{
     FreshCloneCheckoutSpec, InputMeta, IntegrationCondition, Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability,
     PlacementStatus, RepositoryKey, ResourceObject, VirtualClock, WorkPhase, CONVOY_LABEL,
 };
+
+use crate::common;
 
 const NAMESPACE: &str = "flotilla";
 const INTEGRATION_TTL: Duration = Duration::hours(6);

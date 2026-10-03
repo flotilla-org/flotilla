@@ -1,5 +1,3 @@
-mod common;
-
 use std::collections::BTreeMap;
 
 use common::{
@@ -22,6 +20,8 @@ use common::{
     convoy_meta, convoy_spec,
 };
 use flotilla_resources::{Convoy, EventRetention, InMemoryBackend, ResourceBackend};
+
+use crate::common;
 
 #[tokio::test]
 async fn local_authority_shadows_self_origin_replica() {
