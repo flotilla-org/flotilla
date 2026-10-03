@@ -1481,22 +1481,74 @@ exec "$compiler" "$@"
 
 const CONTAINED_RUSTC_WRAPPER_PATH: &str = "/usr/local/bin/flotilla-rustc-wrapper";
 
+const CONTAINED_CARGO_SHIM_DIRECTORY: &str = "/usr/local/lib/flotilla-rust-build-limits";
+const CONTAINED_CARGO_SHIM_PATH: &str = "/usr/local/lib/flotilla-rust-build-limits/cargo";
+const CARGO_BUILD_PROFILE_SHIM: &str = r#"#!/bin/sh
+# flotilla-cargo-profile-shim
+# Remove our directory before resolving Cargo (including rustup's Cargo proxy).
+case "$0" in
+  */*) shim_dir=${0%/*} ;;
+  *) shim_dir=. ;;
+esac
+shim_dir=$(CDPATH= cd -- "$shim_dir" && pwd -P) || exit 127
+remaining=$PATH
+filtered=
+while :; do
+  entry=${remaining%%:*}
+  # Empty entries mean cwd. Preserve their spelling unless they lead back
+  # to this shim, just as for trailing slashes and directory symlinks.
+  entry_dir=$(CDPATH= cd -- "${entry:-.}" 2>/dev/null && pwd -P) || entry_dir=$entry
+  if [ "$entry_dir" != "$shim_dir" ]; then
+    filtered=$filtered:$entry
+  fi
+  case "$remaining" in
+    *:*) remaining=${remaining#*:} ;;
+    *) break ;;
+  esac
+done
+# Resolve with a filtered PATH, but preserve the caller's PATH for Cargo's
+# subprocesses and external subcommands that may invoke Cargo themselves.
+missing_cargo() {
+  echo "flotilla cargo profile shim: no Cargo executable found after removing the shim directory from PATH" >&2
+  exit 127
+}
+[ -n "$filtered" ] || missing_cargo
+cargo=$(PATH=${filtered#:} command -v cargo) || missing_cargo
+# A different directory may contain a file symlink to this same shim.
+# The contained sh must support test -ef (dash, bash, BusyBox and macOS sh do).
+[ "$cargo" -ef "$0" ] && missing_cargo
+# rustup's +toolchain selector must precede Cargo options.
+case "${1:-}" in
+  +*) toolchain=$1; shift
+      exec "$cargo" "$toolchain" --config 'profile.dev.package."*".debug=0' "$@" ;;
+  *) exec "$cargo" --config 'profile.dev.package."*".debug=0' "$@" ;;
+esac
+"#;
+
+fn stage_local_cargo_shim(state_dir: &Path) -> Result<PathBuf, String> {
+    stage_local_build_tool(state_dir, "cargo-profile-shim", CARGO_BUILD_PROFILE_SHIM)
+}
+
 fn stage_local_rustc_wrapper(state_dir: &Path) -> Result<PathBuf, String> {
+    stage_local_build_tool(state_dir, "rustc-linker-cap", RUSTC_LINKER_WRAPPER)
+}
+
+fn stage_local_build_tool(state_dir: &Path, name: &str, contents: &str) -> Result<PathBuf, String> {
     let directory = state_dir.join("environment-tools");
-    std::fs::create_dir_all(&directory).map_err(|error| format!("create rustc wrapper directory: {error}"))?;
-    let path = directory.join("rustc-linker-cap");
-    if std::fs::read_to_string(&path).ok().as_deref() == Some(RUSTC_LINKER_WRAPPER) {
+    std::fs::create_dir_all(&directory).map_err(|error| format!("create build tool directory: {error}"))?;
+    let path = directory.join(name);
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(contents) {
         return Ok(path);
     }
-    let staged = directory.join(format!("rustc-linker-cap-{}.tmp", uuid::Uuid::new_v4()));
-    std::fs::write(&staged, RUSTC_LINKER_WRAPPER).map_err(|error| format!("stage rustc wrapper: {error}"))?;
+    let staged = directory.join(format!("{name}-{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&staged, contents).map_err(|error| format!("stage build tool {name}: {error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("mark rustc wrapper executable: {error}"))?;
+            .map_err(|error| format!("mark build tool {name} executable: {error}"))?;
     }
-    std::fs::rename(&staged, &path).map_err(|error| format!("install rustc wrapper: {error}"))?;
+    std::fs::rename(&staged, &path).map_err(|error| format!("install build tool {name}: {error}"))?;
     Ok(path)
 }
 
@@ -4353,6 +4405,10 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
     async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
         let jobs = self.state.rust_build_jobs(&spec.host_ref).await?;
         let wrapper_host = stage_local_rustc_wrapper_async(self.state.config.state_dir().as_path().to_path_buf()).await?;
+        let state_dir = self.state.config.state_dir().as_path().to_path_buf();
+        let cargo_shim_host = tokio::task::spawn_blocking(move || stage_local_cargo_shim(&state_dir))
+            .await
+            .map_err(|error| format!("stage Cargo shim task: {error}"))??;
         let mut tools = self.state.environment_tools.prepare(name).await?;
         tools.push(
             EnvironmentTool::new("rust-build-limits", CONTAINED_RUSTC_WRAPPER_PATH)
@@ -4362,6 +4418,19 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                     EnvironmentToolAssetKind::File,
                     EnvironmentToolAssetAccess::ReadOnly,
                     "the Rust linker cap",
+                ))
+                .with_asset(EnvironmentToolAsset::new(
+                    cargo_shim_host,
+                    CONTAINED_CARGO_SHIM_PATH,
+                    EnvironmentToolAssetKind::File,
+                    EnvironmentToolAssetAccess::ReadOnly,
+                    "the Rust dependency debug profile",
+                ))
+                .with_environment(EnvironmentVariableUpdate::prepend_path("PATH", CONTAINED_CARGO_SHIM_DIRECTORY))
+                .with_environment(EnvironmentVariableUpdate::set(
+                    "CARGO_PROFILE_DEV_DEBUG",
+                    "line-tables-only",
+                    "the Rust workspace debug profile",
                 ))
                 .with_environment(EnvironmentVariableUpdate::set(
                     "RUSTC_WORKSPACE_WRAPPER",
@@ -5985,6 +6054,182 @@ mod tests {
             Arc,
         },
     };
+
+    // Phase 1a: Cargo decides workspace membership, including non-primary libraries.
+    // Real offline Cargo builds cover defaults, explicit full, desk builds and toolchain forwarding.
+    #[cfg(unix)]
+    #[test]
+    fn contained_cargo_profile_preserves_workspace_override_and_desk_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        for directory in ["src", "member/src", "dependency/src", ".cargo"] {
+            fs::create_dir_all(repo.join(directory)).expect("fixture directory");
+        }
+        fs::write(
+            repo.join("Cargo.toml"),
+            r#"[package]
+name = "profile-check"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+members = ["member"]
+exclude = ["dependency"]
+[dependencies]
+member = { path = "member" }
+"#,
+        )
+        .expect("root manifest");
+        fs::write(
+            repo.join("member/Cargo.toml"),
+            r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+dependency = { path = "../dependency" }
+"#,
+        )
+        .expect("member manifest");
+        fs::write(repo.join("dependency/Cargo.toml"), "[package]\nname = \"dependency\"\nversion = \"0.1.0\"\nedition = \"2024\"\n")
+            .expect("dependency manifest");
+        fs::write(repo.join("src/main.rs"), "fn main() { member::call(); }\n").expect("root source");
+        fs::write(repo.join("member/src/lib.rs"), "pub fn call() { dependency::call(); }\n").expect("member source");
+        fs::write(repo.join("dependency/src/lib.rs"), "pub fn call() {}\n").expect("dependency source");
+        fs::write(repo.join(".cargo/config.toml"), "[build]\nrustflags = [\"--cfg\", \"profile_repo_config\"]\n").expect("repo config");
+        let staged = super::stage_local_cargo_shim(temp.path()).expect("stage shim");
+        let shim_dir = temp.path().join("shim with spaces");
+        fs::create_dir_all(&shim_dir).expect("shim directory");
+        fs::copy(staged, shim_dir.join("cargo")).expect("install shim");
+        let probe = temp.path().join("rustc-probe");
+        // This probe records the real compiler boundary without replacing compilation.
+        fs::write(
+            &probe,
+            "#!/bin/sh\nprintf 'PATH=%s\\n' \"$PATH\" >> \"$PROFILE_LOG\"\nprintf 'BEGIN\\n' >> \"$PROFILE_LOG\"\nprintf '%s\\n' \"$@\" >> \"$PROFILE_LOG\"\nexec rustc \"$@\"\n",
+        )
+        .expect("probe script");
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).expect("executable probe");
+        // Isolate the fixture tool environment from a contained shim running this test suite.
+        // Layering two copies would make each resolve the other as the next Cargo.
+        let stale_shim = temp.path().join("stale-shim");
+        fs::create_dir_all(&stale_shim).expect("stale shim directory");
+        fs::write(stale_shim.join("cargo"), format!("{}\n# previous staged revision\n", super::CARGO_BUILD_PROFILE_SHIM))
+            .expect("stale shim");
+        fs::set_permissions(stale_shim.join("cargo"), fs::Permissions::from_mode(0o755)).expect("executable stale shim");
+        let parent_path =
+            std::env::join_paths(std::iter::once(stale_shim).chain(std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))))
+                .expect("parent fixture PATH");
+        let inherited_path = std::env::join_paths(std::env::split_paths(&parent_path).filter(|directory| {
+            !fs::read_to_string(directory.join("cargo"))
+                .ok()
+                .is_some_and(|contents| contents.starts_with("#!/bin/sh\n# flotilla-cargo-profile-shim\n"))
+        }))
+        .expect("isolated fixture PATH")
+        .to_string_lossy()
+        .into_owned();
+        for (case, contained, debug, selector) in [
+            ("desk", false, None, false),
+            ("contained", true, Some("line-tables-only"), false),
+            ("full", true, Some("full"), false),
+            ("off", true, Some("0"), false),
+            ("flags", true, Some("line-tables-only"), false),
+            ("toolchain", true, Some("line-tables-only"), true),
+        ] {
+            let log = temp.path().join(format!("{case}.log"));
+            let cargo = if contained { shim_dir.join("cargo") } else { std::env::var_os("CARGO").expect("Cargo executable").into() };
+            let mut command = ProcessCommand::new(cargo);
+            if selector {
+                let Ok(toolchain) = std::env::var("RUSTUP_TOOLCHAIN") else {
+                    eprintln!("Skipping Cargo +toolchain case: RUSTUP_TOOLCHAIN is unset; other profile cases still run");
+                    continue;
+                };
+                command.arg(format!("+{toolchain}"));
+            }
+            command
+                .args(["test", "--no-run", "--offline"])
+                .current_dir(&repo)
+                .env("PATH", if contained { format!("{}:{inherited_path}", shim_dir.display()) } else { inherited_path.clone() })
+                .env("RUSTC", &probe)
+                .env("PROFILE_LOG", &log)
+                .env("CARGO_TARGET_DIR", temp.path().join(case))
+                .env_remove("CARGO_PROFILE_DEV_DEBUG")
+                .env_remove("CARGO_PROFILE_TEST_DEBUG")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER");
+            if let Some(debug) = debug {
+                command.env("CARGO_PROFILE_DEV_DEBUG", debug);
+            }
+            if case == "flags" {
+                command.env("RUSTFLAGS", "--cfg profile_env_flag");
+            }
+            let output = command.output().expect("Cargo profile build");
+            assert!(output.status.success(), "{case}: {}", String::from_utf8_lossy(&output.stderr));
+            let arguments = fs::read_to_string(log).expect("compiler arguments");
+            if contained {
+                assert!(
+                    arguments.contains(&format!("PATH={}:", shim_dir.display())),
+                    "Cargo subprocess PATH lost the contained shim: {arguments}"
+                );
+            }
+            for name in ["profile_check", "member", "dependency"] {
+                let unit =
+                    arguments.split("BEGIN\n").find(|unit| unit.contains(&format!("--crate-name\n{name}\n"))).expect("compiled crate");
+                let expected = if (name == "dependency" && contained) || debug == Some("0") {
+                    None
+                } else if debug == Some("line-tables-only") {
+                    Some("line-tables-only")
+                } else {
+                    Some("2")
+                };
+                if let Some(expected) = expected {
+                    assert!(unit.contains(&format!("debuginfo={expected}\n")), "{case}/{name}: {unit}");
+                } else {
+                    assert!(!unit.contains("debuginfo="), "dependency debuginfo must be off: {unit}");
+                }
+                let flag = if case == "flags" { "profile_env_flag" } else { "profile_repo_config" };
+                assert!(unit.contains(flag), "repository or environment flags lost: {unit}");
+            }
+        }
+    }
+
+    // Missing Cargo and path aliases back to this shim must fail promptly with a useful diagnostic.
+    // This is process-boundary glue: no compiler is needed for the missing-executable case.
+    #[cfg(unix)]
+    #[test]
+    fn contained_cargo_profile_reports_missing_cargo() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staged = super::stage_local_cargo_shim(temp.path()).expect("stage shim");
+        let directory = staged.parent().expect("shim directory");
+        let cargo = directory.join("cargo");
+        fs::copy(&staged, &cargo).expect("install fixture shim");
+        let directory_alias = temp.path().join("directory-alias");
+        symlink(directory, &directory_alias).expect("directory symlink");
+        let file_alias = temp.path().join("file-alias");
+        fs::create_dir_all(&file_alias).expect("file alias directory");
+        symlink(&cargo, file_alias.join("cargo")).expect("file symlink");
+        for path in [
+            directory.display().to_string(),
+            format!("{}:/nonexistent-cargo-directory", directory.display()),
+            format!("{}/", directory.display()),
+            format!("{}//", directory.display()),
+            directory_alias.display().to_string(),
+            file_alias.display().to_string(),
+            String::new(),
+            ":".to_string(),
+        ] {
+            let output = ProcessCommand::new(&cargo).env("PATH", path).current_dir(directory).output().expect("run isolated shim");
+            assert_eq!(output.status.code(), Some(127));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("no Cargo executable found"));
+        }
+        let output = ProcessCommand::new("/bin/sh").arg("cargo").current_dir(directory).env("PATH", directory).output().expect("sh cargo");
+        assert_eq!(output.status.code(), Some(127));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("no Cargo executable found"));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -8151,6 +8396,14 @@ mod tests {
             "tool environment belongs to the tool description; crew Git identity is a container baseline"
         );
         assert_eq!(opts.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), vec!["flotilla", "cleat", "rust-build-limits"]);
+        // The contained tool delivers both the workspace default and dependency profile shim.
+        assert!(opts.tools[2].environment.contains(&EnvironmentVariableUpdate::set(
+            "CARGO_PROFILE_DEV_DEBUG",
+            "line-tables-only",
+            "the Rust workspace debug profile"
+        )));
+        assert!(opts.tools[2].environment.contains(&EnvironmentVariableUpdate::prepend_path("PATH", CONTAINED_CARGO_SHIM_DIRECTORY)));
+        assert!(opts.tools[2].assets.iter().any(|asset| asset.environment_path.as_path() == Path::new(CONTAINED_CARGO_SHIM_PATH)));
         let jobs = opts.cpu_limit.expect("container CPU quota");
         assert!(jobs >= 2);
         assert!(opts.tools[2].environment.contains(&EnvironmentVariableUpdate::set(
