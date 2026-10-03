@@ -358,6 +358,22 @@ impl LeafSubscriptionTable {
     }
 
     async fn watch_row(&self, row: LeafSubscriptionRow) -> Result<(), String> {
+        loop {
+            match self.watch_row_once(row.clone()).await {
+                Err(ResourceError::WatchExpired { .. }) => {
+                    if !self.inner.rows.lock().await.contains_key(&row.id) {
+                        return Ok(());
+                    }
+                    // Level-triggered leaves recover from the current snapshot;
+                    // keep the same subscription and firing/episode accounting.
+                    tokio::task::yield_now().await;
+                }
+                result => return result.map_err(|error| error.to_string()),
+            }
+        }
+    }
+
+    async fn watch_row_once(&self, row: LeafSubscriptionRow) -> Result<(), ResourceError> {
         let convoys = self.inner.backend.including_replicas::<Convoy>(&row.namespace);
         let vessels = self.inner.backend.including_replicas::<Vessel>(&row.namespace);
         let change_requests = self.inner.backend.including_replicas::<ChangeRequest>(&row.namespace);
@@ -367,18 +383,18 @@ impl LeafSubscriptionTable {
         // Open watches before taking the level-triggered snapshots. Writes
         // racing the lists are then buffered by the streams and replayed by
         // the loop instead of falling through a list-then-watch gap.
-        let mut convoy_watch = convoys.watch().await.map_err(|error| error.to_string())?;
-        let mut vessel_watch = vessels.watch().await.map_err(|error| error.to_string())?;
-        let mut change_request_watch = change_requests.watch().await.map_err(|error| error.to_string())?;
-        let mut usage_watch = usages.watch().await.map_err(|error| error.to_string())?;
-        let mut issue_watch = issues.watch().await.map_err(|error| error.to_string())?;
-        let mut artifact_watch = artifacts.watch().await.map_err(|error| error.to_string())?;
-        let convoy_list = convoys.list().await.map_err(|error| error.to_string())?;
-        let vessel_list = vessels.list().await.map_err(|error| error.to_string())?;
-        let change_request_list = change_requests.list().await.map_err(|error| error.to_string())?;
-        let usage_list = usages.list().await.map_err(|error| error.to_string())?;
-        let issue_list = issues.list().await.map_err(|error| error.to_string())?;
-        let artifact_list = artifacts.list().await.map_err(|error| error.to_string())?;
+        let mut convoy_watch = convoys.watch().await?;
+        let mut vessel_watch = vessels.watch().await?;
+        let mut change_request_watch = change_requests.watch().await?;
+        let mut usage_watch = usages.watch().await?;
+        let mut issue_watch = issues.watch().await?;
+        let mut artifact_watch = artifacts.watch().await?;
+        let convoy_list = convoys.list().await?;
+        let vessel_list = vessels.list().await?;
+        let change_request_list = change_requests.list().await?;
+        let usage_list = usages.list().await?;
+        let issue_list = issues.list().await?;
+        let artifact_list = artifacts.list().await?;
         let mut convoy_objects = convoy_list.items.into_iter().fold(HashMap::new(), |mut objects, item| {
             objects.entry(item.object.metadata.name.clone()).or_insert(item.object);
             objects
@@ -414,7 +430,9 @@ impl LeafSubscriptionTable {
                 artifacts: &artifact_objects,
             },
             staleness,
-        )? {
+        )
+        .map_err(ResourceError::other)?
+        {
             self.fire(row.id, fire).await;
             if !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }) {
                 return Ok(());
@@ -424,15 +442,15 @@ impl LeafSubscriptionTable {
         loop {
             tokio::select! {
                 event = convoy_watch.next() => {
-                    let event = event.ok_or_else(|| "convoy resource watch closed".to_string())?.map_err(|error| error.to_string())?;
+                    let event = event.ok_or_else(|| ResourceError::other("convoy resource watch closed"))??;
                     apply_read_event(event, &mut convoy_objects);
                 }
                 event = vessel_watch.next() => {
-                    let event = event.ok_or_else(|| "vessel resource watch closed".to_string())?.map_err(|error| error.to_string())?;
+                    let event = event.ok_or_else(|| ResourceError::other("vessel resource watch closed"))??;
                     apply_read_event(event, &mut vessel_objects);
                 }
                 event = change_request_watch.next() => {
-                    let event = event.ok_or_else(|| "change request resource watch closed".to_string())?.map_err(|error| error.to_string())?;
+                    let event = event.ok_or_else(|| ResourceError::other("change request resource watch closed"))??;
                     let name = match event {
                         ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) | ReadWatchEvent::Deleted(item) => item.object.metadata.name,
                         ReadWatchEvent::DeletedByName { tombstone, .. } => tombstone.name,
@@ -440,7 +458,7 @@ impl LeafSubscriptionTable {
                     // A buffered event may precede the initial list snapshot, and a
                     // deletion may expose a suppressed self-origin copy. Refresh
                     // only this name from the current store on either transition.
-                    let copies = change_requests.get_all(&name).await.map_err(|error| error.to_string())?;
+                    let copies = change_requests.get_all(&name).await?;
                     let mut by_source = BTreeMap::new();
                     for item in copies.items {
                         by_source.insert(resource_source(&item.provenance), item.object);
@@ -453,12 +471,12 @@ impl LeafSubscriptionTable {
                     update_freshest_change_request(&name, &change_request_sources, &mut change_request_objects);
                 }
                 event = issue_watch.next() => {
-                    let event = event.ok_or_else(|| "issue resource watch closed".to_string())?.map_err(|error| error.to_string())?;
+                    let event = event.ok_or_else(|| ResourceError::other("issue resource watch closed"))??;
                     let name = match event {
                         ReadWatchEvent::Added(item) | ReadWatchEvent::Modified(item) | ReadWatchEvent::Deleted(item) => item.object.metadata.name,
                         ReadWatchEvent::DeletedByName { tombstone, .. } => tombstone.name,
                     };
-                    let copies = issues.get_all(&name).await.map_err(|error| error.to_string())?;
+                    let copies = issues.get_all(&name).await?;
                     let mut by_source = BTreeMap::new();
                     for item in copies.items {
                         by_source.insert(resource_source(&item.provenance), item.object);
@@ -471,11 +489,11 @@ impl LeafSubscriptionTable {
                     update_freshest_issue(&name, &issue_sources, &mut issue_objects);
                 }
                 event = usage_watch.next() => {
-                    let event = event.ok_or_else(|| "usage resource watch closed".to_string())?.map_err(|error| error.to_string())?;
+                    let event = event.ok_or_else(|| ResourceError::other("usage resource watch closed"))??;
                     apply_read_event(event, &mut usage_objects);
                 }
                 event = artifact_watch.next() => {
-                    let event = event.ok_or_else(|| "artifact resource watch closed".to_string())?.map_err(|error| error.to_string())?;
+                    let event = event.ok_or_else(|| ResourceError::other("artifact resource watch closed"))??;
                     apply_read_event(event, &mut artifact_objects);
                 }
             }
@@ -491,7 +509,9 @@ impl LeafSubscriptionTable {
                     artifacts: &artifact_objects,
                 },
                 staleness,
-            )? {
+            )
+            .map_err(ResourceError::other)?
+            {
                 self.fire(row.id, fire).await;
                 if !matches!(row.watcher, LeafWatcher::TurnDelivery { .. }) {
                     return Ok(());
@@ -2542,6 +2562,45 @@ mod tests {
                 mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
             })
         }
+    }
+
+    // A live wait must survive queue overflow and evaluate the current state
+    // after relisting, with its original subscription identity intact.
+    #[tokio::test]
+    async fn leaf_wait_recovers_after_watch_overflow() {
+        use futures::FutureExt;
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let table = supervision_wake(&backend).subscriptions;
+        create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+        let id = uuid::Uuid::new_v4();
+        let row = LeafSubscriptionRow {
+            id,
+            namespace: "flotilla".into(),
+            leaves: vec![leaf(LeafAddress::Convoy { name: "busy".into() }, ".status.phase", "Failed")],
+            watcher: LeafWatcher::WaitCaller { connection_id: uuid::Uuid::new_v4() },
+            maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
+            freshness_demand: None,
+            created_at: Utc::now(),
+            episode_key: EpisodeKeyFields::default(),
+        };
+        table.inner.rows.lock().await.insert(id, row.clone());
+        let mut watching = Box::pin(table.watch_row(row));
+        // Poll through watch registration and snapshot loading, then deliberately
+        // stop polling while writes outrun the bounded ring.
+        assert!(watching.as_mut().now_or_never().is_none());
+        let convoys = backend.using::<Convoy>("flotilla");
+        let mut object = convoys.get("busy").await.expect("convoy");
+        for index in 0..600 {
+            let spec = ConvoySpec::builder().workflow_ref(format!("workflow-{index}")).build();
+            object = convoys.update(&InputMeta::from(&object.metadata), &object.metadata.resource_version, &spec).await.expect("update");
+        }
+        convoys
+            .update_status("busy", &object.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() })
+            .await
+            .expect("fail convoy");
+        tokio::time::timeout(Duration::from_secs(2), watching).await.expect("wait recovers").expect("watch succeeds");
+        assert!(!table.rows().await.iter().any(|row| row.id == id), "recovered wait fires and releases its row");
+        assert!(table.inner.last_firings.lock().await.is_empty(), "one-shot wait releases firing state");
     }
 
     fn convoy_spec() -> ConvoySpec {

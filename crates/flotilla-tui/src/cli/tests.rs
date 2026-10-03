@@ -455,11 +455,14 @@ fn blob_sync_diagnostics_render_in_host_list_and_status() {
             .convoy_count(0)
             .staleness(flotilla_protocol::FleetHostStaleness::Current)
             .observation_agreement(flotilla_protocol::FleetObservationAgreement::Agree)
+            .daemon_rss_bytes(128 * 1024 * 1024)
             .blob_sync(sync.clone())
             .build()],
         ..Default::default()
     };
     let list = super::format_fleet_health_human(&fleet);
+    assert!(list.contains("Daemon RSS"));
+    assert!(list.contains("128.0 MiB"));
     assert!(list.contains("Blob Sync"));
     assert!(list.contains("2 pending; endpoint unavailable"));
 

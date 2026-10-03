@@ -1187,3 +1187,13 @@ async fn reopening_with_smaller_retention_compacts_existing_events_and_persists_
         Err(flotilla_resources::ResourceError::WatchExpired { compacted_through, .. }) if compacted_through.as_deref() == Some("2")
     ));
 }
+
+#[tokio::test]
+async fn slow_convoy_watch_is_bounded() {
+    common::contract::assert_slow_convoy_watch_is_bounded(backend()).await;
+}
+
+#[tokio::test]
+async fn slow_replica_watch_is_bounded() {
+    common::contract::assert_slow_replica_watch_is_bounded(backend()).await;
+}

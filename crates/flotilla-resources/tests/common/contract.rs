@@ -1096,3 +1096,77 @@ pub async fn assert_metadata_roundtrip_with_backend<F: ResourceContractFixture>(
 pub async fn assert_metadata_roundtrip<F: ResourceContractFixture>() {
     assert_metadata_roundtrip_with_backend::<F>(in_memory_backend()).await;
 }
+
+// Under steady convoy updates, a stalled consumer must expire rather than
+// retain every full resource object indefinitely. Relisting recovers state.
+pub async fn assert_slow_convoy_watch_is_bounded(backend: ResourceBackend) {
+    let convoys = backend.using::<Convoy>("flotilla");
+    let mut objects = Vec::new();
+    for index in 0..64 {
+        let mut meta = convoy_meta(&format!("load-{index}"));
+        meta.annotations.insert("payload".to_string(), "x".repeat(16 * 1024));
+        objects.push(convoys.create(&meta, &convoy_spec("load")).await.expect("create convoy"));
+    }
+    let mut watches = Vec::new();
+    for _ in 0..4 {
+        watches.push(convoys.watch(WatchStart::Now).await.expect("subscribe"));
+    }
+    for step in 0..2048 {
+        let object = &mut objects[step % 64];
+        let mut spec = object.spec.clone();
+        spec.workflow_ref = format!("load-{step}");
+        *object =
+            convoys.update(&InputMeta::from(&object.metadata), &object.metadata.resource_version, &spec).await.expect("update convoy");
+    }
+    for mut watch in watches {
+        let mut delivered = 0;
+        loop {
+            match timeout(Duration::from_secs(1), watch.next()).await.expect("watch must report overflow") {
+                Some(Ok(_)) => {
+                    delivered += 1;
+                    assert!(delivered <= 1024, "slow watch retained {delivered} full convoy updates");
+                }
+                Some(Err(ResourceError::WatchExpired { .. })) => break,
+                event => panic!("expected expiry, got {event:?}"),
+            }
+        }
+        assert!(watch.next().await.is_none(), "expired watch must terminate");
+    }
+    let listed = convoys.list().await.expect("relist");
+    assert_eq!(listed.items.len(), 64);
+    let mut recovered = convoys.watch(WatchStart::resuming_from(&listed)).await.expect("recover watch");
+    let object = &objects[0];
+    convoys
+        .update(&InputMeta::from(&object.metadata), &object.metadata.resource_version, &convoy_spec("recovered"))
+        .await
+        .expect("update after recovery");
+    assert!(matches!(recovered.next().await, Some(Ok(WatchEvent::Modified(_)))));
+}
+
+// Replica notifications use the same bounded ring: overflow requires relisting
+// all sources, and re-subscribing must deliver the next replica write.
+pub async fn assert_slow_replica_watch_is_bounded(backend: ResourceBackend) {
+    let remote = in_memory_backend().using::<Convoy>("flotilla");
+    let mut object = remote.create(&convoy_meta("replicated"), &convoy_spec("start")).await.expect("remote convoy");
+    let writer = backend.replica_writer::<Convoy>(flotilla_protocol::NodeId::new("remote"), "flotilla");
+    writer.apply(WatchEvent::Added(object.clone()), Utc::now()).await.expect("initial replica");
+    let resolver = backend.including_replicas::<Convoy>("flotilla");
+    let mut stalled = resolver.watch().await.expect("replica watch");
+    for index in 0..600 {
+        object = remote
+            .update(&convoy_meta("replicated"), &object.metadata.resource_version, &convoy_spec(&format!("load-{index}")))
+            .await
+            .expect("remote update");
+        writer.apply(WatchEvent::Modified(object.clone()), Utc::now()).await.expect("replicate update");
+    }
+    assert!(matches!(stalled.next().await, Some(Err(ResourceError::WatchExpired { .. }))));
+    drop(stalled);
+    assert_eq!(resolver.list().await.expect("relist replicas").items[0].object.spec.workflow_ref, "load-599");
+    let mut recovered = resolver.watch().await.expect("recovered replica watch");
+    object = remote
+        .update(&convoy_meta("replicated"), &object.metadata.resource_version, &convoy_spec("recovered"))
+        .await
+        .expect("remote update");
+    writer.apply(WatchEvent::Modified(object), Utc::now()).await.expect("replicate after recovery");
+    assert!(matches!(recovered.next().await, Some(Ok(flotilla_resources::ReadWatchEvent::Modified(_)))));
+}

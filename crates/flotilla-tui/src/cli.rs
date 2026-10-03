@@ -186,6 +186,7 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
             "Convoys",
             "Surfaces",
             "Disk Free",
+            "Daemon RSS",
             "Blob Sync",
             "Sleep Inhibition",
             "Staleness",
@@ -237,6 +238,9 @@ pub(crate) fn format_fleet_health_human(response: &FleetHealthResponse) -> Strin
                     host.surface_states.available, host.surface_states.stalled_handled, host.surface_states.needs_you
                 )),
                 Cell::new(format_disk_free(host.disk_free_bytes)),
+                Cell::new(
+                    host.daemon_rss_bytes.map_or_else(|| "-".to_string(), |bytes| format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))),
+                ),
                 Cell::new(host.blob_sync.as_ref().map_or_else(
                     || "-".to_string(),
                     |sync| match &sync.last_error {

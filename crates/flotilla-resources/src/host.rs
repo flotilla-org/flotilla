@@ -140,6 +140,10 @@ pub struct HostStatus {
     /// Available bytes on the host-direct checkout root used for convoy admission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free_bytes: Option<u64>,
+    /// Daemon RSS from the latest heartbeat. Previous-generation Host records
+    /// omit this field; keep the decoder default through the next fleet roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_rss_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_free_space_floor_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -370,6 +374,7 @@ pub enum HostStatusPatch {
         daemon_version: Option<String>,
         daemon_started_at: Option<DateTime<Utc>>,
         disk_free_bytes: Option<u64>,
+        daemon_rss_bytes: Option<u64>,
         admission_free_space_floor_bytes: Option<u64>,
         agent_adapter_baseline: Option<BTreeSet<String>>,
         // Keep the in-process patch enum small; HostStatus stores the unboxed value.
@@ -398,6 +403,7 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 daemon_version,
                 daemon_started_at,
                 disk_free_bytes,
+                daemon_rss_bytes,
                 admission_free_space_floor_bytes,
                 agent_adapter_baseline,
                 resource_store,
@@ -420,6 +426,7 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 status.daemon_version.clone_from(daemon_version);
                 status.daemon_started_at = *daemon_started_at;
                 status.disk_free_bytes = *disk_free_bytes;
+                status.daemon_rss_bytes = *daemon_rss_bytes;
                 status.admission_free_space_floor_bytes = *admission_free_space_floor_bytes;
                 status.agent_adapter_baseline.clone_from(agent_adapter_baseline);
                 status.resource_store = resource_store.as_deref().cloned();

@@ -879,6 +879,7 @@ async fn create_ready_host(backend: &ResourceBackend, name: &str) {
         daemon_version: None,
         daemon_started_at: None,
         disk_free_bytes: None,
+        daemon_rss_bytes: None,
         admission_free_space_floor_bytes: None,
         agent_adapter_baseline: None,
         resource_store: None,
