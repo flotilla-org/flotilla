@@ -4,7 +4,7 @@ use flotilla_protocol::qualified_path::{HostId, QualifiedPath};
 use tokio::sync::{broadcast, Mutex, Notify};
 
 use super::*;
-use crate::event_sink::RecordingEventSink;
+use crate::event_sink::{broadcast_test_sink, RecordingEventSink};
 
 struct TestResolver {
     outcomes: std::sync::Mutex<Vec<Result<StepOutcome, String>>>,
@@ -47,9 +47,8 @@ fn remote_host() -> NodeId {
     }
 }
 
-fn setup() -> (CancellationToken, broadcast::Sender<DaemonEvent>) {
-    let (tx, _rx) = broadcast::channel(64);
-    (CancellationToken::new(), tx)
+fn setup() -> (CancellationToken, Arc<RecordingEventSink>) {
+    (CancellationToken::new(), Arc::new(RecordingEventSink::default()))
 }
 
 #[derive(Clone)]
@@ -115,7 +114,6 @@ impl RemoteStepExecutor for TestRemoteExecutor {
 #[tokio::test]
 async fn all_steps_succeed() {
     let (cancel, tx) = setup();
-    let mut rx = tx.subscribe();
     let resolver = TestResolver::new(vec![Ok(StepOutcome::Completed), Ok(StepOutcome::Completed)]);
     let plan = StepPlan::new(vec![make_step("step-a"), make_step("step-b")]);
 
@@ -126,17 +124,14 @@ async fn all_steps_succeed() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &resolver,
     )
     .await;
     assert_eq!(result, CommandValue::Ok);
 
     // Should have 4 events: Started+Succeeded for each step
-    let mut events = vec![];
-    while let Ok(evt) = rx.try_recv() {
-        events.push(evt);
-    }
+    let events = tx.events();
     assert_eq!(events.len(), 4);
 }
 
@@ -181,7 +176,7 @@ async fn step_failure_stops_execution() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &resolver,
     )
     .await;
@@ -202,7 +197,7 @@ async fn cancellation_before_step() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &resolver,
     )
     .await;
@@ -247,7 +242,7 @@ async fn cancellation_during_running_step_returns_cancelled() {
             RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             ExecutionEnvironmentPath::new("/repo"),
             cancel2,
-            Arc::new(tx),
+            tx.clone(),
             &resolver,
         )
         .await
@@ -273,7 +268,7 @@ async fn skipped_step_continues() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &resolver,
     )
     .await;
@@ -299,7 +294,7 @@ async fn completed_with_overrides_result() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &resolver,
     )
     .await;
@@ -322,7 +317,7 @@ async fn empty_plan_returns_ok() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &resolver,
     )
     .await;
@@ -342,7 +337,7 @@ async fn symbolic_step_action_succeeds() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &resolver,
     )
     .await;
@@ -368,7 +363,7 @@ async fn produced_does_not_override_final_result() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &resolver,
     )
     .await;
@@ -394,7 +389,7 @@ async fn later_failure_preserves_earlier_completed_with() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &resolver,
     )
     .await;
@@ -448,7 +443,7 @@ async fn local_step_consumes_produced_outcome_from_remote_step() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &PriorAssertingResolver,
         &remote,
     )
@@ -475,7 +470,6 @@ async fn remote_failure_stops_execution() {
     }
 
     let (cancel, tx) = setup();
-    let mut rx = tx.subscribe();
     let remote_host = remote_host();
     let plan = StepPlan::new(vec![
         Step { description: "remote".into(), host: StepExecutionContext::Host(remote_host.clone()), action: StepAction::Noop },
@@ -508,7 +502,7 @@ async fn remote_failure_stops_execution() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &PanicResolver,
         &remote,
     )
@@ -516,7 +510,7 @@ async fn remote_failure_stops_execution() {
 
     assert_eq!(result, CommandValue::Error { message: "boom".into() });
 
-    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    let events = tx.events();
     assert!(events.iter().all(|event| match event {
         DaemonEvent::CommandStepUpdate { step_index, .. } => *step_index == 0,
         _ => true,
@@ -541,7 +535,6 @@ async fn remote_error_emits_failed_step_update_without_progress_failure() {
     }
 
     let (cancel, tx) = setup();
-    let mut rx = tx.subscribe();
     let remote_host = remote_host();
     let plan = StepPlan::new(vec![
         Step { description: "remote".into(), host: StepExecutionContext::Host(remote_host.clone()), action: StepAction::Noop },
@@ -566,7 +559,7 @@ async fn remote_error_emits_failed_step_update_without_progress_failure() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &PanicResolver,
         &remote,
     )
@@ -574,7 +567,7 @@ async fn remote_error_emits_failed_step_update_without_progress_failure() {
 
     assert_eq!(result, CommandValue::Error { message: "boom".into() });
 
-    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    let events = tx.events();
     assert!(events.iter().any(|event| {
         matches!(
             event,
@@ -592,7 +585,6 @@ async fn remote_error_emits_failed_step_update_without_progress_failure() {
 #[tokio::test]
 async fn remote_error_uses_latest_started_step_for_multi_step_batch() {
     let (cancel, tx) = setup();
-    let mut rx = tx.subscribe();
     let resolver = TestResolver::new(vec![Ok(StepOutcome::Completed)]);
     let remote_host = remote_host();
     let plan = StepPlan::new(vec![
@@ -627,7 +619,7 @@ async fn remote_error_uses_latest_started_step_for_multi_step_batch() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &resolver,
         &remote,
     )
@@ -635,7 +627,7 @@ async fn remote_error_uses_latest_started_step_for_multi_step_batch() {
 
     assert_eq!(result, CommandValue::Error { message: "boom".into() });
 
-    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    let events = tx.events();
     let failure_events: Vec<_> = events
         .into_iter()
         .filter_map(|event| match event {
@@ -673,7 +665,6 @@ async fn remote_error_does_not_duplicate_failed_progress() {
     }
 
     let (cancel, tx) = setup();
-    let mut rx = tx.subscribe();
     let remote_host = remote_host();
     let plan = StepPlan::new(vec![Step {
         description: "remote".into(),
@@ -707,7 +698,7 @@ async fn remote_error_does_not_duplicate_failed_progress() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &PanicResolver,
         &remote,
     )
@@ -715,7 +706,9 @@ async fn remote_error_does_not_duplicate_failed_progress() {
 
     assert_eq!(result, CommandValue::Error { message: "boom".into() });
 
-    let failure_events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+    let failure_events: Vec<_> = tx
+        .events()
+        .into_iter()
         .filter(|event| matches!(event, DaemonEvent::CommandStepUpdate { status: StepStatus::Failed { .. }, .. }))
         .collect();
     assert_eq!(failure_events.len(), 1);
@@ -724,7 +717,6 @@ async fn remote_error_does_not_duplicate_failed_progress() {
 #[tokio::test]
 async fn remote_progress_maps_to_global_step_indices() {
     let (cancel, tx) = setup();
-    let mut rx = tx.subscribe();
     let resolver = TestResolver::new(vec![Ok(StepOutcome::Completed), Ok(StepOutcome::Completed)]);
     let remote_host = remote_host();
     let plan = StepPlan::new(vec![
@@ -772,7 +764,7 @@ async fn remote_progress_maps_to_global_step_indices() {
         RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
         ExecutionEnvironmentPath::new("/repo"),
         cancel,
-        Arc::new(tx),
+        tx.clone(),
         &resolver,
         &remote,
     )
@@ -780,7 +772,9 @@ async fn remote_progress_maps_to_global_step_indices() {
 
     assert_eq!(result, CommandValue::Ok);
 
-    let remote_indices: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+    let remote_indices: Vec<_> = tx
+        .events()
+        .into_iter()
         .filter_map(|event| match event {
             DaemonEvent::CommandStepUpdate { node_id, step_index, .. } if node_id == remote_host => Some(step_index),
             _ => None,
@@ -802,7 +796,7 @@ async fn remote_progress_omits_repo_path_when_batch_context_missing() {
         repo: None,
         step_offset: 0,
         step_count: 1,
-        event_sink: Arc::new(tx),
+        event_sink: broadcast_test_sink(tx),
         state: std::sync::Mutex::new(RemoteProgressState::default()),
     };
 
@@ -875,7 +869,7 @@ async fn cancellation_while_remote_segment_active_cancels_remote_batch() {
             RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             ExecutionEnvironmentPath::new("/repo"),
             cancel_clone,
-            Arc::new(tx),
+            tx.clone(),
             &PanicResolver,
             &remote_clone,
         )
@@ -921,7 +915,6 @@ async fn cancellation_while_remote_segment_active_returns_cancelled_even_if_remo
         result: Err("cancelled".into()),
     }]);
     let (cancel, tx) = setup();
-    let mut rx = tx.subscribe();
     let plan = StepPlan::new(vec![Step {
         description: "remote".into(),
         host: StepExecutionContext::Host(remote_host.clone()),
@@ -930,6 +923,7 @@ async fn cancellation_while_remote_segment_active_returns_cancelled_even_if_remo
 
     let cancel_clone = cancel.clone();
     let remote_clone = remote.clone();
+    let task_sink = tx.clone();
     let task = tokio::spawn(async move {
         run_step_plan_with_remote_executor(
             plan,
@@ -938,7 +932,7 @@ async fn cancellation_while_remote_segment_active_returns_cancelled_even_if_remo
             RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             ExecutionEnvironmentPath::new("/repo"),
             cancel_clone,
-            Arc::new(tx),
+            task_sink,
             &PanicResolver,
             &remote_clone,
         )
@@ -952,7 +946,9 @@ async fn cancellation_while_remote_segment_active_returns_cancelled_even_if_remo
     assert_eq!(result, CommandValue::Cancelled);
     assert_eq!(remote.cancelled_commands().await, vec![12]);
 
-    let failure_events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+    let failure_events: Vec<_> = tx
+        .events()
+        .into_iter()
         .filter(|event| matches!(event, DaemonEvent::CommandStepUpdate { status: StepStatus::Failed { .. }, .. }))
         .collect();
     assert!(failure_events.is_empty());
@@ -999,7 +995,7 @@ async fn cancellation_after_remote_cancel_timeout_returns_cancelled_without_wait
             RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
             ExecutionEnvironmentPath::new("/repo"),
             cancel_clone,
-            Arc::new(tx),
+            tx.clone(),
             &TestResolver::new(vec![]),
             &remote,
         )

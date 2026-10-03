@@ -1,10 +1,13 @@
 //! Event publication port for in-process services.
 
+#[cfg(test)]
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use flotilla_protocol::DaemonEvent;
 use tokio::sync::broadcast;
 
+/// Publishes synchronously in call order; delivery failures are discarded by the broadcast adapter.
 pub trait EventSink: Send + Sync {
     fn emit(&self, event: DaemonEvent);
 }
@@ -15,6 +18,10 @@ pub struct BroadcastEventSink {
 }
 
 impl BroadcastEventSink {
+    pub fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
+        self.sender.subscribe()
+    }
+
     pub fn new(sender: broadcast::Sender<DaemonEvent>) -> Self {
         Self { sender }
     }
@@ -26,13 +33,10 @@ impl EventSink for BroadcastEventSink {
     }
 }
 
-// Unit tests keep their existing broadcast subscriptions while injecting the
-// publishing port into leaf and step execution.
+/// Broadcast adapter for tests that exercise subscriptions or asynchronous delivery.
 #[cfg(test)]
-impl EventSink for broadcast::Sender<DaemonEvent> {
-    fn emit(&self, event: DaemonEvent) {
-        let _ = self.send(event);
-    }
+pub(crate) fn broadcast_test_sink(sender: broadcast::Sender<DaemonEvent>) -> Arc<dyn EventSink> {
+    Arc::new(BroadcastEventSink::new(sender))
 }
 
 /// A test sink that retains events in emission order without requiring subscribers.
@@ -87,5 +91,56 @@ mod tests {
         sink.emit(event("repo"));
 
         assert!(matches!(receiver.recv().await.expect("broadcast event"), DaemonEvent::RepoUntracked { .. }));
+    }
+    // Behaviour (#2255): publication preserves order and duplicates, including
+    // empty batches and batches crossing the daemon channel's 256-event capacity.
+    #[hegel::test]
+    fn recording_sink_preserves_generated_sequences(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(257));
+        // Small values deliberately produce repeated events.
+        let paths: Vec<_> = (0..count).map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(3)).to_string()).collect();
+        let sink = RecordingEventSink::default();
+        for path in &paths {
+            sink.emit(event(path));
+        }
+        let observed: Vec<_> = sink
+            .events()
+            .into_iter()
+            .map(|event| match event {
+                DaemonEvent::RepoUntracked { repo_identity, .. } => repo_identity.path,
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect();
+        assert_eq!(observed, paths);
+    }
+
+    // Behaviour (#2255): broadcast errors remain discarded, late subscribers
+    // receive no replay, and lagging receivers keep Tokio's original lag semantics.
+    #[test]
+    fn broadcast_sink_preserves_absent_and_lagging_subscriber_semantics() {
+        let (sender, receiver) = broadcast::channel(2);
+        drop(receiver);
+        let sink = BroadcastEventSink::new(sender);
+        sink.emit(event("no subscribers"));
+        let mut slow = sink.subscribe();
+        let mut fast = sink.subscribe();
+        assert!(matches!(slow.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+        for path in ["first", "second", "third"] {
+            sink.emit(event(path));
+            assert!(
+                matches!(fast.try_recv().expect("live event"), DaemonEvent::RepoUntracked { repo_identity, .. } if repo_identity.path == path)
+            );
+        }
+        assert!(matches!(slow.try_recv(), Err(broadcast::error::TryRecvError::Lagged(1))));
+        for path in ["second", "third"] {
+            assert!(
+                matches!(slow.try_recv().expect("retained event"), DaemonEvent::RepoUntracked { repo_identity, .. } if repo_identity.path == path)
+            );
+        }
+        drop(slow);
+        drop(fast);
+        sink.emit(event("no subscribers again"));
+        assert!(matches!(sink.subscribe().try_recv(), Err(broadcast::error::TryRecvError::Empty)));
     }
 }

@@ -27,7 +27,6 @@ use crate::{
     aggregator_projection::AggregatorProjectionState,
     config::ConfigStore,
     environment_manager::{EnvironmentManager, ManagedEnvironmentKind},
-    event_sink::EventSink,
     hop_chain::{
         environment::DockerEnvironmentHopResolver,
         remote::{ssh_resolver_from_config, NoopRemoteHopResolver},
@@ -41,8 +40,6 @@ use crate::{
 };
 
 pub(super) struct AttachResolver<'a> {
-    // Wired now so future attach operations can publish through the daemon port.
-    pub(super) _event_sink: Arc<dyn EventSink>,
     pub(super) resource_backend: &'a ResourceBackend,
     pub(super) observed_resource_backend: &'a ResourceBackend,
     pub(super) aggregator_projection_state: &'a AggregatorProjectionState,

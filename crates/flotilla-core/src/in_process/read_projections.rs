@@ -44,7 +44,6 @@ use crate::{
     checkout_integration::LANDING_EVIDENCE_TTL,
     config::ConfigStore,
     environment_manager::EnvironmentManager,
-    event_sink::EventSink,
     fleet::{
         accumulate_fleet_health_counts, fleet_observation_agreement, format_resource_replication_failures, host_credential_attention,
         join_replica_errors, replica_sync_is_fresh, replicated_host_reports, FleetService, ResourceReplicationFailure,
@@ -61,8 +60,6 @@ use crate::{
 /// Projects resource and fleet state supplied by the daemon and FleetService.
 /// Host refresh stays with the daemon; FleetService gathers local and replica rows.
 pub(super) struct ReadProjections<'a> {
-    // Wired now for read-side operations introduced by later slices.
-    pub(super) _event_sink: Arc<dyn EventSink>,
     pub(super) backend: &'a ResourceBackend,
     pub(super) config: &'a ConfigStore,
     pub(super) host_registry: &'a crate::host_registry::HostRegistry,
@@ -1364,6 +1361,7 @@ mod tests {
     use crate::{
         aggregator_projection::AggregatorProjectionState,
         change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher, GhChangeRequestObservationSource},
+        event_sink::{EventSink, RecordingEventSink},
         providers::{discovery::EnvironmentBag, ProcessCommandRunner},
     };
 
@@ -1548,7 +1546,6 @@ mod tests {
         clock: Arc<dyn Clock>,
         subscriptions: LeafSubscriptionTable,
         fleet: FleetService,
-        event_sink: Arc<dyn EventSink>,
     }
 
     impl ProjectionFixture {
@@ -1556,7 +1553,7 @@ mod tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let backend = ResourceBackend::InMemory(InMemoryBackend::default());
             let config = Arc::new(ConfigStore::with_base(temp.path()));
-            let event_sink: Arc<dyn EventSink> = Arc::new(crate::event_sink::RecordingEventSink::default());
+            let event_sink: Arc<dyn EventSink> = Arc::new(RecordingEventSink::default());
             let runner: Arc<dyn crate::providers::CommandRunner> = Arc::new(ProcessCommandRunner);
             let host_name = HostName::new("local");
             let host_id = HostId::new("local-id");
@@ -1579,26 +1576,12 @@ mod tests {
                 ChangeRequestRefreshCadence::default(),
             );
             let subscriptions = LeafSubscriptionTable::new(backend.clone(), Arc::clone(&event_sink), refresher);
-            let fleet =
-                FleetService::new(Arc::clone(&event_sink), backend.clone(), AggregatorProjectionState::new(), host_name.clone(), None);
-            Self {
-                temp,
-                backend,
-                config,
-                registry,
-                environments,
-                host_name,
-                node_id,
-                clock: Arc::new(SystemClock),
-                subscriptions,
-                fleet,
-                event_sink,
-            }
+            let fleet = FleetService::new(backend.clone(), AggregatorProjectionState::new(), host_name.clone(), None);
+            Self { temp, backend, config, registry, environments, host_name, node_id, clock: Arc::new(SystemClock), subscriptions, fleet }
         }
 
         fn projections(&self) -> ReadProjections<'_> {
             ReadProjections {
-                _event_sink: Arc::clone(&self.event_sink),
                 backend: &self.backend,
                 config: &self.config,
                 host_registry: &self.registry,

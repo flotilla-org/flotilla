@@ -1,9 +1,6 @@
 //! Fleet views and health evidence from replicated resources.
 
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
@@ -21,7 +18,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::{
-    aggregator_projection::AggregatorProjectionState, event_sink::EventSink, host_registry::HostRegistry,
+    aggregator_projection::AggregatorProjectionState, host_registry::HostRegistry,
     host_resolution::canonical_placement_host_ref_from_sources,
 };
 
@@ -76,8 +73,6 @@ pub(crate) async fn replicated_host_reports(
     reports
 }
 pub(crate) struct FleetService {
-    // Retained for federation events introduced by later slices.
-    _event_sink: Arc<dyn EventSink>,
     resource_backend: ResourceBackend,
     aggregator_projection_state: AggregatorProjectionState,
     host_name: HostName,
@@ -87,14 +82,12 @@ pub(crate) struct FleetService {
 
 impl FleetService {
     pub(crate) fn new(
-        event_sink: Arc<dyn EventSink>,
         resource_backend: ResourceBackend,
         aggregator_projection_state: AggregatorProjectionState,
         host_name: HostName,
         canonical_local_host_id: Option<CanonicalHostId>,
     ) -> Self {
         Self {
-            _event_sink: event_sink,
             resource_backend,
             aggregator_projection_state,
             host_name,

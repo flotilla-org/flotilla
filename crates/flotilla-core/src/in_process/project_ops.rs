@@ -25,7 +25,6 @@ use super::{
     convoy_ensure_name, ensure_repository_and_default_project_workflow, project_not_ready_error, repository_matches_target, InProcessDaemon,
 };
 use crate::{
-    event_sink::EventSink,
     ops_entry::{
         parse_operational_entry, OperationalEntryDefinition, DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION,
         DECLARATION_REFUSED_SINCE_ANNOTATION, MATERIALIZED_PROJECT_ANNOTATION, PRESENTS_AS_ANNOTATION, SOURCE_COMMIT_ANNOTATION,
@@ -212,8 +211,6 @@ pub(super) struct ProjectService<'a> {
     pub(super) observed_resource_backend: &'a ResourceBackend,
     pub(super) clock: &'a Arc<dyn Clock>,
     pub(super) namespace: &'a std::sync::RwLock<String>,
-    // This port is injected even though this slice does not publish daemon events.
-    pub(super) _event_sink: Arc<dyn EventSink>,
     pub(super) repository_index: RepositoryIndex<'a>,
     pub(super) operations: &'a dyn ProjectOperations,
 }
@@ -1277,7 +1274,6 @@ mod tests {
             observed_resource_backend: &observed,
             clock: &clock,
             namespace: &namespace,
-            _event_sink: Arc::new(crate::event_sink::RecordingEventSink::default()),
             repository_index: RepositoryIndex { keys_by_path: &repository_keys_by_path },
             operations: &operations,
         };

@@ -1662,7 +1662,7 @@ type CheckoutVcsCache = HashMap<(EnvironmentId, PathBuf), Arc<tokio::sync::OnceC
 pub struct InProcessDaemon {
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
-    event_tx: broadcast::Sender<DaemonEvent>,
+    event_source: Arc<BroadcastEventSink>,
     event_sink: Arc<dyn EventSink>,
     config: Arc<ConfigStore>,
     next_command_id: AtomicU64,
@@ -1903,7 +1903,8 @@ impl InProcessDaemon {
 
         let discovery = Arc::new(discovery);
         let (event_tx, _) = broadcast::channel(256);
-        let event_sink: Arc<dyn EventSink> = Arc::new(BroadcastEventSink::new(event_tx.clone()));
+        let event_source = Arc::new(BroadcastEventSink::new(event_tx));
+        let event_sink: Arc<dyn EventSink> = event_source.clone();
         let mut repos: HashMap<flotilla_protocol::RepoIdentity, RepoState> = HashMap::new();
         let mut order = Vec::new();
         let mut path_identities = HashMap::new();
@@ -2138,7 +2139,7 @@ impl InProcessDaemon {
         let daemon = Arc::new_cyclic(|self_weak| Self {
             repos: Arc::clone(&repos),
             repo_order: RwLock::new(order),
-            event_tx: event_tx.clone(),
+            event_source,
             event_sink: event_sink.clone(),
             config: Arc::clone(&config),
             next_command_id: AtomicU64::new(1),
@@ -2178,7 +2179,6 @@ impl InProcessDaemon {
                 .host_name(host_name.clone())
                 .clock(Arc::clone(&clock))
                 .fulfilment_decider(Arc::new(StaticFulfilmentDecider))
-                .event_sink(event_sink.clone())
                 .build(),
             ensure_admission_retries: Mutex::new(HashMap::new()),
             ensure_reconciliation: Mutex::new(()),
@@ -2195,7 +2195,6 @@ impl InProcessDaemon {
             aggregator_projection_state: aggregator_projection_state.clone(),
             provisioning_namespace: Arc::clone(&provisioning_namespace),
             fleet: FleetService::new(
-                event_sink.clone(),
                 resource_backend.clone(),
                 aggregator_projection_state.clone(),
                 host_name.clone(),
@@ -2988,7 +2987,7 @@ impl InProcessDaemon {
 
     fn start_context_free_command(&self, command_id: u64, description: String) -> flotilla_protocol::RepoIdentity {
         let repo_identity = empty_repo_identity();
-        let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+        self.event_sink.emit(DaemonEvent::CommandStarted {
             command_id,
             node_id: self.node_id.clone(),
             repo_identity: repo_identity.clone(),
@@ -3004,13 +3003,7 @@ impl InProcessDaemon {
         repo_identity: flotilla_protocol::RepoIdentity,
         result: flotilla_protocol::CommandValue,
     ) {
-        let _ = self.event_tx.send(DaemonEvent::CommandFinished {
-            command_id,
-            node_id: self.node_id.clone(),
-            repo_identity,
-            repo: None,
-            result,
-        });
+        self.event_sink.emit(DaemonEvent::CommandFinished { command_id, node_id: self.node_id.clone(), repo_identity, repo: None, result });
     }
 
     pub async fn aggregator_projection_state(&self) -> AggregatorProjectionState {
@@ -3306,7 +3299,7 @@ impl InProcessDaemon {
         let remote_counts = HashMap::new();
         self.host_registry
             .set_configured_peers(peers, &remote_counts, &|e| {
-                let _ = self.event_tx.send(e);
+                self.event_sink.emit(e);
             })
             .await;
     }
@@ -3315,7 +3308,7 @@ impl InProcessDaemon {
         let projection = self.host_registry.description_projection.lock().await;
         self.host_registry
             .sync_peer_identities(identities, &|event| {
-                let _ = self.event_tx.send(event);
+                self.event_sink.emit(event);
             })
             .await;
         drop(projection);
@@ -3328,7 +3321,7 @@ impl InProcessDaemon {
         let _projection = self.host_registry.description_projection.lock().await;
         self.host_registry
             .publish_peer_identity(identity, &|event| {
-                let _ = self.event_tx.send(event);
+                self.event_sink.emit(event);
             })
             .await;
     }
@@ -3368,7 +3361,7 @@ impl InProcessDaemon {
         }
         self.host_registry
             .sync_resource_summaries(summaries, details, &|event| {
-                let _ = self.event_tx.send(event);
+                self.event_sink.emit(event);
             })
             .await;
         Ok(())
@@ -3380,7 +3373,7 @@ impl InProcessDaemon {
         let remote_counts = HashMap::new();
         self.host_registry
             .set_peer_host_summaries(summaries, &remote_counts, &|e| {
-                let _ = self.event_tx.send(e);
+                self.event_sink.emit(e);
             })
             .await;
     }
@@ -3389,7 +3382,7 @@ impl InProcessDaemon {
         let remote_counts = HashMap::new();
         self.host_registry
             .publish_peer_connection_status(node, status, &remote_counts, &|e| {
-                let _ = self.event_tx.send(e);
+                self.event_sink.emit(e);
             })
             .await;
     }
@@ -3411,7 +3404,7 @@ impl InProcessDaemon {
     pub async fn publish_peer_summary(&self, summary: HostSummary) {
         self.host_registry
             .publish_peer_summary(summary, &|e| {
-                let _ = self.event_tx.send(e);
+                self.event_sink.emit(e);
             })
             .await;
     }
@@ -4034,7 +4027,7 @@ impl InProcessDaemon {
         // with peer connections.
 
         info!(repo = %synthetic_path.display(), "added virtual repo");
-        let _ = self.event_tx.send(DaemonEvent::RepoTracked(Box::new(repo_info)));
+        self.event_sink.emit(DaemonEvent::RepoTracked(Box::new(repo_info)));
 
         Ok(())
     }
@@ -4049,13 +4042,12 @@ impl InProcessDaemon {
     /// Calling `send_event(PeerStatusChanged)` directly only updates replay state.
     pub fn send_event(&self, event: DaemonEvent) {
         self.host_registry.apply_event(&event);
-        let _ = self.event_tx.send(event);
+        self.event_sink.emit(event);
     }
 
-    /// Return a clone of the broadcast sender so background tasks (e.g.
-    /// the Aggregator) can emit events into the daemon-wide event bus.
-    pub fn event_sender(&self) -> broadcast::Sender<DaemonEvent> {
-        self.event_tx.clone()
+    /// Publication port for background services on the daemon-wide event bus.
+    pub fn event_sink(&self) -> Arc<dyn EventSink> {
+        self.event_sink.clone()
     }
 }
 
@@ -5465,7 +5457,6 @@ impl InProcessDaemon {
             observed_resource_backend: &self.observed_resource_backend,
             clock: &self.clock,
             namespace: &self.provisioning_namespace,
-            _event_sink: self.event_sink.clone(),
             repository_index: project_ops::RepositoryIndex { keys_by_path: &self.repository_keys_by_path },
             operations: self,
         }
@@ -5801,7 +5792,7 @@ impl InProcessDaemon {
                 if changes.is_empty() {
                     continue;
                 }
-                let _ = self.event_tx.send(DaemonEvent::RepoDelta(Box::new(RepoDelta {
+                self.event_sink.emit(DaemonEvent::RepoDelta(Box::new(RepoDelta {
                     seq: 0,
                     prev_seq: 0,
                     repo_identity: repo.identity.clone(),
@@ -5850,7 +5841,7 @@ impl InProcessDaemon {
             if let Some(info) = repo_infos.into_iter().find(|info| info.identity == *identity) {
                 // RepoTracked also carries late identity enrichment: surfaces
                 // treat an existing identity as an update.
-                let _ = self.event_tx.send(DaemonEvent::RepoTracked(Box::new(info)));
+                self.event_sink.emit(DaemonEvent::RepoTracked(Box::new(info)));
             }
         }
     }
@@ -5974,7 +5965,7 @@ impl InProcessDaemon {
         // ADR 0013) — the daemon only tracks registration.
         info!(repo = %path.display(), "added repo");
         if added_new_identity {
-            let _ = self.event_tx.send(DaemonEvent::RepoTracked(Box::new(repo_info)));
+            self.event_sink.emit(DaemonEvent::RepoTracked(Box::new(repo_info)));
         }
 
         Ok(AddRepoOutcome { tracked_path: path, resolved_from, identity_change })
@@ -6039,7 +6030,7 @@ impl InProcessDaemon {
 
         info!(repo = %path.display(), "removed repo");
         if removed_identity {
-            let _ = self.event_tx.send(DaemonEvent::RepoUntracked { repo_identity, path: Some(path) });
+            self.event_sink.emit(DaemonEvent::RepoUntracked { repo_identity, path: Some(path) });
         }
 
         Ok(())
@@ -6053,7 +6044,6 @@ impl InProcessDaemon {
 
     fn read_projections(&self) -> read_projections::ReadProjections<'_> {
         read_projections::ReadProjections {
-            _event_sink: self.event_sink.clone(),
             backend: &self.resource_backend,
             config: &self.config,
             host_registry: &self.host_registry,
@@ -8132,7 +8122,6 @@ impl InProcessDaemon {
 
     fn attach_resolver(&self) -> AttachResolver<'_> {
         AttachResolver {
-            _event_sink: self.event_sink.clone(),
             resource_backend: &self.resource_backend,
             observed_resource_backend: &self.observed_resource_backend,
             aggregator_projection_state: &self.aggregator_projection_state,
@@ -8554,7 +8543,7 @@ impl InProcessDaemon {
                 let mut guard = self.active_commands.lock().await;
                 guard.insert(id, token.clone());
             }
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            self.event_sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: command_node_id.clone(),
                 repo_identity: repo_identity.clone(),
@@ -8566,7 +8555,6 @@ impl InProcessDaemon {
                 Some(kind) => (self.observed_resource_backend.clone(), kind.to_string()),
                 None => (self.resource_backend.clone(), kind),
             };
-            let event_tx = self.event_tx.clone();
             let event_sink = self.event_sink.clone();
             let active_ref = Arc::clone(&self.active_commands);
             tokio::spawn(async move {
@@ -8582,13 +8570,13 @@ impl InProcessDaemon {
                         .command_id(id)
                         .node_id(command_node_id.clone())
                         .repo_identity(repo_identity.clone())
-                        .event_sink(event_sink)
+                        .event_sink(event_sink.clone())
                         .token(token)
                         .build(),
                 )
                 .await;
                 active_ref.lock().await.remove(&id);
-                let _ = event_tx.send(DaemonEvent::CommandFinished {
+                event_sink.emit(DaemonEvent::CommandFinished {
                     command_id: id,
                     node_id: command_node_id,
                     repo_identity,
@@ -8612,7 +8600,7 @@ impl InProcessDaemon {
                 .items;
             let repo_identity = empty_repo_identity();
             let description = command.description().to_string();
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            self.event_sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: repo_identity.clone(),
@@ -8640,7 +8628,7 @@ impl InProcessDaemon {
                 }
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+            self.event_sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity,
@@ -9073,7 +9061,7 @@ impl InProcessDaemon {
         } = &command.action
         {
             let empty_identity = empty_repo_identity();
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            self.event_sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: empty_identity.clone(),
@@ -9085,7 +9073,7 @@ impl InProcessDaemon {
             let project_identity = project_ref.as_deref();
             if let Err(message) = validate_convoy_name(&role) {
                 let result = flotilla_protocol::CommandValue::Error { message };
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                self.event_sink.emit(DaemonEvent::CommandFinished {
                     command_id: id,
                     node_id: self.node_id.clone(),
                     repo_identity: empty_identity,
@@ -9096,7 +9084,7 @@ impl InProcessDaemon {
             }
             if let Err(message) = self.check_local_free_space_floor().await {
                 let result = flotilla_protocol::CommandValue::Error { message };
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                self.event_sink.emit(DaemonEvent::CommandFinished {
                     command_id: id,
                     node_id: self.node_id.clone(),
                     repo_identity: empty_identity,
@@ -9110,7 +9098,7 @@ impl InProcessDaemon {
             let admission_guard = self.convoy_admission.lock().await;
             if let Err(message) = allocate_convoy_generation(&self.resource_backend, &namespace, project_identity, &role).await {
                 let result = flotilla_protocol::CommandValue::Error { message };
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                self.event_sink.emit(DaemonEvent::CommandFinished {
                     command_id: id,
                     node_id: self.node_id.clone(),
                     repo_identity: empty_identity,
@@ -9132,7 +9120,7 @@ impl InProcessDaemon {
             {
                 Ok(workflow) => workflow,
                 Err(message) => {
-                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    self.event_sink.emit(DaemonEvent::CommandFinished {
                         command_id: id,
                         node_id: self.node_id.clone(),
                         repo_identity: empty_identity,
@@ -9146,7 +9134,7 @@ impl InProcessDaemon {
                 match self.snapshot_project_repositories(&namespace, project_ref, None).await {
                     Ok(repositories) => Some(repositories),
                     Err(message) => {
-                        let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                        self.event_sink.emit(DaemonEvent::CommandFinished {
                             command_id: id,
                             node_id: self.node_id.clone(),
                             repo_identity: empty_identity,
@@ -9161,7 +9149,7 @@ impl InProcessDaemon {
             };
             if project_repositories.is_some() && repository_url.is_some() {
                 let message = "convoy repository selection is not allowed when a project is supplied".to_string();
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                self.event_sink.emit(DaemonEvent::CommandFinished {
                     command_id: id,
                     node_id: self.node_id.clone(),
                     repo_identity: empty_identity,
@@ -9211,7 +9199,7 @@ impl InProcessDaemon {
                         }
                         Err(message) => {
                             let result = flotilla_protocol::CommandValue::Error { message };
-                            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                            self.event_sink.emit(DaemonEvent::CommandFinished {
                                 command_id: id,
                                 node_id: self.node_id.clone(),
                                 repo_identity: empty_identity,
@@ -9260,7 +9248,7 @@ impl InProcessDaemon {
                 match resolved {
                     Ok(repositories) => repositories,
                     Err(message) => {
-                        let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                        self.event_sink.emit(DaemonEvent::CommandFinished {
                             command_id: id,
                             node_id: self.node_id.clone(),
                             repo_identity: empty_identity,
@@ -9279,7 +9267,7 @@ impl InProcessDaemon {
                 if !repositories.iter().any(|repository| repository.repo_ref == repo_ref) {
                     let message =
                         format!("adopted checkout repository {repo_ref} is not part of project {}", project_ref.as_deref().unwrap_or(""));
-                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    self.event_sink.emit(DaemonEvent::CommandFinished {
                         command_id: id,
                         node_id: self.node_id.clone(),
                         repo_identity: empty_identity,
@@ -9303,7 +9291,7 @@ impl InProcessDaemon {
             {
                 Ok(placement) => placement,
                 Err(message) => {
-                    let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                    self.event_sink.emit(DaemonEvent::CommandFinished {
                         command_id: id,
                         node_id: self.node_id.clone(),
                         repo_identity: empty_identity,
@@ -9323,7 +9311,7 @@ impl InProcessDaemon {
             )
             .await;
             if let Err(message) = credential_result {
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                self.event_sink.emit(DaemonEvent::CommandFinished {
                     command_id: id,
                     node_id: self.node_id.clone(),
                     repo_identity: empty_identity,
@@ -9344,7 +9332,7 @@ impl InProcessDaemon {
                         allocation: placement.allocation.clone(),
                     }),
                     Err(message) => {
-                        let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                        self.event_sink.emit(DaemonEvent::CommandFinished {
                             command_id: id,
                             node_id: self.node_id.clone(),
                             repo_identity: empty_identity,
@@ -9357,7 +9345,7 @@ impl InProcessDaemon {
                 None => None,
             };
             if let Err(message) = self.check_remote_placement_free_space_floor(&namespace, placement_decision.as_ref()).await {
-                let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+                self.event_sink.emit(DaemonEvent::CommandFinished {
                     command_id: id,
                     node_id: self.node_id.clone(),
                     repo_identity: empty_identity,
@@ -9388,7 +9376,7 @@ impl InProcessDaemon {
                     admission_guard,
                 )
                 .await;
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+            self.event_sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: empty_identity,
@@ -9403,7 +9391,7 @@ impl InProcessDaemon {
     async fn execute_action_workflow_template_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::WorkflowTemplateApply { name, spec_yaml } = &command.action {
             let empty_identity = empty_repo_identity();
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            self.event_sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: empty_identity.clone(),
@@ -9427,7 +9415,7 @@ impl InProcessDaemon {
                 }
                 Err(err) => flotilla_protocol::CommandValue::Error { message: err },
             };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+            self.event_sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: empty_identity,
@@ -9442,7 +9430,7 @@ impl InProcessDaemon {
     async fn execute_action_project_add(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ProjectAdd { target, name, display_name, remote } = &command.action {
             let empty_identity = empty_repo_identity();
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            self.event_sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: empty_identity.clone(),
@@ -9453,7 +9441,7 @@ impl InProcessDaemon {
                 Ok(name) => flotilla_protocol::CommandValue::ProjectAdded { name },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+            self.event_sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: empty_identity,
@@ -9468,7 +9456,7 @@ impl InProcessDaemon {
     async fn execute_action_project_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ProjectApply { name, spec_yaml } = &command.action {
             let empty_identity = empty_repo_identity();
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            self.event_sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: empty_identity.clone(),
@@ -9513,7 +9501,7 @@ impl InProcessDaemon {
                 },
                 Err(err) => flotilla_protocol::CommandValue::Error { message: err },
             };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+            self.event_sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: empty_identity,
@@ -9528,7 +9516,7 @@ impl InProcessDaemon {
     async fn execute_action_project_register(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ProjectRegister { target } = &command.action {
             let empty_identity = empty_repo_identity();
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            self.event_sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: empty_identity.clone(),
@@ -9539,7 +9527,7 @@ impl InProcessDaemon {
                 Ok((name, members)) => CommandValue::ProjectRegistered { name, members },
                 Err(message) => CommandValue::Error { message },
             };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+            self.event_sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: empty_identity,
@@ -9554,7 +9542,7 @@ impl InProcessDaemon {
     async fn execute_action_project_refresh(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ProjectRefresh { name } = &command.action {
             let empty_identity = empty_repo_identity();
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            self.event_sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: empty_identity.clone(),
@@ -9567,7 +9555,7 @@ impl InProcessDaemon {
                 }
                 Err(message) => CommandValue::Error { message },
             };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+            self.event_sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: empty_identity,
@@ -9584,7 +9572,7 @@ impl InProcessDaemon {
             let description = command.description().to_string();
             let repo_path = path.clone();
             let repo_identity = self.detect_repo_identity(path).await;
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            self.event_sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: repo_identity.clone(),
@@ -9599,7 +9587,7 @@ impl InProcessDaemon {
                 },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+            self.event_sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: self.tracked_repo_identity_for_path(path).await.unwrap_or(repo_identity),
@@ -9619,7 +9607,7 @@ impl InProcessDaemon {
             };
             let description = command.description().to_string();
             let repo_identity = self.tracked_repo_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            self.event_sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: repo_identity.clone(),
@@ -9630,7 +9618,7 @@ impl InProcessDaemon {
                 Ok(()) => flotilla_protocol::CommandValue::RepoUntracked { path: repo_path.clone() },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+            self.event_sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity,
@@ -9648,7 +9636,7 @@ impl InProcessDaemon {
             let repo_path = self.local_checkout_for_repository(&repository.spec.key()).await?;
             let description = command.description().to_string();
             let repo_identity = repository_operations::repository_event_identity(&repository.spec, repo_path.as_deref());
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            self.event_sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: repo_identity.clone(),
@@ -9663,7 +9651,7 @@ impl InProcessDaemon {
                 },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+            self.event_sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity,
@@ -9700,7 +9688,7 @@ impl InProcessDaemon {
             // Query commands should be dispatched through `execute_query`,
             // not through `execute`. Return an error to surface misrouting.
             let empty_identity = empty_repo_identity();
-            let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+            self.event_sink.emit(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: empty_identity.clone(),
@@ -9708,7 +9696,7 @@ impl InProcessDaemon {
                 description: command.description().to_string(),
             });
             let result = flotilla_protocol::CommandValue::Error { message: "query commands should use execute_query, not execute".into() };
-            let _ = self.event_tx.send(DaemonEvent::CommandFinished {
+            self.event_sink.emit(DaemonEvent::CommandFinished {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: empty_identity,
@@ -9848,7 +9836,6 @@ impl InProcessDaemon {
         let repo = self.resolve_repo_for_command(&command).await?;
         let runner = Arc::clone(&self.discovery.runner);
         let env = Arc::clone(&self.discovery.env);
-        let event_tx = self.event_tx.clone();
         let event_sink = self.event_sink.clone();
         let (repo_identity, registry) = {
             let repos = self.repos.read().await;
@@ -9870,7 +9857,7 @@ impl InProcessDaemon {
             guard.insert(id, token.clone());
         }
 
-        let _ = self.event_tx.send(DaemonEvent::CommandStarted {
+        self.event_sink.emit(DaemonEvent::CommandStarted {
             command_id: id,
             node_id: command_node_id.clone(),
             repo_identity: repo_identity.clone(),
@@ -9916,7 +9903,7 @@ impl InProcessDaemon {
                         let mut guard = active_ref.lock().await;
                         guard.remove(&id);
                     }
-                    let _ = event_tx.send(DaemonEvent::CommandFinished {
+                    event_sink.emit(DaemonEvent::CommandFinished {
                         command_id: id,
                         node_id: command_node_id.clone(),
                         repo_identity: repo_identity.clone(),
@@ -9946,14 +9933,14 @@ impl InProcessDaemon {
                         repo_identity.clone(),
                         ExecutionEnvironmentPath::new(&repo_path),
                         token,
-                        event_sink,
+                        event_sink.clone(),
                         &resolver,
                         remote_executor.as_ref(),
                     )
                     .await;
                     let mut guard = active_ref.lock().await;
                     guard.remove(&id);
-                    let _ = event_tx.send(DaemonEvent::CommandFinished {
+                    event_sink.emit(DaemonEvent::CommandFinished {
                         command_id: id,
                         node_id: command_node_id,
                         repo_identity,
@@ -10043,7 +10030,7 @@ impl InProcessDaemon {
 #[async_trait]
 impl DaemonHandle for InProcessDaemon {
     fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
-        self.event_tx.subscribe()
+        self.event_source.subscribe()
     }
 
     fn query_subscription(&self, subscriber_id: uuid::Uuid) -> QuerySubscription {
