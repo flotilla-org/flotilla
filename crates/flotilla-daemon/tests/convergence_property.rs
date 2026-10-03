@@ -4,7 +4,7 @@ use std::{collections::BTreeSet, fmt, sync::Arc, time::Duration};
 
 use chrono::{TimeZone, Utc};
 use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
-use flotilla_daemon::server::test_support::{spawn_in_memory_request_topology, InMemoryRequestTopology};
+use flotilla_daemon::server::test_support::{spawn_in_memory_request_mesh, spawn_in_memory_request_topology, InMemoryRequestTopology};
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     collect_resource_replica_kind, delete_resource_kind, Host, HostSpec, HostStatus, InMemoryBackend, InputMeta, ResourceBackend,
@@ -244,7 +244,15 @@ impl Harness {
 
     async fn run(&mut self, ops: &[Op], fault: bool) -> Result<(), String> {
         self.seed_historical_shapes().await;
-        self.connect_all_permuted().await;
+        // The injected suppression fault is detected on the first local write.
+        // Its initial mesh needs one PeerManager per daemon: separate pairwise
+        // runtimes overwrite each other's topology before the assertion runs.
+        let _fault_mesh = if fault {
+            Some(spawn_in_memory_request_mesh(self.nodes.iter().map(|node| Arc::clone(&node.daemon)).collect()).await?)
+        } else {
+            self.connect_all_permuted().await;
+            None
+        };
         self.assert_shadow(false).await?;
 
         for (step, op) in ops.iter().copied().enumerate() {
