@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use chrono::Utc;
 use flotilla_controllers::reconcilers::VesselReconciler;
@@ -8,7 +15,7 @@ use flotilla_core::{
     leaf_engine::TurnDeliveryRequest,
     providers::discovery::test_support::fake_discovery,
 };
-use flotilla_daemon::runtime::spawn_pending_supervisor_turn_task;
+use flotilla_daemon::runtime::{spawn_pending_supervisor_turn_task, spawn_pending_supervisor_turn_task_with_watches};
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     controller::{Actuation, Reconciler},
@@ -19,6 +26,7 @@ use flotilla_resources::{
     TerminalSessionSource, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkState, WorkflowSnapshot,
     ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
+use futures::StreamExt;
 use tokio_util::task::AbortOnDropHandle;
 
 fn meta(name: &str) -> InputMeta {
@@ -37,6 +45,25 @@ fn agent_message(session: ResourceObject<TerminalSession>) -> TerminalCrewMessag
 
 #[tokio::test]
 async fn reconciled_remote_session_receives_nudge_and_resume_from_convoy_home() {
+    remote_turn_scenario(None).await;
+}
+
+#[derive(Clone, Copy)]
+enum ClosedWatch {
+    Convoy,
+    TerminalSession,
+}
+
+// #2287 recovery: a closed notification stream must be resubscribed, and the
+// recovery scan must deliver a turn replicated while that stream was down.
+#[tokio::test]
+async fn remote_turn_delivery_recovers_after_either_watch_closes() {
+    for input in [ClosedWatch::Convoy, ClosedWatch::TerminalSession] {
+        remote_turn_scenario(Some(input)).await;
+    }
+}
+
+async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     let home = ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("home store")).with_local_root(NodeId::new("home"));
     let placement =
         ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("placement store")).with_local_root(NodeId::new("placement"));
@@ -179,8 +206,37 @@ async fn reconciled_remote_session_receives_nudge_and_resume_from_convoy_home() 
     let (home_task, home_ready) =
         spawn_pending_supervisor_turn_task(Arc::clone(&home_daemon), "flotilla".to_string(), Duration::from_secs(300));
     let _home_task = AbortOnDropHandle::new(home_task);
-    let (placement_task, placement_ready) =
-        spawn_pending_supervisor_turn_task(Arc::clone(&placement_daemon), "flotilla".to_string(), Duration::from_secs(300));
+    let subscriptions = Arc::new(AtomicUsize::new(0));
+    let (placement_task, placement_ready) = if let Some(closed_watch) = closed_watch {
+        let backend = placement.clone();
+        let subscriptions = Arc::clone(&subscriptions);
+        spawn_pending_supervisor_turn_task_with_watches(
+            Arc::clone(&placement_daemon),
+            "flotilla".to_string(),
+            Duration::from_secs(300),
+            move || {
+                let backend = backend.clone();
+                let attempt = subscriptions.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let convoys = backend.including_replicas::<Convoy>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
+                    let sessions =
+                        backend.including_replicas::<TerminalSession>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
+                    // Stand in only for a failed resource-notification stream;
+                    // both stores and the delivery/acknowledgment pass remain real.
+                    Ok(if attempt == 0 {
+                        match closed_watch {
+                            ClosedWatch::Convoy => (futures::stream::empty().boxed(), sessions),
+                            ClosedWatch::TerminalSession => (convoys, futures::stream::empty().boxed()),
+                        }
+                    } else {
+                        (convoys, sessions)
+                    })
+                }
+            },
+        )
+    } else {
+        spawn_pending_supervisor_turn_task(Arc::clone(&placement_daemon), "flotilla".to_string(), Duration::from_secs(300))
+    };
     let _placement_task = AbortOnDropHandle::new(placement_task);
     tokio::time::timeout(Duration::from_secs(5), async {
         home_ready.await.expect("home turn task ready");
@@ -218,6 +274,10 @@ async fn reconciled_remote_session_receives_nudge_and_resume_from_convoy_home() 
         })
     })
     .await;
+    if closed_watch.is_some() {
+        // Delivery requires replacing the closed stream, without waiting 300s.
+        assert!(subscriptions.load(Ordering::SeqCst) >= 2);
+    }
     let delivered = sessions.get(&session_meta.name).await.expect("delivered session");
     let nudge = agent_message(delivered.clone());
     assert!(nudge.text.contains("Your stall is recorded. What changed since your report?"));
