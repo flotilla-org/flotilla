@@ -24,6 +24,8 @@ from conftest import (
 COMPOSE_DIR = Path(__file__).parent
 HUB_SPOKE_COMPOSE = str(COMPOSE_DIR / "docker-compose.hub-spoke.yml")
 
+REPO_PATH = "/home/flotilla/repo"
+
 NODES = ("workstation", "homelab-1", "homelab-2")
 FOLLOWERS = ("homelab-1", "homelab-2")
 pytestmark = pytest.mark.timeout(1800)
@@ -64,7 +66,7 @@ def local_repository_key(node: str) -> str:
         (
             record["object"]["metadata"]["name"]
             for record in repositories
-            if record["object"]["spec"]["identity"].get("git_common_dir") == "/home/flotilla/repo/.git"
+            if record["object"]["spec"]["identity"].get("git_common_dir") == f"{REPO_PATH}/.git"
             and record["object"]["spec"]["identity"].get("host_ref") == host_ref
         ),
         None,
@@ -141,8 +143,8 @@ def hub_spoke_topology():
                 node,
                 "git config --global user.email test@test.com && "
                 "git config --global user.name test && "
-                "git init --initial-branch=master /home/flotilla/repo && "
-                "cd /home/flotilla/repo && "
+                f"git init --initial-branch=master {REPO_PATH} && "
+                f"cd {REPO_PATH} && "
                 "git commit --allow-empty -m init",
             )
             assert result.returncode == 0, f"git init failed on {node}: {result.stderr}"
@@ -207,13 +209,14 @@ def hub_spoke_topology():
             )
 
         for node in NODES:
-            result = hub_exec(node, "flotilla repo add /home/flotilla/repo")
+            result = hub_exec(node, f"flotilla repo add {REPO_PATH}")
             assert result.returncode == 0, f"repo add failed on {node}: {result.stderr}"
 
         for follower in FOLLOWERS:
             wait_for_follower(follower)
 
-        yield
+        # Read each node's own adopted identity once; these durable keys survive restart.
+        yield {node: local_repository_key(node) for node in NODES}
     finally:
         for node in NODES:
             log = daemon_log(node, compose_file=HUB_SPOKE_COMPOSE)
@@ -286,13 +289,13 @@ def test_shpool_attachable_set_survives_daemon_restart(
     """A shpool-backed terminal keeps its durable set across restart."""
     checkout = hub_json(
         "homelab-1",
-        f"repo {local_repository_key('homelab-1')} checkout --fresh feat-shpool-persist",
+        f"repo {hub_spoke_topology['homelab-1']} checkout --fresh feat-shpool-persist",
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
     # The executor plans in the coordinator context before dispatching the remote step.
     # #2500 owns retiring this bridge, as in test_minimal_topology.
-    planning_repository_key = local_repository_key("workstation")
+    planning_repository_key = hub_spoke_topology["workstation"]
     prepared = hub_json(
         "workstation",
         f"host homelab-1 repo {planning_repository_key} prepare-terminal {checkout_path}",
@@ -334,13 +337,13 @@ def test_terminal_without_shpool_uses_passthrough(hub_spoke_topology):
     """The follower without shpool returns executable fallback commands."""
     checkout = hub_json(
         "homelab-2",
-        f"repo {local_repository_key('homelab-2')} checkout --fresh feat-no-shpool",
+        f"repo {hub_spoke_topology['homelab-2']} checkout --fresh feat-no-shpool",
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
     # The executor plans in the coordinator context before dispatching the remote step.
     # #2500 owns retiring this bridge, as in test_minimal_topology.
-    planning_repository_key = local_repository_key("workstation")
+    planning_repository_key = hub_spoke_topology["workstation"]
     prepared = hub_json(
         "workstation",
         f"host homelab-2 repo {planning_repository_key} prepare-terminal {checkout_path}",
@@ -360,12 +363,12 @@ def test_reprepare_reuses_attachable_identity(hub_spoke_topology):
     """Repeated preparation keeps the checkout's attachable-set identity."""
     checkout = hub_json(
         "homelab-1",
-        f"repo {local_repository_key('homelab-1')} checkout --fresh feat-workspace-reprepare",
+        f"repo {hub_spoke_topology['homelab-1']} checkout --fresh feat-workspace-reprepare",
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
     # #2500 owns the coordinator-local planning context for remote terminal steps.
-    planning_repository_key = local_repository_key("workstation")
+    planning_repository_key = hub_spoke_topology["workstation"]
     command = (
         f"host homelab-1 repo {planning_repository_key} prepare-terminal {checkout_path}"
     )
