@@ -1183,11 +1183,12 @@ async fn run_daemon_dev_mode(cli: &Cli, command: DevModeSubCommand) -> Result<()
     }
 }
 
-fn set_fleet_daemon_enabled(_enabled: bool) -> Result<()> {
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(unused_variables))]
+fn set_fleet_daemon_enabled(enabled: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
-    return flotilla_tui::socket::launchd::set_agent_enabled(_enabled).map_err(|error| color_eyre::eyre::eyre!(error));
+    return flotilla_tui::socket::launchd::set_agent_enabled(enabled).map_err(|error| color_eyre::eyre::eyre!(error));
     #[cfg(target_os = "linux")]
-    return flotilla_tui::socket::systemd::set_unit_enabled(_enabled).map_err(|error| color_eyre::eyre::eyre!(error));
+    return flotilla_tui::socket::systemd::set_unit_enabled(enabled).map_err(|error| color_eyre::eyre::eyre!(error));
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     Err(color_eyre::eyre::eyre!("daemon dev mode is only available on macOS and Linux fleet hosts"))
 }
