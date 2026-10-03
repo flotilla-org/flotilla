@@ -1302,7 +1302,7 @@ async fn sync_peer_query_state_mirrors_host_summaries_and_routes_into_daemon() {
 
     {
         let mut pm = peer_manager.lock().await;
-        pm.store_host_summary(flotilla_protocol::HostSummary {
+        pm.store_host_identity(flotilla_protocol::HostSummary {
             environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("remote-host")),
             host_name: Some(HostName::new("remote")),
             node: node_info("remote"),
@@ -1341,7 +1341,7 @@ async fn sync_peer_query_state_preserves_multiple_host_summaries_for_one_node() 
 
     {
         let mut pm = peer_manager.lock().await;
-        pm.store_host_summary(flotilla_protocol::HostSummary {
+        pm.store_host_identity(flotilla_protocol::HostSummary {
             environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("remote-host-a")),
             host_name: Some(HostName::new("remote-a")),
             node: node_info("remote"),
@@ -1350,7 +1350,7 @@ async fn sync_peer_query_state_preserves_multiple_host_summaries_for_one_node() 
             providers: vec![],
             environments: vec![],
         });
-        pm.store_host_summary(flotilla_protocol::HostSummary {
+        pm.store_host_identity(flotilla_protocol::HostSummary {
             environment_id: EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("remote-host-b")),
             host_name: Some(HostName::new("remote-b")),
             node: node_info("remote"),
@@ -1816,7 +1816,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     let next_remote_command_id = Arc::new(AtomicU64::new(1 << 62));
     let sent = Arc::new(StdMutex::new(Vec::new()));
     let mut peer_manager_guard = peer_manager.lock().await;
-    peer_manager_guard.store_host_summary(remote_summary.clone());
+    peer_manager_guard.store_host_identity(remote_summary.clone());
     peer_manager_guard.register_sender(NodeId::new("feta"), Arc::new(MockPeerSender { sent: Arc::clone(&sent) }));
     drop(peer_manager_guard);
     let remote_command_router = make_remote_command_router(
@@ -1992,7 +1992,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     assert!(daemon.resource_backend().using::<TerminalSession>("flotilla").list().await.expect("dispatcher sessions").items.is_empty());
 
     let disconnected_peers = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
-    disconnected_peers.lock().await.store_host_summary(remote_summary);
+    disconnected_peers.lock().await.store_host_identity(remote_summary);
     let disconnected_router = make_remote_command_router(
         &daemon,
         &disconnected_peers,
@@ -3797,7 +3797,7 @@ async fn handle_client_does_not_advance_host_cursor_for_duplicate_host_summary()
 
     {
         let mut pm = peer_manager.lock().await;
-        pm.store_host_summary(summary.clone());
+        pm.store_host_identity(summary.clone());
         ensure_test_connection_generation(&mut pm, &remote_host, MockPeerSender::discard);
     }
     sync_peer_query_state(&peer_manager, &daemon).await;
@@ -3815,7 +3815,7 @@ async fn handle_client_does_not_advance_host_cursor_for_duplicate_host_summary()
 
     {
         let mut pm = peer_manager.lock().await;
-        pm.store_host_summary(summary);
+        pm.store_host_identity(summary);
     }
     sync_peer_query_state(&peer_manager, &daemon).await;
 
@@ -4440,7 +4440,7 @@ async fn send_link_state_sends_host_summary_and_route_advertisement() {
 
     assert!(sent_any, "host summary should count as initial peer sync");
     let sent = sent.lock().expect("lock");
-    assert!(matches!(&sent[0], PeerWireMessage::HostSummary(summary) if summary.node.node_id == host_name));
+    assert!(matches!(&sent[0], PeerWireMessage::HostIdentity(summary) if summary.node.node_id == host_name));
     assert!(matches!(&sent[1], PeerWireMessage::RouteAdvertisement { origin_node_id, .. } if origin_node_id == &host_name));
 }
 

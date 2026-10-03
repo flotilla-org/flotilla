@@ -87,7 +87,7 @@ pub async fn spawn_in_memory_request_mesh(hosts: Vec<Arc<InProcessDaemon>>) -> R
     for (index, peer_manager) in peer_managers.iter().enumerate() {
         for (other_index, other) in hosts.iter().enumerate() {
             if index != other_index {
-                peer_manager.lock().await.store_host_summary(other.local_host_summary().await);
+                peer_manager.lock().await.store_host_identity(other.local_host_summary().await);
             }
         }
     }

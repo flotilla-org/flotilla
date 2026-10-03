@@ -636,7 +636,7 @@ pub(super) async fn send_link_state(
         return false;
     };
 
-    if let Err(e) = sender.send(PeerWireMessage::HostSummary(daemon.local_host_identity())).await {
+    if let Err(e) = sender.send(PeerWireMessage::HostIdentity(daemon.local_host_identity())).await {
         debug!(peer = %peer, err = %e, "failed to send host summary to peer");
         return false;
     }

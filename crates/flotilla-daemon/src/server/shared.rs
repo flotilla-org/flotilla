@@ -39,7 +39,7 @@ pub(super) async fn write_message(writer: &mut (impl AsyncWrite + Unpin), msg: &
 pub(super) async fn sync_peer_query_state(peer_manager: &Arc<Mutex<PeerManager>>, daemon: &Arc<InProcessDaemon>) {
     let (configured, summaries, routes) = {
         let pm = peer_manager.lock().await;
-        (pm.configured_peers(), pm.get_peer_host_summaries().clone(), pm.topology_routes())
+        (pm.configured_peers(), pm.get_peer_host_identities().clone(), pm.topology_routes())
     };
 
     daemon.set_configured_peers(configured).await;

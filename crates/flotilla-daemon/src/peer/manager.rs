@@ -180,7 +180,7 @@ pub async fn dispatch_pending_sends(pending_sends: Vec<PendingPeerSend>) {
 
 fn peer_wire_message_kind(msg: &PeerWireMessage) -> &'static str {
     match msg {
-        PeerWireMessage::HostSummary(_) => "host_summary",
+        PeerWireMessage::HostIdentity(_) => "host_identity",
         PeerWireMessage::RouteAdvertisement { .. } => "route_advertisement",
         PeerWireMessage::Routed(msg) => match msg {
             RoutedPeerMessage::CommandRequest { .. } => "command_request",
@@ -230,7 +230,7 @@ pub struct PeerManager {
     pending_sends: Vec<PendingPeerSend>,
     route_epoch: u64,
     request_id_counter: u64,
-    peer_host_summaries: HashMap<EnvironmentId, HostIdentity>,
+    peer_host_identities: HashMap<EnvironmentId, HostIdentity>,
 }
 
 impl PeerManager {
@@ -255,13 +255,13 @@ impl PeerManager {
             pending_sends: Vec::new(),
             route_epoch: 0,
             request_id_counter: 0,
-            peer_host_summaries: HashMap::new(),
+            peer_host_identities: HashMap::new(),
             command_reverse_paths: HashMap::new(),
         }
     }
 
     fn node_info_for(&self, node_id: &NodeId) -> NodeInfo {
-        self.peer_host_summaries
+        self.peer_host_identities
             .values()
             .find(|summary| summary.node.node_id == *node_id)
             .map(|summary| summary.node.clone())
@@ -557,9 +557,9 @@ impl PeerManager {
         }
 
         match env.msg {
-            PeerWireMessage::HostSummary(mut summary) => {
+            PeerWireMessage::HostIdentity(mut summary) => {
                 summary.node.node_id = env.connection_peer.clone();
-                self.store_host_summary(summary);
+                self.store_host_identity(summary);
                 HandleResult::Ignored
             }
             PeerWireMessage::RouteAdvertisement { origin_node_id, origin_display_name, remaining_hops, mut visited } => {
@@ -1045,18 +1045,20 @@ impl PeerManager {
         &self.local_node_id
     }
 
-    pub fn store_host_summary(&mut self, summary: impl Into<HostIdentity>) {
+    pub fn store_host_identity(&mut self, summary: impl Into<HostIdentity>) {
         let summary = summary.into();
-        self.peer_host_summaries.insert(summary.environment_id.clone(), summary);
+        self.peer_host_identities.insert(summary.environment_id.clone(), summary);
     }
 
-    pub fn get_peer_host_summaries(&self) -> &HashMap<EnvironmentId, HostIdentity> {
-        &self.peer_host_summaries
+    pub fn get_peer_host_identities(&self) -> &HashMap<EnvironmentId, HostIdentity> {
+        &self.peer_host_identities
     }
 
     pub fn node_for_host_environment(&self, environment_id: &EnvironmentId) -> Result<(NodeId, HostName), String> {
-        let summary =
-            self.peer_host_summaries.get(environment_id).ok_or_else(|| format!("no peer summary for host environment {environment_id}"))?;
+        let summary = self
+            .peer_host_identities
+            .get(environment_id)
+            .ok_or_else(|| format!("no peer summary for host environment {environment_id}"))?;
         let host_name = summary.host_name.clone().unwrap_or_else(|| HostName::new(summary.node.display_name.clone()));
         Ok((summary.node.node_id.clone(), host_name))
     }
@@ -1409,7 +1411,7 @@ impl PeerManager {
 
     /// Clear cached live-link metadata after a remote daemon restart.
     pub fn clear_peer_state_for_restart(&mut self, origin: &NodeId) {
-        self.peer_host_summaries.retain(|_, summary| summary.node.node_id != *origin);
+        self.peer_host_identities.retain(|_, summary| summary.node.node_id != *origin);
         info!(peer = %origin, "cleared stale peer state after restart");
     }
 
@@ -1428,7 +1430,7 @@ impl PeerManager {
         self.displaced_senders.retain(|(host, _), _| host != name);
         self.transport_peers.retain(|_, node_id| node_id != name);
         self.command_reverse_paths.retain(|_, hop| hop.next_hop != *name);
-        self.peer_host_summaries.retain(|_, summary| summary.node.node_id != *name);
+        self.peer_host_identities.retain(|_, summary| summary.node.node_id != *name);
         self.routes.remove(name);
         let affected_routes: Vec<NodeId> =
             self.routes.iter().filter(|(_, route)| route.primary.next_hop == *name).map(|(target, _)| target.clone()).collect();

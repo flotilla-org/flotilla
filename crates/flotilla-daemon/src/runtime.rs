@@ -3293,7 +3293,9 @@ fn spawn_host_description_projection_task(daemon: Arc<InProcessDaemon>, namespac
         resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let mut watch = match daemon.resource_backend().including_replicas::<Host>(&namespace).watch().await {
-                Ok(watch) => watch,
+                // Drain ready bursts together so replicated heartbeat fan-in
+                // causes one projection pass per batch, not one scan per event.
+                Ok(watch) => watch.ready_chunks(64),
                 Err(error) => {
                     warn!(%error, "watch host descriptions failed");
                     resync.tick().await;
@@ -3308,10 +3310,11 @@ fn spawn_host_description_projection_task(daemon: Arc<InProcessDaemon>, namespac
                 tokio::select! {
                     event = watch.next() => {
                         match event {
-                            Some(Ok(_)) => {},
-                            Some(Err(error)) => {
-                                warn!(%error, "host description watch failed; resubscribing");
-                                break;
+                            Some(events) => {
+                                if let Some(error) = events.into_iter().find_map(Result::err) {
+                                    warn!(%error, "host description watch failed; resubscribing");
+                                    break;
+                                }
                             }
                             None => break,
                         }

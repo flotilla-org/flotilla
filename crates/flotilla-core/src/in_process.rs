@@ -103,7 +103,7 @@ use crate::{
         resolve_local_environment_state_dir, resolve_local_host_id, resolve_local_node_id, resolve_or_create_environment_id,
         resolve_or_create_remote_environment_id, resolve_or_create_remote_host_id,
     },
-    host_registry::HostCounts,
+    host_registry::{HostCounts, HostQueryDetails},
     host_resolution::canonical_placement_host_ref_from_sources,
     leaf_engine::LeafSubscriptionTable,
     model::{provider_names_from_registry, repo_name, RepoModel},
@@ -2259,6 +2259,7 @@ impl InProcessDaemon {
     /// provisioned-only environment list through HostStatus::host_summary().
     pub async fn local_host_description(&self) -> HostSummary {
         let mut description = self.refresh_local_host_summary().await;
+        // Host queries include direct environments; legacy summaries remain provisioned-only.
         description.environments = self.environment_manager.visible_environments().await;
         description
     }
@@ -3229,17 +3230,20 @@ impl InProcessDaemon {
     }
 
     pub async fn set_peer_host_identities(&self, identities: HashMap<EnvironmentId, flotilla_protocol::HostIdentity>) {
+        let projection = self.host_registry.description_projection.lock().await;
         self.host_registry
             .sync_peer_identities(identities, &|event| {
                 let _ = self.event_tx.send(event);
             })
             .await;
+        drop(projection);
         if let Err(error) = self.refresh_resource_host_summaries().await {
             warn!(%error, "refresh resource host descriptions failed");
         }
     }
 
     pub async fn publish_peer_identity(&self, identity: flotilla_protocol::HostIdentity) {
+        let _projection = self.host_registry.description_projection.lock().await;
         self.host_registry
             .publish_peer_identity(identity, &|event| {
                 let _ = self.event_tx.send(event);
@@ -3250,11 +3254,25 @@ impl InProcessDaemon {
     /// HostRegistry holds a presentation cache only: descriptions originate in
     /// the resource store, connectivity and routes originate in the transport.
     pub async fn refresh_resource_host_summaries(&self) -> Result<(), String> {
+        use flotilla_protocol::qualified_path::HostId;
+
         // Serialize list-and-project passes so a slower old read cannot replace a
         // newer description published by the watch or a concurrent query.
         let _projection = self.host_registry.description_projection.lock().await;
         let namespace = self.provisioning_namespace().await;
         let statuses = self.read_projections().host_statuses(&namespace).await?;
+        let details = statuses
+            .iter()
+            .map(|(name, status)| {
+                (
+                    EnvironmentId::host(HostId::new(name)),
+                    HostQueryDetails::builder()
+                        .maybe_visible_environments(status.description.as_ref().map(|description| description.environments.clone()))
+                        .maybe_blob_sync(status.blob_sync.clone())
+                        .build(),
+                )
+            })
+            .collect();
         let mut summaries: HashMap<EnvironmentId, HostSummary> = statuses
             .into_values()
             .filter_map(|status| status.host_summary())
@@ -3267,7 +3285,7 @@ impl InProcessDaemon {
             summaries.insert(local.environment_id.clone(), local);
         }
         self.host_registry
-            .sync_resource_summaries(summaries, &|event| {
+            .sync_resource_summaries(summaries, details, &|event| {
                 let _ = self.event_tx.send(event);
             })
             .await;
@@ -6239,17 +6257,13 @@ impl InProcessDaemon {
     pub async fn get_host_status_internal(&self, environment_id: &EnvironmentId) -> Result<HostStatusResponse, String> {
         self.refresh_resource_host_summaries().await?;
         let local_summary = self.host_registry.local_host_summary().await;
-        self.read_projections()
-            .get_host_status(environment_id, &self.local_host_counts().await, &local_summary, &self.provisioning_namespace().await)
-            .await
+        self.read_projections().get_host_status(environment_id, &self.local_host_counts().await, &local_summary).await
     }
 
     pub async fn get_host_providers_internal(&self, environment_id: &EnvironmentId) -> Result<HostProvidersResponse, String> {
         self.refresh_resource_host_summaries().await?;
         let local_summary = self.host_registry.local_host_summary().await;
-        self.read_projections()
-            .get_host_providers(environment_id, &self.local_host_counts().await, &local_summary, &self.provisioning_namespace().await)
-            .await
+        self.read_projections().get_host_providers(environment_id, &self.local_host_counts().await, &local_summary).await
     }
 
     pub async fn fleet_replica_snapshot_internal(&self) -> Result<FleetReplicaSnapshot, String> {

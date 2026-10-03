@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
-    CanonicalHostId, HostProviderStatus, HostSummary, SleepInhibitionHealth, AGENT_ADAPTER_PROVIDER_CATEGORY,
+    CanonicalHostId, EnvironmentInfo, HostProviderStatus, HostSummary, SleepInhibitionHealth, AGENT_ADAPTER_PROVIDER_CATEGORY,
     TERMINAL_POOL_PROVIDER_CATEGORY,
 };
 use serde::{Deserialize, Serialize};
@@ -108,6 +108,8 @@ pub struct HostStatus {
     /// Last descriptive observation from the owning daemon, useful even offline.
     /// `environments` holds every visible environment; `host_summary()` projects
     /// the provisioned-only list expected by the legacy summary surface.
+    /// HostSummary and its nested types are persisted here: future shape changes
+    /// must obey ADR 0047 and the stored-record golden corpus.
     /// ADR 0047: previous-generation records omit this; retain the default for one roll.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<HostSummary>,
@@ -231,7 +233,7 @@ impl HostStatus {
         summary.providers.retain(|provider| {
             provider.category != AGENT_ADAPTER_PROVIDER_CATEGORY && provider.category != TERMINAL_POOL_PROVIDER_CATEGORY
         });
-        summary.environments.retain(|environment| matches!(environment, flotilla_protocol::EnvironmentInfo::Provisioned { .. }));
+        summary.environments.retain(|environment| matches!(environment, EnvironmentInfo::Provisioned { .. }));
         for (key, category) in
             [(AGENT_ADAPTERS_CAPABILITY, AGENT_ADAPTER_PROVIDER_CATEGORY), (TERMINAL_POOLS_CAPABILITY, TERMINAL_POOL_PROVIDER_CATEGORY)]
         {

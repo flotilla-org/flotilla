@@ -498,15 +498,9 @@ impl ReadProjections<'_> {
         environment_id: &EnvironmentId,
         counts: &HashMap<EnvironmentId, HostCounts>,
         local_summary: &HostSummary,
-        namespace: &str,
     ) -> Result<HostStatusResponse, String> {
         let mut response = self.host_registry.get_host_status(environment_id, counts).await?;
-        let statuses = self.host_statuses(namespace).await?;
-        let status = environment_id.host_id().and_then(|id| statuses.get(id.as_str()));
-        response.blob_sync = status.and_then(|status| status.blob_sync.clone());
-        if let Some(description) = status.and_then(|status| status.description.as_ref()) {
-            response.visible_environments = description.environments.clone();
-        } else if environment_id == &local_summary.environment_id {
+        if environment_id == &local_summary.environment_id && !self.host_registry.has_resource_description(environment_id).await {
             response.visible_environments = self.environment_manager.visible_environments().await;
         }
         Ok(response)
@@ -517,15 +511,9 @@ impl ReadProjections<'_> {
         environment_id: &EnvironmentId,
         counts: &HashMap<EnvironmentId, HostCounts>,
         local_summary: &HostSummary,
-        namespace: &str,
     ) -> Result<HostProvidersResponse, String> {
         let mut response = self.host_registry.get_host_providers(environment_id, counts).await?;
-        let statuses = self.host_statuses(namespace).await?;
-        if let Some(description) =
-            environment_id.host_id().and_then(|id| statuses.get(id.as_str())).and_then(|status| status.description.as_ref())
-        {
-            response.visible_environments = description.environments.clone();
-        } else if environment_id == &local_summary.environment_id {
+        if environment_id == &local_summary.environment_id && !self.host_registry.has_resource_description(environment_id).await {
             response.visible_environments = self.environment_manager.visible_environments().await;
         }
         Ok(response)
