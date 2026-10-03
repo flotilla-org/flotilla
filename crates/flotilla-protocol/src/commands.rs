@@ -1241,6 +1241,7 @@ pub enum CommandValue {
         path: PathBuf,
     },
     Refreshed {
+        repository_count: usize,
         repos: Vec<PathBuf>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         identity_changes: Vec<RepositoryIdentityChange>,
@@ -1685,7 +1686,11 @@ mod tests {
                 }),
             },
             CommandValue::RepoUntracked { path: PathBuf::from("/old/repo") },
-            CommandValue::Refreshed { repos: vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")], identity_changes: Vec::new() },
+            CommandValue::Refreshed {
+                repository_count: 2,
+                repos: vec![PathBuf::from("/repo-a"), PathBuf::from("/repo-b")],
+                identity_changes: Vec::new(),
+            },
             CommandValue::CheckoutCreated {
                 branch: "feat-new".into(),
                 path: QualifiedPath::host(HostId::new("host-a"), "/repos/project/wt-1"),
@@ -1728,7 +1733,8 @@ mod tests {
             CommandValue::RepositoryResolved { key: Some(crate::RepositoryKey("widgets".into())) },
             CommandValue::RepositoryResolved { key: None },
             CommandValue::RepoProviders(Box::new(RepoProvidersResponse {
-                path: PathBuf::from("/repo"),
+                repository: crate::RepositoryKey("repository".into()),
+                path: Some(PathBuf::from("/repo")),
                 slug: Some("owner/repo".into()),
                 host_discovery: vec![],
                 repo_discovery: vec![],

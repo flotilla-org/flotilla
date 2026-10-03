@@ -280,7 +280,6 @@ async fn cli_lists_include_active_provider_sessions_and_workspaces() {
             path: temp.path().join("repo"),
             model: RepoModel::new(registry, None),
             slug: Some("team/repo".into()),
-            repo_bag: EnvironmentBag::default(),
             unmet: vec![],
             is_local: true,
         }),

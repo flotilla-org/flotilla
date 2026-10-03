@@ -84,6 +84,7 @@ struct FixedInspector {
 
 #[derive(Clone)]
 struct MutableInspector {
+    host_ref: String,
     spec: Arc<RwLock<RepositorySpec>>,
 }
 
@@ -150,7 +151,7 @@ impl RepositoryInspector for MutableInspector {
             spec: self.spec.read().expect("repository identity lock should not be poisoned").clone(),
             checkout: LocalCheckoutInspection {
                 path: path.to_path_buf(),
-                host_ref: "host-01".to_string(),
+                host_ref: self.host_ref.clone(),
                 git_ref: "main".to_string(),
                 is_main: true,
             },
@@ -1230,7 +1231,12 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
     let local_spec = RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec");
     let local_key = local_spec.key();
     let inspected_spec = Arc::new(RwLock::new(local_spec));
-    daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
+    daemon
+        .set_repository_inspector(Arc::new(MutableInspector {
+            spec: Arc::clone(&inspected_spec),
+            host_ref: daemon.local_host_id().expect("local Host").to_string(),
+        }))
+        .await;
 
     let first_id = daemon
         .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
@@ -1322,7 +1328,12 @@ async fn tracking_after_custom_project_identity_change_does_not_modify_the_expli
     std::fs::create_dir(&checkout_path).expect("checkout dir");
     let local_spec = RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec");
     let inspected_spec = Arc::new(RwLock::new(local_spec));
-    daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
+    daemon
+        .set_repository_inspector(Arc::new(MutableInspector {
+            spec: Arc::clone(&inspected_spec),
+            host_ref: daemon.local_host_id().expect("local Host").to_string(),
+        }))
+        .await;
 
     assert_eq!(
         execute_project_add(
@@ -1360,7 +1371,12 @@ async fn identity_change_preserves_existing_project_without_ambient_migration() 
     std::fs::create_dir(&checkout_path).expect("checkout dir");
     let local_spec = RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec");
     let inspected_spec = Arc::new(RwLock::new(local_spec));
-    daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
+    daemon
+        .set_repository_inspector(Arc::new(MutableInspector {
+            spec: Arc::clone(&inspected_spec),
+            host_ref: daemon.local_host_id().expect("local Host").to_string(),
+        }))
+        .await;
     let add_id = daemon
         .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
         .await
@@ -1412,7 +1428,12 @@ async fn refresh_surfaces_repository_identity_change_without_materializing_a_pro
     let inspected_spec = Arc::new(RwLock::new(
         RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec"),
     ));
-    daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
+    daemon
+        .set_repository_inspector(Arc::new(MutableInspector {
+            spec: Arc::clone(&inspected_spec),
+            host_ref: daemon.local_host_id().expect("local Host").to_string(),
+        }))
+        .await;
     let add_id = daemon
         .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
         .await
@@ -1428,6 +1449,7 @@ async fn refresh_surfaces_repository_identity_change_without_materializing_a_pro
         .expect("refresh command");
 
     assert_eq!(await_command_result(&mut rx, refresh_id).await, CommandValue::Refreshed {
+        repository_count: 1,
         repos: vec![checkout_path],
         identity_changes: vec![RepositoryIdentityChange {
             previous_display: "local".to_string(),
@@ -1447,7 +1469,12 @@ async fn identity_migration_marks_repository_retained_by_durable_checkout() {
     let local_spec = RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec");
     let local_key = local_spec.key();
     let inspected_spec = Arc::new(RwLock::new(local_spec));
-    daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
+    daemon
+        .set_repository_inspector(Arc::new(MutableInspector {
+            spec: Arc::clone(&inspected_spec),
+            host_ref: daemon.local_host_id().expect("local Host").to_string(),
+        }))
+        .await;
     let add_id = daemon
         .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
         .await
@@ -1551,7 +1578,12 @@ async fn daemon_restart_does_not_create_project_while_preserving_applied_project
     let local_spec = RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec");
     let local_key = local_spec.key();
     let inspected_spec = Arc::new(RwLock::new(local_spec));
-    daemon.set_repository_inspector(Arc::new(MutableInspector { spec: Arc::clone(&inspected_spec) })).await;
+    daemon
+        .set_repository_inspector(Arc::new(MutableInspector {
+            spec: Arc::clone(&inspected_spec),
+            host_ref: daemon.local_host_id().expect("local Host").to_string(),
+        }))
+        .await;
     let options = RuntimeOptions {
         namespace: "flotilla".to_string(),
         heartbeat_interval: Duration::from_secs(300),

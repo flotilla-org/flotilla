@@ -548,7 +548,7 @@ pub(crate) struct HostScopedDiscovery {
 }
 
 impl HostScopedDiscovery {
-    fn install(&self, registry: &mut ProviderRegistry, unmet: &mut Vec<(String, UnmetRequirement)>) {
+    pub(crate) fn install(&self, registry: &mut ProviderRegistry, unmet: &mut Vec<(String, UnmetRequirement)>) {
         registry.agent_adapters = self.registry.agent_adapters.clone();
         for (descriptor, provider) in &self.registry.cloud_agents {
             registry.cloud_agents.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));

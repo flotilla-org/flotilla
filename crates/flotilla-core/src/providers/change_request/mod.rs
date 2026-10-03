@@ -82,6 +82,36 @@ pub trait ChangeRequestTracker: Send + Sync {
         let (id, change_request) = self.get_change_request(id).await?;
         Ok(ChangeRequestAdmission { id, change_request, base_ref: None })
     }
+    /// Replace the forge request's body without relying on a working copy.
+    async fn update_body(&self, _id: &str, _body: &str) -> Result<(), String> {
+        Err("change request provider does not support editing bodies".into())
+    }
+
+    /// Preserve the existing body and append missing issue-closing references.
+    /// This read-modify-write can race with concurrent forge edits: the provider
+    /// API offers no conditional update, so callers should avoid parallel edits.
+    async fn link_issues(&self, id: &str, issue_ids: &[String]) -> Result<(), String> {
+        if issue_ids.is_empty() {
+            return Ok(());
+        }
+        let (_, request) = self.get_change_request(id).await?;
+        let current = request.body.unwrap_or_default();
+        let mut body = if current.trim().is_empty() { String::new() } else { current.trim_end().to_string() };
+        for issue in issue_ids {
+            let line = format!("Fixes #{issue}");
+            if !body.lines().any(|existing| existing == line) {
+                if !body.is_empty() {
+                    body.push_str("\n\n");
+                }
+                body.push_str(&line);
+            }
+        }
+        if body != current.trim_end() {
+            self.update_body(id, &body).await?;
+        }
+        Ok(())
+    }
+
     async fn open_in_browser(&self, id: &str) -> Result<(), String>;
     async fn close_change_request(&self, id: &str) -> Result<(), String>;
     async fn merge_change_request(&self, id: &str) -> Result<(), String>;

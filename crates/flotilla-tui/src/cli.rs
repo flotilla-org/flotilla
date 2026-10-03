@@ -1125,8 +1125,8 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
             output
         }
         CommandValue::RepoUntracked { path } => format!("stopped observing checkout: {}", path.display()),
-        CommandValue::Refreshed { repos, identity_changes } => {
-            let mut output = format!("refreshed {} repo(s)", repos.len());
+        CommandValue::Refreshed { repository_count, identity_changes, .. } => {
+            let mut output = format!("refreshed {repository_count} repo(s)");
             for change in identity_changes {
                 output.push_str(&format!("\nrepository identity changed: {} → {}", change.previous_display, change.current_display));
             }
@@ -1373,7 +1373,10 @@ pub async fn run_topology(daemon: &dyn DaemonHandle, format: TopologyOutputForma
 
 fn format_repo_providers_human(resp: &RepoProvidersResponse) -> String {
     let mut out = String::new();
-    out.push_str(&format!("Repo: {}\n", resp.path.display()));
+    out.push_str(&format!("Repository: {}\n", resp.repository));
+    if let Some(path) = &resp.path {
+        out.push_str(&format!("Checkout: {}\n", path.display()));
+    }
     if let Some(slug) = &resp.slug {
         out.push_str(&format!("Slug: {slug}\n"));
     }

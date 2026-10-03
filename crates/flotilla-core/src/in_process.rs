@@ -8,6 +8,7 @@ mod attach;
 #[path = "in_process/convoy_admission.rs"]
 mod convoy_admission;
 mod project_ops;
+mod repository_operations;
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -1675,6 +1676,7 @@ pub struct InProcessDaemon {
     issue_query_port: Arc<dyn IssueQueryPort>,
     /// VCS capabilities are selected once for each checkout in its execution environment.
     checkout_vcs: Mutex<CheckoutVcsCache>,
+    repository_providers: Mutex<HashMap<(String, RepositoryKey), Arc<repository_operations::RepositoryProviderLease>>>,
     /// Running commands, keyed by command ID, for cancellation.
     active_commands: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     self_weak: Weak<InProcessDaemon>,
@@ -1891,6 +1893,7 @@ impl InProcessDaemon {
         let mut order = Vec::new();
         let mut path_identities = HashMap::new();
         let mut repository_keys_by_path = HashMap::new();
+        let observed_resource_backend = ResourceBackend::InMemory(InMemoryBackend::observed());
 
         let daemon_config = config.load_daemon_config().expect("failed to load daemon config");
         let config_machine_id = daemon_config.machine_id.as_deref();
@@ -1933,7 +1936,7 @@ impl InProcessDaemon {
             let initial_vcs =
                 discover_vcs_for_checkout(&environment_manager, &discovery, &config, &local_environment_id, &local_environment_id, &path)
                     .await;
-            let startup_inspection = match initial_vcs {
+            let mut startup_inspection = match initial_vcs {
                 Ok(vcs) => {
                     GitRepositoryInspector::new(
                         discovery.runner.clone(),
@@ -1945,7 +1948,7 @@ impl InProcessDaemon {
                 }
                 Err(error) => Err(error),
             };
-            if let Ok(inspection) = &startup_inspection {
+            if let Ok(inspection) = &mut startup_inspection {
                 let mut spec = inspection.spec.clone();
                 if let Some(live_remote) = spec.live_remote() {
                     if let Ok(repositories) = resource_backend.including_replicas::<Repository>(DEFAULT_PROVISIONING_NAMESPACE).list().await
@@ -1957,9 +1960,10 @@ impl InProcessDaemon {
                         }
                     }
                 }
+                inspection.spec = spec.clone();
                 config.set_repository_spec(&ExecutionEnvironmentPath::new(&path), spec);
             }
-            let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_repo_for_environment(
+            let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag: _, unmet } = discover_repo_for_environment(
                 &environment_manager,
                 &discovery,
                 &config,
@@ -1978,7 +1982,48 @@ impl InProcessDaemon {
             let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
             match startup_inspection {
                 Ok(inspection) => {
-                    repository_keys_by_path.insert(path.clone(), inspection.key());
+                    // Observation roots are producers of Repository/Checkout facts.
+                    // Recreate their ephemeral context before identity-based consumers run.
+                    let publish = async {
+                        let spec = match host_repo_bag.find_origin_forge() {
+                            Some(forge) => inspection.spec.clone().on_forge(forge)?,
+                            None => inspection.spec.clone(),
+                        };
+                        let key = spec.key();
+                        flotilla_resources::ensure_repository(
+                            &resource_backend.clone().using::<Repository>(DEFAULT_PROVISIONING_NAMESPACE),
+                            &key,
+                            &spec,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        let mut providers = ProviderData::default();
+                        if let Some(vcs) = registry.vcs.preferred() {
+                            for (checkout_path, checkout) in vcs.list_checkouts().await? {
+                                providers
+                                    .checkouts
+                                    .insert(QualifiedPath::host(local_host_id.clone(), checkout_path.into_path_buf()), checkout);
+                            }
+                        }
+                        crate::observed_resources::reconcile_checkouts(
+                            &observed_resource_backend,
+                            DEFAULT_PROVISIONING_NAMESPACE,
+                            &key,
+                            &spec.catalog_slug(),
+                            &providers,
+                            local_host_id.as_str(),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        Ok::<_, String>(key)
+                    }
+                    .await;
+                    match publish {
+                        Ok(key) => {
+                            repository_keys_by_path.insert(path.clone(), key);
+                        }
+                        Err(error) => warn!(repo = %path.display(), %error, "startup repository observation failed"),
+                    }
                 }
                 Err(error) => {
                     warn!(repo = %path.display(), %error, "repository key is unavailable during daemon startup");
@@ -1991,7 +2036,7 @@ impl InProcessDaemon {
                 checkout_vcs.insert((local_environment_id.clone(), path.clone()), Arc::new(cell));
             }
             let model = RepoModel::new(registry, Some(local_environment_id.clone()));
-            let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
+            let root = RepoRootState { path: path.clone(), model, slug, unmet, is_local: true };
 
             if let Some(state) = repos.get_mut(&identity) {
                 state.add_root(root);
@@ -2057,7 +2102,6 @@ impl InProcessDaemon {
         let leaf_subscriptions =
             LeafSubscriptionTable::with_issues(resource_backend.clone(), event_sink.clone(), change_request_refresher, issue_refresher);
         let admission_free_space_path = config.state_dir().as_path().to_path_buf();
-        let observed_resource_backend = ResourceBackend::InMemory(InMemoryBackend::observed());
         let aggregator_projection_state = AggregatorProjectionState::new();
         let repository_keys_by_path = Arc::new(RwLock::new(repository_keys_by_path));
         let repository_change_requests = Arc::new(RwLock::new(HashMap::new()));
@@ -2090,6 +2134,7 @@ impl InProcessDaemon {
             discovery: Arc::clone(&discovery),
             issue_query_port: Arc::clone(&issue_query_port),
             checkout_vcs: Mutex::new(checkout_vcs),
+            repository_providers: Mutex::new(HashMap::new()),
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             self_weak: self_weak.clone(),
             convoy_admission: ConvoyAdmission::builder()
@@ -2161,6 +2206,11 @@ impl InProcessDaemon {
                 };
                 let live = listed.items.iter().map(|repository| repository.metadata.name.as_str()).collect::<HashSet<_>>();
                 daemon.convoy_admission.repository_change_requests.write().await.retain(|key, _| live.contains(key.to_string().as_str()));
+                daemon
+                    .repository_providers
+                    .lock()
+                    .await
+                    .retain(|(cached_namespace, key), _| cached_namespace != &namespace || live.contains(key.to_string().as_str()));
                 let mut watch = match repositories.watch(WatchStart::resuming_from(&listed)).await {
                     Ok(watch) => watch,
                     Err(error) => {
@@ -2196,6 +2246,11 @@ impl InProcessDaemon {
                     };
                     let Some(daemon) = weak.upgrade() else { return };
                     daemon.convoy_admission.repository_change_requests.write().await.retain(|key, _| key.to_string() != name);
+                    daemon
+                        .repository_providers
+                        .lock()
+                        .await
+                        .retain(|(cached_namespace, key), _| cached_namespace != &namespace || key.to_string() != name);
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -2385,7 +2440,17 @@ impl InProcessDaemon {
     }
 
     async fn configure_inspected_repository(&self, path: &Path, spec: RepositorySpec) -> Result<(RepositorySpec, bool), String> {
-        if let Some(repository_key) = self.repository_keys_by_path.read().await.get(path).cloned() {
+        let repository_key = self.repository_keys_by_path.read().await.get(path).cloned();
+        self.configure_repository_for_checkout(path, spec, repository_key.as_ref()).await
+    }
+
+    async fn configure_repository_for_checkout(
+        &self,
+        path: &Path,
+        spec: RepositorySpec,
+        repository_key: Option<&RepositoryKey>,
+    ) -> Result<(RepositorySpec, bool), String> {
+        if let Some(repository_key) = repository_key {
             let namespace = self.provisioning_namespace().await;
             let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
             if let Ok(stored) = repositories.get(&repository_key.to_string()).await {
@@ -3542,26 +3607,10 @@ impl InProcessDaemon {
 
     async fn resolve_repo_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
         match selector {
-            // #2500 owns replacing this compatibility bridge and its consumers.
-            // Preserve their preferred checkout and provider-registry semantics.
-            flotilla_protocol::RepoSelector::Repository(key) => {
-                let paths = self
-                    .repository_keys_by_path
-                    .read()
-                    .await
-                    .iter()
-                    .filter(|(_, candidate)| *candidate == key)
-                    .map(|(path, _)| path.clone())
-                    .collect::<Vec<_>>();
-                self.repos
-                    .read()
-                    .await
-                    .values()
-                    .filter(|state| paths.iter().any(|path| state.contains_path(path)))
-                    .min_by_key(|state| (state.local_paths().is_empty(), state.preferred_path()))
-                    .map(|state| state.preferred_path().to_path_buf())
-                    .ok_or_else(|| format!("Repository {key} has no available checkout on this host"))
-            }
+            flotilla_protocol::RepoSelector::Repository(key) => self
+                .local_checkout_for_repository(key)
+                .await?
+                .ok_or_else(|| format!("Repository {key} has no available checkout on this host")),
             flotilla_protocol::RepoSelector::Path(path) => {
                 let identities = self.path_identities.read().await;
                 if identities.contains_key(path) {
@@ -3653,11 +3702,6 @@ impl InProcessDaemon {
             }
             CommandAction::Refresh { repo: Some(selector) } => self.resolve_repo_selector(selector).await,
             CommandAction::FetchCheckoutStatus { .. }
-            | CommandAction::OpenChangeRequest { .. }
-            | CommandAction::CloseChangeRequest { .. }
-            | CommandAction::MergeChangeRequest { .. }
-            | CommandAction::OpenIssue { .. }
-            | CommandAction::LinkIssuesToChangeRequest { .. }
             | CommandAction::ArchiveSession { .. }
             | CommandAction::GenerateBranchName { .. }
             | CommandAction::TeleportSession { .. }
@@ -3670,33 +3714,6 @@ impl InProcessDaemon {
             }
             _ => Err("command does not resolve to a single repo".to_string()),
         }
-    }
-
-    async fn repository_action_policy_error(&self, command: &Command, repo: &Path) -> Option<String> {
-        let CommandAction::MergeChangeRequest { id, .. } = &command.action else {
-            return None;
-        };
-        let repository_key = match self.repository_keys_by_path.read().await.get(repo).cloned() {
-            Some(key) => key,
-            None => {
-                return Some(format!(
-                    "cannot determine whether merging change request {id} is permitted: repository policy is unavailable"
-                ));
-            }
-        };
-        let namespace = self.provisioning_namespace().await;
-        let repository = match self.resource_backend.clone().using::<Repository>(&namespace).get(&repository_key.to_string()).await {
-            Ok(repository) => repository,
-            Err(error) => {
-                return Some(format!(
-                    "cannot determine whether merging change request {id} is permitted: repository policy is unavailable: {error}"
-                ));
-            }
-        };
-        repository
-            .spec
-            .is_fork()
-            .then(|| format!("merging change request {id} is forbidden for fork-stance repository; landing is human-only"))
     }
 
     /// Persist every branch-matching PR across the convoy's repositories.
@@ -3988,7 +4005,6 @@ impl InProcessDaemon {
                     path: synthetic_path.clone(),
                     model,
                     slug: None,
-                    repo_bag: EnvironmentBag::new(),
                     unmet: Vec::new(),
                     is_local: false,
                 }),
@@ -5473,6 +5489,15 @@ impl InProcessDaemon {
         &self,
         inspection: &crate::repository_inspection::RepositoryInspection,
     ) -> Result<Option<RepositoryIdentityChange>, String> {
+        let previous = self.repository_keys_by_path.read().await.get(&inspection.checkout.path).cloned();
+        self.reconcile_inspected_repository(inspection, previous.as_ref()).await
+    }
+
+    async fn reconcile_inspected_repository(
+        &self,
+        inspection: &RepositoryInspection,
+        previous_key: Option<&RepositoryKey>,
+    ) -> Result<Option<RepositoryIdentityChange>, String> {
         let namespace = self.provisioning_namespace().await;
         let repository_spec = &inspection.spec;
         let repository_key = repository_spec.key();
@@ -5498,13 +5523,7 @@ impl InProcessDaemon {
             .collect::<BTreeMap<_, _>>();
         let mut superseded_keys = BTreeSet::new();
         let mut declared_alias_keys = BTreeSet::new();
-        let previous_tracked_key = self
-            .repository_keys_by_path
-            .read()
-            .await
-            .get(&inspection.checkout.path)
-            .filter(|previous| *previous != &repository_key)
-            .cloned();
+        let previous_tracked_key = previous_key.filter(|previous| *previous != &repository_key).cloned();
         if let Some(previous) = previous_tracked_key.as_ref().filter(|_| !inspection.replaces_prior_repository) {
             superseded_keys.insert(previous.clone());
         }
@@ -5544,14 +5563,20 @@ impl InProcessDaemon {
             .map_err(|error| error.to_string())?;
         }
 
-        let other_tracked_keys = self
-            .repository_keys_by_path
-            .read()
-            .await
-            .iter()
-            .filter(|(path, _)| *path != &inspection.checkout.path)
-            .map(|(_, key)| key.clone())
-            .collect::<BTreeSet<_>>();
+        let other_tracked_keys = crate::repository_addressing::local_checkouts(
+            &self.resource_backend,
+            &self.observed_resource_backend,
+            &namespace,
+            self.environment_manager.local_host_id().as_str(),
+        )
+        .await?
+        .into_iter()
+        .filter(|checkout| match &checkout.spec {
+            ResourceCheckoutSpec::Observed(spec) => Path::new(&spec.path) != inspection.checkout.path,
+            _ => checkout.status.as_ref().and_then(|status| status.path.as_deref()) != inspection.checkout.path.to_str(),
+        })
+        .map(|checkout| checkout.spec.repo_ref().clone())
+        .collect::<BTreeSet<_>>();
         let mut migratable_keys = superseded_keys.difference(&other_tracked_keys).cloned().collect::<BTreeSet<_>>();
         migratable_keys.extend(declared_alias_keys);
 
@@ -5628,7 +5653,7 @@ impl InProcessDaemon {
         self.refresh_repository(repo, RepositoryRefreshFailurePolicy::BestEffort).await
     }
 
-    /// Refresh a tracked repository and surface inspection failures to the caller.
+    /// Refresh a Repository and surface checkout inspection failures to the caller.
     ///
     /// Operator-triggered reconciliation uses this path so a successful response
     /// means the requested refresh actually ran. Periodic background refreshes use
@@ -5642,41 +5667,54 @@ impl InProcessDaemon {
         repo: &flotilla_protocol::RepoSelector,
         failure_policy: RepositoryRefreshFailurePolicy,
     ) -> Result<Option<RepositoryIdentityChange>, String> {
-        let repo = self.resolve_repo_selector(repo).await?;
-        let identity =
-            self.tracked_repo_identity_for_path(&repo).await.ok_or_else(|| format!("no observed checkout at {}", repo.display()))?;
-        let identity_change = match self.inspect_repository_path(&repo, None).await {
+        let repository = self.repository_for_selector(repo).await?;
+        let key = repository.spec.key();
+        let namespace = self.provisioning_namespace().await;
+        let Some(path) = self.local_checkout_for_repository(&key).await? else {
+            if let Err(error) = self.repository_providers(&repository).await {
+                if failure_policy == RepositoryRefreshFailurePolicy::Strict {
+                    return Err(error);
+                }
+                warn!(repository = %key, %error, "Repository capabilities unavailable during refresh");
+            }
+            return Ok(None);
+        };
+        let inspected = async {
+            let mut inspection = self.repository_inspector().await?.inspect_path(&path, None).await?;
+            inspection.spec = self.resolve_forge_identity(inspection.spec).await?;
+            let (spec, replaces_prior_repository) = self.configure_repository_for_checkout(&path, inspection.spec, Some(&key)).await?;
+            inspection.spec = spec;
+            inspection.replaces_prior_repository = replaces_prior_repository;
+            Ok::<_, String>(inspection)
+        }
+        .await;
+        match inspected {
             Ok(inspection) => {
-                let key_changed = self.repository_keys_by_path.read().await.get(&repo) != Some(&inspection.key());
-                let identity_change = if key_changed {
-                    self.reconcile_tracked_repository(&inspection).await?
+                let changed = inspection.key() != key;
+                let result = if changed {
+                    self.reconcile_inspected_repository(&inspection, Some(&key)).await?
                 } else {
-                    let namespace = self.provisioning_namespace().await;
-                    self.reconcile_repository_config(&namespace, &inspection.key(), &inspection.spec).await?;
-                    self.reconcile_project_checkouts(&namespace, &inspection.key(), &inspection.spec, inspection.checkout.clone()).await?;
+                    self.reconcile_repository_config(&namespace, &key, &inspection.spec).await?;
+                    self.reconcile_project_checkouts(&namespace, &key, &inspection.spec, inspection.checkout.clone()).await?;
                     None
                 };
-                if key_changed {
-                    {
-                        let _reconciliation = self.observed_checkout_reconciliation.lock().await;
-                        if self.tracked_repo_identity_for_path(&repo).await.as_ref() != Some(&identity) {
-                            return Err(format!("no observed checkout at {}", repo.display()));
-                        }
-                        self.repository_keys_by_path.write().await.insert(repo.clone(), inspection.key());
+                // Maintain the retiring observation projection; this never decides
+                // whether refresh is admitted or what response it returns.
+                if changed {
+                    if let Some(projected_key) = self.repository_keys_by_path.write().await.get_mut(&path) {
+                        *projected_key = inspection.key();
                     }
-                    self.publish_repo_info_update(&identity).await;
                 }
-                identity_change
+                Ok(result)
+            }
+            Err(error) if failure_policy == RepositoryRefreshFailurePolicy::Strict => {
+                Err(format!("inspect repository {} during refresh: {error}", path.display()))
             }
             Err(error) => {
-                if failure_policy == RepositoryRefreshFailurePolicy::Strict {
-                    return Err(format!("inspect repository {} during refresh: {error}", repo.display()));
-                }
-                warn!(repo = %repo.display(), %error, "repository identity is unavailable during refresh");
-                None
+                warn!(repo = %path.display(), %error, "repository identity is unavailable during refresh");
+                Ok(None)
             }
-        };
-        Ok(identity_change)
+        }
     }
 
     /// Refresh host-local bare pane state and publish field-scoped deltas.
@@ -5828,7 +5866,7 @@ impl InProcessDaemon {
         self.config.set_repository_spec(&ExecutionEnvironmentPath::new(&path), repository_inspection.spec.clone());
 
         // Create the model outside the lock (spawns provider detection and refresh)
-        let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag, unmet } = discover_repo_for_environment(
+        let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag: _, unmet } = discover_repo_for_environment(
             &self.environment_manager,
             &self.discovery,
             &self.config,
@@ -5880,7 +5918,7 @@ impl InProcessDaemon {
         }
         let slug = repo_slug.clone();
         let model = RepoModel::new(registry, Some(self.local_environment_id.clone()));
-        let root = RepoRootState { path: path.clone(), model, slug, repo_bag, unmet, is_local: true };
+        let root = RepoRootState { path: path.clone(), model, slug, unmet, is_local: true };
 
         let repo_info = RepoInfo {
             identity: identity.clone(),
@@ -5997,39 +6035,7 @@ impl InProcessDaemon {
     // --- Internal query helpers (formerly DaemonHandle trait methods) ---
 
     pub async fn get_repo_providers_internal(&self, repo: &flotilla_protocol::RepoSelector) -> Result<RepoProvidersResponse, String> {
-        let repo_path = self.resolve_repo_selector(repo).await?;
-        let identity =
-            self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-        let repos = self.repos.read().await;
-        let state = repos.get(&identity).ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
-
-        let host_bag = state
-            .preferred_environment_id()
-            .and_then(|env_id| self.environment_manager.environment_bag(env_id))
-            .unwrap_or_else(|| self.environment_manager.local_environment_bag());
-        let host_discovery = host_bag.assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
-        let repo_discovery = state.repo_bag().assertions().iter().map(crate::convert::assertion_to_discovery_entry).collect();
-
-        let provider_infos = state
-            .preferred_root()
-            .model
-            .registry
-            .provider_infos()
-            .into_iter()
-            .map(|(category, name)| ProviderInfo { category, name, healthy: true, disabled_reason: None })
-            .collect();
-
-        let unmet_requirements =
-            state.unmet().iter().map(|(factory, req)| crate::convert::unmet_requirement_to_proto(factory, req)).collect();
-
-        Ok(RepoProvidersResponse {
-            path: state.preferred_path().to_path_buf(),
-            slug: state.slug().map(str::to_string),
-            host_discovery,
-            repo_discovery,
-            providers: provider_infos,
-            unmet_requirements,
-        })
+        self.repository_providers_response(repo).await
     }
 
     fn read_projections(&self) -> read_projections::ReadProjections<'_> {
@@ -8596,45 +8602,48 @@ impl InProcessDaemon {
 
     async fn execute_action_refresh_all(&self, id: u64, command: &Command) -> Result<u64, String> {
         if matches!(command.action, flotilla_protocol::CommandAction::Refresh { repo: None }) {
-            let repo_paths = {
-                let repos = self.repos.read().await;
-                let order = self.repo_order.read().await;
-                order
-                    .iter()
-                    .filter_map(|identity| repos.get(identity).map(|state| state.preferred_path().to_path_buf()))
-                    .collect::<Vec<_>>()
-            };
-            let repo_path = repo_paths.first().cloned().unwrap_or_default();
-            let repo_identity = self.tracked_repo_identity_for_path(&repo_path).await.unwrap_or_else(|| fallback_repo_identity(&repo_path));
+            let repositories = self
+                .resource_backend
+                .including_replicas::<Repository>(&self.provisioning_namespace().await)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .items;
+            let repo_identity = empty_repo_identity();
             let description = command.description().to_string();
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: repo_identity.clone(),
-                repo: Some(repo_path.clone()),
+                repo: None,
                 description,
             });
             let mut refreshed = Vec::new();
             let mut identity_changes = Vec::new();
             let result = match async {
-                for repo in &repo_paths {
-                    if let Some(change) = self.refresh(&flotilla_protocol::RepoSelector::Path(repo.clone())).await? {
+                for repository in &repositories {
+                    let key = repository.object.spec.key();
+                    if let Some(change) = self.refresh(&flotilla_protocol::RepoSelector::Repository(key.clone())).await? {
                         identity_changes.push(change);
                     }
-                    refreshed.push(repo.clone());
+                    if let Some(path) = self.local_checkout_for_repository(&key).await? {
+                        refreshed.push(path);
+                    }
                 }
                 Ok::<(), String>(())
             }
             .await
             {
-                Ok(()) => flotilla_protocol::CommandValue::Refreshed { repos: refreshed, identity_changes },
+                Ok(()) => {
+                    flotilla_protocol::CommandValue::Refreshed { repos: refreshed, repository_count: repositories.len(), identity_changes }
+                }
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
             };
             let _ = self.event_tx.send(DaemonEvent::CommandFinished {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity,
-                repo: Some(repo_path),
+                repo: None,
                 result,
             });
             return Ok(id);
@@ -9634,20 +9643,21 @@ impl InProcessDaemon {
 
     async fn execute_action_refresh_repo(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::Refresh { repo: Some(selector) } = &command.action {
-            let repo_path = self.resolve_repo_selector(selector).await?;
+            let repository = self.repository_for_selector(selector).await?;
+            let repo_path = self.local_checkout_for_repository(&repository.spec.key()).await?;
             let description = command.description().to_string();
-            let repo_identity =
-                self.tracked_repo_identity_for_path(&repo_path).await.ok_or_else(|| format!("repo not found: {}", repo_path.display()))?;
+            let repo_identity = repository_operations::repository_event_identity(&repository.spec, repo_path.as_deref());
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity: repo_identity.clone(),
-                repo: Some(repo_path.clone()),
+                repo: repo_path.clone(),
                 description,
             });
-            let result = match self.refresh(&flotilla_protocol::RepoSelector::Path(repo_path.clone())).await {
+            let result = match self.refresh(selector).await {
                 Ok(identity_change) => flotilla_protocol::CommandValue::Refreshed {
-                    repos: vec![repo_path.clone()],
+                    repository_count: 1,
+                    repos: repo_path.clone().into_iter().collect(),
                     identity_changes: identity_change.into_iter().collect(),
                 },
                 Err(message) => flotilla_protocol::CommandValue::Error { message },
@@ -9656,7 +9666,7 @@ impl InProcessDaemon {
                 command_id: id,
                 node_id: self.node_id.clone(),
                 repo_identity,
-                repo: Some(repo_path),
+                repo: repo_path,
                 result,
             });
             return Ok(id);
@@ -9820,6 +9830,13 @@ impl InProcessDaemon {
                 return boxed_action!(self.execute_action_track_repo_path(id, &command))
             }
             flotilla_protocol::CommandAction::UntrackRepo { .. } => return boxed_action!(self.execute_action_untrack_repo(id, &command)),
+            flotilla_protocol::CommandAction::OpenChangeRequest { .. }
+            | flotilla_protocol::CommandAction::CloseChangeRequest { .. }
+            | flotilla_protocol::CommandAction::MergeChangeRequest { .. }
+            | flotilla_protocol::CommandAction::OpenIssue { .. }
+            | flotilla_protocol::CommandAction::LinkIssuesToChangeRequest { .. } => {
+                return boxed_action!(self.execute_action_repository_forge(id, &command))
+            }
             flotilla_protocol::CommandAction::Refresh { repo: Some(_) } => {
                 return boxed_action!(self.execute_action_refresh_repo(id, &command))
             }
@@ -9828,7 +9845,6 @@ impl InProcessDaemon {
 
         // Gather what the spawned task needs — validate repo before broadcasting
         let repo = self.resolve_repo_for_command(&command).await?;
-        let repository_action_policy_error = self.repository_action_policy_error(&command, &repo).await;
         let runner = Arc::clone(&self.discovery.runner);
         let env = Arc::clone(&self.discovery.env);
         let event_tx = self.event_tx.clone();
@@ -9879,22 +9895,19 @@ impl InProcessDaemon {
             let resolver_repo = executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path.clone() };
             let daemon_socket_dhp = daemon_socket_path.map(DaemonHostPath::new);
 
-            let plan = match repository_action_policy_error {
-                Some(message) => Err(CommandValue::Error { message }),
-                None => executor::build_plan(
-                    command,
-                    executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path },
-                    registry,
-                    providers_data,
-                    config_base,
-                    attachable_store,
-                    daemon_socket_dhp.clone(),
-                    local_node_id.clone(),
-                    local_host,
-                )
-                .await
-                .map_err(executor::PlannerRefusal::into_command_value),
-            };
+            let plan = executor::build_plan(
+                command,
+                executor::RepoExecutionContext { identity: repo_identity.clone(), root: ee_repo_path },
+                registry,
+                providers_data,
+                config_base,
+                attachable_store,
+                daemon_socket_dhp.clone(),
+                local_node_id.clone(),
+                local_host,
+            )
+            .await
+            .map_err(executor::PlannerRefusal::into_command_value);
 
             match plan {
                 Err(result) => {
