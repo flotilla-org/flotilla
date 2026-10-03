@@ -1,4 +1,5 @@
 // Keep integration coverage in one executable to avoid linking the crate graph per module.
+// Tests share a process: isolate state and keep process-wide mutations in separate targets.
 mod aggregator;
 mod convergence_property;
 mod convoy_create_cli;
@@ -8,3 +9,5 @@ mod peer_connect_flow;
 mod project_cli;
 mod reconciled_remote_turn;
 mod terminal_message_history;
+#[path = "../../../../tests/support/integration_modules.rs"]
+mod test_module_registration;

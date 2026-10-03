@@ -1,4 +1,5 @@
 // Keep integration coverage in one executable to avoid linking the crate graph per module.
+// Tests share a process: isolate state and keep process-wide mutations in separate targets.
 #[path = "../common/mod.rs"]
 mod common;
 mod controller_loop;
@@ -30,5 +31,7 @@ mod review_bundle_aggregator;
 mod sqlite;
 mod status_patch;
 mod stored_corpus;
+#[path = "../../../../tests/support/integration_modules.rs"]
+mod test_module_registration;
 mod workflow_template_in_memory;
 mod workflow_template_validation;
