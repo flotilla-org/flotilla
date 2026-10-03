@@ -51,17 +51,26 @@ def local_repository_key(node: str) -> str:
     """Address the adopted identity on this host, not a fleet-wide path."""
     hosts = hub_json(node, "resource list hosts")["records"]
     host_ref = next(
-        record["object"]["metadata"]["name"]
-        for record in hosts
-        if record["object"]["spec"]["display_name"] == node
+        (
+            record["object"]["metadata"]["name"]
+            for record in hosts
+            if record["object"]["spec"]["display_name"] == node
+        ),
+        None,
     )
+    assert host_ref is not None, f"no Host for {node}: {hosts}"
     repositories = hub_json(node, "resource list repositories")["records"]
-    return next(
-        record["object"]["metadata"]["name"]
-        for record in repositories
-        if record["object"]["spec"]["identity"].get("git_common_dir") == "/home/flotilla/repo/.git"
-        and record["object"]["spec"]["identity"].get("host_ref") == host_ref
+    repository_key = next(
+        (
+            record["object"]["metadata"]["name"]
+            for record in repositories
+            if record["object"]["spec"]["identity"].get("git_common_dir") == "/home/flotilla/repo/.git"
+            and record["object"]["spec"]["identity"].get("host_ref") == host_ref
+        ),
+        None,
     )
+    assert repository_key is not None, f"no adopted Repository for {node} ({host_ref}): {repositories}"
+    return repository_key
 
 
 def hub_compose(*args: str, timeout: int = 60):

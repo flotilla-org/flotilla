@@ -2290,11 +2290,16 @@ async fn lookup_cli_repository(daemon: &dyn DaemonHandle, selector: RepoSelector
     }
 }
 
+// Unprefixed relative strings remain identity queries (including forge slugs).
+fn is_path_like_selector(query: &str) -> bool {
+    Path::new(query).is_absolute() || query == "." || query == ".." || query.starts_with("./") || query.starts_with("../")
+}
+
 async fn resolve_cli_repository(daemon: &dyn DaemonHandle, selector: RepoSelector) -> Result<RepoSelector, String> {
     let label = selector.to_string();
     lookup_cli_repository(daemon, selector.clone()).await?.ok_or_else(|| {
         if let RepoSelector::Query(query) = &selector {
-            if Path::new(query).is_absolute() || query == "." || query == ".." || query.starts_with("./") || query.starts_with("../") {
+            if is_path_like_selector(query) {
                 return format!(
                     "repository path selectors are not supported: '{label}'; run from inside the observed checkout and omit --repo for cwd inference, or use a Repository key, project member alias, or forge slug"
                 );
@@ -2330,7 +2335,7 @@ async fn resolve_command_repositories(daemon: &dyn DaemonHandle, command: &mut C
         CommandAction::UntrackRepo { repo } => {
             if let RepoSelector::Query(query) = repo {
                 let path = Path::new(query);
-                if path.is_absolute() || query == "." || query == ".." || query.starts_with("./") || query.starts_with("../") {
+                if is_path_like_selector(query) {
                     *repo = RepoSelector::Path(tokio::fs::canonicalize(path).await.unwrap_or_else(|_| path.to_path_buf()));
                     return Ok(());
                 }
@@ -3858,6 +3863,9 @@ mod tests {
             assert!(error.contains("cwd inference"), "{error}");
             assert!(error.contains("Repository key"), "{error}");
         }
+        // Bare relative strings are identity queries, not filesystem path selectors.
+        let error = super::resolve_cli_repository(&*daemon, RepoSelector::Query("widgets".into())).await.expect_err("unknown identity");
+        assert!(error.starts_with("no Repository matches 'widgets'"), "{error}");
         let mut query = Command::builder()
             .action(CommandAction::QueryIssueFetchByIds { repo: RepoSelector::Query("primary".into()), ids: vec!["1".into()] })
             .build();
