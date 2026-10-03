@@ -753,7 +753,8 @@ impl CliAgentAdapter {
     ) -> Result<(), String> {
         // Install the exclusion before writing any runtime files or launching an agent.
         if let Some(vcs) = vcs {
-            ensure_flotilla_git_exclude(&*self.runner, vcs, cwd.as_path()).await?;
+            let runtime_paths = std::iter::once(brief.path.as_str()).chain(self.flavor.managed_files().iter().copied()).collect::<Vec<_>>();
+            ensure_flotilla_git_exclude(&*self.runner, vcs, cwd.as_path(), &runtime_paths).await?;
         }
         match &self.flavor {
             AdapterFlavor::ClaudeCode { state_config, state_lock, contained } => {
@@ -909,7 +910,22 @@ async fn seed_claude_headless_state(runner: &dyn CommandRunner, cwd: &Path, conf
     runner.write_file(&config.path, &rendered).await
 }
 
-async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, vcs: &dyn crate::vcs::Vcs, cwd: &Path) -> Result<(), String> {
+/// Exclude `.flotilla/` and prove that every runtime file the adapter writes is
+/// ignored. The proof checks those files, not the directory: a repository may
+/// track its own `.flotilla/` declarations (Git never reports a directory that
+/// holds tracked files as ignored), while the runtime files must stay untracked.
+async fn ensure_flotilla_git_exclude(
+    runner: &dyn CommandRunner,
+    vcs: &dyn crate::vcs::Vcs,
+    cwd: &Path,
+    runtime_paths: &[&str],
+) -> Result<(), String> {
+    // A plain directory (a multi-repository workspace root) has nothing that
+    // can be committed; each repository the brief is copied into is prepared
+    // separately and proves its own exclusion.
+    if !vcs.inside_work_tree().await? {
+        return Ok(());
+    }
     let exclude_path = vcs
         .exclude_file_path()
         .await?
@@ -923,8 +939,12 @@ async fn ensure_flotilla_git_exclude(runner: &dyn CommandRunner, vcs: &dyn crate
         .run("sh", &["-lc", &script], cwd, &ChannelLabel::Default)
         .await
         .map_err(|error| format!("cannot install .flotilla/ runtime-file exclusion: {error}"))?;
-    if !vcs.path_is_ignored(Path::new(".flotilla/")).await? {
-        return Err("cannot guarantee .flotilla/ runtime-file exclusion: checkout ignore rules override it".to_string());
+    for runtime_path in runtime_paths {
+        if !vcs.path_is_ignored(Path::new(runtime_path)).await? {
+            return Err(format!(
+                "cannot guarantee .flotilla/ runtime-file exclusion: checkout ignore rules override it for {runtime_path}"
+            ));
+        }
     }
     Ok(())
 }
@@ -2111,14 +2131,34 @@ mod tests {
             providers::vcs::git_worktree::GitWorktreeStrategy,
             vcs::{FlotillaVcs, GitCheckoutStrategy},
         };
-        for (existing, ignore, overridden) in [
-            ("previous-pattern", None, false),
-            (".flotilla/\n!.flotilla/", None, false),
-            ("", Some("!.flotilla/\n"), true),
-            ("", Some("!.flotilla/agent-exits/*\n!.flotilla/briefs/\n"), false),
+        const RUNTIME_PATHS: &[&str] = &[".flotilla/briefs/coder.md", CLAUDE_MANAGED_SETTINGS_PATH];
+        for (existing, ignore, overridden, tracks_declarations) in [
+            ("previous-pattern", None, false, false),
+            (".flotilla/\n!.flotilla/", None, false, false),
+            ("", Some("!.flotilla/\n"), true, false),
+            ("", Some("!.flotilla/agent-exits/*\n!.flotilla/briefs/\n"), false, false),
+            // A repository may track its own `.flotilla/` declarations (flotilla
+            // itself does); Git then never reports the directory as ignored.
+            ("", None, false, true),
         ] {
             let repo = tempfile::tempdir().expect("checkout");
             assert!(ProcessCommand::new("git").args(["init", "-q"]).current_dir(repo.path()).status().expect("git init").success());
+            if tracks_declarations {
+                std::fs::create_dir_all(repo.path().join(".flotilla")).expect("declaration directory");
+                std::fs::write(repo.path().join(".flotilla/environment.yaml"), "kind: Environment\n").expect("declaration");
+                assert!(ProcessCommand::new("git")
+                    .args(["-c", "user.email=t@example.com", "-c", "user.name=t", "add", ".flotilla/environment.yaml"])
+                    .current_dir(repo.path())
+                    .status()
+                    .expect("track declaration")
+                    .success());
+                assert!(ProcessCommand::new("git")
+                    .args(["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "declarations"])
+                    .current_dir(repo.path())
+                    .status()
+                    .expect("commit declaration")
+                    .success());
+            }
             std::fs::write(repo.path().join(".git/info/exclude"), existing).expect("existing exclusions");
             if let Some(ignore) = ignore {
                 std::fs::write(repo.path().join(".gitignore"), ignore).expect("higher-priority rules");
@@ -2131,8 +2171,8 @@ mod tests {
                 GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), runner.clone()))),
             );
             let (result, concurrent) = tokio::join!(
-                super::ensure_flotilla_git_exclude(&*runner, &vcs, repo.path()),
-                super::ensure_flotilla_git_exclude(&*runner, &vcs, repo.path()),
+                super::ensure_flotilla_git_exclude(&*runner, &vcs, repo.path(), RUNTIME_PATHS),
+                super::ensure_flotilla_git_exclude(&*runner, &vcs, repo.path(), RUNTIME_PATHS),
             );
             if overridden {
                 assert!(result.is_err(), "refuse launch when Git does not ignore runtime files");
@@ -2153,7 +2193,34 @@ mod tests {
                 .expect("index");
             assert!(added.status.success());
             assert!(added.stdout.is_empty(), "runtime files must stay out of the index");
+            if tracks_declarations {
+                let tracked =
+                    ProcessCommand::new("git").args(["ls-files", ".flotilla"]).current_dir(repo.path()).output().expect("tracked");
+                assert_eq!(String::from_utf8_lossy(&tracked.stdout).trim(), ".flotilla/environment.yaml", "declarations stay tracked");
+            }
         }
+    }
+
+    // A standing convoy's multi-repository workspace root is a plain directory:
+    // nothing there can be committed, so preparation proceeds without an
+    // exclusion while each repository it holds still proves its own.
+    #[tokio::test]
+    async fn runtime_exclusion_skips_a_plain_workspace_directory() {
+        use crate::{
+            providers::vcs::git_worktree::GitWorktreeStrategy,
+            vcs::{FlotillaVcs, GitCheckoutStrategy},
+        };
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let runner = Arc::new(ProcessCommandRunner);
+        let vcs = FlotillaVcs::new(
+            ExecutionEnvironmentPath::new(workspace.path()),
+            runner.clone(),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), runner.clone()))),
+        );
+        super::ensure_flotilla_git_exclude(&*runner, &vcs, workspace.path(), &[".flotilla/briefs/governor.md"])
+            .await
+            .expect("plain workspace root needs no exclusion");
+        assert!(!workspace.path().join(".git").exists(), "no repository is created");
     }
 
     // Exclusion discovery and write failures are errors, never permission to
@@ -2164,10 +2231,15 @@ mod tests {
             providers::vcs::git_worktree::GitWorktreeStrategy,
             vcs::{FlotillaVcs, GitCheckoutStrategy},
         };
-        for responses in [vec![Err("exclude discovery unavailable".to_string())], vec![Ok(String::new())], vec![
-            Ok(".git/info/exclude\n".to_string()),
-            Err("exclude is read-only".to_string()),
-        ]] {
+        for responses in [
+            vec![Ok("true\n".to_string()), Err("exclude discovery unavailable".to_string())],
+            vec![Ok("true\n".to_string()), Ok(String::new())],
+            vec![Ok("true\n".to_string()), Ok(".git/info/exclude\n".to_string()), Err("exclude is read-only".to_string())],
+            // Work-tree inspection failure refuses too; it never means "no checkout".
+            vec![Err("work tree inspection unavailable".to_string())],
+            // Inside a bare repository or a `.git` directory, Git answers `false`.
+            vec![Ok("false\n".to_string())],
+        ] {
             let runner = Arc::new(MockRunner::new(responses));
             let cwd = ExecutionEnvironmentPath::new("/checkout");
             let vcs = FlotillaVcs::new(
@@ -2175,7 +2247,7 @@ mod tests {
                 runner.clone(),
                 GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), runner.clone()))),
             );
-            assert!(super::ensure_flotilla_git_exclude(&*runner, &vcs, cwd.as_path()).await.is_err());
+            assert!(super::ensure_flotilla_git_exclude(&*runner, &vcs, cwd.as_path(), &[".flotilla/briefs/coder.md"]).await.is_err());
             assert_eq!(runner.remaining(), 0);
         }
     }
@@ -2188,10 +2260,15 @@ mod tests {
             providers::vcs::git_worktree::GitWorktreeStrategy,
             vcs::{FlotillaVcs, GitCheckoutStrategy},
         };
-        for responses in [vec![Err("exclude discovery unavailable".to_string())], vec![Ok(String::new())], vec![
-            Ok(".git/info/exclude\n".to_string()),
-            Err("exclude is read-only".to_string()),
-        ]] {
+        for responses in [
+            vec![Ok("true\n".to_string()), Err("exclude discovery unavailable".to_string())],
+            vec![Ok("true\n".to_string()), Ok(String::new())],
+            vec![Ok("true\n".to_string()), Ok(".git/info/exclude\n".to_string()), Err("exclude is read-only".to_string())],
+            // Work-tree inspection failure refuses too; it never means "no checkout".
+            vec![Err("work tree inspection unavailable".to_string())],
+            // Inside a bare repository or a `.git` directory, Git answers `false`.
+            vec![Ok("false\n".to_string())],
+        ] {
             let runner = Arc::new(MockRunner::new(responses));
             let env = EnvironmentBag::new()
                 .with(EnvironmentAssertion::env_var("CODEX_HOME", "/codex"))

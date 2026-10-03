@@ -681,6 +681,14 @@ pub trait Vcs: Send + Sync {
         Err("checkout ignore inspection is unavailable".into())
     }
 
+    /// Whether this path is inside a version-controlled work tree. A plain
+    /// directory (such as a multi-repository workspace root) answers `false`;
+    /// an inspection failure is an error. VCS implementations without the
+    /// probe answer `true`, so callers keep their strict checkout path.
+    async fn inside_work_tree(&self) -> Result<bool, String> {
+        Ok(true)
+    }
+
     async fn clean_revision(&self) -> Result<String, String> {
         Err("clean revision inspection is unavailable".into())
     }
@@ -1164,6 +1172,22 @@ impl Vcs for FlotillaVcs {
     async fn exclude_file_path(&self) -> Result<Option<PathBuf>, String> {
         let output = self.cli().git_path("info/exclude").await?;
         Ok((output.success && !output.stdout.trim().is_empty()).then(|| PathBuf::from(output.stdout.trim())))
+    }
+
+    async fn inside_work_tree(&self) -> Result<bool, String> {
+        let output = self.cli().output(&["rev-parse", "--is-inside-work-tree"]).await?;
+        if output.success {
+            // `false` means inside a bare repository or a `.git` directory: not a
+            // plain directory, so it is refused rather than treated as one.
+            return match output.stdout.trim() {
+                "true" => Ok(true),
+                other => Err(format!("work tree inspection returned `{other}`")),
+            };
+        }
+        if output.stderr.contains("not a git repository") {
+            return Ok(false);
+        }
+        Err(format!("work tree inspection failed: {}", output.stderr.trim()))
     }
 
     async fn path_is_ignored(&self, path: &Path) -> Result<bool, String> {
