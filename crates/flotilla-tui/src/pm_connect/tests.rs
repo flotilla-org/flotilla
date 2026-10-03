@@ -436,7 +436,15 @@ fn project_membership_full_refresh_and_delta_retract_without_activity() {
         }))),
         Applied::Updated
     );
-    assert!(state.rebuild(&mint()).is_empty(), "unavailable definition makes no empty-membership claim");
+    // An unavailable definition makes no project or membership claim; the
+    // built-in public forge (ADR 0051) is published independently of activity.
+    let initial = state.rebuild(&mint());
+    assert!(initial.iter().all(|patch| !matches!(
+        &patch.target,
+        MetadataTarget::Entity(target) if matches!(target.kind.as_str(), "project" | "project_repository")
+    )));
+    let forge = initial.iter().find(|patch| patch.target == MetadataTarget::Entity(entity::forge("github.com"))).expect("built-in forge");
+    assert_eq!(forge.set["flotilla.forge.web_url"].value, MetadataValue::text("https://github.com"));
     assert_eq!(
         state.apply_event(&DaemonEvent::ResultDelta(Box::new(ResultDelta {
             seq: 1,

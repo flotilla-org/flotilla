@@ -28,6 +28,8 @@ use crate::keys::{
     KEY_SUBJECT_SUPERSEDES, KEY_SUBJECT_WORKS_ON, SEGMENT_PROJECT,
 };
 
+const BUILTIN_GITHUB_SERVICE: &str = "github.com";
+
 fn subject_entity(subject: &Subject) -> EntityRef {
     match subject.kind {
         SubjectKind::Issue => entity::issue(&IssueRef { source: subject.source.clone(), id: subject.id.clone() }),
@@ -145,6 +147,24 @@ pub(super) fn project_role_attempts(catalog: &mut Catalog, role: &StandingRoleRo
     catalog.assert_entity(role_entity(role), facts, None);
 }
 
+/// The declared and built-in forges share the PM connector contract.
+fn project_forge(catalog: &mut Catalog, id: &str, kind: ForgeKind, web_url: &str) {
+    let (kind, path) = match kind {
+        ForgeKind::Github => ("github", "pull"),
+        ForgeKind::Forgejo => ("forgejo", "pulls"),
+    };
+    catalog.assert_entity(
+        entity::forge(id),
+        vec![
+            (KEY_FORGE_KIND, MetadataValue::text(kind)),
+            (KEY_FORGE_WEB_URL, MetadataValue::text(web_url.trim_end_matches('/'))),
+            (KEY_FORGE_CHANGE_REQUEST_URL_TEMPLATE, MetadataValue::text(format!("{{web_url}}/{{scope}}/{path}/{{number}}"))),
+            (KEY_FORGE_ISSUE_URL_TEMPLATE, MetadataValue::text("{web_url}/{scope}/issues/{number}")),
+        ],
+        None,
+    );
+}
+
 pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, observations: &SubjectCatalogInput) {
     let mut links: BTreeMap<Subject, BTreeMap<Relationship, BTreeSet<EntityRef>>> = BTreeMap::new();
     let mut projects = BTreeMap::new();
@@ -185,22 +205,12 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
     }
 
     for record in &observations.forges {
-        let spec = &record.spec;
-        let forge = entity::forge(&spec.forge_id);
-        let (kind, path) = match spec.kind {
-            ForgeKind::Github => ("github", "pull"),
-            ForgeKind::Forgejo => ("forgejo", "pulls"),
-        };
-        catalog.assert_entity(
-            forge,
-            vec![
-                (KEY_FORGE_KIND, MetadataValue::text(kind)),
-                (KEY_FORGE_WEB_URL, MetadataValue::text(spec.https_url.trim_end_matches('/'))),
-                (KEY_FORGE_CHANGE_REQUEST_URL_TEMPLATE, MetadataValue::text(format!("{{web_url}}/{{scope}}/{path}/{{number}}"))),
-                (KEY_FORGE_ISSUE_URL_TEMPLATE, MetadataValue::text("{web_url}/{scope}/issues/{number}")),
-            ],
-            None,
-        );
+        project_forge(catalog, &record.spec.forge_id, record.spec.kind, &record.spec.https_url);
+    }
+    // Like declared forges, publish the default even without visible subjects.
+    // Presentation-only: never declare a resource or re-key repositories.
+    if super::subject_forge(&observations.forges, BUILTIN_GITHUB_SERVICE).is_none() {
+        project_forge(catalog, BUILTIN_GITHUB_SERVICE, ForgeKind::Github, "https://github.com");
     }
 
     for role in input.standing_roles {
@@ -259,7 +269,16 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
     let services: BTreeSet<_> = links.keys().map(|subject| subject.source.service.as_str()).collect();
     let forges: BTreeMap<_, _> = services
         .into_iter()
-        .filter_map(|service| super::subject_forge(&observations.forges, service).map(|forge| (service, forge)))
+        .filter_map(|service| {
+            if let Some(forge) = super::subject_forge(&observations.forges, service) {
+                Some((service, entity::forge(&forge.spec.forge_id)))
+            } else if service == BUILTIN_GITHUB_SERVICE {
+                Some((service, entity::forge(BUILTIN_GITHUB_SERVICE)))
+            } else {
+                tracing::warn!(service, "subject service has no covering Forge");
+                None
+            }
+        })
         .collect();
     let identity_facts = |subject: &Subject| {
         let label = subject.short(&observations.references);
@@ -279,7 +298,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
             (KEY_DISPLAY_LABEL_SHORT, MetadataValue::text(&label)),
         ];
         if let Some(forge) = forges.get(subject.source.service.as_str()) {
-            facts.push((KEY_FORGE, MetadataValue::EntityRefs(vec![entity::forge(&forge.spec.forge_id)])));
+            facts.push((KEY_FORGE, MetadataValue::EntityRefs(vec![forge.clone()])));
         }
         let relationships = links.get(subject);
         let reverse: BTreeSet<_> = relationships.into_iter().flat_map(|links| links.values().flatten().cloned()).collect();
