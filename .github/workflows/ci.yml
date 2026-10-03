@@ -109,6 +109,9 @@ jobs:
   changes:
     name: Platform changes
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       windows: ${{ steps.classify.outputs.windows }}
       macos: ${{ steps.classify.outputs.macos }}
@@ -120,9 +123,21 @@ jobs:
         name: Classify Windows and macOS job inputs
         env:
           EVENT: ${{ github.event_name }}
-          FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+          PR: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ github.token }}
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
+          # Read labels live rather than from the event payload, so re-running
+          # the workflow after adding ci:full honours the label. A failed
+          # lookup fails safe by running both jobs.
+          full_label=false
+          if [ -n "$PR" ]; then
+            if labels=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name'); then
+              if printf '%s\n' "$labels" | grep -qx 'ci:full'; then full_label=true; fi
+            else
+              full_label=true
+            fi
+          fi
           if [ -n "$BASE" ]; then
             git diff --name-only "$BASE" HEAD > "$RUNNER_TEMP/changed-files"
             git diff "$BASE" HEAD -- '*.rs' > "$RUNNER_TEMP/changes.diff"
@@ -130,7 +145,7 @@ jobs:
             : > "$RUNNER_TEMP/changed-files"
             : > "$RUNNER_TEMP/changes.diff"
           fi
-          ci/platform-changes/classify.sh "$EVENT" "$FULL_LABEL" "$RUNNER_TEMP/changed-files" "$RUNNER_TEMP/changes.diff" | tee -a "$GITHUB_OUTPUT"
+          ci/platform-changes/classify.sh "$EVENT" "$full_label" "$RUNNER_TEMP/changed-files" "$RUNNER_TEMP/changes.diff" | tee -a "$GITHUB_OUTPUT"
 
   windows-client:
     name: Windows client

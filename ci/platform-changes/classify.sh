@@ -34,7 +34,7 @@ shared='^(Cargo\.(toml|lock)|crates/[^/]+/Cargo\.toml|rust-toolchain\.toml|\.git
 # Wheelhouse sink. Its platform seams live in these paths; elsewhere, a change
 # reaches Windows only through platform-conditional code, matched in the diff.
 windows_paths="${shared}|^(src/|crates/flotilla-client/|crates/flotilla-transport/|crates/flotilla-manifest/src/sink|crates/flotilla-tui/src/(terminal|run|cli))"
-windows_content='^[+-].*(cfg\(.*(windows|unix|target_os|target_family|target_vendor)|std::os::(unix|windows)|libc::|nix::|Unix(Stream|Listener|Datagram)|::unix::|pre_exec|setsid)'
+windows_content='^[+-].*(cfg(_attr|!)?\(.*(windows|unix|target_os|target_family|target_vendor)|std::os::(unix|windows)|libc::|nix::|Unix(Stream|Listener|Datagram)|::unix::|pre_exec|setsid)'
 
 # The macOS job runs the daemon's peer-identity tests (server::caller).
 macos_paths="${shared}|^(crates/flotilla-daemon/src/server/caller|crates/flotilla-transport/)"

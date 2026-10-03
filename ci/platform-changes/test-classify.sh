@@ -50,6 +50,12 @@ check "core UnixStream runs Windows" pull_request false "crates/flotilla-core/sr
   $'+use tokio::net::UnixStream;\n' "windows=true macos=false "
 check "caller path plus macOS content runs macOS" pull_request false "crates/flotilla-daemon/src/server/caller.rs" \
   $'+#[cfg(target_vendor = "apple")]\n' "windows=true macos=true "
+
+check "core cfg! macro runs Windows" pull_request false "crates/flotilla-core/src/x.rs" \
+  $'+    if cfg!(windows) { return; }\n' "windows=true macos=false "
+check "core cfg_attr runs Windows" pull_request false "crates/flotilla-core/src/x.rs" \
+  $'+#[cfg_attr(unix, path = "unix.rs")]\n' "windows=true macos=false "
+
 large_diff=$'+#[cfg(unix)]\n'$(printf '+line %s padding padding padding\n' $(seq 1 200000))
 check "early content hit in a large diff runs Windows" pull_request false "crates/flotilla-core/src/x.rs" \
   "$large_diff" "windows=true macos=false "
