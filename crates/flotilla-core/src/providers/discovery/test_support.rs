@@ -296,7 +296,8 @@ impl CommandRunner for DiscoveryMockRunner {
         if cmd == "git" && args == ["rev-parse", "--git-path", "info/exclude"] {
             return Ok(".git/info/exclude\n".into());
         }
-        if cmd == "git" && args == ["check-ignore", "--quiet", "--", ".flotilla/"] {
+        // The recorded `.flotilla/` exclusion ignores every runtime path under it.
+        if cmd == "git" && args.len() == 4 && args[..3] == ["check-ignore", "--quiet", "--"] && args[3].starts_with(".flotilla/") {
             return Ok(String::new());
         }
         if cmd == "sh" && args.iter().any(|arg| arg.starts_with("set -eu; exclude=")) {
