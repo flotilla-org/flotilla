@@ -271,10 +271,20 @@ pub fn session_badge(phase: SessionPhase) -> Badge {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Catalog {
+    uncovered_services: BTreeSet<String>,
     facts: BTreeMap<MetadataTarget, BTreeMap<String, MetadataValueUpdate>>,
 }
 
 impl Catalog {
+    /// Warn once per service until a rebuild no longer contains the gap.
+    /// The returned set belongs to the caller's connector lifecycle.
+    pub fn warn_new_uncovered_services(&self, previous: &BTreeSet<String>) -> BTreeSet<String> {
+        for service in self.uncovered_services.difference(previous) {
+            tracing::warn!(service, "subject service has no covering Forge");
+        }
+        self.uncovered_services.clone()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.facts.is_empty()
     }
@@ -332,7 +342,15 @@ fn patch(target: MetadataTarget, mut set: BTreeMap<String, MetadataValueUpdate>,
     MetadataPatch { target, source_id: SOURCE_CONNECTOR.to_owned(), set, unset }
 }
 
+/// Project once and emit diagnostics for callers without a connector lifecycle.
 pub fn project_catalog(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catalog {
+    let catalog = project_catalog_without_warnings(input, mint);
+    catalog.warn_new_uncovered_services(&BTreeSet::new());
+    catalog
+}
+
+/// Projection for connectors that own diagnostic suppression across rebuilds.
+pub fn project_catalog_without_warnings(input: &CatalogInput<'_>, mint: &dyn RecipeMint) -> Catalog {
     let mut catalog = Catalog::default();
     if let Some(nodes) = input.awareness {
         for node in nodes {
