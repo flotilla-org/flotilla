@@ -399,6 +399,7 @@ impl PeerRuntime {
 
                 loop {
                     tokio::select! {
+                        // Joining also reaps successful exits; the pattern leaves them quiet.
                         Some(Err(error)) = connections.join_next(), if !connections.is_empty() => {
                             if error.is_panic() {
                                 warn!(%error, "peer connection task panicked");
