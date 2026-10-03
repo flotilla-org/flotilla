@@ -28,6 +28,7 @@ use super::{
 };
 use crate::{
     admission::AvailableSpaceProbe,
+    providers::CommandOutput,
     repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector},
 };
 
@@ -2329,6 +2330,261 @@ async fn source_pagination_fairness_survives_provider_rediscovery() {
     assert_eq!(pages.len(), 32, "all four cycles retain the eight-page shared budget");
     for (cycle, number) in [1, 2, 3, 1].into_iter().enumerate() {
         assert!(pages[cycle * 8].contains(&format!("number:{number}")), "priority rotates through every PR and wraps across rediscovery");
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestAdmissionReply {
+    Ordinary,
+    Limited,
+    NoDeadline,
+    Secondary,
+    Absent,
+    MissingBase,
+    Success,
+}
+
+#[derive(Clone, Copy)]
+enum RestAdmissionLookup {
+    Id,
+    Branch,
+}
+
+enum RestAdmissionSelection {
+    Failure(RestAdmissionReply),
+    Absent,
+    Found(usize),
+    Ambiguous,
+}
+
+// GitHub subprocess boundary: retain failed stdout headers as the real CLI does.
+struct AdmissionRestRunner {
+    responses: BTreeMap<String, CommandOutput>,
+}
+
+#[async_trait::async_trait]
+impl CommandRunner for AdmissionRestRunner {
+    async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &crate::providers::ChannelLabel) -> Result<String, String> {
+        panic!("admission REST reads use run_output")
+    }
+
+    async fn run_output(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        _cwd: &Path,
+        _label: &crate::providers::ChannelLabel,
+    ) -> Result<CommandOutput, String> {
+        assert_eq!(cmd, "gh");
+        let endpoint = args.iter().find(|arg| arg.starts_with("repos/")).expect("REST endpoint");
+        let scope = endpoint.strip_prefix("repos/").expect("repository path").split("/pulls").next().expect("scope");
+        let response = self.responses.get(scope).expect("configured repository");
+        Ok(CommandOutput { stdout: response.stdout.clone(), stderr: response.stderr.clone(), success: response.success })
+    }
+
+    async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+        true
+    }
+}
+
+fn rest_admission_response(reply: RestAdmissionReply, lookup: RestAdmissionLookup) -> CommandOutput {
+    use RestAdmissionReply::*;
+    let (status, headers, body, success) = match reply {
+        Limited => (
+            403,
+            "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1893456000\r\n",
+            serde_json::json!({"message":"API rate limit exceeded"}),
+            false,
+        ),
+        NoDeadline => (403, "X-RateLimit-Remaining: 0\r\n", serde_json::json!({"message":"API rate limit exceeded"}), false),
+        Secondary => {
+            (403, "X-RateLimit-Remaining: 4989\r\nRetry-After: 30\r\n", serde_json::json!({"message":"secondary rate limit"}), false)
+        }
+        Ordinary => (
+            403,
+            "X-RateLimit-Remaining: 4989\r\nX-RateLimit-Reset: 1893456000\r\n",
+            serde_json::json!({"message":"Resource not accessible by integration"}),
+            false,
+        ),
+        Absent => match lookup {
+            RestAdmissionLookup::Branch => (200, "", serde_json::json!([]), true),
+            RestAdmissionLookup::Id => (404, "", serde_json::json!({"message":"Not Found"}), false),
+        },
+        MissingBase | Success => {
+            let pr = serde_json::json!({"number":7,"title":"Wanted","head":{"ref":"feature/wanted"},"base":{"ref": if reply == MissingBase { serde_json::Value::Null } else { serde_json::json!("main") }},"state":"open"});
+            (
+                200,
+                "",
+                match lookup {
+                    RestAdmissionLookup::Branch => serde_json::json!([pr]),
+                    RestAdmissionLookup::Id => pr,
+                },
+                true,
+            )
+        }
+    };
+    CommandOutput {
+        stdout: format!("HTTP/2 {status}\r\n{headers}\r\n{body}"),
+        stderr: if reply == Ordinary { "rate limited diagnostics unavailable".into() } else { "gh: Not Found".into() },
+        success,
+    }
+}
+
+struct RestAdmissionFixture {
+    daemon: Arc<InProcessDaemon>,
+    keys: Vec<RepositoryKey>,
+    _config: tempfile::TempDir,
+}
+
+async fn rest_admission_fixture(outcomes: [RestAdmissionReply; 2], lookup: RestAdmissionLookup) -> RestAdmissionFixture {
+    use crate::providers::{change_request::github::GitHubChangeRequest, github_api::GhApiClient};
+    let config = tempfile::tempdir().expect("tempdir");
+    std::fs::write(config.path().join("daemon.toml"), "machine_id = \"rest-admission-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let responses = outcomes
+        .into_iter()
+        .enumerate()
+        .map(|(index, reply)| (format!("team/repo{index}"), rest_admission_response(reply, lookup)))
+        .collect();
+    let runner = Arc::new(AdmissionRestRunner { responses });
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(config.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend.clone(),
+    )
+    .await;
+    daemon.set_provisioning_namespace("flotilla".into()).await;
+    let mut keys = Vec::new();
+    for index in 0..2 {
+        let scope = format!("team/repo{index}");
+        let repository = RepositorySpec::remote(format!("https://github.com/{scope}")).expect("repository");
+        let key = repository.key();
+        backend.using::<Repository>("flotilla").create(&test_meta(&key.to_string()), &repository).await.expect("repository");
+        daemon.convoy_admission.repository_change_requests.write().await.insert(key.clone(), RepositoryChangeRequestProvider {
+            service_url: repository.forge().expect("forge").service_url.clone(),
+            repository: scope.clone(),
+            provider: Arc::new(GitHubChangeRequest::new(
+                "github".into(),
+                scope,
+                Arc::new(GhApiClient::new(runner.clone())),
+                runner.clone(),
+            )),
+        });
+        keys.push(key);
+    }
+    RestAdmissionFixture { daemon, keys, _config: config }
+}
+
+// #2541: both REST lookup paths choose classified limits over ordinary text,
+// preserve ordinary diagnostics, and retain successful/ambiguous repo selection.
+// This finite matrix exhausts ordinary, absent, primary (with/without deadline),
+// secondary, missing-base and successful reads; multiple limits retain the first
+// branch failure and all ID diagnostics, preserving the existing lookup policy.
+#[tokio::test]
+async fn rest_admission_lookup_selection_matrix() {
+    use RestAdmissionReply::*;
+    use RestAdmissionSelection::{Ambiguous, Failure, Found};
+    let cases = [
+        ([Ordinary, Limited], Failure(Limited), Failure(Limited)),
+        ([Limited, Ordinary], Failure(Limited), Failure(Limited)),
+        ([Ordinary, NoDeadline], Failure(NoDeadline), Failure(NoDeadline)),
+        ([Ordinary, Secondary], Failure(Secondary), Failure(Secondary)),
+        ([Limited, Secondary], Failure(Limited), Failure(Limited)),
+        ([Secondary, Limited], Failure(Secondary), Failure(Secondary)),
+        ([Ordinary, Ordinary], Failure(Ordinary), Failure(Ordinary)),
+        ([Absent, Ordinary], Failure(Ordinary), Failure(Ordinary)),
+        ([Absent, Absent], Failure(Absent), RestAdmissionSelection::Absent),
+        ([MissingBase, Ordinary], Failure(MissingBase), Found(0)),
+        ([Limited, Success], Found(1), Found(1)),
+        ([Success, Limited], Found(0), Found(0)),
+        ([Success, Success], Ambiguous, Found(0)),
+    ];
+    for (outcomes, id_selection, branch_selection) in cases {
+        for (lookup, expected) in [(RestAdmissionLookup::Id, id_selection), (RestAdmissionLookup::Branch, branch_selection)] {
+            let fixture = rest_admission_fixture(outcomes, lookup).await;
+            let result = match lookup {
+                RestAdmissionLookup::Branch => fixture
+                    .daemon
+                    .resolve_convoy_change_request(&fixture.keys, "feature/wanted", None)
+                    .await
+                    .map(|found| found.map(|found| found.repository_key)),
+                RestAdmissionLookup::Id => {
+                    fixture.daemon.convoy_admission.resolve_convoy_change_request_admission(&fixture.keys, "7").await.map(|found| {
+                        assert_eq!(found.branch, "feature/wanted");
+                        assert_eq!(found.base_ref, "main");
+                        Some(found.binding.repository_ref)
+                    })
+                }
+            };
+            match expected {
+                Found(index) => assert_eq!(result.expect("successful lookup"), Some(fixture.keys[index].clone())),
+                RestAdmissionSelection::Absent => assert!(result.expect("no matching request").is_none()),
+                Ambiguous => assert_eq!(
+                    result.expect_err("ambiguous lookup"),
+                    "change request 7 is ambiguous across 2 consulted repositories [team/repo0, team/repo1]"
+                ),
+                Failure(reply) => {
+                    let error = result.expect_err("lookup refused");
+                    match reply {
+                        Limited | NoDeadline | Secondary => {
+                            assert!(error.contains("budget=REST core"), "{outcomes:?}: {error}");
+                            let kind = if reply == Secondary { "kind=secondary" } else { "kind=primary" };
+                            assert!(error.contains(kind), "{error}");
+                            if reply == NoDeadline {
+                                assert!(error.contains("retry_at=unavailable"), "{error}");
+                            }
+                            if reply == Limited {
+                                assert!(error.contains("retry_source=x-ratelimit-reset, retry_at=2030-01-01T00:00:00+00:00"), "{error}");
+                            }
+                            match lookup {
+                                RestAdmissionLookup::Id => {
+                                    for (index, outcome) in outcomes.iter().enumerate() {
+                                        assert!(error.contains(&format!("repository team/repo{index}:")), "{error}");
+                                        if *outcome == Ordinary {
+                                            assert!(
+                                                error.contains(&format!(
+                                                    "repository team/repo{index}: rate limited diagnostics unavailable"
+                                                )),
+                                                "{error}"
+                                            );
+                                        }
+                                    }
+                                }
+                                RestAdmissionLookup::Branch => {
+                                    assert!(!error.contains("diagnostics unavailable"), "{error}");
+                                    assert!(!error.contains(if reply == Secondary { "kind=primary" } else { "kind=secondary" }), "{error}");
+                                }
+                            }
+                        }
+                        Ordinary => {
+                            match lookup {
+                                RestAdmissionLookup::Branch => assert_eq!(error, "rate limited diagnostics unavailable"),
+                                RestAdmissionLookup::Id => {
+                                    let diagnostics = outcomes
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(index, outcome)| {
+                                            let message =
+                                                if *outcome == Absent { "gh: Not Found" } else { "rate limited diagnostics unavailable" };
+                                            format!("repository team/repo{index}: {message}")
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("; ");
+                                    assert_eq!(error, format!("change request 7 was not found in consulted repositories [team/repo0, team/repo1]: {diagnostics}"));
+                                }
+                            }
+                        }
+                        MissingBase => {
+                            assert!(error.contains("repository team/repo0: change request 7 did not report a base ref"), "{error}")
+                        }
+                        Absent => assert!(error.contains("repository team/repo0: gh: Not Found"), "{error}"),
+                        Success => panic!("success is not a refusal"),
+                    }
+                }
+            }
+        }
     }
 }
 

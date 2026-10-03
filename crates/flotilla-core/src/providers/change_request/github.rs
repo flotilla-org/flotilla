@@ -10,7 +10,7 @@ use super::ObservationError;
 use crate::{
     change_request_observer::{parse_gh_observation_value_with_crew_identity, DEFAULT_REVIEW_BOT_LOGIN},
     providers::{
-        gh_api_get, gh_api_get_with_headers,
+        gh_api_channel_label, gh_api_get,
         github_api::{clamp_per_page, GhApi},
         run, run_output,
         types::*,
@@ -360,14 +360,15 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
             .collect())
     }
 
-    async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, String> {
+    async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, ObservationError> {
         for page in 1..=MAX_BRANCH_LOOKUP_PAGES {
             let endpoint = if page == 1 {
                 format!("repos/{}/pulls?state=all&per_page=100", self.repo_slug)
             } else {
                 format!("repos/{}/pulls?state=all&per_page=100&page={page}", self.repo_slug)
             };
-            let response = gh_api_get_with_headers!(self.api, &endpoint, execution_root())?;
+            let response =
+                self.api.get_classified_with_headers(&endpoint, execution_root(), &gh_api_channel_label("GET", &endpoint)).await?;
             let items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
             if let Some(pull_request) =
                 items.iter().filter_map(Self::parse_pull_request).find(|pull_request| pull_request.head_ref_name == branch)
@@ -378,7 +379,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
                 return Ok(None);
             }
         }
-        Err(format!("GitHub pull request lookup for branch {branch} exceeded {MAX_BRANCH_LOOKUP_PAGES} pages"))
+        Err(format!("GitHub pull request lookup for branch {branch} exceeded {MAX_BRANCH_LOOKUP_PAGES} pages").into())
     }
 
     async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
@@ -390,9 +391,10 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         Ok(self.gh_pr_to_change_request(&pr))
     }
 
-    async fn get_change_request_for_admission(&self, id: &str) -> Result<super::ChangeRequestAdmission, String> {
+    async fn get_change_request_for_admission(&self, id: &str) -> Result<super::ChangeRequestAdmission, ObservationError> {
         let endpoint = format!("repos/{}/pulls/{}", self.repo_slug, id);
-        let body = gh_api_get!(self.api, &endpoint, execution_root())?;
+        let response = self.api.get_classified_with_headers(&endpoint, execution_root(), &gh_api_channel_label("GET", &endpoint)).await?;
+        let body = response.body;
         let value: serde_json::Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
         let pull_request = Self::parse_pull_request(&value).ok_or("malformed pull request")?;
         let (id, change_request) = self.gh_pr_to_change_request(&pull_request);
@@ -438,7 +440,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::providers::{change_request::ChangeRequestTracker, github_api::GhApiClient, replay, testing::MockRunner};
+    use crate::providers::{
+        change_request::ChangeRequestTracker,
+        github_api::{GhApiClient, GithubRetrySource},
+        replay,
+        testing::MockRunner,
+    };
 
     fn branch_lookup_page(items: serde_json::Value, has_next: bool) -> String {
         let link = if has_next { "Link: <https://api.github.com/repos/team/one/pulls?page=2>; rel=\"next\"\r\n" } else { "" };
@@ -1036,7 +1043,7 @@ mod tests {
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
         let error = provider.observe_bound(&[1], &Default::default()).await.expect_err("classified limit");
         assert!(matches!(&error, ObservationError::RateLimited { limit, .. }
-            if limit.kind == GithubRateLimitKind::Primary && limit.retry_source == "unavailable"));
+            if limit.kind == GithubRateLimitKind::Primary && limit.retry_source == GithubRetrySource::Unavailable));
         assert_eq!(error.retry_at(), None, "no fabricated deadline for a cache, completion or Landing wait");
     }
 

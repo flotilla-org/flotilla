@@ -2555,7 +2555,7 @@ mod tests {
     use super::*;
     use crate::{
         event_sink::broadcast_test_sink,
-        providers::github_api::{GithubRateLimit, GithubRateLimitKind},
+        providers::github_api::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource},
     };
 
     #[test]
@@ -4483,7 +4483,11 @@ mod tests {
         let retry_at = now + chrono::Duration::seconds(60);
         let error = ObservationError::RateLimited {
             budget: "GraphQL".into(),
-            limit: GithubRateLimit { kind: GithubRateLimitKind::Secondary, retry_source: "retry-after", retry_at: Some(retry_at) },
+            limit: GithubRateLimit {
+                kind: GithubRateLimitKind::Secondary,
+                retry_source: GithubRetrySource::RetryAfter,
+                retry_at: Some(retry_at),
+            },
         };
         let refresher = ChangeRequestRefresher::new(
             "fleet".into(),

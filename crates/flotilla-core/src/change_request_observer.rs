@@ -1059,7 +1059,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        providers::github_api::{GithubRateLimit, GithubRateLimitKind},
+        providers::github_api::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource},
         tls,
     };
 
@@ -1085,7 +1085,7 @@ mod tests {
             budget: "GraphQL".into(),
             limit: GithubRateLimit {
                 kind: GithubRateLimitKind::Secondary,
-                retry_source: "retry-after",
+                retry_source: GithubRetrySource::RetryAfter,
                 retry_at: Some("2026-10-03T12:00:00Z".parse().expect("deadline")),
             },
         };
