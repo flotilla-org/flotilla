@@ -2292,7 +2292,14 @@ async fn lookup_cli_repository(daemon: &dyn DaemonHandle, selector: RepoSelector
 
 async fn resolve_cli_repository(daemon: &dyn DaemonHandle, selector: RepoSelector) -> Result<RepoSelector, String> {
     let label = selector.to_string();
-    lookup_cli_repository(daemon, selector).await?.ok_or_else(|| {
+    lookup_cli_repository(daemon, selector.clone()).await?.ok_or_else(|| {
+        if let RepoSelector::Query(query) = &selector {
+            if Path::new(query).is_absolute() || query == "." || query == ".." || query.starts_with("./") || query.starts_with("../") {
+                return format!(
+                    "repository path selectors are not supported: '{label}'; run from inside the observed checkout and omit --repo for cwd inference, or use a Repository key, project member alias, or forge slug"
+                );
+            }
+        }
         format!("no Repository matches '{label}'; adopt a checkout with `flotilla repo add <path>` or declare a Project member")
     })
 }
@@ -3838,6 +3845,19 @@ mod tests {
             super::resolve_optional_cwd_repository(&*daemon, "/work/widgets/src".into()).await.expect("cwd identity"),
             Some(RepoSelector::Repository(key.clone()))
         );
+        // #2551: explicit path queries stay unsupported even for observed checkouts.
+        // Single CLI call-through: the diagnostic directs users to identity or cwd inference.
+        for path in ["/work/widgets", "/work/widgets/src", "./widgets", "../widgets", ".", ".."] {
+            let cli = Cli::try_parse_from(["flotilla", "repo", path, "checkout", "--fresh", "feature"]).expect("CLI");
+            let SubCommand::Repo(noun) = cli.command.expect("repo noun") else { panic!("repo noun") };
+            let flotilla_commands::Resolved::Ready(mut command) = noun.resolve().expect("checkout command") else {
+                panic!("ready checkout")
+            };
+            let error = super::resolve_command_repositories(&*daemon, &mut command).await.expect_err("explicit path refused");
+            assert!(error.contains("repository path selectors are not supported"), "{error}");
+            assert!(error.contains("cwd inference"), "{error}");
+            assert!(error.contains("Repository key"), "{error}");
+        }
         let mut query = Command::builder()
             .action(CommandAction::QueryIssueFetchByIds { repo: RepoSelector::Query("primary".into()), ids: vec!["1".into()] })
             .build();

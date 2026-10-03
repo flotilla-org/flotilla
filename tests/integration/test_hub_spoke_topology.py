@@ -47,6 +47,23 @@ def hub_json(service: str, args: str, timeout: int = 30) -> dict | list:
     )
 
 
+def local_repository_key(node: str) -> str:
+    """Address the adopted identity on this host, not a fleet-wide path."""
+    hosts = hub_json(node, "resource list hosts")["records"]
+    host_ref = next(
+        record["object"]["metadata"]["name"]
+        for record in hosts
+        if record["object"]["spec"]["display_name"] == node
+    )
+    repositories = hub_json(node, "resource list repositories")["records"]
+    return next(
+        record["object"]["metadata"]["name"]
+        for record in repositories
+        if record["object"]["spec"]["identity"].get("git_common_dir") == "/home/flotilla/repo/.git"
+        and record["object"]["spec"]["identity"].get("host_ref") == host_ref
+    )
+
+
 def hub_compose(*args: str, timeout: int = 60):
     return compose(
         *args,
@@ -260,13 +277,16 @@ def test_shpool_attachable_set_survives_daemon_restart(
     """A shpool-backed terminal keeps its durable set across restart."""
     checkout = hub_json(
         "homelab-1",
-        "repo /home/flotilla/repo checkout --fresh feat-shpool-persist",
+        f"repo {local_repository_key('homelab-1')} checkout --fresh feat-shpool-persist",
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
+    # The executor plans in the coordinator context before dispatching the remote step.
+    # #2500 owns retiring this bridge, as in test_minimal_topology.
+    planning_repository_key = local_repository_key("workstation")
     prepared = hub_json(
         "workstation",
-        f"host homelab-1 repo /home/flotilla/repo prepare-terminal {checkout_path}",
+        f"host homelab-1 repo {planning_repository_key} prepare-terminal {checkout_path}",
         timeout=60,
     )
     assert prepared["kind"] == "terminal_prepared"
@@ -305,13 +325,16 @@ def test_terminal_without_shpool_uses_passthrough(hub_spoke_topology):
     """The follower without shpool returns executable fallback commands."""
     checkout = hub_json(
         "homelab-2",
-        "repo /home/flotilla/repo checkout --fresh feat-no-shpool",
+        f"repo {local_repository_key('homelab-2')} checkout --fresh feat-no-shpool",
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
+    # The executor plans in the coordinator context before dispatching the remote step.
+    # #2500 owns retiring this bridge, as in test_minimal_topology.
+    planning_repository_key = local_repository_key("workstation")
     prepared = hub_json(
         "workstation",
-        f"host homelab-2 repo /home/flotilla/repo prepare-terminal {checkout_path}",
+        f"host homelab-2 repo {planning_repository_key} prepare-terminal {checkout_path}",
         timeout=60,
     )
     assert prepared["kind"] == "terminal_prepared"
@@ -328,12 +351,14 @@ def test_reprepare_reuses_attachable_identity(hub_spoke_topology):
     """Repeated preparation keeps the checkout's attachable-set identity."""
     checkout = hub_json(
         "homelab-1",
-        "repo /home/flotilla/repo checkout --fresh feat-workspace-reprepare",
+        f"repo {local_repository_key('homelab-1')} checkout --fresh feat-workspace-reprepare",
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
+    # #2500 owns the coordinator-local planning context for remote terminal steps.
+    planning_repository_key = local_repository_key("workstation")
     command = (
-        f"host homelab-1 repo /home/flotilla/repo prepare-terminal {checkout_path}"
+        f"host homelab-1 repo {planning_repository_key} prepare-terminal {checkout_path}"
     )
 
     first = hub_json("workstation", command, timeout=60)
