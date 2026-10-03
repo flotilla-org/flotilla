@@ -69,7 +69,7 @@ use futures::{
 };
 use serde_json::{json, Value};
 use tokio::{
-    sync::{watch, Mutex, RwLock, Semaphore},
+    sync::{oneshot, watch, Mutex, RwLock, Semaphore},
     task::JoinHandle,
 };
 use tokio_util::task::AbortOnDropHandle;
@@ -923,11 +923,9 @@ impl StartupRestoration {
             options.controller_resync_interval,
             runtime_health.clone(),
         )));
-        controller_tasks.push(AbortOnDropHandle::new(spawn_pending_supervisor_turn_task(
-            Arc::clone(daemon),
-            options.namespace.clone(),
-            options.controller_resync_interval,
-        )));
+        let (supervisor_turn_task, _supervisor_turn_ready) =
+            spawn_pending_supervisor_turn_task(Arc::clone(daemon), options.namespace.clone(), options.controller_resync_interval);
+        controller_tasks.push(AbortOnDropHandle::new(supervisor_turn_task));
         controller_tasks.push(AbortOnDropHandle::new(spawn_provisioned_environment_reconciliation_task(
             Arc::clone(state),
             options.namespace.clone(),
@@ -3327,16 +3325,123 @@ fn spawn_host_description_projection_task(daemon: Arc<InProcessDaemon>, namespac
     })
 }
 
-fn spawn_pending_supervisor_turn_task(daemon: Arc<InProcessDaemon>, namespace: String, interval: Duration) -> JoinHandle<()> {
-    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
-        let daemon = Arc::clone(&daemon);
-        let namespace = namespace.clone();
+/// Reconcile durable supervisor turns on resource changes, with periodic recovery.
+/// The caller owns the returned task and must abort it when the daemon stops.
+/// Readiness resolves after both watches subscribe and the startup scan completes.
+#[doc(hidden)]
+pub fn spawn_pending_supervisor_turn_task(
+    daemon: Arc<InProcessDaemon>,
+    namespace: String,
+    interval: Duration,
+) -> (JoinHandle<()>, oneshot::Receiver<()>) {
+    let backend = daemon.resource_backend();
+    let watch_namespace = namespace.clone();
+    spawn_pending_supervisor_turn_task_with_watches(daemon, namespace, interval, move || {
+        let backend = backend.clone();
+        let namespace = watch_namespace.clone();
         async move {
-            if let Err(error) = daemon.reconcile_pending_supervisor_turns_once(&namespace).await {
-                warn!(%error, %namespace, "failed to reconcile pending supervisor turns");
-            }
+            let convoys = backend.including_replicas::<Convoy>(&namespace).watch().await?;
+            let sessions = backend.including_replicas::<TerminalSession>(&namespace).watch().await?;
+            Ok((convoys.map(|event| event.map(|_| ())).boxed(), sessions.map(|event| event.map(|_| ())).boxed()))
         }
     })
+}
+
+type SupervisorTurnWatches = (BoxStream<'static, Result<(), ResourceError>>, BoxStream<'static, Result<(), ResourceError>>);
+
+// Watch subscription is the notification boundary. Tests can close one input
+// without changing the resource stores or the reconciliation they exercise.
+#[cfg_attr(feature = "test-support", visibility::make(pub))]
+#[doc(hidden)]
+fn spawn_pending_supervisor_turn_task_with_watches<F, Fut>(
+    daemon: Arc<InProcessDaemon>,
+    namespace: String,
+    interval: Duration,
+    mut subscribe: F,
+) -> (JoinHandle<()>, oneshot::Receiver<()>)
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<SupervisorTurnWatches, ResourceError>> + Send,
+{
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut ready_tx = Some(ready_tx);
+        let retry_backoff = RetryBackoff { initial: interval.min(Duration::from_secs(1)), maximum: interval };
+        let mut failures = 0_u32;
+        let mut last_watch_warning = None;
+        let mut report_watch_failure = |error: &ResourceError| {
+            let now = tokio::time::Instant::now();
+            if last_watch_warning.is_none_or(|last| now.duration_since(last) >= interval) {
+                warn!(%error, %namespace, "supervisor turn watch failed; resubscribing");
+                last_watch_warning = Some(now);
+            } else {
+                debug!(%error, %namespace, "supervisor turn watch retry failed");
+            }
+        };
+        let mut last_reconcile_warning = None;
+        let mut report_reconcile_failure = |error: &str| {
+            let now = tokio::time::Instant::now();
+            if last_reconcile_warning.is_none_or(|last| now.duration_since(last) >= interval) {
+                warn!(%error, %namespace, "failed to reconcile pending supervisor turns");
+                last_reconcile_warning = Some(now);
+            } else {
+                debug!(%error, %namespace, "pending supervisor turn reconciliation still failing");
+            }
+        };
+        let mut resync = tokio::time::interval(interval);
+        resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume the immediate tick; the subscribed startup scan handles recovery once.
+        resync.tick().await;
+        loop {
+            let (mut convoys, mut sessions) = match subscribe().await {
+                Ok((convoys, sessions)) => (convoys.ready_chunks(64), sessions.ready_chunks(64)),
+                Err(error) => {
+                    report_watch_failure(&error);
+                    // A broken watch must not disable the periodic recovery pass.
+                    if let Err(error) = daemon.reconcile_pending_supervisor_turns_once(&namespace).await {
+                        report_reconcile_failure(&error);
+                    }
+                    failures = failures.saturating_add(1);
+                    tokio::time::sleep(retry_backoff.delay(failures)).await;
+                    continue;
+                }
+            };
+            // Subscribe to both inputs before scanning to preserve updates during a pass.
+            // Invariant: a no-op reconcile_pending_supervisor_turns_once must issue no
+            // writes, or its own watch events would keep this loop running.
+            loop {
+                if let Err(error) = daemon.reconcile_pending_supervisor_turns_once(&namespace).await {
+                    report_reconcile_failure(&error);
+                }
+                if let Some(ready_tx) = ready_tx.take() {
+                    let _ = ready_tx.send(());
+                }
+                let events = tokio::select! {
+                    events = convoys.next() => events,
+                    events = sessions.next() => events,
+                    _ = resync.tick() => {
+                        failures = 0;
+                        continue;
+                    },
+                };
+                match events {
+                    Some(events) => {
+                        if let Some(error) = events.into_iter().find_map(Result::err) {
+                            report_watch_failure(&error);
+                            break;
+                        }
+                        failures = 0;
+                    }
+                    None => break,
+                }
+            }
+            // Re-subscribe promptly after a transient failure, then scan to recover
+            // any events missed during the gap. Pace retries to avoid a hot loop.
+            failures = failures.saturating_add(1);
+            tokio::time::sleep(retry_backoff.delay(failures)).await;
+        }
+    });
+    (task, ready_rx)
 }
 
 fn spawn_managed_terminal_attention_task(daemon: Arc<InProcessDaemon>, interval: Duration) -> JoinHandle<()> {

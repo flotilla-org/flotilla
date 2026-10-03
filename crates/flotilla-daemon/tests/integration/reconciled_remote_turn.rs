@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex as StdMutex,
+    },
+    time::Duration,
+};
 
 use chrono::Utc;
 use flotilla_controllers::reconcilers::VesselReconciler;
@@ -8,6 +15,7 @@ use flotilla_core::{
     leaf_engine::TurnDeliveryRequest,
     providers::discovery::test_support::fake_discovery,
 };
+use flotilla_daemon::runtime::{spawn_pending_supervisor_turn_task, spawn_pending_supervisor_turn_task_with_watches};
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     controller::{Actuation, Reconciler},
@@ -18,6 +26,8 @@ use flotilla_resources::{
     TerminalSessionSource, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkState, WorkflowSnapshot,
     ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
+use futures::StreamExt;
+use tokio_util::task::AbortOnDropHandle;
 
 fn meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
@@ -35,29 +45,52 @@ fn agent_message(session: ResourceObject<TerminalSession>) -> TerminalCrewMessag
 
 #[tokio::test]
 async fn reconciled_remote_session_receives_nudge_and_resume_from_convoy_home() {
+    remote_turn_scenario(None).await;
+}
+
+#[derive(Clone, Copy)]
+enum ClosedWatch {
+    Convoy,
+    TerminalSession,
+}
+
+// #2287 recovery: a closed notification stream must be resubscribed, and the
+// recovery scan must deliver a turn replicated while that stream was down.
+#[tokio::test]
+async fn remote_turn_delivery_recovers_after_either_watch_closes() {
+    for input in [ClosedWatch::Convoy, ClosedWatch::TerminalSession] {
+        remote_turn_scenario(Some(input)).await;
+    }
+}
+
+async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     let home = ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("home store")).with_local_root(NodeId::new("home"));
     let placement =
         ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("placement store")).with_local_root(NodeId::new("placement"));
     let home_dir = tempfile::tempdir().expect("home config");
     std::fs::write(home_dir.path().join("daemon.toml"), "machine_id = \"home\"\n").expect("home identity");
-    let home_daemon = InProcessDaemon::new_with_resource_backend(
-        Vec::new(),
-        Arc::new(ConfigStore::with_base(home_dir.path())),
-        fake_discovery(false),
-        HostName::local(),
-        home.clone(),
-    )
-    .await;
+    let home_daemon = Arc::new(
+        InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(home_dir.path())),
+            fake_discovery(false),
+            HostName::local(),
+            home.clone(),
+        )
+        .await,
+    );
     let placement_dir = tempfile::tempdir().expect("placement config");
     std::fs::write(placement_dir.path().join("daemon.toml"), "machine_id = \"placement\"\n").expect("placement identity");
-    let placement_daemon = InProcessDaemon::new_with_resource_backend(
-        Vec::new(),
-        Arc::new(ConfigStore::with_base(placement_dir.path())),
-        fake_discovery(false),
-        HostName::local(),
-        placement.clone(),
-    )
-    .await;
+    let placement_daemon = Arc::new(
+        InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(placement_dir.path())),
+            fake_discovery(false),
+            HostName::local(),
+            placement.clone(),
+        )
+        .await,
+    );
 
     let convoys = home.clone().using::<Convoy>("flotilla");
     let created =
@@ -168,6 +201,59 @@ async fn reconciled_remote_session_receives_nudge_and_resume_from_convoy_home() 
     convoys.update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &status).await.expect("stall crew");
     replicate::<TerminalSession>(&placement, &home, "placement").await;
 
+    // #2287: replication wakes delivery and acknowledgment well before the 300s resync.
+    // Await the subscribed startup scan so delivery cannot accidentally come from startup.
+    let (home_task, home_ready) =
+        spawn_pending_supervisor_turn_task(Arc::clone(&home_daemon), "flotilla".to_string(), Duration::from_secs(300));
+    let _home_task = AbortOnDropHandle::new(home_task);
+    let subscriptions = Arc::new(AtomicUsize::new(0));
+    let before_retry = Arc::new(StdMutex::new(None));
+    let (placement_task, placement_ready) = if let Some(closed_watch) = closed_watch {
+        let backend = placement.clone();
+        let subscriptions = Arc::clone(&subscriptions);
+        let before_retry = Arc::clone(&before_retry);
+        spawn_pending_supervisor_turn_task_with_watches(
+            Arc::clone(&placement_daemon),
+            "flotilla".to_string(),
+            Duration::from_secs(300),
+            move || {
+                let backend = backend.clone();
+                let before_retry = Arc::clone(&before_retry);
+                let attempt = subscriptions.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 1 {
+                        // Capture the real store before replacing the failed watch.
+                        // Assert from the test body so failures do not hide in the spawned task.
+                        let stored = backend.clone().using::<TerminalSession>("flotilla").list().await?;
+                        *before_retry.lock().expect("retry observation lock") = Some(stored.items);
+                    }
+                    let convoys = backend.including_replicas::<Convoy>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
+                    let sessions =
+                        backend.including_replicas::<TerminalSession>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
+                    // Stand in only for a failed resource-notification stream;
+                    // both stores and the delivery/acknowledgment pass remain real.
+                    Ok(if attempt == 0 {
+                        match closed_watch {
+                            ClosedWatch::Convoy => (futures::stream::empty().boxed(), sessions),
+                            ClosedWatch::TerminalSession => (convoys, futures::stream::empty().boxed()),
+                        }
+                    } else {
+                        (convoys, sessions)
+                    })
+                }
+            },
+        )
+    } else {
+        spawn_pending_supervisor_turn_task(Arc::clone(&placement_daemon), "flotilla".to_string(), Duration::from_secs(300))
+    };
+    let _placement_task = AbortOnDropHandle::new(placement_task);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        home_ready.await.expect("home turn task ready");
+        placement_ready.await.expect("placement turn task ready");
+    })
+    .await
+    .expect("turn tasks subscribe and complete their startup scans");
+
     let request = TurnDeliveryRequest::builder()
         .namespace("flotilla".to_string())
         .convoy("nudge-convoy".to_string())
@@ -190,7 +276,30 @@ async fn reconciled_remote_session_receives_nudge_and_resume_from_convoy_home() 
     let queued = convoys.get("nudge-convoy").await.expect("queued convoy");
     assert!(queued.status.expect("status").turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
     replicate::<Convoy>(&home, &placement, "home").await;
-    placement_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver at placement");
+    if closed_watch.is_some() {
+        wait_until("terminal observation before replacement subscription", || async {
+            before_retry.lock().expect("retry observation lock").is_some()
+        })
+        .await;
+        let stored = before_retry.lock().expect("retry observation lock").take().expect("retry observation");
+        // The failed first subscription must not have delivered the pending turn.
+        assert_eq!(stored.len(), 1, "one fixture terminal captured before resubscribing");
+        assert!(
+            matches!(&stored[0].spec.source, TerminalSessionSource::Agent { message: None, .. }),
+            "initial subscription must leave the pending turn undelivered"
+        );
+    }
+    wait_until("nudge delivery after convoy replication", || async {
+        matches!(sessions.get(&session_meta.name).await.expect("session").spec.source, TerminalSessionSource::Agent {
+            message: Some(_),
+            ..
+        })
+    })
+    .await;
+    if closed_watch.is_some() {
+        // Delivery requires replacing the closed stream, without waiting 300s.
+        assert!(subscriptions.load(Ordering::SeqCst) >= 2);
+    }
     let delivered = sessions.get(&session_meta.name).await.expect("delivered session");
     let nudge = agent_message(delivered.clone());
     assert!(nudge.text.contains("Your stall is recorded. What changed since your report?"));
@@ -203,7 +312,18 @@ async fn reconciled_remote_session_receives_nudge_and_resume_from_convoy_home() 
         .await
         .expect("confirm nudge delivery");
     replicate::<TerminalSession>(&placement, &home, "placement").await;
-    home_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("acknowledge nudge at convoy home");
+    wait_until("nudge acknowledgment after terminal replication", || async {
+        !convoys
+            .get("nudge-convoy")
+            .await
+            .expect("convoy")
+            .status
+            .expect("status")
+            .turn_deliveries
+            .values()
+            .any(|delivery| delivery.pending_supervisor_turn.is_some())
+    })
+    .await;
 
     let convoy = convoys.get("nudge-convoy").await.expect("convoy after nudge");
     let mut status = convoy.status.expect("convoy status");
@@ -221,7 +341,11 @@ async fn reconciled_remote_session_receives_nudge_and_resume_from_convoy_home() 
     racing_nudge.subject_revision = "stall-2".to_string();
     home_daemon.deliver_standing_turn(&racing_nudge).await.expect("racing nudge accepted");
     replicate::<Convoy>(&home, &placement, "home").await;
-    placement_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("deliver resume at placement");
+    wait_until("resume delivery after convoy replication", || async {
+        let message = agent_message(sessions.get(&session_meta.name).await.expect("session"));
+        message.next_after(Some(&nudge_id)).is_some()
+    })
+    .await;
     let resumed_session = sessions.get(&session_meta.name).await.expect("resumed session");
     let resumed = agent_message(resumed_session.clone());
     let resume = resumed.next_after(Some(&nudge_id)).expect("resume follows nudge");
@@ -231,7 +355,10 @@ async fn reconciled_remote_session_receives_nudge_and_resume_from_convoy_home() 
     let mut status = resumed_session.status.expect("terminal status");
     status.delivered_message_id = Some(resume_id);
     sessions.update_status(&session_meta.name, &resumed_session.metadata.resource_version, &status).await.expect("resume delivered");
-    placement_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("queue nudge after resume");
+    wait_until("nudge delivery after local terminal acknowledgment", || async {
+        agent_message(sessions.get(&session_meta.name).await.expect("session")).following.len() == 2
+    })
+    .await;
     let after_race = sessions.get(&session_meta.name).await.expect("session after race");
     let messages = agent_message(after_race.clone());
     assert_eq!(messages.following.len(), 2);
@@ -241,7 +368,32 @@ async fn reconciled_remote_session_receives_nudge_and_resume_from_convoy_home() 
     status.delivered_message_id = Some(messages.following[1].id.clone());
     sessions.update_status(&session_meta.name, &after_race.metadata.resource_version, &status).await.expect("both turns delivered");
     replicate::<TerminalSession>(&placement, &home, "placement").await;
-    home_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("acknowledge both turns");
+    wait_until("cumulative acknowledgment after terminal replication", || async {
+        !convoys
+            .get("nudge-convoy")
+            .await
+            .expect("convoy")
+            .status
+            .expect("status")
+            .turn_deliveries
+            .values()
+            .any(|delivery| delivery.pending_supervisor_turn.is_some())
+    })
+    .await;
     let convoy = convoys.get("nudge-convoy").await.expect("convoy after acknowledgments");
     assert!(!convoy.status.expect("status").turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
+}
+
+async fn wait_until<F, Fut>(behavior: &str, mut condition: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !condition().await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{behavior} must complete without waiting for the resync interval"));
 }
