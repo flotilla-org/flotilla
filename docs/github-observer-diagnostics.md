@@ -80,3 +80,5 @@ wait/retry and landing recovery at the advertised deadline. Choose any further
 cadence, batching, concurrency or identity change from that evidence; this
 instrumentation fix does not claim to explain historical 5000-point consumption
 or to eliminate an unmeasured fleet secondary-limit trigger.
+
+A transport failure has no received HTTP response: the call event records `status=None` alongside `transport_failure=true`, rather than borrowing the parser's headerless-success default of 200. Received responses record `status=Some(code)`.

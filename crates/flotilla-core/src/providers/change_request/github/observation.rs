@@ -45,7 +45,7 @@ impl<'a> ObservationTelemetry<'a> {
         let limit = github_rate_limit(raw, Utc::now());
         tracing::info!(
             scope = %self.scope, query_shape = shape, subject_count = subjects,
-            status = response.status, transport_failure = raw.is_empty(),
+            status = ?(!raw.is_empty()).then_some(response.status), transport_failure = raw.is_empty(),
             x_ratelimit_limit = ?response_header(raw, "x-ratelimit-limit"),
             x_ratelimit_remaining = ?response_header(raw, "x-ratelimit-remaining"),
             x_ratelimit_used = ?response_header(raw, "x-ratelimit-used"),
@@ -115,7 +115,7 @@ mod tests {
         let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8");
         assert_eq!(text.lines().count(), 4, "three calls and one aggregate: {text}");
         for field in [
-            "status=200",
+            "status=Some(200)",
             "x_ratelimit_limit=Some(\"5000\")",
             "x_ratelimit_remaining=Some(\"4989\")",
             "x_ratelimit_used=Some(\"11\")",
@@ -135,6 +135,8 @@ mod tests {
         ] {
             assert!(text.contains(field), "missing {field}: {text}");
         }
+        let transport = text.lines().find(|line| line.contains("transport_failure=true")).expect("transport failure event");
+        assert!(transport.contains("status=None"), "a failed transport has no HTTP response status: {transport}");
         assert!(!text.contains("secret-token") && !text.contains("private-review-body"), "logs must omit credentials and review content");
     }
 }
