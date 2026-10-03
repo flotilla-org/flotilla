@@ -75,7 +75,7 @@ except FileNotFoundError:
 PY
   fi
   [[ -z "$CONFIRMATION_DONE" ]] || touch -- "$CONFIRMATION_DONE"
-  return "$status"
+  exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -723,6 +723,7 @@ restart_darwin_daemon_service() {
     launchctl bootstrap "$domain" "$plist" || return 1
   fi
   launchctl kickstart -k "$target" || return 1
+  # Successful restarts also disarm recovery on exact-generation reinstalls.
   DARWIN_RECOVERY_GENERATION=""
 }
 

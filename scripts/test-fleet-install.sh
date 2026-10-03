@@ -429,9 +429,10 @@ case "$1" in
     [[ "${BOOTOUT_FAIL:-0}" == 0 ]] || exit 1
     rm -f "$LAUNCHCTL_STATE.loaded"
     [[ "${STOP_FAIL:-0}" == 1 ]] || rm -f "$LAUNCHCTL_STATE.running"
-    if [[ "${ABORT_AFTER_BOOTOUT:-0}" == 1 ]]; then kill -TERM "$PPID"; fi
+    if [[ "${ABORT_AFTER_BOOTOUT:-0}" == 1 ]]; then kill -"${ABORT_SIGNAL:-TERM}" "$PPID"; fi
     ;;
   bootstrap)
+    [[ "${BOOTSTRAP_FAIL:-0}" == 0 ]] || exit 1
     [[ ! -f "$LAUNCHCTL_STATE.loaded" ]] || exit 1
     touch "$LAUNCHCTL_STATE.loaded"
     printf '%s\n' "$current" >"$LAUNCHCTL_STATE.running"
@@ -839,14 +840,27 @@ if grep -Fq 'could not restore the previous launch agent' "$test_root/darwin-boo
   fail 'recovery tried to bootstrap an already loaded agent'
 fi
 
-# Interrupt the incoming installer after it unloads launchd, before the flip.
-if ABORT_AFTER_BOOTOUT=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-abort.out" 2>&1; then
-  fail 'aborted Darwin handoff succeeded'
+# Catchable interruptions in the incoming installer must restore the old daemon.
+for abort_signal in TERM INT; do
+  if ABORT_AFTER_BOOTOUT=1 ABORT_SIGNAL="$abort_signal" run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-abort-$abort_signal.out" 2>&1; then
+    fail "Darwin handoff interrupted by $abort_signal succeeded"
+  fi
+  test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'aborted handoff switched generation'
+  test -f "$darwin_home/launchctl-state.loaded" || fail 'aborted handoff left agent unloaded'
+  test -f "$darwin_home/launchctl-state.running" || fail 'aborted handoff left daemon down'
+  test "$(cat "$darwin_home/launchctl-state.running")" = "releases/$generation_one" || fail 'recovery ran the wrong generation'
+done
+
+# A launchd recovery error must be reported, preserve the selection, and fail
+# installation. Retrying the current generation after launchd recovers is safe.
+if STOP_FAIL=1 BOOTSTRAP_FAIL=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-recovery-failed.out" 2>&1; then
+  fail 'failed launch agent restoration returned success'
 fi
-test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'aborted handoff switched generation'
-test -f "$darwin_home/launchctl-state.loaded" || fail 'aborted handoff left agent unloaded'
-test -f "$darwin_home/launchctl-state.running" || fail 'aborted handoff left daemon down'
-test "$(cat "$darwin_home/launchctl-state.running")" = "releases/$generation_one" || fail 'recovery ran the wrong generation'
+grep -Fq 'could not restore the previous launch agent' "$test_root/darwin-recovery-failed.out" || fail 'recovery failure omitted manual recovery hint'
+test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'failed recovery switched generation'
+run_darwin_installer "$darwin_home" "$generation_one" >/dev/null
+test -f "$darwin_home/launchctl-state.loaded" || fail 'retry after recovery failure left agent unloaded'
+test "$(cat "$darwin_home/launchctl-state.running")" = "releases/$generation_one" || fail 'retry after recovery failure ran wrong generation'
 
 # An error from the stop CLI with no remaining process is safe to continue.
 if ! STOP_FAIL=1 STOP_DISAPPEARS=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-disappeared.out" 2>&1; then
