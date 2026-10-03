@@ -1485,8 +1485,9 @@ const CONTAINED_RUSTC_WRAPPER_PATH: &str = "/usr/local/bin/flotilla-rustc-wrappe
 const CONTAINED_CARGO_SHIM_DIRECTORY: &str = "/usr/local/lib/flotilla-rust-build-limits";
 const CONTAINED_CARGO_SHIM_PATH: &str = "/usr/local/lib/flotilla-rust-build-limits/cargo";
 const CARGO_BUILD_PROFILE_SHIM: &str = r#"#!/bin/sh
+# flotilla-cargo-profile-shim
 # Remove our directory before resolving Cargo (including rustup's Cargo proxy).
-shim_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+shim_dir=$(CDPATH= cd -- "${0%/*}" && pwd) || exit 127
 remaining=$PATH
 filtered=
 while :; do
@@ -1501,7 +1502,12 @@ while :; do
 done
 # Resolve with a filtered PATH, but preserve the caller's PATH for Cargo's
 # subprocesses and external subcommands that may invoke Cargo themselves.
-cargo=$(PATH=${filtered#:} command -v cargo) || exit 127
+missing_cargo() {
+  echo "flotilla cargo profile shim: no Cargo executable found after removing the shim directory from PATH" >&2
+  exit 127
+}
+[ -n "$filtered" ] || missing_cargo
+cargo=$(PATH=${filtered#:} command -v cargo) || missing_cargo
 # rustup's +toolchain selector must precede Cargo options.
 case "${1:-}" in
   +*) toolchain=$1; shift
@@ -5990,10 +5996,19 @@ dependency = { path = "../dependency" }
         fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).expect("executable probe");
         // Isolate the fixture tool environment from a contained shim running this test suite.
         // Layering two copies would make each resolve the other as the next Cargo.
-        let inherited_path = std::env::join_paths(
-            std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
-                .filter(|directory| fs::read_to_string(directory.join("cargo")).ok().as_deref() != Some(super::CARGO_BUILD_PROFILE_SHIM)),
-        )
+        let stale_shim = temp.path().join("stale-shim");
+        fs::create_dir_all(&stale_shim).expect("stale shim directory");
+        fs::write(stale_shim.join("cargo"), format!("{}\n# previous staged revision\n", super::CARGO_BUILD_PROFILE_SHIM))
+            .expect("stale shim");
+        fs::set_permissions(stale_shim.join("cargo"), fs::Permissions::from_mode(0o755)).expect("executable stale shim");
+        let parent_path =
+            std::env::join_paths(std::iter::once(stale_shim).chain(std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))))
+                .expect("parent fixture PATH");
+        let inherited_path = std::env::join_paths(std::env::split_paths(&parent_path).filter(|directory| {
+            !fs::read_to_string(directory.join("cargo"))
+                .ok()
+                .is_some_and(|contents| contents.starts_with("#!/bin/sh\n# flotilla-cargo-profile-shim\n"))
+        }))
         .expect("isolated fixture PATH")
         .to_string_lossy()
         .into_owned();
@@ -6057,6 +6072,23 @@ dependency = { path = "../dependency" }
                 let flag = if case == "flags" { "profile_env_flag" } else { "profile_repo_config" };
                 assert!(unit.contains(flag), "repository or environment flags lost: {unit}");
             }
+        }
+    }
+
+    // A contained tool without a subsequent Cargo on PATH must fail promptly with a useful diagnostic.
+    // This is process-boundary glue: no compiler is needed for the missing-executable case.
+    #[cfg(unix)]
+    #[test]
+    fn contained_cargo_profile_reports_missing_cargo() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let staged = super::stage_local_cargo_shim(temp.path()).expect("stage shim");
+        let directory = staged.parent().expect("shim directory");
+        let cargo = directory.join("cargo");
+        fs::copy(&staged, &cargo).expect("install fixture shim");
+        for path in [directory.display().to_string(), format!("{}:/nonexistent-cargo-directory", directory.display())] {
+            let output = ProcessCommand::new(&cargo).env("PATH", path).current_dir(directory).output().expect("run isolated shim");
+            assert_eq!(output.status.code(), Some(127));
+            assert!(String::from_utf8_lossy(&output.stderr).contains("no Cargo executable found"));
         }
     }
 

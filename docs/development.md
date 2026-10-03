@@ -89,7 +89,7 @@ Current Cargo may create the empty `target/debug/incremental/` container even wh
 
 ### Crew and CI debuginfo
 
-Contained `rust-build-limits` tools export `CARGO_PROFILE_DEV_DEBUG=line-tables-only` and prepend a staged Cargo shim to `PATH`. The shim supplies `--config 'profile.dev.package."*".debug=0'`, so workspace crates retain file and line information in backtraces while third-party dependencies emit no debuginfo. CI supplies the same Cargo dependency override and workspace environment setting. Test builds inherit the dev profile.
+Contained `rust-build-limits` tools export `CARGO_PROFILE_DEV_DEBUG=line-tables-only` and prepend a staged Cargo shim to `PATH`. The shim supplies `--config 'profile.dev.package."*".debug=0'`, so workspace crates retain file and line information in backtraces while third-party dependencies emit no debuginfo. CI supplies the same Cargo dependency override and workspace environment setting. Test builds inherit the dev profile. Release and bench profiles retain their existing Cargo settings.
 
 For a build requiring workspace variables and types in a debugger, use `CARGO_PROFILE_DEV_DEBUG=full cargo test --workspace --locked`. This explicit override wins over the tool environment's default; dependency debuginfo remains disabled. Desk builds without the contained tool environment keep Cargo's full workspace debuginfo. The shim forwards `+toolchain` selectors and other arguments to the next Cargo executable on `PATH`, preserving repository Cargo config and Rust flags.
 
