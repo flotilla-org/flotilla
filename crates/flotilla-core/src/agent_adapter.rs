@@ -2237,6 +2237,8 @@ mod tests {
             vec![Ok("true\n".to_string()), Ok(".git/info/exclude\n".to_string()), Err("exclude is read-only".to_string())],
             // Work-tree inspection failure refuses too; it never means "no checkout".
             vec![Err("work tree inspection unavailable".to_string())],
+            // Inside a bare repository or a `.git` directory, Git answers `false`.
+            vec![Ok("false\n".to_string())],
         ] {
             let runner = Arc::new(MockRunner::new(responses));
             let cwd = ExecutionEnvironmentPath::new("/checkout");
@@ -2264,6 +2266,8 @@ mod tests {
             vec![Ok("true\n".to_string()), Ok(".git/info/exclude\n".to_string()), Err("exclude is read-only".to_string())],
             // Work-tree inspection failure refuses too; it never means "no checkout".
             vec![Err("work tree inspection unavailable".to_string())],
+            // Inside a bare repository or a `.git` directory, Git answers `false`.
+            vec![Ok("false\n".to_string())],
         ] {
             let runner = Arc::new(MockRunner::new(responses));
             let env = EnvironmentBag::new()

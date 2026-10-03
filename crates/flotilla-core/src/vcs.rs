@@ -1177,9 +1177,10 @@ impl Vcs for FlotillaVcs {
     async fn inside_work_tree(&self) -> Result<bool, String> {
         let output = self.cli().output(&["rev-parse", "--is-inside-work-tree"]).await?;
         if output.success {
+            // `false` means inside a bare repository or a `.git` directory: not a
+            // plain directory, so it is refused rather than treated as one.
             return match output.stdout.trim() {
                 "true" => Ok(true),
-                "false" => Ok(false),
                 other => Err(format!("work tree inspection returned `{other}`")),
             };
         }
