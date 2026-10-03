@@ -548,6 +548,14 @@ pub(crate) struct HostScopedDiscovery {
 }
 
 impl HostScopedDiscovery {
+    /// Host observations come from the environment's retained discovery, never
+    /// from which repositories happen to install these shared providers.
+    pub(crate) fn provider_statuses(&self) -> Vec<flotilla_protocol::HostProviderStatus> {
+        let mut registry = ProviderRegistry::new();
+        self.install(&mut registry, &mut Vec::new());
+        crate::host_summary::provider_statuses_from_registries([&registry])
+    }
+
     fn install(&self, registry: &mut ProviderRegistry, unmet: &mut Vec<(String, UnmetRequirement)>) {
         registry.agent_adapters = self.registry.agent_adapters.clone();
         for (descriptor, provider) in &self.registry.cloud_agents {
