@@ -293,8 +293,14 @@ impl CommandRunner for DiscoveryMockRunner {
         // Process boundary: model runtime exclusion and launch-specific receipt
         // operations against the same in-memory files used by adapter writes.
         // Explicit canned responses above can still inject transport failures.
+        // Answer the work-tree probe the way Git would for this directory, so
+        // plain-directory fixtures stay plain for repository detection too.
         if cmd == "git" && args == ["rev-parse", "--is-inside-work-tree"] {
-            return Ok("true\n".into());
+            return if cwd.join(".git").exists() {
+                Ok("true\n".into())
+            } else {
+                Err("fatal: not a git repository (or any of the parent directories): .git".into())
+            };
         }
         if cmd == "git" && args == ["rev-parse", "--git-path", "info/exclude"] {
             return Ok(".git/info/exclude\n".into());
