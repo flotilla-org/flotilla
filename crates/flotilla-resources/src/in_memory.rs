@@ -7,7 +7,7 @@ use chrono::Utc;
 use flotilla_protocol::NodeId;
 use futures::{stream, StreamExt};
 use serde_json::Value;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 
 use crate::{
     error::ResourceError,
@@ -15,7 +15,7 @@ use crate::{
     replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, K8sResourceObject, MergeMetadata, ObjectMeta, Resource, ResourceObject},
     retention::{EventRetention, ResourceStoreDiagnostics, FIELD_OWNERSHIP_VIOLATION_TTL_HOURS, MAX_FIELD_OWNERSHIP_VIOLATIONS},
-    watch::{ResourceList, ResourceTombstone, WatchEvent, WatchStart, WatchStream},
+    watch::{ResourceList, ResourceTombstone, WatchChannel, WatchEvent, WatchStart, WatchStream},
 };
 
 type StoreKey = (String, String, String, String);
@@ -36,7 +36,7 @@ type ReplicaKey = (NodeId, StoreKey);
 #[derive(Debug, Default)]
 struct ReplicaState {
     partitions: HashMap<ReplicaKey, ReplicaPartition>,
-    watchers: HashMap<StoreKey, Vec<mpsc::UnboundedSender<StoredReplicaEvent>>>,
+    watchers: HashMap<StoreKey, WatchChannel<StoredReplicaEvent>>,
 }
 
 #[derive(Debug, Default)]
@@ -53,7 +53,7 @@ struct ResourceStore {
     objects: HashMap<String, Value>,
     tombstones: HashMap<String, ResourceTombstone>,
     next_version: u64,
-    watchers: Vec<mpsc::UnboundedSender<StoredEvent>>,
+    watchers: WatchChannel<StoredEvent>,
     event_log: Vec<StoredEvent>,
     compacted_through: u64,
 }
@@ -92,7 +92,7 @@ impl ResourceStore {
             self.event_log.drain(..excess);
         }
         self.event_log.push(event.clone());
-        self.watchers.retain(|watcher| watcher.send(event.clone()).is_ok());
+        self.watchers.send(event);
     }
 }
 
@@ -102,7 +102,7 @@ impl Default for ResourceStore {
             objects: HashMap::new(),
             tombstones: HashMap::new(),
             next_version: 1,
-            watchers: Vec::new(),
+            watchers: WatchChannel::default(),
             event_log: Vec::new(),
             compacted_through: 0,
         }
@@ -244,7 +244,7 @@ impl InMemoryBackend {
 
     fn notify_replica_watchers(state: &mut ReplicaState, key: &StoreKey, event: StoredReplicaEvent) {
         if let Some(watchers) = state.watchers.get_mut(key) {
-            watchers.retain(|watcher| watcher.send(event.clone()).is_ok());
+            watchers.send(event);
         }
     }
 
@@ -305,10 +305,12 @@ impl InMemoryBackend {
         namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.replicas.lock().await.watchers.entry(key).or_default().push(tx);
+        let rx = self.replicas.lock().await.watchers.entry(key).or_default().subscribe(T::API_PATHS.kind, namespace);
         Ok(stream::unfold(rx, |mut rx| async {
-            let event = rx.recv().await?;
+            let event = match rx.next().await? {
+                Ok(event) => (*event).clone(),
+                Err(error) => return Some((Err(error), rx)),
+            };
             let provenance = ResourceProvenance::Replica { origin_root: event.origin_root, last_synced_at: event.synced_at };
             let decoded = if matches!(event.kind, StoredReplicaEventKind::Deleted) {
                 // Name-only tombstones deliberately omit `spec`; a present but
@@ -869,14 +871,13 @@ impl InMemoryBackend {
                 Some(version) => store.event_log.iter().filter(|event| event.version > version).cloned().collect(),
                 None => Vec::new(),
             };
-            let (sender, receiver) = mpsc::unbounded_channel();
-            store.watchers.push(sender);
+            let receiver = store.watchers.subscribe(T::API_PATHS.kind, namespace);
             (replay, receiver)
         };
 
         let replay_stream = stream::iter(replay.into_iter().map(Self::decode_event::<T>));
         let live_stream = stream::unfold(receiver, |mut receiver| async {
-            receiver.recv().await.map(|event| (Self::decode_event::<T>(event), receiver))
+            receiver.next().await.map(|event| (event.and_then(|event| Self::decode_event::<T>((*event).clone())), receiver))
         });
         Ok(WatchStream::new(generation, Box::pin(replay_stream.chain(live_stream))))
     }

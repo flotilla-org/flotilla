@@ -312,6 +312,8 @@ pub struct FleetHostRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_free_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_rss_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_sync: Option<crate::BlobSyncStatus>,
     #[serde(default)]
     #[builder(default)]

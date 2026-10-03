@@ -10,6 +10,19 @@ use crate::{
     providers::{discovery::EnvVars, registry::ProviderRegistry},
 };
 
+/// Resident bytes of this daemon process, sampled for the host heartbeat.
+/// Failure is unknown, never zero; refresh only this PID rather than the fleet.
+pub fn daemon_rss_bytes() -> Option<u64> {
+    let pid = sysinfo::get_current_pid().ok()?;
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_memory(),
+    );
+    system.process(pid).map(|process| process.memory()).filter(|bytes| *bytes > 0)
+}
+
 pub async fn build_local_host_summary(
     node_id: &NodeId,
     host_name: &HostName,
@@ -104,6 +117,13 @@ mod tests {
     use flotilla_protocol::HostEnvironment;
 
     use super::*;
+
+    // Glue: the sampler queries only the current process and reports bytes.
+    #[test]
+    fn daemon_rss_reports_resident_bytes() {
+        assert!(daemon_rss_bytes().is_some_and(|bytes| bytes > 0));
+    }
+
     use crate::{
         environment_manager::EnvironmentManager,
         providers::{

@@ -375,6 +375,7 @@ impl ReadProjections<'_> {
                         .convoy_count(convoys.len())
                         .surface_states(surface_states)
                         .maybe_disk_free_bytes(status.and_then(|status| status.disk_free_bytes))
+                        .maybe_daemon_rss_bytes(status.and_then(|status| status.daemon_rss_bytes))
                         .maybe_blob_sync(status.and_then(|status| status.blob_sync.clone()))
                         .sleep_inhibition(status.map(|status| status.sleep_inhibition.clone()).unwrap_or_default())
                         .staleness(staleness)
@@ -1422,6 +1423,7 @@ mod tests {
             .update_status("local-id", &host.metadata.resource_version, &ResourceHostStatus {
                 heartbeat_at: Some(Utc::now()),
                 ready: true,
+                daemon_rss_bytes: Some(128 * 1024 * 1024),
                 ..Default::default()
             })
             .await
@@ -1433,6 +1435,8 @@ mod tests {
             .await
             .expect("fleet health");
         let local = response.hosts.iter().find(|host| host.host == HostName::new("local")).expect("local host");
+        // Fleet rows preserve the heartbeat RSS byte count.
+        assert_eq!(local.daemon_rss_bytes, Some(128 * 1024 * 1024));
         assert_eq!(local.fulfilments.len(), 1);
         assert_eq!(local.fulfilments[0].name, "local-kind");
     }

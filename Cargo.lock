@@ -1390,6 +1390,7 @@ dependencies = [
  "flotilla-protocol",
  "flotilla-relay-protocol",
  "futures",
+ "hegeltest",
  "indexmap",
  "object_store",
  "reqwest 0.13.2",

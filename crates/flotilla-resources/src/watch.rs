@@ -1,16 +1,63 @@
 use std::{
     fmt,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
-use futures::{stream::BoxStream, Stream};
+use futures::{
+    stream::{self, BoxStream},
+    Stream, StreamExt,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use tokio::sync::broadcast;
 
 use crate::{
     error::ResourceError,
     resource::{Resource, ResourceObject},
 };
+
+pub(crate) const WATCH_RING_CAPACITY: usize = 256;
+
+// One bounded ring per resource stream, shared by all subscribers. A slow
+// subscriber cannot retain a private, ever-growing queue of full objects.
+#[derive(Debug)]
+pub(crate) struct WatchChannel<E> {
+    sender: broadcast::Sender<Arc<E>>,
+}
+
+impl<E> Default for WatchChannel<E> {
+    fn default() -> Self {
+        Self { sender: broadcast::channel(WATCH_RING_CAPACITY).0 }
+    }
+}
+
+impl<E: Send + Sync + 'static> WatchChannel<E> {
+    pub(crate) fn send(&self, event: E) {
+        let _ = self.sender.send(Arc::new(event));
+    }
+
+    pub(crate) fn subscribe(&self, kind: &'static str, namespace: &str) -> BoxStream<'static, Result<Arc<E>, ResourceError>> {
+        stream::unfold((Some(self.sender.subscribe()), namespace.to_owned()), move |(receiver, namespace)| async move {
+            let mut receiver = receiver?;
+            match receiver.recv().await {
+                Ok(event) => Some((Ok(event), (Some(receiver), namespace))),
+                Err(broadcast::error::RecvError::Closed) => None,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(kind, %namespace, skipped, capacity = WATCH_RING_CAPACITY, "resource watch lagged; relist required");
+                    Some((
+                        Err(ResourceError::WatchExpired {
+                            requested_version: "live watch lagged; relist required".to_string(),
+                            compacted_through: None,
+                        }),
+                        (None, namespace),
+                    ))
+                }
+            }
+        })
+        .boxed()
+    }
+}
 
 pub struct WatchStream<T: Resource> {
     generation: Option<String>,
@@ -107,6 +154,8 @@ pub struct ResourceList<T: Resource> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::WatchStart;
 
     #[test]
@@ -114,5 +163,54 @@ mod tests {
         let encoded = serde_json::to_string(&WatchStart::FromVersion("7".to_string())).expect("serialize watch start");
         let decoded: WatchStart = serde_json::from_str(&encoded).expect("deserialize watch start");
         assert_eq!(decoded, WatchStart::FromVersion("7".to_string()));
+    }
+    // The live event heap is bounded independently of subscriber count and
+    // update count. Weak references count retained payloads, not RSS affected
+    // by allocator caching. Every run crosses both ring boundary sides.
+    #[hegel::test]
+    fn shared_watch_ring_bounds_retained_payloads_and_preserves_fast_subscribers(tc: hegel::TestCase) {
+        use futures::StreamExt;
+        use hegel::generators as gs;
+
+        use super::{WatchChannel, WATCH_RING_CAPACITY};
+        // Fleet-sized fan-out, and bursts spanning capacity + 1 through 8x capacity.
+        let subscribers = tc.draw(gs::integers::<usize>().min_value(1).max_value(64));
+        let updates = tc.draw(gs::integers::<usize>().min_value(WATCH_RING_CAPACITY + 1).max_value(WATCH_RING_CAPACITY * 8));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let channel = WatchChannel::default();
+            let slow: Vec<_> = (0..subscribers).map(|_| channel.subscribe("Convoy", "flotilla")).collect();
+            let mut fast = channel.subscribe("Convoy", "flotilla");
+            let mut payloads = Vec::new();
+            for index in 0..updates {
+                let payload = Arc::new(vec![(index % 256) as u8; 16 * 1024]);
+                payloads.push(Arc::downgrade(&payload));
+                channel.send(payload);
+                let received = fast.next().await.expect("fast subscriber event").expect("never lagged");
+                assert_eq!(received[0], (index % 256) as u8);
+                drop(received);
+                assert_eq!(
+                    payloads.iter().filter(|payload| payload.strong_count() > 0).count(),
+                    (index + 1).min(WATCH_RING_CAPACITY),
+                    "only one ring of payloads may survive, regardless of subscriber count"
+                );
+            }
+            for mut subscriber in slow {
+                assert!(matches!(subscriber.next().await, Some(Err(crate::ResourceError::WatchExpired { .. }))));
+                assert!(subscriber.next().await.is_none());
+            }
+            drop(fast);
+            assert!(payloads.iter().all(|payload| payload.strong_count() == 0), "disconnect frees retained events");
+        });
+    }
+
+    // No demand retains no event payloads, even if writers keep publishing.
+    #[test]
+    fn watch_channel_without_subscribers_drops_payloads() {
+        let channel = super::WatchChannel::default();
+        let payload = Arc::new(vec![0; 16384]);
+        let weak = Arc::downgrade(&payload);
+        channel.send(payload);
+        assert_eq!(weak.strong_count(), 0);
     }
 }

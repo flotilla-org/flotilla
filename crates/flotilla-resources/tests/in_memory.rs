@@ -298,3 +298,13 @@ async fn observed_backend_expires_compacted_version_within_current_generation() 
         compacted_through: Some(second.metadata.resource_version),
     });
 }
+
+#[tokio::test]
+async fn slow_convoy_watch_is_bounded() {
+    common::contract::assert_slow_convoy_watch_is_bounded(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}
+
+#[tokio::test]
+async fn slow_replica_watch_is_bounded() {
+    common::contract::assert_slow_replica_watch_is_bounded(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}

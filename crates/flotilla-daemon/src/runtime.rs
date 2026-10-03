@@ -62,8 +62,11 @@ use flotilla_resources::{
     CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
     PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, TRANSPORT_CAPABILITY,
 };
-use futures::{FutureExt, StreamExt};
-use serde_json::json;
+use futures::{
+    stream::{BoxStream, SelectAll},
+    FutureExt, StreamExt,
+};
+use serde_json::{json, Value};
 use tokio::{
     sync::{watch, Mutex, RwLock, Semaphore},
     task::JoinHandle,
@@ -3430,6 +3433,37 @@ fn spawn_dispatch_reconciler_task(daemon: Arc<InProcessDaemon>, namespace: Strin
     })
 }
 
+async fn convoy_ensure_dependency_watches(
+    backend: &ResourceBackend,
+    namespace: &str,
+) -> SelectAll<BoxStream<'static, Result<Value, ResourceError>>> {
+    let mut watches = Vec::new();
+    match watch_resource_kind(backend, namespace, "Clone").await {
+        Ok(watch) => watches.push(watch.stream),
+        Err(error) => warn!(kind = "Clone", %error, "could not watch standing convoy admission trigger"),
+    }
+    // Clone and ConvoyEnsure lifecycle changes are trigger dependencies:
+    // renewed clone demand and ensure readmission can unblock work even
+    // though their payloads are not part of the admission hash.
+    for kind in [
+        "Convoy",
+        "ConvoyEnsure",
+        "Project",
+        "Repository",
+        "WorkflowTemplate",
+        "PlacementPolicy",
+        "CredentialGrant",
+        "CredentialSpec",
+        "Host",
+    ] {
+        match watch_resource_kind_including_replicas(backend, namespace, kind).await {
+            Ok(watch) => watches.push(watch.stream),
+            Err(error) => warn!(%kind, %error, "could not watch standing convoy admission dependency"),
+        }
+    }
+    futures::stream::select_all(watches)
+}
+
 fn spawn_convoy_ensure_reconciler_task(
     state: Arc<ControllerRuntimeState>,
     namespace: String,
@@ -3437,47 +3471,32 @@ fn spawn_convoy_ensure_reconciler_task(
     runtime_health: RuntimeHealth,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut watches = Vec::new();
-        match watch_resource_kind(&state.daemon.resource_backend(), &namespace, "Clone").await {
-            Ok(watch) => watches.push(watch.stream),
-            Err(error) => warn!(kind = "Clone", %error, "could not watch standing convoy admission trigger"),
-        }
-        // Clone and ConvoyEnsure lifecycle changes are trigger dependencies:
-        // renewed clone demand and ensure readmission can unblock work even
-        // though their payloads are not part of the admission hash.
-        for kind in [
-            "Convoy",
-            "ConvoyEnsure",
-            "Project",
-            "Repository",
-            "WorkflowTemplate",
-            "PlacementPolicy",
-            "CredentialGrant",
-            "CredentialSpec",
-            "Host",
-        ] {
-            match watch_resource_kind_including_replicas(&state.daemon.resource_backend(), &namespace, kind).await {
-                Ok(watch) => watches.push(watch.stream),
-                Err(error) => warn!(%kind, %error, "could not watch standing convoy admission dependency"),
-            }
-        }
-        let mut dependency_events = futures::stream::select_all(watches);
+        let backend = state.daemon.resource_backend();
+        let mut dependency_events = convoy_ensure_dependency_watches(&backend, &namespace).await;
         let mut resync = tokio::time::interval(interval);
         resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            let mut restart_watches = dependency_events.is_empty();
             tokio::select! {
                 _ = resync.tick() => {}
                 event = dependency_events.next(), if !dependency_events.is_empty() => {
                     if let Some(Err(error)) = event {
                         warn!(%error, "standing convoy admission dependency watch failed");
+                        restart_watches = true;
                     }
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     while let Some(Some(event)) = dependency_events.next().now_or_never() {
                         if let Err(error) = event {
                             warn!(%error, "standing convoy admission dependency watch failed");
+                            restart_watches = true;
                         }
                     }
                 }
+            }
+            if restart_watches {
+                // Reconciliation below is level-triggered; re-arm dependencies
+                // after overflow so subsequent changes still wake admission.
+                dependency_events = convoy_ensure_dependency_watches(&backend, &namespace).await;
             }
             let result = run_bounded_operation(
                 interval,
@@ -3673,6 +3692,7 @@ async fn apply_host_heartbeat_with_credentials(
         heartbeat_at: Utc::now(),
         ready,
         resource_store: resource_store.map(Box::new),
+        daemon_rss_bytes: flotilla_core::host_summary::daemon_rss_bytes(),
         daemon_generation: health.generation.clone(),
         daemon_version: Some(health.version.clone()),
         daemon_started_at: Some(health.started_at),
@@ -13277,6 +13297,7 @@ mod tests {
         assert_eq!(status.daemon_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
         assert!(status.daemon_started_at.is_some());
         assert!(status.disk_free_bytes.is_some());
+        assert!(status.daemon_rss_bytes.is_some_and(|bytes| bytes > 0));
         assert!(matches!(status.sleep_inhibition, flotilla_protocol::SleepInhibitionHealth::Failed { consecutive_failures: 3, .. }));
         assert_eq!(status.conditions.len(), 1);
         assert_eq!(status.conditions[0].condition_type, flotilla_resources::SLEEP_INHIBITION_CONDITION_TYPE);
@@ -13288,6 +13309,7 @@ mod tests {
         let fleet = daemon.fleet_health_internal().await.expect("query fleet health");
         let local = fleet.hosts.iter().find(|host| host.is_local).expect("local fleet-health row");
         assert_eq!(local.blob_sync.as_ref().expect("fleet list blob sync").pending_count, 1);
+        assert!(local.daemon_rss_bytes.is_some_and(|bytes| bytes > 0));
         assert!(
             local.degraded_conditions.iter().any(|condition| condition.contains("SleepInhibition") && condition.contains("polkit denied")),
             "fleet health should expose the sleep-inhibition condition: {:?}",

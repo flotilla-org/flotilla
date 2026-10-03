@@ -10,7 +10,6 @@ use flotilla_protocol::NodeId;
 use futures::{stream, StreamExt};
 use rusqlite::{params, Connection as RusqliteConnection, OpenFlags, OptionalExtension};
 use serde_json::Value;
-use tokio::sync::mpsc;
 use tokio_rusqlite::Connection;
 
 use crate::{
@@ -21,15 +20,13 @@ use crate::{
         EventRetention, ResourceDecodeQuarantine, ResourceEventDecodeQuarantine, ResourceStoreDiagnostics,
         FIELD_OWNERSHIP_VIOLATION_TTL_HOURS, MAX_FIELD_OWNERSHIP_VIOLATIONS,
     },
-    watch::{ResourceList, ResourceTombstone, WatchEvent, WatchStart, WatchStream},
+    watch::{ResourceList, ResourceTombstone, WatchChannel, WatchEvent, WatchStart, WatchStream},
     FieldOwnershipViolation,
 };
 
 type StoreKey = (String, String, String, String);
-type WatchSender = mpsc::UnboundedSender<StoredEvent>;
-type WatchersByStore = HashMap<StoreKey, Vec<WatchSender>>;
-type ReplicaWatchSender = mpsc::UnboundedSender<StoredReplicaEvent>;
-type ReplicaWatchersByStore = HashMap<StoreKey, Vec<ReplicaWatchSender>>;
+type WatchersByStore = HashMap<StoreKey, WatchChannel<StoredEvent>>;
+type ReplicaWatchersByStore = HashMap<StoreKey, WatchChannel<StoredReplicaEvent>>;
 type CleanupKey = (StoreKey, &'static str);
 
 const READ_DEADLINE: Duration = Duration::from_secs(2);
@@ -854,7 +851,7 @@ impl SqliteBackend {
     fn notify_watchers(watchers: &Mutex<WatchersByStore>, key: &StoreKey, event: StoredEvent) {
         if let Ok(mut watchers) = Self::lock_watchers(watchers) {
             if let Some(entries) = watchers.get_mut(key) {
-                entries.retain(|watcher| watcher.send(event.clone()).is_ok());
+                entries.send(event);
             }
         }
     }
@@ -862,7 +859,7 @@ impl SqliteBackend {
     fn notify_replica_watchers(watchers: &Mutex<ReplicaWatchersByStore>, key: &StoreKey, event: StoredReplicaEvent) {
         if let Ok(mut watchers) = watchers.lock() {
             if let Some(entries) = watchers.get_mut(key) {
-                entries.retain(|watcher| watcher.send(event.clone()).is_ok());
+                entries.send(event);
             }
         }
     }
@@ -1062,15 +1059,18 @@ impl SqliteBackend {
         namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.replica_watchers
+        let rx = self
+            .replica_watchers
             .lock()
             .map_err(|_| ResourceError::other("sqlite replica watch lock poisoned"))?
             .entry(key)
             .or_default()
-            .push(tx);
+            .subscribe(T::API_PATHS.kind, namespace);
         Ok(stream::unfold(rx, |mut rx| async {
-            let event = rx.recv().await?;
+            let event = match rx.next().await? {
+                Ok(event) => (*event).clone(),
+                Err(error) => return Some((Err(error), rx)),
+            };
             let provenance = ResourceProvenance::Replica { origin_root: event.origin_root, last_synced_at: event.synced_at };
             let decoded = if matches!(event.kind, StoredReplicaEventKind::Deleted) {
                 // Name-only tombstones deliberately omit `spec`; a present but
@@ -1900,16 +1900,16 @@ impl SqliteBackend {
                 return Err(ResourceError::invalid("sqlite resource watches do not use generations"));
             }
         };
-        let (sender, receiver) = mpsc::unbounded_channel();
         let watchers = Arc::clone(&self.watchers);
-        let replay = self
+        let (replay, receiver) = self
             .call("watch resource replay", move |connection| {
                 let replay = match replay_from {
                     Some(version) => Self::replay_events::<T>(connection, &key, version)?,
                     None => ReplayedEvents { events: Vec::new(), quarantines: Vec::new() },
                 };
-                Self::lock_watchers(&watchers)?.entry(key).or_default().push(sender);
-                Ok(replay)
+                let namespace = key.3.clone();
+                let receiver = Self::lock_watchers(&watchers)?.entry(key).or_default().subscribe(T::API_PATHS.kind, &namespace);
+                Ok((replay, receiver))
             })
             .await?;
 
@@ -1926,7 +1926,7 @@ impl SqliteBackend {
 
         let replay_stream = stream::iter(replay.events.into_iter().map(Ok));
         let live_stream = stream::unfold(receiver, |mut receiver| async {
-            receiver.recv().await.map(|event| (Self::decode_event::<T>(event), receiver))
+            receiver.next().await.map(|event| (event.and_then(|event| Self::decode_event::<T>((*event).clone())), receiver))
         });
         Ok(WatchStream::new(None, Box::pin(replay_stream.chain(live_stream))))
     }
