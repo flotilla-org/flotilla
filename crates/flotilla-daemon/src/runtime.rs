@@ -1516,6 +1516,7 @@ missing_cargo() {
 [ -n "$filtered" ] || missing_cargo
 cargo=$(PATH=${filtered#:} command -v cargo) || missing_cargo
 # A different directory may contain a file symlink to this same shim.
+# The contained sh must support test -ef (dash, bash, BusyBox and macOS sh do).
 [ "$cargo" -ef "$0" ] && missing_cargo
 # rustup's +toolchain selector must precede Cargo options.
 case "${1:-}" in
@@ -6033,7 +6034,10 @@ dependency = { path = "../dependency" }
             let cargo = if contained { shim_dir.join("cargo") } else { std::env::var_os("CARGO").expect("Cargo executable").into() };
             let mut command = ProcessCommand::new(cargo);
             if selector {
-                let Ok(toolchain) = std::env::var("RUSTUP_TOOLCHAIN") else { continue };
+                let Ok(toolchain) = std::env::var("RUSTUP_TOOLCHAIN") else {
+                    eprintln!("Skipping Cargo +toolchain case: RUSTUP_TOOLCHAIN is unset; other profile cases still run");
+                    continue;
+                };
                 command.arg(format!("+{toolchain}"));
             }
             command
