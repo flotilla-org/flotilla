@@ -32,6 +32,7 @@ use crate::{
     change_request_observer::{ChangeRequestRef, ChangeRequestRefresher},
     event_sink::EventSink,
     issue_observer::{IssueObservationSource, IssueRef, IssueRefreshCadence, IssueRefresher},
+    providers::github_api::rate_limit_reset,
 };
 
 struct UnavailableIssues;
@@ -968,7 +969,7 @@ impl ReconcilerWake {
             let mut able = false;
             let mut unknown = false;
             let mut actionable_rows = 0;
-            for row in convoy_rows {
+            'rows: for row in convoy_rows {
                 if row.leaves.iter().any(|leaf| {
                     let LeafAddress::Work { work, .. } = &leaf.address else { return false };
                     let Some(role) = leaf.field_path.strip_prefix(".crew.").and_then(|field| field.strip_suffix(".phase")) else {
@@ -1318,6 +1319,12 @@ impl ReconcilerWake {
                                         number: *number,
                                     };
                                     let refresh_error = self.subscriptions.change_request_observation_error(&subject).await;
+                                    if refresh_error.as_deref().and_then(rate_limit_reset).is_some_and(|retry_at| retry_at > now) {
+                                        // A known forge retry deadline keeps the observed
+                                        // maker pending; missing evidence is not a crew stall.
+                                        unknown = true;
+                                        continue 'rows;
+                                    }
                                     reason = Some(match (observation.is_some(), has_value, refresh_error) {
                                         (true, true, Some(error)) => format!("stale; refresh failed: {error}"),
                                         (true, true, None) => "stale".into(),
@@ -4030,6 +4037,70 @@ mod tests {
         .await
         .expect("leaf fire must enqueue reconcile without waiting for hourly resync");
         controller.abort();
+    }
+
+    // #2499: Landing keeps its exit gates while the observed maker waits at a
+    // known forge deadline. Only an expired deadline without recovery can stall.
+    #[tokio::test]
+    async fn landing_observation_cooldown_waits_until_deadline_without_stalling() {
+        struct LimitedSource(String);
+        #[async_trait]
+        impl crate::change_request_observer::ChangeRequestObservationSource for LimitedSource {
+            async fn observe(&self, _: &ChangeRequestRef) -> Result<flotilla_resources::ChangeRequestStatus, String> {
+                Err(self.0.clone())
+            }
+        }
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let now = Utc::now();
+        let retry_at = now + chrono::Duration::seconds(60);
+        let error = format!(
+            "github rate limited (budget=GraphQL, identity=host gh login, kind=secondary, retry_source=retry-after, retry_at={retry_at})"
+        );
+        let refresher = ChangeRequestRefresher::new(
+            "fleet".into(),
+            backend.clone(),
+            "authority".into(),
+            Arc::new(LimitedSource(error)),
+            crate::change_request_observer::ChangeRequestRefreshCadence::default(),
+        );
+        let subject = ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "team/one".into(), number: 1 };
+        refresher.refresh_once(&subject).await.expect_err("limited observation records its diagnostic");
+        let (event_tx, _) = broadcast::channel(4);
+        let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher);
+        let convoys = backend.using::<Convoy>("flotilla");
+        let created = convoys
+            .create(
+                &InputMeta::builder().name("cooldown".into()).build(),
+                &ConvoySpec::builder().workflow_ref("workflow".into()).repositories(Vec::new()).build(),
+            )
+            .await
+            .expect("convoy");
+        convoys
+            .update_status("cooldown", &created.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Landing,
+                ..Default::default()
+            })
+            .await
+            .expect("landing");
+        let id = uuid::Uuid::new_v4();
+        table.inner.rows.lock().await.insert(id, LeafSubscriptionRow {
+            id,
+            namespace: "flotilla".into(),
+            leaves: vec!["cr/github.com/team/one/1 .state == merged".parse().expect("exit leaf")],
+            watcher: LeafWatcher::ReconcilerWake { convoy: "cooldown".into() },
+            maker: LeafMaker::Observed { refresher: "change_request".into(), external_party: "forge".into() },
+            freshness_demand: Some(now),
+            created_at: now,
+            episode_key: EpisodeKeyFields::default(),
+        });
+        let wake = ReconcilerWake { subscriptions: table, _marker: PhantomData };
+        for at in [now, retry_at - chrono::Duration::nanoseconds(1), retry_at] {
+            let convoy = convoys.get("cooldown").await.expect("convoy");
+            wake.judge_stalls_at("flotilla", &HashMap::from([("cooldown".into(), convoy)]), at).await.expect("judge");
+            let status = convoys.get("cooldown").await.expect("convoy").status.expect("status");
+            assert_eq!(status.phase, ConvoyPhase::Landing, "missing merge evidence must never land");
+            assert_eq!(status.stalled.is_some(), at >= retry_at, "only the expired unrecovered wait can stall");
+        }
     }
 
     #[tokio::test]

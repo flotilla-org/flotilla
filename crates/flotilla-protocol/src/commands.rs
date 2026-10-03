@@ -1181,6 +1181,11 @@ impl AttachBinding {
 pub enum CommandValue {
     Ok,
     CrewFollowUpDelivered,
+    /// The claim is still unmet; a CLI caller waits and retries at this deadline.
+    CrewCompletionWaiting {
+        reason: String,
+        retry_at: chrono::DateTime<chrono::Utc>,
+    },
     ResourceReconciled {
         resource_kind: String,
         name: String,
@@ -1637,6 +1642,10 @@ mod tests {
         let cases = vec![
             CommandValue::Ok,
             CommandValue::CrewFollowUpDelivered,
+            CommandValue::CrewCompletionWaiting {
+                reason: "GitHub secondary limit".into(),
+                retry_at: "2026-10-03T09:21:59Z".parse().expect("retry deadline"),
+            },
             CommandValue::ConvoyBriefDelivered { displaced: Some("older instruction".into()) },
             CommandValue::ConvoyBriefQueued { displaced: Some("older instruction".into()) },
             CommandValue::ConvoyBriefWithdrawn { withdrawn: Some("latest instruction".into()) },

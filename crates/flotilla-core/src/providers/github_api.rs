@@ -17,20 +17,25 @@ fn is_issue_observation(endpoint: &str) -> bool {
     endpoint.starts_with("repos/") && endpoint.contains("/issues?")
 }
 
-fn response_header<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn response_header<'a>(raw: &'a str, name: &str) -> Option<&'a str> {
     raw.lines().take_while(|line| !line.is_empty()).find_map(|line| {
         let (key, value) = line.split_once(':')?;
         key.eq_ignore_ascii_case(name).then_some(value.trim())
     })
 }
 
-/// Extract a GitHub rate-limit reset timestamp from a provider error.
+/// Extract the GitHub retry deadline from a provider error.
+///
+/// A secondary deadline is distinct from the primary window reset. Legacy
+/// `reset_at` errors remain readable alongside the classified `retry_at` shape.
 ///
 /// Provider traits intentionally expose string errors. Keep the wire format
 /// small and private to the provider layer while giving polling callers a
 /// reliable way to distinguish a rate limit from an ordinary failure.
 pub fn rate_limit_reset(error: &str) -> Option<DateTime<Utc>> {
-    error.strip_prefix(RATE_LIMIT_PREFIX)?.rsplit_once("reset_at=")?.1.strip_suffix(')')?.parse().ok()
+    let fields = error.strip_prefix(RATE_LIMIT_PREFIX)?.strip_suffix(')')?;
+    let deadline = fields.rsplit_once("retry_at=").or_else(|| fields.rsplit_once("reset_at="))?.1;
+    deadline.parse().ok()
 }
 
 /// Only the REST core budget controls issue observation. Search has its own quota.
@@ -105,23 +110,107 @@ pub(crate) fn rate_limit_error(reset: &str) -> String {
     rate_limit_error_for("REST core", reset)
 }
 
-pub(crate) fn rate_limit_error_from_response(raw: &str, budget: &str) -> Option<String> {
-    let response = parse_gh_api_response(raw);
-    let lower = raw.to_ascii_lowercase();
-    if response.status != 403 && !lower.contains("rate limit") {
-        return None;
-    }
-    if !lower.contains("rate limit") && !lower.contains("x-ratelimit-remaining: 0") {
-        return None;
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GithubRateLimitKind {
+    Primary,
+    Secondary,
+}
 
-    let reset = response_header(raw, "x-ratelimit-reset")?;
+impl GithubRateLimitKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Secondary => "secondary",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct GithubRateLimit {
+    pub kind: GithubRateLimitKind,
+    pub retry_at: Option<DateTime<Utc>>,
+    pub retry_source: &'static str,
+}
+
+/// Classify only error fields, never text in a successful response (for example
+/// a PR comment mentioning rate limits). Primary reset headers accompany ordinary
+/// errors too, and must not turn a secondary limit into an hourly suspension.
+pub(crate) fn github_rate_limit(raw: &str, received_at: DateTime<Utc>) -> Option<GithubRateLimit> {
+    let response = parse_gh_api_response(raw);
+    let document: serde_json::Value = serde_json::from_str(&response.body).ok()?;
+    let errors = document["errors"].as_array();
+    let failed = matches!(response.status, 403 | 429) || errors.is_some_and(|errors| !errors.is_empty());
+    if !failed {
+        return None;
+    }
+    let messages = errors
+        .into_iter()
+        .flatten()
+        .filter_map(|error| error["message"].as_str())
+        .chain(document["message"].as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let rate_limited = messages.contains("rate limit")
+        || messages.contains("abuse")
+        || errors.into_iter().flatten().any(|error| error["type"] == "RATE_LIMITED")
+        || response.status == 429;
+    if !rate_limited {
+        return None;
+    }
+    let remaining = response_header(raw, "x-ratelimit-remaining").and_then(|value| value.parse::<u64>().ok());
+    let reset = response_header(raw, "x-ratelimit-reset")
+        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single());
+    let retry_after = response_header(raw, "retry-after").and_then(|value| {
+        value
+            .parse::<i64>()
+            .ok()
+            .filter(|seconds| *seconds >= 0)
+            .and_then(chrono::Duration::try_seconds)
+            .and_then(|delay| received_at.checked_add_signed(delay))
+            .or_else(|| DateTime::parse_from_rfc2822(value).ok().map(|at| at.with_timezone(&Utc)))
+    });
+    let kind = if remaining == Some(0) {
+        GithubRateLimitKind::Primary
+    } else if remaining.is_some() || retry_after.is_some() || messages.contains("secondary") || messages.contains("abuse") {
+        GithubRateLimitKind::Secondary
+    } else {
+        // Insufficient evidence: keep the actual forge error rather than guessing
+        // which budget is exhausted from a reset header alone.
+        return None;
+    };
+    let (retry_at, retry_source) = match (kind, retry_after, reset) {
+        (GithubRateLimitKind::Primary, Some(after), Some(reset)) if reset > after => (reset, "x-ratelimit-reset"),
+        (_, Some(after), _) => (after, "retry-after"),
+        (GithubRateLimitKind::Primary, None, Some(reset)) => (reset, "x-ratelimit-reset"),
+        (GithubRateLimitKind::Secondary, None, _) => {
+            // GitHub documents at least a minute when no Retry-After is supplied.
+            // This is explicitly a fallback, never represented as a primary reset.
+            (received_at + chrono::Duration::minutes(1), "secondary-fallback-60s")
+        }
+        _ => return Some(GithubRateLimit { kind, retry_at: None, retry_source: "unavailable" }),
+    };
+    Some(GithubRateLimit { kind, retry_at: Some(retry_at), retry_source })
+}
+
+pub(crate) fn rate_limit_error_from_response(raw: &str, budget: &str) -> Option<String> {
+    rate_limit_error_from_response_at(raw, budget, Utc::now())
+}
+
+fn rate_limit_error_from_response_at(raw: &str, budget: &str, received_at: DateTime<Utc>) -> Option<String> {
+    let limit = github_rate_limit(raw, received_at)?;
     let budget = if budget == "REST core" {
         response_header(raw, "x-ratelimit-resource").map(|resource| format!("REST {resource}")).unwrap_or_else(|| budget.to_string())
     } else {
         budget.to_string()
     };
-    Some(rate_limit_error_for(&budget, reset))
+    Some(format!(
+        "github rate limited (budget={budget}, identity=host gh login, kind={}, retry_source={}, retry_at={})",
+        limit.kind.as_str(),
+        limit.retry_source,
+        limit.retry_at?.to_rfc3339(),
+    ))
 }
 
 fn low_budget_from_response(raw: &str) -> Option<(DateTime<Utc>, String)> {
@@ -304,9 +393,60 @@ mod tests {
         assert!(!result.has_next_page);
     }
 
+    // A secondary limit with primary points remaining must use Retry-After,
+    // rather than the unrelated primary window reset (operator evidence #2499).
+    #[hegel::test]
+    fn secondary_backoff_ignores_primary_reset(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Cross zero/one and minute boundaries for retry delays; primary quota
+        // is always nonempty, including the operator's 4989 remaining case.
+        let remaining = tc.draw(gs::integers::<u32>().min_value(1).max_value(5000));
+        let delay = tc.draw(gs::integers::<i64>().min_value(0).max_value(120));
+        let now = Utc.timestamp_opt(1784732400, 0).single().expect("time");
+        let raw = format!(
+            "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: {remaining}\r\nX-RateLimit-Reset: {}\r\nRetry-After: {delay}\r\n\r\n{{\"message\":\"You have exceeded a secondary rate limit\"}}",
+            now.timestamp() + 3600,
+        );
+        let error = rate_limit_error_from_response_at(&raw, "GraphQL", now).expect("secondary limit");
+        assert!(error.contains("kind=secondary"), "{error}");
+        let retry = rate_limit_reset(&error).expect("retry deadline");
+        assert_eq!(retry, now + chrono::Duration::seconds(delay));
+    }
+
+    // Response-shape contract: only exhausted primary responses use the reset;
+    // secondary responses use their own delay even with an unrelated reset.
+    #[test]
+    fn rate_limit_classification_matrix() {
+        let now = Utc.timestamp_opt(1784732400, 0).single().expect("time");
+        let cases = [
+            ("HTTP/2 200 OK\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1784736000\r\n\r\n{\"errors\":[{\"type\":\"RATE_LIMITED\",\"message\":\"API rate limit exceeded\"}]}", Some((GithubRateLimitKind::Primary, Some(3600), "x-ratelimit-reset"))),
+            ("HTTP/2 200 OK\r\nX-RateLimit-Remaining: 4989\r\nX-RateLimit-Reset: 1784736000\r\nRetry-After: 10\r\n\r\n{\"errors\":[{\"type\":\"RATE_LIMITED\",\"message\":\"API rate limit exceeded\"}]}", Some((GithubRateLimitKind::Secondary, Some(10), "retry-after"))),
+            ("HTTP/2 429 Too Many Requests\r\nRetry-After: Wed, 22 Jul 2026 15:01:00 GMT\r\n\r\n{\"message\":\"slow down\"}", Some((GithubRateLimitKind::Secondary, Some(60), "retry-after"))),
+            ("HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1784736000\r\nRetry-After: invalid\r\n\r\n{\"message\":\"secondary rate limit\"}", Some((GithubRateLimitKind::Secondary, Some(60), "secondary-fallback-60s"))),
+            ("HTTP/2 200 OK\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1784736000\r\n\r\n{\"data\":{\"body\":\"secondary rate limit\"}}", None),
+            ("HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1784736000\r\n\r\n{\"message\":\"API rate limit exceeded\"}", None),
+            ("HTTP/2 200 OK\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1784736000\r\n\r\n{\"errors\":[{\"type\":\"NOT_FOUND\",\"message\":\"Could not resolve pull request\"}]}", None),
+            ("HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\n\r\n{\"message\":\"API rate limit exceeded\"}", Some((GithubRateLimitKind::Primary, None, "unavailable"))),
+            ("HTTP/2 403 Forbidden\r\nRetry-After: 60\r\n\r\n{\"message\":\"Resource not accessible by integration\"}", None),
+            ("HTTP/2 502 Bad Gateway\r\n\r\nnot JSON", None),
+        ];
+        for (raw, expected) in cases {
+            let actual = github_rate_limit(raw, now)
+                .map(|limit| (limit.kind, limit.retry_at.map(|at| at.signed_duration_since(now).num_seconds()), limit.retry_source));
+            assert_eq!(actual, expected, "{raw}");
+        }
+    }
+
+    // A permissions error may carry primary reset headers. It is not a limit.
+    #[test]
+    fn forbidden_is_not_a_rate_limit_even_with_primary_reset() {
+        let raw = "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 4989\r\nX-RateLimit-Reset: 1893456000\r\n\r\n{\"message\":\"Resource not accessible by integration\"}";
+        assert!(rate_limit_error_from_response(raw, "GraphQL").is_none());
+    }
+
     #[test]
     fn extracts_rate_limit_reset_from_403_response() {
-        let raw = "HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1784736000\r\n\r\n{\"message\":\"API rate limit exceeded\"}";
+        let raw = "HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1784736000\r\nX-RateLimit-Remaining: 0\r\n\r\n{\"message\":\"API rate limit exceeded\"}";
         let error = rate_limit_error_from_response(raw, "REST core").expect("rate limit error");
         assert_eq!(rate_limit_reset(&error).expect("reset timestamp"), Utc.timestamp_opt(1784736000, 0).single().expect("valid timestamp"));
     }

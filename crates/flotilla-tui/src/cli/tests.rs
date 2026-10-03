@@ -543,3 +543,60 @@ fn convoy_explanation_subject_observations_snapshot() {
         !4 https://github.com/owner/repo/pull/4
     "###);
 }
+
+// A completion wait must keep the caller pending, state the deadline, and
+// retry the original claim only when GitHub's advertised cooldown has elapsed.
+#[tokio::test(start_paused = true)]
+async fn crew_completion_wait_retries_same_claim_after_deadline() {
+    use std::sync::{Arc, Mutex};
+
+    use flotilla_protocol::{Command, CommandAction, CrewCommandContext};
+
+    use crate::app::test_support::StubDaemon;
+    let (tx, _) = tokio::sync::broadcast::channel(8);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let daemon = StubDaemon::builder().tx(tx.clone()).execute_calls(calls.clone()).build();
+    let command = Command {
+        node_id: None,
+        provisioning_target: None,
+        context_repo: None,
+        action: CommandAction::CrewComplete {
+            context: CrewCommandContext {
+                crew_id: None,
+                namespace: Some("flotilla".into()),
+                convoy: Some("convoy".into()),
+                vessel_ref: Some("vessel".into()),
+                role: Some("coder".into()),
+            },
+            message: Some("PR delivered".into()),
+            disposition: None,
+            decision_ledger_ref: Some("ledger".into()),
+            force: false,
+        },
+    };
+    let run = super::run_command(&daemon, command.clone(), super::OutputFormat::Json);
+    tokio::pin!(run);
+    // Drive subscription/dispatch before emitting the fake daemon event.
+    assert!(futures::poll!(&mut run).is_pending());
+    let event = |result| DaemonEvent::CommandFinished {
+        command_id: 1,
+        node_id: NodeId::new("node-local-test"),
+        repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "".into() },
+        repo: None,
+        result,
+    };
+    tx.send(event(CommandValue::CrewCompletionWaiting {
+        reason: "GitHub secondary limit".into(),
+        retry_at: chrono::Utc::now() + chrono::Duration::seconds(60),
+    }))
+    .expect("wait event");
+    assert!(futures::poll!(&mut run).is_pending());
+    tokio::time::advance(std::time::Duration::from_secs(59)).await;
+    assert!(futures::poll!(&mut run).is_pending());
+    assert_eq!(calls.lock().expect("calls").len(), 1);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    assert!(futures::poll!(&mut run).is_pending());
+    assert_eq!(*calls.lock().expect("calls"), vec![command.clone(), command]);
+    tx.send(event(CommandValue::Ok)).expect("ready event");
+    assert_eq!(run.await.expect("completed claim"), CommandValue::Ok);
+}

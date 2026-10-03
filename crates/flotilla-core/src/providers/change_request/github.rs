@@ -1,16 +1,19 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+mod observation;
+
+use std::{collections::HashMap, path::Path, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
 
+use self::observation::ObservationTelemetry;
 use crate::{
     change_request_observer::{parse_gh_observation_with_crew_identity, DEFAULT_REVIEW_BOT_LOGIN},
     providers::{
         gh_api_get, gh_api_get_with_headers,
-        github_api::{clamp_per_page, parse_gh_api_response, rate_limit_error_from_response, GhApi},
+        github_api::{clamp_per_page, parse_gh_api_response, rate_limit_error_from_response, rate_limit_reset, GhApi},
         run, run_output,
         types::*,
-        CommandRunner,
+        CommandOutput, CommandRunner,
     },
 };
 
@@ -119,6 +122,24 @@ impl GitHubChangeRequest {
         self
     }
 
+    async fn observation_call(
+        &self,
+        query: &str,
+        shape: &'static str,
+        subjects: usize,
+        telemetry: &mut ObservationTelemetry<'_>,
+    ) -> Result<CommandOutput, String> {
+        let argument = format!("query={query}");
+        let started = Instant::now();
+        let output = run_output!(self.runner, "gh", &["api", "graphql", "--include", "-f", &argument], execution_root());
+        telemetry.record(shape, subjects, output.as_ref().ok().map(|output| output.stdout.as_str()), started.elapsed());
+        let output = output?;
+        if let Some(error) = rate_limit_error_from_response(&output.stdout, "GraphQL") {
+            return Err(error);
+        }
+        Ok(output)
+    }
+
     fn parse_state(state: &str) -> ChangeRequestStatus {
         match state.to_uppercase().as_str() {
             "OPEN" => ChangeRequestStatus::Open,
@@ -183,6 +204,7 @@ impl GitHubChangeRequest {
         request: &mut serde_json::Value,
         pages: &mut usize,
         nodes: &mut usize,
+        telemetry: &mut ObservationTelemetry<'_>,
     ) -> Result<(), String> {
         while let Some(page) = Self::next_history_page(request) {
             if *pages >= MAX_HISTORY_PAGE_QUERIES || *nodes + page.max_nodes() > MAX_HISTORY_PAGE_NODES {
@@ -194,22 +216,26 @@ impl GitHubChangeRequest {
             let cursor = serde_json::to_string(cursor).map_err(|error| error.to_string())?;
             let selection = page.selection(request, number, &cursor)?;
             let query = if matches!(page, HistoryPage::ThreadComments(_)) {
-                format!("query {{ {selection} }}")
+                format!("query {{ rateLimit {{ cost }} {selection} }}")
             } else {
                 let (owner, name) = self.repo_slug.split_once('/').ok_or("GitHub repository must have owner/name scope")?;
                 let owner = serde_json::to_string(owner).map_err(|error| error.to_string())?;
                 let name = serde_json::to_string(name).map_err(|error| error.to_string())?;
-                format!("query {{ repository(owner:{owner},name:{name}) {{ pr:pullRequest(number:{number}) {{ {selection} }} }} }}")
+                format!("query {{ rateLimit {{ cost }} repository(owner:{owner},name:{name}) {{ pr:pullRequest(number:{number}) {{ {selection} }} }} }}")
             };
-            let argument = format!("query={query}");
-            let output = run_output!(self.runner, "gh", &["api", "graphql", "--include", "-f", &argument], execution_root())?;
-            if let Some(error) = rate_limit_error_from_response(&output.stdout, "GraphQL") {
-                return Err(error);
-            }
+            let shape = match page {
+                HistoryPage::Comments => "history-comments",
+                HistoryPage::Reviews => "history-reviews",
+                HistoryPage::Threads => "history-threads",
+                HistoryPage::ThreadComments(_) => "history-thread-comments",
+            };
+            let output = self.observation_call(&query, shape, 1, telemetry).await?;
             let response = parse_gh_api_response(&output.stdout);
             let document: serde_json::Value = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
             if !output.success || document["errors"].as_array().is_some_and(|errors| !errors.is_empty()) {
-                return Err(format!("change request {number} review history page failed: {}", response.body));
+                let messages =
+                    document["errors"].as_array().into_iter().flatten().filter_map(|error| error["message"].as_str()).collect::<Vec<_>>();
+                return Err(format!("change request {number} review history page failed (HTTP {}): {messages:?}", response.status));
             }
             let fetched = match page {
                 HistoryPage::ThreadComments(_) => &document["data"]["node"][page.field()],
@@ -248,7 +274,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         let (owner, name) = self.repo_slug.split_once('/').ok_or("GitHub repository must have owner/name scope")?;
         let owner = serde_json::to_string(owner).map_err(|error| error.to_string())?;
         let name = serde_json::to_string(name).map_err(|error| error.to_string())?;
-        let mut query = format!("query {{ repository(owner:{owner}, name:{name}) {{");
+        let mut query = format!("query {{ rateLimit {{ cost }} repository(owner:{owner}, name:{name}) {{");
         // Keep every bound CR in one repository query so request count is
         // independent of convoy count. If a repository exceeds GitHub's query
         // limits, surface the forge error instead of silently omitting CRs.
@@ -256,14 +282,11 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
             query.push_str(&format!(" pr{number}: pullRequest(number:{number}) {{ title state isDraft headRefOid reviewDecision mergeable author {{ login }} reviewRequests(first:100) {{ pageInfo {{ hasNextPage }} nodes {{ requestedReviewer {{ __typename ... on User {{ login }} }} }} }} comments(last:100) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ databaseId createdAt author {{ login __typename }} body }} }} reviews(last:100) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ fullDatabaseId submittedAt author {{ login __typename }} state body }} }} reviewThreads(last:20) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ id isResolved comments(last:10) {{ pageInfo {{ hasPreviousPage startCursor }} nodes {{ fullDatabaseId createdAt author {{ login __typename }} body }} }} }} }} timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]) {{ nodes {{ ... on HeadRefForcePushedEvent {{ createdAt afterCommit {{ oid }} }} }} }} commits(last:1) {{ nodes {{ commit {{ committedDate pushedDate statusCheckRollup {{ contexts(first:100) {{ nodes {{ ... on CheckRun {{ conclusion status }} ... on StatusContext {{ state }} }} }} }} }} }} }} }}"));
         }
         query.push_str(" } }");
-        let argument = format!("query={query}");
-        let output = run_output!(self.runner, "gh", &["api", "graphql", "--include", "-f", &argument], execution_root())?;
-        if let Some(error) = rate_limit_error_from_response(&output.stdout, "GraphQL") {
-            return Err(error);
-        }
+        let mut telemetry = ObservationTelemetry::new(&self.repo_slug, numbers.len());
+        let output = self.observation_call(&query, "bound-batch", numbers.len(), &mut telemetry).await?;
         let response = parse_gh_api_response(&output.stdout);
-        let document: serde_json::Value = serde_json::from_str(&response.body)
-            .map_err(|error| format!("decode GitHub GraphQL observation: {error}; {}", output.stderr))?;
+        let document: serde_json::Value =
+            serde_json::from_str(&response.body).map_err(|error| format!("decode GitHub GraphQL observation: {error}"))?;
         if let Some(errors) = document["errors"].as_array() {
             let unexpected = errors.iter().filter(|error| error["type"] != "NOT_FOUND").collect::<Vec<_>>();
             if !unexpected.is_empty() {
@@ -279,6 +302,7 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         let observed_at = Utc::now();
         let mut statuses = HashMap::new();
         let (mut pages, mut nodes) = (0, 0);
+        let mut cooldown: Option<String> = None;
         // The caller's order determines which PR receives history pagination
         // priority when the shared follow-up budget is exhausted.
         for number in numbers {
@@ -286,8 +310,17 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
             if request.is_null() {
                 continue;
             }
+            if let Some(error) = &cooldown {
+                if Self::next_history_page(request).is_some() {
+                    statuses.insert(*number, Err(error.clone()));
+                    continue;
+                }
+            }
             let mut request = request.clone();
-            if let Err(error) = self.complete_history(*number, &mut request, &mut pages, &mut nodes).await {
+            if let Err(error) = self.complete_history(*number, &mut request, &mut pages, &mut nodes, &mut telemetry).await {
+                if rate_limit_reset(&error).is_some() {
+                    cooldown = Some(error.clone());
+                }
                 statuses.insert(*number, Err(error));
                 continue;
             }
@@ -785,6 +818,45 @@ mod tests {
         }
     }
 
+    // #2499: a rate-limited history call ends network pagination for the
+    // whole batch, preserving requests already complete in the initial response.
+    #[hegel::test]
+    fn history_limit_stops_followups_for_every_remaining_subject(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Empty through multi-subject batches, including the fleet's six-subject
+        // flotilla volume. All busy subjects have an unfinished history page.
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(10));
+        let requests = (1..=count)
+            .map(|number| {
+                (
+                    format!("pr{number}"),
+                    serde_json::json!({
+                        "state": "OPEN", "comments": {"pageInfo": {"hasPreviousPage": true, "startCursor": "more"}, "nodes": []}
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let responses = if count == 0 {
+            Vec::new()
+        } else {
+            vec![
+            Ok(format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": requests}}))),
+            Ok("HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 4989\r\nX-RateLimit-Reset: 1893456000\r\nRetry-After: 30\r\n\r\n{\"message\":\"secondary rate limit\"}".into()),
+        ]
+        };
+        // MockRunner stands in for the subprocess/GitHub boundary; unexpected
+        // extra requests fail rather than silently granting another response.
+        let runner = Arc::new(MockRunner::new(responses));
+        let provider =
+            GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let numbers = (1..=count as u64).collect::<Vec<_>>();
+        let statuses = runtime.block_on(provider.observe_bound(&numbers, &Default::default())).expect("batch results");
+        assert_eq!(statuses.len(), count);
+        assert!(statuses.values().all(|status| status.as_ref().is_err_and(|error| error.contains("kind=secondary"))));
+        assert_eq!(runner.calls().len(), if count == 0 { 0 } else { 2 }, "no further history calls during a cooldown");
+    }
+
     #[tokio::test]
     async fn pagination_budget_reports_busy_request_without_hiding_healthy_request() {
         let busy = serde_json::json!({
@@ -928,12 +1000,17 @@ mod tests {
     #[tokio::test]
     async fn graphql_rate_limit_reports_budget_identity_and_reset() {
         let runner = Arc::new(MockRunner::new(vec![Ok(
-            "HTTP/2 200 OK\r\nX-RateLimit-Reset: 1784736000\r\n\r\n{\"errors\":[{\"message\":\"API rate limit exceeded\"}]}".into(),
+            "HTTP/2 200 OK\r\nX-RateLimit-Reset: 1784736000\r\nX-RateLimit-Remaining: 0\r\n\r\n{\"errors\":[{\"message\":\"API rate limit exceeded\"}]}".into(),
         )]));
         let api = Arc::new(GhApiClient::new(runner.clone()));
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), api, runner);
         let error = provider.observe_bound(&[1], &Default::default()).await.expect_err("rate limited");
-        assert!(error.contains("rate limited (budget=GraphQL, identity=host gh login, reset_at=2026-"), "{error}");
+        assert!(
+            error.contains(
+                "rate limited (budget=GraphQL, identity=host gh login, kind=primary, retry_source=x-ratelimit-reset, retry_at=2026-"
+            ),
+            "{error}"
+        );
         assert!(crate::providers::github_api::rate_limit_reset(&error).is_some());
     }
 

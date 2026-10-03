@@ -2156,6 +2156,7 @@ async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_c
 struct BatchedObservationRunner {
     calls: std::sync::Mutex<Vec<String>>,
     rate_limit_two: std::sync::atomic::AtomicBool,
+    rate_limit_all: std::sync::atomic::AtomicBool,
     block_one: std::sync::atomic::AtomicBool,
     one_started: tokio::sync::Notify,
     release_one: tokio::sync::Notify,
@@ -2192,9 +2193,16 @@ impl CommandRunner for BatchedObservationRunner {
             self.one_started.notify_one();
             self.release_one.notified().await;
         }
+        // This fake stands in for the GitHub subprocess/network boundary.
+        if self.rate_limit_all.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(crate::providers::CommandOutput {
+                stdout: "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 4989\r\nX-RateLimit-Reset: 1893456000\r\nRetry-After: 60\r\n\r\n{\"message\":\"You have exceeded a secondary rate limit\"}".into(),
+                stderr: String::new(), success: false,
+            });
+        }
         if query.contains("name:\"two\"") && self.rate_limit_two.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(crate::providers::CommandOutput {
-                stdout: "HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1893456000\r\n\r\n{\"message\":\"API rate limit exceeded\"}".into(),
+                stdout: "HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1893456000\r\nX-RateLimit-Remaining: 0\r\n\r\n{\"message\":\"API rate limit exceeded\"}".into(),
                 stderr: "gh: API rate limit exceeded".into(),
                 success: false,
             });
@@ -2309,6 +2317,7 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
     let runner = Arc::new(BatchedObservationRunner {
         calls: std::sync::Mutex::new(Vec::new()),
         rate_limit_two: std::sync::atomic::AtomicBool::new(false),
+        rate_limit_all: std::sync::atomic::AtomicBool::new(false),
         block_one: std::sync::atomic::AtomicBool::new(false),
         one_started: tokio::sync::Notify::new(),
         release_one: tokio::sync::Notify::new(),
@@ -2388,7 +2397,7 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
     runner.rate_limit_two.store(true, std::sync::atomic::Ordering::SeqCst);
     let limited = &subjects[3];
     let error = daemon.change_request_observation_source.observe_for_completion(limited).await.expect_err("fresh read is rate limited");
-    assert!(error.contains("budget=GraphQL, identity=host gh login, reset_at="), "{error}");
+    assert!(error.contains("budget=GraphQL, identity=host gh login, kind=primary, retry_source=x-ratelimit-reset, retry_at="), "{error}");
     assert_eq!(runner.calls.lock().expect("calls").len(), 4);
     assert_eq!(daemon.change_request_observation_source.observe(limited).await.expect_err("cached rate limit"), error);
     assert_eq!(runner.calls.lock().expect("calls").len(), 4, "rate-limited repository waits for reset");
@@ -2409,6 +2418,17 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
 
 #[tokio::test]
 async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates() {
+    completion_claim_observation_case(false).await;
+}
+
+// #2499: a timed observation limit waits without increasing refusal strikes,
+// then admits the same claim after fresh readiness is actually observed.
+#[tokio::test(start_paused = true)]
+async fn rate_limited_completion_waits_then_requires_fresh_ready_observation() {
+    completion_claim_observation_case(true).await;
+}
+
+async fn completion_claim_observation_case(rate_limited: bool) {
     #[derive(Default)]
     struct DeliveredTurns(std::sync::Mutex<Vec<crate::leaf_engine::TurnDeliveryRequest>>);
     #[async_trait]
@@ -2428,6 +2448,7 @@ async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates
     let runner = Arc::new(BatchedObservationRunner {
         calls: std::sync::Mutex::new(Vec::new()),
         rate_limit_two: std::sync::atomic::AtomicBool::new(false),
+        rate_limit_all: std::sync::atomic::AtomicBool::new(false),
         block_one: std::sync::atomic::AtomicBool::new(false),
         one_started: tokio::sync::Notify::new(),
         release_one: tokio::sync::Notify::new(),
@@ -2437,7 +2458,7 @@ async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
-        fake_discovery_with_runner(false, runner),
+        fake_discovery_with_runner(false, runner.clone()),
         HostName::new("test-host"),
         backend.clone(),
     )
@@ -2597,6 +2618,27 @@ async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates
             Some("https://github.com/flotilla-org/flotilla/pull/2200#issuecomment-1".to_string()),
         )
     };
+    if rate_limited {
+        runner.rate_limit_all.store(true, std::sync::atomic::Ordering::SeqCst);
+        let wait = claim().await.expect("observation wait");
+        let flotilla_protocol::CommandValue::CrewCompletionWaiting { reason, retry_at } = wait else { panic!("expected timed wait") };
+        assert!(reason.contains("kind=secondary") && reason.contains("retry_source=retry-after"), "{reason}");
+        assert!(retry_at < Utc::now() + chrono::Duration::minutes(2), "ignore unrelated primary window");
+        let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
+        assert!(status.crew_work["work"]["coder"].completion_refusal.is_none());
+        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+        let calls = runner.calls.lock().expect("calls").len();
+        assert!(matches!(claim().await.expect("cached wait"), flotilla_protocol::CommandValue::CrewCompletionWaiting { .. }));
+        assert_eq!(runner.calls.lock().expect("calls").len(), calls, "fresh completion must respect cooldown");
+        runner.rate_limit_all.store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert!(claim().await.expect_err("fresh conflict still refuses").contains(".ready"));
+        runner.conflicting.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(claim().await.expect("fresh ready claim"), flotilla_protocol::CommandValue::Ok);
+        let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
+        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Done);
+        return;
+    }
     let first = claim().await.expect_err("conflicting PR must refuse claim");
     assert!(first.contains("cr/github.com/flotilla-org/flotilla/2200") && first.contains(".ready"), "{first}");
     let refused_status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");

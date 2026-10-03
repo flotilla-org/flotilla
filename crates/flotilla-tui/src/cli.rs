@@ -2,16 +2,18 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
     path::Path,
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Table};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
-    commands::ExplainedSubjectFact, output::OutputFormat, CliListKind, CliListResponse, Command, CommandValue, CrewListResponse,
-    DaemonEvent, EnvironmentInfo, EnvironmentStatus, EvidenceFreshness, FleetHealthResponse, FleetHostStaleness, FleetListResponse,
-    FleetObservationAgreement, FleetStaleness, FulfilmentListResponse, FulfilmentRow, HostProvidersResponse, HostStatusResponse, NodeId,
-    NodeInfo, PeerConnectionState, ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey, TopologyResponse,
+    commands::ExplainedSubjectFact, output::OutputFormat, CliListKind, CliListResponse, Command, CommandAction, CommandValue,
+    CrewListResponse, DaemonEvent, EnvironmentInfo, EnvironmentStatus, EvidenceFreshness, FleetHealthResponse, FleetHostStaleness,
+    FleetListResponse, FleetObservationAgreement, FleetStaleness, FulfilmentListResponse, FulfilmentRow, HostProvidersResponse,
+    HostStatusResponse, NodeId, NodeInfo, PeerConnectionState, ProjectListResponse, RepoProvidersResponse, StatusResponse, StreamKey,
+    TopologyResponse,
 };
 
 use crate::socket::SocketDaemon;
@@ -1095,6 +1097,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
     match result {
         CommandValue::Ok => "ok".to_string(),
         CommandValue::CrewFollowUpDelivered => flotilla_protocol::commands::CREW_FOLLOW_UP_INSTRUCTION.to_string(),
+        CommandValue::CrewCompletionWaiting { reason, retry_at } => format!("crew completion waiting until {retry_at}: {reason}"),
         CommandValue::ResourceReconciled { message, .. } => message.clone(),
         CommandValue::ConvoyBriefDelivered { displaced: Some(displaced) } => {
             format!("brief delivered now; displaced pending brief:\n{displaced}")
@@ -1518,7 +1521,7 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
     }
 
     let mut rx = daemon.subscribe();
-    let command_id = daemon.execute(command).await?;
+    let mut command_id = daemon.execute(command.clone()).await?;
 
     loop {
         match rx.recv().await {
@@ -1533,6 +1536,18 @@ pub async fn run_command(daemon: &dyn DaemonHandle, command: Command, format: Ou
                 }
             }
             Ok(ref event @ DaemonEvent::CommandFinished { command_id: id, ref result, .. }) if id == command_id => {
+                if let CommandValue::CrewCompletionWaiting { retry_at, .. } = result {
+                    if !matches!(command.action, CommandAction::CrewComplete { .. }) {
+                        return Err("unexpected completion wait for a non-completion command".into());
+                    }
+                    // JSON mode retains one final stdout document; wait progress
+                    // is diagnostic output, just like lag/disconnection notices.
+                    eprintln!("{}", format_command_result(result));
+                    let delay = retry_at.signed_duration_since(Utc::now()).to_std().unwrap_or_default();
+                    tokio::time::sleep(delay.max(Duration::from_millis(10))).await;
+                    command_id = daemon.execute(command.clone()).await?;
+                    continue;
+                }
                 match format {
                     OutputFormat::Human => {
                         println!("{}", format_event_human(event));
