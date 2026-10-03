@@ -77,6 +77,20 @@ pub(super) struct ConvoyAdmission {
     pending_starts: Mutex<HashSet<ConvoyStartKey>>,
 }
 
+struct AdmissionLookupFailure {
+    context: Option<String>,
+    error: ObservationError,
+}
+
+impl AdmissionLookupFailure {
+    fn diagnostic(self) -> String {
+        match self.context {
+            Some(context) => format!("{context}: {}", self.error),
+            None => self.error.to_string(),
+        }
+    }
+}
+
 impl ConvoyAdmission {
     pub(super) fn set_free_space_path(&self, path: PathBuf) {
         *self.admission_free_space_path.write().expect("admission free-space path lock poisoned") = path;
@@ -173,7 +187,10 @@ impl ConvoyAdmission {
         requested_id: &str,
     ) -> Result<ResolvedConvoyChangeRequestAdmission, String> {
         let (candidates, setup_failures) = self.repository_change_request_candidates(repository_keys).await;
-        let mut failures = setup_failures.into_iter().map(|error| (String::new(), ObservationError::Forge(error))).collect::<Vec<_>>();
+        let mut failures = setup_failures
+            .into_iter()
+            .map(|error| AdmissionLookupFailure { context: None, error: ObservationError::Forge(error) })
+            .collect::<Vec<_>>();
         let consulted = candidates.iter().map(|(_, scope, _)| scope.clone()).collect::<Vec<_>>();
 
         let mut matches = Vec::new();
@@ -182,10 +199,10 @@ impl ConvoyAdmission {
             match provider.get_change_request_for_admission(requested_id).await {
                 Ok(admission) => {
                     let Some(base_ref) = admission.base_ref else {
-                        failures.push((
-                            format!("repository {scope}: "),
-                            ObservationError::Forge(format!("change request {} did not report a base ref", admission.id)),
-                        ));
+                        failures.push(AdmissionLookupFailure {
+                            context: Some(format!("repository {scope}")),
+                            error: ObservationError::Forge(format!("change request {} did not report a base ref", admission.id)),
+                        });
                         continue;
                     };
                     matches.push(ResolvedConvoyChangeRequestAdmission {
@@ -195,12 +212,12 @@ impl ConvoyAdmission {
                     });
                     matched_repositories.push(scope);
                 }
-                Err(error) => failures.push((format!("repository {scope}: "), error)),
+                Err(error) => failures.push(AdmissionLookupFailure { context: Some(format!("repository {scope}")), error }),
             }
         }
 
-        let limited = failures.iter().any(|(_, error)| matches!(error, ObservationError::RateLimited { .. }));
-        let failures = failures.into_iter().map(|(context, error)| format!("{context}{error}")).collect::<Vec<_>>();
+        let limited = failures.iter().any(|failure| matches!(failure.error, ObservationError::RateLimited { .. }));
+        let failures = failures.into_iter().map(AdmissionLookupFailure::diagnostic).collect::<Vec<_>>();
         match matches.len() {
             1 => Ok(matches.remove(0)),
             0 if limited => Err(format!("change request {requested_id} lookup was rate limited: {}", failures.join("; "))),
