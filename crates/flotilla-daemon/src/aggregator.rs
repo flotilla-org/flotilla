@@ -1,4 +1,4 @@
-//! Resource-store and fleet-replica Aggregator maintaining named-query result sets.
+//! Resource-store Aggregator maintaining named-query result sets.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -17,11 +17,11 @@ use flotilla_core::{
 use flotilla_protocol::{
     result_set::{
         CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, ProjectRepositoriesRow,
-        ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ResultDelta, Rows, SessionPhase, StandingRoleHold, StandingRoleRow,
+        ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ResultDelta, SessionPhase, StandingRoleHold, StandingRoleRow,
         SurfaceState, VesselRow, WorkPhase,
     },
-    AttachableId, Change, DaemonEvent, EntryOp, FleetReplicaSnapshot, HostName, LifecycleAuthority, ManagedTerminal, PaneExitAttention,
-    RepoDelta, RepoIdentity, RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
+    AttachableId, Change, DaemonEvent, EntryOp, HostName, LifecycleAuthority, ManagedTerminal, PaneExitAttention, RepoDelta, RepoIdentity,
+    RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{
     api_version, change_request_address, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout,
@@ -340,11 +340,7 @@ impl Aggregator {
         self
     }
 
-    pub async fn run(
-        self,
-        resolvers: AggregatorResolvers,
-        replica_rx: broadcast::Receiver<Vec<FleetReplicaSnapshot>>,
-    ) -> Result<(), ResourceError> {
+    pub async fn run(self, resolvers: AggregatorResolvers) -> Result<(), ResourceError> {
         let AggregatorResolvers {
             durable_convoys,
             durable_convoy_ensures,
@@ -377,14 +373,10 @@ impl Aggregator {
             .observed_checkouts(&observed_checkouts)
             .observed_checkout_replicas(&observed_checkout_replicas)
             .build();
-        self.run_with_sources(sources, replica_rx).await
+        self.run_with_sources(sources).await
     }
 
-    async fn run_with_sources(
-        mut self,
-        sources: AggregatorSourceRefs<'_>,
-        mut replica_rx: broadcast::Receiver<Vec<FleetReplicaSnapshot>>,
-    ) -> Result<(), ResourceError> {
+    async fn run_with_sources(mut self, sources: AggregatorSourceRefs<'_>) -> Result<(), ResourceError> {
         let AggregatorSourceRefs {
             durable_convoys,
             durable_convoy_ensures,
@@ -643,15 +635,7 @@ impl Aggregator {
                     Some(Err(error)) => return Err(error),
                     None => return Err(ResourceError::other("aggregator checkout replica watch ended")),
                 },
-                replica = replica_rx.recv() => match replica {
-                    Ok(_) => {},
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "aggregator lagged behind fleet replica refreshes");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        return Err(ResourceError::other("aggregator fleet replica channel closed"));
-                    }
-                },
+
             }
         }
     }
@@ -1699,9 +1683,7 @@ impl Aggregator {
         let convoys = self
             .effective_convoy_reads_including_deleted()
             .into_values()
-            .filter_map(|convoy| {
-                self.read_host(&convoy.provenance).map(|host| (convoy.object.metadata.namespace, convoy.object.metadata.name, host))
-            })
+            .map(|convoy| (convoy.object.metadata.namespace, convoy.object.metadata.name))
             .collect::<HashSet<_>>();
         let mut replicas = HashMap::<HostName, Vec<CheckoutRow>>::new();
         let mut local = Vec::new();
@@ -1714,7 +1696,7 @@ impl Aggregator {
             let for_convoy = checkout.metadata.labels.get(CONVOY_LABEL).cloned();
             let attention_reason = for_convoy
                 .as_ref()
-                .filter(|convoy| !convoys.contains(&(checkout.metadata.namespace.clone(), (*convoy).clone(), host.clone())))
+                .filter(|convoy| !convoys.contains(&(checkout.metadata.namespace.clone(), (*convoy).clone())))
                 .map(|convoy| {
                     format!(
                         "checkout {} at {} references missing convoy {}/{}",
@@ -1814,40 +1796,6 @@ impl Aggregator {
         if salience_changed && !store_changed && !self.bootstrapping {
             self.emit_awareness_result_sets().await;
         }
-    }
-
-    pub async fn apply_replica_cache(&mut self, snapshots: Vec<FleetReplicaSnapshot>) {
-        let mut checkout_replacements = HashMap::new();
-        for snapshot in snapshots {
-            let host = snapshot.host;
-            let mut checkout_rows = Vec::new();
-            for result_set in snapshot.result_sets {
-                match result_set.rows {
-                    // Ensures replicate as definitions; their rows are read
-                    // fleet-wide rather than federated through snapshots.
-                    Rows::Convoys { .. } | Rows::Independents { .. } | Rows::StandingRoles { .. } | Rows::ProjectRepositories { .. } => {}
-                    Rows::Issues { .. } => {
-                        tracing::warn!(host = %host, "ignoring demand-backed issues in fleet replica snapshot");
-                    }
-                    Rows::Checkouts { scope: None, rows } => {
-                        for mut row in rows {
-                            set_checkout_row_host(&mut row, &host);
-                            checkout_rows.push(row);
-                        }
-                    }
-                    Rows::Checkouts { scope: Some(_), .. } => {
-                        tracing::warn!(host = %host, "ignoring derived project checkout set in fleet replica snapshot");
-                    }
-                    Rows::Awareness { .. } => {
-                        tracing::warn!(host = %host, "ignoring derived awareness tree in fleet replica snapshot");
-                    }
-                }
-            }
-            checkout_replacements.insert(host, checkout_rows);
-        }
-
-        let checkout_deltas = self.state.replace_checkout_replica_rows(checkout_replacements).await;
-        self.emit_store_deltas(checkout_deltas).await;
     }
 
     async fn emit_delta(&self, changed: Vec<ConvoyRow>, removed: Vec<ResourceRef>) {
@@ -2696,11 +2644,6 @@ fn is_independent_session(session: &ResourceObject<TerminalSession>) -> bool {
         && session.status.as_ref().map(|status| status.phase) == Some(TerminalSessionPhase::Running)
 }
 
-fn set_checkout_row_host(row: &mut CheckoutRow, host: &HostName) {
-    row.resource.host = Some(host.clone());
-    row.host = host.clone();
-}
-
 fn convoy_phase(phase: ResourceConvoyPhase) -> ConvoyPhase {
     match phase {
         ResourceConvoyPhase::Pending => ConvoyPhase::Pending,
@@ -2753,10 +2696,7 @@ mod tests {
     };
 
     use chrono::Utc;
-    use flotilla_protocol::{
-        result_set::{ResultSet, ResultSetState},
-        PrincipalRef, Subject,
-    };
+    use flotilla_protocol::{result_set::Rows, PrincipalRef, Subject};
     use flotilla_resources::{
         BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, CrewSpec, DeclaredSubject, DemandKind, DemandSpec, DemandStatus,
         DemandTransition, EnvironmentSpec, HostDirectEnvironmentSpec, InMemoryBackend, InputMeta, ObjectMeta, ObservedCheckoutSpec,
@@ -3560,7 +3500,6 @@ mod tests {
         };
         state.replace_subscriber(Uuid::new_v4(), &[flotilla_protocol::QueryCursor { query: awareness_query.clone(), since: None }]);
         let (event_tx, mut event_rx) = broadcast::channel(8);
-        let (replica_tx, replica_rx) = broadcast::channel(1);
         let attach_resolver = Arc::new(CountingAttachResolver::with_origin("feta-node-id", "feta"));
         let run_state = state.clone();
         let run = tokio::spawn(async move {
@@ -3583,7 +3522,6 @@ mod tests {
                         .observed_checkouts(observed.using::<Checkout>("flotilla"))
                         .observed_checkout_replicas(observed.including_replicas::<Checkout>("flotilla"))
                         .build(),
-                    replica_rx,
                 )
                 .await
         });
@@ -3607,13 +3545,9 @@ mod tests {
         assert_eq!(convoy.vessels[0].materialize.as_deref(), Some("terminal-convoy-a-implement-coder"));
         assert!(awareness.rows.as_awareness().expect("awareness rows").iter().any(|node| node.label == "widgets"));
 
-        drop(replica_tx);
-        assert!(run
-            .await
-            .expect("aggregator task")
-            .expect_err("closed replica channel should stop run")
-            .to_string()
-            .contains("replica channel closed"));
+        assert!(!run.is_finished(), "the resource watches remain live");
+        run.abort();
+        let _ = run.await;
     }
 
     #[tokio::test]
@@ -4209,7 +4143,6 @@ mod tests {
         durable_presentations: &dyn AggregatorWatchSource<Presentation>,
         observed_convoys: &dyn AggregatorWatchSource<Convoy>,
         observed_presentations: &dyn AggregatorWatchSource<Presentation>,
-        replica_rx: broadcast::Receiver<Vec<FleetReplicaSnapshot>>,
     ) -> Result<(), ResourceError> {
         let durable_environments = ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_demands = ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -4237,7 +4170,7 @@ mod tests {
             .observed_checkouts(&observed_checkouts)
             .observed_checkout_replicas(&observed_checkout_replicas)
             .build();
-        aggregator.run_with_sources(sources, replica_rx).await
+        aggregator.run_with_sources(sources).await
     }
 
     async fn convoy_object(name: &str) -> ResourceObject<Convoy> {
@@ -4512,25 +4445,6 @@ mod tests {
         }
     }
 
-    async fn repository_replica_snapshot(host: &str, url: &str) -> FleetReplicaSnapshot {
-        let state = AggregatorProjectionState::new();
-        let (event_tx, _) = broadcast::channel(16);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new(host), event_tx);
-        let repository = repository_object(url).await;
-        let repository_key = repository.spec.key();
-        aggregator.apply_repository_event(WatchEvent::Added(repository)).await;
-        aggregator
-            .apply_checkout_event(WatchEvent::Added(checkout_object(host, &format!("/work/{host}"), repository_key).await))
-            .await
-            .expect("source checkout");
-        FleetReplicaSnapshot {
-            host: HostName::new(host),
-            generation: Some(format!("{host}-generation")),
-            rows: Vec::new(),
-            result_sets: state.local_result_sets().await,
-        }
-    }
-
     #[tokio::test]
     async fn convoy_projection_presents_role_identity_instead_of_record_name() {
         let state = AggregatorProjectionState::new();
@@ -4727,13 +4641,33 @@ mod tests {
         // Projects, so they must not create awareness tree nodes.
         let state = AggregatorProjectionState::new();
         let (event_tx, _) = broadcast::channel(16);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("receiver"), event_tx);
-        aggregator
-            .apply_replica_cache(vec![
-                repository_replica_snapshot("github-host", "https://github.com/acme/widgets").await,
-                repository_replica_snapshot("gitlab-host", "https://gitlab.com/acme/widgets").await,
-            ])
-            .await;
+        let resolver = CountingAttachResolver {
+            calls: AtomicUsize::new(0),
+            origin_hosts: HashMap::from([
+                (flotilla_protocol::NodeId::new("github-host"), HostName::new("github-host")),
+                (flotilla_protocol::NodeId::new("gitlab-host"), HostName::new("gitlab-host")),
+            ]),
+        };
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("receiver"), event_tx).with_attach_resolver(Arc::new(resolver));
+        for (host, url) in [("github-host", "https://github.com/acme/widgets"), ("gitlab-host", "https://gitlab.com/acme/widgets")] {
+            let repository = repository_object(url).await;
+            let key = repository.spec.key();
+            aggregator.apply_repository_event(WatchEvent::Added(repository)).await;
+            aggregator
+                .apply_checkout_replica_event(ReadWatchEvent::Added(ReadResourceObject {
+                    object: checkout_object(host, &format!("/work/{host}"), key).await,
+                    provenance: ResourceProvenance::Replica {
+                        origin_root: flotilla_protocol::NodeId::new(host),
+                        last_synced_at: Utc::now(),
+                    },
+                }))
+                .await
+                .expect("replica checkout");
+        }
+        assert_eq!(
+            state.result_set_for(&QueryId::Checkouts { scope: None }).await.expect("checkouts").rows.as_checkouts().expect("rows").len(),
+            2
+        );
 
         let result = state.awareness_result_set(&None, flotilla_protocol::AwarenessGrouping::Project, Default::default()).await;
         let mut labels = result.rows.as_awareness().expect("awareness rows").iter().map(|node| node.label.as_str()).collect::<Vec<_>>();
@@ -4781,14 +4715,12 @@ mod tests {
         let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let (_replica_tx, replica_rx) = broadcast::channel(1);
         let run = run_with_test_sources(
             Aggregator::new(state, HostName::new("local"), event_tx).with_change_request_resolver(Arc::new(BlockingChangeRequestResolver)),
             &durable_convoys,
             &durable_presentations,
             &observed_convoys,
             &observed_presentations,
-            replica_rx,
         );
         tokio::pin!(run);
 
@@ -4978,10 +4910,9 @@ mod tests {
             .observed_checkouts(&observed_checkouts)
             .observed_checkout_replicas(&observed_checkout_replicas)
             .build();
-        let (_replica_tx, replica_rx) = broadcast::channel(1);
         let run = Aggregator::new(state, HostName::new("kiwi"), event_tx.clone())
             .with_attach_resolver(Arc::clone(&resolver))
-            .run_with_sources(sources, replica_rx);
+            .run_with_sources(sources);
         tokio::pin!(run);
 
         tokio::select! {
@@ -5198,14 +5129,12 @@ mod tests {
         let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let (_replica_tx, replica_rx) = broadcast::channel(1);
         let run = run_with_test_sources(
             Aggregator::new(state, HostName::new("local"), event_tx.clone()).with_change_request_resolver(Arc::clone(&resolver)),
             &durable_convoys,
             &durable_presentations,
             &observed_convoys,
             &observed_presentations,
-            replica_rx,
         );
         tokio::pin!(run);
         tokio::select! {
@@ -5257,14 +5186,12 @@ mod tests {
         let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let (_replica_tx, replica_rx) = broadcast::channel(1);
         let run = run_with_test_sources(
             Aggregator::new(state, HostName::new("local"), event_tx.clone()).with_change_request_resolver(Arc::clone(&resolver)),
             &durable_convoys,
             &durable_presentations,
             &observed_convoys,
             &observed_presentations,
-            replica_rx,
         );
         tokio::pin!(run);
         tokio::select! {
@@ -5492,14 +5419,12 @@ mod tests {
         let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let (_replica_tx, replica_rx) = broadcast::channel(1);
         let run = run_with_test_sources(
             Aggregator::new(state, HostName::new("local"), event_tx.clone()).with_change_request_resolver(Arc::clone(&resolver)),
             &durable_convoys,
             &durable_presentations,
             &observed_convoys,
             &observed_presentations,
-            replica_rx,
         );
         tokio::pin!(run);
         tokio::select! {
@@ -5748,43 +5673,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replica_cache_merges_repository_checkout_rows_and_sets_origin_host() {
-        let state = AggregatorProjectionState::new();
-        let repo = RepositoryKey("repo-widgets".into());
-        state.replace_store_catalog(HashMap::from([(repo.clone(), "widgets".to_string())]), HashMap::new()).await;
-        let scope = None;
-        let row = CheckoutRow::builder()
-            .resource(ResourceRef::new("flotilla.work/v1", "Checkout", "flotilla", "remote-checkout"))
-            .repo(repo)
-            .repo_label("widgets")
-            .path("/srv/widgets")
-            .branch("main")
-            .host(HostName::new("incorrect-source-host"))
-            .authority(LifecycleAuthority::Observed)
-            .build();
-        let snapshot = FleetReplicaSnapshot {
-            host: HostName::new("kiwi"),
-            generation: None,
-            rows: vec![],
-            result_sets: vec![ResultSet {
-                seq: 4,
-                rows: Rows::Checkouts { scope: scope.clone(), rows: vec![row] },
-                state: ResultSetState::default(),
-            }],
-        };
-        let (event_tx, _) = broadcast::channel(8);
-        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
-
-        aggregator.apply_replica_cache(vec![snapshot]).await;
-
-        let set = state.result_set_for(&QueryId::Checkouts { scope }).await.expect("checkout result set");
-        let rows = set.rows.as_checkouts().expect("checkout rows");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].host, HostName::new("kiwi"));
-        assert_eq!(rows[0].resource.host, Some(HostName::new("kiwi")));
-    }
-
-    #[tokio::test]
     async fn restart_relist_removes_local_rows_missing_from_stores() {
         let durable = ResourceBackend::InMemory(InMemoryBackend::default());
         let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
@@ -5800,11 +5688,9 @@ mod tests {
                 .build(),
         );
         let (event_tx, mut event_rx) = broadcast::channel(8);
-        let (replica_tx, replica_rx) = broadcast::channel(1);
-        drop(replica_tx);
 
-        let result = Aggregator::new(state.clone(), HostName::new("local"), event_tx)
-            .run(
+        let task = tokio::spawn(
+            Aggregator::new(state.clone(), HostName::new("local"), event_tx).run(
                 AggregatorResolvers::builder()
                     .durable_convoys(durable.including_replicas::<Convoy>("flotilla"))
                     .durable_convoy_ensures(durable.including_replicas::<ConvoyEnsure>("flotilla"))
@@ -5821,16 +5707,19 @@ mod tests {
                     .observed_checkouts(observed.using::<Checkout>("flotilla"))
                     .observed_checkout_replicas(observed.including_replicas::<Checkout>("flotilla"))
                     .build(),
-                replica_rx,
-            )
-            .await;
+            ),
+        );
 
-        assert!(result.expect_err("closed channel should stop the run").to_string().contains("replica channel closed"));
-        let DaemonEvent::ResultSet(result_set) = event_rx.recv().await.expect("relist snapshot") else {
+        let DaemonEvent::ResultSet(result_set) =
+            tokio::time::timeout(Duration::from_secs(1), event_rx.recv()).await.expect("relist timeout").expect("relist snapshot")
+        else {
             panic!("expected relist result set");
         };
         assert!(result_set.rows.is_empty());
         assert!(state.result_set().await.rows.is_empty());
+        assert!(!task.is_finished(), "the watch remains live after bootstrap");
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]
@@ -5845,7 +5734,6 @@ mod tests {
         let observed_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
-        let (_replica_tx, replica_rx) = broadcast::channel(1);
 
         let run_durable_convoys = Arc::clone(&durable_convoys);
         let run_durable_presentations = Arc::clone(&durable_presentations);
@@ -5859,7 +5747,6 @@ mod tests {
                 run_durable_presentations.as_ref(),
                 run_observed_convoys.as_ref(),
                 run_observed_presentations.as_ref(),
-                replica_rx,
             )
             .await
         });
@@ -5905,7 +5792,6 @@ mod tests {
         let observed_checkout_replicas = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
-        let (_replica_tx, replica_rx) = broadcast::channel(1);
 
         let run_state = state.clone();
         let run_durable_sessions = Arc::clone(&durable_sessions);
@@ -5926,7 +5812,7 @@ mod tests {
                 .observed_checkouts(observed_checkouts.as_ref())
                 .observed_checkout_replicas(&observed_checkout_replicas)
                 .build();
-            Aggregator::new(run_state, HostName::new("local"), event_tx).run_with_sources(sources, replica_rx).await
+            Aggregator::new(run_state, HostName::new("local"), event_tx).run_with_sources(sources).await
         });
 
         let initial =
@@ -5963,7 +5849,6 @@ mod tests {
         let observed_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
-        let (_replica_tx, replica_rx) = broadcast::channel(1);
 
         let run_durable_convoys = Arc::clone(&durable_convoys);
         let run_state = state.clone();
@@ -5974,7 +5859,6 @@ mod tests {
                 durable_presentations.as_ref(),
                 observed_convoys.as_ref(),
                 observed_presentations.as_ref(),
-                replica_rx,
             )
             .await
         });
@@ -6007,7 +5891,6 @@ mod tests {
         let observed_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
-        let (_replica_tx, replica_rx) = broadcast::channel(1);
 
         let run_durable_convoys = Arc::clone(&durable_convoys);
         let run_durable_presentations = Arc::clone(&durable_presentations);
@@ -6021,7 +5904,6 @@ mod tests {
                 run_durable_presentations.as_ref(),
                 run_observed_convoys.as_ref(),
                 run_observed_presentations.as_ref(),
-                replica_rx,
             )
             .await
         });
@@ -6082,7 +5964,6 @@ mod tests {
         ));
         let state = AggregatorProjectionState::new();
         let (event_tx, mut event_rx) = broadcast::channel(8);
-        let (_replica_tx, replica_rx) = broadcast::channel(1);
 
         let run_state = state.clone();
         let task = tokio::spawn(async move {
@@ -6092,7 +5973,6 @@ mod tests {
                 durable_presentations.as_ref(),
                 observed_convoys.as_ref(),
                 observed_presentations.as_ref(),
-                replica_rx,
             )
             .await
         });
@@ -6116,7 +5996,6 @@ mod tests {
         let observed_presentations = ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let state = AggregatorProjectionState::new();
         let (event_tx, _event_rx) = broadcast::channel(8);
-        let (_replica_tx, replica_rx) = broadcast::channel(1);
 
         let result = timeout(
             Duration::from_secs(1),
@@ -6126,7 +6005,6 @@ mod tests {
                 &durable_presentations,
                 &observed_convoys,
                 &observed_presentations,
-                replica_rx,
             ),
         )
         .await

@@ -1176,7 +1176,6 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::FulfilmentList(kinds) => format_fulfilment_list_human(kinds),
         CommandValue::FleetList(fleet) => format_fleet_list_human(fleet),
         CommandValue::CrewList(crew) => format_crew_list_human(crew),
-        CommandValue::FleetReplicaSnapshot(_) => "fleet replica snapshot".to_string(),
         CommandValue::DaemonLogs { lines } => lines.join("\n"),
         CommandValue::ConvoyExplanation(explanation) => format_convoy_explanation_human(explanation),
         CommandValue::ResourceRead(response) => {

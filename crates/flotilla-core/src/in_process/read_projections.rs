@@ -1241,7 +1241,6 @@ mod tests {
     use crate::{
         aggregator_projection::AggregatorProjectionState,
         change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher, GhChangeRequestObservationSource},
-        fleet::SshFleetReplicaTransport,
         providers::{discovery::EnvironmentBag, ProcessCommandRunner},
     };
 
@@ -1263,7 +1262,6 @@ mod tests {
         fn new() -> Self {
             let temp = tempfile::tempdir().expect("tempdir");
             let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-            let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
             let config = Arc::new(ConfigStore::with_base(temp.path()));
             let event_sink: Arc<dyn EventSink> = Arc::new(crate::event_sink::RecordingEventSink::default());
             let runner: Arc<dyn crate::providers::CommandRunner> = Arc::new(ProcessCommandRunner);
@@ -1288,16 +1286,8 @@ mod tests {
                 ChangeRequestRefreshCadence::default(),
             );
             let subscriptions = LeafSubscriptionTable::new(backend.clone(), Arc::clone(&event_sink), refresher);
-            let fleet = FleetService::new(
-                Arc::clone(&event_sink),
-                Arc::clone(&config),
-                backend.clone(),
-                observed,
-                AggregatorProjectionState::new(),
-                host_name.clone(),
-                None,
-                Arc::new(SshFleetReplicaTransport),
-            );
+            let fleet =
+                FleetService::new(Arc::clone(&event_sink), backend.clone(), AggregatorProjectionState::new(), host_name.clone(), None);
             Self {
                 temp,
                 backend,
@@ -1691,11 +1681,7 @@ mod tests {
             .await
             .expect("replicate unmapped session");
 
-        let (local_rows, _) =
-            fixture.fleet.rows("flotilla", &fixture.registry, crate::fleet::FleetRowSource::Local).await.expect("local rows");
-        assert!(local_rows.is_empty());
-        let (merged_rows, _) =
-            fixture.fleet.rows("flotilla", &fixture.registry, crate::fleet::FleetRowSource::IncludingReplicas).await.expect("merged rows");
+        let merged_rows = fixture.fleet.rows("flotilla", &fixture.registry).await.expect("fleet rows");
         assert_eq!(merged_rows.len(), 1, "unmapped origin must not create a phantom host row");
         assert_eq!(merged_rows[0].host, HostName::new("remote"));
         assert!(matches!(merged_rows[0].staleness, flotilla_protocol::FleetStaleness::Stale { .. }));

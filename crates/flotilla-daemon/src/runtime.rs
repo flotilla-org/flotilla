@@ -700,7 +700,6 @@ impl DaemonRuntime {
                 options.heartbeat_interval,
             ),
             spawn_credential_refresh_task(Arc::clone(&daemon), options.namespace.clone(), Arc::clone(&credential_store)),
-            spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
             spawn_host_description_projection_task(Arc::clone(&daemon), options.namespace.clone(), options.heartbeat_interval),
             spawn_managed_terminal_attention_task(Arc::clone(&daemon), options.heartbeat_interval),
             spawn_codex_central_refresh_task(Arc::clone(&daemon.discovery_runtime().env), options.codex_central_refresh_interval),
@@ -3327,17 +3326,6 @@ fn spawn_host_description_projection_task(daemon: Arc<InProcessDaemon>, namespac
     })
 }
 
-fn spawn_replica_refresh_task(daemon: Arc<InProcessDaemon>, interval: Duration) -> JoinHandle<()> {
-    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
-        let daemon = Arc::clone(&daemon);
-        async move {
-            if let Err(err) = daemon.refresh_fleet_replicas_once().await {
-                warn!(%err, "failed to refresh fleet replicas");
-            }
-        }
-    })
-}
-
 fn spawn_pending_supervisor_turn_task(daemon: Arc<InProcessDaemon>, namespace: String, interval: Duration) -> JoinHandle<()> {
     spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
@@ -4242,7 +4230,6 @@ fn spawn_aggregator_task(
                             .observed_checkouts(observed.using::<Checkout>(&namespace))
                             .observed_checkout_replicas(observed.including_replicas::<Checkout>(&namespace))
                             .build(),
-                        daemon.subscribe_fleet_replicas(),
                     )
                     .await
             }

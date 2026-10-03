@@ -1038,7 +1038,6 @@ mod tests {
     fn typed_query_actions_follow_the_same_palette_applicability_contract() {
         use flotilla_commands::applicability::tui_actionable_action;
 
-        assert!(!tui_actionable_action(&CommandAction::QueryFleetReplicaSnapshot {}));
         assert!(!tui_actionable_action(&CommandAction::QueryProjectList {}));
         assert!(tui_actionable_action(&CommandAction::Refresh { repo: None }));
     }

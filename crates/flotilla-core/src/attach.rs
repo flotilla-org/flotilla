@@ -409,7 +409,7 @@ impl<'a> AttachResolver<'a> {
                 ResourceProvenance::Local => {
                     sessions_by_name.insert(session.object.metadata.name.clone(), session.object);
                 }
-                ResourceProvenance::Replica { .. } => replicated_sessions.push(session),
+                ResourceProvenance::Replica { .. } => replicated_sessions.push((session, AttachSessionSource::Durable)),
             }
         }
         for session in observed_sessions {
@@ -418,12 +418,12 @@ impl<'a> AttachResolver<'a> {
                     sessions_by_name.entry(session.object.metadata.name.clone()).or_insert(session.object);
                 }
                 ResourceProvenance::Replica { .. } => {
-                    if !replicated_sessions.iter().any(|durable| {
+                    if !replicated_sessions.iter().any(|(durable, _)| {
                         durable.object.metadata.namespace == session.object.metadata.namespace
                             && durable.object.metadata.name == session.object.metadata.name
                             && replica_origin(&durable.provenance) == replica_origin(&session.provenance)
                     }) {
-                        replicated_sessions.push(session);
+                        replicated_sessions.push((session, AttachSessionSource::Observed));
                     }
                 }
             }
@@ -438,7 +438,7 @@ impl<'a> AttachResolver<'a> {
                 target: AttachTarget::Local(Box::new(session)),
             });
         }
-        for replicated in replicated_sessions {
+        for (replicated, source) in replicated_sessions {
             let session = replicated.object;
             let ResourceProvenance::Replica { origin_root, .. } = replicated.provenance else {
                 unreachable!("local durable sessions were partitioned above");
@@ -451,24 +451,33 @@ impl<'a> AttachResolver<'a> {
             let role = session.metadata.labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone());
             let crew = session.metadata.labels.get(VESSEL_LABEL).map_or_else(|| role.clone(), |vessel| format!("{vessel}/{role}"));
             let independent = !session.metadata.labels.contains_key(CONVOY_LABEL);
-            if independent && session.status.as_ref().is_none_or(|status| status.phase != flotilla_resources::TerminalSessionPhase::Running)
+            if independent
+                && matches!(source, AttachSessionSource::Observed)
+                && session.status.as_ref().is_none_or(|status| status.phase != flotilla_resources::TerminalSessionPhase::Running)
             {
                 continue;
             }
             let row = FleetListRow::builder()
                 .convoy(convoy_address.cloned().unwrap_or_else(|| convoy.clone()).replace("@", " @ "))
                 .maybe_convoy_ref((!independent).then_some(convoy))
-                .vessel(session.spec.env_ref.clone())
-                .crew(crew)
+                .vessel(if independent { "-".to_string() } else { session.spec.env_ref.clone() })
+                .crew(if independent { "-".to_string() } else { crew })
                 .crew_state("running")
                 .host(host.clone())
                 .namespace(session.metadata.namespace.clone())
                 .session(session.metadata.name.clone())
                 .staleness(FleetStaleness::Local)
                 .build();
+            let mut references =
+                attach_reference_keys(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str));
+            if !independent {
+                references.extend(fleet_row_attach_reference_keys(&row));
+            }
+            references.sort();
+            references.dedup();
             candidates.push(AttachCandidate {
                 label: if independent { format!("{} ({host})", session.metadata.name) } else { fleet_row_attach_reference_label(&row) },
-                references: if independent { vec![session.metadata.name.clone()] } else { fleet_row_attach_reference_keys(&row) },
+                references,
                 host,
                 target: AttachTarget::Replica { row: Box::new(row) },
             });
@@ -801,6 +810,11 @@ fn attach_reference_label(session_name: &str, labels: &BTreeMap<String, String>,
         (Some(convoy), None, None) => format!("{convoy} ({session_name})"),
         _ => session_name.to_string(),
     }
+}
+
+enum AttachSessionSource {
+    Durable,
+    Observed,
 }
 
 type ConvoyAddresses = HashMap<(String, String, Option<flotilla_protocol::NodeId>), String>;

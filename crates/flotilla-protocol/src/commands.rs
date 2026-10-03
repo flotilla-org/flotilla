@@ -8,8 +8,8 @@ use crate::{
     issue_query::{IssueQuery, IssueResultPage},
     qualified_path::QualifiedPath,
     query::{
-        CrewCommandContext, CrewListResponse, DispatchQueueResponse, FleetHealthResponse, FleetListResponse, FleetReplicaSnapshot,
-        FulfilmentListResponse, HostListResponse, HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoProvidersResponse,
+        CrewCommandContext, CrewListResponse, DispatchQueueResponse, FleetHealthResponse, FleetListResponse, FulfilmentListResponse,
+        HostListResponse, HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoProvidersResponse,
     },
     AttachableSetId, IssueRef, PlacementDecision, PrincipalRef, RepoIdentity,
 };
@@ -980,7 +980,6 @@ pub enum CommandAction {
     QueryCrewList {
         context: CrewCommandContext,
     },
-    QueryFleetReplicaSnapshot {},
     QueryDaemonLogs {
         query: DaemonLogQuery,
     },
@@ -1065,7 +1064,6 @@ impl CommandAction {
                 | CommandAction::QueryFulfilmentList {}
                 | CommandAction::QueryFleetList { .. }
                 | CommandAction::QueryCrewList { .. }
-                | CommandAction::QueryFleetReplicaSnapshot {}
                 | CommandAction::QueryDaemonLogs { .. }
                 | CommandAction::QueryExplainConvoy { .. }
                 | CommandAction::QueryResourceList { .. }
@@ -1141,7 +1139,6 @@ impl Command {
             CommandAction::QueryFulfilmentList {} => "query fulfilment list",
             CommandAction::QueryFleetList { .. } => "query fleet list",
             CommandAction::QueryCrewList { .. } => "query crew list",
-            CommandAction::QueryFleetReplicaSnapshot {} => "query fleet replica snapshot",
             CommandAction::QueryDaemonLogs { .. } => "query daemon logs",
             CommandAction::QueryExplainConvoy { .. } => "explain convoy",
             CommandAction::QueryResourceList { .. } => "query resource list",
@@ -1297,7 +1294,6 @@ pub enum CommandValue {
     FulfilmentList(Box<FulfilmentListResponse>),
     FleetList(Box<FleetListResponse>),
     CrewList(Box<CrewListResponse>),
-    FleetReplicaSnapshot(Box<FleetReplicaSnapshot>),
     DaemonLogs {
         /// Complete JSON-lines records, oldest first.
         lines: Vec<String>,
@@ -1390,8 +1386,8 @@ mod tests {
     use crate::{
         arg::Arg,
         query::{
-            CrewListMember, CrewListResponse, FleetListResponse, FleetListRow, FleetReplicaSnapshot, FleetReplicaStatus, FleetStaleness,
-            HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, RepoProvidersResponse,
+            CrewListMember, CrewListResponse, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness, HostListEntry,
+            HostListResponse, HostProvidersResponse, HostStatusResponse, RepoProvidersResponse,
         },
         test_helpers::assert_json_roundtrip,
         AttachableSetId, HostEnvironment, HostProviderStatus, HostSummary, NodeId, NodeInfo, PeerConnectionState, RepoIdentity, SystemInfo,
@@ -1582,7 +1578,6 @@ mod tests {
                     context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
                 })
                 .build(),
-            Command::builder().action(CommandAction::QueryFleetReplicaSnapshot {}).build(),
             Command::builder()
                 .action(CommandAction::QueryDaemonLogs {
                     query: DaemonLogQuery {
@@ -1840,20 +1835,6 @@ mod tests {
                     stance: Some("trusted-implicit".into()),
                 }],
                 credential_alerts: Vec::new(),
-            })),
-            CommandValue::FleetReplicaSnapshot(Box::new(FleetReplicaSnapshot {
-                host: crate::HostName::new("desktop"),
-                generation: Some("7".into()),
-                rows: vec![FleetListRow::builder()
-                    .convoy("convoy-a")
-                    .vessel("vessel-a")
-                    .crew("main")
-                    .crew_state("exited")
-                    .host(crate::HostName::new("desktop"))
-                    .namespace("dev")
-                    .staleness(FleetStaleness::Local)
-                    .build()],
-                result_sets: vec![],
             })),
             CommandValue::ResourceRead(Box::new(ResourceReadEnvelope {
                 api_version: "flotilla.work/v1".into(),

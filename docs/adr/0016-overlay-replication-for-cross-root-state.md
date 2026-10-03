@@ -108,7 +108,7 @@ durable replica area, resume from the stored version on reconnect.
   generation change: the replica retains the last generation's facts as
   last-known, staleness-stamped state until a new generation replaces them
   — which is precisely the no-regress property durability exists for.
-- The `FleetReplicaSnapshot` broadcast path and the Plane-A peer transport
+- The per-host query-snapshot broadcast path and the Plane-A peer transport
   under it are **subsumed and deletable** — the deletion ADR 0002 promised.
 
 ## The read side is store-level, not per-consumer
@@ -251,7 +251,7 @@ the two must not share a fate. "Home follows the work" applied honestly:
   maintained by the replicator machinery.
 - `ObjectMeta` grows an optional `merge` block; the store's write admission
   stamps it for definitions-class kinds.
-- The aggregator's fleet inputs move from ephemeral `FleetReplicaSnapshot`
+- The aggregator's fleet inputs move from ephemeral query-snapshot
   broadcasts to durable replicas; the snapshot path and the Plane-A peer
   transport beneath it become deletable.
 - Vessel records move to placement-host logs; reconcilers already run where
@@ -259,3 +259,25 @@ the two must not share a fate. "Home follows the work" applied honestly:
   than redistributing it.
 - "Home follows the work" is refined, not revised: a convoy record's home
   is fixed at admission and changes only by explicit succession.
+
+## Snapshot retirement (#742, 2026-10-03)
+
+Fleet health/list and the TUI fleet surfaces read replicated Host, Convoy,
+and TerminalSession resources. Remote checkout aggregation and attach target
+indexing also read origin-tagged resource replicas. The SSH query-snapshot
+fetch, cache, broadcast, hidden CLI command, and protocol variants are removed.
+FleetService remains the named fleet-view service pending the Tender cut.
+
+Local checkout and independent-session observations retain process-scoped
+generations. They are exposed by the observed-store resource endpoint
+and use the same resumable direct and relay replication machinery as durable
+resources. With a SQLite daemon, received observations live in
+`observation-replicas.sqlite`, separate from local desired state and its
+replicas; the observed backend combines ephemeral local writes with those
+durable replicas at its existing list/watch boundary. This keeps a holder
+restart from erasing remote facts while avoiding collisions with same-named
+durable runtime resources. A new origin generation replaces the prior origin
+partition. In-memory daemons use the same read/write contracts without disk.
+
+Store discovery advertises the observation store to candidate pre-roll validation,
+which checks its replica-only namespaces and raw records as well as the primary store.

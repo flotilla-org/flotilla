@@ -167,6 +167,19 @@ async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_f
     assert_eq!(feta_health.crew_count, 1);
     assert_eq!(feta_health.convoy_count, 1);
     assert_eq!(feta_health.replica_generation.as_deref(), Some("feta-generation"));
+    // #742: the aliases formerly indexed from snapshot rows remain attachable.
+    std::fs::write(kiwi.config_store().base_path().join("hosts.toml"), "[hosts.feta]\nhostname = 'feta.example'\n")
+        .expect("attach hop config");
+    for reference in ["feta-session", "feta-convoy/work/coder", "work/coder", "work", "coder", "feta-environment"] {
+        let resolved =
+            kiwi.resolve_attach_command_on_host_internal(reference, Some(&HostName::new("feta"))).await.expect("remote crew alias");
+        let binding = resolved.binding.expect("crew binding");
+        assert_eq!(binding.host, HostName::new("feta"));
+        assert_eq!(binding.session.as_deref(), Some("feta-session"));
+        assert_eq!(binding.convoy.as_deref(), Some("feta-convoy"));
+        assert_eq!(binding.vessel.as_deref(), Some("work"));
+        assert_eq!(binding.role.as_deref(), Some("coder"));
+    }
     drop(topology);
 }
 
@@ -977,6 +990,10 @@ async fn observed_resources_replicate_checkout_queries_and_independent_attach_ta
         .await
         .expect("remote independent attach");
     assert_eq!(resolved.binding.as_ref().map(|binding| &binding.host), Some(&HostName::new("feta")));
+    let checkout_attach =
+        kiwi.resolve_transient_attach_command_internal("/srv/widgets", Some(&HostName::new("feta"))).await.expect("remote checkout attach");
+    assert!(checkout_attach.binding.is_none());
+    assert!(serde_json::to_string(&checkout_attach.plan).expect("attach plan").contains("/srv/widgets"));
     assert!(kiwi.resource_backend().including_replicas::<Checkout>("flotilla").list().await.expect("durable checkouts").items.is_empty());
     checkouts.delete("checkout").await.expect("delete remote checkout");
     sessions.delete("terminal-independent").await.expect("delete independent");

@@ -109,7 +109,6 @@ impl InProcessDaemon {
             | A::QueryFulfilmentList { .. }
             | A::QueryFleetList { .. }
             | A::QueryCrewList { .. }
-            | A::QueryFleetReplicaSnapshot { .. }
             | A::QueryDaemonLogs { .. }
             | A::QueryExplainConvoy { .. }
             | A::QueryResourceList { .. }

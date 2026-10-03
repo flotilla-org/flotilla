@@ -25,7 +25,8 @@ const REPLICATION_NAMESPACE: &str = "flotilla";
 const REPLICATION_RETRY: RetryBackoff =
     RetryBackoff { initial: Duration::from_millis(100), maximum: Duration::from_secs(30), reset_after: Duration::from_secs(60) };
 
-/// Observation replicas live in the ephemeral store, separately from desired state.
+/// Observation replicas share the observed read view, separately from desired
+/// state. Its local generation is ephemeral; received replicas can be durable.
 #[derive(Clone, Copy)]
 pub(super) enum ReplicationStore {
     Durable,
@@ -40,6 +41,7 @@ impl ReplicationStore {
         }
     }
 
+    #[cfg(feature = "test-support")]
     fn kind<T: Resource>(self) -> String {
         match self {
             Self::Durable => T::API_PATHS.plural.to_string(),
