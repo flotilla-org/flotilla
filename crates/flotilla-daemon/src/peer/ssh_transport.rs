@@ -32,9 +32,6 @@ const FORWARDED_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait for an SSH discovery, cleanup, or diagnostic command.
 const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Interval between polls when waiting for the socket to appear.
-const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
 const REMOTE_SOCKET_PATH_PREFIX: &str = "FLOTILLA_DAEMON_SOCKET_PATH=";
 
 const PRE_HELLO_CLOSE_ERROR: &str = "peer closed before sending hello";
@@ -211,22 +208,13 @@ impl SshTransport {
             "spawning SSH tunnel"
         );
 
-        let args = vec![
-            "-N".to_string(),
-            "-L".to_string(),
-            forward_spec,
-            "-R".to_string(),
-            reverse_forward_spec,
-            "-o".to_string(),
-            "ExitOnForwardFailure=yes".to_string(),
-            "-o".to_string(),
-            "StreamLocalBindUnlink=yes".to_string(),
-            "-o".to_string(),
-            "ServerAliveInterval=15".to_string(),
-            "-o".to_string(),
-            "ServerAliveCountMax=3".to_string(),
-            destination,
-        ];
+        let args = tender::ssh::forwarding_arguments(
+            &destination,
+            &self.local_socket_path,
+            self.remote_daemon_socket_path()?,
+            Some((self.remote_resource_socket_path()?, &self.local_daemon_socket_path)),
+            tender::ssh::ExistingSocket::Unlink,
+        );
         let binary = self.ssh_binary.to_string_lossy();
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let child = self
@@ -307,8 +295,8 @@ impl SshTransport {
         let remote_daemon_socket = self.remote_daemon_socket_path().expect("remote daemon socket path is resolved before forwarding");
         let remote_resource_socket = self.remote_resource_socket_path().expect("remote resource socket path is resolved before forwarding");
         (
-            format!("{}:{}", self.local_socket_path.display(), remote_daemon_socket.display()),
-            format!("{}:{}", remote_resource_socket.display(), self.local_daemon_socket_path.display()),
+            tender::ssh::forward_spec(&self.local_socket_path, remote_daemon_socket),
+            tender::ssh::forward_spec(remote_resource_socket, &self.local_daemon_socket_path),
         )
     }
 
@@ -326,30 +314,11 @@ impl SshTransport {
     /// unreachable host, etc.) to fail fast instead of waiting the
     /// full timeout.
     async fn wait_for_socket(&mut self) -> Result<(), String> {
-        let deadline = tokio::time::Instant::now() + FORWARDED_SOCKET_TIMEOUT;
-
-        loop {
-            if self.local_socket_path.exists() {
-                debug!(
-                    path = %self.local_socket_path.display(),
-                    "forwarded socket appeared"
-                );
-                return Ok(());
-            }
-
-            // Detect early SSH exit (auth failure, unreachable host, etc.)
-            if let Some(ref mut child) = self.ssh_process {
-                if let Ok(Some(status)) = child.try_wait() {
-                    return Err(format!("ssh exited prematurely with {status}"));
-                }
-            }
-
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!("timed out waiting for forwarded socket at {}", self.local_socket_path.display()));
-            }
-
-            tokio::time::sleep(SOCKET_POLL_INTERVAL).await;
-        }
+        tender::ssh::wait_for_socket(&self.local_socket_path, FORWARDED_SOCKET_TIMEOUT, || match self.ssh_process.as_mut() {
+            Some(child) => child.try_wait(),
+            None => Ok(None),
+        })
+        .await
     }
 
     /// Connect to the local forwarded socket, complete the hello handshake,
