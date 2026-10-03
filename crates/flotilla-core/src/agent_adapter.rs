@@ -920,6 +920,12 @@ async fn ensure_flotilla_git_exclude(
     cwd: &Path,
     runtime_paths: &[&str],
 ) -> Result<(), String> {
+    // A plain directory (a multi-repository workspace root) has nothing that
+    // can be committed; each repository the brief is copied into is prepared
+    // separately and proves its own exclusion.
+    if !vcs.inside_work_tree().await? {
+        return Ok(());
+    }
     let exclude_path = vcs
         .exclude_file_path()
         .await?
@@ -2195,6 +2201,28 @@ mod tests {
         }
     }
 
+    // A standing convoy's multi-repository workspace root is a plain directory:
+    // nothing there can be committed, so preparation proceeds without an
+    // exclusion while each repository it holds still proves its own.
+    #[tokio::test]
+    async fn runtime_exclusion_skips_a_plain_workspace_directory() {
+        use crate::{
+            providers::vcs::git_worktree::GitWorktreeStrategy,
+            vcs::{FlotillaVcs, GitCheckoutStrategy},
+        };
+        let workspace = tempfile::tempdir().expect("workspace root");
+        let runner = Arc::new(ProcessCommandRunner);
+        let vcs = FlotillaVcs::new(
+            ExecutionEnvironmentPath::new(workspace.path()),
+            runner.clone(),
+            GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(crate::config::default_checkout_path(), runner.clone()))),
+        );
+        super::ensure_flotilla_git_exclude(&*runner, &vcs, workspace.path(), &[".flotilla/briefs/governor.md"])
+            .await
+            .expect("plain workspace root needs no exclusion");
+        assert!(!workspace.path().join(".git").exists(), "no repository is created");
+    }
+
     // Exclusion discovery and write failures are errors, never permission to
     // expose runtime files to git add -A. This is the lowest falsifying seam.
     #[tokio::test]
@@ -2203,10 +2231,13 @@ mod tests {
             providers::vcs::git_worktree::GitWorktreeStrategy,
             vcs::{FlotillaVcs, GitCheckoutStrategy},
         };
-        for responses in [vec![Err("exclude discovery unavailable".to_string())], vec![Ok(String::new())], vec![
-            Ok(".git/info/exclude\n".to_string()),
-            Err("exclude is read-only".to_string()),
-        ]] {
+        for responses in [
+            vec![Ok("true\n".to_string()), Err("exclude discovery unavailable".to_string())],
+            vec![Ok("true\n".to_string()), Ok(String::new())],
+            vec![Ok("true\n".to_string()), Ok(".git/info/exclude\n".to_string()), Err("exclude is read-only".to_string())],
+            // Work-tree inspection failure refuses too; it never means "no checkout".
+            vec![Err("work tree inspection unavailable".to_string())],
+        ] {
             let runner = Arc::new(MockRunner::new(responses));
             let cwd = ExecutionEnvironmentPath::new("/checkout");
             let vcs = FlotillaVcs::new(
@@ -2227,10 +2258,13 @@ mod tests {
             providers::vcs::git_worktree::GitWorktreeStrategy,
             vcs::{FlotillaVcs, GitCheckoutStrategy},
         };
-        for responses in [vec![Err("exclude discovery unavailable".to_string())], vec![Ok(String::new())], vec![
-            Ok(".git/info/exclude\n".to_string()),
-            Err("exclude is read-only".to_string()),
-        ]] {
+        for responses in [
+            vec![Ok("true\n".to_string()), Err("exclude discovery unavailable".to_string())],
+            vec![Ok("true\n".to_string()), Ok(String::new())],
+            vec![Ok("true\n".to_string()), Ok(".git/info/exclude\n".to_string()), Err("exclude is read-only".to_string())],
+            // Work-tree inspection failure refuses too; it never means "no checkout".
+            vec![Err("work tree inspection unavailable".to_string())],
+        ] {
             let runner = Arc::new(MockRunner::new(responses));
             let env = EnvironmentBag::new()
                 .with(EnvironmentAssertion::env_var("CODEX_HOME", "/codex"))

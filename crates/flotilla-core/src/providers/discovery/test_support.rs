@@ -293,6 +293,9 @@ impl CommandRunner for DiscoveryMockRunner {
         // Process boundary: model runtime exclusion and launch-specific receipt
         // operations against the same in-memory files used by adapter writes.
         // Explicit canned responses above can still inject transport failures.
+        if cmd == "git" && args == ["rev-parse", "--is-inside-work-tree"] {
+            return Ok("true\n".into());
+        }
         if cmd == "git" && args == ["rev-parse", "--git-path", "info/exclude"] {
             return Ok(".git/info/exclude\n".into());
         }
