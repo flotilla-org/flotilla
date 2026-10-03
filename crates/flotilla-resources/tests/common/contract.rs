@@ -432,6 +432,22 @@ pub async fn assert_missing_authority_delete_tombstones_replica_with_backend(bac
         .expect("authority watch ended")
         .expect("authority watch failed");
     assert!(matches!(&event, WatchEvent::DeletedByName(tombstone) if tombstone.name == "lost-at-authority"));
+    // The same name-only deletion must survive replay and replica delivery;
+    // it owns its metadata even though the store's payload is shared.
+    let WatchEvent::DeletedByName(tombstone) = &event else { panic!("expected name-only deletion") };
+    let mut replay = local.watch(WatchStart::resuming_from(&listed)).await.expect("replay name deletion");
+    assert!(matches!(replay.next().await, Some(Ok(WatchEvent::DeletedByName(replayed))) if replayed == *tombstone));
+    let remote_origin = flotilla_protocol::NodeId::new("other-authority");
+    let mut replicas = backend.including_replicas::<Convoy>("flotilla").watch().await.expect("watch replica deletion");
+    backend
+        .replica_writer::<Convoy>(remote_origin.clone(), "flotilla")
+        .apply(WatchEvent::DeletedByName(tombstone.clone()), Utc::now())
+        .await
+        .expect("replicate name deletion");
+    assert!(matches!(replicas.next().await,
+        Some(Ok(flotilla_resources::ReadWatchEvent::DeletedByName { tombstone: replicated, provenance:
+            flotilla_resources::ResourceProvenance::Replica { origin_root, .. } }))
+            if replicated == *tombstone && origin_root == remote_origin));
     assert!(
         backend.including_replicas::<Convoy>("flotilla").list().await.expect("list converged replica view").items.is_empty(),
         "the name tombstone must remove the stale replica"

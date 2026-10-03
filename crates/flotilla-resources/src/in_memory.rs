@@ -1,4 +1,5 @@
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, HashMap},
     sync::Arc,
 };
@@ -15,7 +16,9 @@ use crate::{
     replica::{ReadResourceObject, ReadWatchEvent, ReplicaCursor, ResourceProvenance, StoredReplicaEvent, StoredReplicaEventKind},
     resource::{InputMeta, K8sResourceObject, MergeMetadata, ObjectMeta, Resource, ResourceObject},
     retention::{EventRetention, ResourceStoreDiagnostics, FIELD_OWNERSHIP_VIOLATION_TTL_HOURS, MAX_FIELD_OWNERSHIP_VIOLATIONS},
-    watch::{ResourceList, ResourceTombstone, WatchChannel, WatchEvent, WatchStart, WatchStream},
+    watch::{
+        decode_watch_object, decode_watch_tombstone, ResourceList, ResourceTombstone, WatchChannel, WatchEvent, WatchStart, WatchStream,
+    },
 };
 
 type StoreKey = (String, String, String, String);
@@ -342,20 +345,20 @@ impl InMemoryBackend {
         let rx = self.replicas.lock().await.watchers.entry(key).or_default().subscribe(T::API_PATHS.kind, namespace);
         Ok(stream::unfold(rx, |mut rx| async {
             let event = match rx.next().await? {
-                Ok(event) => (*event).clone(),
+                Ok(event) => event,
                 Err(error) => return Some((Err(error), rx)),
             };
-            let provenance = ResourceProvenance::Replica { origin_root: event.origin_root, last_synced_at: event.synced_at };
+            let provenance = ResourceProvenance::Replica { origin_root: event.origin_root.clone(), last_synced_at: event.synced_at };
             let decoded = if matches!(event.kind, StoredReplicaEventKind::Deleted) {
                 // Name-only tombstones deliberately omit `spec`; a present but
                 // malformed spec is a corrupt object and must remain an error.
                 if event.object.get("spec").is_some() {
-                    Self::decode_object::<T>(event.object).map(|object| ReadWatchEvent::Deleted(ReadResourceObject { object, provenance }))
+                    decode_watch_object::<T>(&event.object).map(|object| ReadWatchEvent::Deleted(ReadResourceObject { object, provenance }))
                 } else {
-                    Self::decode_tombstone(event.object).map(|tombstone| ReadWatchEvent::DeletedByName { tombstone, provenance })
+                    decode_watch_tombstone(&event.object).map(|tombstone| ReadWatchEvent::DeletedByName { tombstone, provenance })
                 }
             } else {
-                Self::decode_object::<T>(event.object).map(|object| {
+                decode_watch_object::<T>(&event.object).map(|object| {
                     let object = ReadResourceObject { object, provenance };
                     match event.kind {
                         StoredReplicaEventKind::Added => ReadWatchEvent::Added(object),
@@ -531,40 +534,20 @@ impl InMemoryBackend {
         Ok(self.replicas.lock().await.partitions.get(&key).and_then(|partition| partition.cursor.clone()))
     }
 
-    fn decode_event<T: Resource>(event: StoredEvent) -> Result<WatchEvent<T>, ResourceError> {
-        match event.kind {
-            StoredEventKind::Added => Self::decode_object::<T>(event.object).map(WatchEvent::Added),
-            StoredEventKind::Modified => Self::decode_object::<T>(event.object).map(WatchEvent::Modified),
+    fn decode_event<'de, T: Resource>(
+        kind: StoredEventKind,
+        object: impl Borrow<Value> + serde::Deserializer<'de, Error = serde_json::Error>,
+    ) -> Result<WatchEvent<T>, ResourceError> {
+        match kind {
+            StoredEventKind::Added => decode_watch_object::<T>(object).map(WatchEvent::Added),
+            StoredEventKind::Modified => decode_watch_object::<T>(object).map(WatchEvent::Modified),
             // Name-only tombstones deliberately omit `spec`; a present but
             // malformed spec is a corrupt object and must remain an error.
-            StoredEventKind::Deleted if event.object.get("spec").is_none() => {
-                Self::decode_tombstone(event.object).map(WatchEvent::DeletedByName)
+            StoredEventKind::Deleted if object.borrow().get("spec").is_none() => {
+                decode_watch_tombstone(object.borrow()).map(WatchEvent::DeletedByName)
             }
-            StoredEventKind::Deleted => Self::decode_object::<T>(event.object).map(WatchEvent::Deleted),
+            StoredEventKind::Deleted => decode_watch_object::<T>(object).map(WatchEvent::Deleted),
         }
-    }
-
-    fn decode_tombstone(value: Value) -> Result<ResourceTombstone, ResourceError> {
-        let metadata = value.get("metadata").ok_or_else(|| ResourceError::decode("decode tombstone: missing metadata"))?;
-        let name = metadata
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ResourceError::decode("decode tombstone: missing name"))?
-            .to_string();
-        let resource_version = metadata
-            .get("resourceVersion")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ResourceError::decode("decode tombstone: missing resourceVersion"))?
-            .to_string();
-        let namespace = metadata.get("namespace").and_then(Value::as_str).unwrap_or_default().to_string();
-        let annotations = metadata
-            .get("annotations")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|error| ResourceError::decode(format!("decode tombstone annotations: {error}")))?
-            .unwrap_or_default();
-        Ok(ResourceTombstone { name, namespace, resource_version, annotations })
     }
 
     fn encode_tombstone<T: Resource>(tombstone: &ResourceTombstone) -> Value {
@@ -921,9 +904,9 @@ impl InMemoryBackend {
             (replay, receiver)
         };
 
-        let replay_stream = stream::iter(replay.into_iter().map(Self::decode_event::<T>));
+        let replay_stream = stream::iter(replay.into_iter().map(|event| Self::decode_event::<T>(event.kind, event.object)));
         let live_stream = stream::unfold(receiver, |mut receiver| async {
-            receiver.next().await.map(|event| (event.and_then(|event| Self::decode_event::<T>((*event).clone())), receiver))
+            receiver.next().await.map(|event| (event.and_then(|event| Self::decode_event::<T>(event.kind, &event.object)), receiver))
         });
         Ok(WatchStream::new(generation, Box::pin(replay_stream.chain(live_stream))))
     }
