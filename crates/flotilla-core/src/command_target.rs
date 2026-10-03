@@ -113,6 +113,7 @@ impl InProcessDaemon {
             | A::QueryExplainConvoy { .. }
             | A::QueryResourceList { .. }
             | A::QueryResourceGet { .. }
+            | A::QueryResolveRepository { .. }
             | A::QueryRepoProviders { .. }
             | A::QueryIssues { .. }
             | A::QueryIssueFetchByIds { .. }

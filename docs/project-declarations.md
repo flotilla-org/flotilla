@@ -39,7 +39,7 @@ Register the declaration from a local checkout, then refresh it explicitly when
 the reviewed declaration changes:
 
 ```text
-flotilla project register /path/to/bootstrap # or a tracked repository catalog slug
+flotilla project register /path/to/bootstrap # or a Repository forge slug
 flotilla project refresh example
 ```
 

@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::Path,
     str::FromStr,
     sync::Arc,
 };
@@ -13,16 +13,15 @@ use flotilla_protocol::{
     commands::AttachMode,
     qualified_path::HostId,
     result_set::{CheckoutRow, Rows},
-    AttachBinding, CanonicalHostId, ConvoyPhase, EnvironmentId, FleetListRow, FleetStaleness, HostName, RepoIdentity, ResolvedAttachAction,
+    AttachBinding, CanonicalHostId, ConvoyPhase, EnvironmentId, FleetListRow, FleetStaleness, HostName, ResolvedAttachAction,
     ResolvedAttachPlan, ResultSet,
 };
 use flotilla_resources::{
     terminal_session_attach_target_with_stale_status, Convoy as ResourceConvoy, ConvoyPhase as ResourceConvoyPhase,
-    Environment as ResourceEnvironment, Project, RepositoryKey, ResourceBackend, ResourceProvenance,
-    TerminalSession as ResourceTerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
+    Environment as ResourceEnvironment, Project, ResourceBackend, ResourceProvenance, TerminalSession as ResourceTerminalSession,
+    CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
 use sha2::{Digest, Sha256};
-use tokio::sync::RwLock;
 
 use super::{canonical_placement_host_ref, convoy_address, discover_repo_for_environment, LiveConvoyRecord, RoleAddress};
 use crate::{
@@ -41,7 +40,6 @@ use crate::{
     path_context::ExecutionEnvironmentPath,
     project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION,
     providers::{discovery::DiscoveryRuntime, registry::ProviderRegistry, terminal::TerminalSessionLiveness},
-    repo_state::RepoState,
 };
 
 /// Read-only fleet replica rows used while building the attach index.
@@ -75,9 +73,6 @@ pub(super) struct AttachResolver<'a> {
     pub(super) host_name: &'a HostName,
     pub(super) namespace: &'a std::sync::RwLock<String>,
     pub(super) fleet_rows: Box<dyn FleetRowsSource + 'a>,
-    pub(super) repository_keys_by_path: &'a RwLock<HashMap<PathBuf, RepositoryKey>>,
-    pub(super) path_identities: &'a RwLock<HashMap<PathBuf, RepoIdentity>>,
-    pub(super) repos: &'a RwLock<HashMap<RepoIdentity, RepoState>>,
 }
 
 impl<'a> AttachResolver<'a> {
@@ -95,30 +90,6 @@ impl<'a> AttachResolver<'a> {
 
     fn environment_registry_for_environment(&self, env_id: &EnvironmentId) -> Option<Arc<ProviderRegistry>> {
         self.environment_manager.environment_registry(env_id)
-    }
-
-    async fn resolve_repo_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
-        match selector {
-            flotilla_protocol::RepoSelector::Path(path) => {
-                if self.path_identities.read().await.contains_key(path) {
-                    Ok(path.clone())
-                } else {
-                    Err(format!("repo not tracked: {}", path.display()))
-                }
-            }
-            flotilla_protocol::RepoSelector::Query(query) => {
-                let repos = self.repos.read().await;
-                let entries: Vec<_> = repos.values().map(|state| (state.preferred_path(), state.slug())).collect();
-                crate::resolve::resolve_repo(query, entries.into_iter()).map_err(|e| e.to_string())
-            }
-            flotilla_protocol::RepoSelector::Identity(identity) => self
-                .repos
-                .read()
-                .await
-                .get(identity)
-                .map(|state| state.preferred_path().to_path_buf())
-                .ok_or_else(|| format!("repo not tracked: {identity}")),
-        }
     }
 
     pub(super) async fn resolve_attach(
@@ -187,13 +158,25 @@ impl<'a> AttachResolver<'a> {
         let Some(selector) = selector else {
             return Ok(None);
         };
-        let Ok(path) = self.resolve_repo_selector(selector).await else {
-            return Ok(None);
-        };
-        let Some(repository_key) = self.repository_keys_by_path.read().await.get(&path).cloned() else {
-            return Ok(None);
-        };
         let namespace = self.provisioning_namespace().await;
+        let repository_key = crate::repository_addressing::resolve_repository(
+            self.resource_backend,
+            self.observed_resource_backend,
+            &namespace,
+            self.environment_manager.local_host_id().as_str(),
+            selector,
+        )
+        .await?;
+        let Some(repository_key) = repository_key else {
+            // Cwd is optional context for global session identifiers.
+            return if matches!(selector, flotilla_protocol::RepoSelector::Path(_)) {
+                Ok(None)
+            } else {
+                Err(format!(
+                    "no Repository matches '{selector}'; adopt a checkout with `flotilla repo add <path>` or declare a Project member"
+                ))
+            };
+        };
         let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
         let mut matches = projects
             .into_iter()
@@ -1069,6 +1052,8 @@ fn transient_checkout_session_name(checkout: &CheckoutRow) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use chrono::Utc;
     use flotilla_protocol::{Command, CommandAction, CommandValue};
     use flotilla_resources::{

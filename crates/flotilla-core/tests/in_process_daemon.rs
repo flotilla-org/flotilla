@@ -6858,7 +6858,7 @@ async fn adding_local_clone_promotes_remote_only_identity_to_local_execution() {
 }
 
 #[tokio::test]
-async fn execute_on_untracked_repo_returns_error_without_started_event() {
+async fn refresh_unobserved_checkout_refuses_without_started_event() {
     let config_tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(config_tmp.path().to_path_buf());
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
@@ -6869,7 +6869,7 @@ async fn execute_on_untracked_repo_returns_error_without_started_event() {
         .execute(Command::builder().action(CommandAction::Refresh { repo: Some(RepoSelector::Path(repo.clone())) }).build())
         .await
         .expect_err("untracked repo should fail");
-    assert!(err.contains("repo not tracked"));
+    assert!(err.contains("no observed checkout at"));
 
     let started = tokio::time::timeout(std::time::Duration::from_millis(200), async {
         loop {
@@ -6885,7 +6885,7 @@ async fn execute_on_untracked_repo_returns_error_without_started_event() {
 }
 
 #[tokio::test]
-async fn untrack_missing_repo_returns_error_without_started_event() {
+async fn stop_observing_missing_checkout_refuses_without_started_event() {
     let config_tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store(config_tmp.path().to_path_buf());
     let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::local()).await;
@@ -6896,7 +6896,7 @@ async fn untrack_missing_repo_returns_error_without_started_event() {
         .execute(Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Path(repo.clone()) }).build())
         .await
         .expect_err("untracked repo removal should fail");
-    assert!(err.contains("repo not tracked"));
+    assert!(err.contains("no observed checkout at"));
 
     let started = tokio::time::timeout(std::time::Duration::from_millis(200), async {
         loop {

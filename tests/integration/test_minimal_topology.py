@@ -109,16 +109,35 @@ def test_repository_federates_by_canonical_remote(topology):
 
 def test_remote_prepare_terminal_returns_attachable_set_id(topology):
     """Remote prepare-terminal returns a Flotilla-owned attachable set id."""
+    def local_repository_key(node):
+        hosts = flotilla_json(topology[node], "resource list hosts")["records"]
+        host_ref = next(
+            record["object"]["metadata"]["name"]
+            for record in hosts
+            if record["object"]["spec"]["display_name"] == node
+        )
+        repositories = flotilla_json(topology[node], "resource list repositories")["records"]
+        return next(
+            record["object"]["metadata"]["name"]
+            for record in repositories
+            if record["object"]["spec"]["identity"].get("git_common_dir") == "/home/flotilla/repo/.git"
+            and record["object"]["spec"]["identity"].get("host_ref") == host_ref
+        )
+
+    repository_key = local_repository_key("node-b")
     checkout = flotilla_json(
         topology["node-b"],
-        "repo /home/flotilla/repo checkout --fresh feat-prepare",
+        f"repo {repository_key} checkout --fresh feat-prepare",
     )
     assert checkout["kind"] == "checkout_created"
     checkout_path = checkout["path"]["path"]
 
+    # The current executor plans against the coordinator's provider context,
+    # then sends the terminal step to node-b. #2500 owns retiring that bridge.
+    planning_repository_key = local_repository_key("node-a")
     prepared = flotilla_json(
         topology["node-a"],
-        f"host node-b repo /home/flotilla/repo prepare-terminal {checkout_path}",
+        f"host node-b repo {planning_repository_key} prepare-terminal {checkout_path}",
         timeout=60,
     )
     assert prepared["kind"] == "terminal_prepared"

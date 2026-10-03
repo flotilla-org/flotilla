@@ -192,7 +192,8 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::CheckoutStatus(_) => {
             tracing::warn!("unexpected internal step result reached UI handler");
         }
-        CommandValue::RepoProviders(_)
+        CommandValue::RepositoryResolved { .. }
+        | CommandValue::RepoProviders(_)
         | CommandValue::HostList(_)
         | CommandValue::ProjectList(_)
         | CommandValue::CliList(_)

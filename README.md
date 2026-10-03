@@ -51,8 +51,8 @@ flotilla topology [--json]                        # show multi-host routing view
 ### Repos & checkouts
 
 ```
-flotilla repo add <path>                          # track a new repo
-flotilla repo remove <repo>                       # stop tracking a repo
+flotilla repo add <path>                          # adopt a checkout and start observing it
+flotilla repo remove <repo>                       # stop observing; keep Repository/Project resources
 flotilla repo <repo>                              # query repo details
 flotilla repo <repo> providers                    # list detected providers
 flotilla repo <repo> work                         # list work items
@@ -60,6 +60,18 @@ flotilla repo <repo> checkout <branch>            # check out a branch
 flotilla repo <repo> checkout --fresh <branch>    # create a fresh branch
 flotilla checkout <path> remove                   # remove a checkout
 ```
+
+Use `--repo <selector>` with a Project member alias or an exact forge slug such as
+`acme/widgets`. Without an explicit selector (or `FLOTILLA_REPO`), commands that
+need repository context infer it inside an observed checkout, including its
+worktrees. Lookup never adopts a checkout; use `repo add <path>` for adoption.
+For path removal, use an absolute path or an explicitly relative path such as
+`./checkout`; unprefixed selectors are aliases, forge slugs, or Repository keys.
+Ambiguous aliases or slugs require a unique selector; Repository keys also work.
+
+Forge execution, issue linking, and the providers view still need an available
+checkout; their remaining path dependencies are tracked in
+[#2500](https://github.com/flotilla-org/flotilla/issues/2500).
 
 ### Multi-host
 

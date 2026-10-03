@@ -50,9 +50,22 @@ use crate::{qualified_path::HostId, EnvironmentId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepoSelector {
+    /// Durable Repository identity, independent of checkout presence.
+    Repository(crate::RepositoryKey),
     Path(PathBuf),
     Query(String),
     Identity(RepoIdentity),
+}
+
+impl std::fmt::Display for RepoSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Repository(key) => write!(f, "Repository/{key}"),
+            Self::Path(path) => write!(f, "{}", path.display()),
+            Self::Query(query) => f.write_str(query),
+            Self::Identity(identity) => write!(f, "{identity}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -913,6 +926,9 @@ pub enum CommandAction {
         id: String,
     },
     // Query commands — read-only operations dispatched through execute()
+    QueryResolveRepository {
+        repo: RepoSelector,
+    },
     QueryRepoProviders {
         repo: RepoSelector,
     },
@@ -1014,7 +1030,8 @@ impl CommandAction {
     pub fn is_query(&self) -> bool {
         matches!(
             self,
-            CommandAction::QueryRepoProviders { .. }
+            CommandAction::QueryResolveRepository { .. }
+                | CommandAction::QueryRepoProviders { .. }
                 | CommandAction::QueryHostList {}
                 | CommandAction::QueryProjectList {}
                 | CommandAction::QueryCliList { .. }
@@ -1088,6 +1105,7 @@ impl Command {
             CommandAction::QueryIssues { .. } => "query issues",
             CommandAction::QueryIssueFetchByIds { .. } => "query issue fetch by ids",
             CommandAction::QueryIssueOpenInBrowser { .. } => "query issue open in browser",
+            CommandAction::QueryResolveRepository { .. } => "resolve repository identity",
             CommandAction::QueryRepoProviders { .. } => "query repo providers",
             CommandAction::QueryHostList {} => "query host list",
             CommandAction::QueryProjectList {} => "query project list",
@@ -1230,6 +1248,10 @@ pub enum CommandValue {
     },
     CheckoutPathResolved {
         path: PathBuf,
+    },
+    RepositoryResolved {
+        /// No match is distinct from a refused or failed lookup.
+        key: Option<crate::RepositoryKey>,
     },
     RepoProviders(Box<RepoProvidersResponse>),
     HostList(Box<HostListResponse>),
@@ -1513,6 +1535,10 @@ mod tests {
                 .node_id(NodeId::new("feta"))
                 .context_repo(RepoSelector::Identity(repo_identity()))
                 .build(),
+            // Repository keys remain independent of checkout paths on the wire.
+            Command::builder()
+                .action(CommandAction::QueryResolveRepository { repo: RepoSelector::Repository(crate::RepositoryKey("widgets".into())) })
+                .build(),
             Command::builder().action(CommandAction::QueryRepoProviders { repo: RepoSelector::Path(PathBuf::from("/repo")) }).build(),
             Command::builder().action(CommandAction::QueryHostList {}).build(),
             Command::builder().action(CommandAction::QueryProjectList {}).build(),
@@ -1663,6 +1689,8 @@ mod tests {
             CommandValue::Cancelled,
             CommandValue::AttachCommandResolved { plan: crate::ResolvedAttachPlan::shell_command("bash --login"), binding: None },
             CommandValue::CheckoutPathResolved { path: PathBuf::from("/repos/project/wt-1") },
+            CommandValue::RepositoryResolved { key: Some(crate::RepositoryKey("widgets".into())) },
+            CommandValue::RepositoryResolved { key: None },
             CommandValue::RepoProviders(Box::new(RepoProvidersResponse {
                 path: PathBuf::from("/repo"),
                 slug: Some("owner/repo".into()),
@@ -2029,6 +2057,7 @@ mod tests {
             Command::builder().action(CommandAction::TrackRepoPath { path: PathBuf::from("/tmp") }).build(),
             Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Path(PathBuf::from("/tmp")) }).build(),
             Command::builder().action(CommandAction::Refresh { repo: None }).build(),
+            Command::builder().action(CommandAction::QueryResolveRepository { repo: RepoSelector::Query("widgets".into()) }).build(),
             Command::builder().action(CommandAction::QueryRepoProviders { repo: RepoSelector::Path(PathBuf::from("/tmp")) }).build(),
             Command::builder().action(CommandAction::QueryHostList {}).build(),
             Command::builder().action(CommandAction::QueryProjectList {}).build(),
