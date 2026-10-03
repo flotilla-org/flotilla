@@ -104,6 +104,24 @@ jobs:
           shared-key: "test"
       - run: cargo test --workspace --locked
 
+  windows-client:
+    name: Windows client
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "windows-client"
+      - run: cargo check --bin flotilla --locked
+      - run: cargo clippy -p flotilla-client -p flotilla-manifest -p flotilla-transport --locked
+      - run: cargo build --bin flotilla --locked
+      - run: "cargo test -p flotilla-client --locked --lib windows_tests::"
+      - name: Test Wheelhouse named-pipe HTTP contract
+        run: "cargo test -p flotilla-manifest --locked --lib sink::tests::"
+
   macos-peer-identity:
     name: macOS peer identity
     runs-on: macos-latest
