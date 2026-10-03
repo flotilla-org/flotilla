@@ -200,7 +200,9 @@ Contained host-worktree vessels receive process-scoped tracking settings for the
 provisioned branches: `branch.<branch>.remote=origin`,
 `branch.<branch>.merge=refs/heads/<branch>`, and `push.default=current`.
 Use plain `git push` to publish the branch, including its first push; later
-`git push` and `git pull` follow the same branch on origin. These settings are
+`git push` and `git pull` follow the same branch on origin. Plain `git push`
+reuses the provisioned tracking; `git push -u` requests a write to shared config.
+These settings are
 scoped to the vessel environment and coexist with the injected global credential
 config. The shared clone config and hooks retain their read-only mounts, and the
 host config guard continues to reject `extensions.worktreeConfig` and executable
