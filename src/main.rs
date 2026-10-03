@@ -2290,9 +2290,21 @@ async fn lookup_cli_repository(daemon: &dyn DaemonHandle, selector: RepoSelector
     }
 }
 
+// Unprefixed relative strings remain identity queries (including forge slugs).
+fn is_path_like_selector(query: &str) -> bool {
+    Path::new(query).is_absolute() || query == "." || query == ".." || query.starts_with("./") || query.starts_with("../")
+}
+
 async fn resolve_cli_repository(daemon: &dyn DaemonHandle, selector: RepoSelector) -> Result<RepoSelector, String> {
     let label = selector.to_string();
-    lookup_cli_repository(daemon, selector).await?.ok_or_else(|| {
+    lookup_cli_repository(daemon, selector.clone()).await?.ok_or_else(|| {
+        if let RepoSelector::Query(query) = &selector {
+            if is_path_like_selector(query) {
+                return format!(
+                    "repository path selectors are not supported: '{label}'; run from inside the observed checkout and omit --repo for cwd inference, or use a Repository key, project member alias, or forge slug"
+                );
+            }
+        }
         format!("no Repository matches '{label}'; adopt a checkout with `flotilla repo add <path>` or declare a Project member")
     })
 }
@@ -2323,7 +2335,7 @@ async fn resolve_command_repositories(daemon: &dyn DaemonHandle, command: &mut C
         CommandAction::UntrackRepo { repo } => {
             if let RepoSelector::Query(query) = repo {
                 let path = Path::new(query);
-                if path.is_absolute() || query == "." || query == ".." || query.starts_with("./") || query.starts_with("../") {
+                if is_path_like_selector(query) {
                     *repo = RepoSelector::Path(tokio::fs::canonicalize(path).await.unwrap_or_else(|_| path.to_path_buf()));
                     return Ok(());
                 }
@@ -3838,6 +3850,22 @@ mod tests {
             super::resolve_optional_cwd_repository(&*daemon, "/work/widgets/src".into()).await.expect("cwd identity"),
             Some(RepoSelector::Repository(key.clone()))
         );
+        // #2551: explicit path queries stay unsupported even for observed checkouts.
+        // Single CLI call-through: the diagnostic directs users to identity or cwd inference.
+        for path in ["/work/widgets", "/work/widgets/src", "./widgets", "../widgets", ".", ".."] {
+            let cli = Cli::try_parse_from(["flotilla", "repo", path, "checkout", "--fresh", "feature"]).expect("CLI");
+            let SubCommand::Repo(noun) = cli.command.expect("repo noun") else { panic!("repo noun") };
+            let flotilla_commands::Resolved::Ready(mut command) = noun.resolve().expect("checkout command") else {
+                panic!("ready checkout")
+            };
+            let error = super::resolve_command_repositories(&*daemon, &mut command).await.expect_err("explicit path refused");
+            assert!(error.contains("repository path selectors are not supported"), "{error}");
+            assert!(error.contains("cwd inference"), "{error}");
+            assert!(error.contains("Repository key"), "{error}");
+        }
+        // Bare relative strings are identity queries, not filesystem path selectors.
+        let error = super::resolve_cli_repository(&*daemon, RepoSelector::Query("widgets".into())).await.expect_err("unknown identity");
+        assert!(error.starts_with("no Repository matches 'widgets'"), "{error}");
         let mut query = Command::builder()
             .action(CommandAction::QueryIssueFetchByIds { repo: RepoSelector::Query("primary".into()), ids: vec!["1".into()] })
             .build();
