@@ -7706,3 +7706,190 @@ async fn observation_cache_deadline_crosses_both_clocks() {
         assert_eq!(super::observation_cache_delay(Some(retry), now), std::time::Duration::from_secs(9));
     }
 }
+
+// #1496: resource descriptions survive link changes and observer restart; link
+// state alone determines connectivity. Repeated projection must not bump cursors.
+#[hegel::test]
+fn resource_host_descriptions_survive_transport_changes(tc: hegel::TestCase) {
+    use flotilla_protocol::qualified_path::HostId;
+    use hegel::generators as gs;
+    // Short generated sequences cover duplicate updates, online/offline transitions,
+    // empty inventories, and description changes while the peer is disconnected.
+    let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+    let operations = (0..steps).map(|_| (tc.draw(gs::booleans()), tc.draw(gs::booleans()))).collect::<Vec<_>>();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let temp = tempfile::tempdir().expect("config directory");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"host-description-observer\"\n").expect("daemon config");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let make_daemon = || {
+            InProcessDaemon::new_with_resource_backend(
+                Vec::new(),
+                Arc::new(ConfigStore::with_base(temp.path())),
+                fake_discovery(false),
+                HostName::new("observer"),
+                backend.clone(),
+            )
+        };
+        let daemon = make_daemon().await;
+        // A published local description is also authoritative: the host environment
+        // identity differs from the daemon's direct execution environment id.
+        let local_identity = daemon.local_host_identity();
+        let local_environment = local_identity.environment_id.clone();
+        let local_summary = HostSummary::builder()
+            .environment_id(local_environment.clone())
+            .node(local_identity.node)
+            .system(flotilla_protocol::SystemInfo { os: Some("published-os".into()), ..Default::default() })
+            .build();
+        let local_hosts = backend.clone().using::<ResourceHost>("flotilla");
+        let local_name = daemon.local_host_id().expect("local host").to_string();
+        let local = local_hosts.create(&test_meta(&local_name), &HostSpec::default()).await.expect("local Host");
+        local_hosts
+            .update_status(&local_name, &local.metadata.resource_version, &HostStatus {
+                description: Some(local_summary.clone()),
+                heartbeat_at: Some(Utc::now()),
+                ..Default::default()
+            })
+            .await
+            .expect("publish local description");
+        let local = daemon.get_host_status_internal(&local_environment).await.expect("local resource description");
+        assert_eq!(local.summary, Some(local_summary));
+        let remote = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("remote-root"));
+        let hosts = remote.using::<ResourceHost>("flotilla");
+        hosts.create(&test_meta("remote-host"), &HostSpec::default()).await.expect("host");
+        let writer = backend.replica_writer::<ResourceHost>(NodeId::new("remote-root"), "flotilla");
+        let environment_id = EnvironmentId::host(HostId::new("remote-host"));
+        let node = NodeInfo::new(NodeId::new("remote-node"), "remote");
+        let mut expected = None;
+        for (step, (connected, with_inventory)) in operations.into_iter().enumerate() {
+            let summary = HostSummary::builder()
+                .environment_id(environment_id.clone())
+                .host_name(HostName::new("remote"))
+                .node(node.clone())
+                .system(flotilla_protocol::SystemInfo { cpu_count: Some(step as u16), ..Default::default() })
+                .inventory(flotilla_protocol::ToolInventory {
+                    binaries: if with_inventory {
+                        vec![flotilla_protocol::DiscoveryFact { name: "git".into(), detail: vec![] }]
+                    } else {
+                        vec![]
+                    },
+                    ..Default::default()
+                })
+                .providers(vec![HostProviderStatus::disabled("vcs", "git", "probe failed")])
+                .environments(vec![flotilla_protocol::EnvironmentInfo::Direct {
+                    id: environment_id.clone(),
+                    host_id: Some(HostId::new("remote-host")),
+                    display_name: None,
+                    status: flotilla_protocol::EnvironmentStatus::Running,
+                }])
+                .build();
+            let host = hosts.get("remote-host").await.expect("host");
+            let status = flotilla_resources::HostStatus {
+                description: Some(summary),
+                heartbeat_at: Some(Utc::now()),
+                blob_sync: Some(flotilla_protocol::BlobSyncStatus { pending_count: step, last_error: None }),
+                capabilities: BTreeMap::from([(AGENT_ADAPTERS_CAPABILITY.into(), serde_json::json!(["codex"]))]),
+                ..Default::default()
+            };
+            let expected_environments = status.description.as_ref().expect("description").environments.clone();
+            expected = status.host_summary();
+            hosts.update_status("remote-host", &host.metadata.resource_version, &status).await.expect("publish description");
+            writer.replace(&hosts.list().await.expect("list"), Utc::now()).await.expect("replicate");
+            let identity = flotilla_protocol::HostIdentity {
+                environment_id: environment_id.clone(),
+                host_name: Some(HostName::new("live-name")),
+                node: NodeInfo::new(node.node_id.clone(), "live-name"),
+            };
+            daemon.set_peer_host_identities(HashMap::from([(environment_id.clone(), identity.clone())])).await;
+            let connectivity = if connected { PeerConnectionState::Connected } else { PeerConnectionState::Disconnected };
+            daemon.publish_peer_connection_status(&node, connectivity.clone()).await;
+            if !connected {
+                daemon.set_peer_host_identities(HashMap::new()).await;
+            }
+            let mut presented = expected.clone().expect("description");
+            if connected {
+                presented.node = identity.node;
+                presented.host_name = identity.host_name;
+            }
+            let response = daemon.get_host_status_internal(&environment_id).await.expect("resource backed host");
+            assert_eq!(response.summary, Some(presented.clone()), "live transport identity wins over resource identity");
+            assert_eq!(response.connection_status, connectivity);
+            assert_eq!(response.blob_sync, status.blob_sync);
+            let providers = daemon.get_host_providers_internal(&environment_id).await.expect("providers");
+            assert_eq!(providers.summary, presented);
+            assert_eq!(providers.visible_environments, expected_environments);
+            assert_eq!(response.visible_environments, expected_environments);
+            let replay = daemon.replay_since(&HashMap::new()).await.expect("replay");
+            let seq = replay
+                .iter()
+                .find_map(|event| match event {
+                    DaemonEvent::HostSnapshot(snapshot) if snapshot.environment_id == environment_id => Some(snapshot.seq),
+                    _ => None,
+                })
+                .expect("snapshot");
+            let replay = daemon
+                .replay_since(&HashMap::from([(StreamKey::Host { environment_id: environment_id.clone() }, seq)]))
+                .await
+                .expect("duplicate projection");
+            assert!(!replay
+                .iter()
+                .any(|event| matches!(event, DaemonEvent::HostSnapshot(snapshot) if snapshot.environment_id == environment_id)));
+        }
+        drop(daemon);
+        let restarted = make_daemon().await;
+        let response = restarted.get_host_status_internal(&environment_id).await.expect("offline replica after restart");
+        assert_eq!(response.summary, expected);
+        assert_eq!(response.connection_status, PeerConnectionState::Disconnected);
+        let listed = restarted.list_hosts_internal().await.expect("hosts");
+        assert!(listed.hosts.iter().any(|host| host.environment_id.as_ref() == Some(&environment_id) && host.has_summary));
+        // Deleting one resource must rehome the node's environment mapping to
+        // another described environment, rather than leaving a removed mapping.
+        let original = hosts.get("remote-host").await.expect("remote host").status.expect("status");
+        let alternate_environment = EnvironmentId::host(HostId::new("remote-alternate"));
+        let alternate = hosts.create(&test_meta("remote-alternate"), &HostSpec::default()).await.expect("alternate Host");
+        let mut alternate_status = original.clone();
+        alternate_status.description.as_mut().expect("description").environment_id = alternate_environment.clone();
+        hosts.update_status("remote-alternate", &alternate.metadata.resource_version, &alternate_status).await.expect("alternate status");
+        writer.replace(&hosts.list().await.expect("two hosts"), Utc::now()).await.expect("replicate alternate");
+        restarted.refresh_resource_host_summaries().await.expect("project alternate");
+        hosts.delete("remote-host").await.expect("delete host");
+        writer.replace(&hosts.list().await.expect("remaining host"), Utc::now()).await.expect("replicate deletion");
+        assert!(restarted.get_host_status_internal(&environment_id).await.is_err());
+        assert_eq!(restarted.host_registry.environment_id_for_node(&node.node_id).await, Some(alternate_environment.clone()));
+        hosts.delete("remote-alternate").await.expect("delete alternate");
+        writer.replace(&hosts.list().await.expect("empty list"), Utc::now()).await.expect("replicate final deletion");
+        restarted.refresh_resource_host_summaries().await.expect("project deletion");
+        assert_eq!(restarted.host_registry.environment_id_for_node(&node.node_id).await, None);
+
+        // A live identity keeps its identity-only presentation when a Host loses
+        // its description or is deleted. No description is invented from link state.
+        let created = hosts.create(&test_meta("remote-host"), &HostSpec::default()).await.expect("recreate Host");
+        hosts.update_status("remote-host", &created.metadata.resource_version, &original).await.expect("restore description");
+        writer.replace(&hosts.list().await.expect("restored list"), Utc::now()).await.expect("replicate restored Host");
+        let identity = flotilla_protocol::HostIdentity {
+            environment_id: environment_id.clone(),
+            host_name: Some(HostName::new("live-name")),
+            node: NodeInfo::new(node.node_id.clone(), "live-name"),
+        };
+        restarted.set_peer_host_identities(HashMap::from([(environment_id.clone(), identity.clone())])).await;
+        restarted.publish_peer_connection_status(&node, PeerConnectionState::Connected).await;
+        let current = hosts.get("remote-host").await.expect("current Host");
+        let empty_status =
+            HostStatus { blob_sync: Some(flotilla_protocol::BlobSyncStatus { pending_count: 7, last_error: None }), ..Default::default() };
+        hosts.update_status("remote-host", &current.metadata.resource_version, &empty_status).await.expect("clear description");
+        writer.replace(&hosts.list().await.expect("empty status"), Utc::now()).await.expect("replicate empty status");
+        for deleted in [false, true] {
+            if deleted {
+                hosts.delete("remote-host").await.expect("delete connected Host");
+                writer.replace(&hosts.list().await.expect("empty list"), Utc::now()).await.expect("replicate deletion");
+            }
+            let response = restarted.get_host_status_internal(&environment_id).await.expect("live identity survives missing description");
+            assert_eq!(response.summary, Some(identity.clone().into()));
+            assert_eq!(response.connection_status, PeerConnectionState::Connected);
+            assert!(response.visible_environments.is_empty());
+            assert_eq!(response.blob_sync, if deleted { None } else { empty_status.blob_sync.clone() });
+        }
+        restarted.set_peer_host_identities(HashMap::new()).await;
+        assert!(restarted.get_host_status_internal(&environment_id).await.is_err());
+    });
+}

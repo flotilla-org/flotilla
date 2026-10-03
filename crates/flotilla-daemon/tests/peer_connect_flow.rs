@@ -61,7 +61,7 @@ async fn wait_for_local_state(sent: &Arc<StdMutex<Vec<PeerWireMessage>>>, notify
                 .lock()
                 .expect("lock")
                 .iter()
-                .any(|message| matches!(message, PeerWireMessage::HostSummary(summary) if summary.node.node_id == *node_id));
+                .any(|message| matches!(message, PeerWireMessage::HostIdentity(summary) if summary.node.node_id == *node_id));
             if complete {
                 return;
             }
@@ -73,7 +73,7 @@ async fn wait_for_local_state(sent: &Arc<StdMutex<Vec<PeerWireMessage>>>, notify
 }
 
 fn local_summary_count(messages: &[PeerWireMessage], node_id: &NodeId) -> usize {
-    messages.iter().filter(|message| matches!(message, PeerWireMessage::HostSummary(summary) if summary.node.node_id == *node_id)).count()
+    messages.iter().filter(|message| matches!(message, PeerWireMessage::HostIdentity(summary) if summary.node.node_id == *node_id)).count()
 }
 
 #[tokio::test]
@@ -109,7 +109,7 @@ async fn peer_connect_triggers_local_state_send() {
 
     let messages = sent.lock().expect("lock");
     assert!(
-        messages.iter().any(|m| matches!(m, PeerWireMessage::HostSummary(s) if s.node.node_id == node_a)),
+        messages.iter().any(|m| matches!(m, PeerWireMessage::HostIdentity(s) if s.node.node_id == node_a)),
         "peer should receive HostSummary from host-a, got: {messages:?}"
     );
 }

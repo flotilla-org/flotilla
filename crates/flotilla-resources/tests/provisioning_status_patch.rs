@@ -13,6 +13,7 @@ fn host_status_patch_updates_heartbeat_snapshot() {
     let mut status = HostStatus::default();
     let observed_at = Utc.with_ymd_and_hms(2026, 8, 3, 12, 40, 0).single().expect("valid timestamp");
     HostStatusPatch::Heartbeat {
+        description: None,
         capabilities: [("docker".to_string(), serde_json::Value::Bool(true))].into_iter().collect(),
         heartbeat_at: Utc::now(),
         ready: true,
@@ -87,6 +88,7 @@ async fn heartbeat_patch_preserves_independent_status_after_another_writer_updat
         .observed_at(observed_at)
         .build();
     let patch = HostStatusPatch::Heartbeat {
+        description: None,
         capabilities: Default::default(),
         heartbeat_at: observed_at,
         ready: true,
@@ -434,4 +436,72 @@ fn presentation_status_patch_marks_active_torn_down_and_failed() {
     PresentationStatusPatch::MarkFailed { message: "unknown policy".to_string() }.apply(&mut status);
     assert_eq!(status.phase, PresentationPhase::Failed);
     assert_eq!(status.message.as_deref(), Some("unknown policy"));
+}
+
+// #1496: heartbeat descriptions persist with ADR 0047 defaults. Placement keys
+// supply availability; the stored description must not double-bookkeep it.
+#[hegel::test]
+fn heartbeat_description_has_one_availability_authority(tc: hegel::TestCase) {
+    use flotilla_protocol::{qualified_path::HostId, EnvironmentId, HostProviderStatus, HostSummary, NodeId, NodeInfo, SystemInfo};
+    use hegel::generators as gs;
+    // Include absent/empty capability sets and both availability categories.
+    let adapter = tc.draw(gs::booleans());
+    let pool = tc.draw(gs::booleans());
+    let cpu = tc.draw(gs::integers::<u16>().min_value(0).max_value(u16::MAX));
+    let summary = HostSummary::builder()
+        .environment_id(EnvironmentId::host(HostId::new("host")))
+        .node(NodeInfo::new(NodeId::new("node"), "host"))
+        .system(SystemInfo { cpu_count: Some(cpu), ..Default::default() })
+        .providers(vec![
+            HostProviderStatus::available("agent_adapter", "stale-adapter"),
+            HostProviderStatus::available("terminal_pool", "stale-pool"),
+            HostProviderStatus::disabled("vcs", "git", "missing binary"),
+        ])
+        .build();
+    let mut capabilities = std::collections::BTreeMap::new();
+    if adapter {
+        capabilities.insert("agent_adapters".into(), serde_json::json!(["codex"]));
+    }
+    if pool {
+        capabilities.insert("terminal_pools".into(), serde_json::json!(["cleat"]));
+    }
+    let patch = HostStatusPatch::Heartbeat {
+        description: Some(Box::new(summary.clone())),
+        capabilities,
+        heartbeat_at: Utc::now(),
+        ready: true,
+        daemon_generation: None,
+        daemon_version: None,
+        daemon_started_at: None,
+        disk_free_bytes: None,
+        daemon_rss_bytes: Some(u64::MAX),
+        admission_free_space_floor_bytes: None,
+        agent_adapter_baseline: None,
+        resource_store: None,
+        conditions: vec![],
+    };
+    let mut status = HostStatus::default();
+    patch.apply(&mut status);
+    let stored = status.description.as_ref().expect("description");
+    assert_eq!(stored.system, summary.system);
+    assert_eq!(stored.providers, vec![summary.providers[2].clone()]);
+    let mut expected = stored.clone();
+    if adapter {
+        expected.providers.push(HostProviderStatus::available("agent_adapter", "codex"));
+    }
+    if pool {
+        expected.providers.push(HostProviderStatus::available("terminal_pool", "cleat"));
+    }
+    expected.providers.sort_by(|a, b| (&a.category, &a.name).cmp(&(&b.category, &b.name)));
+    assert_eq!(status.host_summary(), Some(expected));
+    assert_eq!(status.agent_adapters().expect("adapters"), if adapter { ["codex".into()].into() } else { Default::default() });
+    let decoded: HostStatus = serde_json::from_value(serde_json::to_value(&status).expect("encode status")).expect("decode status");
+    assert_eq!(decoded, status);
+    // Previous-generation stored records have no descriptive field.
+    let mut previous = serde_json::to_value(&status).expect("encode previous generation");
+    previous.as_object_mut().expect("object").remove("description");
+    let previous: HostStatus = serde_json::from_value(previous).expect("previous generation still decodes");
+    assert!(previous.description.is_none());
+    assert_eq!(previous.capabilities, status.capabilities);
+    assert_eq!(previous.daemon_rss_bytes, status.daemon_rss_bytes);
 }

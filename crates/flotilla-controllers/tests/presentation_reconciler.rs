@@ -872,6 +872,7 @@ async fn create_ready_host(backend: &ResourceBackend, name: &str) {
     let created = hosts.create(&meta(name), &HostSpec::default()).await.expect("host create should succeed");
     let mut status = HostStatus::default();
     HostStatusPatch::Heartbeat {
+        description: None,
         capabilities: BTreeMap::new(),
         heartbeat_at: Utc::now(),
         ready: true,

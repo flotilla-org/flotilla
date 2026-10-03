@@ -701,6 +701,7 @@ impl DaemonRuntime {
             ),
             spawn_credential_refresh_task(Arc::clone(&daemon), options.namespace.clone(), Arc::clone(&credential_store)),
             spawn_replica_refresh_task(Arc::clone(&daemon), options.heartbeat_interval),
+            spawn_host_description_projection_task(Arc::clone(&daemon), options.namespace.clone(), options.heartbeat_interval),
             spawn_managed_terminal_attention_task(Arc::clone(&daemon), options.heartbeat_interval),
             spawn_codex_central_refresh_task(Arc::clone(&daemon.discovery_runtime().env), options.codex_central_refresh_interval),
             spawn_demand_expiry_task(daemon.resource_backend(), options.namespace.clone(), options.heartbeat_interval),
@@ -3286,6 +3287,46 @@ async fn apply_host_heartbeat(
     apply_host_heartbeat_with_credentials(daemon, namespace, profile, None, health, &RuntimeHealth::default()).await
 }
 
+fn spawn_host_description_projection_task(daemon: Arc<InProcessDaemon>, namespace: String, interval: Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut resync = tokio::time::interval(interval);
+        resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let mut watch = match daemon.resource_backend().including_replicas::<Host>(&namespace).watch().await {
+                // Drain ready bursts together so replicated heartbeat fan-in
+                // causes one projection pass per batch, not one scan per event.
+                Ok(watch) => watch.ready_chunks(64),
+                Err(error) => {
+                    warn!(%error, "watch host descriptions failed");
+                    resync.tick().await;
+                    continue;
+                }
+            };
+            // Subscribe before listing so an update during projection cannot be lost.
+            loop {
+                if let Err(error) = daemon.refresh_resource_host_summaries().await {
+                    warn!(%error, "project host descriptions failed");
+                }
+                tokio::select! {
+                    event = watch.next() => {
+                        match event {
+                            Some(events) => {
+                                if let Some(error) = events.into_iter().find_map(Result::err) {
+                                    warn!(%error, "host description watch failed; resubscribing");
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = resync.tick() => {}
+                }
+            }
+            resync.tick().await;
+        }
+    })
+}
+
 fn spawn_replica_refresh_task(daemon: Arc<InProcessDaemon>, interval: Duration) -> JoinHandle<()> {
     spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
         let daemon = Arc::clone(&daemon);
@@ -3648,7 +3689,7 @@ async fn apply_host_heartbeat_with_credentials(
     if let Some(condition) = adapter_assessment.regression {
         runtime_health.report_capability_regression(condition);
     }
-    let summary = daemon.local_host_summary().await;
+    let summary = daemon.local_host_description().await;
     let resource_store = backend.diagnostics().await.map_err(|err| err.to_string())?;
     if let Some(diagnostics) = resource_store.as_ref().filter(|diagnostics| !diagnostics.warnings.is_empty()) {
         warn!(
@@ -3687,6 +3728,7 @@ async fn apply_host_heartbeat_with_credentials(
     }
     let ready = !conditions.iter().any(HostCondition::blocks_readiness);
     flotilla_resources::apply_status_patch(&hosts, &profile.host_id, &HostStatusPatch::Heartbeat {
+        description: Some(Box::new(summary)),
         capabilities,
         agent_adapter_baseline: Some(adapter_assessment.baseline),
         heartbeat_at: Utc::now(),
@@ -13237,6 +13279,85 @@ mod tests {
         .await
         .expect("observation retains prior facts");
         assert_eq!(after_failure, previous);
+    }
+
+    // #1496: a replicated description must produce a HostSnapshot for live
+    // surfaces without a query or peer-summary message, including while offline.
+    #[tokio::test]
+    async fn host_description_watch_publishes_offline_replica_updates() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"host-watch-observer\"\n").expect("daemon config");
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+        let remote = ResourceBackend::InMemory(Default::default()).with_local_root(NodeId::new("remote-root"));
+        let hosts = remote.using::<Host>(NAMESPACE);
+        let created = hosts.create(&empty_meta("remote-host"), &HostSpec::default()).await.expect("remote host");
+        let summary = HostSummary::builder()
+            .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("remote-host")))
+            .host_name(flotilla_protocol::HostName::new("remote"))
+            .node(flotilla_protocol::NodeInfo::new(NodeId::new("remote-node"), "remote"))
+            .system(flotilla_protocol::SystemInfo { os: Some("linux".into()), ..Default::default() })
+            .build();
+        hosts
+            .update_status("remote-host", &created.metadata.resource_version, &HostStatus {
+                description: Some(summary.clone()),
+                heartbeat_at: Some(Utc::now()),
+                ..Default::default()
+            })
+            .await
+            .expect("remote description");
+        let mut events = daemon.subscribe();
+        let projection = spawn_host_description_projection_task(Arc::clone(&daemon), NAMESPACE.to_string(), Duration::from_secs(3600));
+        daemon
+            .resource_backend()
+            .replica_writer::<Host>(NodeId::new("remote-root"), NAMESPACE)
+            .replace(&hosts.list().await.expect("remote list"), Utc::now())
+            .await
+            .expect("replicate");
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let flotilla_protocol::DaemonEvent::HostSnapshot(snapshot) = events.recv().await.expect("event") {
+                    if snapshot.environment_id == summary.environment_id {
+                        break snapshot;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("watch publishes replicated description");
+        assert_eq!(snapshot.summary, summary);
+        assert_eq!(snapshot.connection_status, flotilla_protocol::PeerConnectionState::Disconnected);
+        let current = hosts.get("remote-host").await.expect("current host");
+        let mut changed = summary.clone();
+        changed.system.cpu_count = Some(8);
+        hosts
+            .update_status("remote-host", &current.metadata.resource_version, &HostStatus {
+                description: Some(changed.clone()),
+                heartbeat_at: Some(Utc::now()),
+                ..Default::default()
+            })
+            .await
+            .expect("change remote description");
+        daemon
+            .resource_backend()
+            .replica_writer::<Host>(NodeId::new("remote-root"), NAMESPACE)
+            .replace(&hosts.list().await.expect("updated list"), Utc::now())
+            .await
+            .expect("replicate update");
+        let updated = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let flotilla_protocol::DaemonEvent::HostSnapshot(snapshot) = events.recv().await.expect("event") {
+                    if snapshot.environment_id == summary.environment_id && snapshot.summary == changed {
+                        break snapshot;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("watch publishes offline update");
+        assert!(updated.seq > snapshot.seq);
+        assert_eq!(updated.connection_status, flotilla_protocol::PeerConnectionState::Disconnected);
+        projection.abort();
+        let _ = projection.await;
     }
 
     #[tokio::test]

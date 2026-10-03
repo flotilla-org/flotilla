@@ -33,7 +33,7 @@ use flotilla_resources::{
     Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState,
     EventRecorder, Forge, FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus,
     IssueSourceResolution, IssueSourceUnavailable, ManifestRoot, Project, ReadResourceObject, Repository, RepositoryKey, ResourceBackend,
-    ResourceError, ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
+    ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
     CONVOY_LABEL, HEARTBEAT_READY_TTL_SECS, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
@@ -465,22 +465,42 @@ impl ReadProjections<'_> {
         Ok(ProjectListResponse { projects: entries })
     }
 
+    pub(super) async fn host_statuses(&self, namespace: &str) -> Result<BTreeMap<String, ResourceHostStatus>, String> {
+        let hosts = self
+            .backend
+            .clone()
+            .including_replicas::<ResourceHost>(namespace)
+            .list_replica_sources()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut statuses = BTreeMap::<String, ResourceHostStatus>::new();
+        for source in hosts.items {
+            let host = source.object;
+            if host.metadata.deletion_timestamp.is_some() {
+                continue;
+            }
+            if let Some(status) = host.status {
+                statuses
+                    .entry(host.metadata.name)
+                    .and_modify(|current| {
+                        if current.heartbeat_at < status.heartbeat_at {
+                            *current = status.clone();
+                        }
+                    })
+                    .or_insert(status);
+            }
+        }
+        Ok(statuses)
+    }
+
     pub(super) async fn get_host_status(
         &self,
         environment_id: &EnvironmentId,
         counts: &HashMap<EnvironmentId, HostCounts>,
         local_summary: &HostSummary,
-        namespace: &str,
     ) -> Result<HostStatusResponse, String> {
         let mut response = self.host_registry.get_host_status(environment_id, counts).await?;
-        if let Some(host_id) = environment_id.host_id() {
-            response.blob_sync = match self.backend.including_replicas::<ResourceHost>(namespace).get(host_id.as_str()).await {
-                Ok(host) => host.object.status.and_then(|status| status.blob_sync),
-                Err(ResourceError::NotFound { .. }) => None,
-                Err(error) => return Err(error.to_string()),
-            };
-        }
-        if environment_id == &local_summary.environment_id {
+        if environment_id == &local_summary.environment_id && !self.host_registry.has_resource_description(environment_id).await {
             response.visible_environments = self.environment_manager.visible_environments().await;
         }
         Ok(response)
@@ -493,7 +513,7 @@ impl ReadProjections<'_> {
         local_summary: &HostSummary,
     ) -> Result<HostProvidersResponse, String> {
         let mut response = self.host_registry.get_host_providers(environment_id, counts).await?;
-        if environment_id == &local_summary.environment_id {
+        if environment_id == &local_summary.environment_id && !self.host_registry.has_resource_description(environment_id).await {
             response.visible_environments = self.environment_manager.visible_environments().await;
         }
         Ok(response)

@@ -22,6 +22,34 @@ impl NodeInfo {
     }
 }
 
+/// Transport identity only. Descriptive observations replicate through Host status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostIdentity {
+    pub environment_id: EnvironmentId,
+    pub host_name: Option<HostName>,
+    pub node: NodeInfo,
+}
+
+impl From<HostSummary> for HostIdentity {
+    fn from(summary: HostSummary) -> Self {
+        Self { environment_id: summary.environment_id, host_name: summary.host_name, node: summary.node }
+    }
+}
+
+impl From<HostIdentity> for HostSummary {
+    fn from(identity: HostIdentity) -> Self {
+        Self {
+            environment_id: identity.environment_id,
+            host_name: identity.host_name,
+            node: identity.node,
+            system: SystemInfo::default(),
+            inventory: ToolInventory::default(),
+            providers: Vec::new(),
+            environments: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct HostSummary {
     pub environment_id: EnvironmentId,

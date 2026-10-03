@@ -2,13 +2,13 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CommandValue, HostSummary, NodeId, RepoIdentity, Step, StepOutcome, StepStatus};
+use crate::{CommandValue, HostIdentity, NodeId, RepoIdentity, Step, StepOutcome, StepStatus};
 
 /// Unified peer-to-peer wire payload used inside `Message::Peer`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "peer_type")]
 pub enum PeerWireMessage {
-    HostSummary(HostSummary),
+    HostIdentity(HostIdentity),
     /// Ephemeral reachability learned from the live peer overlay.
     RouteAdvertisement {
         origin_node_id: NodeId,
@@ -208,11 +208,19 @@ mod tests {
     }
 
     #[test]
-    fn peer_wire_message_host_summary_roundtrip() {
-        let msg = PeerWireMessage::HostSummary(sample_host_summary());
+    fn peer_wire_message_host_identity_roundtrip() {
+        let msg = PeerWireMessage::HostIdentity(sample_host_summary().into());
         let json = serde_json::to_string(&msg).expect("serialize");
         let decoded: PeerWireMessage = serde_json::from_str(&json).expect("deserialize");
-        assert!(matches!(decoded, PeerWireMessage::HostSummary(_)));
+        assert!(matches!(decoded, PeerWireMessage::HostIdentity(_)));
+        // #1496: only identity crosses this wire; descriptions replicate as Host status.
+        let value: serde_json::Value = serde_json::from_str(&json).expect("wire object");
+        assert_eq!(value["peer_type"], "HostIdentity");
+        let summary = &value;
+        assert_eq!(summary.as_object().expect("identity object").len(), 4);
+        for descriptive in ["system", "inventory", "providers", "environments"] {
+            assert!(summary.get(descriptive).is_none(), "peer wire must not carry {descriptive}");
+        }
     }
 
     #[test]
