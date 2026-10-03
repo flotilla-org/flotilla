@@ -1,9 +1,12 @@
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     marker::PhantomData,
     pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -124,7 +127,7 @@ struct LeafSubscriptionTableInner {
     turn_delivery: Mutex<Arc<dyn TurnDeliveryActuator>>,
     episode_limit: u32,
     #[cfg(test)]
-    snapshot_loads: std::sync::atomic::AtomicUsize,
+    snapshot_loads: AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,21 +162,26 @@ fn refusal_limit(status: &ConvoyStatus, vessel: &str, role: &str) -> u32 {
     nudge_policy(status, vessel, role).and_then(|policy| policy.max_refusals).unwrap_or(DEFAULT_REFUSAL_LIMIT).max(1)
 }
 
+const LEAF_WATCH_RECOVERY_INITIAL_DELAY: Duration = Duration::from_millis(25);
+const LEAF_WATCH_RECOVERY_MAX_DELAY: Duration = Duration::from_secs(1);
+const LEAF_WATCH_RECOVERY_RESET_AFTER: Duration = Duration::from_secs(5);
+
 // One immediate burst recovery, then repeated expiries back off from 25 ms
 // to one second. Five healthy seconds restore immediate burst recovery.
 #[derive(Default)]
 struct LeafWatchRecovery {
-    delay: std::time::Duration,
+    delay: Duration,
 }
 
 impl LeafWatchRecovery {
-    fn expired(&mut self, healthy_for: std::time::Duration) -> std::time::Duration {
-        use std::time::Duration;
-        if healthy_for >= Duration::from_secs(5) {
+    fn expired(&mut self, healthy_for: Duration) -> Duration {
+        // Require sustained healthy consumption so intermittent lag cannot
+        // repeatedly restore immediate retries and trigger snapshot bursts.
+        if healthy_for >= LEAF_WATCH_RECOVERY_RESET_AFTER {
             self.delay = Duration::ZERO;
         }
         let delay = self.delay;
-        self.delay = if delay.is_zero() { Duration::from_millis(25) } else { (delay * 2).min(Duration::from_secs(1)) };
+        self.delay = if delay.is_zero() { LEAF_WATCH_RECOVERY_INITIAL_DELAY } else { (delay * 2).min(LEAF_WATCH_RECOVERY_MAX_DELAY) };
         delay
     }
 }
@@ -226,7 +234,7 @@ impl LeafSubscriptionTable {
                 turn_delivery: Mutex::new(Arc::new(UnavailableTurnDeliveryActuator)),
                 episode_limit,
                 #[cfg(test)]
-                snapshot_loads: std::sync::atomic::AtomicUsize::new(0),
+                snapshot_loads: AtomicUsize::new(0),
             }),
         }
     }
@@ -333,11 +341,11 @@ impl LeafSubscriptionTable {
         Box::new(ReconcilerWake { subscriptions: self.clone(), _marker: PhantomData })
     }
 
-    pub fn change_request_stale_after(&self) -> std::time::Duration {
+    pub fn change_request_stale_after(&self) -> Duration {
         self.inner.change_requests.stale_after()
     }
 
-    pub fn issue_stale_after(&self) -> std::time::Duration {
+    pub fn issue_stale_after(&self) -> Duration {
         self.inner.issues.stale_after()
     }
 
@@ -447,7 +455,7 @@ impl LeafSubscriptionTable {
         let issue_list = issues.list().await?;
         let artifact_list = artifacts.list().await?;
         #[cfg(test)]
-        self.inner.snapshot_loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.snapshot_loads.fetch_add(1, Ordering::SeqCst);
         let mut convoy_objects = convoy_list.items.into_iter().fold(HashMap::new(), |mut objects, item| {
             objects.entry(item.object.metadata.name.clone()).or_insert(item.object);
             objects
@@ -1909,7 +1917,7 @@ impl ReconcilerWake {
             listed_convoys.items.into_iter().map(|convoy| (convoy.metadata.name.clone(), convoy)).collect::<HashMap<_, _>>();
         let mut wake_rx = self.subscriptions.inner.reconciler_tx.subscribe();
         self.sync_rows(&namespace, &convoy_objects).await?;
-        let mut judge_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut judge_tick = tokio::time::interval(Duration::from_secs(1));
 
         loop {
             tokio::select! {
@@ -2445,8 +2453,8 @@ fn freshest_issues(sources: &IssueSources) -> HashMap<String, ResourceObject<Iss
 
 #[derive(Clone, Copy)]
 struct LeafObservationStaleness {
-    change_request: std::time::Duration,
-    issue: std::time::Duration,
+    change_request: Duration,
+    issue: Duration,
 }
 
 struct LeafSubjects<'a> {
