@@ -25,8 +25,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+use attach::AttachResolver;
 pub use attach::ResolvedAttach;
-use attach::{AttachResolver, CachedFleetRows};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 pub use convoy_admission::RoleAddress;
 use convoy_admission::{
@@ -1893,7 +1893,6 @@ impl InProcessDaemon {
         let mut order = Vec::new();
         let mut path_identities = HashMap::new();
         let mut repository_keys_by_path = HashMap::new();
-        let observed_resource_backend = ResourceBackend::InMemory(InMemoryBackend::observed());
 
         let daemon_config = config.load_daemon_config().expect("failed to load daemon config");
         let config_machine_id = daemon_config.machine_id.as_deref();
@@ -1903,6 +1902,7 @@ impl InProcessDaemon {
             .await
             .expect("failed to resolve local node id");
         let resource_backend = resource_backend.with_local_root(local_node_id.clone());
+        let observed_resource_backend = ResourceBackend::InMemory(InMemoryBackend::observed()).with_local_root(local_node_id.clone());
         let local_environment_id =
             resolve_or_create_environment_id(&local_environment_state_dir).expect("failed to resolve local direct environment id");
         let local_host_id = resolve_local_host_id(config.state_dir().as_path(), config_machine_id, &*discovery.runner)
@@ -8142,7 +8142,6 @@ impl InProcessDaemon {
             local_environment_id: &self.local_environment_id,
             host_name: &self.host_name,
             namespace: &self.provisioning_namespace,
-            fleet_rows: Box::new(CachedFleetRows { fleet: &self.fleet }),
         }
     }
 
@@ -8564,7 +8563,10 @@ impl InProcessDaemon {
                 description,
             });
 
-            let backend = self.resource_backend.clone();
+            let (backend, kind) = match kind.strip_prefix("observed/") {
+                Some(kind) => (self.observed_resource_backend.clone(), kind.to_string()),
+                None => (self.resource_backend.clone(), kind),
+            };
             let event_tx = self.event_tx.clone();
             let event_sink = self.event_sink.clone();
             let active_ref = Arc::clone(&self.active_commands);

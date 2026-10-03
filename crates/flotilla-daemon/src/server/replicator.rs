@@ -25,6 +25,44 @@ const REPLICATION_NAMESPACE: &str = "flotilla";
 const REPLICATION_RETRY: RetryBackoff =
     RetryBackoff { initial: Duration::from_millis(100), maximum: Duration::from_secs(30), reset_after: Duration::from_secs(60) };
 
+/// Observation replicas live in the ephemeral store, separately from desired state.
+#[derive(Clone, Copy)]
+pub(super) enum ReplicationStore {
+    Durable,
+    Observed,
+}
+
+impl ReplicationStore {
+    fn backend(self, daemon: &InProcessDaemon) -> ResourceBackend {
+        match self {
+            Self::Durable => daemon.resource_backend(),
+            Self::Observed => daemon.observed_resource_backend(),
+        }
+    }
+
+    fn kind<T: Resource>(self) -> String {
+        match self {
+            Self::Durable => T::API_PATHS.plural.to_string(),
+            Self::Observed => format!("observed/{}", T::API_PATHS.plural),
+        }
+    }
+
+    fn health_kind<T: Resource>(self) -> String {
+        match self {
+            Self::Durable => T::API_PATHS.kind.to_string(),
+            Self::Observed => format!("observed/{}", T::API_PATHS.kind),
+        }
+    }
+
+    fn http(self, path: PathBuf) -> Result<HttpBackend, String> {
+        let http = HttpBackend::from_unix_socket(path).map_err(|error| error.to_string())?;
+        Ok(match self {
+            Self::Durable => http,
+            Self::Observed => http.with_path_prefix("observed"),
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RetryBackoff {
     initial: Duration,
@@ -101,7 +139,17 @@ impl PeerReplicatorSupervisors {
                 ReplicationTransport::Http(socket_path_source)
             }
         };
-        flotilla_resources::for_each_registered_resource!(spawn_kind, &daemon, &peer, generation, &transport, &cancellation)
+        flotilla_resources::for_each_registered_resource!(
+            spawn_kind,
+            &daemon,
+            &peer,
+            generation,
+            &transport,
+            &cancellation,
+            ReplicationStore::Durable
+        );
+        spawn_kind::<flotilla_resources::Checkout>(&daemon, &peer, generation, &transport, &cancellation, ReplicationStore::Observed);
+        spawn_kind::<flotilla_resources::TerminalSession>(&daemon, &peer, generation, &transport, &cancellation, ReplicationStore::Observed)
     }
 
     /// Cancel and drop a peer's resource replicators, but only if `generation`
@@ -173,6 +221,7 @@ fn spawn_kind<T: Resource>(
     generation: u64,
     transport: &ReplicationTransport,
     cancellation: &CancellationToken,
+    store: ReplicationStore,
 ) {
     if T::REPLICATION_CLASS == ReplicationClass::None {
         return;
@@ -188,7 +237,7 @@ fn spawn_kind<T: Resource>(
                 supervise_kind(
                     relay_peer,
                     generation,
-                    T::API_PATHS.kind,
+                    &store.health_kind::<T>(),
                     relay_cancellation,
                     REPLICATION_RETRY,
                     move || {
@@ -199,8 +248,8 @@ fn spawn_kind<T: Resource>(
                         let daemon = Arc::clone(&run_daemon);
                         let peer = run_peer.clone();
                         async move {
-                            let http = HttpBackend::from_unix_socket(path).map_err(|error| error.to_string())?;
-                            replicate_relay_over_http::<T>(http, &daemon, &peer).await
+                            let http = store.http(path)?;
+                            replicate_relay_over_http::<T>(http, &daemon, &peer, store).await
                         }
                     },
                 )
@@ -218,7 +267,7 @@ fn spawn_kind<T: Resource>(
                 supervise_kind(
                     relay_peer,
                     generation,
-                    T::API_PATHS.kind,
+                    &store.health_kind::<T>(),
                     relay_cancellation,
                     REPLICATION_RETRY,
                     || async { Ok(()) },
@@ -226,7 +275,7 @@ fn spawn_kind<T: Resource>(
                         let router = router.clone();
                         let daemon = Arc::clone(&run_daemon);
                         let peer = run_peer.clone();
-                        async move { replicate_relay_over_routed_watch::<T>(&router, &daemon, &peer).await }
+                        async move { replicate_relay_over_routed_watch::<T>(&router, &daemon, &peer, store).await }
                     },
                 )
                 .await;
@@ -245,7 +294,7 @@ fn spawn_kind<T: Resource>(
                 supervise_kind(
                     peer,
                     generation,
-                    T::API_PATHS.kind,
+                    &store.health_kind::<T>(),
                     cancellation,
                     REPLICATION_RETRY,
                     move || {
@@ -256,10 +305,10 @@ fn spawn_kind<T: Resource>(
                         let daemon = Arc::clone(&run_daemon);
                         let peer = run_peer.clone();
                         async move {
-                            let http = HttpBackend::from_unix_socket(path).map_err(|error| error.to_string())?;
-                            let result = replicate_kind_over_http::<T>(http, &daemon, &peer).await;
+                            let http = store.http(path)?;
+                            let result = replicate_kind_over_http::<T>(http, &daemon, &peer, store).await;
                             if let Err(error) = &result {
-                                daemon.report_resource_replication_failure(&peer, T::API_PATHS.kind, error).await;
+                                daemon.report_resource_replication_failure(&peer, &store.health_kind::<T>(), error).await;
                             }
                             result
                         }
@@ -274,7 +323,7 @@ fn spawn_kind<T: Resource>(
                 supervise_kind(
                     peer,
                     generation,
-                    T::API_PATHS.kind,
+                    &store.health_kind::<T>(),
                     cancellation,
                     REPLICATION_RETRY,
                     || async { Ok(()) },
@@ -283,9 +332,9 @@ fn spawn_kind<T: Resource>(
                         let daemon = Arc::clone(&run_daemon);
                         let peer = run_peer.clone();
                         async move {
-                            let result = replicate_kind_over_routed_watch::<T>(&router, &daemon, &peer).await;
+                            let result = replicate_kind_over_routed_watch::<T>(&router, &daemon, &peer, store).await;
                             if let Err(error) = &result {
-                                daemon.report_resource_replication_failure(&peer, T::API_PATHS.kind, error).await;
+                                daemon.report_resource_replication_failure(&peer, &store.health_kind::<T>(), error).await;
                             }
                             result
                         }
@@ -297,7 +346,12 @@ fn spawn_kind<T: Resource>(
     });
 }
 
-async fn replicate_relay_over_http<T: Resource>(http: HttpBackend, daemon: &Arc<InProcessDaemon>, peer: &NodeId) -> Result<(), String> {
+async fn replicate_relay_over_http<T: Resource>(
+    http: HttpBackend,
+    daemon: &Arc<InProcessDaemon>,
+    peer: &NodeId,
+    store: ReplicationStore,
+) -> Result<(), String> {
     let mut watch = http.watch_replica_sources_typed::<T>(REPLICATION_NAMESPACE).await.map_err(|error| error.to_string())?;
     while let Some(event) = watch.next().await {
         let event = event.map_err(|error| error.to_string())?;
@@ -310,8 +364,8 @@ async fn replicate_relay_over_http<T: Resource>(http: HttpBackend, daemon: &Arc<
             }
             tombstone.annotations.remove("flotilla.work/origin-root");
             tombstone.annotations.remove("flotilla.work/last-synced-at");
-            daemon
-                .resource_backend()
+            store
+                .backend(daemon)
                 .replica_writer::<T>(origin_root, REPLICATION_NAMESPACE)
                 .apply(WatchEvent::DeletedByName(tombstone), last_synced_at)
                 .await
@@ -337,8 +391,8 @@ async fn replicate_relay_over_http<T: Resource>(http: HttpBackend, daemon: &Arc<
             StoredRelayEventKind::Modified => WatchEvent::Modified(source.object),
             StoredRelayEventKind::Deleted => WatchEvent::Deleted(source.object),
         };
-        daemon
-            .resource_backend()
+        store
+            .backend(daemon)
             .replica_writer::<T>(origin_root, REPLICATION_NAMESPACE)
             .apply(event, last_synced_at)
             .await
@@ -357,7 +411,7 @@ enum StoredRelayEventKind {
 async fn supervise_kind<I, S, SourceFut, F, Fut>(
     peer: NodeId,
     generation: u64,
-    kind: &'static str,
+    kind: &str,
     cancellation: CancellationToken,
     retry: RetryBackoff,
     mut source: S,
@@ -399,14 +453,15 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
     http: HttpBackend,
     daemon: &Arc<InProcessDaemon>,
     peer: &NodeId,
+    store: ReplicationStore,
 ) -> Result<(), String> {
     let remote = ResourceBackend::Http(http).using::<T>(REPLICATION_NAMESPACE);
-    let writer = daemon.resource_backend().replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
+    let writer = store.backend(daemon).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let mut listed = remote.list().await.map_err(|error| error.to_string())?;
     // Validate the persisted cache before trusting its cursor. The SQLite
     // backend quarantines an undecodable replica partition and removes this
     // cursor, turning a cache schema mismatch into the full relist below.
-    daemon.resource_backend().including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
+    store.backend(daemon).including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
     let cursor = writer.cursor().await.map_err(|error| error.to_string())?;
     if let Some(cursor) = cursor.clone().filter(|cursor| cursor.generation == listed.generation) {
         let start = match cursor.generation {
@@ -415,7 +470,7 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
         };
         match remote.watch(start).await {
             Ok(watch) => {
-                daemon.report_resource_replication_healthy(peer, T::API_PATHS.kind).await;
+                daemon.report_resource_replication_healthy(peer, &store.health_kind::<T>()).await;
                 match apply_http_watch(watch, &writer).await {
                     Ok(()) => return Ok(()),
                     Err(error) => {
@@ -441,7 +496,7 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
     let start = WatchStart::resuming_from(&listed);
     writer.replace(&listed, Utc::now()).await.map_err(|error| error.to_string())?;
     let watch = remote.watch(start).await.map_err(|error| error.to_string())?;
-    daemon.report_resource_replication_healthy(peer, T::API_PATHS.kind).await;
+    daemon.report_resource_replication_healthy(peer, &store.health_kind::<T>()).await;
     apply_http_watch(watch, &writer).await
 }
 
@@ -460,17 +515,18 @@ async fn replicate_kind_over_routed_watch<T: Resource>(
     router: &RemoteCommandRouter,
     daemon: &Arc<InProcessDaemon>,
     peer: &NodeId,
+    store: ReplicationStore,
 ) -> Result<(), String> {
-    let writer = daemon.resource_backend().replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
-    daemon.resource_backend().including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
+    let writer = store.backend(daemon).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
+    store.backend(daemon).including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
     let cursor = writer.cursor().await.map_err(|error| error.to_string())?;
-    match run_routed_watch::<T>(router, daemon, peer, cursor.clone()).await {
+    match run_routed_watch::<T>(router, daemon, peer, cursor.clone(), store).await {
         Ok(()) => Ok(()),
         Err(error)
             if cursor.is_some() && (error.contains("expired") || error.contains("generation") || error.contains("resourceVersion")) =>
         {
             debug!(%peer, kind = T::API_PATHS.kind, %error, "replica cursor rejected; relisting origin");
-            run_routed_watch::<T>(router, daemon, peer, None).await
+            run_routed_watch::<T>(router, daemon, peer, None, store).await
         }
         Err(error) => Err(error),
     }
@@ -482,6 +538,7 @@ async fn run_routed_watch<T: Resource>(
     daemon: &Arc<InProcessDaemon>,
     peer: &NodeId,
     cursor: Option<flotilla_resources::ReplicaCursor>,
+    store: ReplicationStore,
 ) -> Result<(), String> {
     let resuming = cursor.is_some();
     let protocol_cursor = cursor.map(|cursor| ResourceCursor::from_position(cursor.resource_version, cursor.generation));
@@ -494,7 +551,7 @@ async fn run_routed_watch<T: Resource>(
                 context_repo: None,
                 action: CommandAction::ResourceWatch {
                     namespace: REPLICATION_NAMESPACE.to_string(),
-                    kind: T::API_PATHS.plural.to_string(),
+                    kind: store.kind::<T>(),
                     name: None,
                     include_replicas: false,
                     replica_sources: false,
@@ -504,8 +561,8 @@ async fn run_routed_watch<T: Resource>(
             None,
         )
         .await?;
-    daemon.report_resource_replication_healthy(peer, T::API_PATHS.kind).await;
-    let writer = daemon.resource_backend().replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
+    daemon.report_resource_replication_healthy(peer, &store.health_kind::<T>()).await;
+    let writer = store.backend(daemon).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let mut initial = Vec::<ResourceObject<T>>::new();
     let mut initializing = !resuming;
 
@@ -546,6 +603,7 @@ async fn replicate_relay_over_routed_watch<T: Resource>(
     router: &RemoteCommandRouter,
     daemon: &Arc<InProcessDaemon>,
     peer: &NodeId,
+    store: ReplicationStore,
 ) -> Result<(), String> {
     let mut events = daemon.subscribe();
     let command_id = router
@@ -556,7 +614,7 @@ async fn replicate_relay_over_routed_watch<T: Resource>(
                 context_repo: None,
                 action: CommandAction::ResourceWatch {
                     namespace: REPLICATION_NAMESPACE.to_string(),
-                    kind: T::API_PATHS.plural.to_string(),
+                    kind: store.kind::<T>(),
                     name: None,
                     include_replicas: false,
                     replica_sources: true,
@@ -577,7 +635,7 @@ async fn replicate_relay_over_routed_watch<T: Resource>(
                     continue;
                 };
                 if response.resource_kind == T::API_PATHS.kind {
-                    apply_relay_response::<T>(daemon, peer, *response).await?;
+                    apply_relay_response::<T>(daemon, peer, *response, store).await?;
                 }
             }
             Ok(DaemonEvent::CommandFinished { command_id: event_command_id, result, .. }) if event_command_id == command_id => {
@@ -602,6 +660,7 @@ async fn apply_relay_response<T: Resource>(
     daemon: &Arc<InProcessDaemon>,
     peer: &NodeId,
     response: ResourceReadEnvelope,
+    store: ReplicationStore,
 ) -> Result<(), String> {
     for record in response.records {
         let Some(event) = record_watch_event::<T>(record)? else {
@@ -624,8 +683,8 @@ async fn apply_relay_response<T: Resource>(
                         .map(|value| value.with_timezone(&Utc))
                         .map_err(|error| format!("decode relayed tombstone sync timestamp: {error}"))
                 })?;
-            daemon
-                .resource_backend()
+            store
+                .backend(daemon)
                 .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
                 .apply(WatchEvent::DeletedByName(tombstone), synced_at)
                 .await
@@ -664,8 +723,8 @@ async fn apply_relay_response<T: Resource>(
             WatchEvent::Deleted(object) => WatchEvent::Deleted(strip(object)),
             WatchEvent::DeletedByName(_) => unreachable!("handled above"),
         };
-        daemon
-            .resource_backend()
+        store
+            .backend(daemon)
             .replica_writer::<T>(origin, REPLICATION_NAMESPACE)
             .apply(event, synced_at)
             .await

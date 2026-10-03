@@ -11,7 +11,7 @@ use flotilla_resources::{
 use flotilla_test_support::TestSocketDir;
 use tokio::{io::AsyncReadExt, net::UnixListener, task::JoinSet};
 
-use super::{replicate_kind_over_http, replicate_relay_over_http};
+use super::{replicate_kind_over_http, replicate_relay_over_http, ReplicationStore};
 use crate::server::resource_http::serve_resource_http;
 
 async fn await_template(daemon: &InProcessDaemon, name: &str, expected: &WorkflowTemplateSpec) {
@@ -174,10 +174,18 @@ async fn governor_relay_contract(storage: TestBackend) {
         let peer = roots[source].0.node_id().clone();
         let path = roots[source].1.clone();
         tasks.spawn(async move {
-            let direct =
-                replicate_kind_over_http::<WorkflowTemplate>(HttpBackend::from_unix_socket(&path).expect("HTTP client"), &daemon, &peer);
-            let relay =
-                replicate_relay_over_http::<WorkflowTemplate>(HttpBackend::from_unix_socket(&path).expect("HTTP client"), &daemon, &peer);
+            let direct = replicate_kind_over_http::<WorkflowTemplate>(
+                HttpBackend::from_unix_socket(&path).expect("HTTP client"),
+                &daemon,
+                &peer,
+                ReplicationStore::Durable,
+            );
+            let relay = replicate_relay_over_http::<WorkflowTemplate>(
+                HttpBackend::from_unix_socket(&path).expect("HTTP client"),
+                &daemon,
+                &peer,
+                ReplicationStore::Durable,
+            );
             tokio::select! {
                 result = direct => panic!("direct replication ended: {result:?}"),
                 result = relay => panic!("relay ended: {result:?}"),
@@ -216,4 +224,112 @@ async fn governor_relay_contract(storage: TestBackend) {
     // Also cover a record first authored after all watches are already live.
     templates.apply(&InputMeta::builder().name("late-governor".to_string()).build(), &workflow).await.expect("author late template");
     await_template(udder, "late-governor", &workflow).await;
+}
+
+// #742: observation replication uses the production HTTP path, retains its
+// origin across a relay, and removes deleted facts without persisting them.
+#[tokio::test]
+async fn observed_checkout_http_relay_keeps_ephemeral_origin_and_deletes() {
+    use flotilla_resources::{Checkout, CheckoutSpec, ObservedCheckoutSpec, RepositoryKey};
+
+    let temp = tempfile::tempdir().expect("temporary configs");
+    let sockets = TestSocketDir::new();
+    let mut roots = Vec::new();
+    let mut tasks = JoinSet::new();
+    for host in ["feta", "kiwi", "udder"] {
+        let config_path = temp.path().join(host);
+        std::fs::create_dir_all(&config_path).expect("config directory");
+        std::fs::write(config_path.join("daemon.toml"), format!("machine_id = \"{host}\"\n")).expect("machine identity");
+        let daemon =
+            InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(config_path)), fake_discovery(false), HostName::new(host)).await;
+        let path = sockets.socket_path(&format!("{host}.sock"));
+        let listener = UnixListener::bind(&path).expect("bind resource API");
+        let server_daemon = Arc::clone(&daemon);
+        tasks.spawn(async move {
+            let mut requests = JoinSet::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept resource request");
+                let daemon = Arc::clone(&server_daemon);
+                requests.spawn(async move {
+                    if let Ok(first) = stream.read_u8().await {
+                        let _ = crate::server::resource_http::serve_resource_http_with_daemon(
+                            stream,
+                            first,
+                            daemon.resource_backend(),
+                            Some(daemon),
+                        )
+                        .await;
+                    }
+                });
+            }
+        });
+        roots.push((daemon, path));
+    }
+    let origin = &roots[0].0;
+    let checkouts = origin.observed_resource_backend().using::<Checkout>("flotilla");
+    let spec = CheckoutSpec::Observed(ObservedCheckoutSpec {
+        path: "/srv/widgets".into(),
+        r#ref: "main".into(),
+        repo_ref: RepositoryKey("widgets".into()),
+        host_ref: "feta".into(),
+        is_main: true,
+    });
+    checkouts.create(&InputMeta::builder().name("remote-checkout".to_string()).build(), &spec).await.expect("publish checkout");
+    for (holder, source) in [(1, 0), (2, 1)] {
+        let daemon = Arc::clone(&roots[holder].0);
+        let peer = roots[source].0.node_id().clone();
+        let path = roots[source].1.clone();
+        tasks.spawn(async move {
+            let direct = replicate_kind_over_http::<Checkout>(
+                HttpBackend::from_unix_socket(&path).expect("HTTP client").with_path_prefix("observed"),
+                &daemon,
+                &peer,
+                ReplicationStore::Observed,
+            );
+            let relay = replicate_relay_over_http::<Checkout>(
+                HttpBackend::from_unix_socket(&path).expect("HTTP client").with_path_prefix("observed"),
+                &daemon,
+                &peer,
+                ReplicationStore::Observed,
+            );
+            tokio::select! {
+                result = direct => panic!("direct observation replication ended: {result:?}"),
+                result = relay => panic!("observation relay ended: {result:?}"),
+            }
+        });
+    }
+    let consumer = &roots[2].0;
+    let reads = consumer.observed_resource_backend().including_replicas::<Checkout>("flotilla");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = reads.list().await.expect("observation replicas");
+            if let Some(source) = rows.items.first() {
+                assert_eq!(source.object.spec, spec);
+                assert!(matches!(&source.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root == origin.node_id()));
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("observation reaches third host");
+    assert!(consumer
+        .resource_backend()
+        .including_replicas::<Checkout>("flotilla")
+        .list()
+        .await
+        .expect("durable checkouts")
+        .items
+        .is_empty());
+    checkouts.delete("remote-checkout").await.expect("delete observation");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if reads.list().await.expect("observation replicas after delete").items.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("observation delete reaches third host");
 }

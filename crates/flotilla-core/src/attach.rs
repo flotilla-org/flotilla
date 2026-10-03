@@ -7,14 +7,13 @@ use std::{
     sync::Arc,
 };
 
-use async_trait::async_trait;
 use flotilla_protocol::{
     arg::Arg,
     commands::AttachMode,
     qualified_path::HostId,
     result_set::{CheckoutRow, Rows},
     AttachBinding, CanonicalHostId, ConvoyPhase, EnvironmentId, FleetListRow, FleetStaleness, HostName, ResolvedAttachAction,
-    ResolvedAttachPlan, ResultSet,
+    ResolvedAttachPlan,
 };
 use flotilla_resources::{
     terminal_session_attach_target_with_stale_status, Convoy as ResourceConvoy, ConvoyPhase as ResourceConvoyPhase,
@@ -29,7 +28,6 @@ use crate::{
     config::ConfigStore,
     environment_manager::{EnvironmentManager, ManagedEnvironmentKind},
     event_sink::EventSink,
-    fleet::FleetService,
     hop_chain::{
         environment::DockerEnvironmentHopResolver,
         remote::{ssh_resolver_from_config, NoopRemoteHopResolver},
@@ -41,23 +39,6 @@ use crate::{
     project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION,
     providers::{discovery::DiscoveryRuntime, registry::ProviderRegistry, terminal::TerminalSessionLiveness},
 };
-
-/// Read-only fleet replica rows used while building the attach index.
-#[async_trait]
-pub(super) trait FleetRowsSource: Send + Sync {
-    async fn rows(&self) -> Vec<(HostName, Vec<FleetListRow>, Vec<ResultSet>)>;
-}
-
-pub(super) struct CachedFleetRows<'a> {
-    pub(super) fleet: &'a FleetService,
-}
-
-#[async_trait]
-impl FleetRowsSource for CachedFleetRows<'_> {
-    async fn rows(&self) -> Vec<(HostName, Vec<FleetListRow>, Vec<ResultSet>)> {
-        self.fleet.cached_rows_for_configured_hosts().await
-    }
-}
 
 pub(super) struct AttachResolver<'a> {
     // Wired now so future attach operations can publish through the daemon port.
@@ -72,7 +53,6 @@ pub(super) struct AttachResolver<'a> {
     pub(super) local_environment_id: &'a EnvironmentId,
     pub(super) host_name: &'a HostName,
     pub(super) namespace: &'a std::sync::RwLock<String>,
-    pub(super) fleet_rows: Box<dyn FleetRowsSource + 'a>,
 }
 
 impl<'a> AttachResolver<'a> {
@@ -227,7 +207,7 @@ impl<'a> AttachResolver<'a> {
         let observed_sessions = self
             .observed_resource_backend
             .clone()
-            .using::<ResourceTerminalSession>(&namespace)
+            .including_replicas::<ResourceTerminalSession>(&namespace)
             .list()
             .await
             .map_err(|error| error.to_string())?;
@@ -239,10 +219,11 @@ impl<'a> AttachResolver<'a> {
                 }
             }
         }
-        for session in observed_sessions.items {
+        for source in observed_sessions.items {
+            let session = source.object;
             if session.status.as_ref().and_then(|status| status.session_id.as_ref()).is_some() {
                 if let Some(convoy) = session.metadata.labels.get(CONVOY_LABEL).cloned() {
-                    sessions_by_convoy.entry(convoy).or_default().push((session, ResourceProvenance::Local));
+                    sessions_by_convoy.entry(convoy).or_default().push((session, source.provenance));
                 }
             }
         }
@@ -403,7 +384,7 @@ impl<'a> AttachResolver<'a> {
             .into_iter()
             .map(|source| {
                 let address = convoy_address(&source.object.spec.role, source.object.spec.project_ref.as_deref());
-                (source.object.metadata.name, address)
+                ((source.object.metadata.namespace, source.object.metadata.name, replica_origin(&source.provenance).cloned()), address)
             })
             .collect::<HashMap<_, _>>();
         let durable_sessions = self
@@ -416,7 +397,7 @@ impl<'a> AttachResolver<'a> {
         let observed_sessions = self
             .observed_resource_backend
             .clone()
-            .using::<ResourceTerminalSession>(&namespace)
+            .including_replicas::<ResourceTerminalSession>(&namespace)
             .list()
             .await
             .map_err(|err| err.to_string())?
@@ -432,11 +413,24 @@ impl<'a> AttachResolver<'a> {
             }
         }
         for session in observed_sessions {
-            sessions_by_name.insert(session.metadata.name.clone(), session);
+            match session.provenance {
+                ResourceProvenance::Local => {
+                    sessions_by_name.entry(session.object.metadata.name.clone()).or_insert(session.object);
+                }
+                ResourceProvenance::Replica { .. } => {
+                    if !replicated_sessions.iter().any(|durable| {
+                        durable.object.metadata.namespace == session.object.metadata.namespace
+                            && durable.object.metadata.name == session.object.metadata.name
+                            && replica_origin(&durable.provenance) == replica_origin(&session.provenance)
+                    }) {
+                        replicated_sessions.push(session);
+                    }
+                }
+            }
         }
         let mut candidates = Vec::new();
         for session in sessions_by_name.into_values() {
-            let convoy_address = session.metadata.labels.get(CONVOY_LABEL).and_then(|name| convoy_addresses.get(name));
+            let convoy_address = session_convoy_address(&session, None, &convoy_addresses);
             candidates.push(AttachCandidate {
                 label: attach_reference_label(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
                 references: attach_reference_keys(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
@@ -444,7 +438,6 @@ impl<'a> AttachResolver<'a> {
                 target: AttachTarget::Local(Box::new(session)),
             });
         }
-        let mut indexed_remote_sessions = HashSet::new();
         for replicated in replicated_sessions {
             let session = replicated.object;
             let ResourceProvenance::Replica { origin_root, .. } = replicated.provenance else {
@@ -453,13 +446,18 @@ impl<'a> AttachResolver<'a> {
             let Some(host) = self.host_registry.live_routed_host_name(&origin_root).await else {
                 continue;
             };
-            indexed_remote_sessions.insert((host.clone(), session.metadata.name.clone()));
-            let convoy_address = session.metadata.labels.get(CONVOY_LABEL).and_then(|name| convoy_addresses.get(name));
+            let convoy_address = session_convoy_address(&session, Some(&origin_root), &convoy_addresses);
             let convoy = session.metadata.labels.get(CONVOY_LABEL).cloned().unwrap_or_else(|| "-".to_string());
             let role = session.metadata.labels.get(ROLE_LABEL).cloned().unwrap_or_else(|| session.spec.role.clone());
             let crew = session.metadata.labels.get(VESSEL_LABEL).map_or_else(|| role.clone(), |vessel| format!("{vessel}/{role}"));
+            let independent = !session.metadata.labels.contains_key(CONVOY_LABEL);
+            if independent && session.status.as_ref().is_none_or(|status| status.phase != flotilla_resources::TerminalSessionPhase::Running)
+            {
+                continue;
+            }
             let row = FleetListRow::builder()
-                .convoy(convoy)
+                .convoy(convoy_address.cloned().unwrap_or_else(|| convoy.clone()).replace("@", " @ "))
+                .maybe_convoy_ref((!independent).then_some(convoy))
                 .vessel(session.spec.env_ref.clone())
                 .crew(crew)
                 .crew_state("running")
@@ -469,8 +467,8 @@ impl<'a> AttachResolver<'a> {
                 .staleness(FleetStaleness::Local)
                 .build();
             candidates.push(AttachCandidate {
-                label: attach_reference_label(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
-                references: attach_reference_keys(&session.metadata.name, &session.metadata.labels, convoy_address.map(String::as_str)),
+                label: if independent { format!("{} ({host})", session.metadata.name) } else { fleet_row_attach_reference_label(&row) },
+                references: if independent { vec![session.metadata.name.clone()] } else { fleet_row_attach_reference_keys(&row) },
                 host,
                 target: AttachTarget::Replica { row: Box::new(row) },
             });
@@ -491,56 +489,6 @@ impl<'a> AttachResolver<'a> {
             }));
         }
 
-        for (host, rows, result_sets) in self.fleet_rows.rows().await {
-            let independent_references = result_sets
-                .iter()
-                .filter_map(|result_set| result_set.rows.as_independents())
-                .flatten()
-                .filter_map(|row| row.attach.as_deref())
-                .collect::<HashSet<_>>();
-            let mut indexed_sessions = HashSet::new();
-            for row in &rows {
-                let Some(session) = &row.session else { continue };
-                if indexed_remote_sessions.contains(&(row.host.clone(), session.clone())) {
-                    continue;
-                }
-                if independent_references.contains(session.as_str()) {
-                    continue;
-                }
-                indexed_sessions.insert(session.clone());
-                candidates.push(AttachCandidate {
-                    label: fleet_row_attach_reference_label(row),
-                    references: fleet_row_attach_reference_keys(row),
-                    host: row.host.clone(),
-                    target: AttachTarget::Replica { row: Box::new(row.clone()) },
-                });
-            }
-            for result_set in &result_sets {
-                let Rows::Independents { scope: None, rows } = &result_set.rows else { continue };
-                for row in rows {
-                    let Some(reference) = &row.attach else { continue };
-                    if row.phase != flotilla_protocol::SessionPhase::Running || !indexed_sessions.insert(reference.clone()) {
-                        continue;
-                    }
-                    let fleet_row = FleetListRow::builder()
-                        .convoy("-")
-                        .vessel("-")
-                        .crew("-")
-                        .crew_state("running")
-                        .host(host.clone())
-                        .namespace(row.resource.namespace.clone())
-                        .session(reference.clone())
-                        .staleness(FleetStaleness::Local)
-                        .build();
-                    candidates.push(AttachCandidate {
-                        label: format!("{} ({host})", row.name),
-                        references: vec![reference.clone()],
-                        host: host.clone(),
-                        target: AttachTarget::Replica { row: Box::new(fleet_row) },
-                    });
-                }
-            }
-        }
         Ok(AttachCandidateIndex::new(candidates))
     }
 
@@ -855,6 +803,34 @@ fn attach_reference_label(session_name: &str, labels: &BTreeMap<String, String>,
     }
 }
 
+type ConvoyAddresses = HashMap<(String, String, Option<flotilla_protocol::NodeId>), String>;
+
+fn session_convoy_address<'a>(
+    session: &flotilla_resources::ResourceObject<ResourceTerminalSession>,
+    origin: Option<&flotilla_protocol::NodeId>,
+    addresses: &'a ConvoyAddresses,
+) -> Option<&'a String> {
+    let name = session.metadata.labels.get(CONVOY_LABEL)?;
+    if let Some(address) = addresses.get(&(session.metadata.namespace.clone(), name.clone(), origin.cloned())) {
+        return Some(address);
+    }
+    // A placed session can belong to a convoy authored by another origin.
+    // Resolve that cross-origin reference only when its address is unambiguous.
+    let mut matches = addresses
+        .iter()
+        .filter(|((namespace, convoy, _), _)| namespace == &session.metadata.namespace && convoy == name)
+        .map(|(_, address)| address);
+    let address = matches.next()?;
+    matches.all(|candidate| candidate == address).then_some(address)
+}
+
+fn replica_origin(provenance: &ResourceProvenance) -> Option<&flotilla_protocol::NodeId> {
+    match provenance {
+        ResourceProvenance::Local => None,
+        ResourceProvenance::Replica { origin_root, .. } => Some(origin_root),
+    }
+}
+
 fn fleet_row_attach_reference_keys(row: &FleetListRow) -> Vec<String> {
     let address = row.convoy.replace(" @ ", "@");
     let mut refs = vec![address.clone(), row.vessel.clone(), row.crew.clone()];
@@ -1066,15 +1042,6 @@ mod tests {
         in_process::tests::{create_identity_convoy, create_running_session, create_test_environment, standing_ensure_fixture, test_meta},
     };
 
-    struct FakeFleetRows(Vec<(HostName, Vec<FleetListRow>, Vec<ResultSet>)>);
-
-    #[async_trait]
-    impl FleetRowsSource for FakeFleetRows {
-        async fn rows(&self) -> Vec<(HostName, Vec<FleetListRow>, Vec<ResultSet>)> {
-            self.0.clone()
-        }
-    }
-
     #[test]
     fn recursive_attach_preserves_take_preference_and_explicit_watch() {
         let host = HostName::new("udder");
@@ -1125,8 +1092,7 @@ mod tests {
         create_running_session(&daemon, &environment, "governor-session", "convoy-andamento", "governor").await;
         create_running_session(&daemon, &environment, "flotilla-governor-session", "convoy-flotilla", "governor").await;
 
-        let mut resolver = daemon.attach_resolver();
-        resolver.fleet_rows = Box::new(FakeFleetRows(Vec::new()));
+        let resolver = daemon.attach_resolver();
 
         let contextual = resolver
             .resolve_attach("governor", None, false, AttachMode::Default, Some("andamento"))
@@ -1205,8 +1171,7 @@ mod tests {
         status.phase = ResourceTerminalSessionPhase::Lost;
         sessions.update_status("coder-session", &session.metadata.resource_version, &status).await.expect("stale session status");
 
-        let mut resolver = daemon.attach_resolver();
-        resolver.fleet_rows = Box::new(FakeFleetRows(Vec::new()));
+        let resolver = daemon.attach_resolver();
         for reference in ["coder", "coder@flotilla", "convoy-failed", "coder-session"] {
             let resolved = resolver.resolve_attach(reference, None, false, AttachMode::Default, None).await.expect(reference);
             assert_eq!(resolved.binding.as_ref().and_then(|binding| binding.convoy_phase), Some(flotilla_protocol::ConvoyPhase::Failed));
@@ -1240,8 +1205,7 @@ mod tests {
         create_running_session(&daemon, &environment, "terminal-old", "convoy-old", "coder").await;
         create_running_session(&daemon, &environment, "terminal-new", "convoy-new", "coder").await;
 
-        let mut resolver = daemon.attach_resolver();
-        resolver.fleet_rows = Box::new(FakeFleetRows(Vec::new()));
+        let resolver = daemon.attach_resolver();
         let resolved = resolver.resolve_attach("coder", None, false, AttachMode::Default, None).await.expect("newest generation");
         assert_eq!(resolved.binding.and_then(|binding| binding.session), Some("terminal-new".to_string()));
         let old = resolver.resolve_attach("convoy-old", None, false, AttachMode::Default, None).await.expect("explicit old generation");
@@ -1288,33 +1252,12 @@ mod tests {
         create_running_session(&daemon, &environment, "terminal-gone", "convoy-gone", "coder").await;
         backend.using::<ResourceTerminalSession>("flotilla").delete("terminal-gone").await.expect("delete terminal session");
 
-        let mut resolver = daemon.attach_resolver();
-        resolver.fleet_rows = Box::new(FakeFleetRows(Vec::new()));
+        let resolver = daemon.attach_resolver();
         let error = resolver.resolve_attach("terminal-gone", None, false, AttachMode::Default, None).await.expect_err("gone session");
         assert_eq!(error, format!("session terminal-gone no longer exists on {}", daemon.host_name));
         let error = resolver.resolve_attach("convoy-gone", None, false, AttachMode::Default, None).await.expect_err("gone convoy session");
         assert_eq!(error, format!("session for convoy-gone no longer exists on {}", daemon.host_name));
         let error = resolver.resolve_attach("coder@flotilla", None, false, AttachMode::Default, None).await.expect_err("gone role session");
         assert_eq!(error, format!("session for coder@flotilla no longer exists on {}", daemon.host_name));
-    }
-    #[tokio::test]
-    async fn candidate_index_reads_fleet_rows_from_its_source() {
-        let (daemon, _backend, _clock, _temp) = standing_ensure_fixture().await;
-        let host = HostName::new("remote");
-        let row = FleetListRow::builder()
-            .convoy("reviewer @ flotilla")
-            .convoy_ref("convoy-opaque")
-            .vessel("vessel-opaque")
-            .crew("implement/coder")
-            .crew_state("failed")
-            .host(host.clone())
-            .namespace("flotilla")
-            .session("remote-session")
-            .staleness(FleetStaleness::Local)
-            .build();
-        let mut resolver = daemon.attach_resolver();
-        resolver.fleet_rows = Box::new(FakeFleetRows(vec![(host.clone(), vec![row], Vec::new())]));
-        let index = resolver.attach_candidate_index().await.expect("index");
-        assert!(index.exact.contains_key("remote-session"));
     }
 }

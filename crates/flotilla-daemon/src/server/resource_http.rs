@@ -48,6 +48,14 @@ pub(super) async fn serve_resource_http_with_daemon(
     }
 
     let (path, raw_query) = target.split_once('?').unwrap_or((target, ""));
+    let (path, backend) = if let Some(path) = path.strip_prefix("/observed") {
+        let Some(daemon) = &daemon else {
+            return write_error(&mut stream, 404, "observed resource store unavailable").await;
+        };
+        (path, daemon.observed_resource_backend())
+    } else {
+        (path, backend)
+    };
     if path == "/apis/flotilla.work/v1" {
         let namespaces = match registered_resource_namespaces(&backend).await {
             Ok(namespaces) => namespaces,

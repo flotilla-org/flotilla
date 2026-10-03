@@ -4219,12 +4219,11 @@ fn spawn_aggregator_task(
             let state = state.clone();
             let issue_polling = issue_polling.clone();
             async move {
-                let mut aggregator = Aggregator::new(state, daemon.host_name().clone(), daemon.event_sender())
+                let aggregator = Aggregator::new(state, daemon.host_name().clone(), daemon.event_sender())
                     .with_attach_resolver(Arc::clone(&daemon))
                     .with_change_request_resolver(Arc::clone(&daemon))
                     .with_issue_resolver(Arc::clone(&daemon))
                     .with_issue_polling_health(issue_polling);
-                aggregator.apply_replica_cache(daemon.cached_fleet_replica_snapshots().await).await;
                 aggregator
                     .run(
                         AggregatorResolvers::builder()
@@ -4239,8 +4238,9 @@ fn spawn_aggregator_task(
                             .durable_regards(durable.using::<Regard>(&namespace))
                             .observed_convoys(observed.clone().using::<Convoy>(&namespace))
                             .observed_presentations(observed.using::<Presentation>(&namespace))
-                            .observed_sessions(observed.using::<flotilla_resources::TerminalSession>(&namespace))
+                            .observed_sessions(observed.including_replicas::<flotilla_resources::TerminalSession>(&namespace))
                             .observed_checkouts(observed.using::<Checkout>(&namespace))
+                            .observed_checkout_replicas(observed.including_replicas::<Checkout>(&namespace))
                             .build(),
                         daemon.subscribe_fleet_replicas(),
                     )

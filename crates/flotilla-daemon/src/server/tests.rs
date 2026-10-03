@@ -55,7 +55,7 @@ use super::{
         extract_command_repo_identity, ForwardedCommand, ForwardedCommandMap, ForwardedCommandState, PendingRemoteCancelMap,
         PendingRemoteCommand, PendingRemoteCommandMap, RemoteCommandRouter,
     },
-    replicator::replicate_kind_over_http,
+    replicator::{replicate_kind_over_http, ReplicationStore},
     request_dispatch::RequestDispatcher,
     resource_http::serve_resource_http,
     shared::{sync_peer_query_state, write_message},
@@ -327,8 +327,9 @@ async fn http_replication_skips_an_old_schema_event_and_reaches_unrelated_resour
     let http = HttpBackend::from_unix_socket(&socket_path).expect("build resource HTTP client");
     let holder_for_replication = Arc::clone(&holder);
     let origin_for_replication = origin_root.clone();
-    let replicator =
-        tokio::spawn(async move { replicate_kind_over_http::<Convoy>(http, &holder_for_replication, &origin_for_replication).await });
+    let replicator = tokio::spawn(async move {
+        replicate_kind_over_http::<Convoy>(http, &holder_for_replication, &origin_for_replication, ReplicationStore::Durable).await
+    });
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -442,8 +443,9 @@ async fn http_replicator_relists_after_an_origin_generation_change() {
     let http = HttpBackend::from_unix_socket(&socket_path).expect("build replicator HTTP client");
     let holder_for_replication = Arc::clone(&holder);
     let origin_for_replication = origin_root.clone();
-    let replicator =
-        tokio::spawn(async move { replicate_kind_over_http::<Convoy>(http, &holder_for_replication, &origin_for_replication).await });
+    let replicator = tokio::spawn(async move {
+        replicate_kind_over_http::<Convoy>(http, &holder_for_replication, &origin_for_replication, ReplicationStore::Durable).await
+    });
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -579,8 +581,9 @@ async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
     let http = HttpBackend::from_unix_socket(&socket_path).expect("build replicator HTTP client");
     let holder_for_replication = Arc::clone(&holder);
     let origin_for_replication = origin_root.clone();
-    let replicator =
-        tokio::spawn(async move { replicate_kind_over_http::<Convoy>(http, &holder_for_replication, &origin_for_replication).await });
+    let replicator = tokio::spawn(async move {
+        replicate_kind_over_http::<Convoy>(http, &holder_for_replication, &origin_for_replication, ReplicationStore::Durable).await
+    });
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
