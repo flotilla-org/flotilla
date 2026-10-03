@@ -38,6 +38,7 @@ INSTALL_LOCK_PATH=""
 INSTALL_LOCK_OWNER=""
 INSTALL_LOCK_HELD=0
 DAEMON_SERVICE_DISABLED=0
+DARWIN_RECOVERY_GENERATION=""
 CONFIRMATION_PID=""
 CONFIRMATION_LOG=""
 CONFIRMATION_DONE=""
@@ -49,6 +50,16 @@ die() {
 }
 
 cleanup() {
+  local status=$?
+  # Before the generation flip there is no health watchdog to restore launchd.
+  # Keep recovery armed across stop errors and catchable interruptions.
+  if [[ -n "$DARWIN_RECOVERY_GENERATION" && "$(current_generation)" == "$DARWIN_RECOVERY_GENERATION" ]]; then
+    if ! restart_darwin_daemon_service; then
+      printf 'fleet-install: could not restore the previous launch agent; bootstrap %s and retry fleet-install\n' \
+        "$LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist" >&2
+      status=1
+    fi
+  fi
   [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
   if ((INSTALL_LOCK_HELD)); then
     python3 - "$INSTALL_LOCK_PATH" "$INSTALL_LOCK_OWNER" <<'PY'
@@ -64,8 +75,11 @@ except FileNotFoundError:
 PY
   fi
   [[ -z "$CONFIRMATION_DONE" ]] || touch -- "$CONFIRMATION_DONE"
+  return "$status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 host_platform() {
   local system="${FLEET_INSTALL_UNAME_S:-$(uname -s)}"
@@ -686,6 +700,9 @@ prepare_darwin_daemon_service() {
   # Unload before publishing the refreshed plist. Enabled clients then defer
   # to launchd, whose kickstart cannot race the generation flip while the job
   # is absent from the domain.
+  if ((!DAEMON_SERVICE_DISABLED)); then
+    DARWIN_RECOVERY_GENERATION="$(current_generation)"
+  fi
   launchctl bootout "$domain/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
   write_launchd_agent
 }
@@ -700,9 +717,13 @@ restart_darwin_daemon_service() {
   local domain="gui/$(id -u)"
   local target="$domain/$LAUNCH_AGENT_LABEL"
   local plist="$LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist"
-  launchctl enable "$target"
-  launchctl bootstrap "$domain" "$plist"
-  launchctl kickstart -k "$target"
+  launchctl enable "$target" || return 1
+  # A failed bootout may have left the job registered. Bootstrap only if absent.
+  if ! launchctl print "$target" >/dev/null 2>&1; then
+    launchctl bootstrap "$domain" "$plist" || return 1
+  fi
+  launchctl kickstart -k "$target" || return 1
+  DARWIN_RECOVERY_GENERATION=""
 }
 
 probe_daemon_health() {
@@ -880,7 +901,15 @@ daemon_preflight() {
   fi
   [[ -n "$cli" ]] || die 'flotillad is running; install a usable flotilla command and run `flotilla daemon stop`'
   if ! "$cli" daemon stop; then
+    # The process can exit between the initial probe and the stop request.
+    if ! pgrep -u "$(id -u)" -x flotillad >/dev/null 2>&1; then
+      printf 'fleet-install: daemon is no longer running; continuing installation\n'
+      return 0
+    fi
     printf -v invocation '%q daemon stop' "$cli"
+    if [[ "$PLATFORM" == darwin-* ]] && ((!DAEMON_SERVICE_DISABLED)); then
+      die "flotillad is still running and could not be stopped; restoring the previous launch agent; resolve the stop failure, then retry fleet-install"
+    fi
     die "flotillad is running and could not be stopped; run \`$invocation\`, then retry"
   fi
 }

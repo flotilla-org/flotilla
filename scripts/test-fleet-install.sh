@@ -183,6 +183,18 @@ add_darwin_derivative() {
   mkdir -p "$bundle/bin" "$bundle/lib"
   for name in flotilla flotillad cleat; do
     printf '#!/usr/bin/env bash\nif [[ "%s" == flotilla && "${1:-}" == --json && "${2:-}" == fleet ]]; then\n  [[ "${FLEET_HEALTH_FAIL_FOR:-}" != "%s" ]] || exit 1\n  printf '\''{"kind":"fleet_health","hosts":[{"host":"test","is_local":true,"daemon_generation":"%s"}],"dispatch_queue":{"entries":[]}}\\n'\''\n  exit 0\nfi\nprintf "%s signed for %s\\n"\n' "$name" "$generation" "$generation" "$name" "$generation" >"$bundle/bin/$name"
+    if [[ "$name" == flotilla ]]; then
+      cat >>"$bundle/bin/$name" <<'SH'
+if [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then
+  if [[ "${STOP_DISAPPEARS:-0}" == 1 ]]; then rm -f "$LAUNCHCTL_STATE.running"; exit 1; fi
+  [[ "${STOP_FAIL:-0}" == 0 ]] || exit 1
+  rm -f "$LAUNCHCTL_STATE.running"
+fi
+if [[ "${1:-}" == --socket && "${3:-}" == resource && "${4:-}" == validate ]]; then
+  [[ "${FLEET_VALIDATE_FAIL_FOR:-}" != "$(basename "$(dirname "$(dirname "$0")")")" ]] || exit 1
+fi
+SH
+    fi
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty signed\n' >"$bundle/lib/libghostty-vt.dylib"
@@ -349,7 +361,11 @@ chmod 0755 "$fake_bin/curl"
 
 cat >"$fake_bin/pgrep" <<'SH'
 #!/usr/bin/env bash
-[[ "${DAEMON_RUNNING:-0}" == 1 ]]
+if [[ -n "${LAUNCHCTL_STATE:-}" ]]; then
+  [[ -f "$LAUNCHCTL_STATE.running" ]]
+else
+  [[ "${DAEMON_RUNNING:-0}" == 1 ]]
+fi
 SH
 chmod 0755 "$fake_bin/pgrep"
 
@@ -406,6 +422,25 @@ if [[ -L "$FLEET_INSTALL_ROOT/current" ]]; then
   current="$(readlink "$FLEET_INSTALL_ROOT/current")"
 fi
 printf '%s|%s\n' "$*" "$current" >>"$LAUNCHCTL_LOG"
+# Process boundary double: model launchd registration separately from its process.
+case "$1" in
+  print) [[ -f "$LAUNCHCTL_STATE.loaded" ]] || exit 1 ;;
+  bootout)
+    [[ "${BOOTOUT_FAIL:-0}" == 0 ]] || exit 1
+    rm -f "$LAUNCHCTL_STATE.loaded"
+    [[ "${STOP_FAIL:-0}" == 1 ]] || rm -f "$LAUNCHCTL_STATE.running"
+    if [[ "${ABORT_AFTER_BOOTOUT:-0}" == 1 ]]; then kill -TERM "$PPID"; fi
+    ;;
+  bootstrap)
+    [[ ! -f "$LAUNCHCTL_STATE.loaded" ]] || exit 1
+    touch "$LAUNCHCTL_STATE.loaded"
+    printf '%s\n' "$current" >"$LAUNCHCTL_STATE.running"
+    ;;
+  kickstart)
+    [[ -f "$LAUNCHCTL_STATE.loaded" ]] || exit 1
+    printf '%s\n' "$current" >"$LAUNCHCTL_STATE.running"
+    ;;
+esac
 if [[ "$1" == print-disabled ]]; then
   printf 'disabled services = {\n    "work.flotilla.flotillad" => %s\n}\n' "${LAUNCHD_AGENT_DISABLED:-false}"
 fi
@@ -463,6 +498,7 @@ run_darwin_installer() {
     FIXTURE_ROOT="$fixture_root" \
     CODESIGN_LOG="$test_root/codesign.log" \
     LAUNCHCTL_LOG="$LAUNCHCTL_LOG" \
+    LAUNCHCTL_STATE="$home/launchctl-state" \
     LAUNCHD_AGENT_DISABLED="${LAUNCHD_AGENT_DISABLED:-false}" \
     FAIL_CODESIGN_FOR="${FAIL_CODESIGN_FOR:-}" \
     FLEET_INSTALL_ROOT="$home/.local/opt/flotilla-fleet" \
@@ -774,6 +810,51 @@ darwin_home="$test_root/darwin-home"
 mkdir -p "$darwin_home/.config/flotilla"
 cp "$test_root/home/.config/flotilla/fleet-reader-token" "$darwin_home/.config/flotilla/fleet-reader-token"
 run_darwin_installer "$darwin_home" "$generation_one" >"$test_root/darwin-install-one.out"
+# Refusing validation leaves the old service untouched and available.
+if FLEET_VALIDATE_FAIL_FOR="$generation_two" run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-validation.out" 2>&1; then
+  fail 'Darwin validation refusal was accepted'
+fi
+test -f "$darwin_home/launchctl-state.loaded" || fail 'validation refusal unloaded agent'
+test -f "$darwin_home/launchctl-state.running" || fail 'validation refusal stopped daemon'
+test "$(cat "$darwin_home/launchctl-state.running")" = "releases/$generation_one" || fail 'recovery ran the wrong generation'
+
+# A failed stop must preserve the selected generation and restore a loaded,
+# running launch agent, even though bootout succeeded before the CLI failed.
+if STOP_FAIL=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-stop-failed.out" 2>&1; then
+  fail 'Darwin failed stop was accepted'
+fi
+test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'failed stop switched generation'
+test -f "$darwin_home/launchctl-state.loaded" || fail 'failed stop left launch agent unloaded'
+test -f "$darwin_home/launchctl-state.running" || fail 'failed stop left daemon down'
+test "$(cat "$darwin_home/launchctl-state.running")" = "releases/$generation_one" || fail 'recovery ran the wrong generation'
+
+grep -Fq 'then retry fleet-install' "$test_root/darwin-stop-failed.out" || fail 'failed stop omitted installer retry hint'
+# If launchd refuses bootout, recovery must kickstart the existing registration.
+if BOOTOUT_FAIL=1 STOP_FAIL=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-bootout-failed.out" 2>&1; then
+  fail 'failed bootout and stop were accepted'
+fi
+test -f "$darwin_home/launchctl-state.loaded" || fail 'failed bootout lost registration'
+test -f "$darwin_home/launchctl-state.running" || fail 'failed bootout lost daemon'
+if grep -Fq 'could not restore the previous launch agent' "$test_root/darwin-bootout-failed.out"; then
+  fail 'recovery tried to bootstrap an already loaded agent'
+fi
+
+# Interrupt the incoming installer after it unloads launchd, before the flip.
+if ABORT_AFTER_BOOTOUT=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-abort.out" 2>&1; then
+  fail 'aborted Darwin handoff succeeded'
+fi
+test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'aborted handoff switched generation'
+test -f "$darwin_home/launchctl-state.loaded" || fail 'aborted handoff left agent unloaded'
+test -f "$darwin_home/launchctl-state.running" || fail 'aborted handoff left daemon down'
+test "$(cat "$darwin_home/launchctl-state.running")" = "releases/$generation_one" || fail 'recovery ran the wrong generation'
+
+# An error from the stop CLI with no remaining process is safe to continue.
+if ! STOP_FAIL=1 STOP_DISAPPEARS=1 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-disappeared.out" 2>&1; then
+  fail 'already exited daemon was treated as a failed stop'
+fi
+grep -Fq 'daemon is no longer running' "$test_root/darwin-disappeared.out" || fail 'missing already stopped diagnosis'
+run_darwin_installer "$darwin_home" rollback >/dev/null
+
 : >"$test_root/launchctl.log"
 if FLEET_HEALTH_FAIL_FOR="$generation_two" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=0 \
   run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-health-rollback.out" 2>&1; then
@@ -781,6 +862,9 @@ if FLEET_HEALTH_FAIL_FOR="$generation_two" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS
 fi
 test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
   || fail 'unhealthy Darwin generation did not roll current back'
+test -f "$darwin_home/launchctl-state.loaded" || fail 'health rollback left agent unloaded'
+test -f "$darwin_home/launchctl-state.running" || fail 'health rollback left daemon down'
+test "$(cat "$darwin_home/launchctl-state.running")" = "releases/$generation_one" || fail 'recovery ran the wrong generation'
 grep -Eq "^kickstart -k gui/[0-9]+/work\\.flotilla\\.flotillad\\|releases/$generation_two$" "$test_root/launchctl.log" \
   || fail 'Darwin health check did not start the candidate generation'
 grep -Eq "^kickstart -k gui/[0-9]+/work\\.flotilla\\.flotillad\\|releases/$generation_one$" "$test_root/launchctl.log" \
