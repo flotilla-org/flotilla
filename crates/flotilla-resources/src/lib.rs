@@ -45,6 +45,8 @@ mod principal_attention;
 mod project;
 mod provisioning_identity;
 mod registry;
+#[cfg(test)]
+mod registry_watch_tests;
 mod replica;
 mod repository;
 mod resource;
@@ -251,6 +253,3 @@ pub use workflow_template::{
     RoleHandoff, Selector, StallNudgePolicy, Stance, SubjectVariable, SupervisionTarget, TurnDeliveryRule, TurnDeliveryTarget,
     ValidationError, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };
-
-#[cfg(test)]
-mod registry_watch_tests;

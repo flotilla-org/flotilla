@@ -21,6 +21,7 @@ use std::{
 };
 
 pub use flotilla_client::reconnect::is_incompatible_daemon_error;
+use flotilla_client::reconnect::{is_permanent_daemon_error, ReconnectBackoff};
 use flotilla_core::{
     config::{ssh_destination, ConfigStore},
     daemon::DaemonHandle,
@@ -53,6 +54,7 @@ where
     Connected: FnMut(Arc<dyn DaemonHandle>) -> ConnectedFuture,
     ConnectedFuture: Future<Output = Result<(), String>>,
 {
+    let mut session_backoff = ReconnectBackoff::default();
     loop {
         let daemon = flotilla_client::reconnect::connect_with_retry(&mut connect, |notice| match notice {
             flotilla_client::reconnect::ReconnectNotice::Attempt { attempt } => debug!(attempt, "connecting to daemon"),
@@ -62,14 +64,21 @@ where
         })
         .await?;
         info!("connected to daemon");
+        let connected_at = tokio::time::Instant::now();
         if let Err(error) = run_connected(daemon).await {
             // Resource validation refusals describe a deterministic request error;
             // reconnecting cannot make the same parameters supported.
-            if error.starts_with("invalid resource:") || is_incompatible_daemon_error(&error) {
+            if is_permanent_daemon_error(&error) {
                 return Err(error);
             }
-            info!(%error, "daemon connection ended; reconnecting");
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // A healthy session resets the next retry; repeated short-lived
+            // failures retain the shared exponential cap and jitter.
+            if connected_at.elapsed() >= Duration::from_secs(30) {
+                session_backoff.reset();
+            }
+            let delay = session_backoff.next_delay();
+            info!(%error, ?delay, "daemon connection ended; reconnecting");
+            tokio::time::sleep(delay).await;
         }
     }
 }
@@ -364,8 +373,7 @@ async fn ensure_resource_watches(
                     ResourceWatchRequest::builder().kind((*kind).to_string()).namespace(namespace.clone()).include_replicas(true).build(),
                 )
                 .await?;
-            let initial = watch.next().await?.ok_or_else(|| "subject catalog resource watch ended during bootstrap".to_string())?;
-            state.apply_resource_records(&initial)?;
+            bootstrap_subject_watch(&mut watch, state, &namespace, kind).await?;
             let updates = updates.clone();
             tasks.spawn(async move {
                 loop {
@@ -386,6 +394,36 @@ async fn ensure_resource_watches(
         watched.insert(namespace);
     }
     Ok(())
+}
+
+// The daemon emits snapshot envelopes followed by a bookmark, then live
+// events. Consume through that explicit boundary, allowing fragmentation but
+// refusing live updates or a mismatched scope before setup can publish.
+async fn bootstrap_subject_watch(
+    watch: &mut flotilla_client::resource::ResourceWatch,
+    state: &mut ConnectorState,
+    namespace: &str,
+    plural: &str,
+) -> Result<(), String> {
+    use flotilla_protocol::ResourceRecordType;
+    use flotilla_resources::ResourceError;
+
+    loop {
+        let envelope = watch.next().await?.ok_or_else(|| "subject catalog resource watch ended during bootstrap".to_string())?;
+        if envelope.namespace != namespace || envelope.plural != plural {
+            return Err(ResourceError::invalid("subject resource snapshot scope does not match its watch").to_string());
+        }
+        if envelope.records.iter().any(|record| record.record_type == ResourceRecordType::Bookmark) {
+            if envelope.records.len() != 1 || envelope.records[0].object.is_some() {
+                return Err(ResourceError::invalid("subject resource snapshot bookmark must be a separate envelope").to_string());
+            }
+            return Ok(());
+        }
+        if envelope.records.iter().any(|record| !matches!(record.record_type, ResourceRecordType::Current | ResourceRecordType::Added)) {
+            return Err(ResourceError::invalid("subject resource snapshot contains a live event before its bookmark").to_string());
+        }
+        state.apply_resource_records(&envelope)?;
+    }
 }
 
 /// The connector loop: subscribe → project → send, with a TTL re-assertion

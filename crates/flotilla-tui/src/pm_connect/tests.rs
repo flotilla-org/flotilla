@@ -255,18 +255,45 @@ impl DaemonHandle for MockDaemon {
             )
             .await?;
         let CommandValue::ResourceRead(envelope) = initial else { panic!("initial envelope") };
-        self.tx
-            .send(DaemonEvent::CommandStepUpdate {
-                command_id: id,
-                node_id: flotilla_protocol::NodeId::new("kiwi"),
-                repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "resource".into() },
-                repo: None,
-                step_index: 0,
-                step_count: 1,
-                description: "initial snapshot".into(),
-                status: flotilla_protocol::StepStatus::Produced { value: Box::new(CommandValue::ResourceWatchEvent(envelope)) },
-            })
-            .expect("initial watch snapshot");
+        // The socket boundary may fragment a snapshot. Its bookmark is the
+        // explicit end of bootstrap, just as in the real daemon handler.
+        let fragments = if envelope.records.is_empty() {
+            vec![(*envelope).clone()]
+        } else {
+            envelope
+                .records
+                .iter()
+                .map(|record| {
+                    let mut fragment = (*envelope).clone();
+                    fragment.records = vec![record.clone()];
+                    fragment
+                })
+                .collect()
+        };
+        for fragment in fragments.into_iter().chain([{
+            let mut bookmark = (*envelope).clone();
+            bookmark.records = vec![flotilla_protocol::ResourceReadRecord {
+                record_type: flotilla_protocol::ResourceRecordType::Bookmark,
+                provenance: flotilla_protocol::ResourceRecordProvenance::Local { node_id: flotilla_protocol::NodeId::new("kiwi") },
+                object: None,
+            }];
+            bookmark
+        }]) {
+            self.tx
+                .send(DaemonEvent::CommandStepUpdate {
+                    command_id: id,
+                    node_id: flotilla_protocol::NodeId::new("kiwi"),
+                    repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "resource".into() },
+                    repo: None,
+                    step_index: 0,
+                    step_count: 1,
+                    description: "initial snapshot".into(),
+                    status: flotilla_protocol::StepStatus::Produced {
+                        value: Box::new(CommandValue::ResourceWatchEvent(Box::new(fragment))),
+                    },
+                })
+                .expect("initial watch snapshot");
+        }
         Ok(id)
     }
 
@@ -852,9 +879,17 @@ async fn connector_real_daemon_stays_subscribed() {
     )
     .await;
     let baseline = daemon.aggregator_projection_state().await.subscribed_queries();
-    let connector = run_connector(daemon.clone(), Arc::new(RecordingSink::new()), Arc::new(mint()), Duration::from_secs(60));
-    let result = tokio::time::timeout(Duration::from_millis(200), connector).await;
-    assert!(result.is_err(), "connector exited instead of watching: {result:?}");
+    let sink = Arc::new(RecordingSink::new());
+    let mut connector = tokio::spawn(run_connector(daemon.clone(), sink.clone(), Arc::new(mint()), Duration::from_secs(60)));
+    // Publication happens only after every watch completed admission. A slow
+    // machine must reach this signal, rather than passing by timing out.
+    tokio::select! {
+        result = &mut connector => panic!("connector exited instead of watching: {result:?}"),
+        _ = wait_until(|| !sink.recorded().is_empty()) => {}
+    }
+    assert!(!connector.is_finished(), "admitted connector stays live");
+    connector.abort();
+    let _ = connector.await;
     assert_eq!(daemon.aggregator_projection_state().await.subscribed_queries(), baseline, "cancellation releases query demand");
 }
 
@@ -970,4 +1005,96 @@ async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
     .await
     .expect("no stale member");
     tasks.shutdown().await;
+}
+
+// The initial watch snapshot can span envelopes; only its bookmark admits a
+// complete bootstrap. The daemon/socket boundary double fragments both records.
+#[tokio::test]
+async fn bootstrap_collects_snapshot_fragments_through_bookmark() {
+    let daemon = Arc::new(MockDaemon::new(vec![]));
+    let mut snapshot = subject_envelope();
+    let mut second = snapshot.records[0].clone();
+    let object = second.object.as_mut().expect("second observation");
+    object["metadata"]["name"] = serde_json::json!("cr-43");
+    object["spec"]["number"] = serde_json::json!(43);
+    snapshot.records.push(second);
+    daemon.resource_lists.lock().expect("snapshots").insert(("flotilla".into(), "changerequests".into()), snapshot);
+    let daemon: Arc<dyn DaemonHandle> = daemon;
+    let mut state = ConnectorState::default();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel(64);
+    ensure_resource_watches(&daemon, &mut state, &mut BTreeSet::new(), &mut tasks, &tx).await.expect("bootstrap");
+    assert_eq!(state.resources.projection().change_requests.len(), 2, "all fragments precede admission/publication");
+    tasks.shutdown().await;
+}
+
+// A live event before the bootstrap bookmark violates the daemon contract and
+// must fail explicitly rather than silently treating it as a complete snapshot.
+#[tokio::test]
+async fn bootstrap_rejects_live_events_before_bookmark() {
+    for record_type in [flotilla_protocol::ResourceRecordType::Modified, flotilla_protocol::ResourceRecordType::Deleted] {
+        let daemon = Arc::new(MockDaemon::new(vec![]));
+        let mut snapshot = subject_envelope();
+        snapshot.records[0].record_type = record_type;
+        daemon.resource_lists.lock().expect("snapshot").insert(("flotilla".into(), "changerequests".into()), snapshot);
+        let handle: Arc<dyn DaemonHandle> = daemon.clone();
+        let mut state = ConnectorState::default();
+        let mut tasks = tokio::task::JoinSet::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let error =
+            ensure_resource_watches(&handle, &mut state, &mut BTreeSet::new(), &mut tasks, &tx).await.expect_err("invalid bootstrap");
+        assert!(error.contains("invalid resource:"), "deterministic protocol error: {error}");
+        assert!(error.contains("snapshot"));
+        wait_until(|| daemon.cancelled.lock().expect("cancelled").len() == 1).await;
+    }
+}
+
+// Transient established-session failures use the shared jittered/capped backoff.
+// A session lasting at least the cap resets the next retry to the initial range.
+#[tokio::test(start_paused = true)]
+async fn reconnect_loop_backs_off_transient_sessions_and_resets_after_health() {
+    for healthy_session in [false, true] {
+        let daemon = Arc::new(MockDaemon::new(vec![]));
+        let times = Mutex::new(Vec::new());
+        let mut sessions = 0;
+        let error = tokio::time::timeout(
+            Duration::from_secs(300),
+            run_reconnecting(
+                || {
+                    times.lock().expect("attempt times").push(tokio::time::Instant::now());
+                    let daemon = daemon.clone() as Arc<dyn DaemonHandle>;
+                    async move { Ok(daemon) }
+                },
+                |_| {
+                    sessions += 1;
+                    let session = sessions;
+                    async move {
+                        if session == 11 {
+                            return Err(flotilla_resources::ResourceError::invalid("unsupported request").to_string());
+                        }
+                        if healthy_session && session == 4 {
+                            tokio::time::sleep(Duration::from_secs(31)).await;
+                        }
+                        Err("daemon disconnected during resource watch".to_string())
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("bounded permanent termination")
+        .expect_err("permanent error");
+        assert!(error.contains("unsupported request"));
+        let times = times.lock().expect("attempt times");
+        assert_eq!(times.len(), 11);
+        let mut base = Duration::from_millis(500);
+        for (index, pair) in times.windows(2).enumerate() {
+            let mut delay = pair[1].duration_since(pair[0]);
+            if healthy_session && index == 3 {
+                delay -= Duration::from_secs(31);
+                base = Duration::from_millis(500);
+            }
+            assert!(delay >= base / 2 && delay <= base, "retry {index}: {delay:?}, expected jittered base {base:?}");
+            base = std::cmp::min(base * 2, Duration::from_secs(30));
+        }
+    }
 }

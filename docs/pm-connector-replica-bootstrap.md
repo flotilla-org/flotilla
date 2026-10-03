@@ -4,7 +4,9 @@ The connector bootstraps each subject kind/namespace from its resource watch's
 own initial snapshot. It does not list first, and it does not request cursor
 resume for an include-replicas watch. The merged-resource layer registers local
 and replica streams before taking its snapshot. The consumer applies that
-snapshot once, followed by every queued event on the same watch. The overlay
+snapshot fragments through the explicit bootstrap bookmark, followed by every
+queued live event on the same watch. Scope mismatches and live modifications or
+deletions before that bookmark are explicit permanent protocol errors. The overlay
 cursor is descriptive; reconnect starts new watches and fresh query cursors.
 
 Definitions are merged logical members. Their initial snapshots and live
@@ -21,7 +23,10 @@ query lifetime belongs to the connection. Reconnect diffs the fresh complete
 bootstrap against the last catalog to retract facts removed offline and refresh
 all surviving TTL facts. Resource validation refusals terminate with their
 original error instead of reconnecting; transient connection/watch failures
-still reconnect, with a delay between established sessions.
+still reconnect with the shared jittered exponential backoff (500ms initial base,
+30s cap). A session lasting at least 30 seconds resets the next retry. Resource
+error classification shares its prefix with the producer/formatter; the connector
+does not duplicate that string.
 
 ## Regression checks
 
@@ -32,8 +37,10 @@ cargo test -p flotilla-tui --test pm_connector_e2e --locked
 ```
 
 The first suite exercises the real daemon's resource-watch command consumer,
-including rejection of unsupported cursor parameters, cancellation, failed
-setup and namespace discovery. The resource suite runs a shared generated
+including rejection of unsupported cursor parameters, publication readiness,
+cancellation, failed setup and namespace discovery. Fragmented bootstrap and
+invalid pre-bookmark live events are pinned; virtual-clock scenarios cover
+transient retry jitter/capping and healthy-session reset. The resource suite runs a shared generated
 membership contract on memory and SQLite storage, plus pinned final-replica,
 name-only deletion and queued-bootstrap arrival/removal cases. The end-to-end
 suite starts an isolated daemon runtime and Aggregator with local and replica
