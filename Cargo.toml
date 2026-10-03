@@ -53,7 +53,6 @@ aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-daemon/aws-lc-prov
 flotilla-client = { path = "crates/flotilla-client" }
 flotilla-commands = { path = "crates/flotilla-commands" }
 flotilla-core = { path = "crates/flotilla-core" }
-flotilla-daemon = { path = "crates/flotilla-daemon" }
 flotilla-manifest = { path = "crates/flotilla-manifest" }
 flotilla-protocol = { path = "crates/flotilla-protocol" }
 flotilla-resources = { path = "crates/flotilla-resources" }
@@ -73,6 +72,9 @@ libc = "0.2"
 uuid = { version = "1", features = ["v4"] }
 humantime = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(unix)'.dependencies]
+flotilla-daemon = { path = "crates/flotilla-daemon" }
 
 [dev-dependencies]
 tempfile = "3"

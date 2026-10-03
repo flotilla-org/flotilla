@@ -10,7 +10,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use crate::{
-    sink::{PatchSink, UnixSocketSink, ZellijPipeSink},
+    sink::{PatchSink, WheelhouseHttpSink, ZellijPipeSink},
     stamp::parse_pane_id,
     wire::PaneTarget,
 };
@@ -23,7 +23,11 @@ pub enum PmInstance {
         /// The pane this process runs in, when the PM exposes it.
         pane: Option<PaneTarget>,
     },
-    /// Wheelhouse accepts HTTP metadata patches at `WHEELHOUSE_SOCKET`.
+    /// Wheelhouse accepts HTTP metadata patches at `WHEELHOUSE_SOCKET`: a Unix
+    /// socket path on Unix, or a named-pipe path (`\\.\pipe\<name>`) on Windows.
+    /// A Unix-style path is not translated on Windows: it is passed literally
+    /// to the named-pipe API and connection failure is reported as a Wheelhouse
+    /// metadata POST error after the normal transport retry. Use `\\.\pipe\<name>`.
     /// The contract is owned by wheelhouse/docs/protocol/pm-connect.md (#22).
     /// `WHEELHOUSE_PANE_ID` remains provisional until native pane identity is
     /// generalized; the current Wheelhouse host does not export it.
@@ -85,7 +89,7 @@ impl PmInstance {
                 }
                 Arc::new(sink)
             }
-            PmInstance::Wheelhouse { socket, .. } => Arc::new(UnixSocketSink::new(socket.clone())),
+            PmInstance::Wheelhouse { socket, .. } => Arc::new(WheelhouseHttpSink::new(socket.clone())),
         }
     }
 

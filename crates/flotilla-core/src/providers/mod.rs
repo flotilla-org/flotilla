@@ -366,6 +366,8 @@ pub trait CommandRunner: Send + Sync {
     /// Atomically publish content with its final Unix permissions. The
     /// temporary file must be private while it is written. Wrappers that may
     /// deliver credentials must override this method; the default fails closed.
+    /// On Windows, ProcessCommandRunner falls back to an atomic write with
+    /// inherited ACLs and warns that the requested mode is not enforced.
     async fn write_file_with_mode(&self, _path: &Path, _content: &str, _mode: u32) -> Result<(), String> {
         Err("command runner does not support protected file writes".to_string())
     }
@@ -619,12 +621,14 @@ impl CommandRunner for ProcessCommandRunner {
         tokio::fs::rename(&temporary, path).await.map_err(|e| format!("rename {} to {}: {e}", temporary.display(), path.display()))
     }
 
+    #[cfg(unix)]
     async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
 
         if mode > 0o777 {
             return Err("file mode must contain only permission bits".to_string());
         }
+
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
         }
@@ -654,6 +658,18 @@ impl CommandRunner for ProcessCommandRunner {
             let _ = tokio::fs::remove_file(&temporary).await;
         }
         result
+    }
+
+    #[cfg(not(unix))]
+    async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+        if mode > 0o777 {
+            return Err("file mode must contain only permission bits".to_string());
+        }
+        // Windows writes inherit directory ACLs; POSIX mode bits cannot enforce
+        // the requested protection. Explicit ACL policy belongs here when
+        // Windows hosts start materializing daemon credentials (#2468).
+        tracing::warn!(mode, path = %path.display(), "writing with inherited ACLs; requested POSIX file permissions are not enforced");
+        self.write_file(path, content).await
     }
 }
 

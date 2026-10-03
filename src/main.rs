@@ -347,7 +347,7 @@ enum PmSubCommand {
         /// Restrict pipe delivery to one plugin instance
         #[arg(long)]
         plugin_url: Option<String>,
-        /// Publish to a wheelhouse unix socket instead of zellij pipes
+        /// Publish to a Wheelhouse Unix socket (Windows: named pipe) instead of zellij pipes
         #[arg(long)]
         wheelhouse_socket: Option<PathBuf>,
         /// Executable path or name the PM runs (default: this connector executable)
@@ -1183,6 +1183,7 @@ async fn run_daemon_dev_mode(cli: &Cli, command: DevModeSubCommand) -> Result<()
     }
 }
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(unused_variables))]
 fn set_fleet_daemon_enabled(enabled: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     return flotilla_tui::socket::launchd::set_agent_enabled(enabled).map_err(|error| color_eyre::eyre::eyre!(error));

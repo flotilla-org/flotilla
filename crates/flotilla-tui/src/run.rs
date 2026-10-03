@@ -4,8 +4,10 @@ use std::{
 };
 
 use color_eyre::Result;
+#[cfg(unix)]
+use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::{
-    event::{EnableMouseCapture, KeyCode, KeyModifiers, MouseEventKind},
+    event::{EnableMouseCapture, MouseEventKind},
     execute,
     terminal::SetTitle,
 };

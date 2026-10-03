@@ -1,6 +1,8 @@
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -14,7 +16,9 @@ use flotilla_protocol::{
     Command, ConnectionRole, DaemonEvent, LeafFire, Message, NodeId, QueryCursor, QueryId, ReplayCursor, RepoInfo, Request, Response,
     ResponseResult, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, PROTOCOL_FINGERPRINT, PROTOCOL_VERSION,
 };
-use flotilla_transport::message::{connect_unix_message_session, MessageSession};
+#[cfg(unix)]
+use flotilla_transport::message::connect_unix_message_session;
+use flotilla_transport::message::MessageSession;
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::{debug, error, warn};
 
@@ -40,10 +44,12 @@ type QuerySet = std::sync::RwLock<HashSet<QueryId>>;
 /// The lock file remains on disk after release so every contender opens the
 /// same inode. Unlinking it during a handoff would let a new client create and
 /// lock a replacement inode while an already-queued client owns the old one.
+#[cfg(unix)]
 struct SpawnLockGuard {
     _file: std::fs::File,
 }
 
+#[cfg(unix)]
 impl SpawnLockGuard {
     fn new(file: std::fs::File) -> Self {
         Self { _file: file }
@@ -371,6 +377,7 @@ impl Drop for SocketDaemon {
 /// - `Ok(Some(file))` — lock acquired, caller should spawn the daemon
 /// - `Ok(None)` — another process is spawning; we blocked until they released
 /// - `Err(_)` — lock file couldn't be opened
+#[cfg(unix)]
 fn acquire_spawn_lock(lock_path: &std::path::Path) -> Result<Option<std::fs::File>, String> {
     use std::os::unix::io::AsRawFd;
 
@@ -408,6 +415,7 @@ fn acquire_spawn_lock(lock_path: &std::path::Path) -> Result<Option<std::fs::Fil
     Ok(None)
 }
 
+#[cfg(unix)]
 fn resolve_flotillad_binary() -> Result<PathBuf, String> {
     if let Ok(path) = std::env::var("FLOTILLAD_BIN") {
         return Ok(PathBuf::from(path));
@@ -428,6 +436,7 @@ fn resolve_flotillad_binary() -> Result<PathBuf, String> {
         .ok_or_else(|| format!("failed to locate flotillad next to {}", current.display()))
 }
 
+#[cfg(unix)]
 fn spawn_daemon(socket_path: &Path, config_dir: &Path, state_dir: &Path) -> Result<(), String> {
     let daemon_binary = resolve_flotillad_binary()?;
     let mut cmd = std::process::Command::new(&daemon_binary);
@@ -497,6 +506,7 @@ async fn connect_required_host_daemon_with_optional_surface(
     })
 }
 
+#[cfg(unix)]
 async fn connect_or_spawn_with_optional_surface(
     socket_path: &Path,
     config_dir: &Path,
@@ -507,9 +517,29 @@ async fn connect_or_spawn_with_optional_surface(
         .await
 }
 
+// Windows clients never acquire daemon lifecycle authority or spawn a daemon.
+#[cfg(not(unix))]
+async fn connect_or_spawn_with_optional_surface(
+    socket_path: &Path,
+    _config_dir: &Path,
+    _state_dir: &Path,
+    surface: Option<SurfaceDeclaration>,
+) -> Result<Arc<SocketDaemon>, String> {
+    connect_required_host_daemon_with_optional_surface(socket_path, surface).await
+}
+
+#[cfg(not(unix))]
+async fn connect_unix_message_session(_socket_path: &Path) -> Result<MessageSession, String> {
+    Err("local Unix daemon sockets are unsupported on this platform; connect to a remote daemon (no local daemon will be spawned)"
+        .to_string())
+}
+
+#[cfg(unix)]
 type DaemonSpawner = dyn Fn(&Path, &Path, &Path) -> Result<(), String> + Send + Sync;
+#[cfg(unix)]
 type DaemonSupervisor = dyn Fn(&Path, &Path, &Path) -> Result<DaemonStartupOwner, String> + Send + Sync;
 
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DaemonStartupOwner {
     Client,
@@ -519,6 +549,7 @@ enum DaemonStartupOwner {
     SystemdUnit,
 }
 
+#[cfg(unix)]
 fn supervisor_startup_owner(socket_path: &Path, config_dir: &Path, state_dir: &Path) -> Result<DaemonStartupOwner, String> {
     #[cfg(target_os = "macos")]
     {
@@ -537,6 +568,7 @@ fn supervisor_startup_owner(socket_path: &Path, config_dir: &Path, state_dir: &P
     Ok(DaemonStartupOwner::Client)
 }
 
+#[cfg(unix)]
 async fn connect_or_spawn_with_optional_surface_using(
     socket_path: &Path,
     config_dir: &Path,
@@ -683,6 +715,7 @@ async fn connect_or_spawn_with_optional_surface_using(
 /// HELLO_HANDSHAKE_TIMEOUT). Handshake errors are retried because the daemon is
 /// expected to be in its startup window. The last error is surfaced if the
 /// deadline expires without a successful handshake.
+#[cfg(unix)]
 async fn wait_for_daemon(socket_path: &Path, surface: Option<&SurfaceDeclaration>, owner: &str) -> Result<Arc<SocketDaemon>, String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut last_handshake_error: Option<String> = None;
@@ -702,6 +735,7 @@ async fn wait_for_daemon(socket_path: &Path, surface: Option<&SurfaceDeclaration
     }
 }
 
+#[cfg(unix)]
 fn ensure_no_live_daemon_without_socket(state_dir: &Path, socket_path: &Path) -> Result<(), String> {
     use std::os::fd::AsRawFd;
 
@@ -741,12 +775,19 @@ const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// a stale socket. The handshake is bounded — a daemon that accepts the
 /// connection but never replies is reported as an error rather than hanging
 /// the caller (or, worse, being treated as absent and spawned over).
+#[cfg(unix)]
 async fn connect_existing_stateful(socket_path: &Path, surface: Option<&SurfaceDeclaration>) -> Result<Option<Arc<SocketDaemon>>, String> {
     let session = match connect_unix_message_session(socket_path).await {
         Ok(session) => session,
         Err(_) => return Ok(None),
     };
     from_session_stateful_bounded(socket_path, session, surface).await.map(Some)
+}
+
+#[cfg(not(unix))]
+async fn connect_existing_stateful(socket_path: &Path, _surface: Option<&SurfaceDeclaration>) -> Result<Option<Arc<SocketDaemon>>, String> {
+    connect_unix_message_session(socket_path).await?;
+    Ok(None)
 }
 
 async fn from_session_stateful_bounded(
@@ -1122,11 +1163,11 @@ impl DaemonHandle for SocketDaemon {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "lib/tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod spawn_lock_tests {
     use std::{
         fs,
@@ -1211,5 +1252,22 @@ mod spawn_lock_tests {
 
         assert_eq!(error, "direct spawner reached");
         assert_eq!(direct_spawns.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    // Windows clients refuse local daemon access without creating locks,
+    // deleting a stale socket, or spawning a daemon (#2468).
+    #[tokio::test]
+    async fn local_connection_refuses_spawn_and_preserves_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("flotilla.sock");
+        std::fs::write(&socket, "sentinel").expect("seed socket path");
+        assert!(connect_or_spawn(&socket, dir.path(), dir.path()).await.is_err(), "local daemon connection must be refused");
+        assert_eq!(std::fs::read_to_string(&socket).expect("socket preserved"), "sentinel");
+        assert_eq!(std::fs::read_dir(dir.path()).expect("entries").count(), 1);
     }
 }
