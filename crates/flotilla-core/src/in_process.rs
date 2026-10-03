@@ -448,6 +448,7 @@ impl ProviderChangeRequestObservationSource {
             if let Some(error) = entry.rate_limit_error() {
                 // Preserve an already-observed hard failure for this subject. A scope
                 // cooldown must not conceal a substantive completion refusal.
+                // A whole-batch Err has no per-subject outcomes to preserve.
                 if let Ok(statuses) = &entry.result {
                     if let Some(Err(hard_error)) = statuses.get(&subject.number) {
                         if hard_error.retry_at().is_none() {

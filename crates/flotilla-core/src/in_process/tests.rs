@@ -2155,6 +2155,7 @@ async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_c
 struct BatchedObservationRunner {
     calls: std::sync::Mutex<Vec<String>>,
     rate_limit_two: std::sync::atomic::AtomicBool,
+    hard_error_one: std::sync::atomic::AtomicBool,
     rate_limit_all: std::sync::atomic::AtomicBool,
     mixed_history_errors: std::sync::atomic::AtomicBool,
     block_one: std::sync::atomic::AtomicBool,
@@ -2211,6 +2212,9 @@ impl CommandRunner for BatchedObservationRunner {
                 stdout: "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 4989\r\nX-RateLimit-Reset: 1893456000\r\nRetry-After: 60\r\n\r\n{\"message\":\"You have exceeded a secondary rate limit\"}".into(),
                 stderr: String::new(), success: false,
             });
+        }
+        if query.contains("name:\"one\"") && self.hard_error_one.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("rate limited diagnostics unavailable: access denied".into());
         }
         if query.contains("name:\"two\"") && self.rate_limit_two.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(crate::providers::CommandOutput {
@@ -2328,11 +2332,56 @@ async fn source_pagination_fairness_survives_provider_rediscovery() {
     }
 }
 
+// #2510: admission must prioritize a classified limit over an ordinary error
+// whose diagnostic happens to mention rate limiting. Exercise real discovery,
+// provider classification and admission; fake only the GitHub subprocess boundary.
+#[tokio::test]
+async fn bound_admission_prioritizes_typed_limit_over_misleading_diagnostic() {
+    let runner = Arc::new(BatchedObservationRunner {
+        calls: std::sync::Mutex::new(Vec::new()),
+        rate_limit_two: std::sync::atomic::AtomicBool::new(true),
+        hard_error_one: std::sync::atomic::AtomicBool::new(true),
+        rate_limit_all: std::sync::atomic::AtomicBool::new(false),
+        mixed_history_errors: std::sync::atomic::AtomicBool::new(false),
+        block_one: std::sync::atomic::AtomicBool::new(false),
+        one_started: tokio::sync::Notify::new(),
+        release_one: tokio::sync::Notify::new(),
+        conflicting: std::sync::atomic::AtomicBool::new(false),
+    });
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"typed-admission-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery_with_runner(false, runner.clone()),
+        HostName::new("test-host"),
+        backend.clone(),
+    )
+    .await;
+    daemon.set_provisioning_namespace("flotilla".into()).await;
+    daemon
+        .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")))
+        .expect("gh discovery");
+    let mut keys = Vec::new();
+    for scope in ["team/one", "team/two"] {
+        let repository = RepositorySpec::remote(format!("https://github.com/{scope}")).expect("repository");
+        let key = repository.key();
+        backend.using::<Repository>("flotilla").create(&test_meta(&key.to_string()), &repository).await.expect("repository");
+        keys.push(key);
+    }
+    let error = daemon.resolve_convoy_change_request(&keys, "main", Some("1")).await.expect_err("no usable observation");
+    assert!(error.contains("budget=GraphQL") && error.contains("kind=primary"), "return the classified limit: {error}");
+    assert!(!error.contains("diagnostics unavailable"), "an ordinary error's words cannot override classification");
+    assert_eq!(runner.calls.lock().expect("calls").len(), 2, "consult both repositories");
+}
+
 #[tokio::test]
 async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit() {
     let runner = Arc::new(BatchedObservationRunner {
         calls: std::sync::Mutex::new(Vec::new()),
         rate_limit_two: std::sync::atomic::AtomicBool::new(false),
+        hard_error_one: std::sync::atomic::AtomicBool::new(false),
         rate_limit_all: std::sync::atomic::AtomicBool::new(false),
         mixed_history_errors: std::sync::atomic::AtomicBool::new(false),
         block_one: std::sync::atomic::AtomicBool::new(false),
@@ -2480,6 +2529,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
     let runner = Arc::new(BatchedObservationRunner {
         calls: std::sync::Mutex::new(Vec::new()),
         rate_limit_two: std::sync::atomic::AtomicBool::new(false),
+        hard_error_one: std::sync::atomic::AtomicBool::new(false),
         rate_limit_all: std::sync::atomic::AtomicBool::new(false),
         mixed_history_errors: std::sync::atomic::AtomicBool::new(false),
         block_one: std::sync::atomic::AtomicBool::new(false),
