@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{CanonicalHostId, SleepInhibitionHealth};
+use flotilla_protocol::{
+    CanonicalHostId, HostProviderStatus, HostSummary, SleepInhibitionHealth, AGENT_ADAPTER_PROVIDER_CATEGORY,
+    TERMINAL_POOL_PROVIDER_CATEGORY,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -102,6 +105,12 @@ impl HostConnection {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct HostStatus {
+    /// Last descriptive observation from the owning daemon, useful even offline.
+    /// `environments` holds every visible environment; `host_summary()` projects
+    /// the provisioned-only list expected by the legacy summary surface.
+    /// ADR 0047: previous-generation records omit this; retain the default for one roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<HostSummary>,
     #[serde(default)]
     pub capabilities: BTreeMap<String, serde_json::Value>,
     /// Live observations keyed by FulfilmentKind name. A fact remains tied to
@@ -216,6 +225,26 @@ pub enum ModelFactSource {
 }
 
 impl HostStatus {
+    /// Join descriptive observations with authoritative placement availability.
+    pub fn host_summary(&self) -> Option<HostSummary> {
+        let mut summary = self.description.clone()?;
+        summary.providers.retain(|provider| {
+            provider.category != AGENT_ADAPTER_PROVIDER_CATEGORY && provider.category != TERMINAL_POOL_PROVIDER_CATEGORY
+        });
+        summary.environments.retain(|environment| matches!(environment, flotilla_protocol::EnvironmentInfo::Provisioned { .. }));
+        for (key, category) in
+            [(AGENT_ADAPTERS_CAPABILITY, AGENT_ADAPTER_PROVIDER_CATEGORY), (TERMINAL_POOLS_CAPABILITY, TERMINAL_POOL_PROVIDER_CATEGORY)]
+        {
+            if let Some(serde_json::Value::Array(implementations)) = self.capabilities.get(key) {
+                for implementation in implementations.iter().filter_map(serde_json::Value::as_str) {
+                    summary.providers.push(HostProviderStatus::available(category, implementation));
+                }
+            }
+        }
+        summary.providers.sort_by(|left, right| (&left.category, &left.name).cmp(&(&right.category, &right.name)));
+        Some(summary)
+    }
+
     pub fn is_agentless_ssh(&self) -> bool {
         self.capabilities.get(AGENTLESS_CAPABILITY) == Some(&serde_json::Value::Bool(true))
             && self.capabilities.get(TRANSPORT_CAPABILITY).and_then(serde_json::Value::as_str) == Some("ssh")
@@ -367,6 +396,7 @@ pub enum HostStatusPatch {
         model_probes: ModelProbeState,
     },
     Heartbeat {
+        description: Option<Box<HostSummary>>,
         capabilities: BTreeMap<String, serde_json::Value>,
         heartbeat_at: DateTime<Utc>,
         ready: bool,
@@ -396,6 +426,7 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 status.model_probes.clone_from(model_probes);
             }
             Self::Heartbeat {
+                description,
                 capabilities,
                 heartbeat_at,
                 ready,
@@ -410,6 +441,14 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 conditions,
             } => {
                 status.capabilities = capabilities.clone();
+                status.description = description.as_deref().cloned();
+                // Placement capability keys are authoritative; do not persist a second
+                // availability list in the descriptive provider health observations.
+                if let Some(description) = &mut status.description {
+                    description.providers.retain(|provider| {
+                        provider.category != AGENT_ADAPTER_PROVIDER_CATEGORY && provider.category != TERMINAL_POOL_PROVIDER_CATEGORY
+                    });
+                }
                 status.heartbeat_at = Some(*heartbeat_at);
                 // Sleep inhibition has its own writer. Apply heartbeat conditions to
                 // the latest status so a concurrent sleep update survives a retry.

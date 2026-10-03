@@ -43,6 +43,6 @@ pub(super) async fn sync_peer_query_state(peer_manager: &Arc<Mutex<PeerManager>>
     };
 
     daemon.set_configured_peers(configured).await;
-    daemon.set_peer_host_summaries(summaries).await;
+    daemon.set_peer_host_identities(summaries).await;
     daemon.set_topology_routes(routes).await;
 }

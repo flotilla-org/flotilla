@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use flotilla_protocol::{
-    DaemonEvent, EnvironmentId, HostListEntry, HostListResponse, HostName, HostProvidersResponse, HostSnapshot, HostStatusResponse,
-    HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey, SystemInfo, ToolInventory, TopologyResponse, TopologyRoute,
+    DaemonEvent, EnvironmentId, HostIdentity, HostListEntry, HostListResponse, HostName, HostProvidersResponse, HostSnapshot,
+    HostStatusResponse, HostSummary, NodeId, NodeInfo, PeerConnectionState, StreamKey, SystemInfo, ToolInventory, TopologyResponse,
+    TopologyRoute,
 };
 use tokio::sync::RwLock;
 
@@ -21,6 +22,9 @@ struct HostState {
 }
 
 pub(crate) struct HostRegistry {
+    pub(crate) description_projection: tokio::sync::Mutex<()>,
+    resource_environments: RwLock<HashSet<EnvironmentId>>,
+    identity_environments: RwLock<HashSet<EnvironmentId>>,
     local_node: NodeInfo,
     hosts: RwLock<HashMap<EnvironmentId, HostState>>,
     node_connectivity: RwLock<HashMap<NodeId, PeerConnectionState>>,
@@ -45,6 +49,9 @@ impl HostRegistry {
         let mut node_environments = HashMap::new();
         node_environments.insert(local_node.node_id.clone(), local_host_summary.environment_id.clone());
         Self {
+            description_projection: tokio::sync::Mutex::new(()),
+            resource_environments: RwLock::new(HashSet::new()),
+            identity_environments: RwLock::new(HashSet::new()),
             local_node,
             hosts: RwLock::new(hosts),
             node_connectivity: RwLock::new(node_connectivity),
@@ -58,31 +65,6 @@ impl HostRegistry {
     #[allow(dead_code)]
     pub(crate) async fn local_host_summary(&self) -> HostSummary {
         self.local_host_summary.read().await.clone()
-    }
-
-    pub(crate) async fn set_local_host_summary(&self, summary: HostSummary) {
-        let changed = {
-            let current = self.local_host_summary.read().await;
-            *current != summary
-        };
-        if !changed {
-            return;
-        }
-
-        {
-            let mut current = self.local_host_summary.write().await;
-            *current = summary.clone();
-        }
-
-        let mut node_environments = self.node_environments.write().await;
-        let mut hosts = self.hosts.write().await;
-        let state = ensure_host_state(&mut hosts, &mut node_environments, &self.local_node, summary.environment_id.clone());
-        node_environments.insert(self.local_node.node_id.clone(), summary.environment_id.clone());
-        if state.summary.as_ref() != Some(&summary) {
-            state.summary = Some(summary);
-            state.seq += 1;
-            state.removed = false;
-        }
     }
 
     pub(crate) async fn peer_connection_status(&self, node_id: &NodeId) -> PeerConnectionState {
@@ -359,7 +341,78 @@ impl HostRegistry {
         self.sync_host_membership(counts, emit).await;
     }
 
+    pub(crate) async fn sync_peer_identities(&self, identities: HashMap<EnvironmentId, HostIdentity>, emit: &impl Fn(DaemonEvent)) {
+        let mut known = self.identity_environments.write().await;
+        let current = identities.keys().cloned().collect::<HashSet<_>>();
+        let descriptions = self.resource_environments.read().await;
+        for environment_id in known.difference(&current).filter(|id| !descriptions.contains(*id)) {
+            let mut hosts = self.hosts.write().await;
+            if let Some(seq) = mark_host_removed(&mut hosts, environment_id) {
+                emit(DaemonEvent::HostRemoved { environment_id: environment_id.clone(), seq });
+            }
+        }
+        *known = current;
+        drop(descriptions);
+        drop(known);
+        for identity in identities.into_values() {
+            self.publish_peer_identity(identity, emit).await;
+        }
+    }
+
+    pub(crate) async fn publish_peer_identity(&self, identity: HostIdentity, emit: &impl Fn(DaemonEvent)) {
+        let snapshot = {
+            let configured = self.configured_peers.read().await.clone();
+            let connectivity = self.node_connectivity.read().await.clone();
+            let mut environments = self.node_environments.write().await;
+            let mut hosts = self.hosts.write().await;
+            let mut summary =
+                hosts.get(&identity.environment_id).and_then(|state| state.summary.clone()).unwrap_or_else(|| identity.clone().into());
+            summary.node = identity.node;
+            summary.host_name = identity.host_name;
+            let node = summary.node.clone();
+            update_host_summary(&self.local_node, &configured, &connectivity, &mut environments, &mut hosts, &node, summary)
+        };
+        if let Some(snapshot) = snapshot {
+            emit(DaemonEvent::HostSnapshot(Box::new(snapshot)));
+        }
+    }
+
+    pub(crate) async fn sync_resource_summaries(&self, summaries: HashMap<EnvironmentId, HostSummary>, emit: &impl Fn(DaemonEvent)) {
+        let mut projected = self.resource_environments.write().await;
+        let removed = projected.difference(&summaries.keys().cloned().collect()).cloned().collect::<Vec<_>>();
+        *projected = summaries.keys().cloned().collect();
+        drop(projected);
+        for environment_id in removed {
+            let mut hosts = self.hosts.write().await;
+            if let Some(seq) = mark_host_removed(&mut hosts, &environment_id) {
+                emit(DaemonEvent::HostRemoved { environment_id, seq });
+            }
+        }
+        for summary in summaries.into_values() {
+            if summary.node.node_id == self.local_node.node_id {
+                *self.local_host_summary.write().await = summary.clone();
+            }
+            self.publish_resource_summary(summary, emit).await;
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn publish_peer_summary(&self, summary: HostSummary, emit: &impl Fn(DaemonEvent)) {
+        if summary_is_overlay_placeholder(&summary)
+            && self
+                .hosts
+                .read()
+                .await
+                .get(&summary.environment_id)
+                .and_then(|state| state.summary.as_ref())
+                .is_some_and(|existing| !summary_is_overlay_placeholder(existing))
+        {
+            return;
+        }
+        self.publish_resource_summary(summary, emit).await;
+    }
+
+    async fn publish_resource_summary(&self, summary: HostSummary, emit: &impl Fn(DaemonEvent)) {
         let snapshot = {
             let configured = self.configured_peers.read().await.clone();
             let node_connectivity = self.node_connectivity.read().await.clone();
@@ -387,6 +440,7 @@ impl HostRegistry {
         self.sync_host_membership(counts, emit).await;
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn set_peer_host_summaries(
         &self,
         summaries: HashMap<EnvironmentId, HostSummary>,
@@ -624,19 +678,9 @@ fn update_host_summary(
             }
         }
     }
-    if current_environment_id.as_ref().is_some_and(|current| *current == summary.environment_id) {
-        if let Some(state) = current_environment_id.as_ref().and_then(|current| hosts.get(current)) {
-            if summary_is_overlay_placeholder(&summary)
-                && state.summary.as_ref().is_some_and(|existing| !summary_is_overlay_placeholder(existing))
-            {
-                return None;
-            }
-            if !state.removed && state.summary.as_ref() == Some(&summary) {
-                return None;
-            }
-        }
+    if hosts.get(&summary.environment_id).is_some_and(|state| !state.removed && state.summary.as_ref() == Some(&summary)) {
+        return None;
     }
-
     let state = ensure_host_state(hosts, node_environments, node, summary.environment_id.clone());
     state.environment_id = summary.environment_id.clone();
     state.summary = Some(summary);
@@ -645,6 +689,7 @@ fn update_host_summary(
     Some(build_host_snapshot(local_node, configured, node_connectivity, &state.environment_id, state))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn summary_is_overlay_placeholder(summary: &HostSummary) -> bool {
     summary.system == SystemInfo::default()
         && summary.inventory == ToolInventory::default()
@@ -731,8 +776,8 @@ fn build_host_status(
         is_local,
         configured: !is_local && ctx.configured.contains_key(&state.node_id),
         connection_status: connection_status_for_node(ctx.local_node, ctx.node_connectivity, &state.node_id),
+        visible_environments: summary.as_ref().map(|summary| summary.environments.clone()).unwrap_or_default(),
         summary,
-        visible_environments: vec![],
         repo_count: counts.repo_count,
         blob_sync: None,
     }
@@ -784,8 +829,8 @@ fn build_host_providers(
         is_local: state.node_id == local_node.node_id,
         configured: state.node_id != local_node.node_id && configured.contains_key(&state.node_id),
         connection_status: connection_status_for_node(local_node, node_connectivity, &state.node_id),
+        visible_environments: summary.environments.clone(),
         summary,
-        visible_environments: vec![],
     }
 }
 

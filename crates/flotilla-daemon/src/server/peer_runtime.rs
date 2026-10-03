@@ -377,10 +377,6 @@ impl PeerRuntime {
                     tokio::select! {
                         maybe_env = rx.recv() => {
                             let Some(env) = maybe_env else { break };
-                            if let PeerWireMessage::HostSummary(summary) = &env.msg {
-                                peer_daemon.publish_peer_summary(summary.clone()).await;
-                            }
-
                             let (post_handle_action, pending_sends) = {
                                 let mut pm = peer_manager_task.lock().await;
                                 let post_handle_action = match pm.handle_inbound(env).await {
@@ -640,7 +636,7 @@ pub(super) async fn send_link_state(
         return false;
     };
 
-    if let Err(e) = sender.send(PeerWireMessage::HostSummary(daemon.local_host_summary().await)).await {
+    if let Err(e) = sender.send(PeerWireMessage::HostSummary(daemon.local_host_identity())).await {
         debug!(peer = %peer, err = %e, "failed to send host summary to peer");
         return false;
     }

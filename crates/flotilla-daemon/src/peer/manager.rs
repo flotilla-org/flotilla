@@ -7,8 +7,8 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{
-    Command, CommandPeerEvent, CommandValue, ConfigLabel, EnvironmentId, GoodbyeReason, HostListEntry, HostListResponse, HostName,
-    HostSummary, NodeId, NodeInfo, PeerConnectionState, PeerReconnectStatus, PeerWireMessage, RepoIdentity, RoutedPeerMessage, Step,
+    Command, CommandPeerEvent, CommandValue, ConfigLabel, EnvironmentId, GoodbyeReason, HostIdentity, HostListEntry, HostListResponse,
+    HostName, NodeId, NodeInfo, PeerConnectionState, PeerReconnectStatus, PeerWireMessage, RepoIdentity, RoutedPeerMessage, Step,
     StepOutcome, StepStatus, TopologyRoute,
 };
 use tokio::sync::mpsc;
@@ -230,7 +230,7 @@ pub struct PeerManager {
     pending_sends: Vec<PendingPeerSend>,
     route_epoch: u64,
     request_id_counter: u64,
-    peer_host_summaries: HashMap<EnvironmentId, HostSummary>,
+    peer_host_summaries: HashMap<EnvironmentId, HostIdentity>,
 }
 
 impl PeerManager {
@@ -1045,11 +1045,12 @@ impl PeerManager {
         &self.local_node_id
     }
 
-    pub fn store_host_summary(&mut self, summary: HostSummary) {
+    pub fn store_host_summary(&mut self, summary: impl Into<HostIdentity>) {
+        let summary = summary.into();
         self.peer_host_summaries.insert(summary.environment_id.clone(), summary);
     }
 
-    pub fn get_peer_host_summaries(&self) -> &HashMap<EnvironmentId, HostSummary> {
+    pub fn get_peer_host_summaries(&self) -> &HashMap<EnvironmentId, HostIdentity> {
         &self.peer_host_summaries
     }
 
