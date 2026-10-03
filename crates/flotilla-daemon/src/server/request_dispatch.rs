@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, future::Future, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    future::Future,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use flotilla_core::{
     agents::{AgentEntry, SharedAgentStateStore},
@@ -69,21 +75,34 @@ async fn project_decision_ledger(
     runner: &dyn CommandRunner,
     cwd: &Path,
     delivery_env: &BTreeMap<String, String>,
-) -> Result<Option<String>, String> {
+) -> Result<Vec<String>, String> {
     let convoy = backend.including_replicas::<Convoy>(namespace).get(convoy_name).await.map_err(|error| error.to_string())?.object;
     let sources = backend.including_replicas::<Checkout>(namespace).list().await.map_err(|error| error.to_string())?;
     let checkouts = select_convoy_children(&convoy, &sources.items);
     let leaves = expected_change_request_leaves(&convoy, &checkouts)?;
-    if leaves.is_empty() {
-        return Ok(None);
+    let mut urls = Vec::new();
+    let mut projected = HashSet::new();
+    for leaf in leaves {
+        if !projected.insert(leaf.address.clone()) {
+            continue;
+        }
+        let url = project_ledger_comment(convoy_name, producer, body, &leaf.address, runner, cwd, delivery_env).await?;
+        urls.push(url);
     }
-    let Some(leaf) = leaves.first() else {
-        return Err("decision ledger projection requires exactly one bound change request".to_string());
-    };
-    if leaves.iter().any(|candidate| candidate.address != leaf.address) {
-        return Err("decision ledger projection requires exactly one bound change request".to_string());
-    }
-    let LeafAddress::ChangeRequest { service, scope, number } = &leaf.address else {
+    Ok(urls)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn project_ledger_comment(
+    convoy_name: &str,
+    producer: &str,
+    body: &[u8],
+    address: &LeafAddress,
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    delivery_env: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let LeafAddress::ChangeRequest { service, scope, number } = address else {
         return Err("decision ledger projection has an invalid change request binding".to_string());
     };
     let text = std::str::from_utf8(body).map_err(|_| "decision ledger must be UTF-8".to_string())?;
@@ -171,7 +190,7 @@ curl --fail-with-body --silent --show-error \
         .and_then(serde_json::Value::as_str)
         .filter(|url| url.starts_with("https://"))
     {
-        return Ok(Some(url.to_string()));
+        return Ok(url.to_string());
     }
     let input = serde_json::to_vec(&serde_json::json!({ "body": format!("{text}\n{marker}") })).map_err(|error| error.to_string())?;
     let response = if service == "github.com" {
@@ -224,7 +243,7 @@ curl --fail-with-body --silent --show-error -X POST \
         .get("html_url")
         .and_then(serde_json::Value::as_str)
         .filter(|url| url.starts_with("https://"))
-        .map(|url| Some(url.to_string()))
+        .map(|url| url.to_string())
         .ok_or_else(|| "projected ledger comment has no HTTPS URL".to_string())
 }
 
@@ -238,22 +257,9 @@ async fn project_decision_ledger_once(
     runner: &dyn CommandRunner,
     cwd: &Path,
     delivery_env: &BTreeMap<String, String>,
-) -> Result<Option<String>, String> {
-    let name = flotilla_resources::artifact_record_name(convoy, producer, "decision-ledger", convoy);
-    let existing = match backend.including_replicas::<flotilla_resources::Artifact>(namespace).get(&name).await {
-        Ok(record) => Some(record.object),
-        Err(flotilla_resources::ResourceError::NotFound { .. }) => None,
-        Err(error) => return Err(error.to_string()),
-    };
-    let digest = BlobDigest::of(body);
-    if let Some(url) = existing
-        .as_ref()
-        .filter(|record| record.spec.digest == digest.as_str())
-        .and_then(|record| record.spec.summary.get("comment_url"))
-        .and_then(serde_json::Value::as_str)
-    {
-        return Ok(Some(url.to_string()));
-    }
+) -> Result<Vec<String>, String> {
+    // Recheck every current binding even for identical content: a stored first
+    // URL cannot prove that PRs bound after the previous put received the ledger.
     let mut last_error = None;
     for attempt in 0..3 {
         match project_decision_ledger(backend, namespace, convoy, producer, body, runner, cwd, delivery_env).await {
@@ -363,7 +369,7 @@ impl<'a> RequestDispatcher<'a> {
                 // Validation runs before the forge write; a path is never treated as content.
                 let body = crate::artifact::read_decision_ledger(temporary.path())?;
                 let delivery_env = self.daemon.ledger_delivery_environment(&namespace, &session.spec.env_ref).await?;
-                let comment_url = project_decision_ledger_once(
+                let comment_urls = project_decision_ledger_once(
                     &backend,
                     &namespace,
                     &caller.convoy,
@@ -375,9 +381,10 @@ impl<'a> RequestDispatcher<'a> {
                 )
                 .await
                 .map_err(|error| format!("decision ledger forge projection failed: {error}"))?;
-                if let Some(comment_url) = comment_url {
-                    summary.insert("comment_url".to_string(), serde_json::Value::String(comment_url));
+                if let Some(comment_url) = comment_urls.first() {
+                    summary.insert("comment_url".to_string(), serde_json::Value::String(comment_url.clone()));
                 }
+                summary.insert("projection_count".to_string(), serde_json::json!(comment_urls.len()));
             }
             let input = ArtifactPutInput::builder()
                 .kind(kind)
@@ -482,12 +489,16 @@ impl<'a> RequestDispatcher<'a> {
             return Message::error_response(id, "ArtifactGet request selected the wrong handler");
         };
         let result = Box::pin(async {
-            let caller = self.caller.crew.as_ref().ok_or_else(|| missing_crew_message("artifact get"))?;
+            if let Some(caller) = self.caller.crew.as_ref() {
+                let name = reference.strip_prefix("artifact/").unwrap_or(&reference);
+                if name.split_once('/').is_some_and(|(namespace, _)| namespace != caller.namespace) {
+                    return Err("crew artifact reads cannot cross namespaces".to_string());
+                }
+            }
             let blobs = self.remote_command_router.blob_store()?;
             let backend = self.daemon.resource_backend();
             let namespace = self.daemon.provisioning_namespace().await;
             let service = ArtifactService { backend: &backend, blobs: blobs.as_ref(), namespace: &namespace };
-            let session = service.caller_session(caller).await?;
             let stores = self.daemon.config_store().load_daemon_config()?.blob_stores;
             let artifact = service.artifact_for_reference(&reference).await?;
             let view_url =
@@ -496,11 +507,21 @@ impl<'a> RequestDispatcher<'a> {
                         .ok()
                         .and_then(|digest| flotilla_core::config::artifact_view_url_for_digest(digest.as_str(), &stores))
                 });
-            let runner = self
-                .daemon
-                .command_runner_for_environment_ref(&session.spec.env_ref)
-                .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
-            let destination_path = absolute_crew_path(&destination_path, &session.spec.cwd);
+            let (runner, destination_path) = if let Some(caller) = self.caller.crew.as_ref() {
+                let session = service.caller_session(caller).await?;
+                let runner = self
+                    .daemon
+                    .command_runner_for_environment_ref(&session.spec.env_ref)
+                    .ok_or_else(|| format!("artifact environment {} is unavailable", session.spec.env_ref))?;
+                (runner, absolute_crew_path(&destination_path, &session.spec.cwd))
+            } else {
+                self.daemon.principal_for_surface(self.session_id)?.ok_or("artifact get requires a connected operator principal")?;
+                if !destination_path.is_absolute() {
+                    return Err("operator artifact destination must be absolute".to_string());
+                }
+                let runner = self.daemon.local_command_runner().ok_or("local artifact environment is unavailable")?;
+                (runner, destination_path)
+            };
             let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
             let size = service.get_to_file(&reference, temporary.path()).await?;
             runner.write_file_from(temporary.path(), &destination_path).await?;
@@ -969,7 +990,7 @@ mod ledger_projection_tests {
             project_decision_ledger(&backend, "flotilla", "demo", "coder", b"## Decision ledger\n", &runner, Path::new("/"), &delivery_env)
                 .await
                 .expect("project with staged credential");
-        assert_eq!(url.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
+        assert_eq!(url.first().map(String::as_str), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
     }
 
     #[tokio::test]
@@ -1009,12 +1030,12 @@ mod ledger_projection_tests {
             project_decision_ledger(&backend, "flotilla", "demo", "coder", b"## Decision ledger\n", &runner, Path::new("/"), &delivery_env)
                 .await
                 .expect("project with staged credential");
-        assert_eq!(url.as_deref(), Some("https://forgejo.example/acme/repo/pulls/42#issuecomment-7"));
+        assert_eq!(url.first().map(String::as_str), Some("https://forgejo.example/acme/repo/pulls/42#issuecomment-7"));
     }
 
     #[derive(Default)]
     struct CapturingRunner {
-        call: Mutex<Option<(Vec<String>, Vec<u8>)>>,
+        calls: Mutex<Vec<(Vec<String>, Vec<u8>)>>,
     }
 
     #[async_trait]
@@ -1038,7 +1059,7 @@ mod ledger_projection_tests {
             input: &[u8],
         ) -> Result<String, String> {
             assert_eq!(cmd, "sh");
-            *self.call.lock().expect("capture lock") = Some((args.iter().map(|arg| (*arg).to_string()).collect(), input.to_vec()));
+            self.calls.lock().expect("capture lock").push((args.iter().map(|arg| (*arg).to_string()).collect(), input.to_vec()));
             Ok(r#"{"html_url":"https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"}"#.to_string())
         }
 
@@ -1071,8 +1092,8 @@ mod ledger_projection_tests {
         let url = project_decision_ledger(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"), &github_delivery_env())
             .await
             .expect("project ledger");
-        assert_eq!(url.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
-        let (args, input) = runner.call.lock().expect("capture lock").take().expect("gh call");
+        assert_eq!(url.first().map(String::as_str), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
+        let (args, input) = runner.calls.lock().expect("capture lock").pop().expect("gh call");
         assert!(args.iter().any(|arg| arg == "repos/flotilla-org/flotilla/issues/42/comments"));
         assert!(!args.iter().any(|arg| arg.contains("Brief silence")));
         let posted = serde_json::from_slice::<serde_json::Value>(&input).expect("JSON");
@@ -1080,8 +1101,8 @@ mod ledger_projection_tests {
     }
 
     #[tokio::test]
-    async fn identical_ledger_digest_reuses_existing_comment_url() {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    async fn stored_ledger_url_does_not_skip_current_bindings() {
+        let backend = github_convoy().await;
         let body = b"## Decision ledger\n\n1. **Brief silence:** Naming\n- **Choice:** demo\n- **Alternative:** example\n- **If asking were free:** Which?\n";
         let comment_url = "https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7";
         let spec = ArtifactSpec::builder()
@@ -1101,13 +1122,33 @@ mod ledger_projection_tests {
             .create(&InputMeta::builder().name(name).build(), &spec)
             .await
             .expect("artifact");
+        // #2527: the same ledger must reach a newly bound PR after it was stored.
+        let convoys = backend.using::<Convoy>("flotilla");
+        let mut convoy = convoys.get("demo").await.expect("convoy");
+        convoy.spec.subjects.push(flotilla_resources::DeclaredSubject {
+            subject: flotilla_protocol::Subject {
+                kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+                id: "43".into(),
+            },
+            relationship: flotilla_protocol::Relationship::Produces,
+            issue: None,
+            change_request: None,
+        });
+        convoys
+            .update(&InputMeta::builder().name("demo".into()).build(), &convoy.metadata.resource_version, &convoy.spec)
+            .await
+            .expect("new PR binding");
         let runner = CapturingRunner::default();
         let result =
             project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"), &github_delivery_env())
                 .await
                 .expect("reuse comment");
-        assert_eq!(result.as_deref(), Some(comment_url));
-        assert!(runner.call.lock().expect("capture lock").is_none());
+        assert_eq!(result.first().map(String::as_str), Some(comment_url));
+        assert_eq!(result.len(), 2);
+        let calls = runner.calls.lock().expect("capture lock");
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().any(|(args, _)| args.iter().any(|arg| arg == "repos/flotilla-org/flotilla/issues/43/comments")));
     }
 
     #[tokio::test]
@@ -1178,7 +1219,7 @@ mod ledger_projection_tests {
             project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"), &github_delivery_env())
                 .await
                 .expect("transient failure retries and finds accepted comment");
-        assert_eq!(url.as_deref(), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
+        assert_eq!(url.first().map(String::as_str), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
         assert_eq!(*runner.posts.lock().expect("posts lock"), 1);
     }
 
@@ -1258,7 +1299,7 @@ mod ledger_projection_tests {
                 project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"), &forgejo_delivery_env())
                     .await
                     .expect("find comment on second page");
-            assert_eq!(url.as_deref(), Some("https://forgejo.example/acme/repo/pulls/42#issuecomment-7"));
+            assert_eq!(url.first().map(String::as_str), Some("https://forgejo.example/acme/repo/pulls/42#issuecomment-7"));
             assert_eq!(*runner.pages.lock().expect("pages lock"), ["1", "2", "3"]);
         }
     }

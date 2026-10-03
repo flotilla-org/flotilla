@@ -108,6 +108,7 @@ impl InProcessDaemon {
             | A::QueryFleetHealth { .. }
             | A::QueryFulfilmentList { .. }
             | A::QueryFleetList { .. }
+            | A::QueryCrewStalls { .. }
             | A::QueryCrewList { .. }
             | A::QueryDaemonLogs { .. }
             | A::QueryExplainConvoy { .. }

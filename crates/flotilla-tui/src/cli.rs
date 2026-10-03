@@ -1095,6 +1095,18 @@ fn repo_label(path: Option<&std::path::Path>, identity: &flotilla_protocol::Repo
     path.map(repo_name).unwrap_or_else(|| identity.path.clone())
 }
 
+fn format_stall_evidence(text: &str, full: bool) -> String {
+    if full {
+        return text.to_string();
+    }
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut abbreviated: String = text.chars().take(160).collect();
+    if text.chars().count() > 160 {
+        abbreviated.push('…');
+    }
+    abbreviated
+}
+
 /// Format a `CommandValue` as a short human-readable string.
 fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> String {
     use flotilla_protocol::commands::CommandValue;
@@ -1175,6 +1187,50 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::FleetHealth(fleet) => format_fleet_health_human(fleet),
         CommandValue::FulfilmentList(kinds) => format_fulfilment_list_human(kinds),
         CommandValue::FleetList(fleet) => format_fleet_list_human(fleet),
+        CommandValue::CrewStalls(stalls) => {
+            if stalls.rows.is_empty() {
+                return "No stalled crew obligations".to_string();
+            }
+            let mut output =
+                String::from("PROJECT / CONVOY | VESSEL / ROLE | RUNG | SUPERVISOR | AGE | PROPOSE | SHARED CAUSE | EVIDENCE\n");
+            let groups: BTreeMap<_, _> = stalls
+                .rows
+                .iter()
+                .map(|row| row.cause_group.as_str())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .enumerate()
+                .map(|(index, cause)| (cause, index + 1))
+                .collect();
+            for row in &stalls.rows {
+                let evidence = format_stall_evidence(&row.evidence, stalls.full);
+                let supervisor = row
+                    .supervisor
+                    .clone()
+                    .unwrap_or_else(|| format!("none: {}", row.supervisor_absence_reason.as_deref().unwrap_or("no supervisor recorded")));
+                let supervisor = format_stall_evidence(&supervisor, stalls.full);
+                let proposed = row.proposed_disposition.map(|value| value.to_string()).unwrap_or_else(|| "-".to_string());
+                let _ = writeln!(
+                    output,
+                    "{} / {} | {} / {} | {} | {} | {} | {} | group {} ({}) | {}",
+                    row.project_display_name.as_deref().or(row.project.as_deref()).unwrap_or("-"),
+                    row.convoy_display_name,
+                    if row.vessel.is_empty() { "-" } else { &row.vessel },
+                    if row.role.is_empty() { "-" } else { &row.role },
+                    row.rung.map(|rung| rung.to_string()).unwrap_or_else(|| "unknown".into()),
+                    supervisor,
+                    row.age_seconds.map(|age| format!("{age}s")).unwrap_or_else(|| "unknown".into()),
+                    proposed,
+                    groups[row.cause_group.as_str()],
+                    row.shared_cause_count,
+                    evidence
+                );
+                if stalls.full && !row.artifacts.is_empty() {
+                    let _ = writeln!(output, "  artifacts: {}", row.artifacts.join(", "));
+                }
+            }
+            output
+        }
         CommandValue::CrewList(crew) => format_crew_list_human(crew),
         CommandValue::DaemonLogs { lines } => lines.join("\n"),
         CommandValue::ConvoyExplanation(explanation) => format_convoy_explanation_human(explanation),

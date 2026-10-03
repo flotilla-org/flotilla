@@ -75,6 +75,129 @@ pub(super) struct ReadProjections<'a> {
 }
 
 impl ReadProjections<'_> {
+    /// Read local and replicated convoy conditions across every stored namespace.
+    pub(super) async fn crew_stalls(
+        backend: &ResourceBackend,
+        full: bool,
+        now: DateTime<Utc>,
+    ) -> Result<flotilla_protocol::CrewStallsResponse, String> {
+        let mut rows = Vec::new();
+        for namespace in backend.stored_namespaces::<ResourceConvoy>().await.map_err(|error| error.to_string())? {
+            let projects = backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
+            let artifacts =
+                backend.including_replicas::<flotilla_resources::Artifact>(&namespace).list().await.map_err(|error| error.to_string())?;
+            for source in backend.including_replicas::<ResourceConvoy>(&namespace).list().await.map_err(|error| error.to_string())?.items {
+                let convoy = source.object;
+                let Some(status) = convoy.status.as_ref().filter(|status| !status.phase.is_terminal()) else { continue };
+                let mut obligations = BTreeMap::new();
+                if let Some(stall) = &status.stalled {
+                    for leaf in &stall.leaves {
+                        if let flotilla_protocol::LeafAddress::Work { work, .. } = &leaf.address {
+                            if let Some(role) = leaf.field_path.strip_prefix(".crew.").and_then(|path| path.strip_suffix(".phase")) {
+                                obligations.insert((work.clone(), role.to_string()), Some(stall));
+                            }
+                        }
+                    }
+                    if obligations.is_empty() {
+                        if let Some(flotilla_resources::LeafMaker::Actor { vessel, role }) = &stall.maker {
+                            obligations.insert((vessel.clone(), role.clone()), Some(stall));
+                        }
+                    }
+                }
+                // A visible stall must not disappear merely because its maker or
+                // leaves do not identify a crew actor (for example a controller wait).
+                if obligations.is_empty() {
+                    if let Some(stall) = &status.stalled {
+                        obligations.insert((String::new(), String::new()), Some(stall));
+                    }
+                }
+                // A later crew declaration can replace the convoy's visible condition.
+                // Keep every stalled crew row; absent per-obligation metadata stays unknown.
+                for (vessel, crew) in &status.crew_work {
+                    for (role, state) in crew {
+                        if state.phase == CrewWorkPhase::Stalled {
+                            obligations.entry((vessel.clone(), role.clone())).or_insert(None);
+                        }
+                    }
+                }
+                let project_display_name = convoy.spec.project_ref.as_ref().and_then(|name| {
+                    projects.iter().find(|project| &project.metadata.name == name).map(|project| project.spec.display_name.clone())
+                });
+                for ((vessel, role), stall) in obligations {
+                    let evidence = stall
+                        .map(|stall| stall.evidence.clone())
+                        .or_else(|| status.crew_work.get(&vessel).and_then(|crew| crew.get(&role)).and_then(|state| state.message.clone()))
+                        .unwrap_or_default();
+                    let group = serde_json::to_string(&(
+                        stall.and_then(|stall| stall.reason),
+                        stall.and_then(|stall| stall.cause.as_ref()),
+                        evidence.split_whitespace().collect::<Vec<_>>().join(" "),
+                    ))
+                    .map_err(|error| error.to_string())?;
+                    let supervisor = stall
+                        .and_then(|stall| stall.supervisor.as_ref())
+                        .map(|supervisor| format!("{}/{}/{}", supervisor.convoy, supervisor.vessel, supervisor.role));
+                    let absence = supervisor.is_none().then(|| {
+                        if stall.is_some() {
+                            evidence.clone()
+                        } else {
+                            "no current stall condition recorded for this obligation".into()
+                        }
+                    });
+                    rows.push(
+                        flotilla_protocol::CrewStallRow::builder()
+                            .namespace(namespace.clone())
+                            .maybe_project(convoy.spec.project_ref.clone())
+                            .maybe_project_display_name(project_display_name.clone())
+                            .convoy(convoy.metadata.name.clone())
+                            .convoy_display_name(if convoy.spec.role.is_empty() {
+                                convoy.metadata.name.clone()
+                            } else {
+                                format!("{} #{}", convoy.spec.role, convoy.spec.generation)
+                            })
+                            .vessel(vessel)
+                            .role(role)
+                            .maybe_rung(stall.map(|stall| stall.rung))
+                            .maybe_supervisor(supervisor)
+                            .maybe_supervisor_absence_reason(absence)
+                            .maybe_began_at(stall.map(|stall| stall.began_at))
+                            .maybe_age_seconds(stall.map(|stall| now.signed_duration_since(stall.began_at).num_seconds().max(0) as u64))
+                            .maybe_proposed_disposition(stall.and_then(|stall| stall.proposed_disposition))
+                            .evidence(evidence)
+                            .cause_group(group)
+                            .shared_cause_count(1)
+                            .artifacts(
+                                artifacts
+                                    .items
+                                    .iter()
+                                    .filter(|artifact| artifact.object.spec.convoy == convoy.metadata.name)
+                                    .map(|artifact| format!("artifact/{namespace}/{}", artifact.object.metadata.name))
+                                    .collect(),
+                            )
+                            .build(),
+                    );
+                }
+            }
+        }
+        let mut counts = BTreeMap::new();
+        for row in &rows {
+            *counts.entry(row.cause_group.clone()).or_insert(0) += 1;
+        }
+        for row in &mut rows {
+            row.shared_cause_count = counts[&row.cause_group];
+        }
+        rows.sort_by(|left, right| {
+            (&left.namespace, &left.project, &left.convoy, &left.vessel, &left.role).cmp(&(
+                &right.namespace,
+                &right.project,
+                &right.convoy,
+                &right.vessel,
+                &right.role,
+            ))
+        });
+        Ok(flotilla_protocol::CrewStallsResponse { observed_at: now, full, rows })
+    }
+
     pub(super) async fn list_hosts(&self, counts: &HashMap<EnvironmentId, HostCounts>) -> Result<HostListResponse, String> {
         Ok(self.host_registry.list_hosts(counts).await)
     }
@@ -1243,6 +1366,176 @@ mod tests {
         change_request_observer::{ChangeRequestRefreshCadence, ChangeRequestRefresher, GhChangeRequestObservationSource},
         providers::{discovery::EnvironmentBag, ProcessCommandRunner},
     };
+
+    // #2498: every distinct stalled actor is visible across namespaces and replica stores.
+    // Generate empty through multi-convoy fleets, duplicate leaves, all rungs, shared and distinct
+    // evidence, future timestamps, and terminal convoys. No transport interleavings affect this read.
+    #[hegel::test]
+    fn crew_stalls_cover_each_obligation(tc: hegel::TestCase) {
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+        let roles = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+        let unrecognized = tc.draw(gs::booleans());
+        let shared = tc.draw(gs::booleans());
+        let future = tc.draw(gs::booleans());
+        let replicated = tc.draw(gs::booleans());
+        let rung = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let author = if replicated { ResourceBackend::InMemory(InMemoryBackend::default()) } else { backend.clone() };
+            let now = Utc::now();
+            let began_at = now + ChronoDuration::seconds(if future { 10 } else { -300 });
+            for index in 0..count {
+                let namespace = format!("namespace-{index}");
+                backend
+                    .using::<Project>(&namespace)
+                    .create(
+                        &InputMeta::builder().name("project".into()).build(),
+                        &ProjectSpec::builder().display_name("Project display".into()).default_workflow_ref("scratch".into()).build(),
+                    )
+                    .await
+                    .expect("project");
+                let convoys = author.using::<ResourceConvoy>(&namespace);
+                for terminal in [false, true] {
+                    let convoy = convoys
+                        .create(
+                            &InputMeta::builder().name(if terminal { "terminal" } else { "stalled" }.into()).build(),
+                            &ConvoySpec::builder()
+                                .workflow_ref("scratch".into())
+                                .role("implement".into())
+                                .generation(2)
+                                .project_ref("project".into())
+                                .build(),
+                        )
+                        .await
+                        .expect("convoy");
+                    let leaves: Vec<_> = (0..roles)
+                        .flat_map(|role| {
+                            let leaf = flotilla_protocol::Leaf {
+                                address: flotilla_protocol::LeafAddress::Work { convoy: convoy.metadata.name.clone(), work: "work".into() },
+                                field_path: if unrecognized { ".phase".into() } else { format!(".crew.role-{role}.phase") },
+                                operator: flotilla_protocol::LeafOperator::Equal,
+                                literal: "Done".into(),
+                            };
+                            [leaf.clone(), leaf]
+                        })
+                        .collect();
+                    convoys
+                        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+                            phase: if terminal { ConvoyPhase::Landed } else { ConvoyPhase::Active },
+                            stalled: Some(flotilla_resources::StalledCondition {
+                                leaves,
+                                maker: None,
+                                evidence: if shared {
+                                    if index % 2 == 0 {
+                                        "rate limit".into()
+                                    } else {
+                                        " rate\n limit ".into()
+                                    }
+                                } else {
+                                    format!("cause {index}")
+                                },
+                                source: flotilla_resources::StallEvidenceSource::Crew,
+                                cause: None,
+                                began_at,
+                                rung: [
+                                    flotilla_resources::StallRung::Nudge,
+                                    flotilla_resources::StallRung::Supervisor,
+                                    flotilla_resources::StallRung::Bosun,
+                                    flotilla_resources::StallRung::Governor,
+                                    flotilla_resources::StallRung::Operator,
+                                ][rung],
+                                supervisor: (rung != 4).then(|| flotilla_resources::StallSupervisor {
+                                    convoy: "governor".into(),
+                                    vessel: "control".into(),
+                                    role: "governor".into(),
+                                }),
+                                supervision_index: None,
+                                supervision_exhausted: false,
+                                reason: Some(flotilla_protocol::StallReason::Infra),
+                                proposed_disposition: Some(flotilla_protocol::StallProposedDisposition::Resume),
+                                nudge_history: vec![],
+                            }),
+                            ..Default::default()
+                        })
+                        .await
+                        .expect("stalled status");
+                }
+                if replicated {
+                    backend
+                        .replica_writer::<ResourceConvoy>(NodeId::new("remote"), &namespace)
+                        .replace(&convoys.list().await.expect("remote convoys"), now)
+                        .await
+                        .expect("replicate");
+                }
+            }
+            for full in [false, true] {
+                let response = ReadProjections::crew_stalls(&backend, full, now).await.expect("stalls");
+                let obligations_per_convoy = if unrecognized { 1 } else { roles };
+                assert_eq!(response.rows.len(), count * obligations_per_convoy);
+                assert_eq!(response.full, full);
+                let encoded = serde_json::to_value(&response).expect("JSON");
+                assert_eq!(encoded["rows"].as_array().expect("rows").len(), count * obligations_per_convoy);
+                for row in response.rows {
+                    assert_eq!(row.convoy, "stalled");
+                    assert_eq!(row.project_display_name.as_deref(), Some("Project display"));
+                    assert_eq!(row.convoy_display_name, "implement #2");
+                    assert_eq!(row.age_seconds, Some(if future { 0 } else { 300 }));
+                    assert_eq!(row.vessel.is_empty(), unrecognized);
+                    assert_eq!(row.role.is_empty(), unrecognized);
+                    assert_eq!(row.shared_cause_count, if shared { count * obligations_per_convoy } else { obligations_per_convoy });
+                    assert_eq!(
+                        row.rung,
+                        Some(
+                            [
+                                flotilla_resources::StallRung::Nudge,
+                                flotilla_resources::StallRung::Supervisor,
+                                flotilla_resources::StallRung::Bosun,
+                                flotilla_resources::StallRung::Governor,
+                                flotilla_resources::StallRung::Operator
+                            ][rung]
+                        )
+                    );
+                    assert_eq!(row.supervisor.as_deref(), (rung != 4).then_some("governor/control/governor"));
+                    assert_eq!(row.supervisor_absence_reason.as_deref(), (rung == 4).then_some(row.evidence.as_str()));
+                    assert_eq!(row.proposed_disposition, Some(flotilla_protocol::StallProposedDisposition::Resume));
+                }
+            }
+        });
+    }
+
+    // #2498: a stalled crew remains listed after its visible condition is replaced or absent.
+    #[tokio::test]
+    async fn crew_stalls_retains_crew_without_current_condition() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let convoys = backend.using::<ResourceConvoy>("other-namespace");
+        let convoy = convoys
+            .create(&InputMeta::builder().name("stalled".into()).build(), &ConvoySpec::builder().workflow_ref("scratch".into()).build())
+            .await
+            .expect("convoy");
+        convoys
+            .update_status("stalled", &convoy.metadata.resource_version, &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([
+                        ("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Stalled).message("rate limit".into()).build()),
+                        ("reviewer".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
+                    ]),
+                )]),
+                ..Default::default()
+            })
+            .await
+            .expect("status");
+        let response = ReadProjections::crew_stalls(&backend, false, Utc::now()).await.expect("stalls");
+        assert_eq!(response.rows.len(), 1);
+        let row = &response.rows[0];
+        assert_eq!(row.role, "coder");
+        assert_eq!(row.rung, None);
+        assert_eq!(row.age_seconds, None);
+        assert_eq!(row.evidence, "rate limit");
+        assert_eq!(row.supervisor_absence_reason.as_deref(), Some("no current stall condition recorded for this obligation"));
+    }
 
     struct ProjectionFixture {
         temp: tempfile::TempDir,

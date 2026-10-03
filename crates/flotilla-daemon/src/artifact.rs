@@ -280,8 +280,9 @@ impl ArtifactService<'_> {
             Ok(None)
         } else {
             let name = reference.strip_prefix("artifact/").unwrap_or(reference);
+            let (namespace, name) = name.split_once('/').unwrap_or((self.namespace, name));
             self.backend
-                .including_replicas::<Artifact>(self.namespace)
+                .including_replicas::<Artifact>(namespace)
                 .get(name)
                 .await
                 .map(|item| Some(item.object))
@@ -293,9 +294,8 @@ impl ArtifactService<'_> {
         let digest = if let Ok(digest) = BlobDigest::parse(reference) {
             digest
         } else {
-            let name = reference.strip_prefix("artifact/").unwrap_or(reference);
-            let object = self.backend.including_replicas::<Artifact>(self.namespace).get(name).await.map_err(|error| error.to_string())?;
-            BlobDigest::parse(&object.object.spec.digest)?
+            let object = self.artifact_for_reference(reference).await?.ok_or("artifact record is unavailable")?;
+            BlobDigest::parse(&object.spec.digest)?
         };
         Ok(digest)
     }

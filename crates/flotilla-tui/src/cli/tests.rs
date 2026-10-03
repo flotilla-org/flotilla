@@ -617,3 +617,40 @@ async fn completion_wait_case(cancel: bool) {
     tx.send(event(CommandValue::Ok)).expect("ready event");
     assert_eq!(run.await.expect("completed claim"), CommandValue::Ok);
 }
+
+// #2498: human output abbreviates Unicode evidence; --full and JSON retain it.
+#[test]
+fn crew_stalls_format_preserves_full_evidence() {
+    let evidence = "限".repeat(161);
+    let response = flotilla_protocol::CrewStallsResponse {
+        observed_at: chrono::Utc::now(),
+        full: false,
+        rows: vec![flotilla_protocol::CrewStallRow::builder()
+            .namespace("flotilla".into())
+            .project("project".into())
+            .project_display_name("Project".into())
+            .convoy("convoy-id".into())
+            .convoy_display_name("implement #2".into())
+            .vessel("work".into())
+            .role("coder".into())
+            .rung(flotilla_protocol::StallRung::Operator)
+            .supervisor_absence_reason("no live governor for project".into())
+            .age_seconds(300)
+            .proposed_disposition(flotilla_protocol::StallProposedDisposition::Resume)
+            .evidence(evidence.clone())
+            .cause_group("rate-limit".into())
+            .shared_cause_count(2)
+            .artifacts(vec!["artifact/evidence".into()])
+            .build()],
+    };
+    let human = format_command_result(&CommandValue::CrewStalls(Box::new(response.clone())));
+    assert!(human.contains("Project / implement #2"));
+    assert!(human.contains("none: no live governor for project"));
+    assert!(human.contains(&format!("{}…", "限".repeat(160))));
+    assert!(!human.contains(&evidence));
+    let json = serde_json::to_value(&response).expect("JSON");
+    assert_eq!(json["rows"][0]["evidence"], evidence);
+    let full = format_command_result(&CommandValue::CrewStalls(Box::new(flotilla_protocol::CrewStallsResponse { full: true, ..response })));
+    assert!(full.contains(&evidence));
+    assert!(full.contains("artifact/evidence"));
+}

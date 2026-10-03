@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -13,7 +13,7 @@ use flotilla_core::{
     command_target::TargetHost,
     config::ConfigStore,
     daemon::DaemonHandle,
-    in_process::InProcessDaemon,
+    in_process::{InProcessDaemon, WorkCredentialReconciler},
     providers::{
         discovery::{
             test_support::{fake_discovery, fake_discovery_with_provider_set, FakeDiscoveryProviders},
@@ -1905,8 +1905,12 @@ enum ArtifactEnvironment {
 // after storing a decision ledger. No transport concurrency is involved here.
 #[tokio::test]
 async fn artifact_environment_reference_contract() {
-    for environment_kind in [ArtifactEnvironment::LocalHostDirect, ArtifactEnvironment::RemoteHostDirect, ArtifactEnvironment::Provisioned]
-    {
+    for (environment_kind, two_repositories) in [
+        (ArtifactEnvironment::LocalHostDirect, false),
+        (ArtifactEnvironment::RemoteHostDirect, false),
+        (ArtifactEnvironment::Provisioned, false),
+        (ArtifactEnvironment::RemoteHostDirect, true),
+    ] {
         let leader = empty_daemon_named("artifact-crew-host").await;
         // Install the real credential collaborator while keeping automatic
         // resource reconciliation gated; this contract drives requests itself.
@@ -1921,13 +1925,36 @@ async fn artifact_environment_reference_contract() {
         let namespace = "flotilla";
         let convoy = "artifact-demo";
         let workspace = tempfile::tempdir().expect("crew workspace");
+        let mut convoy_spec = ConvoySpec::builder().workflow_ref("scratch".to_string()).build();
+        if two_repositories {
+            for (repo, number) in [("first", 42), ("second", 43)] {
+                convoy_spec.repositories.push(
+                    flotilla_resources::ConvoyRepositorySpec::builder()
+                        .repo_ref(RepositoryKey(repo.into()))
+                        .url(format!("https://github.com/acme/{repo}.git"))
+                        .source_ref("main".into())
+                        .target_ref("main".into())
+                        .workspace_slug(repo.into())
+                        .subpaths(vec![])
+                        .build(),
+                );
+                convoy_spec.subjects.push(flotilla_resources::DeclaredSubject {
+                    subject: flotilla_protocol::Subject {
+                        kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                        source: IssueSource { service: "github.com".into(), scope: format!("acme/{repo}") },
+                        id: number.to_string(),
+                    },
+                    relationship: flotilla_protocol::Relationship::Produces,
+                    issue: None,
+                    change_request: None,
+                });
+            }
+            leader.set_work_credential_reconciler(Arc::new(ArtifactLedgerCredentials)).await;
+        }
         leader
             .resource_backend()
             .using::<Convoy>(namespace)
-            .create(
-                &InputMeta::builder().name(convoy.to_string()).build(),
-                &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
-            )
+            .create(&InputMeta::builder().name(convoy.to_string()).build(), &convoy_spec)
             .await
             .expect("create home convoy");
         let env_ref = match environment_kind {
@@ -1935,7 +1962,9 @@ async fn artifact_environment_reference_contract() {
             ArtifactEnvironment::RemoteHostDirect => "host-direct-remote-artifact-host".to_string(),
             ArtifactEnvironment::Provisioned => "env-artifact-vessel".to_string(),
         };
-        let runner: Arc<dyn CommandRunner> = Arc::new(ArtifactContractRunner { root: workspace.path().to_path_buf() });
+        let comments = Arc::new(Mutex::new(BTreeMap::new()));
+        let runner: Arc<dyn CommandRunner> =
+            Arc::new(ArtifactContractRunner { root: workspace.path().to_path_buf(), comments: comments.clone() });
         if environment_kind == ArtifactEnvironment::RemoteHostDirect {
             leader
                 .register_direct_environment_for_test(
@@ -2119,8 +2148,73 @@ async fn artifact_environment_reference_contract() {
             .artifact_put("decision-ledger".into(), String::new(), BTreeMap::new(), "text/markdown".into(), "ledger.md".into())
             .await
             .expect("put ledger");
-        topology.client.artifact_get(address, "result.bin".into()).await.expect("get ledger");
+        topology.client.artifact_get(address.clone(), "result.bin".into()).await.expect("get ledger");
+        if two_repositories {
+            // #2527: both repositories receive the convoy ledger; retry cannot duplicate comments.
+            assert_eq!(comments.lock().expect("comments").keys().cloned().collect::<Vec<_>>(), vec![
+                "repos/acme/first/issues/42/comments",
+                "repos/acme/second/issues/43/comments"
+            ]);
+            topology
+                .client
+                .artifact_put("decision-ledger".into(), String::new(), BTreeMap::new(), "text/markdown".into(), "ledger.md".into())
+                .await
+                .expect("retry ledger put");
+            assert_eq!(comments.lock().expect("comments").len(), 2);
+            let artifacts = leader.resource_backend().using::<Artifact>(namespace).list().await.expect("artifacts");
+            let artifact = artifacts.items.iter().find(|artifact| artifact.spec.kind == "decision-ledger").expect("stored ledger");
+            assert_eq!(artifact.spec.subject, convoy);
+            assert_eq!(artifact.spec.summary["projection_count"], 2);
+            for comment in comments.lock().expect("comments").values() {
+                assert!(comment["body"].as_str().expect("body").starts_with(std::str::from_utf8(ledger).expect("UTF-8")));
+            }
+        }
+        // #2498: a connected operator reads crew artifacts without a calling crew session.
+        let operator = spawn_in_memory_request_topology_stateful_with_caller_and_blob_store(
+            leader.clone(),
+            follower.clone(),
+            SurfaceDeclaration::focal_for_namespace(namespace),
+            CommandCaller { principal_ref: PrincipalRef::implicit_for_namespace(namespace), process: None, crew: None },
+            store.clone(),
+        )
+        .await
+        .expect("operator surface");
+        let operator_destination = workspace.path().join("operator-ledger.md");
+        operator.client.artifact_get(address.clone(), operator_destination.clone()).await.expect("operator get ledger");
+        let record = leader
+            .resource_backend()
+            .using::<Artifact>(namespace)
+            .get(address.strip_prefix("artifact/").expect("artifact address"))
+            .await
+            .expect("ledger record");
+        leader
+            .resource_backend()
+            .using::<Artifact>("other-project-namespace")
+            .create(&InputMeta::builder().name(record.metadata.name.clone()).build(), &record.spec)
+            .await
+            .expect("other namespace artifact");
+        topology
+            .client
+            .artifact_get(format!("artifact/{namespace}/{}", record.metadata.name), "result.bin".into())
+            .await
+            .expect("crew can qualify its own namespace");
+        // Review #2536: namespace-qualified reads across the fleet belong to the operator.
+        let error = topology
+            .client
+            .artifact_get(format!("artifact/other-project-namespace/{}", record.metadata.name), "denied.bin".into())
+            .await
+            .expect_err("crew cannot cross namespaces");
+        assert!(error.contains("cannot cross namespaces"), "{error}");
+        assert!(!workspace.path().join("denied.bin").exists());
+        operator
+            .client
+            .artifact_get(format!("artifact/other-project-namespace/{}", record.metadata.name), operator_destination.clone())
+            .await
+            .expect("operator get qualified artifact");
+        assert_eq!(tokio::fs::read(operator_destination).await.expect("operator file"), ledger);
         assert_eq!(tokio::fs::read(destination).await.expect("ledger destination"), ledger);
+        // Observe only the completion below; earlier artifact requests can fill the broadcast buffer.
+        let mut events = leader.subscribe();
         let id = topology.client.execute(completion()).await.expect("dispatch completion with ledger");
         assert!(matches!(await_command_result(&mut events, id).await, CommandValue::Ok), "ledger admits completion");
         assert_eq!(
@@ -2171,12 +2265,37 @@ impl ProvisionedEnvironment for ArtifactContractEnvironment {
 // filesystem, so resolving a remote reference to the local runner cannot pass.
 struct ArtifactContractRunner {
     root: PathBuf,
+    comments: Arc<Mutex<BTreeMap<String, serde_json::Value>>>,
+}
+
+// Credential delivery is a process boundary; the test runner never reads a real token.
+struct ArtifactLedgerCredentials;
+#[async_trait]
+impl WorkCredentialReconciler for ArtifactLedgerCredentials {
+    async fn reconcile(&self, _: &str, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn ledger_delivery_environment(&self, _: &str, _: &str) -> Result<BTreeMap<String, String>, String> {
+        Ok(BTreeMap::from([("GITHUB_TOKEN_FILE".into(), "/credential/token".into())]))
+    }
 }
 
 #[async_trait]
 impl CommandRunner for ArtifactContractRunner {
-    async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
-        Err("unexpected subprocess".into())
+    async fn run(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+        assert_eq!(cmd, "sh");
+        let endpoint = args.iter().find(|arg| arg.starts_with("repos/")).expect("comment endpoint").split('?').next().expect("endpoint");
+        let comments = self.comments.lock().expect("comments");
+        Ok(serde_json::json!([comments.get(endpoint).into_iter().collect::<Vec<_>>()]).to_string())
+    }
+    async fn run_with_input(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel, input: &[u8]) -> Result<String, String> {
+        assert_eq!(cmd, "sh");
+        let endpoint = args.iter().find(|arg| arg.starts_with("repos/")).expect("post endpoint");
+        let mut comment: serde_json::Value = serde_json::from_slice(input).expect("comment JSON");
+        comment["html_url"] = format!("https://github.com/{endpoint}#issuecomment-1").into();
+        let mut comments = self.comments.lock().expect("comments");
+        assert!(comments.insert(endpoint.to_string(), comment.clone()).is_none(), "duplicate ledger post");
+        Ok(comment.to_string())
     }
     async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
         Err("unexpected subprocess".into())
@@ -3742,4 +3861,64 @@ fn generated_router_repository_identity_operations(tc: hegel::TestCase) {
         .build()
         .expect("runtime")
         .block_on(repository_identity_operations_scenario(alias));
+}
+
+// #2498: the operator's request queries replicated stalls without a crew or repo target.
+#[tokio::test]
+async fn operator_crew_stalls_query_reads_remote_obligations() {
+    let leader = empty_daemon_named("stall-reader").await;
+    let follower = empty_daemon_named("stall-home").await;
+    let remote = follower.resource_backend().using::<Convoy>("other-project-namespace");
+    let convoy = remote
+        .create(&InputMeta::builder().name("remote-stall".into()).build(), &convoy_spec("scratch", "implement"))
+        .await
+        .expect("remote convoy");
+    remote
+        .update_status("remote-stall", &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ResourceConvoyPhase::Active,
+            crew_work: BTreeMap::from([(
+                "work".into(),
+                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("working crew");
+    flotilla_resources::apply_status_patch(
+        &remote,
+        "remote-stall",
+        &flotilla_resources::external_patches::mark_crew_stalled(
+            "remote-stall".into(),
+            "work".into(),
+            "coder".into(),
+            Utc::now(),
+            flotilla_protocol::StallReason::Infra,
+            Some(flotilla_protocol::StallProposedDisposition::Resume),
+            "GitHub rate limit".into(),
+        ),
+    )
+    .await
+    .expect("declare stall");
+    leader
+        .resource_backend()
+        .replica_writer::<Convoy>(follower.node_id().clone(), "other-project-namespace")
+        .replace(&remote.list().await.expect("remote list"), Utc::now())
+        .await
+        .expect("replicate stall");
+    let topology =
+        spawn_in_memory_request_topology_stateful_with_surface(leader, follower, SurfaceDeclaration::focal_for_namespace("flotilla"))
+            .await
+            .expect("operator connection");
+    let result = topology
+        .client
+        .execute_query(Command::builder().action(CommandAction::QueryCrewStalls { full: true }).build(), uuid::Uuid::nil())
+        .await
+        .expect("operator stalls");
+    let CommandValue::CrewStalls(response) = result else { panic!("expected stalls: {result:?}") };
+    assert_eq!(response.rows.len(), 1);
+    assert_eq!(response.rows[0].namespace, "other-project-namespace");
+    assert_eq!(response.rows[0].convoy, "remote-stall");
+    assert_eq!(response.rows[0].role, "coder");
+    assert_eq!(response.rows[0].rung, Some(flotilla_protocol::StallRung::Operator));
+    assert_eq!(response.rows[0].evidence, "GitHub rate limit");
 }
