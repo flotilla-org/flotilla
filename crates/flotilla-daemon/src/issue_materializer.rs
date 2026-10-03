@@ -563,7 +563,7 @@ async fn run_materialization(
     let MaterializationContext { resolver, state, event_sink, shared_refresh } = context;
     let mut window = tokio::select! {
         _ = cancel.cancelled() => return,
-        window = load_window(&query, generation, resolver.as_ref(), &shared_refresh, &state, &event_sink) => window,
+        window = load_window(&query, generation, resolver.as_ref(), &shared_refresh, &state, event_sink.as_ref()) => window,
     };
     let mut refresh = tokio::time::interval_at(tokio::time::Instant::now() + REFRESH_INTERVAL, REFRESH_INTERVAL);
     loop {
@@ -574,17 +574,17 @@ async fn run_materialization(
                 Some(MaterializationIntent::FetchMore) => {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
-                        _ = fetch_more(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_sink) => {}
+                        _ = fetch_more(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, event_sink.as_ref()) => {}
                     }
                 }
                 Some(MaterializationIntent::Refilter) => {
-                    publish_loaded_window(&query, generation, window.rows(), window.has_more(), window.conditions.clone(), &state, &event_sink).await;
+                    publish_loaded_window(&query, generation, window.rows(), window.has_more(), window.conditions.clone(), &state, event_sink.as_ref()).await;
                 }
                 #[cfg(test)]
                 Some(MaterializationIntent::Refresh) => {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
-                        _ = refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_sink) => {}
+                        _ = refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, event_sink.as_ref()) => {}
                     }
                 }
                 None => return,
@@ -592,12 +592,12 @@ async fn run_materialization(
             _ = refresh.tick(), if suspended.is_none_or(|deadline| deadline <= tokio::time::Instant::now()) => {
                 tokio::select! {
                     _ = cancel.cancelled() => return,
-                    _ = refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_sink) => {}
+                    _ = refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, event_sink.as_ref()) => {}
                 }
             },
             _ = tokio::time::sleep_until(suspended.unwrap_or_else(tokio::time::Instant::now)), if suspended.is_some() => {
                 window.suspended_until = None;
-                refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_sink).await;
+                refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, event_sink.as_ref()).await;
             },
         }
     }
@@ -609,7 +609,7 @@ async fn load_window(
     resolver: &dyn IssueMaterializationResolver,
     shared_refresh: &SharedIssueRefresh,
     state: &AggregatorProjectionState,
-    event_sink: &Arc<dyn EventSink>,
+    event_sink: &dyn EventSink,
 ) -> MaterializedWindow {
     let QueryId::Issues { scope, search, label } = query else { unreachable!("issue materializer only accepts issue queries") };
     let base_params = IssueQuery { search: search.clone(), label: label.clone(), match_fields: Default::default() };
@@ -712,7 +712,7 @@ async fn fetch_more(
     shared_refresh: &SharedIssueRefresh,
     window: &mut MaterializedWindow,
     state: &AggregatorProjectionState,
-    event_sink: &Arc<dyn EventSink>,
+    event_sink: &dyn EventSink,
 ) {
     let requests = window
         .sources
@@ -776,7 +776,7 @@ async fn refresh_window(
     shared_refresh: &SharedIssueRefresh,
     window: &mut MaterializedWindow,
     state: &AggregatorProjectionState,
-    event_sink: &Arc<dyn EventSink>,
+    event_sink: &dyn EventSink,
 ) {
     if window.suspended_until.is_some_and(|deadline| deadline > tokio::time::Instant::now()) {
         return;
@@ -896,7 +896,7 @@ async fn publish_window(
     has_more: bool,
     conditions: Vec<ResultSetCondition>,
     state: &AggregatorProjectionState,
-    event_sink: &Arc<dyn EventSink>,
+    event_sink: &dyn EventSink,
 ) {
     if let Some(result_set) = state.replace_issues(query, generation, rows, demand_state(has_more, conditions)) {
         event_sink.emit(DaemonEvent::ResultSet(Box::new(result_set)));
@@ -911,14 +911,14 @@ async fn publish_loaded_window(
     has_more: bool,
     conditions: Vec<ResultSetCondition>,
     state: &AggregatorProjectionState,
-    event_sink: &Arc<dyn EventSink>,
+    event_sink: &dyn EventSink,
 ) {
     suppress_represented_rows(&mut rows, state).await;
     sort_rows(&mut rows);
     publish_window(query, generation, rows, has_more, conditions, state, event_sink).await;
 }
 
-async fn publish_awareness_sets(state: &AggregatorProjectionState, event_sink: &Arc<dyn EventSink>) {
+async fn publish_awareness_sets(state: &AggregatorProjectionState, event_sink: &dyn EventSink) {
     for query in state.subscribed_queries() {
         if !matches!(query, QueryId::Awareness { .. }) {
             continue;
