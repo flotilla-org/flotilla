@@ -73,6 +73,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::CrewFail { .. }
         | CommandAction::CrewStall { .. }
         | CommandAction::CrewSupervise { .. }
+        | CommandAction::DeliverCrewTurn { .. }
         | CommandAction::ConvoyCreate { .. }
         | CommandAction::ConvoyStart { .. }
         | CommandAction::WorkflowTemplateApply { .. }

@@ -90,6 +90,7 @@ impl InProcessDaemon {
             | A::CrewStall { .. }
             | A::CrewHandoff { .. }
             | A::CrewSupervise { .. }
+            | A::DeliverCrewTurn { .. }
             | A::ResourceApply { .. }
             | A::ResourceManifestResolve { .. }
             | A::ConvoyEnsureRoll { .. }

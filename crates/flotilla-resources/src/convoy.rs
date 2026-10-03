@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     CommandCaller, IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, PlacementDecision, PrincipalRef, Relationship, Subject,
 };
-pub use flotilla_protocol::{StallProposedDisposition, StallReason};
+pub use flotilla_protocol::{StallProposedDisposition, StallReason, TurnDeliveryRung};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
@@ -1125,13 +1125,6 @@ pub struct TurnDeliveryEpisode {
 pub enum TurnDeliveryOutcome {
     Delivered { rung: TurnDeliveryRung, delivered_at: DateTime<Utc> },
     Refused { reason: String, refused_at: DateTime<Utc>, hold_executed: bool },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TurnDeliveryRung {
-    WarmSession,
-    FreshAgent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
