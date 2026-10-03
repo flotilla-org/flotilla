@@ -44,7 +44,10 @@ decide() {
   local paths=$1 content=$2
   if grep -qE "$paths" "$changed_files"; then
     echo true
-  elif grep -E '^[+-]' "$diff" | grep -vE '^(\+\+\+|---) ' | grep -qE "$content"; then
+  # The content patterns anchor on added or removed lines. The final grep
+  # reads its whole input rather than using -q: an early exit would SIGPIPE
+  # the writer and, under pipefail, turn a match into a miss on large diffs.
+  elif grep -vE '^(\+\+\+|---) ' "$diff" | grep -E "$content" >/dev/null; then
     echo true
   else
     echo false

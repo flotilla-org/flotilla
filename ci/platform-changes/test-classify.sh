@@ -50,6 +50,9 @@ check "core UnixStream runs Windows" pull_request false "crates/flotilla-core/sr
   $'+use tokio::net::UnixStream;\n' "windows=true macos=false "
 check "caller path plus macOS content runs macOS" pull_request false "crates/flotilla-daemon/src/server/caller.rs" \
   $'+#[cfg(target_vendor = "apple")]\n' "windows=true macos=true "
+large_diff=$'+#[cfg(unix)]\n'$(printf '+line %s padding padding padding\n' $(seq 1 200000))
+check "early content hit in a large diff runs Windows" pull_request false "crates/flotilla-core/src/x.rs" \
+  "$large_diff" "windows=true macos=false "
 
 if ((failures > 0)); then
   echo "$failures platform-changes classification test(s) failed" >&2
