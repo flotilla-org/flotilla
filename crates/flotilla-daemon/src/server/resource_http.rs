@@ -48,6 +48,7 @@ pub(super) async fn serve_resource_http_with_daemon(
     }
 
     let (path, raw_query) = target.split_once('?').unwrap_or((target, ""));
+    let additional_stores = if daemon.is_some() && !path.starts_with("/observed/") { vec!["/observed"] } else { Vec::new() };
     let (path, backend) = if let Some(path) = path.strip_prefix("/observed") {
         let Some(daemon) = &daemon else {
             return write_error(&mut stream, 404, "observed resource store unavailable").await;
@@ -64,7 +65,7 @@ pub(super) async fn serve_resource_http_with_daemon(
         return write_json(
             &mut stream,
             200,
-            &serde_json::json!({"kinds": REGISTERED_RESOURCE_KINDS.iter().map(|kind| kind.plural).collect::<Vec<_>>(), "namespaces": namespaces }),
+            &serde_json::json!({"kinds": REGISTERED_RESOURCE_KINDS.iter().map(|kind| kind.plural).collect::<Vec<_>>(), "namespaces": namespaces, "stores": additional_stores }),
         )
         .await;
     }
