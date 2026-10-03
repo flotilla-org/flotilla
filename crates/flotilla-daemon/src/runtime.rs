@@ -3377,6 +3377,16 @@ where
                 debug!(%error, %namespace, "supervisor turn watch retry failed");
             }
         };
+        let mut last_reconcile_warning = None;
+        let mut report_reconcile_failure = |error: &str| {
+            let now = tokio::time::Instant::now();
+            if last_reconcile_warning.is_none_or(|last| now.duration_since(last) >= interval) {
+                warn!(%error, %namespace, "failed to reconcile pending supervisor turns");
+                last_reconcile_warning = Some(now);
+            } else {
+                debug!(%error, %namespace, "pending supervisor turn reconciliation still failing");
+            }
+        };
         let mut resync = tokio::time::interval(interval);
         resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Consume the immediate tick; the subscribed startup scan handles recovery once.
@@ -3388,7 +3398,7 @@ where
                     report_watch_failure(&error);
                     // A broken watch must not disable the periodic recovery pass.
                     if let Err(error) = daemon.reconcile_pending_supervisor_turns_once(&namespace).await {
-                        warn!(%error, %namespace, "failed to reconcile pending supervisor turns");
+                        report_reconcile_failure(&error);
                     }
                     failures = failures.saturating_add(1);
                     tokio::time::sleep(retry_backoff.delay(failures)).await;
@@ -3399,7 +3409,7 @@ where
             // Reconciliation is idempotent, including events caused by its own writes.
             loop {
                 if let Err(error) = daemon.reconcile_pending_supervisor_turns_once(&namespace).await {
-                    warn!(%error, %namespace, "failed to reconcile pending supervisor turns");
+                    report_reconcile_failure(&error);
                 }
                 if let Some(ready_tx) = ready_tx.take() {
                     let _ = ready_tx.send(());

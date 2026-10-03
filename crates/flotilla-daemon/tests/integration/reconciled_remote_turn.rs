@@ -218,6 +218,14 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
                 let backend = backend.clone();
                 let attempt = subscriptions.fetch_add(1, Ordering::SeqCst);
                 async move {
+                    if attempt == 1 {
+                        // The pending turn must remain undelivered until the replacement
+                        // subscription's recovery scan, rather than the first subscription.
+                        let stored =
+                            backend.clone().using::<TerminalSession>("flotilla").list().await.expect("terminal before resubscribe");
+                        assert_eq!(stored.items.len(), 1);
+                        assert!(matches!(&stored.items[0].spec.source, TerminalSessionSource::Agent { message: None, .. }));
+                    }
                     let convoys = backend.including_replicas::<Convoy>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
                     let sessions =
                         backend.including_replicas::<TerminalSession>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
