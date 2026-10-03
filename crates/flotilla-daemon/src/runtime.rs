@@ -3326,14 +3326,54 @@ fn spawn_host_description_projection_task(daemon: Arc<InProcessDaemon>, namespac
     })
 }
 
-fn spawn_pending_supervisor_turn_task(daemon: Arc<InProcessDaemon>, namespace: String, interval: Duration) -> JoinHandle<()> {
-    spawn_periodic_task(interval, PeriodicTaskStart::Immediate, move || {
-        let daemon = Arc::clone(&daemon);
-        let namespace = namespace.clone();
-        async move {
-            if let Err(error) = daemon.reconcile_pending_supervisor_turns_once(&namespace).await {
-                warn!(%error, %namespace, "failed to reconcile pending supervisor turns");
+/// Reconcile durable supervisor turns on resource changes, with periodic recovery.
+/// The caller owns the returned task and must abort it when the daemon stops.
+pub fn spawn_pending_supervisor_turn_task(daemon: Arc<InProcessDaemon>, namespace: String, interval: Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut resync = tokio::time::interval(interval);
+        resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let backend = daemon.resource_backend();
+            let watches = async {
+                let convoys = backend.including_replicas::<Convoy>(&namespace).watch().await?;
+                let sessions = backend.including_replicas::<TerminalSession>(&namespace).watch().await?;
+                Ok::<_, ResourceError>((convoys.ready_chunks(64), sessions.ready_chunks(64)))
             }
+            .await;
+            let (mut convoys, mut sessions) = match watches {
+                Ok(watches) => watches,
+                Err(error) => {
+                    warn!(%error, %namespace, "watch pending supervisor turns failed");
+                    resync.tick().await;
+                    // A broken watch must not disable the periodic recovery pass.
+                    if let Err(error) = daemon.reconcile_pending_supervisor_turns_once(&namespace).await {
+                        warn!(%error, %namespace, "failed to reconcile pending supervisor turns");
+                    }
+                    continue;
+                }
+            };
+            // Subscribe to both inputs before scanning to preserve updates during a pass.
+            // Reconciliation is idempotent, including events caused by its own writes.
+            loop {
+                if let Err(error) = daemon.reconcile_pending_supervisor_turns_once(&namespace).await {
+                    warn!(%error, %namespace, "failed to reconcile pending supervisor turns");
+                }
+                let events = tokio::select! {
+                    events = convoys.next() => events.map(|events| events.into_iter().map(|event| event.map(|_| ())).collect::<Vec<_>>()),
+                    events = sessions.next() => events.map(|events| events.into_iter().map(|event| event.map(|_| ())).collect::<Vec<_>>()),
+                    _ = resync.tick() => continue,
+                };
+                match events {
+                    Some(events) => {
+                        if let Some(error) = events.into_iter().find_map(Result::err) {
+                            warn!(%error, %namespace, "supervisor turn watch failed; resubscribing");
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            resync.tick().await;
         }
     })
 }
