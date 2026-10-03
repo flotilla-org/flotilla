@@ -2644,6 +2644,9 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         assert!(matches!(claim().await.expect("cached wait"), flotilla_protocol::CommandValue::CrewCompletionWaiting { .. }));
         assert_eq!(runner.calls.lock().expect("calls").len(), calls, "fresh completion must respect cooldown");
         runner.rate_limit_all.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Advance only the monotonic cache TTL. The old response's UTC deadline
+        // remains future; expiry admits a new forge read, now healthy, before
+        // completion is judged. The explicit two-clock test pins the conversion.
         tokio::time::advance(Duration::from_secs(60)).await;
         assert!(claim().await.expect_err("fresh conflict still refuses").contains(".ready"));
         runner.conflicting.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -7691,7 +7694,7 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
 // expired/zero deadlines from causing a burst of concurrent cache misses.
 #[tokio::test(start_paused = true)]
 async fn observation_cache_deadline_crosses_both_clocks() {
-    let wall = chrono::DateTime::parse_from_rfc3339("2026-10-03T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+    let wall = chrono::DateTime::parse_from_rfc3339("2026-10-03T12:00:00Z").expect("fixed UTC timestamp").with_timezone(&chrono::Utc);
     let retry = wall + chrono::Duration::seconds(60);
     let expires = tokio::time::Instant::now() + super::observation_cache_delay(Some(retry), wall);
     tokio::time::advance(std::time::Duration::from_secs(59)).await;

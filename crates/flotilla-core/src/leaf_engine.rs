@@ -1322,6 +1322,8 @@ impl ReconcilerWake {
                                     if refresh_error.as_deref().and_then(rate_limit_reset).is_some_and(|retry_at| retry_at > now) {
                                         // A known forge retry deadline keeps the observed
                                         // maker pending; missing evidence is not a crew stall.
+                                        // Deliberately defer every leaf in this row until
+                                        // its observed maker can be judged with fresh evidence.
                                         unknown = true;
                                         continue 'rows;
                                     }
