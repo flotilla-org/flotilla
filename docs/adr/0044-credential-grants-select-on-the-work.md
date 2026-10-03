@@ -53,6 +53,42 @@ For minted credentials (the GitHub App installation token today), a grant declar
 
 When several grants match one crew, their permission sets **union** per credential, capped by the permissions the credential declaration (and the App installation itself) allows. Grants can narrow what the App can do, never exceed it.
 
+**Composition rule (owner ruling #2491, 2026-10-03):** for each credential on
+one vessel, matching grants must either all list that credential in `permissions`
+or all omit it. Admission refuses a mix, naming the credential, the listed grant,
+and the unlisted grant, and asks for the unlisted grant to be made explicit.
+An empty map for the credential counts as explicit and requests no permissions.
+Unlisted-only grants use the credential spec's declared maximum; explicit-only
+grants union their listed permissions, capped by the spec. The offline
+`flotilla resource validate` manifest gate rejects potentially co-selectable mixed
+grants within a namespace, even if no currently installed workflow uses that role.
+Repository selectors need not intersect: a multi-repository vessel can match both.
+This changes composition policy, not the resource schema; project-map is the
+external author of these grants and requires no schema migration.
+
+**Admission and refresh:**
+
+- **Frozen at admission:** credential references and the resolved permission map
+  are retained in the convoy's workflow snapshot. Explicit permissions are
+  unioned and capped against the then-current spec. Unlisted-only grants also
+  freeze that spec's maximum when it is declared; otherwise no map is stored.
+  Editing grants later does not change the snapshot.
+- **Re-read on preparation:** initial delivery and re-adoption after daemon
+  restart read the current spec and cap the snapshot again. An absent snapshot
+  map uses that spec's maximum, or the installation default when the maximum is
+  still absent. Source paths and installation configuration are read again too.
+- **Re-resolved on periodic refresh:** repository scopes follow current grants,
+  projects, and repository trust (#1985), constrained by the vessel's admitted
+  repository selection. Permissions use the snapshot map supplied by runtime,
+  falling back to the previously prepared mint request when no map was stored.
+  Refresh does **not** re-read grant permission maps or the spec's maximum; it
+  also retains source paths and installation configuration from the mint request.
+  The App installation itself still bounds every mint.
+
+Spec edits are therefore not a live permission-refresh mechanism. A snapshot
+without a map follows a later spec maximum on fresh preparation/re-adoption,
+not on each periodic mint.
+
 Token permissions cannot prevent a merge: contents plus pull-request write can merge. "Crews don't merge their own work" (#954) therefore stays a settlement-time check (`mergedBy` is not the crew identity), not a permission.
 
 ### 4. No scarce-material abstraction

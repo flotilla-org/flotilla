@@ -310,6 +310,28 @@ This first manifest-reconciliation slice is deliberately additive: removing a
 file does not delete its object, and existing unmanaged objects are never
 adopted. Omit `[manifests]` to disable the loop.
 
+## Credential grant permissions
+
+For each credential on a vessel, matching `CredentialGrant` resources must all
+list that credential in `permissions`, or all omit it. Mixing the two refuses
+admission: the error names the credential and both grants and asks you to make
+the unlisted grant explicit. An explicit empty map requests no permissions.
+Unlisted-only grants use the credential spec's maximum; explicit grants union
+their permissions and are capped by the spec.
+
+Validate the complete manifest directory before applying grant edits, so the
+check can compare grants across files:
+
+```bash
+flotilla resource validate /path/to/project-map/flotilla-manifests
+```
+
+Permission maps are resolved at admission and retained in the convoy snapshot;
+repository scopes re-resolve during refresh. Spec edits are read during fresh
+credential preparation, while periodic token refresh retains the snapshot or
+prepared request's permissions. See [ADR 0044](adr/0044-credential-grants-select-on-the-work.md)
+for the absent-maximum case and the complete admission and refresh contract.
+
 ## Dependencies
 
 Flotilla auto-detects available tools. Nothing is strictly required beyond git, but more tools unlock more features.

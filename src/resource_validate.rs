@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::{collections::BTreeMap, sync::Arc};
 
 use color_eyre::{eyre::eyre, Result};
+use flotilla_core::in_process::DEFAULT_PROVISIONING_NAMESPACE;
 #[cfg(unix)]
 use flotilla_core::{
     ops_entry::{parse_operational_entry, OperationalEntryFile},
@@ -296,6 +297,7 @@ fn validate_ops_inventory(inventory: &OperationalEntryInventory) -> Result<usize
 pub fn validate_path(path: &Path, skill_catalog: Option<&Path>) -> Result<()> {
     let catalog = skill_catalog.map(load_catalog).transpose()?;
     let mut skill_documents = Vec::new();
+    let mut grant_documents = Vec::new();
     let mut files = Vec::new();
     collect_files(path, &mut files)?;
     if files.is_empty() {
@@ -321,7 +323,12 @@ pub fn validate_path(path: &Path, skill_catalog: Option<&Path>) -> Result<()> {
                         skill_documents.push(document.clone());
                     }
                     match validate_resource_document(document) {
-                        Ok(()) => println!("{label}: valid"),
+                        Ok(()) => {
+                            if document["kind"].as_str() == Some("CredentialGrant") {
+                                grant_documents.push(document.clone());
+                            }
+                            println!("{label}: valid");
+                        }
                         Err(error) => {
                             eprintln!("{label}: {error}");
                             failed = true;
@@ -335,6 +342,10 @@ pub fn validate_path(path: &Path, skill_catalog: Option<&Path>) -> Result<()> {
             }
         }
     }
+    if let Err(error) = validate_grant_documents(&grant_documents) {
+        eprintln!("{error}");
+        failed = true;
+    }
     if failed {
         Err(eyre!("resource validation failed"))
     } else {
@@ -342,6 +353,41 @@ pub fn validate_path(path: &Path, skill_catalog: Option<&Path>) -> Result<()> {
             validate_skill_documents(catalog, &skill_documents)?;
         }
         Ok(())
+    }
+}
+
+/// Validate potential co-selection, including future roles and multi-repository vessels.
+/// Namespace boundaries remain independent, as they are at admission.
+fn validate_grant_documents(documents: &[Value]) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    use flotilla_resources::{validate_matching_grant_permissions, CredentialGrantSpec};
+
+    let mut namespaces = BTreeMap::<String, Vec<(String, CredentialGrantSpec)>>::new();
+    for document in documents {
+        let namespace = document["metadata"]["namespace"].as_str().unwrap_or(DEFAULT_PROVISIONING_NAMESPACE).to_string();
+        // Schema validation reports malformed documents separately. They must
+        // not hide composition errors among the remaining valid grants.
+        let Some(name) = document["metadata"]["name"].as_str() else { continue };
+        let Ok(spec) = serde_json::from_value::<CredentialGrantSpec>(document["spec"].clone()) else { continue };
+        namespaces.entry(namespace).or_default().push((name.to_string(), spec));
+    }
+    let mut errors = Vec::new();
+    for (namespace, grants) in namespaces {
+        for (index, (name, grant)) in grants.iter().enumerate() {
+            for (other_name, other) in &grants[index + 1..] {
+                if grant.selector.overlaps(&other.selector) {
+                    if let Err(error) = validate_matching_grant_permissions([(name.as_str(), grant), (other_name.as_str(), other)]) {
+                        errors.extend(error.lines().map(|message| format!("{namespace}: {message}")));
+                    }
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(eyre!("credential grant validation refused:\n{}", errors.join("\n")))
     }
 }
 
@@ -358,7 +404,7 @@ fn validate_skill_documents(catalog: &[flotilla_resources::SkillCatalogEntry], d
     use flotilla_resources::{crew_defaults::check_skill_declarations, CrewDefaultsSpec, ProjectSpec};
     let mut namespaces = BTreeMap::<String, (BTreeMap<String, Vec<CrewDefaultsSpec>>, Vec<ProjectSpec>)>::new();
     for document in documents {
-        let namespace = document["metadata"]["namespace"].as_str().unwrap_or("flotilla").to_string();
+        let namespace = document["metadata"]["namespace"].as_str().unwrap_or(DEFAULT_PROVISIONING_NAMESPACE).to_string();
         let (defaults, projects) = namespaces.entry(namespace).or_default();
         match document["kind"].as_str() {
             Some("CrewDefaults") => {
@@ -432,11 +478,74 @@ mod tests {
     use flotilla_protocol::NodeId;
     use flotilla_resources::{validate_resource_document, Convoy, ConvoySpec, ConvoyStatus, InputMeta, Project, ProjectSpec};
     use flotilla_test_support::TestSocketDir;
+    use serde_json::Value;
 
     use super::{
-        collect_files, inspect_validation_roots, ops_inventory_endpoint_absent, parse_documents, validate_daemon, validate_project_ops,
-        VALIDATION_INSPECTION_HOST,
+        collect_files, inspect_validation_roots, ops_inventory_endpoint_absent, parse_documents, validate_daemon, validate_grant_documents,
+        validate_path, validate_project_ops, VALIDATION_INSPECTION_HOST,
     };
+
+    // Owner ruling #2491: the actual offline manifest command catches the
+    // mixed case across files, including a listed empty map, before admission.
+    #[test]
+    fn manifest_gate_refuses_mixed_grant_permissions() {
+        let root = tempfile::tempdir().expect("manifest directory");
+        let grant = |name: &str, namespace: &str, role: &str, listed: bool| {
+            serde_json::json!({
+                "apiVersion":"flotilla.work/v1", "kind":"CredentialGrant",
+                "metadata":{"name":name,"namespace":namespace},
+                "spec":{"selector":{"projects":["demo"],"roles":[role]},"credentials":["app"],
+                    "permissions":if listed { serde_json::json!({"app":{}}) } else { serde_json::json!({}) }}
+            })
+        };
+        let base = grant("base", "flotilla", "governor", false);
+        let listed = grant("elevation", "flotilla", "governor", true);
+        std::fs::write(root.path().join("base.json"), base.to_string()).expect("base");
+        std::fs::write(root.path().join("listed.json"), listed.to_string()).expect("listed");
+        assert!(validate_path(root.path(), None).is_err());
+        let error = validate_grant_documents(&[base.clone(), listed.clone()]).expect_err("mixed policy refused").to_string();
+        for name in ["base", "elevation", "app", "explicit"] {
+            assert!(error.contains(name), "{error}");
+        }
+        // Disjoint roles do not co-select for one crew (admission also forbids
+        // different grant sets across co-located roles); namespaces are independent.
+        assert!(validate_grant_documents(&[base.clone(), grant("elevation", "flotilla", "coder", true)]).is_ok());
+        assert!(validate_grant_documents(&[base.clone(), grant("elevation", "other", "governor", true)]).is_ok());
+        // Homogeneous unlisted and explicit policy remains valid.
+        assert!(validate_grant_documents(&[base, grant("second", "flotilla", "governor", false)]).is_ok());
+        assert!(validate_grant_documents(&[listed, grant("second", "flotilla", "governor", true)]).is_ok());
+    }
+
+    // A malformed grant must not hide diagnostics for valid grants; every
+    // conflicting pair and credential is reported in one manifest validation pass.
+    #[test]
+    fn manifest_gate_reports_all_conflicts_despite_malformed_documents() {
+        let grant = |name: &str, credentials: &[&str], permissions: Value| {
+            serde_json::json!({
+                "apiVersion":"flotilla.work/v1", "kind":"CredentialGrant", "metadata":{"name":name},
+                "spec":{"selector":{}, "credentials":credentials, "permissions":permissions}
+            })
+        };
+        let documents = vec![
+            serde_json::json!({"kind":"CredentialGrant", "metadata":{"name":"malformed"}, "spec":{"selector":{},"credentials":false}}),
+            grant("base", &["app", "other"], serde_json::json!({})),
+            grant("elevation", &["app", "other"], serde_json::json!({"app":{},"other":{}})),
+            grant("second-base", &["extra"], serde_json::json!({})),
+            grant("second-elevation", &["extra"], serde_json::json!({"extra":{}})),
+        ];
+        let error = validate_grant_documents(&documents).expect_err("all valid conflicts are reported").to_string();
+        for credential in ["app", "other", "extra"] {
+            assert!(error.contains(&format!("credential `{credential}`")), "{error}");
+        }
+        for grant in ["base", "elevation", "second-base", "second-elevation"] {
+            assert!(error.contains(&format!("grant `{grant}`")), "{error}");
+        }
+        let root = tempfile::tempdir().expect("manifest directory");
+        for (index, document) in documents.into_iter().enumerate() {
+            std::fs::write(root.path().join(format!("{index}.json")), document.to_string()).expect("manifest");
+        }
+        assert!(validate_path(root.path(), None).is_err(), "malformed manifests still refuse the overall validation");
+    }
 
     #[test]
     fn previous_generation_daemons_fall_back_to_local_ops_inspection() {
