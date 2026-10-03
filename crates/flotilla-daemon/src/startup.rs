@@ -5,7 +5,7 @@ use std::{future::Future, time::Duration};
 use tracing::{info, warn};
 
 /// Startup-only diagnostic deadline; restoration continues to own readiness.
-const PENDING_WARNING_THRESHOLD: Duration = Duration::from_secs(60);
+pub(crate) const PENDING_WARNING_THRESHOLD: Duration = Duration::from_secs(60);
 
 struct PhaseTiming {
     phase: &'static str,
@@ -32,7 +32,7 @@ pub(crate) async fn phase<T>(phase: &'static str, operation: impl Future<Output 
         biased;
         result = &mut operation => result,
         _ = tokio::time::sleep(PENDING_WARNING_THRESHOLD) => {
-            warn!(phase, elapsed_ms = timing.started.elapsed().as_secs_f64() * 1000.0,
+            warn!(phase, elapsed_ms = u64::try_from(timing.started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "daemon startup phase remains pending");
             operation.await
         }
@@ -48,6 +48,16 @@ mod tests {
     use tracing::instrument::WithSubscriber;
 
     use super::phase;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PhaseOutcome {
+        Success,
+        Error,
+        Cancelled,
+        Panic,
+        Blocked,
+        Deadline,
+    }
 
     // Deferred restoration remains pending before readiness, starts after
     // readiness, and is cancelled when the server closes without listening.
@@ -72,7 +82,14 @@ mod tests {
     async fn pending_phase_warning_observes_deadline_and_future_lifetime() {
         use futures::FutureExt;
 
-        for outcome in ["success", "error", "cancelled", "panic", "blocked", "deadline"] {
+        for outcome in [
+            PhaseOutcome::Success,
+            PhaseOutcome::Error,
+            PhaseOutcome::Cancelled,
+            PhaseOutcome::Panic,
+            PhaseOutcome::Blocked,
+            PhaseOutcome::Deadline,
+        ] {
             let log = tempfile::NamedTempFile::new().expect("log file");
             let subscriber = tracing_subscriber::fmt().json().with_ansi(false).with_writer(log.reopen().expect("log writer")).finish();
             async {
@@ -80,8 +97,8 @@ mod tests {
                 let mut operation = Box::pin(
                     std::panic::AssertUnwindSafe(phase("blocked_preflight", async {
                         gate.await.expect("released preflight");
-                        assert_ne!(outcome, "panic", "injected phase panic");
-                        if outcome == "error" {
+                        assert_ne!(outcome, PhaseOutcome::Panic, "injected phase panic");
+                        if outcome == PhaseOutcome::Error {
                             Err("preflight failed")
                         } else {
                             Ok(())
@@ -95,21 +112,21 @@ mod tests {
                 let before = std::fs::read_to_string(log.path()).expect("log");
                 assert!(!before.contains("remains pending"), "no warning before threshold");
 
-                if outcome == "blocked" {
+                if outcome == PhaseOutcome::Blocked {
                     tokio::time::advance(Duration::from_millis(1)).await;
                     assert!(futures::poll!(&mut operation).is_pending(), "warning cannot release dependent work");
                     tokio::time::advance(super::PENDING_WARNING_THRESHOLD * 2).await;
                     assert!(futures::poll!(&mut operation).is_pending());
-                } else if outcome != "cancelled" {
-                    if outcome == "deadline" {
+                } else if outcome != PhaseOutcome::Cancelled {
+                    if outcome == PhaseOutcome::Deadline {
                         // Completion ready with the timer wins without a stale warning.
                         tokio::time::advance(Duration::from_millis(1)).await;
                     }
                     release.send(()).expect("release phase");
                     let result = operation.as_mut().await;
-                    assert_eq!(result.is_err(), outcome == "panic");
+                    assert_eq!(result.is_err(), outcome == PhaseOutcome::Panic);
                     if let Ok(result) = result {
-                        assert_eq!(result.is_err(), outcome == "error");
+                        assert_eq!(result.is_err(), outcome == PhaseOutcome::Error);
                     }
                 }
                 drop(operation);
@@ -123,10 +140,10 @@ mod tests {
                 .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON record"))
                 .collect::<Vec<_>>();
             let warnings = records.iter().filter(|record| record["level"] == "WARN").collect::<Vec<_>>();
-            assert_eq!(warnings.len(), usize::from(outcome == "blocked"), "{outcome}");
+            assert_eq!(warnings.len(), usize::from(outcome == PhaseOutcome::Blocked), "{outcome:?}");
             if let Some(warning) = warnings.first() {
                 assert_eq!(warning["fields"]["phase"], "blocked_preflight");
-                assert_eq!(warning["fields"]["elapsed_ms"], 60_000.0);
+                assert_eq!(warning["fields"]["elapsed_ms"], 60_000);
                 assert_eq!(warning["fields"].as_object().expect("fields").len(), 3, "diagnostic excludes credential material");
             }
         }
@@ -136,22 +153,22 @@ mod tests {
     // duration in the JSON log. Virtual time makes the 38-second gap inexpensive.
     #[tokio::test(start_paused = true)]
     async fn startup_phase_records_duration_for_success_error_and_cancellation() {
-        for outcome in ["success", "error", "cancelled"] {
+        for outcome in [PhaseOutcome::Success, PhaseOutcome::Error, PhaseOutcome::Cancelled] {
             let log = tempfile::NamedTempFile::new().expect("log file");
             let subscriber = tracing_subscriber::fmt().json().with_ansi(false).with_writer(log.reopen().expect("log writer")).finish();
             let operation = phase("reconcile_work_credentials", async {
                 tokio::time::sleep(Duration::from_millis(38_650)).await;
-                if outcome == "error" {
+                if outcome == PhaseOutcome::Error {
                     Err("staging failed")
                 } else {
                     Ok(())
                 }
             });
             async {
-                if outcome == "cancelled" {
+                if outcome == PhaseOutcome::Cancelled {
                     assert!(tokio::time::timeout(Duration::from_millis(1234), operation).await.is_err());
                 } else {
-                    assert_eq!(operation.await.is_err(), outcome == "error");
+                    assert_eq!(operation.await.is_err(), outcome == PhaseOutcome::Error);
                 }
             }
             .with_subscriber(subscriber)
@@ -164,8 +181,8 @@ mod tests {
             assert_eq!(records.len(), 2);
             let fields = &records[1]["fields"];
             assert_eq!(fields["phase"], "reconcile_work_credentials");
-            assert_eq!(fields["status"], if outcome == "cancelled" { "cancelled" } else { "completed" });
-            assert_eq!(fields["duration_ms"], if outcome == "cancelled" { 1234.0 } else { 38_650.0 });
+            assert_eq!(fields["status"], if outcome == PhaseOutcome::Cancelled { "cancelled" } else { "completed" });
+            assert_eq!(fields["duration_ms"], if outcome == PhaseOutcome::Cancelled { 1234.0 } else { 38_650.0 });
         }
     }
 }
