@@ -35,6 +35,7 @@ use crate::{
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONTROL: usize = 64 * 1024;
+const MAX_CHANNELS: usize = 256;
 
 /// Persist this key independently of SSH keys, account names, and routes.
 #[derive(Clone)]
@@ -203,14 +204,17 @@ impl Server {
         let registrations = Arc::new(Mutex::new(BTreeMap::new()));
         let authority = policy.clone();
         let task = tokio::spawn(async move {
-            let permits = Arc::new(Semaphore::new(256));
+            let permits = Arc::new(Semaphore::new(MAX_CHANNELS));
             let mut cleanup = tokio::time::interval(Duration::from_secs(1));
             let mut connections = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break };
-                        let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
+                        let Ok(permit) = permits.clone().try_acquire_owned() else {
+                            tracing::debug!(max_channels = MAX_CHANNELS, "Tender channel admission limit reached");
+                            continue
+                        };
                         let policy = authority.clone();
                         let identity = identity.clone();
                         let registrations = registrations.clone();
@@ -608,6 +612,21 @@ impl SshTender {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum RetryPause {
+    Elapsed,
+    Cancelled,
+}
+
+async fn pause_publisher_retry(sender: &mpsc::UnboundedSender<ByteStream>, registration: &mut UnixStream, delay: Duration) -> RetryPause {
+    let mut byte = [0];
+    tokio::select! {
+        _ = sender.closed() => RetryPause::Cancelled,
+        _ = registration.read(&mut byte) => RetryPause::Cancelled,
+        _ = sleep(delay) => RetryPause::Elapsed,
+    }
+}
+
 #[async_trait]
 impl Tender for SshTender {
     async fn publish(&self, session: &Session, request: PublishRequest) -> Result<Published, Error> {
@@ -627,7 +646,8 @@ impl Tender for SshTender {
         let held_lease = lease.clone();
         tokio::spawn(async move {
             let mut byte = [0];
-            loop {
+            let mut retry_delay = Duration::from_millis(100);
+            'publisher: loop {
                 let accept = async {
                     let mut stream = adapter.request(&session, Request::Accept(held_lease.clone())).await?;
                     match read_control(&mut stream).await.map_err(|_| Error::Unavailable)? {
@@ -641,8 +661,17 @@ impl Tender for SshTender {
                     _ = registration_stream.read(&mut byte) => break,
                     stream = accept => {
                         match stream {
-                            Ok(stream) => { if sender.send(Box::new(stream) as ByteStream).is_err() { break } }
-                            Err(Error::Unavailable | Error::Deadline) => sleep(Duration::from_millis(100)).await,
+                            Ok(stream) => {
+                                retry_delay = Duration::from_millis(100);
+                                if sender.send(Box::new(stream) as ByteStream).is_err() { break }
+                            }
+                            Err(Error::Unavailable | Error::Deadline) => {
+                                // Backoff cannot delay lease loss or owner cancellation.
+                                if pause_publisher_retry(&sender, &mut registration_stream, retry_delay).await == RetryPause::Cancelled {
+                                    break 'publisher;
+                                }
+                                retry_delay = (retry_delay * 2).min(Duration::from_secs(8));
+                            },
                             Err(_) => break,
                         }
                     }
@@ -893,5 +922,25 @@ mod tests {
         std::fs::write(&socket, b"").expect("stale file");
         assert!(wait_for_socket(&socket, Duration::from_secs(1), || Ok(Some(std::process::ExitStatus::from_raw(256)))).await.is_err());
         assert_eq!(wait_for_socket(&socket, Duration::from_secs(1), || Err("probe failed".into())).await, Err("probe failed".into()));
+    }
+
+    // Both cancellation sources interrupt even the maximum outage backoff;
+    // the real Unix pair models the registration channel, not application data.
+    #[tokio::test]
+    async fn maximum_publisher_backoff_remains_cancellable() {
+        for cause in ["owner", "registration"] {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            let (mut registration, remote) = UnixStream::pair().expect("registration pair");
+            let paused = tokio::spawn(async move { pause_publisher_retry(&sender, &mut registration, Duration::from_secs(8)).await });
+            match cause {
+                "owner" => drop(receiver),
+                "registration" => drop(remote),
+                _ => unreachable!("generator covers the two cancellation sources"),
+            }
+            assert_eq!(
+                timeout(Duration::from_secs(1), paused).await.expect("prompt backoff cancellation").expect("retry task"),
+                RetryPause::Cancelled
+            );
+        }
     }
 }

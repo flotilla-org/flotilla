@@ -43,8 +43,8 @@ After SSH loss, retained browse/watch metadata becomes Unavailable rather than
 Withdrawn. `replace_route` supplies a restored forward; watch re-establishes its
 control subscription and fresh connects use that route. Existing application
 streams are never migrated or replayed. A remote publisher holds a separate
-registration control channel: transient Accept failures retry while that lease
-is healthy, but losing it reserves the identity and closes its Published
+registration control channel: transient Accept failures retry with backoff from
+100 ms to eight seconds while that lease is healthy, but losing it reserves the identity and closes its Published
 receiver. The owner explicitly reclaims to obtain the new generation's Lease;
 an automatic reclaim would silently stale the caller's existing Lease.
 Exposure health checks run once a second while healthy and back off to eight
