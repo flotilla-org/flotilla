@@ -28,6 +28,8 @@ use crate::keys::{
     KEY_SUBJECT_SUPERSEDES, KEY_SUBJECT_WORKS_ON, SEGMENT_PROJECT,
 };
 
+const BUILTIN_GITHUB_SERVICE: &str = "github.com";
+
 fn subject_entity(subject: &Subject) -> EntityRef {
     match subject.kind {
         SubjectKind::Issue => entity::issue(&IssueRef { source: subject.source.clone(), id: subject.id.clone() }),
@@ -205,9 +207,10 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
     for record in &observations.forges {
         project_forge(catalog, &record.spec.forge_id, record.spec.kind, &record.spec.https_url);
     }
-    // Presentation-only default: never declare a resource or re-key repositories.
-    if super::subject_forge(&observations.forges, "github.com").is_none() {
-        project_forge(catalog, "github.com", ForgeKind::Github, "https://github.com");
+    // Like declared forges, publish the default even without visible subjects.
+    // Presentation-only: never declare a resource or re-key repositories.
+    if super::subject_forge(&observations.forges, BUILTIN_GITHUB_SERVICE).is_none() {
+        project_forge(catalog, BUILTIN_GITHUB_SERVICE, ForgeKind::Github, "https://github.com");
     }
 
     for role in input.standing_roles {
@@ -269,8 +272,8 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
         .filter_map(|service| {
             if let Some(forge) = super::subject_forge(&observations.forges, service) {
                 Some((service, entity::forge(&forge.spec.forge_id)))
-            } else if service == "github.com" {
-                Some((service, entity::forge("github.com")))
+            } else if service == BUILTIN_GITHUB_SERVICE {
+                Some((service, entity::forge(BUILTIN_GITHUB_SERVICE)))
             } else {
                 tracing::warn!(service, "subject service has no covering Forge");
                 None
