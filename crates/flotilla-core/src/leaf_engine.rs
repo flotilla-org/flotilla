@@ -410,6 +410,8 @@ impl LeafSubscriptionTable {
             if !self.inner.rows.lock().await.contains_key(&row.id) {
                 return Ok(());
             }
+            // Attempt time includes opening watches and loading snapshots.
+            // A slow relist already bounds snapshot work, so it may reset backoff.
             let started = tokio::time::Instant::now();
             match self.watch_row_once(row.clone()).await {
                 Err(ResourceError::WatchExpired { .. }) => {
