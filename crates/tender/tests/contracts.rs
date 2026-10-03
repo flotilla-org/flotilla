@@ -1,3 +1,7 @@
+#[cfg(unix)]
+#[path = "common/ssh.rs"]
+mod ssh_fixture;
+
 use std::{collections::BTreeSet, time::Duration};
 
 use tender::{memory::MemoryTender, Availability, Error, Fingerprint, Grant, Namespace, PublicationId, PublishRequest, Session, Tender};
@@ -50,17 +54,66 @@ struct Rig {
     tender: Box<dyn Tender>,
     host: Box<dyn HostControls>,
     host_id: Fingerprint,
+    #[cfg(unix)]
+    _ssh: Option<(tender::ssh::Server, tender::ssh::Forward, ssh_fixture::Sshd)>,
 }
 
 fn memory() -> Rig {
     let host_id = fp("host-key");
     let host = MemoryTender::new(host_id.clone());
-    Rig { tender: Box::new(host.clone()), host: Box::new(host), host_id }
+    Rig {
+        tender: Box::new(host.clone()),
+        host: Box::new(host),
+        host_id,
+        #[cfg(unix)]
+        _ssh: None,
+    }
 }
 
 fn fp(value: &str) -> Fingerprint {
-    Fingerprint(value.into())
+    #[cfg(unix)]
+    {
+        identity(value).fingerprint()
+    }
+    #[cfg(not(unix))]
+    {
+        Fingerprint(value.into())
+    }
 }
+#[cfg(unix)]
+fn identity(label: &str) -> tender::ssh::Identity {
+    use sha2::{Digest, Sha256};
+    tender::ssh::Identity::from_secret(Sha256::digest(label.as_bytes()).into())
+}
+
+#[cfg(unix)]
+async fn ssh() -> Rig {
+    let fixture = ssh_fixture::Sshd::start().await;
+    let host_identity = identity("host-key");
+    let host_id = host_identity.fingerprint();
+    let host = MemoryTender::new(host_id.clone());
+    let endpoint = fixture.directory.path().join("tender");
+    let server = tender::ssh::Server::bind(endpoint.clone(), host_identity, host.clone()).expect("Tender listener");
+    let forward = tender::ssh::Forward::start(&fixture.destination, &endpoint, &fixture.options).await.expect("SSH forward");
+    let names = [
+        "host-user",
+        "laptop",
+        "container-key",
+        "parent",
+        "outsider",
+        "owner",
+        "consumer",
+        "contender",
+        "first-helper",
+        "second-helper",
+        "kept",
+        "removed",
+    ];
+    let adapter = tender::ssh::SshTender::new(forward.socket().to_owned(), host_id.clone(), names.into_iter().map(identity).collect())
+        .expect("adapter");
+    Rig { tender: Box::new(adapter), host: Box::new(host), host_id, _ssh: Some((server, forward, fixture)) }
+}
+
 fn ns(value: &str) -> Namespace {
     Namespace(value.into())
 }
@@ -332,8 +385,10 @@ async fn backpressure_and_cancel(rig: Rig) {
     let mut published = rig.tender.publish(&publisher, request("n", "service", &["consumer"], None)).await.expect("publish");
     let mut connection = rig.tender.connect_with_deadline(&client, published.lease.id, Duration::from_secs(1)).await.expect("bounded open");
     let mut service = published.incoming.recv().await.expect("incoming");
+    // Exceeds SSH channel windows and OS socket buffers as well as the
+    // in-memory pipe, without assuming an adapter-specific capacity.
     assert!(
-        timeout(Duration::from_millis(30), connection.write_all(&vec![7; 1_000_000])).await.is_err(),
+        timeout(Duration::from_millis(30), connection.write_all(&vec![7; 16_000_000])).await.is_err(),
         "bounded stream must apply backpressure"
     );
     drop(connection); // Cooperative cancellation closes this one raw channel.
@@ -346,7 +401,7 @@ async fn backpressure_and_cancel(rig: Rig) {
         }
         total += n;
     }
-    assert!(total < 1_000_000);
+    assert!(total < 16_000_000);
 }
 
 macro_rules! contract {
@@ -371,3 +426,34 @@ contract!(restart_and_replacement);
 contract!(publisher_receiver_closure);
 contract!(narrowed_grant_removes_live_audience);
 contract!(backpressure_and_cancel);
+
+// The SSH adapter excludes the slice-3 container/intermediary walkthroughs.
+// The remaining slice-1 expectations are unchanged and run over real SSH.
+#[cfg(unix)]
+macro_rules! ssh_contract {
+    ($name:ident, $scenario:ident) => {
+        #[tokio::test]
+        #[ignore = "requires local sshd; run --ignored with TENDER_TEST_SSHD if needed"]
+        async fn $name() {
+            $scenario(ssh().await).await;
+        }
+    };
+}
+#[cfg(unix)]
+ssh_contract!(ssh_existing_service, existing_service_on_ssh_host);
+#[cfg(unix)]
+ssh_contract!(ssh_lifecycle, lifecycle_and_stale_teardown);
+#[cfg(unix)]
+ssh_contract!(ssh_namespaces, reclaim_cannot_probe_other_namespaces);
+#[cfg(unix)]
+ssh_contract!(ssh_grant_loss, grant_loss_and_expiry);
+#[cfg(unix)]
+ssh_contract!(ssh_no_replay, no_replay_or_rebind);
+#[cfg(unix)]
+ssh_contract!(ssh_restart, restart_and_replacement);
+#[cfg(unix)]
+ssh_contract!(ssh_publisher_closure, publisher_receiver_closure);
+#[cfg(unix)]
+ssh_contract!(ssh_audience, narrowed_grant_removes_live_audience);
+#[cfg(unix)]
+ssh_contract!(ssh_backpressure, backpressure_and_cancel);

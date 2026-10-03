@@ -63,6 +63,12 @@ impl MemoryTender {
         }
     }
 
+    /// Authorization and current reachability without opening application data.
+    #[cfg(unix)]
+    pub(crate) fn check_connect(&self, session: &Session, id: PublicationId) -> Result<(), Error> {
+        self.inner.lock().expect("state lock").record_for_connect(session, id).map(|_| ())
+    }
+
     pub fn host(&self) -> Fingerprint {
         self.inner.lock().expect("state lock").host.clone()
     }

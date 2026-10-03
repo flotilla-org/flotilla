@@ -11,32 +11,35 @@
 use std::{collections::BTreeSet, fmt, time::Duration};
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc,
 };
 
 pub mod memory;
+#[cfg(unix)]
+pub mod ssh;
 
 /// Fingerprint of a persisted instance key, independent of its current route.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Fingerprint(pub String);
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Namespace(pub String);
 
 /// Host-assigned identity; names and routes are never used as identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct PublicationId(pub u64);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Availability {
     Available,
     Unavailable,
     Withdrawn,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct Publication {
     pub id: PublicationId,
     pub namespace: Namespace,
@@ -48,7 +51,7 @@ pub struct Publication {
 }
 
 /// The host enforces this grant, including its audience ceiling and expiry.
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Grant {
     pub grantee: Fingerprint,
     pub namespace: Namespace,
@@ -60,14 +63,14 @@ pub struct Grant {
 /// A session represents a completed, transport-independent identity handshake.
 /// The pinned host is checked on every operation. A relay is a separately
 /// pinned instance trusted with plaintext, never the asserted caller identity.
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Session {
     pub caller: Fingerprint,
     pub pinned_host: Fingerprint,
     pub via: Option<Fingerprint>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PublishRequest {
     pub namespace: Namespace,
     pub name: String,
@@ -77,7 +80,7 @@ pub struct PublishRequest {
     pub reclaim: Option<PublicationId>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct Lease {
     pub id: PublicationId,
     pub generation: u64,
@@ -96,14 +99,14 @@ pub struct Published {
 
 /// Consumer-owned address. It is bound to both a host fingerprint and a
 /// publication ID, so reconnecting never substitutes a same-named service.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct Exposure {
     pub host: Fingerprint,
     pub publication: PublicationId,
     pub local_name: String,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 pub enum Error {
     IdentityMismatch,
     UntrustedIntermediary,
