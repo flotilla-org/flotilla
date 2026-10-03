@@ -61,6 +61,8 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
 
     let mut collections = kind_namespaces.into_iter().map(|(kind, namespaces)| (base.to_string(), kind, namespaces)).collect::<Vec<_>>();
     for prefix in additional_stores {
+        // Deliberately fail closed: admitting an unknown store would skip
+        // persisted records that this candidate cannot inventory before a roll.
         if prefix != "/observed" {
             return Err(eyre!("unknown advertised resource store {prefix:?}"));
         }

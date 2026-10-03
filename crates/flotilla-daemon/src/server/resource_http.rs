@@ -48,8 +48,10 @@ pub(super) async fn serve_resource_http_with_daemon(
     }
 
     let (path, raw_query) = target.split_once('?').unwrap_or((target, ""));
-    let additional_stores = if daemon.is_some() && !path.starts_with("/observed/") { vec!["/observed"] } else { Vec::new() };
-    let (path, backend) = if let Some(path) = path.strip_prefix("/observed") {
+    let observed_path = path == "/observed" || path.starts_with("/observed/");
+    let additional_stores = if daemon.is_some() && !observed_path { vec!["/observed"] } else { Vec::new() };
+    let (path, backend) = if observed_path {
+        let path = path.strip_prefix("/observed").expect("observed store prefix");
         let Some(daemon) = &daemon else {
             return write_error(&mut stream, 404, "observed resource store unavailable").await;
         };
