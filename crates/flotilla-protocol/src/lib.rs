@@ -256,11 +256,11 @@ pub use provider_data::{
 pub use query::{
     BlobSyncStatus, CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse,
     DeclarationAttentionKind, DeclarationAttentionRow, DiscoveryEntry, DispatchQueueResponse, DispatchQueueRow, FleetHealthResponse,
-    FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaSnapshot, FleetReplicaStatus,
-    FleetStaleness, FleetSurfaceCounts, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListEntry,
-    HostListResponse, HostProvidersResponse, HostStatusResponse, PeerReconnectStatus, ProjectListEntry, ProjectListRepository,
-    ProjectListResponse, ProviderHealthMap, ProviderInfo, RepoProvidersResponse, RepoSummary, SleepInhibitionHealth, StatusResponse,
-    TopologyResponse, TopologyRoute, UnmetRequirementInfo,
+    FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetObservationAgreement, FleetReplicaStatus, FleetStaleness,
+    FleetSurfaceCounts, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListEntry, HostListResponse,
+    HostProvidersResponse, HostStatusResponse, PeerReconnectStatus, ProjectListEntry, ProjectListRepository, ProjectListResponse,
+    ProviderHealthMap, ProviderInfo, RepoProvidersResponse, RepoSummary, SleepInhibitionHealth, StatusResponse, TopologyResponse,
+    TopologyRoute, UnmetRequirementInfo,
 };
 pub use repository::{RepositoryRelation, RepositoryUpstream};
 pub use resource_ref::ResourceRef;

@@ -25,8 +25,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+use attach::AttachResolver;
 pub use attach::ResolvedAttach;
-use attach::{AttachResolver, CachedFleetRows};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 pub use convoy_admission::RoleAddress;
 use convoy_admission::{
@@ -41,11 +41,11 @@ use flotilla_protocol::{
     result_set::{ConvoyChangeRequest, Rows},
     AttachBinding, CanonicalHostId, Change, CheckoutArchiveOutcome, CheckoutArchiveStatus, CliListKind, CliListResponse, CliListRow,
     Command, CommandAction, CommandValue, ConvoyDispatchRegard, ConvoyExplanation, CrewCommandContext, CrewListMember, CrewListResponse,
-    DaemonEvent, DispatchQueueResponse, EntryOp, EnvironmentId, FleetHealthResponse, FleetListResponse, FleetReplicaSnapshot,
-    FulfilmentAllocation, FulfilmentAllocationCandidate, FulfilmentListResponse, HostListResponse, HostName, HostProviderStatus,
-    HostProvidersResponse, HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal, NodeId, NodeInfo, PeerConnectionState,
-    PlacementDecision, PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListResponse, ProviderData,
-    ProviderInfo, QueryCursor, RepoDelta, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachPlan, ResourceCursor,
+    DaemonEvent, DispatchQueueResponse, EntryOp, EnvironmentId, FleetHealthResponse, FleetListResponse, FulfilmentAllocation,
+    FulfilmentAllocationCandidate, FulfilmentListResponse, HostListResponse, HostName, HostProviderStatus, HostProvidersResponse,
+    HostStatusResponse, HostSummary, LeafAddress, ManagedTerminal, NodeId, NodeInfo, PeerConnectionState, PlacementDecision,
+    PlacementRefusal, PlacementTargetHost, PlacementViableCandidate, PrincipalRef, ProjectListResponse, ProviderData, ProviderInfo,
+    QueryCursor, RepoDelta, RepoIdentity, RepoInfo, RepoProvidersResponse, RepoSummary, ResolvedAttachPlan, ResourceCursor,
     ResourceJsonResponse, ResourceRecordType, ResourceRef, StatusResponse, StreamKey, SurfaceDeclaration, TopologyResponse, TopologyRoute,
     ViewAddress, AGENT_ADAPTER_PROVIDER_CATEGORY, TERMINAL_POOL_PROVIDER_CATEGORY,
 };
@@ -99,7 +99,7 @@ use crate::{
     event_sink::{BroadcastEventSink, EventSink},
     executor,
     executor::checkout::{checkout_matches_scope, CheckoutResolutionScope},
-    fleet::{crew_attention, FleetRowSource, FleetService, SshFleetReplicaTransport},
+    fleet::{crew_attention, FleetService},
     host_identity::{
         resolve_local_environment_state_dir, resolve_local_host_id, resolve_local_node_id, resolve_or_create_environment_id,
         resolve_or_create_remote_environment_id, resolve_or_create_remote_host_id,
@@ -1893,7 +1893,6 @@ impl InProcessDaemon {
         let mut order = Vec::new();
         let mut path_identities = HashMap::new();
         let mut repository_keys_by_path = HashMap::new();
-        let observed_resource_backend = ResourceBackend::InMemory(InMemoryBackend::observed());
 
         let daemon_config = config.load_daemon_config().expect("failed to load daemon config");
         let config_machine_id = daemon_config.machine_id.as_deref();
@@ -1903,6 +1902,17 @@ impl InProcessDaemon {
             .await
             .expect("failed to resolve local node id");
         let resource_backend = resource_backend.with_local_root(local_node_id.clone());
+        let observed = if matches!(&resource_backend, ResourceBackend::Sqlite(_)) {
+            let path = config.state_dir().as_path().join("observation-replicas.sqlite");
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await.expect("create observation replica directory");
+            }
+            let replicas = flotilla_resources::SqliteBackend::open_async(&path).await.expect("open durable observation replicas");
+            InMemoryBackend::observed_with_durable_replicas(replicas)
+        } else {
+            InMemoryBackend::observed()
+        };
+        let observed_resource_backend = ResourceBackend::InMemory(observed).with_local_root(local_node_id.clone());
         let local_environment_id =
             resolve_or_create_environment_id(&local_environment_state_dir).expect("failed to resolve local direct environment id");
         let local_host_id = resolve_local_host_id(config.state_dir().as_path(), config_machine_id, &*discovery.runner)
@@ -2173,13 +2183,10 @@ impl InProcessDaemon {
             provisioning_namespace: Arc::clone(&provisioning_namespace),
             fleet: FleetService::new(
                 event_sink.clone(),
-                Arc::clone(&config),
                 resource_backend.clone(),
-                observed_resource_backend.clone(),
                 aggregator_projection_state.clone(),
                 host_name.clone(),
                 Some(CanonicalHostId::resolved(environment_manager.local_host_id().as_str())),
-                Arc::new(SshFleetReplicaTransport),
             ),
             repository_inspector: RwLock::new(None),
             operator_reconciler: RwLock::new(None),
@@ -2994,14 +3001,6 @@ impl InProcessDaemon {
 
     pub async fn aggregator_projection_state(&self) -> AggregatorProjectionState {
         self.aggregator_projection_state.clone()
-    }
-
-    pub fn subscribe_fleet_replicas(&self) -> broadcast::Receiver<Vec<FleetReplicaSnapshot>> {
-        self.fleet.subscribe()
-    }
-
-    pub async fn cached_fleet_replica_snapshots(&self) -> Vec<FleetReplicaSnapshot> {
-        self.fleet.cached_snapshots().await
     }
 
     pub fn resource_backend(&self) -> ResourceBackend {
@@ -6077,7 +6076,7 @@ impl InProcessDaemon {
         let now = Utc::now();
         let namespace = self.provisioning_namespace().await;
         let host_list = self.list_hosts_internal().await?;
-        let (rows, _) = self.fleet.rows(&namespace, &self.host_registry, FleetRowSource::IncludingReplicas).await?;
+        let rows = self.fleet.rows(&namespace, &self.host_registry).await?;
         self.read_projections().fleet_health(&namespace, host_list, rows, self.local_host_id().map(|id| id.to_string()), now).await
     }
 
@@ -6277,16 +6276,9 @@ impl InProcessDaemon {
         self.read_projections().get_host_providers(environment_id, &self.local_host_counts().await, &local_summary).await
     }
 
-    pub async fn fleet_replica_snapshot_internal(&self) -> Result<FleetReplicaSnapshot, String> {
-        let namespace = self.provisioning_namespace().await;
-        let (rows, generation) = self.fleet.rows(&namespace, &self.host_registry, FleetRowSource::Local).await?;
-        let result_sets = self.aggregator_projection_state().await.local_result_sets().await;
-        Ok(FleetReplicaSnapshot { host: self.host_name.clone(), generation, rows, result_sets })
-    }
-
     pub async fn fleet_list_internal(&self) -> Result<FleetListResponse, String> {
         let namespace = self.provisioning_namespace().await;
-        let (rows, _) = self.fleet.rows(&namespace, &self.host_registry, FleetRowSource::IncludingReplicas).await?;
+        let rows = self.fleet.rows(&namespace, &self.host_registry).await?;
         self.read_projections().fleet_list(&namespace, rows, Utc::now()).await
     }
 
@@ -8124,11 +8116,6 @@ impl InProcessDaemon {
             .map(|_| ())
     }
 
-    pub async fn refresh_fleet_replicas_once(&self) -> Result<(), String> {
-        let namespace = self.provisioning_namespace().await;
-        self.fleet.refresh_once(&namespace, self.local_command_runner()).await
-    }
-
     fn attach_resolver(&self) -> AttachResolver<'_> {
         AttachResolver {
             _event_sink: self.event_sink.clone(),
@@ -8142,7 +8129,6 @@ impl InProcessDaemon {
             local_environment_id: &self.local_environment_id,
             host_name: &self.host_name,
             namespace: &self.provisioning_namespace,
-            fleet_rows: Box::new(CachedFleetRows { fleet: &self.fleet }),
         }
     }
 
@@ -8564,7 +8550,10 @@ impl InProcessDaemon {
                 description,
             });
 
-            let backend = self.resource_backend.clone();
+            let (backend, kind) = match kind.strip_prefix("observed/") {
+                Some(kind) => (self.observed_resource_backend.clone(), kind.to_string()),
+                None => (self.resource_backend.clone(), kind),
+            };
             let event_tx = self.event_tx.clone();
             let event_sink = self.event_sink.clone();
             let active_ref = Arc::clone(&self.active_commands);
@@ -10141,10 +10130,6 @@ impl DaemonHandle for InProcessDaemon {
             }
             CommandAction::QueryCrewList { context } => match self.crew_list_internal(context).await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::CrewList(Box::new(v))),
-                Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
-            },
-            CommandAction::QueryFleetReplicaSnapshot {} => match self.fleet_replica_snapshot_internal().await {
-                Ok(v) => Ok(flotilla_protocol::CommandValue::FleetReplicaSnapshot(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
             },
             CommandAction::QueryDaemonLogs { query } => {

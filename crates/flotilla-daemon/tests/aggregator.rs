@@ -760,9 +760,8 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         .expect("project independents replay result set");
     assert!(matches!(scoped_rows, [row] if row.name == "terminal-yeoman"));
 
-    let replica = daemon.fleet_replica_snapshot_internal().await.expect("fleet replica snapshot");
-    let local_independents = replica
-        .result_sets
+    let local_sets = daemon.aggregator_projection_state().await.local_result_sets().await;
+    let local_independents = local_sets
         .iter()
         .find(|result_set| result_set.query() == (QueryId::Independents { scope: None }))
         .map(independent_rows)

@@ -45,6 +45,12 @@ impl HttpBackend {
         Ok(Self::new(http, "http://flotilla.local"))
     }
 
+    /// Select a separate read-only resource store served by the same endpoint.
+    pub fn with_path_prefix(mut self, prefix: &str) -> Self {
+        self.base_url = format!("{}/{}", self.base_url.trim_end_matches('/'), prefix.trim_matches('/'));
+        self
+    }
+
     fn namespaced_url(&self, paths: ApiPaths, namespace: &str, name: Option<&str>, status: bool) -> String {
         let mut url = format!(
             "{}/apis/{}/{}/namespaces/{}/{}",

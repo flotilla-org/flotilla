@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn typed_cli_query_cannot_bypass_palette_dispatch_gate() {
         let harness = TestWidgetHarness::new();
-        let command = Command::builder().action(CommandAction::QueryFleetReplicaSnapshot {}).build();
+        let command = Command::builder().action(CommandAction::QueryFleetHealth {}).build();
         let result = tui_dispatch(Resolved::Ready(command), &harness.model, &harness.provisioning_target);
         assert!(result.is_err());
     }

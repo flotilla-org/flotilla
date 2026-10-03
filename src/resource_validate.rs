@@ -35,32 +35,22 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
     let base = "http://flotilla.local";
     let discovery = client.get(format!("{base}/apis/flotilla.work/v1")).send().await?;
     let discovered = discovery.status().is_success();
+    let mut additional_stores = Vec::new();
     let kind_namespaces = if discovered {
         let document: Value = discovery.json().await?;
-        let kinds = document
-            .get("kinds")
-            .and_then(Value::as_array)
-            .ok_or_else(|| eyre!("daemon kind discovery response has no kinds array"))?
-            .iter()
-            .map(|kind| kind.as_str().map(str::to_string).ok_or_else(|| eyre!("daemon kind discovery contains a non-string kind")))
-            .collect::<Result<Vec<_>>>()?;
-        let namespaces = document
-            .get("namespaces")
-            .and_then(Value::as_object)
-            .ok_or_else(|| eyre!("daemon kind discovery response has no namespace inventory"))?;
-        kinds
-            .into_iter()
-            .map(|kind| {
-                let found = namespaces
-                    .get(&kind)
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| eyre!("daemon kind discovery has no namespaces for {kind}"))?
+        additional_stores = document
+            .get("stores")
+            .map(|stores| {
+                stores
+                    .as_array()
+                    .ok_or_else(|| eyre!("daemon stores inventory is not an array"))?
                     .iter()
-                    .map(|namespace| namespace.as_str().map(str::to_string).ok_or_else(|| eyre!("invalid namespace for {kind}")))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok((kind, found))
+                    .map(|store| store.as_str().map(str::to_string).ok_or_else(|| eyre!("invalid resource store path")))
+                    .collect::<Result<Vec<_>>>()
             })
-            .collect::<Result<Vec<_>>>()?
+            .transpose()?
+            .unwrap_or_default();
+        discovery_kind_namespaces(&document)?
     } else if discovery.status() == reqwest::StatusCode::NOT_FOUND {
         // Previous-generation daemons predate discovery. All daemon-managed
         // records in that generation use the default namespace.
@@ -69,18 +59,31 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
         return Err(eyre!("daemon kind discovery failed: {}", discovery.status()));
     };
 
+    let mut collections = kind_namespaces.into_iter().map(|(kind, namespaces)| (base.to_string(), kind, namespaces)).collect::<Vec<_>>();
+    for prefix in additional_stores {
+        // Deliberately fail closed: admitting an unknown store would skip
+        // persisted records that this candidate cannot inventory before a roll.
+        if prefix != "/observed" {
+            return Err(eyre!("unknown advertised resource store {prefix:?}"));
+        }
+        let store_base = format!("{base}{prefix}");
+        let document: Value = client.get(format!("{store_base}/apis/flotilla.work/v1")).send().await?.error_for_status()?.json().await?;
+        collections
+            .extend(discovery_kind_namespaces(&document)?.into_iter().map(|(kind, namespaces)| (store_base.clone(), kind, namespaces)));
+    }
+
     let mut failed = false;
     let mut count = 0;
     let mut projects = BTreeMap::<String, Vec<ResourceObject<Project>>>::new();
-    for (kind, namespaces) in kind_namespaces {
+    for (store_base, kind, namespaces) in collections {
         let replication = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.plural == kind).map(|entry| entry.replication_class);
         let query = if replication.is_some_and(|class| class != ReplicationClass::None) { "?replicaSources=true" } else { "" };
         for namespace in namespaces {
             if namespace.is_empty() || namespace.contains(['/', '?', '#']) {
                 return Err(eyre!("daemon kind discovery returned invalid namespace {namespace:?} for {kind}"));
             }
-            let label = format!("{namespace}/{kind}");
-            let url = format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/{kind}{query}");
+            let label = format!("{store_base}/{namespace}/{kind}");
+            let url = format!("{store_base}/apis/flotilla.work/v1/namespaces/{namespace}/{kind}{query}");
             let response = client.get(url).send().await.map_err(|error| eyre!("list {label}: {error}"))?;
             if response.status() == reqwest::StatusCode::BAD_REQUEST && !discovered {
                 let message = response.text().await?;
@@ -102,7 +105,7 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
             for item in items {
                 count += 1;
                 let name = item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>");
-                if kind == "projects" {
+                if store_base == base && kind == "projects" {
                     match serde_json::from_value::<K8sResourceObject<Project>>(item.clone())
                         .map_err(|error| error.to_string())
                         .and_then(|object| ResourceObject::from_k8s_object(object).map_err(|error| error.to_string()))
@@ -119,7 +122,7 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
                     failed = true;
                 }
             }
-            if catalog.is_some() && matches!(kind.as_str(), "projects" | "crewdefaults") {
+            if store_base == base && catalog.is_some() && matches!(kind.as_str(), "projects" | "crewdefaults") {
                 // Schema validation checks every stored provenance above. Skill
                 // policy must use the merged definition view, just like admission.
                 let merged: Value = client
@@ -195,6 +198,34 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
         println!("validated {count} stored records");
         Ok(count)
     }
+}
+
+#[cfg(unix)]
+fn discovery_kind_namespaces(document: &Value) -> Result<Vec<(String, Vec<String>)>> {
+    let kinds = document
+        .get("kinds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| eyre!("daemon kind discovery response has no kinds array"))?
+        .iter()
+        .map(|kind| kind.as_str().map(str::to_string).ok_or_else(|| eyre!("daemon kind discovery contains a non-string kind")))
+        .collect::<Result<Vec<_>>>()?;
+    let namespaces = document
+        .get("namespaces")
+        .and_then(Value::as_object)
+        .ok_or_else(|| eyre!("daemon kind discovery response has no namespace inventory"))?;
+    kinds
+        .into_iter()
+        .map(|kind| {
+            let found = namespaces
+                .get(&kind)
+                .and_then(Value::as_array)
+                .ok_or_else(|| eyre!("daemon kind discovery has no namespaces for {kind}"))?
+                .iter()
+                .map(|namespace| namespace.as_str().map(str::to_string).ok_or_else(|| eyre!("invalid namespace for {kind}")))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((kind, found))
+        })
+        .collect::<Result<Vec<_>>>()
 }
 
 /// Whether a daemon lacks the operational-entries inventory endpoint. Previous
@@ -519,6 +550,7 @@ mod tests {
             .await
             .expect("write replica source");
         replicas.delete("replica-only").await.expect("remove local replica source");
+        let observed = server.daemon().observed_resource_backend();
         let task = tokio::spawn(async move { server.run().await });
         for _ in 0..100 {
             if socket.exists() {
@@ -534,8 +566,31 @@ mod tests {
             .expect("raw ops endpoint");
         assert_eq!(inventory.status(), reqwest::StatusCode::OK);
         assert_eq!(inventory.json::<serde_json::Value>().await.expect("inventory")["entries"], serde_json::json!([]));
+        let primary_count = validate_daemon(&socket, Some(&[]), None).await.expect("validate primary store");
+        // Persisted observations in a replica-only namespace must participate
+        // in the candidate pre-roll gate alongside primary-store records.
+        let checkouts = observed.using::<flotilla_resources::Checkout>("observed-only");
+        checkouts
+            .create(
+                &InputMeta::builder().name("remote-checkout".to_string()).build(),
+                &flotilla_resources::CheckoutSpec::Observed(flotilla_resources::ObservedCheckoutSpec {
+                    repo_ref: flotilla_resources::RepositoryKey("widgets".into()),
+                    path: "/srv/widgets".into(),
+                    r#ref: "main".into(),
+                    host_ref: "remote".into(),
+                    is_main: true,
+                }),
+            )
+            .await
+            .expect("create observation source");
+        observed
+            .replica_writer::<flotilla_resources::Checkout>(NodeId::new("remote"), "observed-only")
+            .replace(&checkouts.list().await.expect("list observation source"), chrono::Utc::now())
+            .await
+            .expect("persist observation replica");
+        checkouts.delete("remote-checkout").await.expect("remove local observation");
         let checked = validate_daemon(&socket, Some(&[]), None).await.expect("candidate decodes all served kinds and namespaces");
-        assert!(checked >= 4, "expected default, non-default, and replica-only records; got {checked}");
+        assert_eq!(checked, primary_count + 1, "the observed replica-only record must be validated");
         // Intended: schema compatibility alone cannot admit a Project whose
         // skill declaration is absent from the candidate's supply catalog.
         let catalog = root.join(".flotilla-skill-catalog.json");

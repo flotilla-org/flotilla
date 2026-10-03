@@ -168,9 +168,6 @@ enum SubCommand {
         #[arg(long, hide = true)]
         host: Option<String>,
     },
-    /// Emit this host's store-backed fleet replica snapshot
-    #[command(hide = true)]
-    ReplicaSnapshot,
     /// Receive agent hook events (called by agent hook systems)
     Hook {
         /// Agent harness name (e.g. claude-code, codex, gemini)
@@ -782,7 +779,6 @@ async fn main() -> Result<()> {
         Some(SubCommand::Attach { reference, watch, strict, take, transient, host }) => {
             run_attach(&cli, &reference, attach_mode(watch, strict, take), transient, host.as_deref(), format).await
         }
-        Some(SubCommand::ReplicaSnapshot) => run_replica_snapshot(&cli).await,
         Some(SubCommand::Hook { harness, event_type, payload }) => run_hook(&cli, &harness, &event_type, payload.as_deref()).await,
         Some(SubCommand::Hooks { command }) => run_hooks_command(&command).await,
         Some(SubCommand::Pm { command }) => run_pm_command(&cli, command).await,
@@ -1619,29 +1615,6 @@ async fn run_fleet_health(cli: &Cli, format: OutputFormat) -> Result<()> {
         format,
     )
     .await
-}
-
-async fn run_replica_snapshot(cli: &Cli) -> Result<()> {
-    reset_sigpipe();
-    let socket_path = cli.socket_path();
-    let daemon = flotilla_tui::socket::SocketDaemon::connect(&socket_path)
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!("cannot connect to daemon at {}: {e}", socket_path.display()))?;
-    let result = daemon
-        .execute_query(
-            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetReplicaSnapshot {} },
-            uuid::Uuid::new_v4(),
-        )
-        .await
-        .map_err(|e| color_eyre::eyre::eyre!(e))?;
-    match result {
-        CommandValue::FleetReplicaSnapshot(snapshot) => {
-            println!("{}", flotilla_protocol::output::json_pretty(&*snapshot));
-            Ok(())
-        }
-        CommandValue::Error { message } => Err(color_eyre::eyre::eyre!(message)),
-        other => Err(color_eyre::eyre::eyre!("unexpected replica snapshot response: {other:?}")),
-    }
 }
 
 async fn run_manifest_command(cli: &Cli, command: ManifestSubCommand, format: OutputFormat) -> Result<()> {
@@ -2880,11 +2853,11 @@ mod tests {
     use super::{
         attach_mode, cli_surface_from, client_dirs_from, confirm_command, daemon_paths_from, default_project_landing,
         format_human_resource_value, host_daemon_socket_required, incompatible_daemon_reexec_failure, install_codex_hook,
-        provisioning_target_for_environment, replace_host_ids, resolve_pm_flotilla_bin, run_replica_snapshot, select_host_target,
-        select_startup_repo_roots, should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from,
-        topology_output_format, uninstall_codex_hook, ArtifactSubCommand, Cli, CliPaths, CommandValue, DaemonSubCommand, DevModeSubCommand,
-        PmSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs,
-        ResourceReconcileNowArgs, ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
+        provisioning_target_for_environment, replace_host_ids, resolve_pm_flotilla_bin, select_host_target, select_startup_repo_roots,
+        should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, topology_output_format,
+        uninstall_codex_hook, ArtifactSubCommand, Cli, CliPaths, CommandValue, DaemonSubCommand, DevModeSubCommand, PmSubCommand,
+        ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs, ResourceReconcileNowArgs,
+        ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
     };
 
     #[tokio::test]
@@ -3516,42 +3489,6 @@ mod tests {
         let rendered = format_human_resource_value(value.clone(), Err::<CommandValue, _>("transient host lookup failure"));
 
         assert_eq!(rendered, flotilla_protocol::output::json_pretty(&value));
-    }
-
-    #[tokio::test]
-    async fn replica_snapshot_does_not_spawn_daemon_when_socket_is_missing() {
-        let test_dir = std::env::temp_dir().join(format!(
-            "flotilla-replica-snapshot-no-spawn-{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock after epoch").as_nanos()
-        ));
-        std::fs::create_dir_all(&test_dir).expect("create test dir");
-        let config_dir = test_dir.join("config");
-        let socket = test_dir.join("missing.sock");
-        let cli = Cli::try_parse_from([
-            "flotilla",
-            "--config-dir",
-            config_dir.to_str().expect("config dir utf8"),
-            "--socket",
-            socket.to_str().expect("socket utf8"),
-            "replica-snapshot",
-        ])
-        .expect("replica snapshot cli should parse");
-
-        // FLOTILLA_DAEMON_SOCKET takes precedence over --socket (contained crew
-        // delivery relies on that), so a live ambient value would otherwise route
-        // this test at the real host daemon instead of the intentionally-missing
-        // socket under test. Isolate it for the duration of the assertion.
-        let ambient_socket = std::env::var_os("FLOTILLA_DAEMON_SOCKET");
-        std::env::remove_var("FLOTILLA_DAEMON_SOCKET");
-
-        let err = run_replica_snapshot(&cli).await.expect_err("missing socket should fail");
-
-        if let Some(value) = ambient_socket {
-            std::env::set_var("FLOTILLA_DAEMON_SOCKET", value);
-        }
-
-        assert!(err.to_string().contains("cannot connect to daemon"), "unexpected error: {err}");
-        std::fs::remove_dir_all(&test_dir).expect("remove test dir");
     }
 
     #[test]

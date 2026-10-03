@@ -48,6 +48,17 @@ pub(super) async fn serve_resource_http_with_daemon(
     }
 
     let (path, raw_query) = target.split_once('?').unwrap_or((target, ""));
+    let observed_path = path == "/observed" || path.starts_with("/observed/");
+    let additional_stores = if daemon.is_some() && !observed_path { vec!["/observed"] } else { Vec::new() };
+    let (path, backend) = if observed_path {
+        let path = path.strip_prefix("/observed").expect("observed store prefix");
+        let Some(daemon) = &daemon else {
+            return write_error(&mut stream, 404, "observed resource store unavailable").await;
+        };
+        (path, daemon.observed_resource_backend())
+    } else {
+        (path, backend)
+    };
     if path == "/apis/flotilla.work/v1" {
         let namespaces = match registered_resource_namespaces(&backend).await {
             Ok(namespaces) => namespaces,
@@ -56,7 +67,7 @@ pub(super) async fn serve_resource_http_with_daemon(
         return write_json(
             &mut stream,
             200,
-            &serde_json::json!({"kinds": REGISTERED_RESOURCE_KINDS.iter().map(|kind| kind.plural).collect::<Vec<_>>(), "namespaces": namespaces }),
+            &serde_json::json!({"kinds": REGISTERED_RESOURCE_KINDS.iter().map(|kind| kind.plural).collect::<Vec<_>>(), "namespaces": namespaces, "stores": additional_stores }),
         )
         .await;
     }

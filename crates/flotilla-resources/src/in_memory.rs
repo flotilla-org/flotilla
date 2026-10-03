@@ -25,6 +25,7 @@ type StoreKey = (String, String, String, String);
 pub struct InMemoryBackend {
     stores: Arc<Mutex<HashMap<StoreKey, ResourceStore>>>,
     replicas: Arc<Mutex<ReplicaState>>,
+    durable_replicas: Option<crate::SqliteBackend>,
     generation: Option<String>,
     event_retention: EventRetention,
     local_root: Option<NodeId>,
@@ -114,6 +115,7 @@ impl InMemoryBackend {
         Self {
             stores: Arc::default(),
             replicas: Arc::default(),
+            durable_replicas: None,
             generation: Some(uuid::Uuid::new_v4().to_string()),
             event_retention: EventRetention::default(),
             local_root: None,
@@ -121,10 +123,25 @@ impl InMemoryBackend {
         }
     }
 
+    /// Local observations have a new generation per process, while received
+    /// facts remain durable across holder restarts (ADR 0016). Only the replica
+    /// operations use this store; local writes always remain in memory.
+    pub fn observed_with_durable_replicas(replicas: crate::SqliteBackend) -> Self {
+        Self { durable_replicas: Some(replicas), ..Self::observed() }
+    }
+
+    pub(crate) async fn delete_decode_quarantine_typed<T: Resource>(&self, namespace: &str, name: &str) -> Result<bool, ResourceError> {
+        match &self.durable_replicas {
+            Some(backend) => backend.delete_decode_quarantine_typed::<T>(namespace, name).await,
+            None => Ok(false),
+        }
+    }
+
     pub fn with_event_retention(event_retention: EventRetention) -> Self {
         Self {
             stores: Arc::default(),
             replicas: Arc::default(),
+            durable_replicas: None,
             generation: None,
             event_retention,
             local_root: None,
@@ -136,6 +153,7 @@ impl InMemoryBackend {
         Self {
             stores: Arc::default(),
             replicas: Arc::default(),
+            durable_replicas: None,
             generation: Some(uuid::Uuid::new_v4().to_string()),
             event_retention,
             local_root: None,
@@ -144,6 +162,9 @@ impl InMemoryBackend {
     }
 
     pub(crate) fn with_local_root(mut self, local_root: NodeId) -> Self {
+        if let Some(backend) = self.durable_replicas.take() {
+            self.durable_replicas = Some(backend.with_local_root(local_root.clone()));
+        }
         self.local_root = Some(local_root);
         self
     }
@@ -193,6 +214,10 @@ impl InMemoryBackend {
 
     pub(crate) async fn stored_namespaces_typed<T: Resource>(&self) -> Result<Vec<String>, ResourceError> {
         let mut namespaces = self.local_namespaces_typed::<T>().await?.into_iter().collect::<std::collections::BTreeSet<_>>();
+        if let Some(backend) = &self.durable_replicas {
+            namespaces.extend(backend.stored_namespaces_typed::<T>().await?);
+            return Ok(namespaces.into_iter().collect());
+        }
         let replicas = self.replicas.lock().await;
         for ((_, key), partition) in &replicas.partitions {
             if key.0 == T::API_PATHS.group && key.1 == T::API_PATHS.version && key.2 == T::API_PATHS.plural && !partition.objects.is_empty()
@@ -249,6 +274,9 @@ impl InMemoryBackend {
     }
 
     pub(crate) async fn list_replicas_typed<T: Resource>(&self, namespace: &str) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.list_replicas_typed::<T>(namespace).await;
+        }
         let key = Self::store_key::<T>(namespace);
         let replicas = self.replicas.lock().await;
         let mut items = Vec::new();
@@ -276,6 +304,9 @@ impl InMemoryBackend {
         namespace: &str,
         name: &str,
     ) -> Result<Vec<ReadResourceObject<T>>, ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.get_replicas_typed::<T>(namespace, name).await;
+        }
         let key = Self::store_key::<T>(namespace);
         let replicas = self.replicas.lock().await;
         let mut items = Vec::new();
@@ -304,6 +335,9 @@ impl InMemoryBackend {
         &self,
         namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.watch_replicas_typed::<T>(namespace).await;
+        }
         let key = Self::store_key::<T>(namespace);
         let rx = self.replicas.lock().await.watchers.entry(key).or_default().subscribe(T::API_PATHS.kind, namespace);
         Ok(stream::unfold(rx, |mut rx| async {
@@ -342,6 +376,9 @@ impl InMemoryBackend {
         listed: &ResourceList<T>,
         synced_at: chrono::DateTime<Utc>,
     ) -> Result<(), ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.replace_replicas_typed::<T>(origin_root, namespace, listed, synced_at).await;
+        }
         let store_key = Self::store_key::<T>(namespace);
         let replica_key = (origin_root.clone(), store_key.clone());
         let mut state = self.replicas.lock().await;
@@ -390,6 +427,9 @@ impl InMemoryBackend {
         object: &ResourceObject<T>,
         synced_at: chrono::DateTime<Utc>,
     ) -> Result<(), ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.apply_replica_typed::<T>(origin_root, namespace, kind, object, synced_at).await;
+        }
         let store_key = Self::store_key::<T>(namespace);
         let replica_key = (origin_root.clone(), store_key.clone());
         let encoded = Self::encode_object(object)?;
@@ -448,6 +488,9 @@ impl InMemoryBackend {
         tombstone: &ResourceTombstone,
         synced_at: chrono::DateTime<Utc>,
     ) -> Result<(), ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.apply_replica_tombstone_typed::<T>(origin_root, namespace, tombstone, synced_at).await;
+        }
         let store_key = Self::store_key::<T>(namespace);
         let replica_key = (origin_root.clone(), store_key.clone());
         let encoded = Self::encode_tombstone::<T>(tombstone);
@@ -481,6 +524,9 @@ impl InMemoryBackend {
         origin_root: &NodeId,
         namespace: &str,
     ) -> Result<Option<ReplicaCursor>, ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.replica_cursor_typed::<T>(origin_root, namespace).await;
+        }
         let key = (origin_root.clone(), Self::store_key::<T>(namespace));
         Ok(self.replicas.lock().await.partitions.get(&key).and_then(|partition| partition.cursor.clone()))
     }
