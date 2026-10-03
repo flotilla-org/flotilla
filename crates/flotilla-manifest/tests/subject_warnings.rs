@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use flotilla_manifest::{
     entity,
-    projection::{project_catalog, CatalogInput, SubjectCatalogInput},
+    projection::{project_catalog_without_warnings, CatalogInput, SubjectCatalogInput},
     recipe::FlotillaRecipes,
     wire::MetadataTarget,
 };
@@ -14,7 +14,7 @@ use flotilla_protocol::{ConvoyPhase, ConvoyRow, IssueRef, IssueSource, ResourceR
 use flotilla_resources::{ChangeRequest, Issue};
 
 // Behaviour (ADR 0051): non-built-in uncovered services produce a structured
-// warning once per service per catalog rebuild, keep subjects visible, and
+// warning on each connector gap transition, keep subjects visible, and
 // omit unresolved edges.
 #[test]
 fn uncovered_subject_service_warns_with_service() {
@@ -81,7 +81,7 @@ fn uncovered_subject_service_warns_with_service() {
                 .create(
                     &InputMeta::builder().name("issue".into()).build(),
                     &IssueSpec::builder()
-                        .service("forge.example".into())
+                        .service("other.example".into())
                         .scope("org/repo".into())
                         .number(42)
                         .observing_authority("kiwi".into())
@@ -102,7 +102,14 @@ fn uncovered_subject_service_warns_with_service() {
     convoy.subjects = [SubjectKind::ChangeRequest, SubjectKind::Issue]
         .into_iter()
         .map(|kind| ConvoySubjectRow {
-            subject: Subject { kind, source: source.clone(), id: "42".into() },
+            subject: Subject {
+                kind,
+                source: IssueSource {
+                    service: if kind == SubjectKind::Issue { "other.example".into() } else { source.service.clone() },
+                    scope: source.scope.clone(),
+                },
+                id: "42".into(),
+            },
             relationship: Relationship::Produces,
             declared: false,
             short: "42".into(),
@@ -121,12 +128,26 @@ fn uncovered_subject_service_warns_with_service() {
     };
     let warnings = Warnings::default();
     let patches = tracing::subscriber::with_default(warnings.clone(), || {
-        project_catalog(&input, &FlotillaRecipes::new("flotilla")).reassert_patches()
+        let catalog = project_catalog_without_warnings(&input, &FlotillaRecipes::new("flotilla"));
+        let first = catalog.warn_new_uncovered_services(&Default::default());
+        // A persistent gap stays silent; an independent connector warns separately.
+        let repeated = catalog.warn_new_uncovered_services(&first);
+        assert_eq!(first, repeated);
+        catalog.warn_new_uncovered_services(&Default::default());
+        // Recovery clears suppression, allowing the next occurrence to warn.
+        let recovered = flotilla_manifest::projection::Catalog::default().warn_new_uncovered_services(&repeated);
+        assert!(recovered.is_empty());
+        catalog.warn_new_uncovered_services(&recovered);
+        catalog.reassert_patches()
     });
     let warnings = warnings.0.lock().expect("warnings");
-    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings.len(), 6);
+    assert_eq!(warnings.iter().filter(|event| event["service"] == "other.example").count(), 3);
     assert_eq!(warnings[0]["service"], "forge.example");
-    for target in [entity::change_request("forge.example", "org/repo", "42"), entity::issue(&IssueRef { source, id: "42".into() })] {
+    for target in [
+        entity::change_request("forge.example", "org/repo", "42"),
+        entity::issue(&IssueRef { source: IssueSource { service: "other.example".into(), scope: source.scope }, id: "42".into() }),
+    ] {
         let target = MetadataTarget::Entity(target);
         let patch = patches.iter().find(|patch| patch.target == target).expect("visible subject");
         assert!(!patch.set.contains_key("flotilla.forge"));

@@ -275,7 +275,7 @@ pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, 
             } else if service == BUILTIN_GITHUB_SERVICE {
                 Some((service, entity::forge(BUILTIN_GITHUB_SERVICE)))
             } else {
-                tracing::warn!(service, "subject service has no covering Forge");
+                catalog.uncovered_services.insert(service.to_owned());
                 None
             }
         })

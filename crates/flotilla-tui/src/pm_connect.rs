@@ -29,7 +29,7 @@ use flotilla_core::{
 use flotilla_manifest::{
     keys::REASSERT_INTERVAL_MS,
     pm::PmInstance,
-    projection::{project_catalog, Catalog, CatalogInput},
+    projection::{project_catalog_without_warnings, Catalog, CatalogInput},
     recipe::{FlotillaRecipes, RecipeMint},
     sink::PatchSink,
     wire::MetadataPatch,
@@ -131,6 +131,7 @@ pub struct ConnectorState {
     seqs: HashMap<QueryId, u64>,
     catalog: Arc<Mutex<Catalog>>,
     subscriber_id: uuid::Uuid,
+    uncovered_services: std::collections::BTreeSet<String>,
 }
 
 impl Default for ConnectorState {
@@ -145,6 +146,7 @@ impl Default for ConnectorState {
             seqs: HashMap::new(),
             catalog: Arc::new(Mutex::new(Catalog::default())),
             subscriber_id: uuid::Uuid::new_v4(),
+            uncovered_services: Default::default(),
         }
     }
 }
@@ -276,7 +278,7 @@ impl ConnectorState {
         let awareness = (!self.awareness.is_empty()).then_some(self.awareness.as_slice());
         let mut subjects = self.resources.projection();
         subjects.now = Some(now);
-        let next = project_catalog(
+        let next = project_catalog_without_warnings(
             &CatalogInput {
                 subjects: Some(&subjects),
                 awareness,
@@ -287,6 +289,7 @@ impl ConnectorState {
             },
             mint,
         );
+        self.uncovered_services = next.warn_new_uncovered_services(&self.uncovered_services);
         let mut catalog = self.catalog.lock().expect("published catalog");
         let patches = next.diff_patches(&catalog);
         *catalog = next;
