@@ -1052,6 +1052,36 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn claim_time_recovery_clears_rate_limit_error() {
+        struct RecoveringSource(Mutex<Result<ChangeRequestStatus, String>>);
+        #[async_trait]
+        impl ChangeRequestObservationSource for RecoveringSource {
+            async fn observe(&self, _: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+                self.0.lock().await.clone()
+            }
+        }
+        let error = "github rate limited (budget=GraphQL, identity=host gh login, kind=secondary, retry_source=retry-after, retry_at=2026-10-03T12:00:00Z)";
+        let source = Arc::new(RecoveringSource(Mutex::new(Err(error.into()))));
+        let refresher = ChangeRequestRefresher::new(
+            "fleet".into(),
+            ResourceBackend::InMemory(InMemoryBackend::default()),
+            "node".into(),
+            source.clone(),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let subject = ChangeRequestRef { namespace: "ops".into(), service: "github.com".into(), scope: "org/repo".into(), number: 42 };
+        assert_eq!(refresher.refresh_once(&subject).await.unwrap_err(), error);
+        assert_eq!(refresher.observation_error(&subject).await.as_deref(), Some(error));
+        *source.0.lock().await = Ok(parse_gh_observation(
+            r#"{"state":"OPEN","headRefOid":"head","statusCheckRollup":[],"reviewDecision":"APPROVED","mergeable":"MERGEABLE"}"#,
+            Utc::now(),
+        )
+        .expect("healthy observation"));
+        refresher.refresh_once(&subject).await.expect("recovered observation");
+        assert!(refresher.observation_error(&subject).await.is_none());
+    }
+
     struct CountingSource(Arc<AtomicUsize>);
 
     fn review_actionable(request: serde_json::Value) -> bool {

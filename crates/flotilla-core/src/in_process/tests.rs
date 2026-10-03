@@ -7666,3 +7666,20 @@ async fn resume_relaunches_exited_active_and_interrupted_crew() {
         assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
     }
 }
+
+// UTC-to-monotonic conversion must preserve a future header deadline and keep
+// expired/zero deadlines from causing a burst of concurrent cache misses.
+#[tokio::test(start_paused = true)]
+async fn observation_cache_deadline_crosses_both_clocks() {
+    let wall = chrono::DateTime::parse_from_rfc3339("2026-10-03T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+    let retry = wall + chrono::Duration::seconds(60);
+    let expires = tokio::time::Instant::now() + super::observation_cache_delay(Some(retry), wall);
+    tokio::time::advance(std::time::Duration::from_secs(59)).await;
+    assert!(tokio::time::Instant::now() < expires);
+    assert_eq!(super::observation_cache_delay(Some(retry), wall + chrono::Duration::seconds(59)), std::time::Duration::from_secs(1));
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    assert_eq!(tokio::time::Instant::now(), expires);
+    for now in [retry, retry + chrono::Duration::seconds(1)] {
+        assert_eq!(super::observation_cache_delay(Some(retry), now), std::time::Duration::from_secs(9));
+    }
+}

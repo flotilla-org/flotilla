@@ -153,9 +153,22 @@ struct CachedObservation {
 }
 
 impl CachedObservation {
+    // A classified GitHub quota is identity-wide, even when a paginated
+    // subject reports it. Ordinary per-subject errors do not enter this path.
     fn rate_limit_error(&self) -> Option<&str> {
         observation_rate_limit_error(&self.result)
     }
+}
+
+// Header deadlines use UTC; translate their remaining duration once into a
+// monotonic cache TTL. Completion and Landing still compare the original UTC
+// deadline. Expired headers retain the ordinary short cache TTL to avoid a burst
+// of simultaneous fresh claims, without advertising a fabricated forge reset.
+fn observation_cache_delay(retry_at: Option<chrono::DateTime<Utc>>, now: chrono::DateTime<Utc>) -> Duration {
+    retry_at
+        .and_then(|retry_at| retry_at.signed_duration_since(now).to_std().ok())
+        .filter(|delay| !delay.is_zero())
+        .unwrap_or(Duration::from_secs(9))
 }
 
 fn observation_rate_limit_error(result: &Result<BoundObservations, String>) -> Option<&str> {
@@ -557,10 +570,7 @@ impl ProviderChangeRequestObservationSource {
         let provider = self.query_port.discover_repository_change_request(&subject.namespace, &repository.object.spec).await?;
         let crew_logins = crew_logins.into_iter().map(|(number, logins)| (number, logins.into_iter().collect())).collect();
         let result = provider.observe_bound(&numbers, &crew_logins).await;
-        let delay = observation_rate_limit_error(&result)
-            .and_then(rate_limit_reset)
-            .map(|retry_at| retry_at.signed_duration_since(Utc::now()).to_std().unwrap_or_default())
-            .unwrap_or(Duration::from_secs(9));
+        let delay = observation_cache_delay(observation_rate_limit_error(&result).and_then(rate_limit_reset), Utc::now());
         let status = result.as_ref().map_err(Clone::clone).and_then(|statuses| {
             statuses.get(&subject.number).cloned().unwrap_or_else(|| Err(format!("change request {} was not found", subject.number)))
         });
