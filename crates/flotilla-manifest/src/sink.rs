@@ -521,11 +521,13 @@ done
         #[cfg(unix)]
         let mut listener = UnixListener::bind(&path).expect("bind test socket");
         #[cfg(windows)]
-        let path = PathBuf::from(format!(
-            r"\\.\pipe\flotilla-manifest-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("clock").as_nanos()
-        ));
+        let path = {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            // Windows wall-clock resolution can give concurrent tests identical
+            // timestamps. A process-local sequence keeps first instances unique.
+            static NEXT_PIPE: AtomicU64 = AtomicU64::new(0);
+            PathBuf::from(format!(r"\\.\pipe\flotilla-manifest-{}-{}", std::process::id(), NEXT_PIPE.fetch_add(1, Ordering::Relaxed)))
+        };
         #[cfg(windows)]
         let mut listener = PipeListener::bind(path.clone());
         let calls: Calls = Arc::new(Mutex::new((statuses.into(), Vec::new())));

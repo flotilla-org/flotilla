@@ -45,6 +45,8 @@ mod principal_attention;
 mod project;
 mod provisioning_identity;
 mod registry;
+#[cfg(test)]
+mod registry_watch_tests;
 mod replica;
 mod repository;
 mod resource;

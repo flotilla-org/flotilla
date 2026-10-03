@@ -62,6 +62,14 @@ pub enum ResourceError {
 }
 
 impl ResourceError {
+    // Keep wire-message classification beside its formatter until command errors
+    // carry typed categories. Changing this prefix updates both sides together.
+    const INVALID_MESSAGE_PREFIX: &'static str = "invalid resource: ";
+
+    pub fn is_invalid_message(message: &str) -> bool {
+        message.starts_with(Self::INVALID_MESSAGE_PREFIX)
+    }
+
     pub fn not_found(name: impl Into<String>) -> Self {
         Self::NotFound { name: name.into() }
     }
@@ -98,7 +106,7 @@ impl fmt::Display for ResourceError {
         match self {
             Self::NotFound { name } => write!(f, "resource not found: {name}"),
             Self::Conflict { name, message } => write!(f, "resource conflict for {name}: {message}"),
-            Self::Invalid { message } => write!(f, "invalid resource: {message}"),
+            Self::Invalid { message } => write!(f, "{}{message}", Self::INVALID_MESSAGE_PREFIX),
             Self::WatchExpired { requested_version, compacted_through: Some(compacted_through) } => {
                 write!(f, "watch resourceVersion {requested_version} expired; events through {compacted_through} were compacted")
             }

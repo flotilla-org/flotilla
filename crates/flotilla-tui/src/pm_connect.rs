@@ -16,11 +16,12 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     future::Future,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 pub use flotilla_client::reconnect::is_incompatible_daemon_error;
+use flotilla_client::reconnect::{is_permanent_daemon_error, ReconnectBackoff};
 use flotilla_core::{
     config::{ssh_destination, ConfigStore},
     daemon::DaemonHandle,
@@ -53,6 +54,7 @@ where
     Connected: FnMut(Arc<dyn DaemonHandle>) -> ConnectedFuture,
     ConnectedFuture: Future<Output = Result<(), String>>,
 {
+    let mut session_backoff = ReconnectBackoff::default();
     loop {
         let daemon = flotilla_client::reconnect::connect_with_retry(&mut connect, |notice| match notice {
             flotilla_client::reconnect::ReconnectNotice::Attempt { attempt } => debug!(attempt, "connecting to daemon"),
@@ -62,8 +64,21 @@ where
         })
         .await?;
         info!("connected to daemon");
+        let connected_at = tokio::time::Instant::now();
         if let Err(error) = run_connected(daemon).await {
-            info!(%error, "daemon connection ended; reconnecting");
+            // Resource validation refusals describe a deterministic request error;
+            // reconnecting cannot make the same parameters supported.
+            if is_permanent_daemon_error(&error) {
+                return Err(error);
+            }
+            // A healthy session resets the next retry; repeated short-lived
+            // failures retain the shared exponential cap and jitter.
+            if connected_at.elapsed() >= Duration::from_secs(30) {
+                session_backoff.reset();
+            }
+            let delay = session_backoff.next_delay();
+            info!(%error, ?delay, "daemon connection ended; reconnecting");
+            tokio::time::sleep(delay).await;
         }
     }
 }
@@ -114,7 +129,7 @@ pub struct ConnectorState {
     standing_roles: HashMap<ResourceRef, StandingRoleRow>,
     project_repositories: HashMap<ResourceRef, ProjectRepositoriesRow>,
     seqs: HashMap<QueryId, u64>,
-    catalog: Catalog,
+    catalog: Arc<Mutex<Catalog>>,
     subscriber_id: uuid::Uuid,
 }
 
@@ -128,7 +143,7 @@ impl Default for ConnectorState {
             standing_roles: HashMap::new(),
             project_repositories: HashMap::new(),
             seqs: HashMap::new(),
-            catalog: Catalog::default(),
+            catalog: Arc::new(Mutex::new(Catalog::default())),
             subscriber_id: uuid::Uuid::new_v4(),
         }
     }
@@ -272,14 +287,25 @@ impl ConnectorState {
             },
             mint,
         );
-        let patches = next.diff_patches(&self.catalog);
-        self.catalog = next;
+        let mut catalog = self.catalog.lock().expect("published catalog");
+        let patches = next.diff_patches(&catalog);
+        *catalog = next;
         patches
+    }
+
+    // A reconnect retracts absent facts against the last published catalog,
+    // while refreshing all surviving facts even if their TTL expired offline.
+    fn bootstrap_patches(&mut self, mint: &dyn RecipeMint) -> Vec<MetadataPatch> {
+        let mut patches: BTreeMap<_, _> = self.rebuild(mint).into_iter().map(|patch| (patch.target.clone(), patch)).collect();
+        for full in self.reassert() {
+            patches.entry(full.target.clone()).and_modify(|diff| diff.set = full.set.clone()).or_insert(full);
+        }
+        patches.into_values().collect()
     }
 
     /// Full re-assertion of the published catalog — the TTL heartbeat.
     pub fn reassert(&self) -> Vec<MetadataPatch> {
-        self.catalog.reassert_patches()
+        self.catalog.lock().expect("published catalog").reassert_patches()
     }
 
     /// Resume cursors for every named query. A gapped query's cursor is
@@ -304,26 +330,17 @@ async fn send_patches(sink: &dyn PatchSink, patches: Vec<MetadataPatch>) {
     }
 }
 
-/// (Re)subscribe to every named query and publish whatever changed.
-async fn resubscribe(
-    daemon: &dyn DaemonHandle,
-    state: &mut ConnectorState,
-    mint: &dyn RecipeMint,
-    sink: &dyn PatchSink,
-) -> Result<(), String> {
-    let events = daemon.subscribe_queries(state.subscriber_id, &state.cursors()).await?;
-    let mut updated = false;
-    for event in &events {
-        updated |= state.apply_event(event) == Applied::Updated;
-    }
-    if updated {
-        send_patches(sink, state.rebuild(mint)).await;
+/// (Re)subscribe to every named query; publish only after subject bootstrap.
+async fn resubscribe(daemon: &dyn DaemonHandle, state: &mut ConnectorState) -> Result<(), String> {
+    for event in daemon.subscribe_queries(state.subscriber_id, &state.cursors()).await? {
+        state.apply_event(&event);
     }
     Ok(())
 }
 
-/// List before watching with the returned cursor: observations written between
-/// bootstrap and watch admission are replayed rather than lost.
+/// Bootstrap from each merged watch's initial snapshot, never a separate list.
+/// The resource layer subscribes before taking that snapshot; subsequent events
+/// remain queued on the same watch. Consume the snapshot before publishing.
 async fn ensure_resource_watches(
     daemon: &Arc<dyn DaemonHandle>,
     state: &mut ConnectorState,
@@ -331,7 +348,7 @@ async fn ensure_resource_watches(
     tasks: &mut tokio::task::JoinSet<()>,
     updates: &tokio::sync::mpsc::Sender<Result<flotilla_protocol::ResourceReadEnvelope, String>>,
 ) -> Result<(), String> {
-    use flotilla_client::resource::{ResourceClient, ResourceListRequest, ResourceWatchRequest};
+    use flotilla_client::resource::{ResourceClient, ResourceWatchRequest};
     // Scope follows the named-query graph. Namespaces with no convoy, role or
     // project membership are intentionally outside this subject projection.
     let namespaces: BTreeSet<_> = ["flotilla".to_string()]
@@ -351,20 +368,12 @@ async fn ensure_resource_watches(
             continue;
         }
         for kind in resources::KINDS {
-            let listed = client
-                .list(ResourceListRequest::builder().kind((*kind).to_string()).namespace(namespace.clone()).include_replicas(true).build())
-                .await?;
-            state.apply_resource_records(&listed)?;
             let mut watch = client
                 .watch(
-                    ResourceWatchRequest::builder()
-                        .kind((*kind).to_string())
-                        .namespace(namespace.clone())
-                        .include_replicas(true)
-                        .cursor(listed.cursor)
-                        .build(),
+                    ResourceWatchRequest::builder().kind((*kind).to_string()).namespace(namespace.clone()).include_replicas(true).build(),
                 )
                 .await?;
+            bootstrap_subject_watch(&mut watch, state, &namespace, kind).await?;
             let updates = updates.clone();
             tasks.spawn(async move {
                 loop {
@@ -387,6 +396,36 @@ async fn ensure_resource_watches(
     Ok(())
 }
 
+// The daemon emits snapshot envelopes followed by a bookmark, then live
+// events. Consume through that explicit boundary, allowing fragmentation but
+// refusing live updates or a mismatched scope before setup can publish.
+async fn bootstrap_subject_watch(
+    watch: &mut flotilla_client::resource::ResourceWatch,
+    state: &mut ConnectorState,
+    namespace: &str,
+    plural: &str,
+) -> Result<(), String> {
+    use flotilla_protocol::ResourceRecordType;
+    use flotilla_resources::ResourceError;
+
+    loop {
+        let envelope = watch.next().await?.ok_or_else(|| "subject catalog resource watch ended during bootstrap".to_string())?;
+        if envelope.namespace != namespace || envelope.plural != plural {
+            return Err(ResourceError::invalid("subject resource snapshot scope does not match its watch").to_string());
+        }
+        if envelope.records.iter().any(|record| record.record_type == ResourceRecordType::Bookmark) {
+            if envelope.records.len() != 1 || envelope.records[0].object.is_some() {
+                return Err(ResourceError::invalid("subject resource snapshot bookmark must be a separate envelope").to_string());
+            }
+            return Ok(());
+        }
+        if envelope.records.iter().any(|record| !matches!(record.record_type, ResourceRecordType::Current | ResourceRecordType::Added)) {
+            return Err(ResourceError::invalid("subject resource snapshot contains a live event before its bookmark").to_string());
+        }
+        state.apply_resource_records(&envelope)?;
+    }
+}
+
 /// The connector loop: subscribe → project → send, with a TTL re-assertion
 /// tick and gap-triggered resubscription. Returns when the daemon
 /// connection's event stream closes.
@@ -396,16 +435,50 @@ pub async fn run_connector(
     mint: Arc<dyn RecipeMint>,
     reassert_interval: Duration,
 ) -> Result<(), String> {
+    Connector::default().run(daemon, sink, mint, reassert_interval).await
+}
+
+/// One PM publication lifetime. Keep this owner across daemon reconnects so a
+/// fresh snapshot can retract facts removed while disconnected. Watch/query
+/// state is connection-local and is always rebuilt from scratch.
+#[derive(Default)]
+pub struct Connector {
+    catalog: Arc<Mutex<Catalog>>,
+}
+
+impl Connector {
+    pub async fn run(
+        &self,
+        daemon: Arc<dyn DaemonHandle>,
+        sink: Arc<dyn PatchSink>,
+        mint: Arc<dyn RecipeMint>,
+        reassert_interval: Duration,
+    ) -> Result<(), String> {
+        let subscriber_id = uuid::Uuid::new_v4();
+        let _queries = daemon.query_subscription(subscriber_id);
+        let state = ConnectorState { subscriber_id, catalog: self.catalog.clone(), ..ConnectorState::default() };
+        let result = run_connector_subscribed(&daemon, &*sink, &*mint, reassert_interval, state).await;
+        daemon.unsubscribe_queries(subscriber_id).await;
+        result
+    }
+}
+
+async fn run_connector_subscribed(
+    daemon: &Arc<dyn DaemonHandle>,
+    sink: &dyn PatchSink,
+    mint: &dyn RecipeMint,
+    reassert_interval: Duration,
+    mut state: ConnectorState,
+) -> Result<(), String> {
     // Subscribe to the broadcast before the query subscription so nothing
     // emitted in between is dropped.
     let mut events = daemon.subscribe();
-    let mut state = ConnectorState::default();
-    resubscribe(&*daemon, &mut state, &*mint, &*sink).await?;
+    resubscribe(&**daemon, &mut state).await?;
     let (resource_tx, mut resource_rx) = tokio::sync::mpsc::channel(64);
     let mut resource_tasks = tokio::task::JoinSet::new();
     let mut watched_namespaces = BTreeSet::new();
-    ensure_resource_watches(&daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &resource_tx).await?;
-    send_patches(&*sink, state.rebuild(&*mint)).await;
+    ensure_resource_watches(daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &resource_tx).await?;
+    send_patches(sink, state.bootstrap_patches(mint)).await;
     info!("pm connector subscribed; publishing catalog");
 
     let mut tick = tokio::time::interval(reassert_interval);
@@ -416,8 +489,8 @@ pub async fn run_connector(
         tokio::select! {
             _ = tick.tick() => {
                 // The landed window expires even when no resource changes.
-                send_patches(&*sink, state.rebuild(&*mint)).await;
-                send_patches(&*sink, state.reassert()).await;
+                send_patches(sink, state.rebuild(mint)).await;
+                send_patches(sink, state.reassert()).await;
             }
             update = resource_rx.recv() => {
                 // Watch end/gap/error restarts the whole snapshot via run_reconnecting.
@@ -425,30 +498,29 @@ pub async fn run_connector(
                 // cancels their commands; no partial subscription survives a retry.
                 let envelope = update.ok_or_else(|| "subject catalog watch channel ended".to_string())??;
                 state.apply_resource_records(&envelope)?;
-                send_patches(&*sink, state.rebuild(&*mint)).await;
+                send_patches(sink, state.rebuild(mint)).await;
             }
             received = events.recv() => match received {
                 Ok(event) => match state.apply_event(&event) {
                     Applied::Updated => {
-                        ensure_resource_watches(&daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &resource_tx).await?;
-                        send_patches(&*sink, state.rebuild(&*mint)).await;
+                        ensure_resource_watches(daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &resource_tx).await?;
+                        send_patches(sink, state.rebuild(mint)).await;
                     }
                     Applied::Ignored => {}
                     Applied::Gap(query) => {
                         debug!(%query, "result stream gap; resubscribing");
-                        resubscribe(&*daemon, &mut state, &*mint, &*sink).await?;
-                        ensure_resource_watches(&daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &resource_tx).await?;
-                        send_patches(&*sink, state.rebuild(&*mint)).await;
+                        resubscribe(&**daemon, &mut state).await?;
+                        ensure_resource_watches(daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &resource_tx).await?;
+                        send_patches(sink, state.rebuild(mint)).await;
                     }
                 },
                 Err(RecvError::Lagged(skipped)) => {
                     warn!(skipped, "event stream lagged; resubscribing");
-                    resubscribe(&*daemon, &mut state, &*mint, &*sink).await?;
-                    ensure_resource_watches(&daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &resource_tx).await?;
-                    send_patches(&*sink, state.rebuild(&*mint)).await;
+                    resubscribe(&**daemon, &mut state).await?;
+                    ensure_resource_watches(daemon, &mut state, &mut watched_namespaces, &mut resource_tasks, &resource_tx).await?;
+                    send_patches(sink, state.rebuild(mint)).await;
                 }
                 Err(RecvError::Closed) => {
-                    daemon.unsubscribe_queries(state.subscriber_id).await;
                     return Err("daemon event stream closed".to_owned());
                 }
             }
@@ -489,6 +561,7 @@ pub async fn run(
         ssh_hosts.remove(&host);
     }
     let mint: Arc<dyn RecipeMint> = Arc::new(FlotillaRecipes::new(options.flotilla_bin.clone()).with_host_routes(local_host, ssh_hosts));
+    let connector = Arc::new(Connector::default());
     run_reconnecting(
         || async {
             let surface = flotilla_protocol::SurfaceDeclaration::ambient_for_namespace("flotilla");
@@ -499,7 +572,12 @@ pub async fn run(
             }
             .map(|daemon| daemon as Arc<dyn DaemonHandle>)
         },
-        |daemon| run_connector(daemon, sink.clone(), mint.clone(), Duration::from_millis(REASSERT_INTERVAL_MS)),
+        |daemon| {
+            let connector = connector.clone();
+            let sink = sink.clone();
+            let mint = mint.clone();
+            async move { connector.run(daemon, sink, mint, Duration::from_millis(REASSERT_INTERVAL_MS)).await }
+        },
     )
     .await
 }

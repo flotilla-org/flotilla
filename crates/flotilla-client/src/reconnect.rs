@@ -1,5 +1,7 @@
 use std::{future::Future, time::Duration};
 
+use flotilla_resources::ResourceError;
+
 const INITIAL_DELAY: Duration = Duration::from_millis(500);
 const MAX_DELAY: Duration = Duration::from_secs(30);
 pub const REEXEC_BUILD_ENV: &str = "FLOTILLA_REEXEC_BUILD";
@@ -41,6 +43,12 @@ pub enum ReconnectNotice {
 
 pub fn is_incompatible_daemon_error(error: &str) -> bool {
     error.contains("protocol version mismatch") || error.contains("wire generation mismatch")
+}
+
+/// Deterministic refusals cannot be repaired by reconnecting the same client.
+/// Resource-message classification is owned by the error's producer/formatter.
+pub fn is_permanent_daemon_error(error: &str) -> bool {
+    ResourceError::is_invalid_message(error) || is_incompatible_daemon_error(error)
 }
 
 /// Connect to a daemon with the shared retry policy used by every long-lived
@@ -139,5 +147,22 @@ mod tests {
 
         assert_eq!(attempts, 1);
         assert!(error.contains("wire generation mismatch"));
+    }
+
+    // Glue: classify actual producer-rendered errors, alongside wire/protocol
+    // incompatibilities. Not-found/conflict/transport failures remain retryable.
+    #[test]
+    fn permanent_classification_uses_resource_producer_category() {
+        for message in ["", "unsupported watch parameters", "arbitrary detail"] {
+            assert!(is_permanent_daemon_error(&ResourceError::invalid(message).to_string()));
+        }
+        for error in ["protocol version mismatch", "wire generation mismatch"] {
+            assert!(is_permanent_daemon_error(error));
+        }
+        for error in
+            [ResourceError::not_found("name"), ResourceError::conflict("name", "stale view"), ResourceError::other("daemon unavailable")]
+        {
+            assert!(!is_permanent_daemon_error(&error.to_string()));
+        }
     }
 }
