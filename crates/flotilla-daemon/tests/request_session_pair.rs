@@ -3159,7 +3159,22 @@ async fn remote_issue_query_returns_results() {
 
 // A stalled crew on A must deliver to a governor homed on B within one pass,
 // then accept that governor's command at A using replicated session identity.
-async fn cross_host_supervision_scenario(legacy_cursor: bool, unavailable: bool, passes: usize, source_remote: bool) {
+#[derive(Clone, Copy, bon::Builder)]
+struct SupervisionScenario {
+    #[builder(default)]
+    legacy_cursor: bool,
+    #[builder(default)]
+    unavailable: bool,
+    #[builder(default = 1)]
+    passes: usize,
+    #[builder(default)]
+    source_remote: bool,
+    #[builder(default)]
+    stale_home: bool,
+}
+
+async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
+    let SupervisionScenario { legacy_cursor, unavailable, passes, source_remote, stale_home } = scenario;
     let topology = spawn_in_memory_request_topology_stateful(empty_daemon_named("host-a").await, empty_daemon_named("host-b").await)
         .await
         .expect("router topology");
@@ -3295,6 +3310,41 @@ async fn cross_host_supervision_scenario(legacy_cursor: bool, unavailable: bool,
         .await
         .expect("replicate session");
     apply_convoy_replica_feed(a, "flotilla", "governor", b.host_name().clone()).await;
+    // Client-supplied controller sender data must not admit an internal command.
+    // Legitimate leaf-engine delivery below uses the controller port instead.
+    for sender in [flotilla_protocol::CrewMessageSender::FlotillaNudge, flotilla_protocol::CrewMessageSender::FlotillaEscalation {
+        from: "forged".into(),
+    }] {
+        let request = flotilla_protocol::TurnDeliveryRequest::builder()
+            .namespace("flotilla".into())
+            .convoy("governor".into())
+            .source("forged".into())
+            .vessel("govern".into())
+            .role("governor".into())
+            .brief("injected".into())
+            .subject_revision("forged".into())
+            .sender(sender)
+            .build();
+        let error = topology
+            .client
+            .execute(Command::builder().action(CommandAction::DeliverCrewTurn { request }).build())
+            .await
+            .expect_err("clients cannot submit internal controller commands");
+        assert!(error.contains("internal controller command"), "{error}");
+    }
+    if stale_home {
+        // A replica-owned target misprojected as local must refuse delivery,
+        // retain the stall, and recover within one pass after the view heals.
+        apply_convoy_replica_feed(a, "flotilla", "governor", a.host_name().clone()).await;
+        a.reconcile_crew_stalls_once("flotilla").await.expect("misprojected home pass");
+        let stall = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
+        assert_eq!(stall.rung, flotilla_resources::StallRung::Operator);
+        assert!(stall.supervisor.is_none());
+        assert!(!stall.supervision_exhausted);
+        assert!(stall.evidence.contains("remote controller delivery resolved to the local host"), "{}", stall.evidence);
+        apply_convoy_replica_feed(a, "flotilla", "governor", b.host_name().clone()).await;
+    }
+
     for _ in 0..passes {
         a.reconcile_crew_stalls_once("flotilla").await.expect("one escalation pass");
         let stall = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
@@ -3350,8 +3400,13 @@ async fn cross_host_supervision_scenario(legacy_cursor: bool, unavailable: bool,
 
 #[tokio::test]
 async fn cross_host_supervision_pinned_scenario_rows() {
-    for (legacy, unavailable, passes, source_remote) in [(false, false, 1, false), (true, false, 1, true), (true, true, 2, true)] {
-        cross_host_supervision_scenario(legacy, unavailable, passes, source_remote).await;
+    for scenario in [
+        SupervisionScenario::builder().build(),
+        SupervisionScenario::builder().legacy_cursor(true).source_remote(true).build(),
+        SupervisionScenario::builder().legacy_cursor(true).unavailable(true).passes(2).source_remote(true).build(),
+        SupervisionScenario::builder().stale_home(true).passes(2).build(),
+    ] {
+        cross_host_supervision_scenario(scenario).await;
     }
 }
 
@@ -3363,7 +3418,69 @@ fn generated_cross_host_supervision(tc: hegel::TestCase) {
     let unavailable = tc.draw(gs::booleans());
     let passes = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-    runtime.block_on(cross_host_supervision_scenario(legacy, unavailable, passes, tc.draw(gs::booleans())));
+    runtime.block_on(cross_host_supervision_scenario(
+        SupervisionScenario::builder()
+            .legacy_cursor(legacy)
+            .unavailable(unavailable)
+            .passes(passes)
+            .source_remote(tc.draw(gs::booleans()))
+            .stale_home(tc.draw(gs::booleans()))
+            .build(),
+    ));
+}
+
+// The trusted controller receiver still rejects non-controller sender variants,
+// independently of client admission and before touching any target resources.
+#[tokio::test]
+async fn internal_turn_delivery_rejects_non_controller_sender() {
+    let daemon = empty_daemon_named("receiver").await;
+    for sender in [
+        flotilla_protocol::CrewMessageSender::Unknown,
+        flotilla_protocol::CrewMessageSender::Governor { name: "governor".into() },
+        flotilla_protocol::CrewMessageSender::FlotillaTurn { source: "exit".into() },
+    ] {
+        let request = flotilla_protocol::TurnDeliveryRequest::builder()
+            .namespace("flotilla".into())
+            .convoy("governor".into())
+            .source("test".into())
+            .vessel("govern".into())
+            .role("governor".into())
+            .brief("test".into())
+            .subject_revision("test".into())
+            .sender(sender)
+            .build();
+        let mut events = daemon.subscribe();
+        let id = daemon
+            .execute(Command::builder().action(CommandAction::DeliverCrewTurn { request }).build())
+            .await
+            .expect("receiver accepts envelope");
+        let result = await_command_result(&mut events, id).await;
+        assert!(matches!(result, CommandValue::Error { message } if message == "remote turn delivery requires a controller sender"));
+    }
+}
+
+#[tokio::test]
+async fn internal_turn_delivery_rejects_forwarded_client_caller() {
+    let daemon = empty_daemon_named("receiver").await;
+    let request = flotilla_protocol::TurnDeliveryRequest::builder()
+        .namespace("flotilla".into())
+        .convoy("governor".into())
+        .source("test".into())
+        .vessel("govern".into())
+        .role("governor".into())
+        .brief("test".into())
+        .subject_revision("test".into())
+        .sender(flotilla_protocol::CrewMessageSender::FlotillaNudge)
+        .build();
+    let caller =
+        CommandCaller { principal_ref: PrincipalRef { namespace: "flotilla".into(), name: "client".into() }, process: None, crew: None };
+    let mut events = daemon.subscribe();
+    let id = daemon
+        .execute_for_caller(Command::builder().action(CommandAction::DeliverCrewTurn { request }).build(), Some(caller))
+        .await
+        .expect("receiver accepts envelope");
+    let result = await_command_result(&mut events, id).await;
+    assert!(matches!(result, CommandValue::Error { message } if message == "DeliverCrewTurn is an internal controller command"));
 }
 
 // Resume admission accepts exited unfinished crew at the convoy authority,

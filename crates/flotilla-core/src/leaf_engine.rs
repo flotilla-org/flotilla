@@ -208,7 +208,8 @@ impl LeafSubscriptionTable {
         }
     }
 
-    /// Deterministic stepping seam for replication and router scenarios.
+    /// Step locally authored convoys once. Supervisor and child context is read
+    /// from the replica view during judgement; replica convoys are never actuated.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn reconcile_stalls_once(&self, namespace: &str) -> Result<(), String> {
         let convoys = self
@@ -1627,6 +1628,9 @@ impl ReconcilerWake {
                         condition.supervisor = None;
                         // The cursor records consumed rungs, not failed delivery attempts.
                         // Retain it so retrying a higher rung cannot route back to a lower one.
+                        // Persist the last consumed rung, not the next attempt.
+                        // Retrying legacy rung i stores i - 1 (None at zero), so
+                        // failed lookup/delivery retries i without revisiting lower rungs.
                         condition.supervision_index = prior.and_then(|stalled| stalled.supervision_index).and_then(|index| {
                             if retry_exhausted {
                                 index.checked_sub(1)

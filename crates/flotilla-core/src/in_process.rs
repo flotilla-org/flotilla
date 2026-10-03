@@ -1714,6 +1714,8 @@ pub struct InProcessDaemon {
     /// deltas without disturbing unrelated provider snapshot state.
     managed_terminals_by_repo: RwLock<HashMap<RepoIdentity, HashMap<flotilla_protocol::AttachableId, ManagedTerminal>>>,
     leaf_subscriptions: LeafSubscriptionTable,
+    // Networking can restart against the same daemon, replacing a dead router.
+    // This lock protects only Weak pointer copies/swaps, never async work.
     remote_turn_delivery: std::sync::RwLock<Option<Weak<dyn crate::leaf_engine::RemoteTurnDelivery>>>,
 }
 
@@ -7676,6 +7678,7 @@ impl InProcessDaemon {
         self.leaf_subscriptions.reconcile_stalls_once(namespace).await
     }
 
+    /// Replace the routing port when the networking runtime is constructed or restarted.
     pub fn set_remote_turn_delivery(&self, delivery: Weak<dyn crate::leaf_engine::RemoteTurnDelivery>) {
         *self.remote_turn_delivery.write().expect("remote turn delivery lock") = Some(delivery);
     }
@@ -9686,7 +9689,9 @@ impl InProcessDaemon {
             flotilla_protocol::CommandAction::CrewStall { .. } => return boxed_action!(self.execute_action_crew_stall(id, &command)),
             flotilla_protocol::CommandAction::DeliverCrewTurn { request } => {
                 let identity = self.start_context_free_command(id, command.description().to_string());
-                let result = if matches!(request.sender, CrewMessageSender::FlotillaEscalation { .. } | CrewMessageSender::FlotillaNudge) {
+                let result = if caller.is_some() {
+                    CommandValue::Error { message: "DeliverCrewTurn is an internal controller command".into() }
+                } else if matches!(request.sender, CrewMessageSender::FlotillaEscalation { .. } | CrewMessageSender::FlotillaNudge) {
                     match self.deliver_standing_turn(request).await {
                         Ok(rung) => CommandValue::CrewTurnDelivered { rung },
                         Err(message) => CommandValue::Error { message },

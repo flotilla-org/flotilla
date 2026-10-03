@@ -212,6 +212,9 @@ impl flotilla_core::leaf_engine::RemoteTurnDelivery for RemoteCommandRouterInner
     ) -> Result<flotilla_resources::TurnDeliveryRung, String> {
         let router = RemoteCommandRouter { inner: self };
         let command = Command::builder().action(CommandAction::DeliverCrewTurn { request: request.clone() }).build();
+        // Controller deliveries have no interactive surface. Pending commands
+        // and their oneshots are keyed by unique request_id, not session_id;
+        // session_id is used only for query projection at the receiver.
         match router.dispatch_and_wait(command, uuid::Uuid::nil()).await? {
             CommandValue::CrewTurnDelivered { rung } => Ok(rung),
             CommandValue::Error { message } => Err(message),
@@ -368,6 +371,9 @@ impl RemoteCommandRouter {
         mut command: Command,
         caller: Option<flotilla_protocol::CommandCaller>,
     ) -> Result<u64, String> {
+        if matches!(command.action, CommandAction::DeliverCrewTurn { .. }) {
+            return Err("DeliverCrewTurn is an internal controller command".into());
+        }
         let dispatching_principal_ref = caller.as_ref().map(|caller| caller.principal_ref.clone());
         let mut crew_completion = self.resolve_crew_command_routing(&mut command.action).await?;
         if let Some(completion) = &mut crew_completion {

@@ -47,6 +47,9 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::QueryResourceGet { .. }
         | CommandAction::ResourceWatch { .. } => false,
 
+        // Controller transport commands are unavailable to interactive surfaces.
+        CommandAction::DeliverCrewTurn { .. } => false,
+
         CommandAction::CreateWorkspaceForCheckout { .. }
         | CommandAction::CreateWorkspaceFromPreparedTerminal { .. }
         | CommandAction::SelectWorkspace { .. }
@@ -73,7 +76,6 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::CrewFail { .. }
         | CommandAction::CrewStall { .. }
         | CommandAction::CrewSupervise { .. }
-        | CommandAction::DeliverCrewTurn { .. }
         | CommandAction::ConvoyCreate { .. }
         | CommandAction::ConvoyStart { .. }
         | CommandAction::WorkflowTemplateApply { .. }
