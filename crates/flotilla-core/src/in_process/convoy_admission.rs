@@ -70,7 +70,6 @@ pub(super) struct ConvoyAdmission {
     host_name: HostName,
     clock: Arc<dyn Clock>,
     fulfilment_decider: Arc<dyn FulfilmentDecider>,
-    _event_sink: Arc<dyn EventSink>,
     /// Serializes the identity selector check with Convoy creation on the owner host.
     #[builder(default)]
     guard: Mutex<()>,

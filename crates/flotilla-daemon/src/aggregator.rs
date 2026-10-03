@@ -6,8 +6,11 @@ use std::{
 };
 
 use async_trait::async_trait;
+#[cfg(test)]
+use flotilla_core::event_sink::BroadcastEventSink;
 use flotilla_core::{
     aggregator_projection::AggregatorProjectionState,
+    event_sink::EventSink,
     in_process::InProcessDaemon,
     ops_entry::{ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION},
     path_context::canonical_or_original,
@@ -248,7 +251,8 @@ pub struct Aggregator {
     pane_exit_as_of: HashMap<(RepoIdentity, AttachableId), (PaneExitAttention, chrono::DateTime<chrono::Utc>)>,
     #[builder(skip)]
     issue_materializer: Option<IssueMaterializer>,
-    event_tx: broadcast::Sender<DaemonEvent>,
+    event_sink: Arc<dyn EventSink>,
+    event_rx: broadcast::Receiver<DaemonEvent>,
 }
 
 struct ChangeRequestResolution {
@@ -273,7 +277,18 @@ impl Default for ChangeRequestRefreshQueue {
 impl Aggregator {
     const WATCH_RESTART_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
+    #[cfg(test)]
     pub fn new(state: AggregatorProjectionState, local_host: HostName, event_tx: broadcast::Sender<DaemonEvent>) -> Self {
+        let event_rx = event_tx.subscribe();
+        Self::with_events(state, local_host, Arc::new(BroadcastEventSink::new(event_tx)), event_rx)
+    }
+
+    pub fn with_events(
+        state: AggregatorProjectionState,
+        local_host: HostName,
+        event_sink: Arc<dyn EventSink>,
+        event_rx: broadcast::Receiver<DaemonEvent>,
+    ) -> Self {
         Self {
             state,
             local_host,
@@ -306,7 +321,8 @@ impl Aggregator {
             managed_terminals_by_repo: HashMap::new(),
             pane_exit_as_of: HashMap::new(),
             issue_materializer: None,
-            event_tx,
+            event_sink,
+            event_rx,
         }
     }
 
@@ -330,7 +346,7 @@ impl Aggregator {
     where
         R: IssueMaterializationResolver + 'static,
     {
-        self.issue_materializer = Some(IssueMaterializer::new(self.state.clone(), resolver, self.event_tx.clone()));
+        self.issue_materializer = Some(IssueMaterializer::new(self.state.clone(), resolver, self.event_sink.clone()));
         self
     }
 
@@ -399,7 +415,7 @@ impl Aggregator {
         // reconciler plugs into this same initial/change path.
         let mut demand_rx = self.state.subscribe_demand();
         let mut fetch_more_rx = self.state.subscribe_fetch_more();
-        let mut daemon_event_rx = self.event_tx.subscribe();
+        let mut daemon_event_rx = self.event_rx.resubscribe();
         let initial_demand = demand_rx.borrow_and_update().clone();
         if let Some(materializer) = &mut self.issue_materializer {
             materializer.reconcile(initial_demand);
@@ -429,8 +445,8 @@ impl Aggregator {
         let mut checkout_replica_stream = self.recover_checkout_replica_watch(observed_checkout_replicas).await?;
         self.bootstrapping = false;
         self.emitted_queries.extend(QueryId::ALWAYS_MATERIALIZED.iter().cloned());
-        let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
-        let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(self.state.independents_result_set(&None).await)));
+        self.event_sink.emit(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
+        self.event_sink.emit(DaemonEvent::ResultSet(Box::new(self.state.independents_result_set(&None).await)));
         self.emit_awareness_result_sets().await;
 
         let mut change_request_sweep =
@@ -1457,12 +1473,12 @@ impl Aggregator {
             self.emit_delta(changed, removed).await;
         } else {
             self.emitted_queries.insert(QueryId::Convoys { scope: None });
-            let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
+            self.event_sink.emit(DaemonEvent::ResultSet(Box::new(result_set)));
         }
         self.emit_scoped_convoy_result_sets().await;
         let represented = self.state.represented_issue_refs().await;
         for delta in self.state.suppress_issues(&represented) {
-            let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
+            self.event_sink.emit(DaemonEvent::ResultDelta(Box::new(delta)));
         }
         if let Some(materializer) = &self.issue_materializer {
             // The direct delta hides represented rows immediately; refiltering
@@ -1741,7 +1757,7 @@ impl Aggregator {
         }
         let changed = !deltas.is_empty();
         for delta in deltas {
-            let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
+            self.event_sink.emit(DaemonEvent::ResultDelta(Box::new(delta)));
         }
         if changed {
             self.emit_awareness_result_sets().await;
@@ -1801,7 +1817,7 @@ impl Aggregator {
     async fn emit_delta(&self, changed: Vec<ConvoyRow>, removed: Vec<ResourceRef>) {
         let seq = self.state.seq().await;
         let changes = QueryChanges::Convoys { scope: None, changed, removed };
-        let _ = self.event_tx.send(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changes, state: None })));
+        self.event_sink.emit(DaemonEvent::ResultDelta(Box::new(ResultDelta { seq, changes, state: None })));
         self.emit_awareness_result_sets().await;
     }
 
@@ -1819,7 +1835,7 @@ impl Aggregator {
             "projected scoped convoy snapshots"
         );
         for result_set in result_sets {
-            let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
+            self.event_sink.emit(DaemonEvent::ResultSet(Box::new(result_set)));
         }
     }
 
@@ -1996,7 +2012,7 @@ impl Aggregator {
                 continue;
             }
             if let Some(result_set) = self.state.result_set_for(&query).await {
-                let _ = self.event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
+                self.event_sink.emit(DaemonEvent::ResultSet(Box::new(result_set)));
             }
         }
     }

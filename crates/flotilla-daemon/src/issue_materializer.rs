@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_core::{
     aggregator_projection::AggregatorProjectionState,
+    event_sink::EventSink,
     in_process::InProcessDaemon,
     providers::{
         github_api::{core_rate_limit_reset, rate_limit_reset},
@@ -26,8 +27,10 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{ConditionValue, HostCondition, ResolvedIssueSourceBinding};
 use futures::{stream, StreamExt};
+#[cfg(test)]
+use tokio::sync::broadcast;
 use tokio::{
-    sync::{broadcast, mpsc, Mutex},
+    sync::{mpsc, Mutex},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -78,7 +81,7 @@ struct ActiveMaterialization {
 struct MaterializationContext {
     resolver: Arc<dyn IssueMaterializationResolver>,
     state: AggregatorProjectionState,
-    event_tx: broadcast::Sender<DaemonEvent>,
+    event_sink: Arc<dyn EventSink>,
     shared_refresh: Arc<SharedIssueRefresh>,
 }
 
@@ -92,7 +95,7 @@ impl ActiveMaterialization {
 pub(crate) struct IssueMaterializer {
     state: AggregatorProjectionState,
     resolver: Arc<dyn IssueMaterializationResolver>,
-    event_tx: broadcast::Sender<DaemonEvent>,
+    event_sink: Arc<dyn EventSink>,
     active: HashMap<QueryId, ActiveMaterialization>,
     shared_refresh: Arc<SharedIssueRefresh>,
 }
@@ -427,11 +430,11 @@ impl SharedIssueRefresh {
 }
 
 impl IssueMaterializer {
-    pub(crate) fn new<R>(state: AggregatorProjectionState, resolver: Arc<R>, event_tx: broadcast::Sender<DaemonEvent>) -> Self
+    pub(crate) fn new<R>(state: AggregatorProjectionState, resolver: Arc<R>, event_sink: Arc<dyn EventSink>) -> Self
     where
         R: IssueMaterializationResolver + 'static,
     {
-        Self { state, resolver, event_tx, active: HashMap::new(), shared_refresh: Arc::new(SharedIssueRefresh::default()) }
+        Self { state, resolver, event_sink, active: HashMap::new(), shared_refresh: Arc::new(SharedIssueRefresh::default()) }
     }
 
     pub(crate) fn with_polling_health(mut self, health: IssuePollingHealth) -> Self {
@@ -468,7 +471,7 @@ impl IssueMaterializer {
                 MaterializationContext {
                     resolver: Arc::clone(&self.resolver),
                     state: self.state.clone(),
-                    event_tx: self.event_tx.clone(),
+                    event_sink: self.event_sink.clone(),
                     shared_refresh: Arc::clone(&self.shared_refresh),
                 },
                 cancel.clone(),
@@ -557,10 +560,10 @@ async fn run_materialization(
     cancel: CancellationToken,
     mut intents: mpsc::Receiver<MaterializationIntent>,
 ) {
-    let MaterializationContext { resolver, state, event_tx, shared_refresh } = context;
+    let MaterializationContext { resolver, state, event_sink, shared_refresh } = context;
     let mut window = tokio::select! {
         _ = cancel.cancelled() => return,
-        window = load_window(&query, generation, resolver.as_ref(), &shared_refresh, &state, &event_tx) => window,
+        window = load_window(&query, generation, resolver.as_ref(), &shared_refresh, &state, &event_sink) => window,
     };
     let mut refresh = tokio::time::interval_at(tokio::time::Instant::now() + REFRESH_INTERVAL, REFRESH_INTERVAL);
     loop {
@@ -571,17 +574,17 @@ async fn run_materialization(
                 Some(MaterializationIntent::FetchMore) => {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
-                        _ = fetch_more(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_tx) => {}
+                        _ = fetch_more(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_sink) => {}
                     }
                 }
                 Some(MaterializationIntent::Refilter) => {
-                    publish_loaded_window(&query, generation, window.rows(), window.has_more(), window.conditions.clone(), &state, &event_tx).await;
+                    publish_loaded_window(&query, generation, window.rows(), window.has_more(), window.conditions.clone(), &state, &event_sink).await;
                 }
                 #[cfg(test)]
                 Some(MaterializationIntent::Refresh) => {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
-                        _ = refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_tx) => {}
+                        _ = refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_sink) => {}
                     }
                 }
                 None => return,
@@ -589,12 +592,12 @@ async fn run_materialization(
             _ = refresh.tick(), if suspended.is_none_or(|deadline| deadline <= tokio::time::Instant::now()) => {
                 tokio::select! {
                     _ = cancel.cancelled() => return,
-                    _ = refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_tx) => {}
+                    _ = refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_sink) => {}
                 }
             },
             _ = tokio::time::sleep_until(suspended.unwrap_or_else(tokio::time::Instant::now)), if suspended.is_some() => {
                 window.suspended_until = None;
-                refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_tx).await;
+                refresh_window(&query, generation, resolver.as_ref(), &shared_refresh, &mut window, &state, &event_sink).await;
             },
         }
     }
@@ -606,7 +609,7 @@ async fn load_window(
     resolver: &dyn IssueMaterializationResolver,
     shared_refresh: &SharedIssueRefresh,
     state: &AggregatorProjectionState,
-    event_tx: &broadcast::Sender<DaemonEvent>,
+    event_sink: &Arc<dyn EventSink>,
 ) -> MaterializedWindow {
     let QueryId::Issues { scope, search, label } = query else { unreachable!("issue materializer only accepts issue queries") };
     let base_params = IssueQuery { search: search.clone(), label: label.clone(), match_fields: Default::default() };
@@ -615,13 +618,13 @@ async fn load_window(
         Ok(_) => {
             shared_refresh.unregister(query);
             let conditions = vec![unavailable(None, "query scope has no issue source")];
-            publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_tx).await;
+            publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_sink).await;
             return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions, suspended_until: None };
         }
         Err(message) => {
             shared_refresh.unregister(query);
             let conditions = vec![unavailable(None, message)];
-            publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_tx).await;
+            publish_window(query, generation, Vec::new(), false, conditions.clone(), state, event_sink).await;
             return MaterializedWindow { sources: Vec::new(), needs_full_reload: true, conditions, suspended_until: None };
         }
     };
@@ -697,7 +700,8 @@ async fn load_window(
     }
     let rows = rows.into_values().collect::<Vec<_>>();
     let needs_full_reload = !conditions.is_empty();
-    publish_loaded_window(query, generation, rows, windows.iter().any(|window| window.has_more), conditions.clone(), state, event_tx).await;
+    publish_loaded_window(query, generation, rows, windows.iter().any(|window| window.has_more), conditions.clone(), state, event_sink)
+        .await;
     MaterializedWindow { sources: windows, needs_full_reload, conditions, suspended_until: suspension }
 }
 
@@ -708,7 +712,7 @@ async fn fetch_more(
     shared_refresh: &SharedIssueRefresh,
     window: &mut MaterializedWindow,
     state: &AggregatorProjectionState,
-    event_tx: &broadcast::Sender<DaemonEvent>,
+    event_sink: &Arc<dyn EventSink>,
 ) {
     let requests = window
         .sources
@@ -760,8 +764,8 @@ async fn fetch_more(
     // Metadata-only deltas are significant: an empty final page must still
     // clear `has_more` for clients.
     if let Some(delta) = state.apply_issue_changes(query, generation, changed, Vec::new(), result_state) {
-        let _ = event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
-        publish_awareness_sets(state, event_tx).await;
+        event_sink.emit(DaemonEvent::ResultDelta(Box::new(delta)));
+        publish_awareness_sets(state, event_sink).await;
     }
 }
 
@@ -772,7 +776,7 @@ async fn refresh_window(
     shared_refresh: &SharedIssueRefresh,
     window: &mut MaterializedWindow,
     state: &AggregatorProjectionState,
-    event_tx: &broadcast::Sender<DaemonEvent>,
+    event_sink: &Arc<dyn EventSink>,
 ) {
     if window.suspended_until.is_some_and(|deadline| deadline > tokio::time::Instant::now()) {
         return;
@@ -782,11 +786,11 @@ async fn refresh_window(
     {
         // Provider-specific fields are not all present in normalized Issues,
         // so changed-since results cannot be safely filtered client-side.
-        *window = load_window(query, generation, resolver, shared_refresh, state, event_tx).await;
+        *window = load_window(query, generation, resolver, shared_refresh, state, event_sink).await;
         return;
     }
     if window.sources.is_empty() || window.needs_full_reload {
-        *window = load_window(query, generation, resolver, shared_refresh, state, event_tx).await;
+        *window = load_window(query, generation, resolver, shared_refresh, state, event_sink).await;
         return;
     }
 
@@ -868,7 +872,7 @@ async fn refresh_window(
         }
     }
     if overflowed || boundary_invalidated {
-        *window = load_window(query, generation, resolver, shared_refresh, state, event_tx).await;
+        *window = load_window(query, generation, resolver, shared_refresh, state, event_sink).await;
         return;
     }
 
@@ -880,8 +884,8 @@ async fn refresh_window(
     window.conditions = conditions.clone();
     let result_state = demand_state(window.sources.iter().any(|source| source.has_more), conditions);
     if let Some(delta) = state.apply_issue_changes(query, generation, changed, removed, result_state) {
-        let _ = event_tx.send(DaemonEvent::ResultDelta(Box::new(delta)));
-        publish_awareness_sets(state, event_tx).await;
+        event_sink.emit(DaemonEvent::ResultDelta(Box::new(delta)));
+        publish_awareness_sets(state, event_sink).await;
     }
 }
 
@@ -892,11 +896,11 @@ async fn publish_window(
     has_more: bool,
     conditions: Vec<ResultSetCondition>,
     state: &AggregatorProjectionState,
-    event_tx: &broadcast::Sender<DaemonEvent>,
+    event_sink: &Arc<dyn EventSink>,
 ) {
     if let Some(result_set) = state.replace_issues(query, generation, rows, demand_state(has_more, conditions)) {
-        let _ = event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
-        publish_awareness_sets(state, event_tx).await;
+        event_sink.emit(DaemonEvent::ResultSet(Box::new(result_set)));
+        publish_awareness_sets(state, event_sink).await;
     }
 }
 
@@ -907,20 +911,20 @@ async fn publish_loaded_window(
     has_more: bool,
     conditions: Vec<ResultSetCondition>,
     state: &AggregatorProjectionState,
-    event_tx: &broadcast::Sender<DaemonEvent>,
+    event_sink: &Arc<dyn EventSink>,
 ) {
     suppress_represented_rows(&mut rows, state).await;
     sort_rows(&mut rows);
-    publish_window(query, generation, rows, has_more, conditions, state, event_tx).await;
+    publish_window(query, generation, rows, has_more, conditions, state, event_sink).await;
 }
 
-async fn publish_awareness_sets(state: &AggregatorProjectionState, event_tx: &broadcast::Sender<DaemonEvent>) {
+async fn publish_awareness_sets(state: &AggregatorProjectionState, event_sink: &Arc<dyn EventSink>) {
     for query in state.subscribed_queries() {
         if !matches!(query, QueryId::Awareness { .. }) {
             continue;
         }
         if let Some(result_set) = state.result_set_for(&query).await {
-            let _ = event_tx.send(DaemonEvent::ResultSet(Box::new(result_set)));
+            event_sink.emit(DaemonEvent::ResultSet(Box::new(result_set)));
         }
     }
 }
@@ -956,8 +960,9 @@ mod tests {
     use std::{collections::VecDeque, path::Path, sync::Mutex as StdMutex};
 
     use chrono::{Duration as ChronoDuration, Utc};
-    use flotilla_core::providers::{
-        github_api::GhApiClient, issue_tracker::github::GitHubIssueProvider, ChannelLabel, CommandOutput, CommandRunner,
+    use flotilla_core::{
+        event_sink::BroadcastEventSink,
+        providers::{github_api::GhApiClient, issue_tracker::github::GitHubIssueProvider, ChannelLabel, CommandOutput, CommandRunner},
     };
     use flotilla_protocol::{
         issue_query::{IssueResultPage, READY_ISSUE_LABEL},
@@ -1326,7 +1331,7 @@ mod tests {
         let generation = subscribe(state, query);
         let resolver = Arc::new(FixedResolver { sources, provider });
         let (event_tx, event_rx) = broadcast::channel(8);
-        let mut materializer = IssueMaterializer::new(state.clone(), resolver, event_tx);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver, Arc::new(BroadcastEventSink::new(event_tx)));
         materializer.reconcile(HashMap::from([(query.clone(), generation)]));
         (materializer, event_rx)
     }
@@ -1364,7 +1369,7 @@ mod tests {
             provider: provider.clone(),
         });
         let (event_tx, mut events) = broadcast::channel(16);
-        let mut materializer = IssueMaterializer::new(state.clone(), resolver, event_tx);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver, Arc::new(BroadcastEventSink::new(event_tx)));
         let first_generation = subscribe(&state, &first);
         materializer.reconcile(HashMap::from([(first.clone(), first_generation)]));
         next_event(&mut events).await;
@@ -1412,7 +1417,7 @@ mod tests {
                 provider: provider.clone(),
             });
             let (event_tx, mut events) = broadcast::channel(16);
-            let mut materializer = IssueMaterializer::new(state.clone(), resolver, event_tx);
+            let mut materializer = IssueMaterializer::new(state.clone(), resolver, Arc::new(BroadcastEventSink::new(event_tx)));
             let first_generation = subscribe(&state, &first);
             materializer.reconcile(HashMap::from([(first.clone(), first_generation)]));
             next_event(&mut events).await;
@@ -1445,7 +1450,7 @@ mod tests {
             provider: StdMutex::new(old.clone()),
         });
         let (event_tx, mut events) = broadcast::channel(16);
-        let mut materializer = IssueMaterializer::new(state.clone(), resolver.clone(), event_tx);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver.clone(), Arc::new(BroadcastEventSink::new(event_tx)));
         let first_generation = subscribe(&state, &first);
         materializer.reconcile(HashMap::from([(first.clone(), first_generation)]));
         next_event(&mut events).await;
@@ -1481,7 +1486,7 @@ mod tests {
             provider: StdMutex::new(old.clone()),
         });
         let (event_tx, mut events) = broadcast::channel(16);
-        let mut materializer = IssueMaterializer::new(state.clone(), resolver.clone(), event_tx);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver.clone(), Arc::new(BroadcastEventSink::new(event_tx)));
         let generation = subscribe(&state, &query);
         materializer.reconcile(HashMap::from([(query.clone(), generation)]));
         next_event(&mut events).await;
@@ -1511,7 +1516,7 @@ mod tests {
             provider: provider.clone(),
         });
         let (event_tx, mut events) = broadcast::channel(16);
-        let mut materializer = IssueMaterializer::new(state.clone(), resolver, event_tx);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver, Arc::new(BroadcastEventSink::new(event_tx)));
         let first_generation = subscribe(&state, &first);
         let second_generation = subscribe(&state, &second);
         materializer.reconcile(HashMap::from([(first.clone(), first_generation), (second.clone(), second_generation)]));
@@ -1549,7 +1554,11 @@ mod tests {
         let query = QueryId::Issues { scope, search: None, label: Some(READY_ISSUE_LABEL.into()) };
         let provider = Arc::new(ActivityProvider::default());
         let (event_tx, mut events) = broadcast::channel(32);
-        let mut materializer = IssueMaterializer::new(state.clone(), Arc::new(ActivityResolver(provider.clone())), event_tx);
+        let mut materializer = IssueMaterializer::new(
+            state.clone(),
+            Arc::new(ActivityResolver(provider.clone())),
+            Arc::new(BroadcastEventSink::new(event_tx)),
+        );
         materializer.reconcile(state.subscribe_demand().borrow().clone());
         next_issue_event(&mut events, &query).await;
         tokio::time::advance(REFRESH_INTERVAL).await;
@@ -1576,7 +1585,11 @@ mod tests {
         let query = QueryId::Issues { scope, search: None, label: Some(READY_ISSUE_LABEL.into()) };
         let provider = Arc::new(ActivityProvider::default());
         let (event_tx, mut events) = broadcast::channel(32);
-        let mut materializer = IssueMaterializer::new(state.clone(), Arc::new(ActivityResolver(provider.clone())), event_tx);
+        let mut materializer = IssueMaterializer::new(
+            state.clone(),
+            Arc::new(ActivityResolver(provider.clone())),
+            Arc::new(BroadcastEventSink::new(event_tx)),
+        );
         materializer.reconcile(state.subscribe_demand().borrow().clone());
         next_issue_event(&mut events, &query).await;
         for _ in 0..23 {
@@ -1615,7 +1628,11 @@ mod tests {
         let quiet = project_query("quiet");
         let provider = Arc::new(ActivityProvider::default());
         let (event_tx, mut events) = broadcast::channel(32);
-        let mut materializer = IssueMaterializer::new(state.clone(), Arc::new(ActivityResolver(provider.clone())), event_tx);
+        let mut materializer = IssueMaterializer::new(
+            state.clone(),
+            Arc::new(ActivityResolver(provider.clone())),
+            Arc::new(BroadcastEventSink::new(event_tx)),
+        );
         let demand = [&busy, &alias, &quiet].into_iter().map(|query| (query.clone(), subscribe(&state, query))).collect();
         materializer.reconcile(demand);
         for _ in 0..3 {
@@ -1651,7 +1668,7 @@ mod tests {
         }]));
         let resolver = Arc::new(FixedResolver { sources: vec![source], provider: provider.clone() });
         let (event_tx, mut events) = broadcast::channel(8);
-        let mut materializer = IssueMaterializer::new(state.clone(), resolver, event_tx);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver, Arc::new(BroadcastEventSink::new(event_tx)));
         let first_generation = subscribe(&state, &first);
         let second_generation = subscribe(&state, &second);
         materializer.reconcile(HashMap::from([(first.clone(), first_generation), (second.clone(), second_generation)]));
@@ -1686,7 +1703,7 @@ mod tests {
         ));
         let resolver = Arc::new(FixedResolver { sources: vec![source], provider });
         let (event_tx, mut events) = broadcast::channel(8);
-        let mut materializer = IssueMaterializer::new(state.clone(), resolver, event_tx);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver, Arc::new(BroadcastEventSink::new(event_tx)));
         let first_generation = subscribe(&state, &first);
         materializer.reconcile(HashMap::from([(first.clone(), first_generation)]));
         next_event(&mut events).await;
@@ -1720,7 +1737,7 @@ mod tests {
         ));
         let resolver = Arc::new(FixedResolver { sources: vec![source], provider: provider.clone() });
         let (event_tx, mut events) = broadcast::channel(8);
-        let mut materializer = IssueMaterializer::new(state.clone(), resolver, event_tx);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver, Arc::new(BroadcastEventSink::new(event_tx)));
         let first_generation = subscribe(&state, &first);
         materializer.reconcile(HashMap::from([(first.clone(), first_generation)]));
         next_event(&mut events).await;
@@ -2132,7 +2149,7 @@ mod tests {
             Arc::new(BlockingProvider { slow_started: Notify::new(), release_slow: Notify::new(), slow_cancelled: Notify::new() });
         let resolver = Arc::new(ScopeResolver { provider: provider.clone() });
         let (event_tx, mut events) = broadcast::channel(8);
-        let mut materializer = IssueMaterializer::new(state.clone(), resolver, event_tx);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver, Arc::new(BroadcastEventSink::new(event_tx)));
         materializer.reconcile(HashMap::from([(slow.clone(), slow_generation)]));
         tokio::time::timeout(Duration::from_secs(1), provider.slow_started.notified()).await.expect("slow provider started");
 
@@ -2154,7 +2171,7 @@ mod tests {
             Arc::new(BlockingProvider { slow_started: Notify::new(), release_slow: Notify::new(), slow_cancelled: Notify::new() });
         let resolver = Arc::new(ScopeResolver { provider: provider.clone() });
         let (event_tx, _events) = broadcast::channel(8);
-        let mut materializer = IssueMaterializer::new(state, resolver, event_tx);
+        let mut materializer = IssueMaterializer::new(state, resolver, Arc::new(BroadcastEventSink::new(event_tx)));
         materializer.reconcile(HashMap::from([(query.clone(), 1)]));
         tokio::time::timeout(Duration::from_secs(1), provider.slow_started.notified()).await.expect("generation one started");
 
@@ -2178,7 +2195,7 @@ mod tests {
         ));
         let resolver = Arc::new(FixedResolver { sources: vec![source], provider: provider.clone() });
         let (event_tx, mut events) = broadcast::channel(8);
-        let mut materializer = IssueMaterializer::new(state.clone(), resolver, event_tx);
+        let mut materializer = IssueMaterializer::new(state.clone(), resolver, Arc::new(BroadcastEventSink::new(event_tx)));
         state.replace_subscriber(subscriber, &[QueryCursor { query: query.clone(), since: None }]);
         let old_generation = generation(&state, &query);
         materializer.reconcile(HashMap::from([(query.clone(), old_generation)]));

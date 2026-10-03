@@ -190,12 +190,12 @@ impl InProcessDaemon {
         let identity = repository_event_identity(&repository.spec, None);
         let lease = self.repository_providers(&repository).await?;
         let action = command.action.clone();
-        let event_tx = self.event_tx.clone();
+        let event_sink = self.event_sink.clone();
         let node_id = self.node_id.clone();
         let active_commands = Arc::clone(&self.active_commands);
         let cancel = CancellationToken::new();
         active_commands.lock().await.insert(command_id, cancel.clone());
-        let _ = event_tx.send(DaemonEvent::CommandStarted {
+        event_sink.emit(DaemonEvent::CommandStarted {
             command_id,
             node_id: node_id.clone(),
             repo_identity: identity.clone(),
@@ -235,7 +235,7 @@ impl InProcessDaemon {
                 _ = cancel.cancelled() => CommandValue::Cancelled,
             };
             active_commands.lock().await.remove(&command_id);
-            let _ = event_tx.send(DaemonEvent::CommandFinished { command_id, node_id, repo_identity: identity, repo: None, result });
+            event_sink.emit(DaemonEvent::CommandFinished { command_id, node_id, repo_identity: identity, repo: None, result });
         });
         Ok(command_id)
     }

@@ -12,6 +12,7 @@ use super::{
 use crate::{
     attachable::{AttachableStore, BindingObjectKind, ProviderBinding, SharedAttachableStore},
     environment_manager::EnvironmentManager,
+    event_sink::RecordingEventSink,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     provider_data::ProviderData,
     providers::{
@@ -2193,7 +2194,6 @@ async fn run_build_plan_to_completion_with(
     config_base: DaemonHostPath,
     attachable_store: SharedAttachableStore,
 ) -> CommandValue {
-    use tokio::sync::broadcast;
     use tokio_util::sync::CancellationToken;
 
     use crate::step::run_step_plan;
@@ -2220,7 +2220,7 @@ async fn run_build_plan_to_completion_with(
     match plan {
         Err(refusal) => refusal.into_command_value(),
         Ok(step_plan) => {
-            let (cancel, tx) = (CancellationToken::new(), broadcast::channel(64).0);
+            let (cancel, tx) = (CancellationToken::new(), Arc::new(RecordingEventSink::default()));
             let resolver = ExecutorStepResolver {
                 repo,
                 registry,
@@ -2235,7 +2235,7 @@ async fn run_build_plan_to_completion_with(
                 local_host: local_host.clone(),
                 environment_manager: empty_environment_manager().await,
             };
-            run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, Arc::new(tx), &resolver).await
+            run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, tx, &resolver).await
         }
     }
 }
@@ -2577,7 +2577,6 @@ async fn build_plan_create_workspace_for_checkout_uses_remote_prepare_and_local_
 
 #[tokio::test]
 async fn checkout_plan_end_to_end_creates_workspace() {
-    use tokio::sync::broadcast;
     use tokio_util::sync::CancellationToken;
 
     use crate::step::run_step_plan;
@@ -2609,7 +2608,7 @@ async fn checkout_plan_end_to_end_creates_workspace() {
     )
     .await;
 
-    let (cancel, tx) = (CancellationToken::new(), broadcast::channel(64).0);
+    let (cancel, tx) = (CancellationToken::new(), Arc::new(RecordingEventSink::default()));
     let resolver = ExecutorStepResolver {
         repo,
         registry,
@@ -2626,7 +2625,7 @@ async fn checkout_plan_end_to_end_creates_workspace() {
     };
 
     let result = match plan {
-        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, Arc::new(tx), &resolver).await,
+        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, tx, &resolver).await,
         _ => panic!("expected steps"),
     };
 
@@ -2654,7 +2653,6 @@ async fn checkout_plan_end_to_end_creates_workspace() {
 
 #[tokio::test]
 async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
-    use tokio::sync::broadcast;
     use tokio_util::sync::CancellationToken;
 
     use crate::step::run_step_plan;
@@ -2688,7 +2686,7 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
     )
     .await;
 
-    let (cancel, tx) = (CancellationToken::new(), broadcast::channel(64).0);
+    let (cancel, tx) = (CancellationToken::new(), Arc::new(RecordingEventSink::default()));
     let resolver = ExecutorStepResolver {
         repo,
         registry,
@@ -2705,7 +2703,7 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
     };
 
     let result = match plan {
-        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, Arc::new(tx), &resolver).await,
+        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, tx, &resolver).await,
         _ => panic!("expected steps"),
     };
 
@@ -2722,7 +2720,6 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
 
 #[tokio::test]
 async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
-    use tokio::sync::broadcast;
     use tokio_util::sync::CancellationToken;
 
     use crate::step::run_step_plan;
@@ -2753,7 +2750,7 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
     )
     .await;
 
-    let (cancel, tx) = (CancellationToken::new(), broadcast::channel(64).0);
+    let (cancel, tx) = (CancellationToken::new(), Arc::new(RecordingEventSink::default()));
     let resolver = ExecutorStepResolver {
         repo,
         registry,
@@ -2770,7 +2767,7 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
     };
 
     let result = match plan {
-        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, Arc::new(tx), &resolver).await,
+        Ok(step_plan) => run_step_plan(step_plan, 1, local_node_id(), repo_identity(), repo_root(), cancel, tx, &resolver).await,
         _ => panic!("expected steps"),
     };
 

@@ -28,6 +28,7 @@ use flotilla_core::{
         inspect_convoy_checkout_integration, LANDING_EVIDENCE_TTL,
     },
     config::{ConfigStore, DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY},
+    daemon::DaemonHandle,
     demand_lifecycle::DemandLifecycle,
     in_process::{InProcessDaemon, OperatorReconciler, StandingConvoyBackingInspector, WorkCredentialReconciler},
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
@@ -4207,7 +4208,7 @@ fn spawn_aggregator_task(
             let state = state.clone();
             let issue_polling = issue_polling.clone();
             async move {
-                let aggregator = Aggregator::new(state, daemon.host_name().clone(), daemon.event_sender())
+                let aggregator = Aggregator::with_events(state, daemon.host_name().clone(), daemon.event_sink(), daemon.subscribe())
                     .with_attach_resolver(Arc::clone(&daemon))
                     .with_change_request_resolver(Arc::clone(&daemon))
                     .with_issue_resolver(Arc::clone(&daemon))
