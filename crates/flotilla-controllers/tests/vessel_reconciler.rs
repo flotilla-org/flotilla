@@ -1483,9 +1483,20 @@ fn assert_contained_tracking(env: &BTreeMap<String, String>) {
     use std::{
         fs,
         os::unix::fs::{MetadataExt, PermissionsExt},
-        path::Path,
+        path::{Path, PathBuf},
         process::Command,
     };
+
+    // Restore permissions before TempDir drops, including when an assertion panics.
+    struct RestoreDirectories(Vec<(PathBuf, fs::Permissions)>);
+    impl Drop for RestoreDirectories {
+        fn drop(&mut self) {
+            for (path, permissions) in &self.0 {
+                // Cleanup must preserve the original assertion failure.
+                let _ = fs::set_permissions(path, permissions.clone());
+            }
+        }
+    }
 
     // Real Git is required here: tracking writes and lock/rename are the process boundary behind #2516.
     let temp = tempfile::tempdir().expect("Git fixture");
@@ -1523,6 +1534,15 @@ fn assert_contained_tracking(env: &BTreeMap<String, String>) {
     let hook = hooks.join("protected");
     fs::write(&hook, "host hook").expect("host hook");
     let original_config = fs::read(&config).expect("shared config");
+    let _restore_directories = RestoreDirectories(
+        [clone.join(".git"), hooks.clone()]
+            .into_iter()
+            .map(|path| {
+                let permissions = fs::metadata(&path).expect("original directory permissions").permissions();
+                (path, permissions)
+            })
+            .collect(),
+    );
     // Directory permissions model the mount's lock/rename refusal; the existing
     // reconciliation assertion separately verifies the actual read-only overlays.
     for path in [&config, &hook] {
@@ -1554,9 +1574,6 @@ fn assert_contained_tracking(env: &BTreeMap<String, String>) {
     assert_eq!(git(&work, &["rev-parse", "HEAD"], true), git(&peer, &["rev-parse", "HEAD"], false));
     assert_eq!(fs::read(&config).expect("read protected config"), original_config);
     assert_eq!(fs::read_to_string(&hook).expect("read protected hook"), "host hook");
-    for path in [clone.join(".git"), hooks] {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("restore directories");
-    }
 }
 
 #[tokio::test]
