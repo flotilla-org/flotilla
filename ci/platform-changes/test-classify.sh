@@ -41,6 +41,16 @@ check "macOS target_os runs macOS" pull_request false "crates/flotilla-core/src/
 check "diff header alone is not content" pull_request false "crates/flotilla-core/src/cfg_unix.rs" \
   $'--- a/crates/flotilla-core/src/cfg(unix).rs\n+++ b/crates/flotilla-core/src/cfg(unix).rs\n+fn x() {}\n' "windows=false macos=false "
 
+check "unknown event runs both" workflow_dispatch false "" "" "windows=true macos=true "
+check "manifest sink runs Windows" pull_request false "crates/flotilla-manifest/src/sink.rs" "" "windows=true macos=false "
+check "crate manifest runs both" pull_request false "crates/flotilla-core/Cargo.toml" "" "windows=true macos=true "
+check "core libc call runs Windows" pull_request false "crates/flotilla-core/src/x.rs" \
+  $'+    let pid = unsafe { libc::getpid() };\n' "windows=true macos=false "
+check "core UnixStream runs Windows" pull_request false "crates/flotilla-core/src/x.rs" \
+  $'+use tokio::net::UnixStream;\n' "windows=true macos=false "
+check "caller path plus macOS content runs macOS" pull_request false "crates/flotilla-daemon/src/server/caller.rs" \
+  $'+#[cfg(target_vendor = "apple")]\n' "windows=true macos=true "
+
 if ((failures > 0)); then
   echo "$failures platform-changes classification test(s) failed" >&2
   exit 1

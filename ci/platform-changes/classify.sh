@@ -8,8 +8,8 @@
 #   diff           file holding the unified diff of those changes
 #
 # Prints `windows=<true|false>` and `macos=<true|false>`, suitable for
-# appending to $GITHUB_OUTPUT. Pushes to main and ci:full run both jobs; other
-# events run a job only when its inputs changed.
+# appending to $GITHUB_OUTPUT. Pull requests and merge groups run a job only
+# when its inputs changed; every other event, and ci:full, runs both.
 set -euo pipefail
 
 event=$1
@@ -17,20 +17,24 @@ full_label=$2
 changed_files=$3
 diff=$4
 
-if [[ "$event" == "push" || "$full_label" == "true" ]]; then
+# Only pull requests and merge groups carry a diff base; every other event
+# (push to main, workflow_dispatch, schedule, ...) runs both jobs.
+if [[ ( "$event" != "pull_request" && "$event" != "merge_group" ) || "$full_label" == "true" ]]; then
   echo "windows=true"
   echo "macos=true"
   exit 0
 fi
 
 # Shared inputs: the toolchain, the lockfile, the workflow and this classifier.
-shared='^(Cargo\.(toml|lock)|rust-toolchain\.toml|\.github/workflows/ci\.yml|ci/platform-changes/)'
+# Crate manifests count too: a new unix-only dependency breaks Windows without
+# touching any Rust source.
+shared='^(Cargo\.(toml|lock)|crates/[^/]+/Cargo\.toml|rust-toolchain\.toml|\.github/workflows/ci\.yml|ci/platform-changes/)'
 
 # The Windows client job builds `flotilla` and tests its client, transport and
 # Wheelhouse sink. Its platform seams live in these paths; elsewhere, a change
 # reaches Windows only through platform-conditional code, matched in the diff.
 windows_paths="${shared}|^(src/|crates/flotilla-client/|crates/flotilla-transport/|crates/flotilla-manifest/src/sink|crates/flotilla-tui/src/(terminal|run|cli))"
-windows_content='^[+-].*(cfg\(.*(windows|unix|target_os|target_family)|std::os::(unix|windows))'
+windows_content='^[+-].*(cfg\(.*(windows|unix|target_os|target_family|target_vendor)|std::os::(unix|windows)|libc::|nix::|Unix(Stream|Listener|Datagram)|::unix::|pre_exec|setsid)'
 
 # The macOS job runs the daemon's peer-identity tests (server::caller).
 macos_paths="${shared}|^(crates/flotilla-daemon/src/server/caller|crates/flotilla-transport/)"
