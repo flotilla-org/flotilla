@@ -89,6 +89,7 @@ struct MutableRemoteHostDetector {
 }
 
 struct TestRepositoryInspector {
+    host_ref: String,
     repository: Arc<std::sync::RwLock<String>>,
     fixed_repository_by_path: HashMap<PathBuf, String>,
     continuity: bool,
@@ -109,7 +110,7 @@ impl RepositoryInspector for TestRepositoryInspector {
             spec: RepositorySpec::remote(format!("https://github.com/owner/{repository}"))?,
             checkout: LocalCheckoutInspection {
                 path: path.to_path_buf(),
-                host_ref: "host-test".to_string(),
+                host_ref: self.host_ref.clone(),
                 git_ref: "main".to_string(),
                 is_main: true,
             },
@@ -130,6 +131,7 @@ impl RepositoryInspector for TestRepositoryInspector {
 async fn install_test_repository_inspector(daemon: &InProcessDaemon, repository: Arc<std::sync::RwLock<String>>) {
     daemon
         .set_repository_inspector(Arc::new(TestRepositoryInspector {
+            host_ref: daemon.local_host_id().expect("local Host").to_string(),
             repository,
             fixed_repository_by_path: HashMap::new(),
             continuity: true,
@@ -2236,6 +2238,7 @@ async fn fork_stance_refuses_change_request_merge_without_calling_provider() {
         FakeDiscoveryProviders::new().with_change_request(provider.clone() as Arc<dyn ChangeRequestTracker>),
     );
     let (_temp, repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    daemon.add_repo(&repo).await.expect("adopt test checkout into resources");
     daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("reconcile repository identity");
     let repository_key = daemon.repository_key_for_path(&repo).await.expect("tracked repository key");
     let repositories = daemon.resource_backend().using::<Repository>("flotilla");
@@ -5380,6 +5383,8 @@ async fn daemon_for_fake_repo() -> (tempfile::TempDir, PathBuf, Arc<InProcessDae
 
     let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::local()).await;
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".into()))).await;
+    daemon.add_repo(&repo).await.expect("adopt test checkout into resources");
     let identity = daemon.tracked_repo_identity_for_path(&repo).await.expect("identity");
     (temp, repo, daemon, identity)
 }
@@ -5414,6 +5419,7 @@ async fn strict_refresh_surfaces_repository_inspection_failures() {
     let (_temp, repo, daemon, _identity) = daemon_for_fake_repo().await;
     daemon
         .set_repository_inspector(Arc::new(TestRepositoryInspector {
+            host_ref: daemon.local_host_id().expect("local Host").to_string(),
             repository: Arc::new(std::sync::RwLock::new("repo".to_string())),
             fixed_repository_by_path: HashMap::new(),
             continuity: true,
@@ -6509,6 +6515,7 @@ async fn associated_path_replaced_by_unrelated_repository_mints_new_identity() {
     let daemon = InProcessDaemon::new(Vec::new(), test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
     daemon
         .set_repository_inspector(Arc::new(TestRepositoryInspector {
+            host_ref: daemon.local_host_id().expect("local Host").to_string(),
             repository: Arc::clone(&remote),
             fixed_repository_by_path: HashMap::new(),
             continuity: false,
@@ -6869,7 +6876,7 @@ async fn refresh_unobserved_checkout_refuses_without_started_event() {
         .execute(Command::builder().action(CommandAction::Refresh { repo: Some(RepoSelector::Path(repo.clone())) }).build())
         .await
         .expect_err("untracked repo should fail");
-    assert!(err.contains("no observed checkout at"));
+    assert!(err.contains("no Repository matches"));
 
     let started = tokio::time::timeout(std::time::Duration::from_millis(200), async {
         loop {
@@ -6921,6 +6928,17 @@ async fn refresh_all_command_refreshes_every_tracked_repo() {
 
     let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo_a.clone(), repo_b.clone()], config, fake_discovery(false), HostName::local()).await;
+    daemon
+        .set_repository_inspector(Arc::new(TestRepositoryInspector {
+            host_ref: daemon.local_host_id().expect("local Host").to_string(),
+            repository: Arc::new(std::sync::RwLock::new("repo".into())),
+            fixed_repository_by_path: HashMap::from([(repo_a.clone(), "repo-a".into()), (repo_b.clone(), "repo-b".into())]),
+            continuity: true,
+            inspection_failure: None,
+        }))
+        .await;
+    daemon.add_repo(&repo_a).await.expect("adopt first checkout");
+    daemon.add_repo(&repo_b).await.expect("adopt second checkout");
     let mut rx = daemon.subscribe();
 
     let refresh_id = daemon
@@ -7076,11 +7094,11 @@ async fn add_virtual_repo_is_idempotent() {
 async fn get_repo_providers_returns_structured_unmet_requirements_and_discovery() {
     let (_temp, repo, daemon) = daemon_for_plain_dir().await;
 
-    let repo_name = repo.file_name().expect("repo should have a file name").to_str().expect("repo name should be valid UTF-8");
-    let providers =
-        daemon.get_repo_providers_internal(&RepoSelector::Query(repo_name.to_string())).await.expect("get_repo_providers failed");
+    install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".into()))).await;
+    daemon.add_repo(&repo).await.expect("adopt test checkout into resources");
+    let providers = daemon.get_repo_providers_internal(&RepoSelector::Path(repo.clone())).await.expect("get_repo_providers failed");
 
-    assert_eq!(providers.path, repo);
+    assert_eq!(providers.path, Some(repo));
     assert!(
         providers.host_discovery.iter().any(|entry| entry.kind == "binary_available" && entry.detail.get("name") == Some(&"git".into())),
         "should include host discovery assertions"
@@ -7092,10 +7110,9 @@ async fn get_repo_providers_returns_structured_unmet_requirements_and_discovery(
             .any(|req| { req.factory == "github" && req.kind == "missing_binary" && req.value.as_deref() == Some("gh") }),
         "should expose structured valued unmet requirements"
     );
-    assert!(
-        providers.unmet_requirements.iter().any(|req| req.factory == "git-cli" && req.kind == "no_vcs_checkout" && req.value.is_none()),
-        "should expose valueless unmet requirements without forcing a placeholder string"
-    );
+    // The view now discovers checkout capabilities from resource facts rather
+    // than retaining the tracked registry's historical no-checkout refusal.
+    assert!(providers.providers.iter().any(|provider| provider.category == "vcs"));
 }
 
 #[tokio::test]
@@ -8298,4 +8315,243 @@ async fn crew_completion_without_a_decision_ledger_is_refused() {
         .expect("already-admitted completion is idempotent");
     let after_duplicate = convoys.get("missing-ledger").await.expect("read convoy after duplicate").status.expect("status after duplicate");
     assert_eq!(after_duplicate, forced);
+}
+
+async fn run_identity_command(daemon: &InProcessDaemon, action: CommandAction, selector: RepoSelector) -> CommandValue {
+    let mut events = daemon.subscribe();
+    let id = daemon.execute(Command::builder().action(action).context_repo(selector).build()).await.expect("admit identity command");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let DaemonEvent::CommandFinished { command_id, result, .. } = events.recv().await.expect("command event") {
+                if command_id == id {
+                    return result;
+                }
+            }
+        }
+    })
+    .await
+    .expect("identity command finishes")
+}
+
+// #2500: Alias, slug and cwd address the same Repository without any tracked
+// roots. Linking and forge mutations must preserve this across operation sequences.
+#[hegel::test]
+fn repository_operations_without_tracked_roots(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    // Every selector, no-checkout/observed-checkout, duplicate/empty issue lists,
+    // and repeated links or closes are included in the operation space.
+    let checkout = tc.draw(gs::booleans());
+    let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
+    let operations = (0..steps)
+        .map(|_| (tc.draw(gs::integers::<usize>().min_value(0).max_value(2)), tc.draw(gs::integers::<usize>().min_value(0).max_value(4))))
+        .collect::<Vec<_>>();
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let temp = tempfile::tempdir().expect("test config");
+        let provider = Arc::new(FakeChangeRequest::new());
+        provider
+            .add_change_requests(vec![("55".into(), ChangeRequest {
+                title: "Identity".into(),
+                branch: "feature".into(),
+                status: flotilla_protocol::ChangeRequestStatus::Open,
+                body: Some("Existing body".into()),
+                provider_name: "fake".into(),
+                provider_display_name: "Fake".into(),
+            })])
+            .await;
+        let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_change_request(provider.clone()));
+        let daemon = InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), discovery, HostName::local()).await;
+        let spec = RepositorySpec::remote("https://github.com/owner/identity-repo").expect("Repository");
+        let key = spec.key();
+        daemon
+            .resource_backend()
+            .using::<Repository>("flotilla")
+            .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
+            .await
+            .expect("declare Repository");
+        daemon
+            .resource_backend()
+            .using::<Project>("flotilla")
+            .create(
+                &InputMeta::builder().name("identity-project".into()).build(),
+                &ProjectSpec::builder()
+                    .display_name("Identity".into())
+                    .default_workflow_ref("workflow".into())
+                    .repositories(vec![ProjectRepositorySpec::builder().repo(key.clone()).alias("app".into()).build()])
+                    .build(),
+            )
+            .await
+            .expect("declare alias");
+        let path = temp.path().join("checkout");
+        if checkout {
+            daemon
+                .observed_resource_backend()
+                .using::<ResourceCheckout>("flotilla")
+                .create(
+                    &InputMeta::builder().name("identity-checkout".into()).build(),
+                    &ResourceCheckoutSpec::Observed(ObservedCheckoutSpec {
+                        repo_ref: key.clone(),
+                        host_ref: daemon.local_host_id().expect("Host").to_string(),
+                        path: path.to_string_lossy().into_owned(),
+                        r#ref: "main".into(),
+                        is_main: true,
+                    }),
+                )
+                .await
+                .expect("checkout fact");
+            install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("identity-repo".into()))).await;
+        }
+        let mut linked = false;
+        for (selector, operation) in operations {
+            let selector = match selector {
+                0 => RepoSelector::Query("app".into()),
+                1 => RepoSelector::Query("owner/identity-repo".into()),
+                _ if checkout => RepoSelector::Path(path.join("src")),
+                _ => RepoSelector::Repository(key.clone()),
+            };
+            let response = daemon.get_repo_providers_internal(&selector).await.expect("identity provider view");
+            assert_eq!(response.repository, key);
+            assert_eq!(response.path, checkout.then(|| path.clone()));
+            assert!(response.providers.iter().any(|provider| provider.category == ProviderCategory::ChangeRequest.slug()));
+            let action = match operation {
+                0 => CommandAction::LinkIssuesToChangeRequest { change_request_id: "55".into(), issue_ids: vec!["10".into(), "10".into()] },
+                1 => CommandAction::LinkIssuesToChangeRequest { change_request_id: "55".into(), issue_ids: vec![] },
+                2 => CommandAction::CloseChangeRequest { id: "55".into() },
+                3 => CommandAction::Refresh { repo: Some(selector.clone()) },
+                _ => CommandAction::Refresh { repo: None },
+            };
+            let result = run_identity_command(&daemon, action, selector).await;
+            assert!(matches!(result, CommandValue::Ok | CommandValue::Refreshed { .. }), "{result:?}");
+            if let CommandValue::Refreshed { repository_count, .. } = result {
+                assert_eq!(repository_count, 1);
+            }
+            linked |= operation == 0;
+            let (_, request) = provider.get_change_request("55").await.expect("request");
+            assert_eq!(request.body.as_deref(), Some(if linked { "Existing body\n\nFixes #10" } else { "Existing body" }));
+            assert!(daemon.tracked_repo_paths().await.is_empty());
+        }
+    });
+}
+
+// #2500: GitHub provider execution must select the declared Forge and Repository,
+// even when its resolved transport names a Forge alias and no checkout exists.
+#[tokio::test]
+async fn repository_github_execution_uses_forge_identity_without_checkout() {
+    use flotilla_resources::{Forge, ForgeKind, ForgeSpec};
+    // Boundary double: exact gh subprocess arguments and response headers.
+    let runner = Arc::new(
+        DiscoveryMockRunner::builder()
+            .on_run(
+                "gh",
+                &["api", "--include", "repos/team/widget/pulls/55"],
+                Ok(format!(
+                    "HTTP/2.0 200 OK\n\n{}",
+                    serde_json::json!({"number": 55, "title": "PR", "head": {"ref": "feature"}, "body": "Notes"})
+                )),
+            )
+            .on_run("gh", &["pr", "edit", "55", "--repo", "team/widget", "--body", "Notes\n\nFixes #10"], Ok(String::new()))
+            .on_run("gh", &["pr", "close", "55", "--repo", "team/widget"], Ok(String::new()))
+            .build(),
+    );
+    let temp = tempfile::tempdir().expect("config");
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery_with_runner(false, runner.clone()),
+        HostName::local(),
+    )
+    .await;
+    daemon
+        .replace_local_environment_bag_for_test(
+            EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/bin/gh")).with(EnvironmentAssertion::remote_host(
+                "github.com",
+                "wrong",
+                "target",
+                "origin",
+            )),
+        )
+        .expect("gh capability");
+    let forge = ForgeSpec::builder()
+        .forge_id("github".into())
+        .kind(ForgeKind::Github)
+        .hosts(BTreeSet::from(["github-alias".into(), "github.com".into()]))
+        .https_url("https://github.com".into())
+        .git_ssh_host("github-alias".into())
+        .build();
+    daemon
+        .resource_backend()
+        .using::<Forge>("flotilla")
+        .create(&InputMeta::builder().name("github".into()).build(), &forge)
+        .await
+        .expect("Forge");
+    let spec = RepositorySpec::remote("https://github-alias/team/widget").expect("remote").on_forge(&forge).expect("Forge identity");
+    let key = spec.key();
+    daemon
+        .resource_backend()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
+        .await
+        .expect("Repository");
+    for action in [
+        CommandAction::LinkIssuesToChangeRequest { change_request_id: "55".into(), issue_ids: vec!["10".into()] },
+        CommandAction::CloseChangeRequest { id: "55".into() },
+    ] {
+        assert_eq!(run_identity_command(&daemon, action, RepoSelector::Repository(key.clone())).await, CommandValue::Ok);
+    }
+    assert!(daemon.tracked_repo_paths().await.is_empty());
+}
+
+// #2500 preserves confirmation, fork policy and provider errors with no tracked root.
+#[tokio::test]
+async fn repository_forge_refusals_without_tracked_roots() {
+    let temp = tempfile::tempdir().expect("config");
+    let provider = Arc::new(FakeChangeRequest::new());
+    let daemon = InProcessDaemon::new(
+        vec![],
+        test_config_store(temp.path().join("config")),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_change_request(provider)),
+        HostName::local(),
+    )
+    .await;
+    let spec = RepositorySpec::remote("https://github.com/owner/refusals").expect("Repository");
+    let key = spec.key();
+    let repositories = daemon.resource_backend().using::<Repository>("flotilla");
+    let stored = repositories.create(&InputMeta::builder().name(key.to_string()).build(), &spec).await.expect("Repository");
+    let cases = [
+        (CommandAction::MergeChangeRequest { id: "42".into(), confirmed: false }, "requires explicit confirmation"),
+        (CommandAction::CloseChangeRequest { id: "missing".into() }, "not found"),
+        (CommandAction::OpenIssue { id: "42".into() }, "no issue provider"),
+    ];
+    for (action, expected) in cases {
+        let result = run_identity_command(&daemon, action, RepoSelector::Repository(key.clone())).await;
+        assert!(matches!(result, CommandValue::Error { message } if message.contains(expected)));
+    }
+    let fork = spec.with_upstream("https://github.com/upstream/refusals", RepositoryRelation::Fork).expect("fork");
+    repositories.update(&InputMeta::from(&stored.metadata), &stored.metadata.resource_version, &fork).await.expect("fork policy");
+    let result = run_identity_command(
+        &daemon,
+        CommandAction::MergeChangeRequest { id: "42".into(), confirmed: true },
+        RepoSelector::Repository(key),
+    )
+    .await;
+    assert!(matches!(result, CommandValue::Error { message } if message.contains("human-only")));
+}
+
+// #2500: observation seeds must publish resource context before Repository-based
+// consumers run after startup, while observing a root does not mint a Project.
+#[tokio::test]
+async fn startup_observation_publishes_repository_context_without_project_minting() {
+    let temp = tempfile::tempdir().expect("checkout fixture");
+    let path = temp.path().join("repo");
+    init_git_repo_with_remote(&path, "https://github.com/owner/startup");
+    let daemon = InProcessDaemon::new(
+        vec![path.clone()],
+        test_config_store(temp.path().join("config")),
+        git_process_discovery(false),
+        HostName::local(),
+    )
+    .await;
+    let response = daemon.get_repo_providers_internal(&RepoSelector::Path(path.join("src"))).await.expect("startup cwd context");
+    assert_eq!(response.repository, RepositorySpec::remote("https://github.com/owner/startup").expect("Repository").key());
+    assert_eq!(response.path, Some(path));
+    assert!(daemon.resource_backend().using::<Project>("flotilla").list().await.expect("Projects").items.is_empty());
 }

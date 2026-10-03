@@ -297,6 +297,11 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
         Ok(ChangeRequestAdmission { id, change_request, base_ref: value["base"]["ref"].as_str().map(str::to_string) })
     }
 
+    async fn update_body(&self, id: &str, body: &str) -> Result<(), String> {
+        self.execute(reqwest::Method::PATCH, &format!("pulls/{id}"), &[], Some(serde_json::json!({"body": body}))).await?;
+        Ok(())
+    }
+
     async fn open_in_browser(&self, id: &str) -> Result<(), String> {
         let url = format!("{}/{}/pulls/{id}", self.config.service_url, self.repo_slug);
         #[cfg(target_os = "macos")]
@@ -335,7 +340,10 @@ mod tests {
     use std::{
         collections::VecDeque,
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
     };
 
     use super::*;
@@ -344,6 +352,47 @@ mod tests {
         testing::MockRunner,
         ChannelLabel,
     };
+
+    // Boundary double: Forgejo HTTP requests, including the body update.
+    struct LinkHttp {
+        body: Mutex<String>,
+        patches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl HttpClient for LinkHttp {
+        async fn execute(&self, request: reqwest::Request, _label: &ChannelLabel) -> Result<http::Response<bytes::Bytes>, String> {
+            assert_eq!(request.url().as_str(), "https://forgejo.example/api/v1/repos/team/repo/pulls/7");
+            let mut body = self.body.lock().expect("body");
+            if request.method() == reqwest::Method::PATCH {
+                let value: serde_json::Value =
+                    serde_json::from_slice(request.body().expect("PATCH body").as_bytes().expect("JSON bytes")).expect("JSON");
+                *body = value["body"].as_str().expect("body field").into();
+                self.patches.fetch_add(1, Ordering::SeqCst);
+            } else {
+                assert_eq!(request.method(), reqwest::Method::GET);
+            }
+            Ok(json_response(&serde_json::json!({"number": 7, "title": "PR", "head": {"ref": "feature"}, "state": "open", "body": *body})))
+        }
+    }
+
+    // Glue: the native Forgejo endpoint preserves the body, deduplicates links,
+    // and an empty issue list produces no write. No working copy is involved.
+    #[tokio::test]
+    async fn links_issues_through_forgejo_body_endpoint() {
+        let http = Arc::new(LinkHttp { body: Mutex::new("Notes".into()), patches: AtomicUsize::new(0) });
+        let provider = ForgejoChangeRequestProvider::new(
+            http.clone(),
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new("https://forgejo.example".into(), None, auth()),
+            "team/repo".into(),
+        );
+        provider.link_issues("7", &["10".into(), "10".into()]).await.expect("link");
+        provider.link_issues("7", &["10".into()]).await.expect("repeat");
+        provider.link_issues("7", &[]).await.expect("empty");
+        assert_eq!(*http.body.lock().expect("body"), "Notes\n\nFixes #10");
+        assert_eq!(http.patches.load(Ordering::SeqCst), 1);
+    }
 
     fn parse_review_decision(value: &serde_json::Value) -> Option<ObservedReviewDecision> {
         review_decision(value.as_array().expect("review array"))

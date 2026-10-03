@@ -2456,7 +2456,42 @@ pub(super) async fn discover_repository_change_request_with(
     repository: &RepositorySpec,
 ) -> Result<Arc<dyn ChangeRequestTracker>, String> {
     let identity = repository.forge().ok_or("no forge identity")?;
-    let remote = repository.live_remote().ok_or("no repository remote")?;
+    let bag = repository_provider_bag(resource_backend, environment_manager, local_environment_id, namespace, repository).await?;
+    let probe_root = ExecutionEnvironmentPath::new(config.base_path().as_ref());
+    let mut unmet = Vec::new();
+    for factory in &discovery.factories.change_requests {
+        match factory.probe(&bag, config, &probe_root, Arc::clone(&discovery.runner)).await {
+            Ok(provider) => return Ok(provider),
+            Err(requirements) => unmet.extend(requirements.into_iter().map(|requirement| format!("{requirement:?}"))),
+        }
+    }
+    Err(format!("change request provider unavailable for {} ({})", identity.service_url, unmet.join(", ")))
+}
+
+pub(super) async fn repository_provider_bag(
+    resource_backend: &ResourceBackend,
+    environment_manager: &EnvironmentManager,
+    local_environment_id: &EnvironmentId,
+    namespace: &str,
+    repository: &RepositorySpec,
+) -> Result<EnvironmentBag, String> {
+    let host_bag = environment_manager.environment_bag(local_environment_id).ok_or("local discovery environment unavailable")?;
+    // Host capabilities cannot contribute an ambient checkout's forge target.
+    let host_bag = host_bag
+        .assertions()
+        .iter()
+        .filter(|assertion| {
+            !matches!(
+                assertion,
+                EnvironmentAssertion::RemoteHost { .. }
+                    | EnvironmentAssertion::OriginForge { .. }
+                    | EnvironmentAssertion::VcsCheckoutDetected { .. }
+            )
+        })
+        .fold(EnvironmentBag::new(), |bag, assertion| bag.with(assertion.clone()));
+    let Some(remote) = repository.live_remote() else {
+        return Ok(host_bag);
+    };
     let forge = match repository.identity() {
         RepositoryIdentity::Forge { forge_ref, .. } => Some(
             resource_backend
@@ -2470,7 +2505,7 @@ pub(super) async fn discover_repository_change_request_with(
         _ => forge_for_remote(resource_backend, namespace, remote).await?,
     };
     let remote_assertion = remote_assertion(remote, "origin").ok_or_else(|| format!("invalid repository remote {remote}"))?;
-    let mut bag = environment_manager.environment_bag(local_environment_id).unwrap_or_default().with(remote_assertion);
+    let mut bag = host_bag.with(remote_assertion);
     if let Some(forge) = &forge {
         bag = bag.with(EnvironmentAssertion::origin_forge(forge.clone()));
         if forge.kind == ForgeKind::Forgejo {
@@ -2491,15 +2526,7 @@ pub(super) async fn discover_repository_change_request_with(
             }
         }
     }
-    let probe_root = ExecutionEnvironmentPath::new(config.base_path().as_ref());
-    let mut unmet = Vec::new();
-    for factory in &discovery.factories.change_requests {
-        match factory.probe(&bag, config, &probe_root, Arc::clone(&discovery.runner)).await {
-            Ok(provider) => return Ok(provider),
-            Err(requirements) => unmet.extend(requirements.into_iter().map(|requirement| format!("{requirement:?}"))),
-        }
-    }
-    Err(format!("change request provider unavailable for {} ({})", identity.service_url, unmet.join(", ")))
+    Ok(bag)
 }
 
 #[derive(Debug)]

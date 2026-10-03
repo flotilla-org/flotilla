@@ -18,7 +18,7 @@ use flotilla_daemon::{
     peer::{test_support::ensure_test_connection_generation, PeerManager, PeerSender},
     server::{PeerConnectedNotice, PeerConnectionEvent},
 };
-use flotilla_protocol::{GoodbyeReason, HostName, NodeId, PeerWireMessage, RepoSelector};
+use flotilla_protocol::{GoodbyeReason, HostName, NodeId, PeerWireMessage};
 use tokio::sync::{Mutex, Notify};
 
 fn test_node_id(name: &str) -> NodeId {
@@ -88,7 +88,6 @@ async fn peer_connect_triggers_local_state_send() {
 
     let daemon = InProcessDaemon::new(vec![repo_path.clone()], config, fake_discovery(false), host_a.clone()).await;
     let node_a = daemon.node_id().clone();
-    daemon.refresh(&RepoSelector::Path(repo_path.clone())).await.expect("refresh");
 
     let sent = Arc::new(StdMutex::new(Vec::new()));
     let notify = Arc::new(Notify::new());
@@ -126,7 +125,6 @@ async fn peer_reconnect_resends_local_state() {
 
     let daemon = InProcessDaemon::new(vec![repo_path.clone()], config, fake_discovery(false), host_a.clone()).await;
     let node_a = daemon.node_id().clone();
-    daemon.refresh(&RepoSelector::Path(repo_path.clone())).await.expect("refresh");
 
     let sent = Arc::new(StdMutex::new(Vec::new()));
     let notify = Arc::new(Notify::new());

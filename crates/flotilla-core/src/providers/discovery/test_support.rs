@@ -1093,6 +1093,14 @@ impl ChangeRequestTracker for FakeChangeRequest {
         }
     }
 
+    async fn update_body(&self, id: &str, body: &str) -> Result<(), String> {
+        let mut store = self.change_requests.lock().await;
+        let (_, request) =
+            store.iter_mut().find(|(request_id, _)| request_id == id).ok_or_else(|| format!("change request {id} not found"))?;
+        request.body = Some(body.into());
+        Ok(())
+    }
+
     async fn merge_change_request(&self, id: &str) -> Result<(), String> {
         let mut store = self.change_requests.lock().await;
         if let Some((_, cr)) = store.iter_mut().find(|(cr_id, _)| cr_id == id) {

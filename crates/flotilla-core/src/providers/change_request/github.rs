@@ -360,6 +360,11 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
         Ok(super::ChangeRequestAdmission { id, change_request, base_ref: pull_request.base_ref_name })
     }
 
+    async fn update_body(&self, id: &str, body: &str) -> Result<(), String> {
+        run!(self.runner, "gh", &["pr", "edit", id, "--repo", &self.repo_slug, "--body", body], execution_root())?;
+        Ok(())
+    }
+
     async fn open_in_browser(&self, id: &str) -> Result<(), String> {
         run!(self.runner, "gh", &["pr", "view", id, "--repo", &self.repo_slug, "--web"], execution_root())?;
         Ok(())

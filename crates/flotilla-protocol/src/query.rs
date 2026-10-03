@@ -114,7 +114,8 @@ pub struct RepoSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoProvidersResponse {
-    pub path: PathBuf,
+    pub repository: crate::RepositoryKey,
+    pub path: Option<PathBuf>,
     pub slug: Option<String>,
     pub host_discovery: Vec<DiscoveryEntry>,
     pub repo_discovery: Vec<DiscoveryEntry>,

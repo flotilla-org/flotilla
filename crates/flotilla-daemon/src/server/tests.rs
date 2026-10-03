@@ -14,8 +14,7 @@ use flotilla_core::{
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
     providers::discovery::test_support::{
-        fake_discovery, fake_discovery_with_provider_set, git_process_discovery, init_git_repo_with_remote, FakeDiscoveryProviders,
-        FakePresentationManager, FakePresentationManagerFactory,
+        fake_discovery, git_process_discovery, init_git_repo_with_remote, FakePresentationManager, FakePresentationManagerFactory,
     },
 };
 use flotilla_protocol::{
@@ -2488,7 +2487,7 @@ async fn remote_command_mutations_route_remote_step_requests() {
     let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
-    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
+    daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
@@ -2572,7 +2571,7 @@ async fn remote_command_remote_step_events_remap_to_presentation_command_id_and_
     let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
-    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
+    daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
@@ -2672,10 +2671,10 @@ async fn remote_checkout_completion_runs_workspace_step_on_presentation_host() {
     init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
     let workspace_manager = Arc::new(FakePresentationManager::new());
-    let discovery =
-        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_presentation_manager(workspace_manager.clone() as Arc<_>));
+    let mut discovery = git_process_discovery(false);
+    discovery.factories.presentation_managers = vec![Box::new(FakePresentationManagerFactory(workspace_manager.clone()))];
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::new("local")).await;
-    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
+    daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
@@ -2843,10 +2842,10 @@ async fn remote_checkout_failure_with_empty_response_still_stops_local_workspace
     init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
     let workspace_manager = Arc::new(FakePresentationManager::new());
-    let discovery =
-        fake_discovery_with_provider_set(FakeDiscoveryProviders::new().with_presentation_manager(workspace_manager.clone() as Arc<_>));
+    let mut discovery = git_process_discovery(false);
+    discovery.factories.presentation_managers = vec![Box::new(FakePresentationManagerFactory(workspace_manager.clone()))];
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, discovery, HostName::new("local")).await;
-    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
+    daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
@@ -3086,7 +3085,7 @@ async fn cancel_active_remote_segment_routes_remote_step_cancel_and_finishes_com
     let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
-    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
+    daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
@@ -3245,7 +3244,7 @@ async fn cancel_disconnect_of_active_remote_segment_finishes_pending_command() {
     let repo_identity = init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
-    daemon.refresh(&RepoSelector::Path(repo.clone())).await.expect("refresh repo");
+    daemon.add_repo(&repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
@@ -3436,9 +3435,10 @@ async fn cancel_forwarded_command_waits_for_launching_registration() {
 async fn execute_forwarded_command_proxies_lifecycle_and_response() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
-    std::fs::create_dir_all(repo.join(".git")).expect("create .git");
+    init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
     let config = test_config_store(tmp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::new("local")).await;
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
+    daemon.add_repo(&repo).await.expect("adopt repo resources");
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
     let forwarded_commands = Arc::new(Mutex::new(HashMap::new()));
@@ -3489,13 +3489,17 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
                     assert_eq!(responder_node_id, daemon.node_id());
                     match event.as_ref() {
                         CommandPeerEvent::Started { repo: event_repo, description, .. } => {
-                            assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
+                            assert!(event_repo.is_none(), "refresh-all has no single checkout context");
                             assert_eq!(description, "Refreshing...");
                             saw_started = true;
                         }
                         CommandPeerEvent::Finished { repo: event_repo, result, .. } => {
-                            assert_eq!(event_repo.as_deref(), Some(repo.as_path()));
-                            assert_eq!(result, &CommandValue::Refreshed { repos: vec![repo.clone()], identity_changes: Vec::new() });
+                            assert!(event_repo.is_none(), "refresh-all has no single checkout context");
+                            assert_eq!(result, &CommandValue::Refreshed {
+                                repository_count: 1,
+                                repos: vec![repo.clone()],
+                                identity_changes: Vec::new()
+                            });
                             saw_finished = true;
                         }
                         CommandPeerEvent::StepUpdate { .. } => {}
@@ -3511,7 +3515,11 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
                     assert_eq!(*request_id, 7);
                     assert_eq!(requester_node_id, &NodeId::new("desktop"));
                     assert_eq!(responder_node_id, daemon.node_id());
-                    assert_eq!(result.as_ref(), &CommandValue::Refreshed { repos: vec![repo.clone()], identity_changes: Vec::new() });
+                    assert_eq!(result.as_ref(), &CommandValue::Refreshed {
+                        repository_count: 1,
+                        repos: vec![repo.clone()],
+                        identity_changes: Vec::new()
+                    });
                     saw_response = true;
                 }
                 other => panic!("unexpected proxied message: {other:?}"),
@@ -3537,7 +3545,7 @@ async fn execute_forwarded_checkout_resolves_repo_identity_across_different_root
     let daemon =
         InProcessDaemon::new(vec![remote_repo.clone()], config, git_process_discovery_with_workspace_manager(), HostName::new("local"))
             .await;
-    daemon.refresh(&flotilla_protocol::RepoSelector::Path(remote_repo.clone())).await.expect("refresh repo");
+    daemon.add_repo(&remote_repo).await.expect("adopt repo resources");
 
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));

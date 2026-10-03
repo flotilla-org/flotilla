@@ -2969,8 +2969,7 @@ fn generated_router_exited_crew_resume(tc: hegel::TestCase) {
 
 // #1769: identity resolution is a local read through the request router and works
 // for a declared Repository with no checkout or observation-root membership.
-#[tokio::test]
-async fn repository_identity_resolution_is_a_local_resource_read() {
+async fn repository_identity_operations_scenario(alias: bool) {
     use flotilla_resources::{Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec};
 
     let topology = spawn_in_memory_request_topology_stateful(empty_daemon_named("leader").await, empty_daemon_named("follower").await)
@@ -2998,17 +2997,72 @@ async fn repository_identity_resolution_is_a_local_resource_read() {
         .create(&InputMeta::builder().name("widgets".into()).build(), &project)
         .await
         .expect("declare Project");
-    for query in ["primary", "acme/widgets"] {
-        let result = topology
+    let selector = RepoSelector::Query(if alias { "primary" } else { "acme/widgets" }.into());
+    let result = topology
+        .client
+        .execute_query(
+            Command::builder().action(CommandAction::QueryResolveRepository { repo: selector.clone() }).build(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("resolve through router");
+    assert_eq!(result, CommandValue::RepositoryResolved { key: Some(key.clone()) });
+    let providers = topology
+        .client
+        .execute_query(
+            Command::builder().action(CommandAction::QueryRepoProviders { repo: selector.clone() }).build(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("providers through router");
+    assert!(matches!(providers, CommandValue::RepoProviders(response) if response.repository == key && response.path.is_none()));
+    for (action, refresh) in
+        [(CommandAction::Refresh { repo: Some(selector.clone()) }, true), (CommandAction::CloseChangeRequest { id: "55".into() }, false)]
+    {
+        let mut events = topology.client.subscribe();
+        let command_id = topology
             .client
-            .execute_query(
-                Command::builder().action(CommandAction::QueryResolveRepository { repo: RepoSelector::Query(query.into()) }).build(),
-                uuid::Uuid::new_v4(),
-            )
+            .execute(Command::builder().action(action).context_repo(selector.clone()).build())
             .await
-            .expect("resolve through router");
-        assert_eq!(result, CommandValue::RepositoryResolved { key: Some(key.clone()) });
+            .expect("admit Repository command");
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let DaemonEvent::CommandFinished { command_id: id, result, .. } = events.recv().await.expect("command event") {
+                    if id == command_id {
+                        return result;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("Repository command finishes");
+        if refresh {
+            assert!(matches!(result, CommandValue::Refreshed { repository_count: 1, repos, .. } if repos.is_empty()));
+        } else {
+            // Provider refusal remains a capability error, independent of roots.
+            assert!(matches!(result, CommandValue::Error { message } if message.contains("no change request provider")));
+        }
     }
     assert!(topology.leader.tracked_repo_paths().await.is_empty());
     assert!(topology.follower.tracked_repo_paths().await.is_empty());
+}
+
+// #1769/#2500: named Repository operations traverse the real request router
+// without observation-root membership; aliases and slugs have identical behavior.
+#[tokio::test]
+async fn repository_identity_resolution_is_a_local_resource_read() {
+    for alias in [false, true] {
+        repository_identity_operations_scenario(alias).await;
+    }
+}
+
+#[hegel::test]
+fn generated_router_repository_identity_operations(tc: hegel::TestCase) {
+    // Both public selector forms, with provider queries and refresh/admission.
+    let alias = tc.draw(gs::booleans());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(repository_identity_operations_scenario(alias));
 }

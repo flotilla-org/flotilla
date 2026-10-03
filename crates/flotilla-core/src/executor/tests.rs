@@ -1674,13 +1674,25 @@ async fn open_issue_with_provider() {
 // Tests: LinkIssuesToChangeRequest
 // -----------------------------------------------------------------------
 
+fn link_request_response(body: &str) -> String {
+    format!("HTTP/2.0 200 OK\n\n{}", serde_json::json!({"number": 55, "title": "PR", "head": {"ref": "feature"}, "body": body}))
+}
+
+fn install_link_provider(registry: &mut ProviderRegistry, runner: MockRunner) {
+    use crate::providers::{change_request::github::GitHubChangeRequest, github_api::GhApiClient};
+    let runner: Arc<dyn CommandRunner> = Arc::new(runner);
+    let provider = GitHubChangeRequest::new("github".into(), "owner/repo".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+    registry.change_requests.insert("github", desc("github"), Arc::new(provider));
+}
+
 #[tokio::test]
 async fn link_issues_success_with_existing_body() {
-    let registry = empty_registry();
-    // First call: gh pr view returns existing body
+    let mut registry = empty_registry();
+    // Subprocess boundary: the provider reads the explicitly addressed GitHub API.
     // Second call: gh pr edit succeeds
-    let runner = MockRunner::new(vec![Ok("Existing PR body".to_string()), Ok(String::new())]);
+    let runner = MockRunner::new(vec![Ok(link_request_response("Existing PR body")), Ok(String::new())]);
 
+    install_link_provider(&mut registry, runner);
     let result = run_build_plan_to_completion(
         CommandAction::LinkIssuesToChangeRequest {
             change_request_id: "55".to_string(),
@@ -1688,7 +1700,7 @@ async fn link_issues_success_with_existing_body() {
         },
         registry,
         empty_data(),
-        runner,
+        MockRunner::new(vec![]),
     )
     .await;
 
@@ -1697,17 +1709,18 @@ async fn link_issues_success_with_existing_body() {
 
 #[tokio::test]
 async fn link_issues_success_with_empty_body() {
-    let registry = empty_registry();
+    let mut registry = empty_registry();
     let runner = MockRunner::new(vec![
-        Ok("  \n".to_string()), // empty/whitespace body
-        Ok(String::new()),      // edit succeeds
+        Ok(link_request_response("  \n")), // empty/whitespace body
+        Ok(String::new()),                 // edit succeeds
     ]);
 
+    install_link_provider(&mut registry, runner);
     let result = run_build_plan_to_completion(
         CommandAction::LinkIssuesToChangeRequest { change_request_id: "55".to_string(), issue_ids: vec!["10".to_string()] },
         registry,
         empty_data(),
-        runner,
+        MockRunner::new(vec![]),
     )
     .await;
 
@@ -1716,14 +1729,15 @@ async fn link_issues_success_with_empty_body() {
 
 #[tokio::test]
 async fn link_issues_view_fails() {
-    let registry = empty_registry();
+    let mut registry = empty_registry();
     let runner = MockRunner::new(vec![Err("gh not found".to_string())]);
 
+    install_link_provider(&mut registry, runner);
     let result = run_build_plan_to_completion(
         CommandAction::LinkIssuesToChangeRequest { change_request_id: "55".to_string(), issue_ids: vec!["10".to_string()] },
         registry,
         empty_data(),
-        runner,
+        MockRunner::new(vec![]),
     )
     .await;
 
@@ -1732,14 +1746,15 @@ async fn link_issues_view_fails() {
 
 #[tokio::test]
 async fn link_issues_edit_fails() {
-    let registry = empty_registry();
-    let runner = MockRunner::new(vec![Ok("body text".to_string()), Err("permission denied".to_string())]);
+    let mut registry = empty_registry();
+    let runner = MockRunner::new(vec![Ok(link_request_response("body text")), Err("permission denied".to_string())]);
 
+    install_link_provider(&mut registry, runner);
     let result = run_build_plan_to_completion(
         CommandAction::LinkIssuesToChangeRequest { change_request_id: "55".to_string(), issue_ids: vec!["10".to_string()] },
         registry,
         empty_data(),
-        runner,
+        MockRunner::new(vec![]),
     )
     .await;
 

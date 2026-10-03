@@ -34,7 +34,7 @@ use crate::{
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     provider_data::ProviderData,
     providers::{
-        discovery::EnvVars, issue_tracker::forge_issue_source, registry::ProviderRegistry, run, types::WorkspaceConfig,
+        discovery::EnvVars, issue_tracker::forge_issue_source, registry::ProviderRegistry, types::WorkspaceConfig,
         vcs::write_branch_issue_links, CommandRunner,
     },
     step::{Step, StepAction, StepExecutionContext, StepOutcome, StepPlan, StepResolver},
@@ -1159,42 +1159,10 @@ impl StepResolver for ExecutorStepResolver {
             }
             StepAction::LinkIssuesToChangeRequest { change_request_id, issue_ids } => {
                 info!(issue_ids = ?issue_ids, %change_request_id, "linking issues to change request");
-                let body_result = run!(
-                    self.runner.as_ref(),
-                    "gh",
-                    &["pr", "view", &change_request_id, "--json", "body", "--jq", ".body"],
-                    self.repo.root.as_path()
-                );
-                match body_result {
-                    Ok(current_body) => {
-                        let fixes_lines: Vec<String> = issue_ids.iter().map(|id| format!("Fixes #{id}")).collect();
-                        let new_body = if current_body.trim().is_empty() {
-                            fixes_lines.join("\n")
-                        } else {
-                            format!("{}\n\n{}", current_body.trim(), fixes_lines.join("\n"))
-                        };
-                        let result = run!(
-                            self.runner.as_ref(),
-                            "gh",
-                            &["pr", "edit", &change_request_id, "--body", &new_body],
-                            self.repo.root.as_path()
-                        );
-                        match result {
-                            Ok(_) => {
-                                info!(%change_request_id, "linked issues to change request");
-                                Ok(StepOutcome::Completed)
-                            }
-                            Err(e) => {
-                                error!(err = %e, "failed to edit change request");
-                                Err(e)
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!(err = %e, "failed to read change request body");
-                        Err(e)
-                    }
-                }
+                let provider =
+                    self.registry.change_requests.preferred().ok_or("no change request provider is active for this Repository")?;
+                provider.link_issues(&change_request_id, &issue_ids).await?;
+                Ok(StepOutcome::Completed)
             }
 
             // -----------------------------------------------------------------

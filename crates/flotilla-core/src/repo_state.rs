@@ -8,14 +8,13 @@ use flotilla_protocol::EnvironmentId;
 
 use crate::{
     model::{provider_names_from_registry, RepoModel},
-    providers::discovery::{EnvironmentBag, UnmetRequirement},
+    providers::discovery::UnmetRequirement,
 };
 
 pub(crate) struct RepoRootState {
     pub(crate) path: PathBuf,
     pub(crate) model: RepoModel,
     pub(crate) slug: Option<String>,
-    pub(crate) repo_bag: EnvironmentBag,
     pub(crate) unmet: Vec<(String, UnmetRequirement)>,
     pub(crate) is_local: bool,
 }
@@ -43,9 +42,6 @@ impl RepoState {
     }
     pub(crate) fn slug(&self) -> Option<&str> {
         self.preferred_root().slug.as_deref()
-    }
-    pub(crate) fn repo_bag(&self) -> &EnvironmentBag {
-        &self.preferred_root().repo_bag
     }
     pub(crate) fn unmet(&self) -> &[(String, UnmetRequirement)] {
         &self.preferred_root().unmet

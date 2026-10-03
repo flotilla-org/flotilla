@@ -52,43 +52,15 @@ pub(crate) async fn resolve_repository(
             }
         }
         RepoSelector::Path(cwd) => {
-            let mut checkouts = observed
-                .clone()
-                .using::<Checkout>(namespace)
-                .list()
-                .await
-                .map_err(|error| error.to_string())?
-                .items
-                .into_iter()
-                .map(|checkout| (checkout.metadata.name.clone(), checkout))
-                .collect::<BTreeMap<_, _>>();
-            // Match Aggregator precedence: durable status wins over its ephemeral projection.
-            for source in backend.including_replicas::<Checkout>(namespace).list().await.map_err(|error| error.to_string())?.items {
-                checkouts.insert(source.object.metadata.name.clone(), source.object);
-            }
-            let local_environments = backend
-                .including_replicas::<Environment>(namespace)
-                .list()
-                .await
-                .map_err(|error| error.to_string())?
-                .items
-                .into_iter()
-                .filter(|source| source.object.spec.host_direct.as_ref().is_some_and(|direct| direct.host_ref == local_host))
-                .map(|source| source.object.metadata.name)
-                .collect::<BTreeSet<_>>();
+            let checkouts = local_checkouts(backend, observed, namespace, local_host).await?;
             // Nested known checkouts scope to the deepest containing checkout.
             let mut deepest = 0;
-            for checkout in checkouts.into_values() {
-                if checkout.status.as_ref().is_some_and(|status| status.phase != CheckoutPhase::Ready) {
-                    continue;
-                }
+            for checkout in checkouts {
                 let (path, key) = match &checkout.spec {
-                    CheckoutSpec::Observed(spec) if spec.host_ref == local_host => (spec.path.as_str(), &spec.repo_ref),
-                    spec if spec.env_ref().is_some_and(|env| local_environments.contains(env)) => {
-                        let Some(path) = checkout.status.as_ref().and_then(|status| status.path.as_deref()) else { continue };
-                        (path, spec.repo_ref())
+                    CheckoutSpec::Observed(spec) => (spec.path.as_str(), &spec.repo_ref),
+                    spec => {
+                        (checkout.status.as_ref().and_then(|status| status.path.as_deref()).expect("local checkout path"), spec.repo_ref())
                     }
-                    _ => continue,
                 };
                 let path = Path::new(path);
                 if !path.is_absolute() || !cwd.starts_with(path) {
@@ -127,6 +99,59 @@ pub(crate) async fn resolve_repository(
             candidates.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
         )),
     }
+}
+
+/// Ready checkout facts on the local host, with durable-over-observed precedence.
+pub(crate) async fn local_checkouts(
+    backend: &ResourceBackend,
+    observed: &ResourceBackend,
+    namespace: &str,
+    local_host: &str,
+) -> Result<Vec<flotilla_resources::ResourceObject<Checkout>>, String> {
+    let mut checkouts = observed
+        .clone()
+        .using::<Checkout>(namespace)
+        .list()
+        .await
+        .map_err(|error| error.to_string())?
+        .items
+        .into_iter()
+        .map(|checkout| (checkout.metadata.name.clone(), checkout))
+        .collect::<BTreeMap<_, _>>();
+    // Match Aggregator precedence: durable status wins over its ephemeral projection.
+    for source in backend.including_replicas::<Checkout>(namespace).list().await.map_err(|error| error.to_string())?.items {
+        checkouts.insert(source.object.metadata.name.clone(), source.object);
+    }
+    let local_environments = backend
+        .including_replicas::<Environment>(namespace)
+        .list()
+        .await
+        .map_err(|error| error.to_string())?
+        .items
+        .into_iter()
+        .filter(|source| source.object.spec.host_direct.as_ref().is_some_and(|direct| direct.host_ref == local_host))
+        .map(|source| source.object.metadata.name)
+        .collect::<BTreeSet<_>>();
+
+    Ok(checkouts
+        .into_values()
+        .filter(|checkout| {
+            if checkout.status.as_ref().is_some_and(|status| status.phase != CheckoutPhase::Ready) {
+                return false;
+            }
+            match &checkout.spec {
+                CheckoutSpec::Observed(spec) => spec.host_ref == local_host && Path::new(&spec.path).is_absolute(),
+                spec => {
+                    spec.env_ref().is_some_and(|env| local_environments.contains(env))
+                        && checkout
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.path.as_deref())
+                            .is_some_and(|path| Path::new(path).is_absolute())
+                }
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]
