@@ -123,6 +123,8 @@ struct LeafSubscriptionTableInner {
     reconciler_tx: broadcast::Sender<String>,
     turn_delivery: Mutex<Arc<dyn TurnDeliveryActuator>>,
     episode_limit: u32,
+    #[cfg(test)]
+    snapshot_loads: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +157,25 @@ fn is_conflict_probe(leaf: &Leaf) -> bool {
 
 fn refusal_limit(status: &ConvoyStatus, vessel: &str, role: &str) -> u32 {
     nudge_policy(status, vessel, role).and_then(|policy| policy.max_refusals).unwrap_or(DEFAULT_REFUSAL_LIMIT).max(1)
+}
+
+// One immediate burst recovery, then repeated expiries back off from 25 ms
+// to one second. Five healthy seconds restore immediate burst recovery.
+#[derive(Default)]
+struct LeafWatchRecovery {
+    delay: std::time::Duration,
+}
+
+impl LeafWatchRecovery {
+    fn expired(&mut self, healthy_for: std::time::Duration) -> std::time::Duration {
+        use std::time::Duration;
+        if healthy_for >= Duration::from_secs(5) {
+            self.delay = Duration::ZERO;
+        }
+        let delay = self.delay;
+        self.delay = if delay.is_zero() { Duration::from_millis(25) } else { (delay * 2).min(Duration::from_secs(1)) };
+        delay
+    }
 }
 
 impl LeafSubscriptionTable {
@@ -204,6 +225,8 @@ impl LeafSubscriptionTable {
                 reconciler_tx,
                 turn_delivery: Mutex::new(Arc::new(UnavailableTurnDeliveryActuator)),
                 episode_limit,
+                #[cfg(test)]
+                snapshot_loads: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
     }
@@ -374,7 +397,12 @@ impl LeafSubscriptionTable {
     }
 
     async fn watch_row(&self, row: LeafSubscriptionRow) -> Result<(), String> {
+        let mut recovery = LeafWatchRecovery::default();
         loop {
+            if !self.inner.rows.lock().await.contains_key(&row.id) {
+                return Ok(());
+            }
+            let started = tokio::time::Instant::now();
             match self.watch_row_once(row.clone()).await {
                 Err(ResourceError::WatchExpired { .. }) => {
                     if !self.inner.rows.lock().await.contains_key(&row.id) {
@@ -382,7 +410,14 @@ impl LeafSubscriptionTable {
                     }
                     // Level-triggered leaves recover from the current snapshot;
                     // keep the same subscription and firing/episode accounting.
-                    tokio::task::yield_now().await;
+                    let delay = recovery.expired(started.elapsed());
+                    if delay.is_zero() {
+                        tokio::task::yield_now().await;
+                    } else {
+                        // unsubscribe_connection and row replacement abort this
+                        // task, including its sleep, releasing demands immediately.
+                        tokio::time::sleep(delay).await;
+                    }
                 }
                 result => return result.map_err(|error| error.to_string()),
             }
@@ -411,6 +446,8 @@ impl LeafSubscriptionTable {
         let usage_list = usages.list().await?;
         let issue_list = issues.list().await?;
         let artifact_list = artifacts.list().await?;
+        #[cfg(test)]
+        self.inner.snapshot_loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut convoy_objects = convoy_list.items.into_iter().fold(HashMap::new(), |mut objects, item| {
             objects.entry(item.object.metadata.name.clone()).or_insert(item.object);
             objects
@@ -2661,6 +2698,156 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), watching).await.expect("wait recovers").expect("watch succeeds");
         assert!(!table.rows().await.iter().any(|row| row.id == id), "recovered wait fires and releases its row");
         assert!(table.inner.last_firings.lock().await.is_empty(), "one-shot wait releases firing state");
+    }
+
+    fn overload_row(connection_id: uuid::Uuid) -> LeafSubscriptionRow {
+        LeafSubscriptionRow {
+            id: uuid::Uuid::new_v4(),
+            namespace: "flotilla".into(),
+            leaves: vec![leaf(LeafAddress::Convoy { name: "busy".into() }, ".status.phase", "Failed")],
+            watcher: LeafWatcher::WaitCaller { connection_id },
+            maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
+            freshness_demand: None,
+            created_at: Utc::now(),
+            episode_key: EpisodeKeyFields::default(),
+        }
+    }
+
+    async fn overload_demand(table: &LeafSubscriptionTable, id: uuid::Uuid) {
+        table
+            .inner
+            .change_requests
+            .demand(
+                id,
+                ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "org/repo".into(), number: 1 },
+                None,
+            )
+            .await
+            .expect("refresher demand");
+        assert_eq!(table.inner.change_requests.active_demands().await, 1);
+    }
+
+    async fn overload_convoy(backend: &ResourceBackend) {
+        let convoys = backend.using::<Convoy>("flotilla");
+        let mut object = convoys.get("busy").await.expect("convoy");
+        for index in 0..300 {
+            object = convoys
+                .update(
+                    &InputMeta::from(&object.metadata),
+                    &object.metadata.resource_version,
+                    &ConvoySpec::builder().workflow_ref(format!("load-{index}")).build(),
+                )
+                .await
+                .expect("overload write");
+        }
+    }
+
+    // Permanent overload must bound six-kind snapshot work, retain identity
+    // and accounting during sleeps, then recover from the latest state.
+    #[tokio::test(start_paused = true)]
+    async fn leaf_sustained_overload_bounds_snapshot_work_and_recovers() {
+        use futures::FutureExt;
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let table = supervision_wake(&backend).subscriptions;
+        create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+        let row = overload_row(uuid::Uuid::new_v4());
+        let id = row.id;
+        table.inner.last_firings.lock().await.insert((id, row.leaves[0].clone()), LeafFiringRecord {
+            leaf: row.leaves[0].clone(),
+            value: "Active".into(),
+            fired_at: Utc::now(),
+        });
+        table.inner.unable_since.lock().await.insert(id, (UnableEvidenceKey::Absent, Utc::now()));
+        table.inner.stale_attention_reported.lock().await.insert(id);
+        overload_demand(&table, id).await;
+        table.inner.rows.lock().await.insert(id, row.clone());
+        let mut watching = Box::pin(table.watch_row(row));
+        assert!(watching.as_mut().now_or_never().is_none());
+        // 30,000 writes in two simulated seconds, with the leaf allowed
+        // to run between bursts. Count completed six-kind snapshots, not RSS.
+        for _ in 0..100 {
+            overload_convoy(&backend).await;
+            for _ in 0..2 {
+                assert!(watching.as_mut().now_or_never().is_none());
+            }
+            tokio::time::advance(Duration::from_millis(20)).await;
+        }
+        let snapshots = table.inner.snapshot_loads.load(Ordering::SeqCst);
+        eprintln!("overload: 30000 writes/2s, {snapshots} six-kind snapshots ({} logical lists)", snapshots * 6);
+        assert!(snapshots <= 10, "repeated expiry must throttle full snapshots: {snapshots}");
+        assert!(table.rows().await.iter().any(|row| row.id == id));
+        assert_eq!(table.inner.change_requests.active_demands().await, 1, "backoff retains demand");
+        assert_eq!(table.inner.last_firings.lock().await.len(), 1, "backoff retains firing history");
+        assert!(table.inner.unable_since.lock().await.contains_key(&id), "backoff retains episode accounting");
+        assert!(table.inner.stale_attention_reported.lock().await.contains(&id));
+        let convoys = backend.using::<Convoy>("flotilla");
+        let object = convoys.get("busy").await.expect("convoy");
+        convoys
+            .update_status("busy", &object.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() })
+            .await
+            .expect("fail convoy");
+        tokio::time::timeout(Duration::from_secs(2), watching).await.expect("bounded recovery latency").expect("watch succeeds");
+        assert!(table.rows().await.is_empty());
+        assert_eq!(table.inner.change_requests.active_demands().await, 0, "completion releases demand");
+        assert!(table.inner.last_firings.lock().await.is_empty());
+        assert!(table.inner.unable_since.lock().await.is_empty());
+        assert!(table.inner.stale_attention_reported.lock().await.is_empty());
+    }
+
+    // Connection cancellation must abort a sleeping recovery task and release
+    // row/firing state immediately rather than waiting for the recovery timer.
+    #[tokio::test(start_paused = true)]
+    async fn leaf_overload_backoff_is_cancelled_by_disconnect() {
+        use futures::FutureExt;
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let table = supervision_wake(&backend).subscriptions;
+        create_convoy(&backend, "busy", ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() }).await;
+        let connection_id = uuid::Uuid::new_v4();
+        let row = overload_row(connection_id);
+        let id = row.id;
+        overload_demand(&table, id).await;
+        table.inner.rows.lock().await.insert(id, row.clone());
+        let watching_table = table.clone();
+        let mut watching = Box::pin(async move { watching_table.watch_row(row).await });
+        assert!(watching.as_mut().now_or_never().is_none());
+        overload_convoy(&backend).await;
+        assert!(watching.as_mut().now_or_never().is_none());
+        assert!(watching.as_mut().now_or_never().is_none());
+        assert_eq!(table.inner.snapshot_loads.load(Ordering::SeqCst), 2, "first recovery is immediate");
+        overload_convoy(&backend).await;
+        assert!(watching.as_mut().now_or_never().is_none());
+        assert_eq!(table.inner.snapshot_loads.load(Ordering::SeqCst), 2, "second expiry sleeps");
+        let task = tokio::spawn(async move {
+            watching.await.expect("watch succeeds");
+        });
+        let abort = task.abort_handle();
+        table.inner.tasks.lock().await.insert(id, task);
+        table.unsubscribe_connection(connection_id).await;
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished(), "disconnect cancels the pending sleep");
+        assert!(table.rows().await.is_empty());
+        assert_eq!(table.inner.change_requests.active_demands().await, 0, "completion releases demand");
+        assert!(table.inner.last_firings.lock().await.is_empty());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(table.inner.snapshot_loads.load(Ordering::SeqCst), 2, "cancelled leaf does not relist");
+    }
+
+    // Generated healthy/overloaded intervals cross the reset boundary; retry
+    // delay never exceeds one second and a healthy interval restores immediacy.
+    #[hegel::test]
+    fn leaf_recovery_budget_resets_after_healthy_watch(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(30));
+        let mut recovery = LeafWatchRecovery::default();
+        for _ in 0..steps {
+            let healthy_ms = tc.draw(gs::integers::<u64>().min_value(0).max_value(6000));
+            let delay = recovery.expired(Duration::from_millis(healthy_ms));
+            assert!(delay <= Duration::from_secs(1));
+            if healthy_ms >= 5000 {
+                assert!(delay.is_zero());
+            }
+        }
+        assert!(recovery.expired(Duration::from_secs(5)).is_zero());
     }
 
     fn convoy_spec() -> ConvoySpec {

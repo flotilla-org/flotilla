@@ -9,13 +9,43 @@ use futures::{
     stream::{self, BoxStream},
     Stream, StreamExt,
 };
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::{
     error::ResourceError,
-    resource::{Resource, ResourceObject},
+    resource::{K8sResourceObject, Resource, ResourceObject},
 };
+
+// Shared live payloads borrow their JSON tree; owned replay payloads can reuse
+// their strings. Both return owned objects without an intermediate tree clone.
+pub(crate) fn decode_watch_object<'de, T: Resource>(
+    value: impl Deserializer<'de, Error = serde_json::Error>,
+) -> Result<ResourceObject<T>, ResourceError> {
+    let object: K8sResourceObject<T> =
+        Deserialize::deserialize(value).map_err(|error| ResourceError::decode(format!("decode stored object: {error}")))?;
+    ResourceObject::from_k8s_object(object)
+}
+
+pub(crate) fn decode_watch_tombstone(value: &Value) -> Result<ResourceTombstone, ResourceError> {
+    let metadata = value.get("metadata").ok_or_else(|| ResourceError::decode("decode tombstone: missing metadata"))?;
+    let name =
+        metadata.get("name").and_then(Value::as_str).ok_or_else(|| ResourceError::decode("decode tombstone: missing name"))?.to_string();
+    let resource_version = metadata
+        .get("resourceVersion")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ResourceError::decode("decode tombstone: missing resourceVersion"))?
+        .to_string();
+    let namespace = metadata.get("namespace").and_then(Value::as_str).unwrap_or_default().to_string();
+    let annotations = metadata
+        .get("annotations")
+        .map(serde::Deserialize::deserialize)
+        .transpose()
+        .map_err(|error| ResourceError::decode(format!("decode tombstone annotations: {error}")))?
+        .unwrap_or_default();
+    Ok(ResourceTombstone { name, namespace, resource_version, annotations })
+}
 
 pub(crate) const WATCH_RING_CAPACITY: usize = 256;
 
@@ -164,6 +194,63 @@ mod tests {
         let decoded: WatchStart = serde_json::from_str(&encoded).expect("deserialize watch start");
         assert_eq!(decoded, WatchStart::FromVersion("7".to_string()));
     }
+    // Borrowed decoding must agree with the previous owned-value decoder for
+    // valid objects and reject malformed records. Generate empty through large
+    // payloads/maps and wrong type, metadata, spec, kind and API-version cases.
+    #[hegel::test]
+    fn borrowed_watch_decode_matches_owned(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+
+        use crate::{api_version, Convoy, ConvoySpec, K8sResourceObject, Resource, ResourceObject};
+        let labels = tc.draw(gs::integers::<usize>().min_value(0).max_value(64));
+        let size = tc.draw(gs::integers::<usize>().min_value(0).max_value(16384));
+        let corruption = tc.draw(gs::integers::<usize>().min_value(0).max_value(5));
+        let mut value = serde_json::json!({
+            "apiVersion": api_version(Convoy::API_PATHS), "kind": Convoy::API_PATHS.kind,
+            "metadata": {"name": "payload", "namespace": "test", "resourceVersion": "1", "creationTimestamp": "2026-01-01T00:00:00Z"},
+            "spec": ConvoySpec::builder().workflow_ref("x".repeat(size)).build(),
+        });
+        let map: std::collections::BTreeMap<_, _> = (0..labels).map(|i| (format!("key-{i}"), "value".to_owned())).collect();
+        value["metadata"]["labels"] = serde_json::to_value(map).expect("labels");
+        match corruption {
+            0 => {}
+            1 => value = serde_json::Value::Null,
+            2 => value["metadata"]["name"] = serde_json::json!(42),
+            3 => value["spec"] = serde_json::Value::Null,
+            4 => value["kind"] = serde_json::json!("Wrong"),
+            5 => value["apiVersion"] = serde_json::json!("Wrong"),
+            _ => unreachable!(),
+        }
+        let owned = serde_json::from_value::<K8sResourceObject<Convoy>>(value.clone())
+            .map_err(|error| crate::ResourceError::decode(error.to_string()))
+            .and_then(ResourceObject::from_k8s_object);
+        let borrowed = super::decode_watch_object::<Convoy>(&value);
+        assert_eq!(borrowed.is_ok(), owned.is_ok());
+        if let (Ok(borrowed), Ok(owned)) = (borrowed, owned) {
+            drop(value);
+            assert_eq!(
+                serde_json::to_value(borrowed.to_k8s_object()).expect("borrowed"),
+                serde_json::to_value(owned.to_k8s_object()).expect("owned")
+            );
+        }
+    }
+
+    // Name-only deletes own their metadata and reject malformed annotations.
+    #[test]
+    fn borrowed_watch_tombstone_keeps_annotations_and_rejects_invalid_metadata() {
+        let mut value =
+            serde_json::json!({"metadata": {"name": "gone", "namespace": "test", "resourceVersion": "7", "annotations": {"key": "value"}}});
+        let tombstone = super::decode_watch_tombstone(&value).expect("tombstone");
+        value["metadata"]["annotations"]["key"] = serde_json::json!(123);
+        assert!(super::decode_watch_tombstone(&value).is_err());
+        value["metadata"].as_object_mut().expect("metadata").remove("name");
+        assert!(super::decode_watch_tombstone(&value).is_err());
+        drop(value);
+        assert_eq!(tombstone.name, "gone");
+        assert_eq!(tombstone.resource_version, "7");
+        assert_eq!(tombstone.annotations["key"], "value");
+    }
+
     // The live event heap is bounded independently of subscriber count and
     // update count. Weak references count retained payloads, not RSS affected
     // by allocator caching. Every run crosses both ring boundary sides.
