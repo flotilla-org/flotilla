@@ -449,6 +449,8 @@ impl ProviderChangeRequestObservationSource {
                 // Preserve an already-observed hard failure for this subject. A scope
                 // cooldown must not conceal a substantive completion refusal.
                 // A whole-batch Err has no per-subject outcomes to preserve.
+                // A classified limit without a deadline also stays visible here:
+                // a sibling's timed cooldown cannot supply this subject's retry time.
                 if let Ok(statuses) = &entry.result {
                     if let Some(Err(hard_error)) = statuses.get(&subject.number) {
                         if hard_error.retry_at().is_none() {
@@ -505,8 +507,8 @@ impl ProviderChangeRequestObservationSource {
                     continue;
                 }
             };
-            numbers.extend(&bound.numbers);
             if !bound.numbers.is_empty() {
+                numbers.extend(&bound.numbers);
                 if convoy.object.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref()).is_some() {
                     for (number, refs) in bound.credentials_by_number {
                         credential_refs_by_number.entry(number).or_default().extend(refs);
