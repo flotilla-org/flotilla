@@ -95,7 +95,7 @@ impl ChangeRequestObservationSource for GhChangeRequestObservationSource {
             &["pr", "view", &number, "--repo", &subject.scope, "--json", "state,headRefOid,statusCheckRollup,reviewDecision,mergeable",],
             Path::new("/"),
         )?;
-        parse_gh_observation(&output, Utc::now()).map_err(Into::into)
+        parse_gh_observation(&output, Utc::now()).map_err(ObservationError::Forge)
     }
 
     async fn observe_for_completion(&self, subject: &ChangeRequestRef) -> Result<ChangeRequestStatus, ObservationError> {
@@ -117,7 +117,7 @@ impl ChangeRequestObservationSource for GhChangeRequestObservationSource {
             ],
             Path::new("/"),
         )?;
-        parse_gh_observation(&output, Utc::now()).map_err(Into::into)
+        parse_gh_observation(&output, Utc::now()).map_err(ObservationError::Forge)
     }
 }
 
@@ -431,7 +431,9 @@ impl ChangeRequestRefresher {
         let subject = &subject.clone().normalized();
         let lock = self.subject_lock(subject).await;
         let _guard = lock.lock().await;
-        if !self.owns_record(subject, false, create_missing).await? {
+        // Ownership and publication use the resource store's string errors, not
+        // forge observations. Tag them explicitly as ordinary failures.
+        if !self.owns_record(subject, false, create_missing).await.map_err(ObservationError::Forge)? {
             return Ok(());
         }
         let status = if create_missing {
@@ -460,7 +462,7 @@ impl ChangeRequestRefresher {
                 return Err(error);
             }
         };
-        self.publish(subject, &subject.record_name(), status, true, false, create_missing).await.map_err(Into::into)
+        self.publish(subject, &subject.record_name(), status, true, false, create_missing).await.map_err(ObservationError::Forge)
     }
 
     pub async fn demand(
@@ -812,7 +814,7 @@ impl ChangeRequestRefresher {
                     continue;
                 }
                 Err(error) => {
-                    self.inner.observation_errors.lock().await.insert(subject.clone(), error.into());
+                    self.inner.observation_errors.lock().await.insert(subject.clone(), ObservationError::Forge(error));
                     if !self.wait_for_next(&subject, self.refresh_delay(&subject, self.inner.cadence.checks_pending).await).await {
                         break;
                     }
@@ -836,7 +838,7 @@ impl ChangeRequestRefresher {
                     let demanded =
                         self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.values().any(Option::is_some));
                     if let Err(error) = self.publish(&subject, &record_name, status.clone(), demanded, true, true).await {
-                        self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone().into());
+                        self.inner.observation_errors.lock().await.insert(subject.clone(), ObservationError::Forge(error.clone()));
                         tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "publish change request observation failed");
                     } else {
                         self.inner.observation_errors.lock().await.remove(&subject);

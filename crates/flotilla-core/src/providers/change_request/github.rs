@@ -134,15 +134,9 @@ impl GitHubChangeRequest {
         let started = Instant::now();
         let output = run_output!(self.runner, "gh", &["api", "graphql", "--include", "-f", &argument], execution_root());
         let elapsed = started.elapsed();
-        let parsed = output.as_ref().ok().map(|output| {
-            let mut parsed = ParsedObservationResponse::new(&output.stdout);
-            parsed.success = output.success;
-            parsed.stderr = output.stderr.clone();
-            parsed
-        });
-        telemetry.record(shape, subjects, output.as_ref().ok().map(|output| output.stdout.as_str()), parsed.as_ref(), elapsed);
-        output?;
-        let parsed = parsed.expect("received output has a parsed response");
+        let parsed = output.map(ParsedObservationResponse::from_output);
+        telemetry.record(shape, subjects, parsed.as_ref().ok(), elapsed);
+        let parsed = parsed?;
         if let Some(limit) = &parsed.limit {
             return Err(ObservationError::RateLimited { budget: "GraphQL".into(), limit: limit.clone() });
         }
@@ -328,6 +322,8 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
             }
             let mut request = request.clone();
             if let Err(error) = self.complete_history(*number, &mut request, &mut pages, &mut nodes, &mut telemetry).await {
+                // Classification without a deadline remains an error, but does
+                // not invent a timed cooldown; the bounded batch may continue.
                 if error.retry_at().is_some() {
                     cooldown = Some(error.clone());
                 }
@@ -1027,6 +1023,21 @@ mod tests {
             "{error}"
         );
         assert!(error.retry_at().is_some());
+    }
+
+    // #2510: missing headers do not discard proven primary classification or
+    // fabricate a retry deadline. Glue: classifier matrix owns response variants.
+    #[tokio::test]
+    async fn primary_limit_without_deadline_keeps_classification_without_timed_wait() {
+        use crate::providers::github_api::GithubRateLimitKind;
+        let runner = Arc::new(MockRunner::new(vec![Ok(
+            "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\n\r\n{\"message\":\"API rate limit exceeded\"}".into(),
+        )]));
+        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        let error = provider.observe_bound(&[1], &Default::default()).await.expect_err("classified limit");
+        assert!(matches!(&error, ObservationError::RateLimited { limit, .. }
+            if limit.kind == GithubRateLimitKind::Primary && limit.retry_source == "unavailable"));
+        assert_eq!(error.retry_at(), None, "no fabricated deadline for a cache, completion or Landing wait");
     }
 
     #[tokio::test]
