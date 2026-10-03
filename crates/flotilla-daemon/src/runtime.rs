@@ -3406,7 +3406,8 @@ where
                 }
             };
             // Subscribe to both inputs before scanning to preserve updates during a pass.
-            // Reconciliation is idempotent, including events caused by its own writes.
+            // Invariant: a no-op reconcile_pending_supervisor_turns_once must issue no
+            // writes, or its own watch events would keep this loop running.
             loop {
                 if let Err(error) = daemon.reconcile_pending_supervisor_turns_once(&namespace).await {
                     report_reconcile_failure(&error);

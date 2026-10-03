@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::Duration,
 };
@@ -207,24 +207,25 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         spawn_pending_supervisor_turn_task(Arc::clone(&home_daemon), "flotilla".to_string(), Duration::from_secs(300));
     let _home_task = AbortOnDropHandle::new(home_task);
     let subscriptions = Arc::new(AtomicUsize::new(0));
+    let before_retry = Arc::new(StdMutex::new(None));
     let (placement_task, placement_ready) = if let Some(closed_watch) = closed_watch {
         let backend = placement.clone();
         let subscriptions = Arc::clone(&subscriptions);
+        let before_retry = Arc::clone(&before_retry);
         spawn_pending_supervisor_turn_task_with_watches(
             Arc::clone(&placement_daemon),
             "flotilla".to_string(),
             Duration::from_secs(300),
             move || {
                 let backend = backend.clone();
+                let before_retry = Arc::clone(&before_retry);
                 let attempt = subscriptions.fetch_add(1, Ordering::SeqCst);
                 async move {
                     if attempt == 1 {
-                        // The pending turn must remain undelivered until the replacement
-                        // subscription's recovery scan, rather than the first subscription.
-                        let stored =
-                            backend.clone().using::<TerminalSession>("flotilla").list().await.expect("terminal before resubscribe");
-                        assert_eq!(stored.items.len(), 1);
-                        assert!(matches!(&stored.items[0].spec.source, TerminalSessionSource::Agent { message: None, .. }));
+                        // Capture the real store before replacing the failed watch.
+                        // Assert from the test body so failures do not hide in the spawned task.
+                        let stored = backend.clone().using::<TerminalSession>("flotilla").list().await?;
+                        *before_retry.lock().expect("retry observation lock") = Some(stored.items);
                     }
                     let convoys = backend.including_replicas::<Convoy>("flotilla").watch().await?.map(|event| event.map(|_| ())).boxed();
                     let sessions =
@@ -275,6 +276,19 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     let queued = convoys.get("nudge-convoy").await.expect("queued convoy");
     assert!(queued.status.expect("status").turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
     replicate::<Convoy>(&home, &placement, "home").await;
+    if closed_watch.is_some() {
+        wait_until("terminal observation before replacement subscription", || async {
+            before_retry.lock().expect("retry observation lock").is_some()
+        })
+        .await;
+        let stored = before_retry.lock().expect("retry observation lock").take().expect("retry observation");
+        // The failed first subscription must not have delivered the pending turn.
+        assert_eq!(stored.len(), 1, "one fixture terminal captured before resubscribing");
+        assert!(
+            matches!(&stored[0].spec.source, TerminalSessionSource::Agent { message: None, .. }),
+            "initial subscription must leave the pending turn undelivered"
+        );
+    }
     wait_until("nudge delivery after convoy replication", || async {
         matches!(sessions.get(&session_meta.name).await.expect("session").spec.source, TerminalSessionSource::Agent {
             message: Some(_),
