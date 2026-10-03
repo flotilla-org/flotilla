@@ -8552,6 +8552,50 @@ async fn startup_observation_publishes_repository_context_without_project_mintin
     .await;
     let response = daemon.get_repo_providers_internal(&RepoSelector::Path(path.join("src"))).await.expect("startup cwd context");
     assert_eq!(response.repository, RepositorySpec::remote("https://github.com/owner/startup").expect("Repository").key());
+    let tracked_identity = daemon.tracked_repo_identity_for_path(&path).await.expect("repo-info identity");
+    let mut events = daemon.subscribe();
+    let _ = run_identity_command(
+        &daemon,
+        CommandAction::Refresh { repo: Some(RepoSelector::Repository(response.repository.clone())) },
+        RepoSelector::Repository(response.repository.clone()),
+    )
+    .await;
+    let mut matched = false;
+    while let Ok(event) = events.try_recv() {
+        if let DaemonEvent::CommandStarted { repo_identity, .. } = event {
+            assert_eq!(repo_identity, tracked_identity);
+            matched = true;
+        }
+    }
+    assert!(matched, "refresh publishes the repo-info event identity");
     assert_eq!(response.path, Some(path));
     assert!(daemon.resource_backend().using::<Project>("flotilla").list().await.expect("Projects").items.is_empty());
+}
+
+// Background discovery failure must not turn checkout-less refresh into a
+// command failure; the explicit strict CLI refresh still reports it.
+#[tokio::test]
+async fn checkoutless_refresh_honors_failure_policy() {
+    use flotilla_resources::{ForgeKind, ForgeSpec};
+    let temp = tempfile::tempdir().expect("config");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let forge = ForgeSpec::builder()
+        .forge_id("unavailable".into())
+        .kind(ForgeKind::Github)
+        .hosts(BTreeSet::from(["github.com".into()]))
+        .https_url("https://github.com".into())
+        .git_ssh_host("github.com".into())
+        .build();
+    let spec = RepositorySpec::remote("https://github.com/team/repo").expect("remote").on_forge(&forge).expect("identity");
+    let key = spec.key();
+    daemon
+        .resource_backend()
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
+        .await
+        .expect("Repository");
+    let selector = RepoSelector::Repository(key);
+    assert_eq!(daemon.refresh(&selector).await.expect("best effort"), None);
+    assert!(daemon.refresh_strict(&selector).await.is_err(), "strict refresh reports the missing Forge");
 }

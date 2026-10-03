@@ -8,6 +8,24 @@ use crate::{
     },
 };
 
+/// Match forge discovery's event identity, including installation paths. Local
+/// refresh uses its actual checkout when present; checkout-less resources use
+/// their durable key as a display identity, never as a filesystem path.
+pub(super) fn repository_event_identity(spec: &RepositorySpec, path: Option<&Path>) -> RepoIdentity {
+    if let Some(forge) = spec.forge() {
+        let authority = forge
+            .service_url
+            .strip_prefix("https://")
+            .or_else(|| forge.service_url.strip_prefix("http://"))
+            .unwrap_or(&forge.service_url)
+            .trim_end_matches('/')
+            .to_string();
+        RepoIdentity { authority, path: forge.repository.clone() }
+    } else {
+        path.map(fallback_repo_identity).unwrap_or_else(|| RepoIdentity { authority: "repository".into(), path: spec.key().to_string() })
+    }
+}
+
 #[derive(bon::Builder)]
 pub(super) struct RepositoryProviderLease {
     spec: RepositorySpec,
@@ -66,6 +84,8 @@ impl InProcessDaemon {
                 _ => checkout.status.and_then(|status| status.path).map(|path| (true, PathBuf::from(path))),
             })
             .collect::<Vec<_>>();
+        // Observed main checkouts rank first; other Ready checkouts use lexical
+        // order rather than the retiring tracked-root preferred_path projection.
         paths.sort();
         Ok(paths.into_iter().next().map(|(_, path)| path))
     }
@@ -84,9 +104,10 @@ impl InProcessDaemon {
         )
         .await?;
         let runner = self.environment_manager.environment_runner(&self.local_environment_id).ok_or("local runner unavailable")?;
-        let config = serde_json::to_value(self.config.load_config()).map_err(|error| error.to_string())?;
+        let host_config = self.config.load_config();
+        let config = serde_json::to_value(&host_config).map_err(|error| error.to_string())?;
         let key = (namespace, repository.spec.key());
-        let mut cache = self.repository_providers.lock().await;
+        let cache = self.repository_providers.lock().await;
         if let Some(lease) = cache.get(&key) {
             if lease.spec == repository.spec
                 && lease.bag.assertions() == bag.assertions()
@@ -96,6 +117,8 @@ impl InProcessDaemon {
                 return Ok(Arc::clone(lease));
             }
         }
+        drop(cache);
+        // Probes may perform I/O; never serialize unrelated Repository lookups.
         let mut registry = ProviderRegistry::new();
         let mut unmet = Vec::new();
         let probe_root = ExecutionEnvironmentPath::new(self.config.base_path().as_path());
@@ -111,7 +134,7 @@ impl InProcessDaemon {
         .await;
         probe(&self.discovery.factories.issue_trackers, &bag, &self.config, &runner, &probe_root, &mut registry.issue_trackers, &mut unmet)
             .await;
-        let default_backend = self.config.load_config().change_request.preference.backend;
+        let default_backend = host_config.change_request.preference.backend;
         if let Some(backend) = repository.spec.change_request().backend.as_deref().or(default_backend.as_deref()) {
             if !registry.change_requests.prefer_by_backend(backend) {
                 unmet.push(("change_request".into(), UnmetRequirement::UnknownProviderPreference {
@@ -120,7 +143,7 @@ impl InProcessDaemon {
                 }));
             }
         }
-        if let Some(backend) = self.config.load_config().issue_tracker.preference.backend {
+        if let Some(backend) = host_config.issue_tracker.preference.backend {
             if !registry.issue_trackers.prefer_by_backend(&backend) {
                 unmet.push(("issue_tracker".into(), UnmetRequirement::UnknownProviderPreference {
                     category: ProviderCategory::IssueProvider,
@@ -152,21 +175,17 @@ impl InProcessDaemon {
                 .unmet(unmet)
                 .build(),
         );
-        cache.insert(key, Arc::clone(&lease));
+        self.repository_providers.lock().await.insert(key, Arc::clone(&lease));
         Ok(lease)
     }
 
     pub(super) async fn execute_action_repository_forge(&self, command_id: u64, command: &Command) -> Result<u64, String> {
         let selector = command.context_repo.as_ref().ok_or("command requires Repository context")?;
         let repository = self.repository_for_selector(selector).await?;
-        let identity = repository
-            .spec
-            .forge()
-            .map(|forge| RepoIdentity {
-                authority: forge.service_url.trim_start_matches("https://").trim_end_matches('/').into(),
-                path: forge.repository.clone(),
-            })
-            .ok_or("Repository has no forge identity")?;
+        if repository.spec.forge().is_none() {
+            return Err("Repository has no forge identity".into());
+        }
+        let identity = repository_event_identity(&repository.spec, None);
         let lease = self.repository_providers(&repository).await?;
         let action = command.action.clone();
         let event_tx = self.event_tx.clone();
@@ -296,5 +315,17 @@ impl InProcessDaemon {
                 .map(|(factory, req)| crate::convert::unmet_requirement_to_proto(factory, req))
                 .collect(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Event routing must preserve forge authority without a transport scheme.
+    #[test]
+    fn event_identity_preserves_http_authority() {
+        let spec = RepositorySpec::remote("http://forge.example/team/repo").expect("Repository");
+        assert_eq!(repository_event_identity(&spec, None), RepoIdentity { authority: "forge.example".into(), path: "team/repo".into() });
     }
 }

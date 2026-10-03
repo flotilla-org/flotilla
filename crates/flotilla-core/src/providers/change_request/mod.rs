@@ -88,6 +88,8 @@ pub trait ChangeRequestTracker: Send + Sync {
     }
 
     /// Preserve the existing body and append missing issue-closing references.
+    /// This read-modify-write can race with concurrent forge edits: the provider
+    /// API offers no conditional update, so callers should avoid parallel edits.
     async fn link_issues(&self, id: &str, issue_ids: &[String]) -> Result<(), String> {
         if issue_ids.is_empty() {
             return Ok(());

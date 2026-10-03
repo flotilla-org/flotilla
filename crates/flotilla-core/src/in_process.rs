@@ -5541,9 +5541,13 @@ impl InProcessDaemon {
         let repository = self.repository_for_selector(repo).await?;
         let key = repository.spec.key();
         let namespace = self.provisioning_namespace().await;
-        self.repository_providers.lock().await.remove(&(namespace.clone(), key.clone()));
         let Some(path) = self.local_checkout_for_repository(&key).await? else {
-            self.repository_providers(&repository).await?;
+            if let Err(error) = self.repository_providers(&repository).await {
+                if failure_policy == RepositoryRefreshFailurePolicy::Strict {
+                    return Err(error);
+                }
+                warn!(repository = %key, %error, "Repository capabilities unavailable during refresh");
+            }
             return Ok(None);
         };
         let inspected = async {
@@ -9472,14 +9476,7 @@ impl InProcessDaemon {
             let repository = self.repository_for_selector(selector).await?;
             let repo_path = self.local_checkout_for_repository(&repository.spec.key()).await?;
             let description = command.description().to_string();
-            let repo_identity = repository
-                .spec
-                .forge()
-                .map(|forge| RepoIdentity {
-                    authority: forge.service_url.trim_start_matches("https://").trim_end_matches('/').into(),
-                    path: forge.repository.clone(),
-                })
-                .unwrap_or_else(|| RepoIdentity { authority: "repository".into(), path: repository.spec.key().to_string() });
+            let repo_identity = repository_operations::repository_event_identity(&repository.spec, repo_path.as_deref());
             let _ = self.event_tx.send(DaemonEvent::CommandStarted {
                 command_id: id,
                 node_id: self.node_id.clone(),
