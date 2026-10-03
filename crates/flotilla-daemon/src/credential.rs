@@ -2405,13 +2405,19 @@ mod tests {
             ("HOME".to_string(), temp.path().to_string_lossy().into_owned()),
             (FLOTILLA_SKILLS_DIR_ENV.to_string(), skills.to_string_lossy().into_owned()),
         ])))));
-        let results = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            futures::future::join_all((0..6).map(|index| {
-                let store = Arc::clone(&store);
-                let registry = Arc::clone(&registry);
+        // Prepare every fake Git fixture before spawning: constructors rewrite the shared executable.
+        let runners = (0..6)
+            .map(|index| {
                 let mut runner = promisor_runner(temp.path());
                 runner.config_base = temp.path().join(format!("config-{index}"));
+                runner
+            })
+            .collect::<Vec<_>>();
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            futures::future::join_all(runners.into_iter().enumerate().map(|(index, runner)| {
+                let store = Arc::clone(&store);
+                let registry = Arc::clone(&registry);
                 tokio::spawn(async move {
                     let token_file = store
                         .prepare_skill_source("github-skills-fork", "https://github.com/example/private-skills.git", &runner)
@@ -2427,7 +2433,15 @@ mod tests {
                         )
                         .await;
                     assert!(!token_file.exists(), "crew {index} must clean its own token");
-                    outcome
+                    outcome?;
+                    // Each staging must install the fake Git response, never content from real Git.
+                    let staged_skill = runner.config_base.join("claude/skills/private-source/SKILL.md");
+                    assert_eq!(
+                        std::fs::read_to_string(staged_skill).expect("fake Git skill must be staged"),
+                        "---\nname: private-source\ndescription: test skill\n---\n# Private source\n",
+                        "crew {index} must use the fake Git response",
+                    );
+                    Ok::<(), String>(())
                 })
             })),
         )
@@ -2438,6 +2452,8 @@ mod tests {
         }
         assert_eq!(minter.max_in_flight.load(Ordering::SeqCst), 6, "all six initial mints must overlap");
         assert_eq!(minter.calls.load(Ordering::SeqCst), 8, "two transient failures must each be retried");
+        let fetches = std::fs::read_to_string(temp.path().join("fetches")).expect("fake Git fetch log");
+        assert_eq!(fetches.lines().collect::<Vec<_>>(), vec!["fetch"; 6], "each staging must fetch through fake Git");
         let tokens = std::fs::read_to_string(temp.path().join("fetches.tokens")).expect("captured fetch tokens");
         let tokens = tokens.lines().collect::<BTreeSet<_>>();
         assert_eq!(tokens.len(), 6, "each fetch must use its own nonempty token");
