@@ -270,14 +270,19 @@ pub fn validate_matching_grant_permissions<'a>(grants: impl IntoIterator<Item = 
             } else {
                 unlisted.get_or_insert(name);
             }
-            if let (Some(listed), Some(unlisted)) = (*listed, *unlisted) {
-                return Err(format!(
-                    "credential `{credential}` mixes permissions listed by grant `{listed}` with unlisted permissions in grant `{unlisted}`; make grant `{unlisted}` explicit for credential `{credential}`"
-                ));
-            }
         }
     }
-    Ok(())
+    let errors = modes.into_iter().filter_map(|(credential, (listed, unlisted))| {
+        let (Some(listed), Some(unlisted)) = (listed, unlisted) else { return None };
+        Some(format!(
+            "credential `{credential}` mixes permissions listed by grant `{listed}` with unlisted permissions in grant `{unlisted}`; make grant `{unlisted}` explicit for credential `{credential}`"
+        ))
+    }).collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
 }
 
 /// Constraint retained when a human-gate approval releases a landing

@@ -66,25 +66,28 @@ Repository selectors need not intersect: a multi-repository vessel can match bot
 This changes composition policy, not the resource schema; project-map is the
 external author of these grants and requires no schema migration.
 
-**Admission and refresh:** credential references and the resolved permission map
-are frozen in the convoy's workflow snapshot at admission. Explicit permissions
-are unioned and capped against the then-current spec; editing grants later does
-not change that snapshot. Unlisted-only admission with a declared spec maximum
-freezes that resolved maximum too. If the spec had no declared maximum, no map is
-stored. Initial delivery (and re-adoption after daemon restart) reads the current
-spec and caps the snapshot again; an absent snapshot map uses that spec's maximum,
-or the installation default when the spec still has no maximum.
+**Admission and refresh:**
 
-Periodic token refresh does **not** re-read grant permission maps or the spec's
-maximum. It uses the snapshot permissions supplied by runtime, falling back to
-the previously prepared mint request when the snapshot has no map. Thus spec
-edits are not a live permission-refresh mechanism: a snapshot without a map
-follows a later spec maximum on fresh preparation/re-adoption, not on each
-periodic mint. The App installation itself still bounds every mint. Repository
-scopes, unlike permission maps, re-resolve from current grants, projects, and
-repository trust on refresh (#1985), constrained by the vessel's admitted
-repository selection. Source paths and installation configuration in the mint
-request are also retained for periodic refresh, and read again on preparation.
+- **Frozen at admission:** credential references and the resolved permission map
+  are retained in the convoy's workflow snapshot. Explicit permissions are
+  unioned and capped against the then-current spec. Unlisted-only grants also
+  freeze that spec's maximum when it is declared; otherwise no map is stored.
+  Editing grants later does not change the snapshot.
+- **Re-read on preparation:** initial delivery and re-adoption after daemon
+  restart read the current spec and cap the snapshot again. An absent snapshot
+  map uses that spec's maximum, or the installation default when the maximum is
+  still absent. Source paths and installation configuration are read again too.
+- **Re-resolved on periodic refresh:** repository scopes follow current grants,
+  projects, and repository trust (#1985), constrained by the vessel's admitted
+  repository selection. Permissions use the snapshot map supplied by runtime,
+  falling back to the previously prepared mint request when no map was stored.
+  Refresh does **not** re-read grant permission maps or the spec's maximum; it
+  also retains source paths and installation configuration from the mint request.
+  The App installation itself still bounds every mint.
+
+Spec edits are therefore not a live permission-refresh mechanism. A snapshot
+without a map follows a later spec maximum on fresh preparation/re-adoption,
+not on each periodic mint.
 
 Token permissions cannot prevent a merge: contents plus pull-request write can merge. "Crews don't merge their own work" (#954) therefore stays a settlement-time check (`mergedBy` is not the crew identity), not a permission.
 
