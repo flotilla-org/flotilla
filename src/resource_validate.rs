@@ -296,6 +296,7 @@ fn validate_ops_inventory(inventory: &OperationalEntryInventory) -> Result<usize
 pub fn validate_path(path: &Path, skill_catalog: Option<&Path>) -> Result<()> {
     let catalog = skill_catalog.map(load_catalog).transpose()?;
     let mut skill_documents = Vec::new();
+    let mut grant_documents = Vec::new();
     let mut files = Vec::new();
     collect_files(path, &mut files)?;
     if files.is_empty() {
@@ -320,6 +321,9 @@ pub fn validate_path(path: &Path, skill_catalog: Option<&Path>) -> Result<()> {
                     if catalog.is_some() && matches!(document["kind"].as_str(), Some("Project" | "CrewDefaults")) {
                         skill_documents.push(document.clone());
                     }
+                    if document["kind"].as_str() == Some("CredentialGrant") {
+                        grant_documents.push(document.clone());
+                    }
                     match validate_resource_document(document) {
                         Ok(()) => println!("{label}: valid"),
                         Err(error) => {
@@ -335,6 +339,10 @@ pub fn validate_path(path: &Path, skill_catalog: Option<&Path>) -> Result<()> {
             }
         }
     }
+    if let Err(error) = validate_grant_documents(&grant_documents) {
+        eprintln!("{error}");
+        failed = true;
+    }
     if failed {
         Err(eyre!("resource validation failed"))
     } else {
@@ -343,6 +351,32 @@ pub fn validate_path(path: &Path, skill_catalog: Option<&Path>) -> Result<()> {
         }
         Ok(())
     }
+}
+
+/// Validate potential co-selection, including future roles and multi-repository vessels.
+/// Namespace boundaries remain independent, as they are at admission.
+fn validate_grant_documents(documents: &[Value]) -> Result<()> {
+    use std::collections::BTreeMap;
+
+    use flotilla_resources::{validate_matching_grant_permissions, CredentialGrantSpec};
+
+    let mut namespaces = BTreeMap::<String, Vec<(String, CredentialGrantSpec)>>::new();
+    for document in documents {
+        let namespace = document["metadata"]["namespace"].as_str().unwrap_or("flotilla").to_string();
+        let name = document["metadata"]["name"].as_str().ok_or_else(|| eyre!("CredentialGrant name missing"))?.to_string();
+        namespaces.entry(namespace).or_default().push((name, serde_json::from_value(document["spec"].clone())?));
+    }
+    for (namespace, grants) in namespaces {
+        for (index, (name, grant)) in grants.iter().enumerate() {
+            for (other_name, other) in &grants[index + 1..] {
+                if grant.selector.overlaps(&other.selector) {
+                    validate_matching_grant_permissions([(name.as_str(), grant), (other_name.as_str(), other)])
+                        .map_err(|error| eyre!("{namespace}: {error}"))?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn load_catalog(path: &Path) -> Result<Vec<flotilla_resources::SkillCatalogEntry>> {
@@ -434,9 +468,40 @@ mod tests {
     use flotilla_test_support::TestSocketDir;
 
     use super::{
-        collect_files, inspect_validation_roots, ops_inventory_endpoint_absent, parse_documents, validate_daemon, validate_project_ops,
-        VALIDATION_INSPECTION_HOST,
+        collect_files, inspect_validation_roots, ops_inventory_endpoint_absent, parse_documents, validate_daemon, validate_grant_documents,
+        validate_path, validate_project_ops, VALIDATION_INSPECTION_HOST,
     };
+
+    // Owner ruling #2491: the actual offline manifest command catches the
+    // mixed case across files, including a listed empty map, before admission.
+    #[test]
+    fn manifest_gate_refuses_mixed_grant_permissions() {
+        let root = tempfile::tempdir().expect("manifest directory");
+        let grant = |name: &str, namespace: &str, role: &str, listed: bool| {
+            serde_json::json!({
+                "apiVersion":"flotilla.work/v1", "kind":"CredentialGrant",
+                "metadata":{"name":name,"namespace":namespace},
+                "spec":{"selector":{"projects":["demo"],"roles":[role]},"credentials":["app"],
+                    "permissions":if listed { serde_json::json!({"app":{}}) } else { serde_json::json!({}) }}
+            })
+        };
+        let base = grant("base", "flotilla", "governor", false);
+        let listed = grant("elevation", "flotilla", "governor", true);
+        std::fs::write(root.path().join("base.json"), base.to_string()).expect("base");
+        std::fs::write(root.path().join("listed.json"), listed.to_string()).expect("listed");
+        assert!(validate_path(root.path(), None).is_err());
+        let error = validate_grant_documents(&[base.clone(), listed.clone()]).expect_err("mixed policy refused").to_string();
+        for name in ["base", "elevation", "app", "explicit"] {
+            assert!(error.contains(name), "{error}");
+        }
+        // Disjoint roles do not co-select for one crew (admission also forbids
+        // different grant sets across co-located roles); namespaces are independent.
+        assert!(validate_grant_documents(&[base.clone(), grant("elevation", "flotilla", "coder", true)]).is_ok());
+        assert!(validate_grant_documents(&[base.clone(), grant("elevation", "other", "governor", true)]).is_ok());
+        // Homogeneous unlisted and explicit policy remains valid.
+        assert!(validate_grant_documents(&[base, grant("second", "flotilla", "governor", false)]).is_ok());
+        assert!(validate_grant_documents(&[listed, grant("second", "flotilla", "governor", true)]).is_ok());
+    }
 
     #[test]
     fn previous_generation_daemons_fall_back_to_local_ops_inspection() {

@@ -2928,6 +2928,17 @@ pub(super) async fn resolve_workflow_credentials(
                     .ok_or_else(|| format!("repository `{key}` unavailable for credential grant selection"))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let matching_grants = grants
+            .iter()
+            .filter(|source| {
+                (vessel.crew.is_empty() && source.object.spec.selector.matches(project_ref, &repository_trust, ""))
+                    || vessel.crew.iter().any(|crew| source.object.spec.selector.matches(project_ref, &repository_trust, &crew.role))
+            })
+            .collect::<Vec<_>>();
+        flotilla_resources::validate_matching_grant_permissions(
+            matching_grants.iter().map(|grant| (grant.object.metadata.name.as_str(), &grant.object.spec)),
+        )
+        .map_err(|error| format!("vessel `{}`: {error}", vessel.name))?;
         if vessel.crew.len() > 1 {
             let grant_sets = vessel
                 .crew
@@ -2947,13 +2958,6 @@ pub(super) async fn resolve_workflow_credentials(
                 ));
             }
         }
-        let matching_grants = grants
-            .iter()
-            .filter(|source| {
-                (vessel.crew.is_empty() && source.object.spec.selector.matches(project_ref, &repository_trust, ""))
-                    || vessel.crew.iter().any(|crew| source.object.spec.selector.matches(project_ref, &repository_trust, &crew.role))
-            })
-            .collect::<Vec<_>>();
         let granted = matching_grants.iter().flat_map(|grant| grant.object.spec.credentials.iter().cloned()).collect::<BTreeSet<_>>();
         if let Some(missing) = granted.iter().find(|name| !specs.contains_key(*name)) {
             return Err(format!("credential grant references missing credential `{missing}`"));

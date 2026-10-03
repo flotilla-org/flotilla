@@ -6612,6 +6612,75 @@ async fn grant_resolution_scopes_roles_trust_and_permissions_independently_of_is
     assert!(fork_coder.credential_refs.is_empty());
 }
 
+// Owner ruling #2491: admission keeps the maximum for unlisted-only grants,
+// unions and caps explicit grants, and refuses mixed modes with named evidence.
+#[tokio::test]
+async fn admission_refuses_mixed_grant_permissions_and_preserves_homogeneous_modes() {
+    for mode in ["unlisted", "unlisted-no-cap", "explicit", "mixed", "empty-explicit"] {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
+        backend
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&test_meta("app"), &CredentialSpecSpec {
+                consumer: CredentialConsumer::GithubApp {
+                    actor_login: None,
+                    installation_id: Some(1),
+                    installation_repository: None,
+                    permissions: (mode != "unlisted-no-cap")
+                        .then(|| BTreeMap::from([("contents".into(), "write".into()), ("actions".into(), "read".into())])),
+                },
+                source: CredentialSource::GithubApp { app_id_path: "app-id".into(), private_key_path: "key".into() },
+                lifecycle: CredentialLifecycle::Refreshable,
+                placement: CredentialPlacementRequirements::default(),
+            })
+            .await
+            .expect("spec");
+        for name in ["base", "elevation"] {
+            let listed = mode == "explicit" || mode == "empty-explicit" || (mode == "mixed" && name == "elevation");
+            let permissions = if mode == "empty-explicit" {
+                BTreeMap::new()
+            } else if name == "base" {
+                BTreeMap::from([("contents".into(), "read".into())])
+            } else {
+                BTreeMap::from([("actions".into(), "write".into()), ("workflows".into(), "write".into())])
+            };
+            backend
+                .definitions::<CredentialGrant>("flotilla")
+                .create(
+                    &test_meta(name),
+                    &CredentialGrantSpec::builder()
+                        .selector(CredentialGrantSelector::builder().build())
+                        .credentials(BTreeSet::from(["app".into()]))
+                        .permissions(if listed { BTreeMap::from([("app".into(), permissions)]) } else { BTreeMap::new() })
+                        .build(),
+                )
+                .await
+                .expect("grant");
+        }
+        let mut workflow = WorkflowTemplateSpec::builder()
+            .vessels(vec![VesselRequirement::builder().name("work".into()).crew(Vec::new()).build()])
+            .build();
+        let result = resolve_workflow_credentials(&backend, "flotilla", None, &[], &mut workflow).await;
+        if mode == "mixed" {
+            let error = result.expect_err("mixed grant admission refused");
+            for name in ["work", "app", "base", "elevation", "explicit"] {
+                assert!(error.contains(name), "{error}");
+            }
+        } else {
+            result.expect("homogeneous grants admitted");
+            let expected = match mode {
+                "unlisted" => BTreeMap::from([("contents".into(), "write".into()), ("actions".into(), "read".into())]),
+                "explicit" => BTreeMap::from([("contents".into(), "read".into()), ("actions".into(), "read".into())]),
+                _ => BTreeMap::new(),
+            };
+            if mode == "unlisted-no-cap" {
+                assert!(!workflow.vessels[0].credential_permissions.contains_key("app"));
+            } else {
+                assert_eq!(workflow.vessels[0].credential_permissions["app"], expected, "{mode}");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn contained_claude_requires_and_accepts_a_project_selected_oauth_grant() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
