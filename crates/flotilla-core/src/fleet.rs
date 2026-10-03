@@ -309,7 +309,7 @@ impl FleetService {
     }
 }
 
-fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
+pub(crate) fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) -> String {
     match phase {
         Some(ResourceTerminalSessionPhase::Starting) | None => "starting".to_string(),
         Some(ResourceTerminalSessionPhase::Running) => "running".to_string(),

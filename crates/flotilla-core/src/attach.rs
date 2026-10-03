@@ -412,17 +412,27 @@ impl<'a> AttachResolver<'a> {
                 ResourceProvenance::Replica { .. } => replicated_sessions.push((session, AttachSessionSource::Durable)),
             }
         }
+        let mut replica_keys = replicated_sessions
+            .iter()
+            .map(|(session, _)| {
+                (
+                    session.object.metadata.namespace.clone(),
+                    session.object.metadata.name.clone(),
+                    replica_origin(&session.provenance).cloned(),
+                )
+            })
+            .collect::<HashSet<_>>();
         for session in observed_sessions {
             match session.provenance {
                 ResourceProvenance::Local => {
                     sessions_by_name.entry(session.object.metadata.name.clone()).or_insert(session.object);
                 }
                 ResourceProvenance::Replica { .. } => {
-                    if !replicated_sessions.iter().any(|(durable, _)| {
-                        durable.object.metadata.namespace == session.object.metadata.namespace
-                            && durable.object.metadata.name == session.object.metadata.name
-                            && replica_origin(&durable.provenance) == replica_origin(&session.provenance)
-                    }) {
+                    if replica_keys.insert((
+                        session.object.metadata.namespace.clone(),
+                        session.object.metadata.name.clone(),
+                        replica_origin(&session.provenance).cloned(),
+                    )) {
                         replicated_sessions.push((session, AttachSessionSource::Observed));
                     }
                 }
@@ -462,7 +472,7 @@ impl<'a> AttachResolver<'a> {
                 .maybe_convoy_ref((!independent).then_some(convoy))
                 .vessel(if independent { "-".to_string() } else { session.spec.env_ref.clone() })
                 .crew(if independent { "-".to_string() } else { crew })
-                .crew_state("running")
+                .crew_state(crate::fleet::session_status_label(session.status.as_ref().map(|status| status.phase)))
                 .host(host.clone())
                 .namespace(session.metadata.namespace.clone())
                 .session(session.metadata.name.clone())
@@ -1055,6 +1065,43 @@ mod tests {
         daemon::DaemonHandle,
         in_process::tests::{create_identity_convoy, create_running_session, create_test_environment, standing_ensure_fixture, test_meta},
     };
+
+    #[tokio::test]
+    async fn placed_session_requires_an_unambiguous_cross_origin_convoy_address() {
+        let backend = ResourceBackend::InMemory(Default::default());
+        let session = backend
+            .using::<ResourceTerminalSession>("flotilla")
+            .create(
+                &flotilla_resources::InputMeta::builder()
+                    .name("placed".to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy".to_string())]))
+                    .build(),
+                &flotilla_resources::TerminalSessionSpec::builder()
+                    .env_ref("env".to_string())
+                    .role("coder".to_string())
+                    .source(flotilla_resources::TerminalSessionSource::Tool { command: "sh".into() })
+                    .cwd("/work".to_string())
+                    .pool("passthrough".to_string())
+                    .build(),
+            )
+            .await
+            .expect("placed session");
+        let first = flotilla_protocol::NodeId::new("first");
+        let second = flotilla_protocol::NodeId::new("second");
+        let placed = flotilla_protocol::NodeId::new("placed");
+        let key = |origin| ("flotilla".to_string(), "convoy".to_string(), Some(origin));
+        // Origin identity wins. Without an exact origin, placement elsewhere
+        // permits a shared address, but different candidate addresses are ambiguous.
+        for second_address in ["coder@project", "reviewer@project"] {
+            let addresses =
+                HashMap::from([(key(first.clone()), "coder@project".to_string()), (key(second.clone()), second_address.to_string())]);
+            assert_eq!(session_convoy_address(&session, Some(&first), &addresses).map(String::as_str), Some("coder@project"));
+            assert_eq!(
+                session_convoy_address(&session, Some(&placed), &addresses).map(String::as_str),
+                (second_address == "coder@project").then_some("coder@project")
+            );
+        }
+    }
 
     #[test]
     fn recursive_attach_preserves_take_preference_and_explicit_watch() {
