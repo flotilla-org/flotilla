@@ -25,6 +25,8 @@ are outside this comparison.
 | Target file bytes (decimal GB) | 51.15 | 29.19 | 42.9% |
 | Test executable bytes (decimal GB) | 35.83 | 13.88 | 61.3% |
 
+This table predates the delivery rebases; the rebase note below explains the fifth binary added upstream.
+
 Size is the sum of regular-file lengths immediately after the measured build,
 not allocated disk blocks. Executable counts come from Cargo's `Executable` output.
 These are single runs; timing is sensitive to host load and filesystem cache warmth.

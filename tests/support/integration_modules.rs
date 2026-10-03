@@ -3,6 +3,8 @@ use std::{fs, path::Path};
 #[test]
 fn every_integration_source_is_registered() {
     // Every integration source must participate in the package's test binary.
+    // These suites use flat *.rs modules. Directory modules (foo/mod.rs) are
+    // outside this guard; extend it if a suite adopts that layout.
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration");
     let source = fs::read_to_string(directory.join("main.rs")).expect("read integration crate root");
     for entry in fs::read_dir(&directory).expect("list integration sources") {
