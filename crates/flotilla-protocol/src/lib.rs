@@ -260,7 +260,7 @@ pub use query::{
     FleetReplicaStatus, FleetStaleness, FleetSurfaceCounts, FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow,
     HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse, PeerReconnectStatus, ProjectListEntry,
     ProjectListRepository, ProjectListResponse, ProviderHealthMap, ProviderInfo, RepoProvidersResponse, RepoSummary, SleepInhibitionHealth,
-    StatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
+    StallRung, StatusResponse, TopologyResponse, TopologyRoute, UnmetRequirementInfo,
 };
 pub use repository::{RepositoryRelation, RepositoryUpstream};
 pub use resource_ref::ResourceRef;

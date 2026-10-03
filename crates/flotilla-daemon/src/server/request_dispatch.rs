@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, future::Future, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    future::Future,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use flotilla_core::{
     agents::{AgentEntry, SharedAgentStateStore},
@@ -75,7 +81,7 @@ async fn project_decision_ledger(
     let checkouts = select_convoy_children(&convoy, &sources.items);
     let leaves = expected_change_request_leaves(&convoy, &checkouts)?;
     let mut urls = Vec::new();
-    let mut projected = std::collections::HashSet::new();
+    let mut projected = HashSet::new();
     for leaf in leaves {
         if !projected.insert(leaf.address.clone()) {
             continue;
@@ -252,6 +258,8 @@ async fn project_decision_ledger_once(
     cwd: &Path,
     delivery_env: &BTreeMap<String, String>,
 ) -> Result<Vec<String>, String> {
+    // Recheck every current binding even for identical content: a stored first
+    // URL cannot prove that PRs bound after the previous put received the ledger.
     let mut last_error = None;
     for attempt in 0..3 {
         match project_decision_ledger(backend, namespace, convoy, producer, body, runner, cwd, delivery_env).await {
@@ -481,6 +489,12 @@ impl<'a> RequestDispatcher<'a> {
             return Message::error_response(id, "ArtifactGet request selected the wrong handler");
         };
         let result = Box::pin(async {
+            if let Some(caller) = self.caller.crew.as_ref() {
+                let name = reference.strip_prefix("artifact/").unwrap_or(&reference);
+                if name.split_once('/').is_some_and(|(namespace, _)| namespace != caller.namespace) {
+                    return Err("crew artifact reads cannot cross namespaces".to_string());
+                }
+            }
             let blobs = self.remote_command_router.blob_store()?;
             let backend = self.daemon.resource_backend();
             let namespace = self.daemon.provisioning_namespace().await;

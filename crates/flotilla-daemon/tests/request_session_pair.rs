@@ -2193,6 +2193,19 @@ async fn artifact_environment_reference_contract() {
             .create(&InputMeta::builder().name(record.metadata.name.clone()).build(), &record.spec)
             .await
             .expect("other namespace artifact");
+        topology
+            .client
+            .artifact_get(format!("artifact/{namespace}/{}", record.metadata.name), "result.bin".into())
+            .await
+            .expect("crew can qualify its own namespace");
+        // Review #2536: namespace-qualified reads across the fleet belong to the operator.
+        let error = topology
+            .client
+            .artifact_get(format!("artifact/other-project-namespace/{}", record.metadata.name), "denied.bin".into())
+            .await
+            .expect_err("crew cannot cross namespaces");
+        assert!(error.contains("cannot cross namespaces"), "{error}");
+        assert!(!workspace.path().join("denied.bin").exists());
         operator
             .client
             .artifact_get(format!("artifact/other-project-namespace/{}", record.metadata.name), operator_destination.clone())
@@ -2200,6 +2213,8 @@ async fn artifact_environment_reference_contract() {
             .expect("operator get qualified artifact");
         assert_eq!(tokio::fs::read(operator_destination).await.expect("operator file"), ledger);
         assert_eq!(tokio::fs::read(destination).await.expect("ledger destination"), ledger);
+        // Observe only the completion below; earlier artifact requests can fill the broadcast buffer.
+        let mut events = leader.subscribe();
         let id = topology.client.execute(completion()).await.expect("dispatch completion with ledger");
         assert!(matches!(await_command_result(&mut events, id).await, CommandValue::Ok), "ledger admits completion");
         assert_eq!(
@@ -3904,6 +3919,6 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
     assert_eq!(response.rows[0].namespace, "other-project-namespace");
     assert_eq!(response.rows[0].convoy, "remote-stall");
     assert_eq!(response.rows[0].role, "coder");
-    assert_eq!(response.rows[0].rung, "operator");
+    assert_eq!(response.rows[0].rung, Some(flotilla_protocol::StallRung::Operator));
     assert_eq!(response.rows[0].evidence, "GitHub rate limit");
 }

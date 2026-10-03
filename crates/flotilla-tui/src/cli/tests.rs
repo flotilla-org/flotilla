@@ -633,7 +633,7 @@ fn crew_stalls_format_preserves_full_evidence() {
             .convoy_display_name("implement #2".into())
             .vessel("work".into())
             .role("coder".into())
-            .rung("operator".into())
+            .rung(flotilla_protocol::StallRung::Operator)
             .supervisor_absence_reason("no live governor for project".into())
             .age_seconds(300)
             .proposed_disposition(flotilla_protocol::StallProposedDisposition::Resume)

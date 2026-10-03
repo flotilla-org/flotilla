@@ -561,8 +561,83 @@ pub struct TopologyRoute {
     pub last_error: Option<String>,
 }
 
+/// Escalation rung shared by stored convoy conditions and query rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StallRung {
+    Nudge,
+    Supervisor,
+    Bosun,
+    Governor,
+    Operator,
+}
+
+impl std::fmt::Display for StallRung {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Nudge => "nudge",
+            Self::Supervisor => "supervisor",
+            Self::Bosun => "bosun",
+            Self::Governor => "governor",
+            Self::Operator => "operator",
+        })
+    }
+}
+
+/// Fleet-wide stalled obligations; evidence remains complete in JSON output.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrewStallsResponse {
+    pub observed_at: DateTime<Utc>,
+    pub full: bool,
+    pub rows: Vec<CrewStallRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct CrewStallRow {
+    pub namespace: String,
+    pub project: Option<String>,
+    pub project_display_name: Option<String>,
+    pub convoy: String,
+    pub convoy_display_name: String,
+    pub vessel: String,
+    pub role: String,
+    pub rung: Option<StallRung>,
+    pub supervisor: Option<String>,
+    pub supervisor_absence_reason: Option<String>,
+    pub began_at: Option<DateTime<Utc>>,
+    pub age_seconds: Option<u64>,
+    pub proposed_disposition: Option<crate::StallProposedDisposition>,
+    pub evidence: String,
+    /// Equal keys flag possible shared causes, without guessing from keywords.
+    pub cause_group: String,
+    pub shared_cause_count: usize,
+    pub artifacts: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
+    // Display labels preserve the wire spelling for every rung and proposed disposition.
+    #[test]
+    fn stall_labels_match_wire_values() {
+        for rung in [
+            super::StallRung::Nudge,
+            super::StallRung::Supervisor,
+            super::StallRung::Bosun,
+            super::StallRung::Governor,
+            super::StallRung::Operator,
+        ] {
+            assert_eq!(rung.to_string(), serde_json::to_value(rung).expect("rung serializes").as_str().expect("string"));
+        }
+        for disposition in
+            [crate::StallProposedDisposition::Resume, crate::StallProposedDisposition::ReduceScope, crate::StallProposedDisposition::Fail]
+        {
+            assert_eq!(
+                disposition.to_string(),
+                serde_json::to_value(disposition).expect("disposition serializes").as_str().expect("string")
+            );
+        }
+    }
+
     use serde_json::json;
 
     use super::{
@@ -738,34 +813,4 @@ mod tests {
 
         assert_roundtrip(&response);
     }
-}
-
-/// Fleet-wide stalled obligations; evidence remains complete in JSON output.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CrewStallsResponse {
-    pub observed_at: DateTime<Utc>,
-    pub full: bool,
-    pub rows: Vec<CrewStallRow>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
-pub struct CrewStallRow {
-    pub namespace: String,
-    pub project: Option<String>,
-    pub project_display_name: Option<String>,
-    pub convoy: String,
-    pub convoy_display_name: String,
-    pub vessel: String,
-    pub role: String,
-    pub rung: String,
-    pub supervisor: Option<String>,
-    pub supervisor_absence_reason: Option<String>,
-    pub began_at: Option<DateTime<Utc>>,
-    pub age_seconds: Option<u64>,
-    pub proposed_disposition: Option<crate::StallProposedDisposition>,
-    pub evidence: String,
-    /// Equal keys flag possible shared causes, without guessing from keywords.
-    pub cause_group: String,
-    pub shared_cause_count: usize,
-    pub artifacts: Vec<String>,
 }

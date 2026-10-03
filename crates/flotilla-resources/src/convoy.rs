@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use flotilla_protocol::{
     CommandCaller, IssueRef, IssueState, Leaf, LeafAddress, LeafOperator, PlacementDecision, PrincipalRef, Relationship, Subject,
 };
-pub use flotilla_protocol::{StallProposedDisposition, StallReason, TurnDeliveryRung};
+pub use flotilla_protocol::{StallProposedDisposition, StallReason, StallRung, TurnDeliveryRung};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
@@ -909,16 +909,6 @@ pub enum StallEvidenceSource {
 #[serde(rename_all = "snake_case")]
 pub enum StallCause {
     Capacity,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StallRung {
-    Nudge,
-    Supervisor,
-    Bosun,
-    Governor,
-    Operator,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

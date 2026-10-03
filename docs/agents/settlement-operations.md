@@ -15,14 +15,16 @@ flag possible shared causes; the view does not infer causes from keywords.
 A later declaration can replace a convoy's visible stall condition while other
 crew remain stalled. Those obligations are still listed, with unknown rung and
 age where the store no longer has per-obligation metadata. Terminal convoys are
-excluded. The view reflects the replicated state available to the connected
+excluded. Conditions without a recognizable crew obligation are shown with
+empty vessel/role identifiers (`-` in human output), preserving their recorded
+rung, age and evidence. The view reflects the replicated state available to the connected
 daemon; a disconnected host's new stalls appear after replication resumes.
 
 An operator connected to the daemon can read evidence with
 `flotilla artifact get artifact/<namespace>/<name> --output <path>`. The CLI resolves the
 output to an absolute path in the operator's local environment. Unqualified
 `artifact/<name>` references use the daemon's provisioning namespace. Crew reads
-continue to use their calling session's environment.
+continue to use their calling session's environment and cannot cross namespaces.
 
 Decision ledgers belong to the convoy and producer role. Putting a ledger
 projects its complete contents onto every distinct bound change request, across

@@ -703,6 +703,16 @@ pub enum StallProposedDisposition {
     Fail,
 }
 
+impl std::fmt::Display for StallProposedDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Resume => "resume",
+            Self::ReduceScope => "reduce-scope",
+            Self::Fail => "fail",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum CommandAction {

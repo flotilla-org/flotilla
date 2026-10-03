@@ -1095,7 +1095,6 @@ fn repo_label(path: Option<&std::path::Path>, identity: &flotilla_protocol::Repo
     path.map(repo_name).unwrap_or_else(|| identity.path.clone())
 }
 
-/// Format a `CommandValue` as a short human-readable string.
 fn format_stall_evidence(text: &str, full: bool) -> String {
     if full {
         return text.to_string();
@@ -1108,6 +1107,7 @@ fn format_stall_evidence(text: &str, full: bool) -> String {
     abbreviated
 }
 
+/// Format a `CommandValue` as a short human-readable string.
 fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> String {
     use flotilla_protocol::commands::CommandValue;
     match result {
@@ -1197,7 +1197,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
                 .rows
                 .iter()
                 .map(|row| row.cause_group.as_str())
-                .collect::<std::collections::BTreeSet<_>>()
+                .collect::<BTreeSet<_>>()
                 .into_iter()
                 .enumerate()
                 .map(|(index, cause)| (cause, index + 1))
@@ -1209,20 +1209,15 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
                     .clone()
                     .unwrap_or_else(|| format!("none: {}", row.supervisor_absence_reason.as_deref().unwrap_or("no supervisor recorded")));
                 let supervisor = format_stall_evidence(&supervisor, stalls.full);
-                let proposed = row
-                    .proposed_disposition
-                    .map(|value| {
-                        serde_json::to_value(value).expect("disposition serializes").as_str().expect("disposition is string").to_string()
-                    })
-                    .unwrap_or_else(|| "-".to_string());
+                let proposed = row.proposed_disposition.map(|value| value.to_string()).unwrap_or_else(|| "-".to_string());
                 let _ = writeln!(
                     output,
                     "{} / {} | {} / {} | {} | {} | {} | {} | group {} ({}) | {}",
                     row.project_display_name.as_deref().or(row.project.as_deref()).unwrap_or("-"),
                     row.convoy_display_name,
-                    row.vessel,
-                    row.role,
-                    row.rung,
+                    if row.vessel.is_empty() { "-" } else { &row.vessel },
+                    if row.role.is_empty() { "-" } else { &row.role },
+                    row.rung.map(|rung| rung.to_string()).unwrap_or_else(|| "unknown".into()),
                     supervisor,
                     row.age_seconds.map(|age| format!("{age}s")).unwrap_or_else(|| "unknown".into()),
                     proposed,

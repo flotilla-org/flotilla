@@ -104,6 +104,13 @@ impl ReadProjections<'_> {
                         }
                     }
                 }
+                // A visible stall must not disappear merely because its maker or
+                // leaves do not identify a crew actor (for example a controller wait).
+                if obligations.is_empty() {
+                    if let Some(stall) = &status.stalled {
+                        obligations.insert((String::new(), String::new()), Some(stall));
+                    }
+                }
                 // A later crew declaration can replace the convoy's visible condition.
                 // Keep every stalled crew row; absent per-obligation metadata stays unknown.
                 for (vessel, crew) in &status.crew_work {
@@ -127,11 +134,6 @@ impl ReadProjections<'_> {
                         evidence.split_whitespace().collect::<Vec<_>>().join(" "),
                     ))
                     .map_err(|error| error.to_string())?;
-                    let rung = stall
-                        .map(|stall| {
-                            serde_json::to_value(stall.rung).expect("rung serializes").as_str().expect("rung is a string").to_string()
-                        })
-                        .unwrap_or_else(|| "unknown".into());
                     let supervisor = stall
                         .and_then(|stall| stall.supervisor.as_ref())
                         .map(|supervisor| format!("{}/{}/{}", supervisor.convoy, supervisor.vessel, supervisor.role));
@@ -155,7 +157,7 @@ impl ReadProjections<'_> {
                             })
                             .vessel(vessel)
                             .role(role)
-                            .rung(rung)
+                            .maybe_rung(stall.map(|stall| stall.rung))
                             .maybe_supervisor(supervisor)
                             .maybe_supervisor_absence_reason(absence)
                             .maybe_began_at(stall.map(|stall| stall.began_at))
@@ -1372,6 +1374,7 @@ mod tests {
     fn crew_stalls_cover_each_obligation(tc: hegel::TestCase) {
         let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
         let roles = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+        let unrecognized = tc.draw(gs::booleans());
         let shared = tc.draw(gs::booleans());
         let future = tc.draw(gs::booleans());
         let replicated = tc.draw(gs::booleans());
@@ -1410,7 +1413,7 @@ mod tests {
                         .flat_map(|role| {
                             let leaf = flotilla_protocol::Leaf {
                                 address: flotilla_protocol::LeafAddress::Work { convoy: convoy.metadata.name.clone(), work: "work".into() },
-                                field_path: format!(".crew.role-{role}.phase"),
+                                field_path: if unrecognized { ".phase".into() } else { format!(".crew.role-{role}.phase") },
                                 operator: flotilla_protocol::LeafOperator::Equal,
                                 literal: "Done".into(),
                             };
@@ -1468,17 +1471,31 @@ mod tests {
             }
             for full in [false, true] {
                 let response = ReadProjections::crew_stalls(&backend, full, now).await.expect("stalls");
-                assert_eq!(response.rows.len(), count * roles);
+                let obligations_per_convoy = if unrecognized { 1 } else { roles };
+                assert_eq!(response.rows.len(), count * obligations_per_convoy);
                 assert_eq!(response.full, full);
                 let encoded = serde_json::to_value(&response).expect("JSON");
-                assert_eq!(encoded["rows"].as_array().expect("rows").len(), count * roles);
+                assert_eq!(encoded["rows"].as_array().expect("rows").len(), count * obligations_per_convoy);
                 for row in response.rows {
                     assert_eq!(row.convoy, "stalled");
                     assert_eq!(row.project_display_name.as_deref(), Some("Project display"));
                     assert_eq!(row.convoy_display_name, "implement #2");
                     assert_eq!(row.age_seconds, Some(if future { 0 } else { 300 }));
-                    assert_eq!(row.shared_cause_count, if shared { count * roles } else { roles });
-                    assert_eq!(row.rung, ["nudge", "supervisor", "bosun", "governor", "operator"][rung]);
+                    assert_eq!(row.vessel.is_empty(), unrecognized);
+                    assert_eq!(row.role.is_empty(), unrecognized);
+                    assert_eq!(row.shared_cause_count, if shared { count * obligations_per_convoy } else { obligations_per_convoy });
+                    assert_eq!(
+                        row.rung,
+                        Some(
+                            [
+                                flotilla_resources::StallRung::Nudge,
+                                flotilla_resources::StallRung::Supervisor,
+                                flotilla_resources::StallRung::Bosun,
+                                flotilla_resources::StallRung::Governor,
+                                flotilla_resources::StallRung::Operator
+                            ][rung]
+                        )
+                    );
                     assert_eq!(row.supervisor.as_deref(), (rung != 4).then_some("governor/control/governor"));
                     assert_eq!(row.supervisor_absence_reason.as_deref(), (rung == 4).then_some(row.evidence.as_str()));
                     assert_eq!(row.proposed_disposition, Some(flotilla_protocol::StallProposedDisposition::Resume));
@@ -1514,7 +1531,7 @@ mod tests {
         assert_eq!(response.rows.len(), 1);
         let row = &response.rows[0];
         assert_eq!(row.role, "coder");
-        assert_eq!(row.rung, "unknown");
+        assert_eq!(row.rung, None);
         assert_eq!(row.age_seconds, None);
         assert_eq!(row.evidence, "rate limit");
         assert_eq!(row.supervisor_absence_reason.as_deref(), Some("no current stall condition recorded for this obligation"));
