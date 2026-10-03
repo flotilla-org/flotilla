@@ -1564,6 +1564,7 @@ impl SqliteBackend {
                 return Err(ResourceError::conflict(&meta.name, "resource already exists"));
             }
 
+            Self::validate_namespace_spec::<T>(&tx, &key, &meta, &spec)?;
             let version = Self::allocate_version(&tx, &key)?;
             let object = ResourceObject::<T> {
                 metadata: ObjectMeta {
@@ -1652,6 +1653,7 @@ impl SqliteBackend {
             }
             T::validate_spec_update(&object.spec, &spec)?;
             T::validate_spec(&meta, &spec)?;
+            Self::validate_namespace_spec::<T>(&tx, &key, &meta, &spec)?;
             if object.matches_update(&meta, &spec)?
                 && admitted_merge.as_ref().is_none_or(|merge| object.metadata.merge.as_ref() == Some(merge))
             {
@@ -1912,6 +1914,32 @@ impl SqliteBackend {
             receiver.next().await.map(|event| (event.and_then(|event| Self::decode_event::<T>(event.kind, &event.object)), receiver))
         });
         Ok(WatchStream::new(None, Box::pin(replay_stream.chain(live_stream))))
+    }
+
+    fn validate_namespace_spec<T: Resource>(
+        tx: &rusqlite::Transaction<'_>,
+        key: &StoreKey,
+        meta: &InputMeta,
+        spec: &T::Spec,
+    ) -> Result<(), ResourceError> {
+        if !T::VALIDATE_NAMESPACE_SPEC {
+            return Ok(());
+        }
+        let mut statement = tx.prepare("SELECT body_json FROM resource_objects WHERE group_name = ?1 AND version = ?2 AND kind = ?3 AND namespace = ?4 AND name != ?5")
+            .map_err(|err| Self::map_sqlite(err, "prepare namespace validation"))?;
+        let rows = statement
+            .query_map(params![key.0, key.1, key.2, key.3, meta.name], |row| row.get::<_, String>(0))
+            .map_err(|err| Self::map_sqlite(err, "read namespace validation"))?;
+        let mut siblings = Vec::new();
+        for row in rows {
+            let body = row.map_err(|err| Self::map_sqlite(err, "read namespace sibling"))?;
+            let value = serde_json::from_str(&body).map_err(|err| ResourceError::decode(format!("decode namespace sibling: {err}")))?;
+            let object = Self::decode_object::<T>(value)?;
+            if object.metadata.deletion_timestamp.is_none() {
+                siblings.push(object.spec);
+            }
+        }
+        T::validate_spec_with_siblings(spec, &siblings)
     }
 
     fn select_existing<T: Resource>(

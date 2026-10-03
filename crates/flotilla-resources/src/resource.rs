@@ -119,6 +119,13 @@ pub trait Resource: Send + Sync + 'static {
     const API_PATHS: ApiPaths;
     const REPLICATION_CLASS: crate::ReplicationClass = crate::ReplicationClass::None;
 
+    /// Opt in to sibling validation at the authoritative write boundary.
+    const VALIDATE_NAMESPACE_SPEC: bool = false;
+
+    fn validate_spec_with_siblings(_spec: &Self::Spec, _siblings: &[Self::Spec]) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
     fn validate_spec(_meta: &InputMeta, _spec: &Self::Spec) -> Result<(), ResourceError> {
         Ok(())
     }

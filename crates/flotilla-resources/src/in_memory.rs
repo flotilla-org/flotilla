@@ -626,6 +626,23 @@ impl InMemoryBackend {
         self.create_typed_with_merge(namespace, meta, spec, Some(merge)).await
     }
 
+    fn validate_namespace_spec<T: Resource>(store: &ResourceStore, meta: &InputMeta, spec: &T::Spec) -> Result<(), ResourceError> {
+        if !T::VALIDATE_NAMESPACE_SPEC {
+            return Ok(());
+        }
+        let siblings = store
+            .objects
+            .values()
+            .cloned()
+            .map(Self::decode_object::<T>)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|object| object.metadata.name != meta.name && object.metadata.deletion_timestamp.is_none())
+            .map(|object| object.spec)
+            .collect::<Vec<_>>();
+        T::validate_spec_with_siblings(spec, &siblings)
+    }
+
     async fn create_typed_with_merge<T: Resource>(
         &self,
         namespace: &str,
@@ -639,6 +656,7 @@ impl InMemoryBackend {
                 return Err(ResourceError::conflict(&meta.name, "resource already exists"));
             }
 
+            Self::validate_namespace_spec::<T>(store, meta, spec)?;
             let version = store.allocate_version();
             let object = ResourceObject::<T> {
                 metadata: ObjectMeta {
@@ -706,6 +724,7 @@ impl InMemoryBackend {
             }
             T::validate_spec_update(&object.spec, spec)?;
             T::validate_spec(meta, spec)?;
+            Self::validate_namespace_spec::<T>(store, meta, spec)?;
             if object.matches_update(meta, spec)?
                 && admitted_merge.as_ref().is_none_or(|merge| object.metadata.merge.as_ref() == Some(merge))
             {

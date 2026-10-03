@@ -95,6 +95,21 @@ impl<T: Resource> DefinitionResolver<T> {
     pub async fn apply_as(&self, writer: &WriterIdentity, meta: &InputMeta, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
         T::validate_spec(meta, spec)?;
+        if T::VALIDATE_NAMESPACE_SPEC {
+            // This pass includes merged replicas. Embedded stores repeat the local
+            // check under their lock/transaction to serialize local admissions.
+            // No-op reapplies intentionally refuse legacy overlaps until repaired.
+            // list() excludes resolved tombstones; deletion conflicts stay visible
+            // and must continue reserving ownership for namespace consumers.
+            let siblings = self
+                .list()
+                .await?
+                .into_iter()
+                .filter(|object| object.metadata.name != meta.name)
+                .map(|object| object.spec)
+                .collect::<Vec<_>>();
+            T::validate_spec_with_siblings(spec, &siblings)?;
+        }
         let local_root = self.backend.local_root()?;
         let sources = self.sources_for_name(&meta.name).await?;
         let current = (!sources.is_empty()).then(|| merge_sources(&sources)).transpose()?;
