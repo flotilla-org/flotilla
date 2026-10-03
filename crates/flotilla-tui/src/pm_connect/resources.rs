@@ -156,7 +156,12 @@ impl Records {
         let forges = self.typed::<Forge>("forges");
         let repositories = self.typed::<Repository>("repositories");
         let projects = self.typed::<Project>("projects");
-        let change_requests = self.typed::<ChangeRequest>("changerequests");
+        let change_requests = flotilla_resources::select_change_requests(self.objects.values().filter_map(|record| match record {
+            SubjectRecord::ChangeRequest(object) => Some(object),
+            _ => None,
+        }))
+        .into_values()
+        .collect::<Vec<_>>();
         let issues = self.typed::<Issue>("issues");
         let sources: BTreeSet<_> = change_requests
             .iter()

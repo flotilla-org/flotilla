@@ -1,17 +1,20 @@
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::Duration,
 };
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_protocol::LeafAddress;
+use flotilla_protocol::{
+    IssueSource, LeafAddress, ReferenceContext, Relationship, Subject as ConvoySubject, SubjectKind as ConvoySubjectKind,
+};
 use flotilla_relay_protocol::{Subject, SubjectKind};
 use flotilla_resources::{
-    change_request_record_name, ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, InputMeta,
-    Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision, ResourceBackend,
+    change_request_record_name, convoy_subject_rows, merge_change_request_history, retain_change_request, select_change_requests,
+    ChangeRequest, ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestStatus, ChangeRequestSubjectHistory, Convoy, InputMeta,
+    Observation, ObservedChangeRequestState, ObservedChecks, ObservedMergeability, ObservedReviewDecision, ResourceBackend, ResourceError,
     ResourceProvenance,
 };
 use tokio::{
@@ -20,6 +23,9 @@ use tokio::{
 };
 
 use crate::providers::{run, CommandRunner};
+
+const RETAINED_REFRESH_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const HISTORY_REFRESH_INTERVAL_SECS: i64 = 60 * 60;
 
 pub(crate) const DEFAULT_REVIEW_BOT_LOGIN: &str = "claude";
 
@@ -348,16 +354,19 @@ pub struct ChangeRequestRefresher {
 struct ChangeRequestRefresherInner {
     backend: ResourceBackend,
     authority: String,
+    origin: String,
     source: Arc<dyn ChangeRequestObservationSource>,
     cadence: ChangeRequestRefreshCadence,
     active: Mutex<HashMap<ChangeRequestRef, ActiveRefresh>>,
     observation_errors: Mutex<HashMap<ChangeRequestRef, String>>,
+    subject_locks: Mutex<HashMap<ChangeRequestRef, Weak<Mutex<()>>>>,
     relay_healthy: std::sync::atomic::AtomicBool,
     relay_wake: Notify,
 }
 
 impl ChangeRequestRefresher {
     pub fn new(
+        origin: String,
         backend: ResourceBackend,
         authority: String,
         source: Arc<dyn ChangeRequestObservationSource>,
@@ -367,14 +376,27 @@ impl ChangeRequestRefresher {
             inner: Arc::new(ChangeRequestRefresherInner {
                 backend,
                 authority,
+                origin,
                 source,
                 cadence,
                 active: Mutex::new(HashMap::new()),
                 observation_errors: Mutex::new(HashMap::new()),
+                subject_locks: Mutex::new(HashMap::new()),
                 relay_healthy: std::sync::atomic::AtomicBool::new(false),
                 relay_wake: Notify::new(),
             }),
         }
+    }
+
+    async fn subject_lock(&self, subject: &ChangeRequestRef) -> Arc<Mutex<()>> {
+        let mut locks = self.inner.subject_locks.lock().await;
+        if let Some(lock) = locks.get(subject).and_then(Weak::upgrade) {
+            return lock;
+        }
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(subject.clone(), Arc::downgrade(&lock));
+        lock
     }
 
     pub fn stale_after(&self) -> Duration {
@@ -393,6 +415,8 @@ impl ChangeRequestRefresher {
 
     async fn refresh_once_with_creation(&self, subject: &ChangeRequestRef, create_missing: bool) -> Result<(), String> {
         let subject = &subject.clone().normalized();
+        let lock = self.subject_lock(subject).await;
+        let _guard = lock.lock().await;
         if !self.owns_record(subject, false, create_missing).await? {
             return Ok(());
         }
@@ -422,17 +446,21 @@ impl ChangeRequestRefresher {
         freshness: Option<DateTime<Utc>>,
     ) -> Result<(), String> {
         let subject = subject.normalized();
+        let lock = self.subject_lock(&subject).await;
+        let _guard = lock.lock().await;
         let name = subject.record_name();
         match self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace).get(&name).await {
             Ok(_) => {}
-            Err(flotilla_resources::ResourceError::NotFound { .. }) => self.ensure_record(&subject, &name).await?,
+            Err(ResourceError::NotFound { .. }) => self.ensure_record(&subject, &name).await?,
             Err(error) => return Err(error.to_string()),
         }
 
+        self.record_convoy_history(&subject).await?;
         let mut active = self.inner.active.lock().await;
         if let Some(refresh) = active.get_mut(&subject) {
+            let was_retained = refresh.demands.is_empty();
             refresh.demands.insert(subscription_id, freshness);
-            if freshness.is_some() {
+            if freshness.is_some() || was_retained {
                 refresh.wake.notify_one();
             }
             return Ok(());
@@ -453,8 +481,8 @@ impl ChangeRequestRefresher {
         let empty = active
             .iter_mut()
             .filter_map(|(subject, refresh)| {
-                refresh.demands.remove(&subscription_id);
-                refresh.demands.is_empty().then_some(subject.clone())
+                let removed = refresh.demands.remove(&subscription_id).is_some();
+                (removed && refresh.demands.is_empty()).then_some(subject.clone())
             })
             .collect::<Vec<_>>();
         let stopped =
@@ -464,30 +492,47 @@ impl ChangeRequestRefresher {
         for (subject, task) in stopped {
             task.abort();
             let _ = task.await;
-            let active = self.inner.active.lock().await;
-            if active.contains_key(&subject) {
+            let lock = self.subject_lock(&subject).await;
+            let _guard = lock.lock().await;
+            if self.inner.active.lock().await.contains_key(&subject) {
                 continue;
             }
             self.inner.observation_errors.lock().await.remove(&subject);
             let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
             let result = match records.get(&subject.record_name()).await {
-                Ok(record) if record.spec.observing_authority == self.inner.authority => records.delete(&subject.record_name()).await,
-                Ok(_) | Err(flotilla_resources::ResourceError::NotFound { .. }) => Ok(()),
+                Ok(record) if retain_change_request(&record) => {
+                    self.start_retained(subject.clone()).await;
+                    continue;
+                }
+                Ok(record)
+                    if record.spec.observing_authority == self.inner.authority
+                        || record.spec.subject_of.iter().any(|entry| entry.relationship == Relationship::Produces) =>
+                {
+                    self.collect_local_subject(&subject).await
+                }
+                Ok(_) | Err(ResourceError::NotFound { .. }) => Ok(()),
                 Err(error) => Err(error),
             };
             if let Err(error) = result {
-                if !matches!(error, flotilla_resources::ResourceError::NotFound { .. }) {
+                if !matches!(error, ResourceError::NotFound { .. }) {
                     tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "garbage collect undemanded change request failed");
                 }
             }
-            drop(active);
         }
     }
 
     /// The relay only acts on live demand, and the same authority check used by
     /// refresh_once is repeated just before the forge read.
     pub async fn demanded_owned(&self) -> Result<Vec<ChangeRequestRef>, String> {
-        let subjects = self.inner.active.lock().await.keys().cloned().collect::<Vec<_>>();
+        let subjects = self
+            .inner
+            .active
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, refresh)| !refresh.demands.is_empty())
+            .map(|(subject, _)| subject.clone())
+            .collect::<Vec<_>>();
         let mut owned = Vec::new();
         for subject in subjects {
             if self.owns_record(&subject, false, false).await? {
@@ -508,9 +553,14 @@ impl ChangeRequestRefresher {
             .active
             .lock()
             .await
-            .keys()
-            .filter(|subject| subject.service == hint.service && subject.scope == hint.scope && subject.number == hint.number)
-            .cloned()
+            .iter()
+            .filter(|(subject, refresh)| {
+                !refresh.demands.is_empty()
+                    && subject.service == hint.service
+                    && subject.scope == hint.scope
+                    && subject.number == hint.number
+            })
+            .map(|(subject, _)| subject.clone())
             .collect::<Vec<_>>();
         let mut first_error = None;
         for subject in subjects {
@@ -538,17 +588,173 @@ impl ChangeRequestRefresher {
         }
     }
 
-    /// A daemon restart has no surviving leaf subscriptions, so locally
-    /// authoritative observations from the previous process are all orphans.
+    /// Recover produced requests after restart; ordinary demand-only observations
+    /// are collected. Retention has no time expiry while the forge is open:
+    /// one task per subject, polling at most once every fifteen minutes.
     pub async fn garbage_collect_orphans(&self) -> Result<(), String> {
         let namespaces = self.inner.backend.local_namespaces::<ChangeRequest>().await.map_err(|error| error.to_string())?;
         for namespace in namespaces {
             let records = self.inner.backend.using::<ChangeRequest>(&namespace);
             for record in records.list().await.map_err(|error| error.to_string())?.items {
-                records.delete(&record.metadata.name).await.map_err(|error| error.to_string())?;
+                if retain_change_request(&record) {
+                    self.start_retained(ChangeRequestRef {
+                        namespace: namespace.clone(),
+                        service: record.spec.service.clone(),
+                        scope: record.spec.scope.clone(),
+                        number: record.spec.number,
+                    })
+                    .await;
+                } else {
+                    records.delete(&record.metadata.name).await.map_err(|error| error.to_string())?;
+                }
             }
         }
         Ok(())
+    }
+
+    async fn collect_retained_if_terminal(&self, subject: &ChangeRequestRef) -> Result<bool, ResourceError> {
+        let lock = self.subject_lock(subject).await;
+        let _guard = lock.lock().await;
+        let retained = self.inner.active.lock().await.get(subject).is_some_and(|refresh| refresh.demands.is_empty());
+        if !retained {
+            return Ok(false);
+        }
+        let sources = self.inner.backend.including_replicas::<ChangeRequest>(&subject.namespace).list().await?;
+        let selected = select_change_requests(sources.items.iter().map(|source| &source.object));
+        let terminal = selected
+            .values()
+            .find(|record| {
+                record.spec.service == subject.service && record.spec.scope == subject.scope && record.spec.number == subject.number
+            })
+            .is_some_and(|record| {
+                record.status.as_ref().is_some_and(|status| {
+                    matches!(status.state.value, Some(ObservedChangeRequestState::Merged | ObservedChangeRequestState::Closed))
+                })
+            });
+        if !terminal {
+            return Ok(false);
+        }
+        self.collect_local_subject(subject).await?;
+        self.inner.active.lock().await.remove(subject);
+        Ok(true)
+    }
+
+    async fn collect_local_subject(&self, subject: &ChangeRequestRef) -> Result<(), ResourceError> {
+        let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+        for record in records.list().await?.items.iter().filter(|record| {
+            record.spec.service == subject.service && record.spec.scope == subject.scope && record.spec.number == subject.number
+        }) {
+            match records.delete(&record.metadata.name).await {
+                Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    async fn start_retained(&self, subject: ChangeRequestRef) {
+        let mut active = self.inner.active.lock().await;
+        if active.contains_key(&subject) {
+            return;
+        }
+        let this = self.clone();
+        let task_subject = subject.clone();
+        let task = tokio::spawn(async move { this.refresh_loop(task_subject).await });
+        active.insert(subject, ActiveRefresh { demands: HashMap::new(), wake: Arc::new(Notify::new()), task });
+    }
+
+    /// Capture links at admission, before a convoy can disappear. History is in
+    /// the spec so ordinary forge status refreshes cannot erase it, and it follows
+    /// the record's existing observation replication class.
+    async fn record_convoy_history(&self, subject: &ChangeRequestRef) -> Result<(), String> {
+        let convoys = self.inner.backend.using::<Convoy>(&subject.namespace).list().await.map_err(|error| error.to_string())?;
+        let target = ConvoySubject {
+            kind: ConvoySubjectKind::ChangeRequest,
+            source: IssueSource { service: subject.service.clone(), scope: subject.scope.clone() },
+            id: subject.number.to_string(),
+        };
+        let mut history = Vec::new();
+        let references = ReferenceContext::default();
+        for convoy in convoys.items {
+            for row in convoy_subject_rows(&convoy, &references) {
+                if row.subject != target {
+                    continue;
+                }
+                history.push(
+                    ChangeRequestSubjectHistory::builder()
+                        .namespace(convoy.metadata.namespace.clone())
+                        .convoy(convoy.metadata.name.clone())
+                        .origin(self.inner.origin.clone())
+                        .relationship(row.relationship)
+                        .role(convoy.spec.role.clone())
+                        .maybe_project(convoy.spec.project_ref.clone())
+                        .last_seen(Utc::now())
+                        .build(),
+                );
+            }
+        }
+        if history.is_empty() {
+            return Ok(());
+        }
+        let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
+        loop {
+            let current = match records.get(&subject.record_name()).await {
+                Ok(current) => current,
+                Err(ResourceError::NotFound { .. }) => {
+                    // The observing authority may be remote. Keep a local copy
+                    // of its record so this convoy's history can replicate too.
+                    let observed = self
+                        .inner
+                        .backend
+                        .including_replicas::<ChangeRequest>(&subject.namespace)
+                        .get(&subject.record_name())
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .object;
+                    let mut spec = observed.spec.clone();
+                    merge_change_request_history(&mut spec.subject_of, &history);
+                    match records.create(&InputMeta::builder().name(subject.record_name()).build(), &spec).await {
+                        Ok(created) => {
+                            if let Some(status) = observed.status {
+                                records
+                                    .update_status(&subject.record_name(), &created.metadata.resource_version, &status)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            continue;
+                        }
+                        Err(ResourceError::Conflict { .. }) => continue,
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            let mut spec = current.spec.clone();
+            let mut incoming = history.clone();
+            for entry in &mut incoming {
+                if let Some(prior) = spec.subject_of.iter().find(|prior| {
+                    prior.namespace == entry.namespace
+                        && prior.convoy == entry.convoy
+                        && prior.origin == entry.origin
+                        && prior.relationship == entry.relationship
+                        && prior.role == entry.role
+                        && prior.project == entry.project
+                }) {
+                    if entry.last_seen.signed_duration_since(prior.last_seen).num_seconds() < HISTORY_REFRESH_INTERVAL_SECS {
+                        entry.last_seen = prior.last_seen;
+                    }
+                }
+            }
+            merge_change_request_history(&mut spec.subject_of, &incoming);
+            if spec == current.spec {
+                return Ok(());
+            }
+            match records.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await {
+                Ok(_) => return Ok(()),
+                Err(ResourceError::Conflict { .. }) => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
     }
 
     #[cfg(test)]
@@ -556,19 +762,34 @@ impl ChangeRequestRefresher {
         self.inner.active.lock().await.values().map(|refresh| refresh.demands.len()).sum()
     }
 
+    async fn refresh_delay(&self, subject: &ChangeRequestRef, demanded_delay: Duration) -> Duration {
+        if self.inner.active.lock().await.get(subject).is_some_and(|refresh| refresh.demands.is_empty()) {
+            RETAINED_REFRESH_INTERVAL
+        } else {
+            demanded_delay
+        }
+    }
+
     async fn refresh_loop(&self, subject: ChangeRequestRef) {
         let record_name = subject.record_name();
         loop {
+            match self.collect_retained_if_terminal(&subject).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "collect retained change request failed")
+                }
+            }
             match self.owns_record(&subject, true, true).await {
                 Ok(false) => {
-                    if !self.wait_for_next(&subject, self.inner.cadence.state).await {
+                    if !self.wait_for_next(&subject, self.refresh_delay(&subject, self.inner.cadence.state).await).await {
                         break;
                     }
                     continue;
                 }
                 Err(error) => {
                     self.inner.observation_errors.lock().await.insert(subject.clone(), error);
-                    if !self.wait_for_next(&subject, self.inner.cadence.checks_pending).await {
+                    if !self.wait_for_next(&subject, self.refresh_delay(&subject, self.inner.cadence.checks_pending).await).await {
                         break;
                     }
                     continue;
@@ -596,7 +817,17 @@ impl ChangeRequestRefresher {
                     } else {
                         self.inner.observation_errors.lock().await.remove(&subject);
                     }
-                    let delay = if demanded {
+                    match self.collect_retained_if_terminal(&subject).await {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "collect retained change request failed")
+                        }
+                    }
+                    let retained = self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.is_empty());
+                    let delay = if retained {
+                        RETAINED_REFRESH_INTERVAL
+                    } else if demanded {
                         self.inner.cadence.freshness_demanded
                     } else if status.checks.value == Some(ObservedChecks::Pending) {
                         self.inner.cadence.checks_pending
@@ -604,7 +835,7 @@ impl ChangeRequestRefresher {
                         self.inner.cadence.state
                     };
                     let delay = if self.inner.relay_healthy.load(std::sync::atomic::Ordering::SeqCst) {
-                        delay.max(Duration::from_secs(15 * 60))
+                        delay.max(RETAINED_REFRESH_INTERVAL)
                     } else {
                         delay
                     };
@@ -615,7 +846,9 @@ impl ChangeRequestRefresher {
                 Err(error) => {
                     self.inner.observation_errors.lock().await.insert(subject.clone(), error.clone());
                     tracing::warn!(service = %subject.service, scope = %subject.scope, number = subject.number, %error, "change request observation failed");
-                    if !self.wait_for_next(&subject, self.inner.cadence.checks_pending).await {
+                    let retained = self.inner.active.lock().await.get(&subject).is_some_and(|refresh| refresh.demands.is_empty());
+                    let delay = if retained { RETAINED_REFRESH_INTERVAL } else { self.inner.cadence.checks_pending };
+                    if !self.wait_for_next(&subject, delay).await {
                         break;
                     }
                 }
@@ -659,12 +892,15 @@ impl ChangeRequestRefresher {
         let local = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
         let mut spec = record.object.spec.clone();
         spec.observing_authority = self.inner.authority.clone();
+        if let Ok(existing) = local.get(&name).await {
+            merge_change_request_history(&mut spec.subject_of, &existing.spec.subject_of);
+        }
         // A former owner can keep its local record while another host owns a
         // fresher replica. Reclaim through that local record when it exists.
         let result = match local.get(&name).await {
             Ok(existing) if existing.spec.observing_authority == self.inner.authority => Ok(existing),
             Ok(existing) => local.update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &spec).await,
-            Err(flotilla_resources::ResourceError::NotFound { .. }) => {
+            Err(ResourceError::NotFound { .. }) => {
                 // A single conditional create claims a local copy, so an
                 // interruption cannot strand a foreign shadow.
                 local.create(&InputMeta::builder().name(name).build(), &spec).await
@@ -673,7 +909,7 @@ impl ChangeRequestRefresher {
         };
         match result {
             Ok(_) => Ok(true),
-            Err(flotilla_resources::ResourceError::Conflict { .. }) => Ok(false),
+            Err(ResourceError::Conflict { .. }) => Ok(false),
             Err(error) => Err(error.to_string()),
         }
     }
@@ -702,6 +938,7 @@ impl ChangeRequestRefresher {
         if !self.owns_record(subject, allow_takeover, create_missing).await? {
             return Ok(());
         }
+        self.record_convoy_history(subject).await?;
         let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
         let current = records.get(name).await.map_err(|error| error.to_string())?;
         if current.spec.observing_authority != self.inner.authority {
@@ -731,8 +968,24 @@ impl ChangeRequestRefresher {
         let records = self.inner.backend.using::<ChangeRequest>(&subject.namespace);
         match records.get(name).await {
             Ok(current) => Ok(current),
-            Err(flotilla_resources::ResourceError::NotFound { .. }) => {
+            Err(ResourceError::NotFound { .. }) => {
+                let candidates = self
+                    .inner
+                    .backend
+                    .including_replicas::<ChangeRequest>(&subject.namespace)
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let selected = select_change_requests(candidates.items.iter().map(|source| &source.object));
+                let history = selected
+                    .values()
+                    .find(|record| {
+                        record.spec.service == subject.service && record.spec.scope == subject.scope && record.spec.number == subject.number
+                    })
+                    .map(|record| record.spec.subject_of.clone())
+                    .unwrap_or_default();
                 let spec = ChangeRequestSpec::builder()
+                    .subject_of(history)
                     .service(subject.service.clone())
                     .scope(subject.scope.clone())
                     .number(subject.number)
@@ -740,7 +993,7 @@ impl ChangeRequestRefresher {
                     .build();
                 match records.create(&InputMeta::builder().name(name.to_string()).build(), &spec).await {
                     Ok(created) => Ok(created),
-                    Err(flotilla_resources::ResourceError::Conflict { .. }) => records.get(name).await.map_err(|error| error.to_string()),
+                    Err(ResourceError::Conflict { .. }) => records.get(name).await.map_err(|error| error.to_string()),
                     Err(error) => Err(error.to_string()),
                 }
             }
@@ -765,9 +1018,16 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use flotilla_resources::{InMemoryBackend, ResourceBackend};
+    use flotilla_manifest::{
+        entity,
+        projection::{project_catalog, CatalogInput, SubjectCatalogInput},
+        recipe::FlotillaRecipes,
+        wire::{MetadataTarget, MetadataValue},
+    };
+    use flotilla_resources::{HttpBackend, InMemoryBackend, ResourceBackend, TypedResolver};
 
     use super::*;
+    use crate::tls;
 
     struct UnavailableSource;
 
@@ -1030,6 +1290,7 @@ mod tests {
     async fn concurrent_first_demands_converge_on_one_authority_record() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
             Arc::new(UnavailableSource),
@@ -1051,10 +1312,323 @@ mod tests {
         assert_eq!(refresher.active_demands().await, 2);
     }
 
+    // Behaviour (#2445): a local convoy keeps history even when a different
+    // host observes the forge. A terminal history-bearing local copy is collectible.
+    #[tokio::test(start_paused = true)]
+    async fn remote_observer_does_not_lose_local_convoy_history() {
+        use flotilla_protocol::{IssueSource, NodeId, Relationship, Subject, SubjectKind};
+        use flotilla_resources::{Convoy, ConvoySpec, DeclaredSubject};
+        for via_replica in [false, true] {
+            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let remote = ResourceBackend::InMemory(InMemoryBackend::default());
+            let subject = ChangeRequestRef { namespace: "ops".into(), service: "github.com".into(), scope: "org/repo".into(), number: 42 };
+            let remote_records = remote.using::<ChangeRequest>("ops");
+            let record = remote_records
+                .create(
+                    &InputMeta::builder().name(subject.record_name()).build(),
+                    &ChangeRequestSpec::builder()
+                        .service(subject.service.clone())
+                        .scope(subject.scope.clone())
+                        .number(subject.number)
+                        .observing_authority("remote".into())
+                        .build(),
+                )
+                .await
+                .expect("remote record");
+            let observed = parse_gh_observation(r#"{"state":"OPEN"}"#, Utc::now()).expect("observation");
+            remote_records
+                .update_status(&subject.record_name(), &record.metadata.resource_version, &observed)
+                .await
+                .expect("remote observation");
+            backend
+                .replica_writer::<ChangeRequest>(NodeId::new("remote"), "ops")
+                .replace(&remote_records.list().await.expect("remote list"), Utc::now())
+                .await
+                .expect("replica");
+            backend
+                .using::<Convoy>("ops")
+                .create(
+                    &InputMeta::builder().name("producer".into()).build(),
+                    &ConvoySpec::builder()
+                        .workflow_ref("dev".into())
+                        .role("coder".into())
+                        .subjects(vec![DeclaredSubject {
+                            subject: Subject {
+                                kind: SubjectKind::ChangeRequest,
+                                source: IssueSource { service: subject.service.clone(), scope: subject.scope.clone() },
+                                id: "42".into(),
+                            },
+                            relationship: Relationship::Produces,
+                            issue: None,
+                            change_request: None,
+                        }])
+                        .build(),
+                )
+                .await
+                .expect("local convoy");
+            let refresher = ChangeRequestRefresher::new(
+                "kiwi".into(),
+                backend.clone(),
+                "local".into(),
+                Arc::new(UnavailableSource),
+                ChangeRequestRefreshCadence::default(),
+            );
+            let demand = uuid::Uuid::new_v4();
+            refresher.demand(demand, subject.clone(), None).await.expect("demand");
+            let records = backend.using::<ChangeRequest>("ops");
+            let record = records.get(&subject.record_name()).await.expect("local history copy");
+            assert_eq!(record.spec.observing_authority, "remote");
+            assert_eq!(record.spec.subject_of.len(), 1);
+            assert_eq!(record.spec.subject_of[0].origin, "kiwi");
+            assert_eq!(record.status.as_ref().expect("copied observation").state.value, Some(ObservedChangeRequestState::Open));
+            let second = uuid::Uuid::new_v4();
+            refresher.demand(second, subject.clone(), None).await.expect("second demand");
+            assert_eq!(
+                records.get(&subject.record_name()).await.expect("history unchanged").metadata.resource_version,
+                record.metadata.resource_version
+            );
+            backend.using::<Convoy>("ops").delete("producer").await.expect("delete producer");
+            refresher.release(demand).await;
+            if via_replica {
+                refresher.release(second).await;
+                assert!(records.get(&subject.record_name()).await.is_ok());
+                let current = remote_records.get(&subject.record_name()).await.expect("remote current");
+                let mut terminal = current.status.expect("remote status");
+                terminal.state = Observation::known(ObservedChangeRequestState::Merged, Utc::now() + chrono::Duration::seconds(1));
+                remote_records
+                    .update_status(&subject.record_name(), &current.metadata.resource_version, &terminal)
+                    .await
+                    .expect("remote merge");
+                backend
+                    .replica_writer::<ChangeRequest>(NodeId::new("remote"), "ops")
+                    .replace(&remote_records.list().await.expect("remote terminal list"), Utc::now())
+                    .await
+                    .expect("terminal replica");
+                tokio::time::advance(RETAINED_REFRESH_INTERVAL).await;
+                wait_for_request_state(&records, &subject.record_name(), None).await;
+                assert!(!refresher.inner.active.lock().await.contains_key(&subject));
+                continue;
+            }
+            let mut terminal = record.status.expect("status");
+            terminal.state = Observation::known(ObservedChangeRequestState::Closed, Utc::now());
+            records
+                .update_status(&subject.record_name(), &record.metadata.resource_version, &terminal)
+                .await
+                .expect("terminal observation");
+            refresher.release(second).await;
+            assert!(records.list().await.expect("local records").items.is_empty());
+        }
+    }
+
+    // Forge boundary: inject observations instead of invoking a live forge API.
+    struct MutableSource(Mutex<ChangeRequestStatus>, AtomicUsize);
+    #[async_trait]
+    impl ChangeRequestObservationSource for MutableSource {
+        async fn observe(&self, _: &ChangeRequestRef) -> Result<ChangeRequestStatus, String> {
+            let status = self.0.lock().await.clone();
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Ok(status)
+        }
+    }
+
+    async fn wait_for_request_state(records: &TypedResolver<ChangeRequest>, name: &str, expected: Option<ObservedChangeRequestState>) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let found = records.get(name).await;
+                let matches = match expected {
+                    Some(state) => {
+                        found.as_ref().is_ok_and(|record| record.status.as_ref().is_some_and(|status| status.state.value == Some(state)))
+                    }
+                    None => matches!(found, Err(ResourceError::NotFound { .. })),
+                };
+                if matches {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("request reached expected state before deadline");
+    }
+
+    // Wait for observable progress, with a deadline shorter than any refresh cadence.
+    async fn wait_for_calls(calls: &AtomicUsize, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) < count {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("observer call before deadline");
+        // Let the completed observation publish and arm its next timer.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    async fn wait_for_observation(source: &MutableSource, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while source.1.load(Ordering::SeqCst) < count {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("retained observation before deadline");
+    }
+
+    // HTTP boundary: an invalid endpoint deterministically refuses backend I/O,
+    // without a server or a live request. Cleanup errors must not retire monitoring.
+    #[tokio::test]
+    async fn failed_collection_keeps_retained_monitoring() {
+        let backend = ResourceBackend::Http(HttpBackend::new(tls::client(), "invalid://resource-store"));
+        let refresher = ChangeRequestRefresher::new(
+            "kiwi".into(),
+            backend,
+            "node".into(),
+            Arc::new(UnavailableSource),
+            ChangeRequestRefreshCadence::default(),
+        );
+        let subject = ChangeRequestRef { namespace: "ops".into(), service: "github.com".into(), scope: "org/repo".into(), number: 42 };
+        refresher.start_retained(subject.clone()).await;
+        assert!(refresher.collect_local_subject(&subject).await.is_err());
+        assert!(refresher.collect_retained_if_terminal(&subject).await.is_err());
+        assert!(refresher.inner.active.lock().await.contains_key(&subject));
+        for (_, refresh) in refresher.inner.active.lock().await.drain() {
+            refresh.task.abort();
+        }
+    }
+
+    // Behaviour (#2445): link history replicates with the request, survives convoy
+    // deletion, demand release, and daemon restart, then terminal polling collects it.
+    #[tokio::test(start_paused = true)]
+    async fn produced_request_survives_release_and_restart_until_terminal() {
+        use flotilla_resources::{Convoy, ConvoySpec, ConvoyStatus, SubjectDiscoverySource};
+        for terminal in [ObservedChangeRequestState::Merged, ObservedChangeRequestState::Closed] {
+            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let observed_at = Utc::now();
+            let opened = parse_gh_observation(
+                r#"{"state":"OPEN","headRefOid":"head","statusCheckRollup":[],"reviewDecision":"APPROVED","mergeable":"MERGEABLE"}"#,
+                observed_at,
+            )
+            .expect("open");
+            let source = Arc::new(MutableSource(Mutex::new(opened), AtomicUsize::new(0)));
+            let refresher = ChangeRequestRefresher::new(
+                "kiwi".into(),
+                backend.clone(),
+                "node".into(),
+                source.clone(),
+                ChangeRequestRefreshCadence::default(),
+            );
+            let convoys = backend.using::<Convoy>("ops");
+            let convoy = convoys
+                .create(
+                    &InputMeta::builder().name("producer".into()).build(),
+                    &ConvoySpec::builder().workflow_ref("dev".into()).role("coder".into()).project_ref("platform".into()).build(),
+                )
+                .await
+                .expect("convoy");
+            let subject = ChangeRequestRef { namespace: "ops".into(), service: "github.com".into(), scope: "org/repo".into(), number: 42 };
+            let mut status = ConvoyStatus::default();
+            status.discover_subject(
+                ConvoySubject {
+                    kind: ConvoySubjectKind::ChangeRequest,
+                    source: IssueSource { service: subject.service.clone(), scope: subject.scope.clone() },
+                    id: "42".into(),
+                },
+                Relationship::Produces,
+                SubjectDiscoverySource::Claim,
+                observed_at,
+            );
+            convoys.update_status("producer", &convoy.metadata.resource_version, &status).await.expect("link");
+            let demand = uuid::Uuid::new_v4();
+            refresher.demand(demand, subject.clone(), None).await.expect("demand");
+            refresher.refresh_once(&subject).await.expect("initial observation");
+            let records = backend.using::<ChangeRequest>("ops");
+            let record = records.get(&subject.record_name()).await.expect("request");
+            assert_eq!(record.spec.subject_of.len(), 1);
+            assert_eq!(record.spec.subject_of[0].convoy, "producer");
+            assert_eq!(record.spec.subject_of[0].origin, "kiwi");
+            assert_eq!(record.spec.subject_of[0].role, "coder");
+            convoys.delete("producer").await.expect("delete convoy");
+            let next_observation = source.1.load(Ordering::SeqCst) + 1;
+            refresher.release(demand).await;
+            assert!(records.get(&subject.record_name()).await.is_ok());
+            assert_eq!(refresher.active_demands().await, 0);
+            wait_for_observation(&source, next_observation).await;
+            source.0.lock().await.state = Observation::known(ObservedChangeRequestState::Draft, observed_at);
+            // Releasing an unrelated demand must not restart retained polling.
+            refresher.release(uuid::Uuid::new_v4()).await;
+            tokio::time::advance(Duration::from_secs(14 * 60)).await;
+            assert_eq!(
+                records.get(&subject.record_name()).await.expect("slow poll").status.expect("status").state.value,
+                Some(ObservedChangeRequestState::Open)
+            );
+            let resumed = uuid::Uuid::new_v4();
+            refresher.demand(resumed, subject.clone(), None).await.expect("reactivate ordinary demand");
+            wait_for_request_state(&records, &subject.record_name(), Some(ObservedChangeRequestState::Draft)).await;
+            assert_eq!(
+                records.get(&subject.record_name()).await.expect("reactivated").status.expect("status").state.value,
+                Some(ObservedChangeRequestState::Draft)
+            );
+            refresher.release(resumed).await;
+            let observations = SubjectCatalogInput {
+                change_requests: vec![records.get(&subject.record_name()).await.expect("retained")],
+                ..Default::default()
+            };
+            let catalog = project_catalog(
+                &CatalogInput {
+                    subjects: Some(&observations),
+                    awareness: None,
+                    convoys: &[],
+                    independents: &[],
+                    standing_roles: &[],
+                    project_repositories: &[],
+                },
+                &FlotillaRecipes::new("flotilla"),
+            );
+            let patches = catalog.reassert_patches();
+            let cr = entity::change_request("github.com", "org/repo", "42");
+            let patch = patches.iter().find(|patch| patch.target == MetadataTarget::Entity(cr.clone())).expect("orphan");
+            assert_eq!(patch.set["flotilla.orphaned"].value, MetadataValue::Bool(true));
+            assert_eq!(
+                patch.set["flotilla.subject_of.produces"].value,
+                MetadataValue::EntityRefs(vec![entity::convoy("ops", "producer", "kiwi")])
+            );
+            // A restart loses all in-memory demand/tasks but retains the store.
+            for (_, refresh) in refresher.inner.active.lock().await.drain() {
+                refresh.task.abort();
+            }
+            let recovered = ChangeRequestRefresher::new(
+                "kiwi".into(),
+                backend.clone(),
+                "node".into(),
+                source.clone(),
+                ChangeRequestRefreshCadence::default(),
+            );
+            recovered.garbage_collect_orphans().await.expect("recover");
+            assert!(records.get(&subject.record_name()).await.is_ok());
+            source.0.lock().await.state = Observation::known(terminal, observed_at + chrono::Duration::seconds(1));
+            wait_for_request_state(&records, &subject.record_name(), None).await;
+            assert!(matches!(records.get(&subject.record_name()).await, Err(ResourceError::NotFound { .. })));
+            let observations = SubjectCatalogInput { change_requests: records.list().await.expect("list").items, ..Default::default() };
+            let catalog = project_catalog(
+                &CatalogInput {
+                    subjects: Some(&observations),
+                    awareness: None,
+                    convoys: &[],
+                    independents: &[],
+                    standing_roles: &[],
+                    project_repositories: &[],
+                },
+                &FlotillaRecipes::new("flotilla"),
+            );
+            assert!(!catalog.reassert_patches().iter().any(|patch| patch.target == MetadataTarget::Entity(cr.clone())));
+        }
+    }
+
     #[tokio::test]
     async fn last_released_demand_garbage_collects_observed_record() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
             Arc::new(UnavailableSource),
@@ -1083,6 +1657,7 @@ mod tests {
     async fn startup_garbage_collection_covers_non_default_namespaces() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
             Arc::new(UnavailableSource),
@@ -1108,6 +1683,7 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
             Arc::new(CountingSource(Arc::clone(&calls))),
@@ -1120,18 +1696,14 @@ mod tests {
             number: 1366,
         };
         refresher.demand(uuid::Uuid::new_v4(), subject.clone(), None).await.expect("demand");
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 1).await;
         let records = backend.using::<ChangeRequest>("flotilla");
         let first = records.get(&subject.record_name()).await.expect("first observation");
 
         const IDENTICAL_POLLS: usize = 4;
-        for _ in 0..IDENTICAL_POLLS {
+        for poll in 0..IDENTICAL_POLLS {
             tokio::time::advance(Duration::from_secs(90)).await;
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
+            wait_for_calls(&calls, poll + 2).await;
         }
 
         let after = records.get(&subject.record_name()).await.expect("observation after identical polls");
@@ -1145,6 +1717,7 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend,
             "authority".to_string(),
             Arc::new(CountingSource(Arc::clone(&calls))),
@@ -1158,24 +1731,16 @@ mod tests {
             number: 2051,
         };
         refresher.demand(uuid::Uuid::new_v4(), subject, None).await.expect("demand");
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 1).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         tokio::time::advance(Duration::from_secs(90)).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "healthy relay uses slow backstop");
         refresher.set_relay_healthy(false);
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 2).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "disconnect wakes the normal refresher");
         tokio::time::advance(Duration::from_secs(90)).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 3).await;
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
@@ -1184,6 +1749,7 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
             Arc::new(CountingSource(Arc::clone(&calls))),
@@ -1204,9 +1770,7 @@ mod tests {
                 .await
                 .expect("demand");
         }
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 2).await;
         let before = calls.load(Ordering::SeqCst);
         let hint = Subject::new(SubjectKind::ChangeRequest, "github.com", "flotilla-org/flotilla", 2051);
         refresher.refresh_hint(&hint).await.expect("hint");
@@ -1216,7 +1780,7 @@ mod tests {
         backend.using::<ChangeRequest>("ops").delete(&name).await.expect("delete record during live demand");
         refresher.refresh_hint(&hint).await.expect("hint after record deletion");
         assert!(
-            matches!(backend.using::<ChangeRequest>("ops").get(&name).await, Err(flotilla_resources::ResourceError::NotFound { .. })),
+            matches!(backend.using::<ChangeRequest>("ops").get(&name).await, Err(ResourceError::NotFound { .. })),
             "hint does not recreate a missing record"
         );
         assert_eq!(calls.load(Ordering::SeqCst), before + 3, "remaining namespace still refreshes");
@@ -1225,10 +1789,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn freshness_demand_heartbeats_identical_observations() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
-            Arc::new(CountingSource(Arc::new(AtomicUsize::new(0)))),
+            Arc::new(CountingSource(Arc::clone(&calls))),
             ChangeRequestRefreshCadence::default(),
         );
         let subject = ChangeRequestRef {
@@ -1238,16 +1804,12 @@ mod tests {
             number: 1699,
         };
         refresher.demand(uuid::Uuid::new_v4(), subject.clone(), Some(Utc::now())).await.expect("freshness demand");
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 1).await;
         let records = backend.using::<ChangeRequest>("flotilla");
         let first = records.get(&subject.record_name()).await.expect("first observation");
 
         tokio::time::advance(Duration::from_secs(10)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 2).await;
         let heartbeat = records.get(&subject.record_name()).await.expect("heartbeat observation");
 
         assert_ne!(heartbeat.metadata.resource_version, first.metadata.resource_version);
@@ -1259,6 +1821,7 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend,
             "authority".to_string(),
             Arc::new(CountingSource(Arc::clone(&calls))),
@@ -1276,16 +1839,12 @@ mod tests {
             number: 1366,
         };
         refresher.demand(uuid::Uuid::new_v4(), subject.clone(), None).await.expect("initial demand");
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 1).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         tokio::time::advance(Duration::from_secs(5)).await;
         refresher.demand(uuid::Uuid::new_v4(), subject, Some(Utc::now())).await.expect("late freshness demand");
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 2).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "freshness demand must preempt the remaining 85-second sleep");
     }
 
@@ -1293,6 +1852,7 @@ mod tests {
     async fn observation_failure_is_available_to_settlement_diagnostics() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend,
             "authority".to_string(),
             Arc::new(UnavailableSource),

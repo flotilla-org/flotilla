@@ -2561,6 +2561,7 @@ mod tests {
     fn supervision_wake(backend: &ResourceBackend) -> ReconcilerWake {
         let (event_tx, _) = broadcast::channel(16);
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "test-host".into(),
             Arc::new(UnavailableChangeRequests),
@@ -3511,6 +3512,7 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let (event_tx, _) = broadcast::channel(16);
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "test-host".into(),
             Arc::new(UnavailableChangeRequests),
@@ -3600,6 +3602,7 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let (event_tx, _) = broadcast::channel(16);
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "test-host".to_string(),
             Arc::new(UnavailableChangeRequests),
@@ -3748,6 +3751,7 @@ mod tests {
     async fn assert_leaf_subscription_contract(backend: ResourceBackend) {
         let (event_tx, _) = broadcast::channel(16);
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "test-host".to_string(),
             Arc::new(UnavailableChangeRequests),
@@ -3905,6 +3909,7 @@ mod tests {
 
         let (event_tx, _) = broadcast::channel(16);
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "test-host".to_string(),
             Arc::new(UnavailableChangeRequests),
@@ -3938,7 +3943,7 @@ mod tests {
             freshness_demanded: Duration::from_millis(20),
             stale_after: Duration::from_secs(60),
         };
-        let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source.clone(), cadence);
+        let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source.clone(), cadence);
         let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher);
         let repo_ref = RepositoryKey("repo".to_string());
         let spec = ConvoySpec::builder()
@@ -4032,6 +4037,7 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let (event_tx, _) = broadcast::channel(4);
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
             Arc::new(ControlledChangeRequests { merged: AtomicBool::new(false) }),
@@ -4078,6 +4084,7 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let (event_tx, _) = broadcast::channel(4);
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
             Arc::new(UnavailableChangeRequests),
@@ -4289,7 +4296,7 @@ mod tests {
             freshness_demanded: Duration::from_millis(20),
             stale_after: Duration::from_secs(60),
         };
-        let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source.clone(), cadence);
+        let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source.clone(), cadence);
         let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher);
         let repo_ref = RepositoryKey("repo".to_string());
         let spec = ConvoySpec::builder()
@@ -4373,7 +4380,13 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let (event_tx, _) = broadcast::channel(16);
         let cadence = crate::change_request_observer::ChangeRequestRefreshCadence::default();
-        let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), Arc::new(UnavailableChangeRequests), cadence);
+        let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
+            backend.clone(),
+            "authority".to_string(),
+            Arc::new(UnavailableChangeRequests),
+            cadence,
+        );
         let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher);
         let convoys = backend.clone().using::<Convoy>("flotilla");
         let created = convoys
@@ -4437,7 +4450,7 @@ mod tests {
             freshness_demanded: Duration::from_millis(20),
             stale_after: Duration::from_secs(60),
         };
-        let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source.clone(), cadence);
+        let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source.clone(), cadence);
         let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher);
         let repo_ref = RepositoryKey("repo".to_string());
         let mut spec = ConvoySpec::builder()
@@ -4640,8 +4653,13 @@ mod tests {
 
         let (event_tx, _) = broadcast::channel(16);
         let cadence = crate::change_request_observer::ChangeRequestRefreshCadence::default();
-        let refresher =
-            ChangeRequestRefresher::new(authority.clone(), "authority-root".to_string(), Arc::new(UnavailableChangeRequests), cadence);
+        let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
+            authority.clone(),
+            "authority-root".to_string(),
+            Arc::new(UnavailableChangeRequests),
+            cadence,
+        );
         let table = LeafSubscriptionTable::new(authority.clone(), Arc::new(event_tx), refresher);
         let controller = tokio::spawn(
             ControllerLoop {
@@ -4683,7 +4701,7 @@ mod tests {
             freshness_demanded: Duration::from_secs(2),
             stale_after: Duration::from_secs(120),
         };
-        let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source, cadence);
+        let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source, cadence);
         let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx.clone()), refresher.clone());
         let connection_id = uuid::Uuid::new_v4();
         let mut events = event_tx.subscribe();
@@ -4719,7 +4737,7 @@ mod tests {
             freshness_demanded: Duration::from_secs(5),
             stale_after: Duration::from_secs(120),
         };
-        let refresher = ChangeRequestRefresher::new(backend.clone(), "authority".to_string(), source, cadence);
+        let refresher = ChangeRequestRefresher::new("fleet".to_string(), backend.clone(), "authority".to_string(), source, cadence);
         let table = LeafSubscriptionTable::new(backend.clone(), Arc::new(event_tx), refresher.clone());
         let connection_id = uuid::Uuid::new_v4();
         let request = WaitSubscriptionRequest {
@@ -4803,6 +4821,7 @@ mod tests {
             .expect("replicate authority CR");
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             reader.clone(),
             "kiwi".to_string(),
             Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) }),
@@ -4848,6 +4867,7 @@ mod tests {
             stale_after: Duration::from_secs(60),
         };
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "local-host".to_string(),
             Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) }),
@@ -4887,6 +4907,7 @@ mod tests {
         };
         let owner_calls = Arc::new(AtomicUsize::new(0));
         let owner_refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             owner.clone(),
             "owner".to_string(),
             Arc::new(CountingChangeRequests { calls: Arc::clone(&owner_calls) }),
@@ -4916,6 +4937,7 @@ mod tests {
             .expect("replicate owner observation");
         let reader_calls = Arc::new(AtomicUsize::new(0));
         let reader_refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             reader.clone(),
             "reader".to_string(),
             Arc::new(CountingChangeRequests { calls: Arc::clone(&reader_calls) }),
@@ -5005,6 +5027,7 @@ mod tests {
             .expect("replicate takeover");
         let (event_tx, _) = broadcast::channel(16);
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             former_owner.clone(),
             "former".to_string(),
             Arc::new(UnavailableChangeRequests),
@@ -5130,6 +5153,7 @@ mod tests {
             .expect("replicate stale takeover");
         let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             former.clone(),
             "former".to_string(),
             Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) }),
@@ -5216,6 +5240,7 @@ mod tests {
             stale_after: Duration::from_secs(2),
         };
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             reader.clone(),
             "reader".to_string(),
             Arc::new(CountingChangeRequests { calls: Arc::clone(&calls) }),
@@ -5256,6 +5281,7 @@ mod tests {
             .expect("replicate claim to old owner");
         let owner_calls = Arc::new(AtomicUsize::new(0));
         let old_owner = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             owner.clone(),
             "owner".to_string(),
             Arc::new(CountingChangeRequests { calls: Arc::clone(&owner_calls) }),
@@ -5273,6 +5299,7 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let (event_tx, mut events) = broadcast::channel(16);
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "authority".into(),
             Arc::new(UnavailableChangeRequests),
@@ -5341,6 +5368,7 @@ mod tests {
         let created = records.update_status(&name, &created.metadata.resource_version, &stale).await.expect("stale issue");
         let (event_tx, mut events) = broadcast::channel(16);
         let change_requests = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "cr-owner".into(),
             Arc::new(UnavailableChangeRequests),
@@ -5388,6 +5416,7 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let (event_tx, _) = broadcast::channel(4);
         let refresher = ChangeRequestRefresher::new(
+            "fleet".to_string(),
             backend.clone(),
             "authority".into(),
             Arc::new(UnavailableChangeRequests),

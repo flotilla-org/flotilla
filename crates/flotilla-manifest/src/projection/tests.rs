@@ -2081,3 +2081,217 @@ fn subject_project_is_unambiguous(tc: hegel::TestCase) {
         }
     }
 }
+
+// Behaviour (#2471): duplicate subject names select one complete observation,
+// independently of arrival order, and preserve the union of convoy history.
+#[hegel::test]
+fn duplicate_request_subjects_have_one_observation(tc: hegel::TestCase) {
+    use flotilla_protocol::Relationship;
+    use flotilla_resources::{
+        select_change_requests, ChangeRequest, ChangeRequestSpec, ChangeRequestSubjectHistory, InMemoryBackend, InputMeta, ResourceBackend,
+    };
+    use hegel::generators as gs;
+
+    // Cover empty/single/many records, equal and unequal timestamps, multiple
+    // authorities, known/unknown fields, unrelated subject numbers, and rotations.
+    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
+    let offset = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
+    let now: Timestamp = "2026-10-02T12:00:00Z".parse().expect("time");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+    let mut records = Vec::new();
+    let mut expected = BTreeMap::new();
+    for index in 0..count {
+        let stamp = tc.draw(gs::integers::<i64>().min_value(0).max_value(2));
+        let authority = tc.draw(gs::integers::<usize>().min_value(0).max_value(2)).to_string();
+        let number = tc.draw(gs::integers::<u64>().min_value(42).max_value(43));
+        let known = tc.draw(gs::booleans());
+        let canonical = index == 0 && tc.draw(gs::booleans());
+        let name = if canonical {
+            flotilla_resources::change_request_record_name("github", "org/repo", number)
+        } else {
+            format!("duplicate-{index}")
+        };
+        let mut record = runtime
+            .block_on(
+                backend.using::<ChangeRequest>("dev").create(
+                    &InputMeta::builder().name(name.clone()).build(),
+                    &ChangeRequestSpec::builder()
+                        .service("github".into())
+                        .scope("org/repo".into())
+                        .number(number)
+                        .observing_authority(authority.clone())
+                        .subject_of(vec![ChangeRequestSubjectHistory::builder()
+                            .namespace("dev".into())
+                            .convoy(format!("convoy-{index}"))
+                            .origin("kiwi".into())
+                            .relationship(Relationship::Produces)
+                            .role("coder".into())
+                            .last_seen(now)
+                            .build()])
+                        .build(),
+                ),
+            )
+            .expect("record");
+        let at = now + std::time::Duration::from_secs(stamp as u64);
+        record.status = Some(ChangeRequestStatus {
+            title: if known { Observation::known(name.clone(), at) } else { Observation::unknown(at) },
+            author: Observation::default(),
+            state: Observation::known(ObservedChangeRequestState::Open, at),
+            checks: Observation::unknown(at),
+            mergeable: Observation::unknown(at),
+            head_sha: Observation::unknown(at),
+            review: ChangeRequestReviewObservation { actionable_at_head: Observation::unknown(at) },
+            review_decision: Observation::unknown(at),
+            review_requested_from_owner: Observation::unknown(at),
+        });
+        record.spec.subject_of.push(
+            ChangeRequestSubjectHistory::builder()
+                .namespace("dev".into())
+                .convoy("shared-producer".into())
+                .origin("kiwi".into())
+                .relationship(Relationship::Produces)
+                .role("coder".into())
+                .last_seen(at)
+                .build(),
+        );
+        let rank = (stamp, authority, canonical, name);
+        let winner = expected.entry(number).or_insert((rank.clone(), record.status.clone()));
+        if rank > winner.0 {
+            *winner = (rank, record.status.clone());
+        }
+        records.push(record);
+    }
+    let selected = select_change_requests(&records);
+    // The returned source tag is the exact winner, even when observations tie.
+    for (_, (object, index)) in
+        flotilla_resources::select_change_request_sources(records.iter().enumerate().map(|(index, object)| (object, index)))
+    {
+        assert_eq!(object.metadata.name, records[index].metadata.name);
+        assert_eq!(object.status, records[index].status);
+    }
+    for (subject, record) in &selected {
+        let number = subject.id.parse::<u64>().expect("number");
+        assert_eq!(record.status, expected[&number].1);
+        assert_eq!(record.spec.subject_of.len(), records.iter().filter(|record| record.spec.number == number).count() + 1);
+        let latest = records
+            .iter()
+            .filter(|record| record.spec.number == number)
+            .flat_map(|record| &record.spec.subject_of)
+            .filter(|entry| entry.convoy == "shared-producer")
+            .map(|entry| entry.last_seen)
+            .max()
+            .expect("producer history");
+        assert_eq!(
+            record.spec.subject_of.iter().find(|entry| entry.convoy == "shared-producer").expect("merged history").last_seen,
+            latest
+        );
+    }
+    let convoys = [42, 43].map(|number| {
+        let mut row =
+            ConvoyRow::builder().resource(convoy_ref("dev", "live")).name("live").workflow_ref("dev").phase(ConvoyPhase::Active).build();
+        row.subjects.push(flotilla_protocol::result_set::ConvoySubjectRow {
+            subject: flotilla_protocol::Subject {
+                kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                source: IssueSource { service: "github".into(), scope: "org/repo".into() },
+                id: number.to_string(),
+            },
+            relationship: Relationship::Produces,
+            declared: false,
+            short: number.to_string(),
+            url: None,
+            repository_key: None,
+        });
+        row
+    });
+    let observations = SubjectCatalogInput { change_requests: records.clone(), ..Default::default() };
+    let mut input = catalog_input(&convoys);
+    input.subjects = Some(&observations);
+    let patches = project_catalog(&input, &mint()).reassert_patches();
+    for (number, (_, status)) in &expected {
+        let patch = find_entity(&patches, &entity::change_request("github", "org/repo", &number.to_string()));
+        let expected_title = status.as_ref().expect("status").title.value.as_deref();
+        assert_eq!(
+            patch.set.get("flotilla.change_request.title").and_then(|value| match &value.value {
+                MetadataValue::Text(text) => Some(text.as_str()),
+                _ => None,
+            }),
+            expected_title
+        );
+    }
+    records.reverse();
+    if count > 0 {
+        records.rotate_left(offset % count);
+    }
+    assert_eq!(
+        serde_json::to_value(select_change_requests(&records).into_values().collect::<Vec<_>>()).expect("json"),
+        serde_json::to_value(selected.into_values().collect::<Vec<_>>()).expect("json")
+    );
+}
+
+// Behaviour (ADR 0051): an open produced request outlives its deleted convoy,
+// preserves reverse links, and vanishes when merged/closed. Unknown is retained
+// conservatively by storage but is not presented as an observed open orphan.
+#[test]
+fn orphaned_request_keeps_departed_convoy_edge_until_terminal() {
+    use flotilla_protocol::Relationship;
+    use flotilla_resources::{ChangeRequest, ChangeRequestSpec, ChangeRequestSubjectHistory, InMemoryBackend, InputMeta, ResourceBackend};
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+    let now = "2026-10-02T12:00:00Z".parse().expect("time");
+    let mut record = runtime
+        .block_on(
+            backend.using::<ChangeRequest>("dev").create(
+                &InputMeta::builder().name("noncanonical".into()).build(),
+                &ChangeRequestSpec::builder()
+                    .service("github".into())
+                    .scope("org/repo".into())
+                    .number(42)
+                    .observing_authority("node".into())
+                    .subject_of(vec![ChangeRequestSubjectHistory::builder()
+                        .namespace("dev".into())
+                        .convoy("departed".into())
+                        .origin("kiwi".into())
+                        .relationship(Relationship::Produces)
+                        .role("coder".into())
+                        .last_seen(now)
+                        .build()])
+                    .build(),
+            ),
+        )
+        .expect("record");
+    let cr = entity::change_request("github", "org/repo", "42");
+    for state in [
+        ObservedChangeRequestState::Open,
+        ObservedChangeRequestState::Draft,
+        ObservedChangeRequestState::Merged,
+        ObservedChangeRequestState::Closed,
+    ] {
+        record.status = Some(ChangeRequestStatus {
+            title: Observation::default(),
+            author: Observation::default(),
+            state: Observation::known(state, now),
+            checks: Observation::default(),
+            mergeable: Observation::default(),
+            head_sha: Observation::default(),
+            review: ChangeRequestReviewObservation { actionable_at_head: Observation::default() },
+            review_decision: Observation::default(),
+            review_requested_from_owner: Observation::default(),
+        });
+        let observations = SubjectCatalogInput { change_requests: vec![record.clone()], now: Some(now), ..Default::default() };
+        let mut input = catalog_input(&[]);
+        input.subjects = Some(&observations);
+        let catalog = project_catalog(&input, &mint());
+        let patches = catalog.reassert_patches();
+        if matches!(state, ObservedChangeRequestState::Open | ObservedChangeRequestState::Draft) {
+            let patch = find_entity(&patches, &cr);
+            assert_eq!(patch.set["flotilla.orphaned"].value, MetadataValue::Bool(true));
+            assert_eq!(
+                patch.set["flotilla.subject_of.produces"].value,
+                MetadataValue::EntityRefs(vec![entity::convoy("dev", "departed", "kiwi")])
+            );
+        } else {
+            assert!(!patches.iter().any(|patch| patch.target == MetadataTarget::Entity(cr.clone())));
+        }
+    }
+}

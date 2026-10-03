@@ -200,6 +200,7 @@ pub const KEY_SUBJECT_ADOPTS: &str = "flotilla.subject.adopts";
 pub const KEY_SUBJECT_WORKS_ON: &str = "flotilla.subject.works_on";
 pub const KEY_SUBJECT_SUPERSEDES: &str = "flotilla.subject.supersedes";
 pub const KEY_SUBJECT_REFERENCES: &str = "flotilla.subject.references";
+pub const KEY_SUBJECT_ORPHANED: &str = "flotilla.orphaned";
 pub const KEY_SUBJECT_OF: &str = "flotilla.subject_of";
 pub const KEY_SUBJECT_OF_PRODUCES: &str = "flotilla.subject_of.produces";
 pub const KEY_SUBJECT_OF_ADOPTS: &str = "flotilla.subject_of.adopts";
