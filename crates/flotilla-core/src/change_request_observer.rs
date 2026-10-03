@@ -1451,6 +1451,19 @@ mod tests {
         .expect("request reached expected state before deadline");
     }
 
+    // Wait for observable progress, with a deadline shorter than any refresh cadence.
+    async fn wait_for_calls(calls: &AtomicUsize, count: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) < count {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("observer call before deadline");
+        // Let the completed observation publish and arm its next timer.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
     async fn wait_for_observation(source: &MutableSource, count: usize) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while source.1.load(Ordering::SeqCst) < count {
@@ -1683,18 +1696,14 @@ mod tests {
             number: 1366,
         };
         refresher.demand(uuid::Uuid::new_v4(), subject.clone(), None).await.expect("demand");
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 1).await;
         let records = backend.using::<ChangeRequest>("flotilla");
         let first = records.get(&subject.record_name()).await.expect("first observation");
 
         const IDENTICAL_POLLS: usize = 4;
-        for _ in 0..IDENTICAL_POLLS {
+        for poll in 0..IDENTICAL_POLLS {
             tokio::time::advance(Duration::from_secs(90)).await;
-            for _ in 0..5 {
-                tokio::task::yield_now().await;
-            }
+            wait_for_calls(&calls, poll + 2).await;
         }
 
         let after = records.get(&subject.record_name()).await.expect("observation after identical polls");
@@ -1722,24 +1731,16 @@ mod tests {
             number: 2051,
         };
         refresher.demand(uuid::Uuid::new_v4(), subject, None).await.expect("demand");
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 1).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         tokio::time::advance(Duration::from_secs(90)).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "healthy relay uses slow backstop");
         refresher.set_relay_healthy(false);
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 2).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "disconnect wakes the normal refresher");
         tokio::time::advance(Duration::from_secs(90)).await;
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 3).await;
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
@@ -1769,9 +1770,7 @@ mod tests {
                 .await
                 .expect("demand");
         }
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 2).await;
         let before = calls.load(Ordering::SeqCst);
         let hint = Subject::new(SubjectKind::ChangeRequest, "github.com", "flotilla-org/flotilla", 2051);
         refresher.refresh_hint(&hint).await.expect("hint");
@@ -1790,11 +1789,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn freshness_demand_heartbeats_identical_observations() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let calls = Arc::new(AtomicUsize::new(0));
         let refresher = ChangeRequestRefresher::new(
             "fleet".to_string(),
             backend.clone(),
             "authority".to_string(),
-            Arc::new(CountingSource(Arc::new(AtomicUsize::new(0)))),
+            Arc::new(CountingSource(Arc::clone(&calls))),
             ChangeRequestRefreshCadence::default(),
         );
         let subject = ChangeRequestRef {
@@ -1804,16 +1804,12 @@ mod tests {
             number: 1699,
         };
         refresher.demand(uuid::Uuid::new_v4(), subject.clone(), Some(Utc::now())).await.expect("freshness demand");
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 1).await;
         let records = backend.using::<ChangeRequest>("flotilla");
         let first = records.get(&subject.record_name()).await.expect("first observation");
 
         tokio::time::advance(Duration::from_secs(10)).await;
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 2).await;
         let heartbeat = records.get(&subject.record_name()).await.expect("heartbeat observation");
 
         assert_ne!(heartbeat.metadata.resource_version, first.metadata.resource_version);
@@ -1843,16 +1839,12 @@ mod tests {
             number: 1366,
         };
         refresher.demand(uuid::Uuid::new_v4(), subject.clone(), None).await.expect("initial demand");
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 1).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         tokio::time::advance(Duration::from_secs(5)).await;
         refresher.demand(uuid::Uuid::new_v4(), subject, Some(Utc::now())).await.expect("late freshness demand");
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        wait_for_calls(&calls, 2).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "freshness demand must preempt the remaining 85-second sleep");
     }
 
