@@ -14,6 +14,25 @@ use crate::{
     AttachableSetId, IssueRef, PlacementDecision, PrincipalRef, RepoIdentity,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct TurnDeliveryRequest {
+    pub namespace: String,
+    pub convoy: String,
+    pub source: String,
+    pub vessel: String,
+    pub role: String,
+    pub brief: String,
+    pub subject_revision: String,
+    pub sender: crate::CrewMessageSender,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TurnDeliveryRung {
+    WarmSession,
+    FreshAgent,
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -841,6 +860,10 @@ pub enum CommandAction {
         proposed_disposition: Option<StallProposedDisposition>,
         message: String,
     },
+    /// Internal controller delivery, routed to the target Convoy's home.
+    DeliverCrewTurn {
+        request: TurnDeliveryRequest,
+    },
     CrewSupervise {
         namespace: Option<String>,
         convoy: String,
@@ -1089,6 +1112,7 @@ impl Command {
             CommandAction::CrewComplete { .. } => "Completing crew work...",
             CommandAction::CrewFail { .. } => "Failing crew work...",
             CommandAction::CrewStall { .. } => "Stalling crew work...",
+            CommandAction::DeliverCrewTurn { .. } => "Delivering crew turn...",
             CommandAction::CrewSupervise { .. } => "Supervising crew work...",
             CommandAction::ConvoyCreate { .. } => "Creating convoy...",
             CommandAction::ConvoyStart { .. } => "Starting convoy...",
@@ -1179,6 +1203,9 @@ impl AttachBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandValue {
+    CrewTurnDelivered {
+        rung: TurnDeliveryRung,
+    },
     Ok,
     CrewFollowUpDelivered,
     /// The claim is still unmet; a CLI caller waits and retries at this deadline.

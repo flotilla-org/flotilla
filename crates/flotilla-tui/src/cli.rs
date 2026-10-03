@@ -1099,6 +1099,7 @@ fn repo_label(path: Option<&std::path::Path>, identity: &flotilla_protocol::Repo
 fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> String {
     use flotilla_protocol::commands::CommandValue;
     match result {
+        CommandValue::CrewTurnDelivered { rung } => format!("Crew turn delivered: {rung:?}"),
         CommandValue::Ok => "ok".to_string(),
         CommandValue::CrewFollowUpDelivered => flotilla_protocol::commands::CREW_FOLLOW_UP_INSTRUCTION.to_string(),
         CommandValue::CrewCompletionWaiting { reason, retry_at } => format!("crew completion waiting until {retry_at}: {reason}"),

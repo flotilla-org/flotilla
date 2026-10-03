@@ -7282,7 +7282,9 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     let status = wait_for_stall(&backend, "idle-crew", true).await;
     let stalled = status.stalled.expect("stalled");
     assert!(matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Actor { ref role, .. }) if role == "coder"));
-    assert_eq!(stalled.evidence, "idle");
+    // The projectless fixture keeps its idle evidence and explains why the
+    // default ProjectCrew rung cannot supply a supervisor (#2522).
+    assert_eq!(stalled.evidence, "idle; cannot find governor: convoy has no project_ref");
     assert_eq!(stalled.source, flotilla_resources::StallEvidenceSource::Screen);
     let mut events = daemon.event_tx.subscribe();
     let subscription = daemon

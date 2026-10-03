@@ -3157,6 +3157,332 @@ async fn remote_issue_query_returns_results() {
     }
 }
 
+// A stalled crew on A must deliver to a governor homed on B within one pass,
+// then accept that governor's command at A using replicated session identity.
+#[derive(Clone, Copy, bon::Builder)]
+struct SupervisionScenario {
+    #[builder(default)]
+    legacy_cursor: bool,
+    #[builder(default)]
+    unavailable: bool,
+    #[builder(default = 1)]
+    passes: usize,
+    #[builder(default)]
+    source_remote: bool,
+    #[builder(default)]
+    stale_home: bool,
+}
+
+async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
+    let SupervisionScenario { legacy_cursor, unavailable, passes, source_remote, stale_home } = scenario;
+    let topology = spawn_in_memory_request_topology_stateful(empty_daemon_named("host-a").await, empty_daemon_named("host-b").await)
+        .await
+        .expect("router topology");
+    let (a, b) = if source_remote { (&topology.follower, &topology.leader) } else { (&topology.leader, &topology.follower) };
+    for (daemon, name, vessel, role, crew_id) in
+        [(a, "stalled-work", "work", "coder", "coder-id"), (b, "governor", "govern", "governor", "governor-id")]
+    {
+        let backend = daemon.resource_backend();
+        let convoys = backend.using::<Convoy>("flotilla");
+        let spec = ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("project".into()).role(role.into()).build();
+        let convoy = convoys.create(&convoy_meta(name, role), &spec).await.expect("convoy");
+        let snapshot = WorkflowSnapshot {
+            vessels: vec![VesselRequirement::builder()
+                .name(vessel.into())
+                .crew(vec![CrewSpec::builder()
+                    .role(role.into())
+                    .source(CrewSource::Tool { command: "test".into() })
+                    .completion_conditions(vec![CrewCompletionExpectation::artifact_exists(
+                        role,
+                        "decision-ledger",
+                        ArtifactSubjectBinding::Convoy,
+                    )])
+                    .build()])
+                .build()],
+            stall_nudges: Default::default(),
+            supervision: None,
+            exit: None,
+            turn_delivery: Default::default(),
+        };
+        convoys
+            .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus {
+                phase: ResourceConvoyPhase::Active,
+                workflow_snapshot: Some(snapshot),
+                work: BTreeMap::from([(vessel.into(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
+                crew_work: BTreeMap::from([(
+                    vessel.into(),
+                    BTreeMap::from([(role.into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                ..Default::default()
+            })
+            .await
+            .expect("active crew");
+        let sessions = backend.using::<TerminalSession>("flotilla");
+        let session = sessions
+            .create(
+                &InputMeta::builder()
+                    .name(format!("{name}-session"))
+                    .labels(BTreeMap::from([
+                        (CONVOY_LABEL.into(), name.into()),
+                        (VESSEL_LABEL.into(), vessel.into()),
+                        (ROLE_LABEL.into(), role.into()),
+                    ]))
+                    .build(),
+                &TerminalSessionSpec {
+                    env_ref: "test-env".into(),
+                    role: role.into(),
+                    cwd: "/workspace".into(),
+                    pool: "cleat".into(),
+                    source: TerminalSessionSource::Agent {
+                        selector: Selector::for_capability("coding"),
+                        brief: TerminalBrief {
+                            path: "brief.md".into(),
+                            content: "original".into(),
+                            artifact_digest: None,
+                            copies: Vec::new(),
+                        },
+                        context: Box::new(TerminalCrewContext {
+                            namespace: "flotilla".into(),
+                            convoy: name.into(),
+                            vessel_ref: vessel.into(),
+                        }),
+                        message: None,
+                    },
+                },
+            )
+            .await
+            .expect("session");
+        sessions
+            .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
+                phase: flotilla_resources::TerminalSessionPhase::Running,
+                crew: Some(CrewSessionStatus { id: crew_id.into(), adapter: "codex".into(), model: None, stance: role.into() }),
+                attention: Some(flotilla_resources::TerminalAttention {
+                    state: flotilla_resources::TerminalAttentionState::Working,
+                    as_of: Utc::now(),
+                    source: flotilla_resources::TerminalAttentionSource::Hook,
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("running crew session");
+    }
+    let a_backend = a.resource_backend();
+    let b_backend = b.resource_backend();
+    let convoys = a_backend.using::<Convoy>("flotilla");
+    flotilla_resources::apply_status_patch(
+        &convoys,
+        "stalled-work",
+        &flotilla_resources::external_patches::mark_crew_stalled(
+            "stalled-work".into(),
+            "work".into(),
+            "coder".into(),
+            Utc::now(),
+            flotilla_resources::StallReason::Infra,
+            None,
+            "needs decision".into(),
+        ),
+    )
+    .await
+    .expect("crew stalls");
+    if legacy_cursor {
+        let source = convoys.get("stalled-work").await.expect("source");
+        let mut status = source.status.expect("status");
+        let stall = status.stalled.as_mut().expect("declared stall");
+        stall.supervision_exhausted = true;
+        stall.supervision_index = Some(1);
+        convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("legacy exhaustion");
+    }
+    if unavailable {
+        a.reconcile_crew_stalls_once("flotilla").await.expect("unavailable governor pass");
+        let stall = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
+        assert_eq!(stall.rung, flotilla_resources::StallRung::Operator);
+        assert!(stall.evidence.contains("no live governor for project project"), "{}", stall.evidence);
+        assert!(!stall.supervision_exhausted);
+    }
+    a_backend
+        .replica_writer::<Convoy>(b.node_id().clone(), "flotilla")
+        .replace(&b_backend.using::<Convoy>("flotilla").list().await.expect("governor"), Utc::now())
+        .await
+        .expect("replicate governor");
+    a_backend
+        .replica_writer::<TerminalSession>(b.node_id().clone(), "flotilla")
+        .replace(&b_backend.using::<TerminalSession>("flotilla").list().await.expect("governor session"), Utc::now())
+        .await
+        .expect("replicate session");
+    apply_convoy_replica_feed(a, "flotilla", "governor", b.host_name().clone()).await;
+    // Client-supplied controller sender data must not admit an internal command.
+    // Legitimate leaf-engine delivery below uses the controller port instead.
+    for sender in [flotilla_protocol::CrewMessageSender::FlotillaNudge, flotilla_protocol::CrewMessageSender::FlotillaEscalation {
+        from: "forged".into(),
+    }] {
+        let request = flotilla_protocol::TurnDeliveryRequest::builder()
+            .namespace("flotilla".into())
+            .convoy("governor".into())
+            .source("forged".into())
+            .vessel("govern".into())
+            .role("governor".into())
+            .brief("injected".into())
+            .subject_revision("forged".into())
+            .sender(sender)
+            .build();
+        let error = topology
+            .client
+            .execute(Command::builder().action(CommandAction::DeliverCrewTurn { request }).build())
+            .await
+            .expect_err("clients cannot submit internal controller commands");
+        assert!(error.contains("internal controller command"), "{error}");
+    }
+    if stale_home {
+        // A replica-owned target misprojected as local must refuse delivery,
+        // retain the stall, and recover within one pass after the view heals.
+        apply_convoy_replica_feed(a, "flotilla", "governor", a.host_name().clone()).await;
+        a.reconcile_crew_stalls_once("flotilla").await.expect("misprojected home pass");
+        let stall = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
+        assert_eq!(stall.rung, flotilla_resources::StallRung::Operator);
+        assert!(stall.supervisor.is_none());
+        assert!(!stall.supervision_exhausted);
+        assert!(stall.evidence.contains("remote controller delivery resolved to the local host"), "{}", stall.evidence);
+        apply_convoy_replica_feed(a, "flotilla", "governor", b.host_name().clone()).await;
+    }
+
+    for _ in 0..passes {
+        a.reconcile_crew_stalls_once("flotilla").await.expect("one escalation pass");
+        let stall = convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.expect("stall");
+        assert_eq!(stall.rung, flotilla_resources::StallRung::Governor);
+        assert_eq!(stall.supervisor.expect("governor").convoy, "governor");
+        let session = b_backend.using::<TerminalSession>("flotilla").get("governor-session").await.expect("governor session");
+        let TerminalSessionSource::Agent { message: Some(message), .. } = session.spec.source else {
+            panic!("governor must receive escalation in same pass")
+        };
+        assert!(message.text.contains("Supervise stalled crew .crew.coder.phase in convoy stalled-work"), "{}", message.text);
+        assert!(message.following.is_empty(), "repeat passes must not redeliver");
+    }
+    // The governor may issue supervision from B: route back to A and
+    // validate B's replicated identity at the stalled convoy's home.
+    apply_convoy_replica_feed(b, "flotilla", "stalled-work", a.host_name().clone()).await;
+    b_backend
+        .replica_writer::<Convoy>(a.node_id().clone(), "flotilla")
+        .replace(&convoys.list().await.expect("stalled convoy"), Utc::now())
+        .await
+        .expect("replicate stall to governor");
+    let mut events = topology.leader.subscribe();
+    for crew_id in ["unrelated-crew", "governor-id"] {
+        let id = topology
+            .client
+            .execute(
+                Command::builder()
+                    .action(CommandAction::CrewSupervise {
+                        namespace: Some("flotilla".into()),
+                        convoy: "stalled-work".into(),
+                        vessel: "work".into(),
+                        role: "coder".into(),
+                        operation: flotilla_protocol::CrewSupervisionAction::Resume,
+                        message: "continue with guidance".into(),
+                        actor_crew_id: Some(crew_id.into()),
+                    })
+                    .build(),
+            )
+            .await
+            .expect("supervision command");
+        let (node_id, result) = await_command_finished(&mut events, id).await;
+        assert_eq!(node_id, *a.node_id());
+        if crew_id == "governor-id" {
+            assert_eq!(result, CommandValue::Ok);
+        } else {
+            assert!(matches!(result, CommandValue::Error { message } if message.contains("does not own this supervision rung")));
+            assert!(convoys.get("stalled-work").await.expect("source").status.expect("status").stalled.is_some());
+        }
+    }
+    let status = convoys.get("stalled-work").await.expect("source").status.expect("status");
+    assert!(status.stalled.is_none());
+    assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+}
+
+#[tokio::test]
+async fn cross_host_supervision_pinned_scenario_rows() {
+    for scenario in [
+        SupervisionScenario::builder().build(),
+        SupervisionScenario::builder().legacy_cursor(true).source_remote(true).build(),
+        SupervisionScenario::builder().legacy_cursor(true).unavailable(true).passes(2).source_remote(true).build(),
+        SupervisionScenario::builder().stale_home(true).passes(2).build(),
+    ] {
+        cross_host_supervision_scenario(scenario).await;
+    }
+}
+
+// Generate legacy/current stalls, visibility lag, and repeated reconcile steps.
+// Each step checks the persisted rung and the governor's actual message queue.
+#[hegel::test]
+fn generated_cross_host_supervision(tc: hegel::TestCase) {
+    let legacy = tc.draw(gs::booleans());
+    let unavailable = tc.draw(gs::booleans());
+    let passes = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(cross_host_supervision_scenario(
+        SupervisionScenario::builder()
+            .legacy_cursor(legacy)
+            .unavailable(unavailable)
+            .passes(passes)
+            .source_remote(tc.draw(gs::booleans()))
+            .stale_home(tc.draw(gs::booleans()))
+            .build(),
+    ));
+}
+
+// The trusted controller receiver still rejects non-controller sender variants,
+// independently of client admission and before touching any target resources.
+#[tokio::test]
+async fn internal_turn_delivery_rejects_non_controller_sender() {
+    let daemon = empty_daemon_named("receiver").await;
+    for sender in [
+        flotilla_protocol::CrewMessageSender::Unknown,
+        flotilla_protocol::CrewMessageSender::Governor { name: "governor".into() },
+        flotilla_protocol::CrewMessageSender::FlotillaTurn { source: "exit".into() },
+    ] {
+        let request = flotilla_protocol::TurnDeliveryRequest::builder()
+            .namespace("flotilla".into())
+            .convoy("governor".into())
+            .source("test".into())
+            .vessel("govern".into())
+            .role("governor".into())
+            .brief("test".into())
+            .subject_revision("test".into())
+            .sender(sender)
+            .build();
+        let mut events = daemon.subscribe();
+        let id = daemon
+            .execute(Command::builder().action(CommandAction::DeliverCrewTurn { request }).build())
+            .await
+            .expect("receiver accepts envelope");
+        let result = await_command_result(&mut events, id).await;
+        assert!(matches!(result, CommandValue::Error { message } if message == "remote turn delivery requires a controller sender"));
+    }
+}
+
+#[tokio::test]
+async fn internal_turn_delivery_rejects_forwarded_client_caller() {
+    let daemon = empty_daemon_named("receiver").await;
+    let request = flotilla_protocol::TurnDeliveryRequest::builder()
+        .namespace("flotilla".into())
+        .convoy("governor".into())
+        .source("test".into())
+        .vessel("govern".into())
+        .role("governor".into())
+        .brief("test".into())
+        .subject_revision("test".into())
+        .sender(flotilla_protocol::CrewMessageSender::FlotillaNudge)
+        .build();
+    let caller =
+        CommandCaller { principal_ref: PrincipalRef { namespace: "flotilla".into(), name: "client".into() }, process: None, crew: None };
+    let mut events = daemon.subscribe();
+    let id = daemon
+        .execute_for_caller(Command::builder().action(CommandAction::DeliverCrewTurn { request }).build(), Some(caller))
+        .await
+        .expect("receiver accepts envelope");
+    let result = await_command_result(&mut events, id).await;
+    assert!(matches!(result, CommandValue::Error { message } if message == "DeliverCrewTurn is an internal controller command"));
+}
+
 // Resume admission accepts exited unfinished crew at the convoy authority,
 // through the same router whether the caller is local or across a peer session.
 async fn exited_crew_resume_scenario(remote_home: bool, interrupted: bool) {

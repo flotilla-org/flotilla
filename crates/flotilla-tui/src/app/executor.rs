@@ -156,6 +156,7 @@ pub fn handle_attach_dispatch_completion(session_id: uuid::Uuid, result: Result<
 pub fn handle_result(result: CommandValue, app: &mut App) {
     match result {
         CommandValue::Ok
+        | CommandValue::CrewTurnDelivered { .. }
         | CommandValue::ResourceReconciled { .. }
         | CommandValue::ConvoyBriefDelivered { .. }
         | CommandValue::ConvoyBriefQueued { .. }

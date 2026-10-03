@@ -39,6 +39,7 @@ fn command_action_name(command: &Command) -> &'static str {
         CommandAction::CrewComplete { .. } => "crew_complete",
         CommandAction::CrewFail { .. } => "crew_fail",
         CommandAction::CrewStall { .. } => "crew_stall",
+        CommandAction::DeliverCrewTurn { .. } => "deliver_crew_turn",
         CommandAction::CrewSupervise { .. } => "crew_supervise",
         CommandAction::CrewHandoff { .. } => "crew_handoff",
         CommandAction::ResourceApply { .. } => "resource_apply",
@@ -57,6 +58,7 @@ fn command_subject(action: &CommandAction) -> String {
         | CommandAction::ConvoyResume { namespace, name, .. } => {
             format!("convoy:{}/{}", namespace.as_deref().unwrap_or("default"), name)
         }
+        CommandAction::DeliverCrewTurn { request } => format!("convoy:{}/{}", request.namespace, request.convoy),
         CommandAction::CrewSupervise { namespace, convoy, .. } => {
             format!("convoy:{}/{}", namespace.as_deref().unwrap_or("default"), convoy)
         }
@@ -89,8 +91,8 @@ pub(super) struct PendingRemoteCommand {
     pub(super) repo_identity: Option<RepoIdentity>,
     pub(super) repo: Option<PathBuf>,
     pub(super) finished_via_event: bool,
-    /// When set, the originator is waiting for a direct query result rather
-    /// than a broadcast `CommandFinished` event.  `complete_remote_command`
+    /// When set, the originator is waiting for a direct acknowledgement rather
+    /// than a broadcast `CommandFinished` event. `complete_remote_command`
     /// resolves this instead of broadcasting.
     pub(super) query_completion: Option<oneshot::Sender<CommandValue>>,
     pub(super) crew_completion: Option<PendingCrewCompletionRoute>,
@@ -175,6 +177,10 @@ type ForwardedRemoteStepBatchMap = Arc<Mutex<HashMap<u64, ForwardedRemoteStepBat
 
 #[derive(Clone)]
 pub(super) struct RemoteCommandRouter {
+    inner: Arc<RemoteCommandRouterInner>,
+}
+
+pub(super) struct RemoteCommandRouterInner {
     daemon: Arc<InProcessDaemon>,
     peer_manager: Arc<Mutex<PeerManager>>,
     pending_remote_commands: PendingRemoteCommandMap,
@@ -190,6 +196,33 @@ pub(super) struct RemoteCommandRouter {
     blob_store: Arc<OnceLock<Arc<TieredBlobStore>>>,
 }
 
+impl std::ops::Deref for RemoteCommandRouter {
+    type Target = RemoteCommandRouterInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[async_trait]
+impl flotilla_core::leaf_engine::RemoteTurnDelivery for RemoteCommandRouterInner {
+    async fn deliver(
+        self: Arc<Self>,
+        request: &flotilla_core::leaf_engine::TurnDeliveryRequest,
+    ) -> Result<flotilla_resources::TurnDeliveryRung, String> {
+        let router = RemoteCommandRouter { inner: self };
+        let command = Command::builder().action(CommandAction::DeliverCrewTurn { request: request.clone() }).build();
+        // Controller deliveries have no interactive surface. Pending commands
+        // and their oneshots are keyed by unique request_id, not session_id;
+        // session_id is used only for query projection at the receiver.
+        match router.dispatch_and_wait(command, uuid::Uuid::nil()).await? {
+            CommandValue::CrewTurnDelivered { rung } => Ok(rung),
+            CommandValue::Error { message } => Err(message),
+            value => Err(format!("unexpected remote turn delivery result: {value:?}")),
+        }
+    }
+}
+
 impl RemoteCommandRouter {
     pub(super) fn new(
         daemon: Arc<InProcessDaemon>,
@@ -199,7 +232,7 @@ impl RemoteCommandRouter {
         pending_remote_cancels: PendingRemoteCancelMap,
         next_remote_command_id: Arc<AtomicU64>,
     ) -> Self {
-        Self {
+        let inner = Arc::new(RemoteCommandRouterInner {
             daemon,
             peer_manager,
             pending_remote_commands,
@@ -212,7 +245,10 @@ impl RemoteCommandRouter {
             next_remote_command_id,
             retrying_crew_completions: Arc::new(StdMutex::new(HashMap::new())),
             blob_store: Arc::new(OnceLock::new()),
-        }
+        });
+        let delivery: Arc<dyn flotilla_core::leaf_engine::RemoteTurnDelivery> = inner.clone();
+        inner.daemon.set_remote_turn_delivery(Arc::downgrade(&delivery));
+        Self { inner }
     }
 
     pub(super) fn install_blob_store(&self, store: Arc<TieredBlobStore>) -> Result<(), String> {
@@ -335,6 +371,9 @@ impl RemoteCommandRouter {
         mut command: Command,
         caller: Option<flotilla_protocol::CommandCaller>,
     ) -> Result<u64, String> {
+        if matches!(command.action, CommandAction::DeliverCrewTurn { .. }) {
+            return Err("DeliverCrewTurn is an internal controller command".into());
+        }
         let dispatching_principal_ref = caller.as_ref().map(|caller| caller.principal_ref.clone());
         let mut crew_completion = self.resolve_crew_command_routing(&mut command.action).await?;
         if let Some(completion) = &mut crew_completion {
@@ -378,13 +417,14 @@ impl RemoteCommandRouter {
         }
     }
 
-    /// Dispatch a query command and return the result synchronously.
-    ///
-    /// For local targets this calls `execute_query` directly.  For remote
-    /// targets the command is forwarded via the peer manager and we wait on a
-    /// oneshot for the `CommandResponse` to arrive — no `CommandFinished`
-    /// broadcast is synthesised.
-    pub(super) async fn dispatch_query(&self, mut command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
+    pub(super) async fn dispatch_query(&self, command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
+        self.dispatch_and_wait(command, session_id).await
+    }
+
+    /// Return the destination's acknowledgement for a remote command or query.
+    /// Local queries retain surface projection; controller mutations must resolve
+    /// remotely, since this port is invoked only for replica-owned targets.
+    async fn dispatch_and_wait(&self, mut command: Command, session_id: uuid::Uuid) -> Result<CommandValue, String> {
         self.resolve_crew_command_routing(&mut command.action).await?;
         let target =
             self.daemon.resolve_command_target(&command.action, command.node_id.as_ref()).await.map_err(|error| error.to_string())?;
@@ -394,12 +434,16 @@ impl RemoteCommandRouter {
         };
         let crew_convoy = match &command.action {
             CommandAction::QueryCrewList { context } => context.convoy.clone(),
+            CommandAction::DeliverCrewTurn { request } => Some(request.convoy.clone()),
             _ => None,
         };
         let target_node_id = self.target_node_id(&target.host).await.map_err(|error| error.to_string())?;
         command.node_id = if matches!(&target.host, TargetHost::Local) { None } else { Some(target_node_id.clone()) };
 
         if target_node_id == *self.daemon.node_id() {
+            if !command.action.is_query() {
+                return Err("remote controller delivery resolved to the local host".into());
+            }
             return self.execute_projected_query(command, session_id).await;
         }
 

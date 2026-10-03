@@ -244,7 +244,7 @@ pub use commands::{
     ExplainedLifecycleMutation, ExplainedSettlement, ExplainedSubscription, ExplainedTerminalCondition, ExplainedUnclaimedWork,
     ExplainedUnmetExpectation, IssueSelector, ManifestResolution, PreparedTerminalCommand, PreparedWorkspace, RepoSelector,
     ResolvedPaneCommand, ResourceCursor, ResourceJsonResponse, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordProvenance,
-    ResourceRecordType, StallProposedDisposition, StallReason, StepStatus,
+    ResourceRecordType, StallProposedDisposition, StallReason, StepStatus, TurnDeliveryRequest, TurnDeliveryRung,
 };
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{

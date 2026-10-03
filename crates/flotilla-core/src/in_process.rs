@@ -1714,6 +1714,9 @@ pub struct InProcessDaemon {
     /// deltas without disturbing unrelated provider snapshot state.
     managed_terminals_by_repo: RwLock<HashMap<RepoIdentity, HashMap<flotilla_protocol::AttachableId, ManagedTerminal>>>,
     leaf_subscriptions: LeafSubscriptionTable,
+    // Networking can restart against the same daemon, replacing a dead router.
+    // This lock protects only Weak pointer copies/swaps, never async work.
+    remote_turn_delivery: std::sync::RwLock<Option<Weak<dyn crate::leaf_engine::RemoteTurnDelivery>>>,
 }
 
 /// Default provisioning namespace used until [`InProcessDaemon::set_provisioning_namespace`]
@@ -2139,6 +2142,7 @@ impl InProcessDaemon {
             local_placement_provider_statuses: RwLock::new(Vec::new()),
             managed_terminals_by_repo: RwLock::new(HashMap::new()),
             leaf_subscriptions: leaf_subscriptions.clone(),
+            remote_turn_delivery: std::sync::RwLock::new(None),
         });
         leaf_subscriptions.set_turn_delivery_actuator(Arc::new(DaemonTurnDeliveryActuator { daemon: Arc::downgrade(&daemon) })).await;
 
@@ -3386,6 +3390,7 @@ impl InProcessDaemon {
             | flotilla_protocol::CommandAction::QueryExplainConvoy { namespace, name } => {
                 (namespace.clone().unwrap_or(self.provisioning_namespace().await), name.as_str())
             }
+            flotilla_protocol::CommandAction::DeliverCrewTurn { request } => (request.namespace.clone(), request.convoy.as_str()),
             flotilla_protocol::CommandAction::CrewSupervise { namespace, convoy, .. } => {
                 (namespace.clone().unwrap_or(self.provisioning_namespace().await), convoy.as_str())
             }
@@ -6884,11 +6889,11 @@ impl InProcessDaemon {
             let sessions = self
                 .resource_backend
                 .clone()
-                .using::<ResourceTerminalSession>(namespace)
+                .including_replicas::<ResourceTerminalSession>(namespace)
                 .list()
                 .await
                 .map_err(|error| error.to_string())?;
-            let authorized = sessions.items.iter().any(|session| {
+            let authorized = sessions.items.iter().map(|source| &source.object).any(|session| {
                 session.status.as_ref().and_then(|status| status.crew.as_ref()).is_some_and(|crew| crew.id == crew_id)
                     && session.metadata.labels.get(CONVOY_LABEL) == Some(&supervisor.convoy)
                     && session.metadata.labels.get(VESSEL_LABEL) == Some(&supervisor.vessel)
@@ -7752,7 +7757,33 @@ impl InProcessDaemon {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn reconcile_crew_stalls_once(&self, namespace: &str) -> Result<(), String> {
+        self.leaf_subscriptions.reconcile_stalls_once(namespace).await
+    }
+
+    /// Replace the routing port when the networking runtime is constructed or restarted.
+    pub fn set_remote_turn_delivery(&self, delivery: Weak<dyn crate::leaf_engine::RemoteTurnDelivery>) {
+        *self.remote_turn_delivery.write().expect("remote turn delivery lock") = Some(delivery);
+    }
+
     pub async fn deliver_standing_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
+        let target = self
+            .resource_backend
+            .including_replicas::<ResourceConvoy>(&request.namespace)
+            .get(&request.convoy)
+            .await
+            .map_err(|error| error.to_string())?;
+        if matches!(target.provenance, ResourceProvenance::Replica { .. }) {
+            let delivery = self
+                .remote_turn_delivery
+                .read()
+                .expect("remote turn delivery lock")
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .ok_or_else(|| "remote turn delivery router unavailable".to_string())?;
+            return delivery.deliver(request).await;
+        }
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&request.namespace);
         let session = sessions
             .list_matching_labels(&BTreeMap::from([
@@ -9739,6 +9770,21 @@ impl InProcessDaemon {
             }
             flotilla_protocol::CommandAction::CrewFail { .. } => return boxed_action!(self.execute_action_crew_fail(id, &command, &caller)),
             flotilla_protocol::CommandAction::CrewStall { .. } => return boxed_action!(self.execute_action_crew_stall(id, &command)),
+            flotilla_protocol::CommandAction::DeliverCrewTurn { request } => {
+                let identity = self.start_context_free_command(id, command.description().to_string());
+                let result = if caller.is_some() {
+                    CommandValue::Error { message: "DeliverCrewTurn is an internal controller command".into() }
+                } else if matches!(request.sender, CrewMessageSender::FlotillaEscalation { .. } | CrewMessageSender::FlotillaNudge) {
+                    match self.deliver_standing_turn(request).await {
+                        Ok(rung) => CommandValue::CrewTurnDelivered { rung },
+                        Err(message) => CommandValue::Error { message },
+                    }
+                } else {
+                    CommandValue::Error { message: "remote turn delivery requires a controller sender".into() }
+                };
+                self.finish_context_free_command(id, identity, result);
+                return Ok(id);
+            }
             flotilla_protocol::CommandAction::CrewSupervise { .. } => {
                 return boxed_action!(self.execute_action_crew_supervise(id, &command, &caller, &dispatching_principal_ref))
             }
