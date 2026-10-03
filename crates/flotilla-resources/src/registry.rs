@@ -627,6 +627,10 @@ pub async fn watch_resource_kind_from(
     dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, watch_typed(backend, namespace, Some(start)).await)
 }
 
+/// A merged-view bootstrap: register local and replica streams before reading
+/// the initial members. Consumers apply `initial` once, then every queued stream
+/// event in order (including deletions). The overlay cursor is descriptive only;
+/// this watch cannot resume from a list cursor. Reconnect with a fresh snapshot.
 pub async fn watch_resource_kind_including_replicas(
     backend: &ResourceBackend,
     namespace: &str,

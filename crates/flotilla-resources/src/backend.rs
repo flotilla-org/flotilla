@@ -401,12 +401,14 @@ impl<T: Resource> ReplicaReadResolver<T> {
                 let namespace = namespace.clone();
                 async move {
                     let event = event?;
-                    if let ReadWatchEvent::DeletedByName { tombstone, provenance } = event {
+                    if let ReadWatchEvent::DeletedByName { tombstone, .. } = event {
                         return match backend.definitions::<T>(&namespace).get(&tombstone.name).await {
                             Ok(object) => {
                                 Ok(ReadWatchEvent::Modified(ReadResourceObject { object, provenance: ResourceProvenance::Local }))
                             }
-                            Err(ResourceError::NotFound { .. }) => Ok(ReadWatchEvent::DeletedByName { tombstone, provenance }),
+                            Err(ResourceError::NotFound { .. }) => {
+                                Ok(ReadWatchEvent::DeletedByName { tombstone, provenance: ResourceProvenance::Local })
+                            }
                             Err(error) => Err(error),
                         };
                     }
@@ -416,7 +418,12 @@ impl<T: Resource> ReplicaReadResolver<T> {
                     };
                     match backend.definitions::<T>(&namespace).get(&fallback.object.metadata.name).await {
                         Ok(object) => Ok(ReadWatchEvent::Modified(ReadResourceObject { object, provenance: ResourceProvenance::Local })),
-                        Err(ResourceError::NotFound { .. }) => Ok(ReadWatchEvent::Deleted(fallback)),
+                        // Definitions are one merged logical member, whose initial
+                        // list uses Local provenance even when entirely replicated.
+                        Err(ResourceError::NotFound { .. }) => Ok(ReadWatchEvent::Deleted(ReadResourceObject {
+                            object: fallback.object,
+                            provenance: ResourceProvenance::Local,
+                        })),
                         Err(error) => Err(error),
                     }
                 }

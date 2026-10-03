@@ -194,6 +194,8 @@ impl PatchSink for RecordingSink {
     }
 }
 
+// Socket-boundary double for publication tests; real daemon tests below enforce
+// the watch contract, including rejection, bootstrap and namespace discovery.
 struct MockDaemon {
     tx: broadcast::Sender<DaemonEvent>,
     bootstrap: Mutex<Vec<DaemonEvent>>,
@@ -203,6 +205,7 @@ struct MockDaemon {
     watch_starts: AtomicUsize,
     cancelled: Mutex<Vec<u64>>,
     list_failure: Mutex<Option<String>>,
+    unsubscribe_calls: AtomicUsize,
 }
 
 impl MockDaemon {
@@ -217,6 +220,7 @@ impl MockDaemon {
             watch_starts: AtomicUsize::new(0),
             cancelled: Mutex::new(Vec::new()),
             list_failure: Mutex::new(None),
+            unsubscribe_calls: AtomicUsize::new(0),
         }
     }
 }
@@ -236,10 +240,33 @@ impl DaemonHandle for MockDaemon {
             return Err("mock".into());
         };
         assert!(include_replicas);
-        assert!(cursor.is_some(), "watch resumes from the list cursor");
-        let mut commands = self.watch_commands.lock().expect("watch commands");
+        assert!(cursor.is_none(), "merged watches bootstrap from their own snapshot");
         let id = self.watch_starts.fetch_add(1, Ordering::SeqCst) as u64 + 1;
-        commands.insert((namespace, kind), id);
+        self.watch_commands.lock().expect("watch commands").insert((namespace.clone(), kind.clone()), id);
+        let initial = self
+            .execute_query(
+                Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: flotilla_protocol::CommandAction::QueryResourceList { namespace, kind, include_replicas: true },
+                },
+                uuid::Uuid::new_v4(),
+            )
+            .await?;
+        let CommandValue::ResourceRead(envelope) = initial else { panic!("initial envelope") };
+        self.tx
+            .send(DaemonEvent::CommandStepUpdate {
+                command_id: id,
+                node_id: flotilla_protocol::NodeId::new("kiwi"),
+                repo_identity: flotilla_protocol::RepoIdentity { authority: "local".into(), path: "resource".into() },
+                repo: None,
+                step_index: 0,
+                step_count: 1,
+                description: "initial snapshot".into(),
+                status: flotilla_protocol::StepStatus::Produced { value: Box::new(CommandValue::ResourceWatchEvent(envelope)) },
+            })
+            .expect("initial watch snapshot");
         Ok(id)
     }
 
@@ -278,6 +305,10 @@ impl DaemonHandle for MockDaemon {
     async fn subscribe_queries(&self, _subscriber_id: uuid::Uuid, _queries: &[QueryCursor]) -> Result<Vec<DaemonEvent>, String> {
         self.subscribe_calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.bootstrap.lock().expect("bootstrap lock").clone())
+    }
+
+    async fn unsubscribe_queries(&self, _subscriber_id: uuid::Uuid) {
+        self.unsubscribe_calls.fetch_add(1, Ordering::SeqCst);
     }
 
     async fn get_status(&self) -> Result<StatusResponse, String> {
@@ -544,7 +575,7 @@ fn linked_subject_convoy() -> ConvoyRow {
 }
 
 #[tokio::test]
-async fn connector_lists_replicated_subjects_and_publishes_watch_updates() {
+async fn connector_bootstraps_replicated_subjects_and_publishes_watch_updates() {
     let daemon = Arc::new(MockDaemon::new(vec![DaemonEvent::ResultSet(Box::new(ResultSet {
         seq: 1,
         rows: Rows::Convoys { scope: None, rows: vec![linked_subject_convoy()] },
@@ -768,17 +799,18 @@ async fn connector_watch_end_and_error_cancel_siblings_before_snapshot_restart()
 }
 
 #[tokio::test]
-async fn connector_partial_list_failure_cancels_admitted_watches_before_retry() {
+async fn connector_partial_watch_failure_cancels_admitted_watches_before_retry() {
     let daemon = Arc::new(MockDaemon::new(vec![convoys_set(1)]));
     *daemon.list_failure.lock().expect("list failure") = Some("forges".into());
     let sink = Arc::new(RecordingSink::new());
     let error = run_connector(daemon.clone(), sink.clone(), Arc::new(mint()), Duration::from_secs(30)).await.expect_err("list fails");
     assert!(error.contains("transient list failure"));
-    assert_eq!(daemon.watch_starts.load(Ordering::SeqCst), 2);
+    assert_eq!(daemon.unsubscribe_calls.load(Ordering::SeqCst), 1, "failed setup releases named queries");
+    assert_eq!(daemon.watch_starts.load(Ordering::SeqCst), 3);
     wait_until(|| daemon.cancelled.lock().expect("cancelled").len() == 2).await;
     *daemon.list_failure.lock().expect("list failure") = None;
     let handle = tokio::spawn(run_connector(daemon.clone(), sink, Arc::new(mint()), Duration::from_secs(30)));
-    wait_until(|| daemon.watch_starts.load(Ordering::SeqCst) == 7).await;
+    wait_until(|| daemon.watch_starts.load(Ordering::SeqCst) == 8).await;
     handle.abort();
     let _ = handle.await;
     wait_until(|| daemon.cancelled.lock().expect("cancelled").len() == 7).await;
@@ -801,4 +833,141 @@ fn connector_clock_expires_landed_subjects_without_resource_updates() {
     assert!(before.iter().any(|patch| patch.target == target && patch.set.contains_key("flotilla.subject_of")));
     let after = state.rebuild_at(&mint(), "2026-10-02T12:00:00Z".parse().expect("boundary"));
     assert!(after.iter().any(|patch| patch.target == target && patch.unset.contains(&"flotilla.subject_of".into())));
+}
+
+// #2523: the real connector must keep the daemon's merged resource watches alive.
+// This uses the actual daemon command consumer, which rejects replica cursor resume.
+#[tokio::test]
+async fn connector_real_daemon_stays_subscribed() {
+    use flotilla_core::{in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
+    use flotilla_resources::{InMemoryBackend, ResourceBackend};
+    let tmp = tempfile::tempdir().expect("config directory");
+    std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-2523\"\n").expect("machine id");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::new(ConfigStore::with_base(tmp.path().to_path_buf())),
+        fake_discovery(false),
+        HostName::new("local"),
+        ResourceBackend::InMemory(InMemoryBackend::default()),
+    )
+    .await;
+    let baseline = daemon.aggregator_projection_state().await.subscribed_queries();
+    let connector = run_connector(daemon.clone(), Arc::new(RecordingSink::new()), Arc::new(mint()), Duration::from_secs(60));
+    let result = tokio::time::timeout(Duration::from_millis(200), connector).await;
+    assert!(result.is_err(), "connector exited instead of watching: {result:?}");
+    assert_eq!(daemon.aggregator_projection_state().await.subscribed_queries(), baseline, "cancellation releases query demand");
+}
+
+// #2523: a deterministic daemon refusal must be reported after one connection,
+// rather than republishing the catalog indefinitely. Use the real watch handler.
+#[tokio::test]
+async fn reconnect_loop_bounds_real_unsupported_watch_errors() {
+    use flotilla_client::resource::{ResourceClient, ResourceWatchRequest};
+    use flotilla_core::{in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
+    use flotilla_resources::{InMemoryBackend, ResourceBackend};
+    let tmp = tempfile::tempdir().expect("config directory");
+    std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-refusal-2523\"\n").expect("machine id");
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::new(ConfigStore::with_base(tmp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        ResourceBackend::InMemory(InMemoryBackend::default()),
+    )
+    .await;
+    let attempts = AtomicUsize::new(0);
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        run_reconnecting(
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let daemon = daemon.clone() as Arc<dyn DaemonHandle>;
+                async move { Ok(daemon) }
+            },
+            |daemon| async move {
+                let mut watch = ResourceClient::new(daemon)
+                    .watch(
+                        ResourceWatchRequest::builder()
+                            .kind("issues".into())
+                            .include_replicas(true)
+                            .cursor(flotilla_protocol::ResourceCursor::from_position("overlay", None))
+                            .build(),
+                    )
+                    .await?;
+                watch.next().await?;
+                Ok(())
+            },
+        ),
+    )
+    .await
+    .expect("permanent refusals terminate promptly")
+    .expect_err("permanent refusal");
+    assert_eq!(error, "invalid resource: include-replicas watches do not support cursor resume");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "one bounded attempt");
+}
+
+// #2523: namespaces newly appearing in the named-query graph bootstrap their
+// existing replica observations and then deliver changes/removals on the same
+// actual daemon watch. Query rows are the input seam; resource consumers are real.
+#[tokio::test]
+async fn newly_discovered_namespace_uses_real_watch_snapshot_and_updates() {
+    use flotilla_core::{in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
+    use flotilla_resources::{ChangeRequest, InMemoryBackend, K8sResourceObject, ResourceBackend, ResourceObject, WatchEvent};
+    let tmp = tempfile::tempdir().expect("config");
+    std::fs::write(tmp.path().join("daemon.toml"), "machine_id = \"pm-namespace-2523\"\n").expect("config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon: Arc<dyn DaemonHandle> = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::new(ConfigStore::with_base(tmp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+    let mut state = ConnectorState::default();
+    let mut watched = BTreeSet::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    ensure_resource_watches(&daemon, &mut state, &mut watched, &mut tasks, &tx).await.expect("initial namespace");
+    assert_eq!(watched, BTreeSet::from(["flotilla".into()]));
+    let mut json = subject_envelope().records[0].object.clone().expect("fixture observation");
+    json["metadata"]["namespace"] = serde_json::json!("new-island");
+    let mut object = ResourceObject::<ChangeRequest>::from_k8s_object(
+        serde_json::from_value::<K8sResourceObject<ChangeRequest>>(json).expect("typed observation"),
+    )
+    .expect("observation");
+    let writer = backend.replica_writer::<ChangeRequest>(flotilla_protocol::NodeId::new("kiwi"), "new-island");
+    writer.apply(WatchEvent::Added(object.clone()), chrono::Utc::now()).await.expect("pre-existing replica");
+    let mut row = linked_subject_convoy();
+    row.resource.namespace = "new-island".into();
+    state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: 1,
+        rows: Rows::Convoys { scope: None, rows: vec![row] },
+        state: Default::default(),
+    })));
+    ensure_resource_watches(&daemon, &mut state, &mut watched, &mut tasks, &tx).await.expect("discover namespace");
+    assert_eq!(state.resources.projection().change_requests.len(), 1, "own initial snapshot bootstrapped the replica");
+    object.status.as_mut().expect("status").state.value = Some(flotilla_resources::ObservedChangeRequestState::Merged);
+    writer.apply(WatchEvent::Modified(object.clone()), chrono::Utc::now()).await.expect("update");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            state.apply_resource_records(&rx.recv().await.expect("update channel").expect("watch event")).expect("apply");
+            if state.resources.projection().change_requests[0].status.as_ref().expect("status").state.value
+                == Some(flotilla_resources::ObservedChangeRequestState::Merged)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("update not lost");
+    writer.apply(WatchEvent::Deleted(object), chrono::Utc::now()).await.expect("deletion");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !state.resources.projection().change_requests.is_empty() {
+            state.apply_resource_records(&rx.recv().await.expect("update channel").expect("watch event")).expect("apply");
+        }
+    })
+    .await
+    .expect("no stale member");
+    tasks.shutdown().await;
 }

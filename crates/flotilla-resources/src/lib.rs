@@ -251,3 +251,6 @@ pub use workflow_template::{
     RoleHandoff, Selector, StallNudgePolicy, Stance, SubjectVariable, SupervisionTarget, TurnDeliveryRule, TurnDeliveryTarget,
     ValidationError, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };
+
+#[cfg(test)]
+mod registry_watch_tests;
