@@ -1487,12 +1487,19 @@ const CONTAINED_CARGO_SHIM_PATH: &str = "/usr/local/lib/flotilla-rust-build-limi
 const CARGO_BUILD_PROFILE_SHIM: &str = r#"#!/bin/sh
 # flotilla-cargo-profile-shim
 # Remove our directory before resolving Cargo (including rustup's Cargo proxy).
-shim_dir=$(CDPATH= cd -- "${0%/*}" && pwd) || exit 127
+case "$0" in
+  */*) shim_dir=${0%/*} ;;
+  *) shim_dir=. ;;
+esac
+shim_dir=$(CDPATH= cd -- "$shim_dir" && pwd -P) || exit 127
 remaining=$PATH
 filtered=
 while :; do
   entry=${remaining%%:*}
-  if [ "$entry" != "$shim_dir" ]; then
+  # Empty entries mean cwd. Preserve their spelling unless they lead back
+  # to this shim, just as for trailing slashes and directory symlinks.
+  entry_dir=$(CDPATH= cd -- "${entry:-.}" 2>/dev/null && pwd -P) || entry_dir=$entry
+  if [ "$entry_dir" != "$shim_dir" ]; then
     filtered=$filtered:$entry
   fi
   case "$remaining" in
@@ -1508,6 +1515,8 @@ missing_cargo() {
 }
 [ -n "$filtered" ] || missing_cargo
 cargo=$(PATH=${filtered#:} command -v cargo) || missing_cargo
+# A different directory may contain a file symlink to this same shim.
+[ "$cargo" -ef "$0" ] && missing_cargo
 # rustup's +toolchain selector must precede Cargo options.
 case "${1:-}" in
   +*) toolchain=$1; shift
@@ -6024,7 +6033,8 @@ dependency = { path = "../dependency" }
             let cargo = if contained { shim_dir.join("cargo") } else { std::env::var_os("CARGO").expect("Cargo executable").into() };
             let mut command = ProcessCommand::new(cargo);
             if selector {
-                command.arg(format!("+{}", std::env::var("RUSTUP_TOOLCHAIN").expect("Cargo rustup toolchain")));
+                let Ok(toolchain) = std::env::var("RUSTUP_TOOLCHAIN") else { continue };
+                command.arg(format!("+{toolchain}"));
             }
             command
                 .args(["test", "--no-run", "--offline"])
@@ -6075,21 +6085,40 @@ dependency = { path = "../dependency" }
         }
     }
 
-    // A contained tool without a subsequent Cargo on PATH must fail promptly with a useful diagnostic.
+    // Missing Cargo and path aliases back to this shim must fail promptly with a useful diagnostic.
     // This is process-boundary glue: no compiler is needed for the missing-executable case.
     #[cfg(unix)]
     #[test]
     fn contained_cargo_profile_reports_missing_cargo() {
+        use std::os::unix::fs::symlink;
+
         let temp = tempfile::tempdir().expect("tempdir");
         let staged = super::stage_local_cargo_shim(temp.path()).expect("stage shim");
         let directory = staged.parent().expect("shim directory");
         let cargo = directory.join("cargo");
         fs::copy(&staged, &cargo).expect("install fixture shim");
-        for path in [directory.display().to_string(), format!("{}:/nonexistent-cargo-directory", directory.display())] {
+        let directory_alias = temp.path().join("directory-alias");
+        symlink(directory, &directory_alias).expect("directory symlink");
+        let file_alias = temp.path().join("file-alias");
+        fs::create_dir_all(&file_alias).expect("file alias directory");
+        symlink(&cargo, file_alias.join("cargo")).expect("file symlink");
+        for path in [
+            directory.display().to_string(),
+            format!("{}:/nonexistent-cargo-directory", directory.display()),
+            format!("{}/", directory.display()),
+            format!("{}//", directory.display()),
+            directory_alias.display().to_string(),
+            file_alias.display().to_string(),
+            String::new(),
+            ":".to_string(),
+        ] {
             let output = ProcessCommand::new(&cargo).env("PATH", path).current_dir(directory).output().expect("run isolated shim");
             assert_eq!(output.status.code(), Some(127));
             assert!(String::from_utf8_lossy(&output.stderr).contains("no Cargo executable found"));
         }
+        let output = ProcessCommand::new("/bin/sh").arg("cargo").current_dir(directory).env("PATH", directory).output().expect("sh cargo");
+        assert_eq!(output.status.code(), Some(127));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("no Cargo executable found"));
     }
 
     #[cfg(target_os = "linux")]
