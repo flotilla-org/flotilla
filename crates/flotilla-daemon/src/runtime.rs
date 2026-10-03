@@ -6031,7 +6031,7 @@ mod tests {
             ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH, ENVIRONMENT_CLEAT_LIBRARY_DIR, ENVIRONMENT_CLEAT_PATH, ENVIRONMENT_CLEAT_RUNTIME_DIR,
             ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH,
         },
-        startup::test_support::GatedCredentialPreflight,
+        startup::{test_support::GatedCredentialPreflight, PENDING_WARNING_THRESHOLD},
     };
 
     #[test]
@@ -10700,16 +10700,33 @@ mod tests {
         // The test uses Tokio's current-thread runtime, so the scoped dispatcher
         // covers both the spawned phase and its cancellation/drop path.
         let _logging = tracing::subscriber::set_default(subscriber);
+        let phase_started = tokio::time::Instant::now();
         let task = tokio::spawn(async move { phase("reconcile_work_credentials", reconcile_work_credentials(&state, NAMESPACE)).await });
         tokio::time::timeout(Duration::from_secs(1), runner.entered.notified()).await.expect("work credential preflight starts");
         tokio::time::advance(Duration::from_millis(38_650)).await;
         assert!(!task.is_finished(), "credential preflight is still pending");
         let health = daemon.fleet_health_internal().await.expect("fleet health while staging is blocked");
         assert!(health.hosts.iter().any(|host| host.is_local && host.heartbeat_at.is_some()));
+        let before_deadline = fs::read_to_string(log.path()).expect("phase log");
+        assert!(!before_deadline.contains("daemon startup phase remains pending"), "no early warning");
+        // Reach the phase deadline without depending on earlier virtual-time steps.
+        tokio::time::advance(PENDING_WARNING_THRESHOLD.saturating_sub(phase_started.elapsed())).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "warning leaves preflight pending");
+        let health = daemon.fleet_health_internal().await.expect("fleet health after warning");
+        assert!(health.hosts.iter().any(|host| host.is_local && host.heartbeat_at.is_some()));
         runner.release.add_permits(1);
         task.await.expect("reconciliation task").expect("credential staging completes");
         assert_eq!(store.tracked_work_deliveries().await.get(env_id.as_str()), Some(&BTreeSet::from(["work-token".to_string()])));
+        tokio::time::advance(Duration::from_secs(120)).await;
         let records = fs::read_to_string(log.path()).expect("phase log");
+        let warnings = records
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON"))
+            .filter(|record| record["fields"]["phase"] == "reconcile_work_credentials" && record["level"] == "WARN")
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "one warning, with no stale timer after completion");
+        assert_eq!(warnings[0]["fields"]["elapsed_ms"], 60_000);
         let finish = records
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON"))
