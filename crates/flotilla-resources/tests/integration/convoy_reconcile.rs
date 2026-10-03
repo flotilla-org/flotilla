@@ -1,5 +1,3 @@
-mod common;
-
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -22,6 +20,8 @@ use flotilla_resources::{
     UnmetSettlementExpectation, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase,
     WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
+
+use crate::common;
 
 struct AlwaysEligible;
 

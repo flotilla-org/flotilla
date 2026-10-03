@@ -1,5 +1,3 @@
-mod common;
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,6 +8,8 @@ use flotilla_resources::{
     EnvironmentSpec, ForgeIdentity, FreshCloneCheckoutSpec, HostDirectEnvironmentSpec, LifecycleAuthority, ObservedCheckoutSpec,
     Repository, RepositoryCheckoutKind, RepositorySpec, ResourceBackend,
 };
+
+use crate::common;
 
 const NAMESPACE: &str = "flotilla";
 

@@ -1,5 +1,3 @@
-mod common;
-
 use std::{
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
@@ -33,6 +31,8 @@ use flotilla_resources::{
     TerminalSession, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, AUTHORITY_LABEL, CONVOY_LABEL,
     CREW_ORDINAL_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL,
 };
+
+use crate::common;
 
 const NAMESPACE: &str = "flotilla";
 const HOST_REF: &str = "01HXYZ";

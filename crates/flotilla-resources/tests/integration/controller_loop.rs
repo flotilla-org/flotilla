@@ -1,5 +1,3 @@
-mod common;
-
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -20,6 +18,8 @@ use flotilla_resources::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Notify, time::timeout};
+
+use crate::common;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PrimaryResource;

@@ -1,5 +1,3 @@
-mod common;
-
 use common::{valid_workflow_template_spec, valid_workflow_template_yaml};
 use flotilla_protocol::{IssueRef, IssueSource};
 use flotilla_resources::{
@@ -8,6 +6,8 @@ use flotilla_resources::{
     InterpolationLocation, RepositoryKey, ValidationError, WorkflowTemplateSpec,
 };
 use serde::Deserialize;
+
+use crate::common;
 
 #[derive(Debug, Deserialize)]
 struct WorkflowTemplateDocument {

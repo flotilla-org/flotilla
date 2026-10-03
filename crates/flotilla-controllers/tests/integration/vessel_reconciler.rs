@@ -1,5 +1,3 @@
-mod common;
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -31,6 +29,8 @@ use flotilla_resources::{
 };
 use rstest::rstest;
 use tokio::time::{timeout, Duration};
+
+use crate::common;
 
 const NAMESPACE: &str = "flotilla";
 const REPO_URL: &str = "https://github.com/flotilla-org/flotilla.git";

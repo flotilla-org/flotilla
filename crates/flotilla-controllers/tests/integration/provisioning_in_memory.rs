@@ -1,5 +1,3 @@
-mod common;
-
 use std::{
     collections::BTreeMap,
     sync::{
@@ -42,6 +40,8 @@ use flotilla_resources::{
     TerminalSession, TerminalSessionPhase, Vessel, VesselPhase, VesselRequirement, CONVOY_LABEL, CREW_ORDINAL_LABEL, VESSEL_ORDINAL_LABEL,
     VESSEL_REF_LABEL,
 };
+
+use crate::common;
 
 const NAMESPACE: &str = "flotilla";
 

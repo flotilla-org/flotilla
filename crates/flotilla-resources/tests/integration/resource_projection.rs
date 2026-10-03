@@ -1,5 +1,3 @@
-mod common;
-
 use std::collections::BTreeMap;
 
 use common::{convoy_object, convoy_spec, convoy_status, timestamp};
@@ -8,6 +6,8 @@ use flotilla_resources::{
     LifecycleAuthority, ObservedCheckoutSpec, RepositoryKey, ResourceError, ResourceObject, Usage, UsageSpec, UsageStatus, UsageWindow,
     AUTHORITY_LABEL,
 };
+
+use crate::common;
 
 #[test]
 fn resource_object_projects_to_k8s_object_shape() {
@@ -62,7 +62,7 @@ fn convoy_repository_snapshot_roundtrips_every_repository_field() {
 
 #[test]
 fn convoy_crd_allows_omitted_empty_repository_subpaths() {
-    let crd: serde_json::Value = serde_yml::from_str(include_str!("../src/crds/convoy.crd.yaml")).expect("CRD should parse");
+    let crd: serde_json::Value = serde_yml::from_str(include_str!("../../src/crds/convoy.crd.yaml")).expect("CRD should parse");
     let required = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["repositories"]["items"]
         ["required"]
         .as_array()
@@ -76,8 +76,8 @@ fn convoy_crd_allows_omitted_empty_repository_subpaths() {
 
 #[test]
 fn attention_crds_parse_with_expected_names() {
-    let regard: serde_json::Value = serde_yml::from_str(include_str!("../src/crds/regard.crd.yaml")).expect("Regard CRD should parse");
-    let demand: serde_json::Value = serde_yml::from_str(include_str!("../src/crds/demand.crd.yaml")).expect("Demand CRD should parse");
+    let regard: serde_json::Value = serde_yml::from_str(include_str!("../../src/crds/regard.crd.yaml")).expect("Regard CRD should parse");
+    let demand: serde_json::Value = serde_yml::from_str(include_str!("../../src/crds/demand.crd.yaml")).expect("Demand CRD should parse");
 
     assert_eq!(regard["metadata"]["name"], "regards.flotilla.work");
     assert_eq!(regard["spec"]["names"]["kind"], "Regard");
@@ -88,7 +88,7 @@ fn attention_crds_parse_with_expected_names() {
 #[test]
 fn convoy_ensure_crd_parses_with_expected_shape() {
     let ensure: serde_json::Value =
-        serde_yml::from_str(include_str!("../src/crds/convoy_ensure.crd.yaml")).expect("ConvoyEnsure CRD should parse");
+        serde_yml::from_str(include_str!("../../src/crds/convoy_ensure.crd.yaml")).expect("ConvoyEnsure CRD should parse");
 
     assert_eq!(ensure["metadata"]["name"], "convoyensures.flotilla.work");
     assert_eq!(ensure["spec"]["names"]["kind"], "ConvoyEnsure");
@@ -108,7 +108,7 @@ fn convoy_ensure_crd_parses_with_expected_shape() {
 #[test]
 fn dispatch_observation_crd_parses_with_immutable_record_fields() {
     let observation: serde_json::Value =
-        serde_yml::from_str(include_str!("../src/crds/dispatch_observation.crd.yaml")).expect("DispatchObservation CRD should parse");
+        serde_yml::from_str(include_str!("../../src/crds/dispatch_observation.crd.yaml")).expect("DispatchObservation CRD should parse");
 
     assert_eq!(observation["metadata"]["name"], "dispatchobservations.flotilla.work");
     assert_eq!(observation["spec"]["names"]["kind"], "DispatchObservation");
@@ -157,7 +157,7 @@ fn usage_resource_roundtrips_provider_account_subject_and_window_set() {
 
 #[test]
 fn usage_crd_requires_account_windows_and_observation_time() {
-    let usage: serde_json::Value = serde_yml::from_str(include_str!("../src/crds/usage.crd.yaml")).expect("Usage CRD should parse");
+    let usage: serde_json::Value = serde_yml::from_str(include_str!("../../src/crds/usage.crd.yaml")).expect("Usage CRD should parse");
 
     assert_eq!(usage["metadata"]["name"], "usages.flotilla.work");
     assert_eq!(usage["spec"]["names"]["kind"], "Usage");

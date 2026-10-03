@@ -54,6 +54,17 @@ Package-local `flotilla-core` daemon integration coverage uses shared discovery 
 cargo test -p flotilla-core --locked --features test-support --test in_process_daemon
 ```
 
+`flotilla-resources` and `flotilla-controllers` collect their integration tests in `tests/integration/main.rs`.
+The resources `watch_allocations` target stays separate because it installs a process-wide counting allocator.
+`flotilla-daemon` uses that target for general integration tests and `tests/request_session_pair/main.rs` for routing scenarios.
+Run `cargo test -p <package> --locked --test integration` for the integration target, and
+`cargo test -p flotilla-daemon --locked --test request_session_pair` for routing scenarios. Append a former target's module name or a test name
+(for example, `cargo test -p flotilla-daemon --locked --test request_session_pair generated_partition_heal_restart_preserves_tombstones`) to select that area.
+The workspace CI commands still run all of these tests. Fixtures and shared harnesses remain in `tests/fixtures/` and `tests/common/`.
+Register each new integration module in its `main.rs`; each suite checks this with the shared `test_module_registration` test.
+Tests in a shared binary must isolate state: avoid changing process-wide environment variables, working directories, or global tracing
+subscribers. Keep tests that require process-wide state (such as a global allocator) in a separate target.
+
 ## Testing Philosophy
 
 - Prefer behavior tests that run through injected collaborators over tests that depend on real filesystem state, subprocess orchestration, sockets, or live multi-host setup.

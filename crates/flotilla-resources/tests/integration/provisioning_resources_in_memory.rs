@@ -1,5 +1,3 @@
-mod common;
-
 use chrono::Utc;
 use common::{owner_reference, resource_meta};
 use flotilla_resources::{
@@ -9,6 +7,8 @@ use flotilla_resources::{
     ResourceBackend, Selector, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec, Vessel,
     VesselPhase, VesselSpec, VesselStatus,
 };
+
+use crate::common;
 
 fn placement_meta(name: &str) -> flotilla_resources::InputMeta {
     resource_meta().name(name).call()

@@ -1,5 +1,3 @@
-mod common;
-
 use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
 
 use common::{convoy_meta, convoy_spec, convoy_status};
@@ -11,6 +9,8 @@ use tokio::{
     sync::oneshot,
     time::timeout,
 };
+
+use crate::common;
 
 async fn spawn_one_shot_server(response: String) -> (String, oneshot::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test server");

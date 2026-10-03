@@ -1,5 +1,3 @@
-mod common;
-
 use common::timestamp;
 use flotilla_protocol::ResourceRef;
 use flotilla_resources::{
@@ -7,6 +5,8 @@ use flotilla_resources::{
     DemandStatusPatch, DemandVerdict, DemandVerdictDisposition, PrincipalRef, RegardStatus, RegardStatusPatch, ResourceBackend,
     StatusPatch,
 };
+
+use crate::common;
 
 #[test]
 fn regard_refresh_records_created_and_latest_refreshed_time() {
