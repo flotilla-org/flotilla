@@ -7708,6 +7708,84 @@ async fn observation_cache_deadline_crosses_both_clocks() {
     }
 }
 
+// #1496 operator follow-up: host provider observations and CLI summaries are
+// independent of tracked roots; the published status remains the query authority.
+#[hegel::test]
+fn host_provider_summary_survives_root_membership_changes(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+
+    use crate::providers::discovery::test_support::FakePresentationManager;
+
+    // Cover no roots, multiple roots, both discovery outcomes, repeated removals,
+    // and either root removal order. Factories stand in for process providers.
+    let root_count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+    let available = tc.draw(gs::booleans());
+    let reverse = tc.draw(gs::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let temp = tempfile::tempdir().expect("config directory");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"host-provider-observer\"\n").expect("daemon config");
+        let mut roots = (0..root_count).map(|index| temp.path().join(format!("repo-{index}"))).collect::<Vec<_>>();
+        for root in &roots {
+            std::fs::create_dir(root).expect("root directory");
+        }
+        let mut providers = FakeDiscoveryProviders::new().with_change_request(Arc::new(FakeChangeRequest::new()));
+        if available {
+            providers = providers.with_presentation_manager(Arc::new(FakePresentationManager::new()));
+        }
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            roots.clone(),
+            Arc::new(ConfigStore::with_base(temp.path())),
+            fake_discovery_with_provider_set(providers),
+            HostName::new("observer"),
+            backend.clone(),
+        )
+        .await;
+        let environment = daemon.local_host_identity().environment_id;
+        let expected = if available {
+            vec![HostProviderStatus {
+                category: "workspace_manager".into(),
+                name: "Fake Workspaces".into(),
+                implementation: "fake-workspaces".into(),
+                healthy: true,
+                disabled_reason: None,
+            }]
+        } else {
+            vec![]
+        };
+        let mut description = daemon.local_host_description().await;
+        assert_eq!(description.providers, expected, "host discovery cannot depend on a tracked repository");
+        assert_eq!(daemon.get_host_providers_internal(&environment).await.expect("bootstrap providers").summary.providers, expected,);
+
+        // A stored health observation can differ from this process's discovery;
+        // queries must present that status even while roots are removed.
+        let published = vec![HostProviderStatus::disabled("workspace_manager", "published", "offline probe")];
+        description.providers = published.clone();
+        let hosts = backend.using::<ResourceHost>("flotilla");
+        let name = daemon.local_host_id().expect("host id").to_string();
+        let host = hosts.create(&test_meta(&name), &HostSpec::default()).await.expect("Host");
+        hosts
+            .update_status(&name, &host.metadata.resource_version, &HostStatus { description: Some(description), ..Default::default() })
+            .await
+            .expect("published description");
+        if reverse {
+            roots.reverse();
+        }
+        for root in std::iter::once(None).chain(roots.iter().flat_map(|root| [Some(root), Some(root)])) {
+            if let Some(root) = root {
+                daemon.remove_repo(root).await.expect("remove root or repeat removal");
+            }
+            assert_eq!(daemon.local_host_description().await.providers, expected, "heartbeat discovery survives root removal");
+            assert_eq!(
+                daemon.get_host_providers_internal(&environment).await.expect("resource providers").summary.providers,
+                published,
+                "provider CLI reads stored health, independent of tracked roots",
+            );
+        }
+    });
+}
+
 // #1496: resource descriptions survive link changes and observer restart; link
 // state alone determines connectivity. Repeated projection must not bump cursors.
 #[hegel::test]

@@ -1711,6 +1711,9 @@ pub struct InProcessDaemon {
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
     operator_reconciler: RwLock<Option<Arc<dyn OperatorReconciler>>>,
     work_credential_reconciler: RwLock<Option<Arc<dyn WorkCredentialReconciler>>>,
+    /// Process-lifetime host discovery, independent of tracked-root membership.
+    /// Heartbeats publish these observations into Host status.
+    local_provider_statuses: Vec<HostProviderStatus>,
     local_placement_provider_statuses: RwLock<Vec<HostProviderStatus>>,
     /// Last terminal state published per repository, used to emit field-scoped
     /// deltas without disturbing unrelated provider snapshot state.
@@ -1916,7 +1919,7 @@ impl InProcessDaemon {
         let local_runner = environment_manager
             .environment_runner(&local_environment_id)
             .expect("local direct environment runner should always be available");
-        discovery
+        let local_host_discovery = discovery
             .host_scoped_providers
             .discover_for_environment(
                 &local_environment_id,
@@ -2047,15 +2050,13 @@ impl InProcessDaemon {
             path_identities.insert(path.clone(), identity);
         }
 
-        let local_provider_statuses = crate::host_summary::provider_statuses_from_registries(
-            repos.values().map(|state| state.preferred_root().model.registry.as_ref()),
-        );
+        let local_provider_statuses = local_host_discovery.provider_statuses();
         let local_host_summary = crate::host_summary::build_local_host_summary(
             &local_node_id,
             &host_name,
             EnvironmentId::host(environment_manager.local_host_id().clone()),
             &environment_manager,
-            local_provider_statuses,
+            local_provider_statuses.clone(),
             &*discovery.env,
         )
         .await;
@@ -2184,6 +2185,7 @@ impl InProcessDaemon {
             repository_inspector: RwLock::new(None),
             operator_reconciler: RwLock::new(None),
             work_credential_reconciler: RwLock::new(None),
+            local_provider_statuses,
             local_placement_provider_statuses: RwLock::new(Vec::new()),
             managed_terminals_by_repo: RwLock::new(HashMap::new()),
             leaf_subscriptions: leaf_subscriptions.clone(),
@@ -8258,9 +8260,7 @@ impl InProcessDaemon {
     }
 
     async fn refresh_local_host_summary(&self) -> HostSummary {
-        let mut providers = crate::host_summary::provider_statuses_from_registries(
-            self.repos.read().await.values().map(|state| state.preferred_root().model.registry.as_ref()),
-        );
+        let mut providers = self.local_provider_statuses.clone();
         for advertised in self.local_placement_provider_statuses.read().await.iter() {
             if !providers
                 .iter()
