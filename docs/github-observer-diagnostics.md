@@ -82,3 +82,27 @@ instrumentation fix does not claim to explain historical 5000-point consumption
 or to eliminate an unmeasured fleet secondary-limit trigger.
 
 A transport failure has no received HTTP response: the call event records `status=None` alongside `transport_failure=true`, rather than using the parser's numeric zero sentinel. Received responses record `status=Some(code)`.
+
+## Observer refactor acceptance for #2510 and #2513
+
+Observation errors carry primary/secondary classification, retry source and the
+optional UTC deadline through the cache, refresher, completion and Landing.
+Only presentation and external string interfaces render the diagnostic. A
+classified limit without a usable deadline remains classified but cannot offer
+a timed wait. The REST string boundary still accepts legacy `reset_at` errors.
+A cached hard error for a particular PR remains a refusal even when another PR
+in its repository is limited; the cooldown still prevents new network calls.
+
+Each received GraphQL response is parsed once at the observer call, shared by
+classification, telemetry and decoding. Query labels and history accounting
+come from the same query-shape enum. Network query text and request counts are
+unchanged. Malformed responses still emit their headers and unknown-cost call
+before decoding fails.
+
+After rollout, compare the fleet's call/cycle `elapsed_ms` before and after this
+refactor, grouped by scope, subject count and history-call shape. Compare cycle
+time with the sum of call times, tracking cost and unknown-cost counts as well.
+Use comparable successful cycles separately from backoff/error cycles and
+record host load; this comparison estimates local overhead, it does not isolate
+JSON parsing CPU time. Judge material improvement from that post-deployment
+trace rather than claiming a CPU regression or gain from static code changes.

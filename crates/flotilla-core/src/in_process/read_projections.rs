@@ -969,7 +969,7 @@ impl ReadProjections<'_> {
             if let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = leaf.address {
                 let subject = crate::change_request_observer::ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
                 if let Some(error) = self.leaf_subscriptions.change_request_observation_error(&subject).await {
-                    observation_errors.insert(subject.record_name(), error);
+                    observation_errors.insert(subject.record_name(), error.to_string());
                 }
             }
         }

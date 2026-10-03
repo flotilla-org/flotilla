@@ -2155,7 +2155,9 @@ async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_c
 struct BatchedObservationRunner {
     calls: std::sync::Mutex<Vec<String>>,
     rate_limit_two: std::sync::atomic::AtomicBool,
+    hard_error_one: std::sync::atomic::AtomicBool,
     rate_limit_all: std::sync::atomic::AtomicBool,
+    mixed_history_errors: std::sync::atomic::AtomicBool,
     block_one: std::sync::atomic::AtomicBool,
     one_started: tokio::sync::Notify,
     release_one: tokio::sync::Notify,
@@ -2193,11 +2195,26 @@ impl CommandRunner for BatchedObservationRunner {
             self.release_one.notified().await;
         }
         // This fake stands in for the GitHub subprocess/network boundary.
+        if self.mixed_history_errors.load(std::sync::atomic::Ordering::SeqCst) && query.contains("before:") {
+            let limited = query.contains("number:2201)");
+            return Ok(crate::providers::CommandOutput {
+                stdout: if limited {
+                    "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 4989\r\nRetry-After: 60\r\n\r\n{\"errors\":[{\"type\":\"RATE_LIMITED\",\"message\":\"secondary rate limit\"}]}".into()
+                } else {
+                    "HTTP/2 200 OK\r\n\r\n{\"errors\":[{\"type\":\"FORBIDDEN\",\"message\":\"history access denied\"}]}".into()
+                },
+                stderr: String::new(),
+                success: !limited,
+            });
+        }
         if self.rate_limit_all.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(crate::providers::CommandOutput {
                 stdout: "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 4989\r\nX-RateLimit-Reset: 1893456000\r\nRetry-After: 60\r\n\r\n{\"message\":\"You have exceeded a secondary rate limit\"}".into(),
                 stderr: String::new(), success: false,
             });
+        }
+        if query.contains("name:\"one\"") && self.hard_error_one.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("rate limited diagnostics unavailable: access denied".into());
         }
         if query.contains("name:\"two\"") && self.rate_limit_two.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(crate::providers::CommandOutput {
@@ -2216,7 +2233,11 @@ impl CommandRunner for BatchedObservationRunner {
                     serde_json::json!({
                         "state": "OPEN", "isDraft": false, "headRefOid": "abc", "reviewDecision": null,
                         "mergeable": if self.conflicting.load(std::sync::atomic::Ordering::SeqCst) { "CONFLICTING" } else { "MERGEABLE" },
-                        "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": []}}}}]}
+                        "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": []}}}}]},
+                        "comments": {"nodes": [], "pageInfo": {
+                            "hasPreviousPage": self.mixed_history_errors.load(std::sync::atomic::Ordering::SeqCst),
+                            "startCursor": "older",
+                        }}
                     }),
                 ))
             })
@@ -2301,7 +2322,7 @@ async fn source_pagination_fairness_survives_provider_rediscovery() {
     });
     for _ in 0..4 {
         let error = daemon.change_request_observation_source.observe_group(&subjects, &subjects[0]).await.expect_err("incomplete history");
-        assert!(error.contains("pagination budget"));
+        assert!(error.to_string().contains("pagination budget"));
         tokio::time::advance(Duration::from_secs(10)).await;
     }
     let pages = runner.pages.lock().expect("pages");
@@ -2311,12 +2332,58 @@ async fn source_pagination_fairness_survives_provider_rediscovery() {
     }
 }
 
+// #2510: admission must prioritize a classified limit over an ordinary error
+// whose diagnostic happens to mention rate limiting. Exercise real discovery,
+// provider classification and admission; fake only the GitHub subprocess boundary.
+#[tokio::test]
+async fn bound_admission_prioritizes_typed_limit_over_misleading_diagnostic() {
+    let runner = Arc::new(BatchedObservationRunner {
+        calls: std::sync::Mutex::new(Vec::new()),
+        rate_limit_two: std::sync::atomic::AtomicBool::new(true),
+        hard_error_one: std::sync::atomic::AtomicBool::new(true),
+        rate_limit_all: std::sync::atomic::AtomicBool::new(false),
+        mixed_history_errors: std::sync::atomic::AtomicBool::new(false),
+        block_one: std::sync::atomic::AtomicBool::new(false),
+        one_started: tokio::sync::Notify::new(),
+        release_one: tokio::sync::Notify::new(),
+        conflicting: std::sync::atomic::AtomicBool::new(false),
+    });
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"typed-admission-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery_with_runner(false, runner.clone()),
+        HostName::new("test-host"),
+        backend.clone(),
+    )
+    .await;
+    daemon.set_provisioning_namespace("flotilla".into()).await;
+    daemon
+        .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")))
+        .expect("gh discovery");
+    let mut keys = Vec::new();
+    for scope in ["team/one", "team/two"] {
+        let repository = RepositorySpec::remote(format!("https://github.com/{scope}")).expect("repository");
+        let key = repository.key();
+        backend.using::<Repository>("flotilla").create(&test_meta(&key.to_string()), &repository).await.expect("repository");
+        keys.push(key);
+    }
+    let error = daemon.resolve_convoy_change_request(&keys, "main", Some("1")).await.expect_err("no usable observation");
+    assert!(error.contains("budget=GraphQL") && error.contains("kind=primary"), "return the classified limit: {error}");
+    assert!(!error.contains("diagnostics unavailable"), "an ordinary error's words cannot override classification");
+    assert_eq!(runner.calls.lock().expect("calls").len(), 2, "consult both repositories");
+}
+
 #[tokio::test]
 async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit() {
     let runner = Arc::new(BatchedObservationRunner {
         calls: std::sync::Mutex::new(Vec::new()),
         rate_limit_two: std::sync::atomic::AtomicBool::new(false),
+        hard_error_one: std::sync::atomic::AtomicBool::new(false),
         rate_limit_all: std::sync::atomic::AtomicBool::new(false),
+        mixed_history_errors: std::sync::atomic::AtomicBool::new(false),
         block_one: std::sync::atomic::AtomicBool::new(false),
         one_started: tokio::sync::Notify::new(),
         release_one: tokio::sync::Notify::new(),
@@ -2396,7 +2463,10 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
     runner.rate_limit_two.store(true, std::sync::atomic::Ordering::SeqCst);
     let limited = &subjects[3];
     let error = daemon.change_request_observation_source.observe_for_completion(limited).await.expect_err("fresh read is rate limited");
-    assert!(error.contains("budget=GraphQL, identity=host gh login, kind=primary, retry_source=x-ratelimit-reset, retry_at="), "{error}");
+    assert!(
+        error.to_string().contains("budget=GraphQL, identity=host gh login, kind=primary, retry_source=x-ratelimit-reset, retry_at="),
+        "{error}"
+    );
     assert_eq!(runner.calls.lock().expect("calls").len(), 4);
     assert_eq!(daemon.change_request_observation_source.observe(limited).await.expect_err("cached rate limit"), error);
     assert_eq!(runner.calls.lock().expect("calls").len(), 4, "rate-limited repository waits for reset");
@@ -2417,22 +2487,29 @@ async fn live_bound_observation_batches_two_repositories_and_caches_rate_limit()
 
 #[tokio::test]
 async fn claim_message_pr_is_observed_and_repeated_conflicting_refusal_escalates() {
-    completion_claim_observation_case(false, false).await;
+    completion_claim_observation_case(false, false, false).await;
 }
 
 // #2499: a timed observation limit waits without increasing refusal strikes,
 // then admits the same claim after fresh readiness is actually observed.
 #[tokio::test(start_paused = true)]
 async fn rate_limited_completion_waits_then_requires_fresh_ready_observation() {
-    completion_claim_observation_case(true, false).await;
+    completion_claim_observation_case(true, false, false).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn rate_limited_completion_defers_but_preserves_non_forge_gate() {
-    completion_claim_observation_case(true, true).await;
+    completion_claim_observation_case(true, true, false).await;
 }
 
-async fn completion_claim_observation_case(rate_limited: bool, missing_artifact: bool) {
+// #2510: a limited PR never masks another PR's hard error, even on a cached
+// completion read; a refusal records a strike and recovery needs fresh evidence.
+#[tokio::test(start_paused = true)]
+async fn mixed_observation_completion_refuses_and_recovers() {
+    completion_claim_observation_case(false, false, true).await;
+}
+
+async fn completion_claim_observation_case(rate_limited: bool, missing_artifact: bool, mixed: bool) {
     #[derive(Default)]
     struct DeliveredTurns(std::sync::Mutex<Vec<crate::leaf_engine::TurnDeliveryRequest>>);
     #[async_trait]
@@ -2452,7 +2529,9 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
     let runner = Arc::new(BatchedObservationRunner {
         calls: std::sync::Mutex::new(Vec::new()),
         rate_limit_two: std::sync::atomic::AtomicBool::new(false),
+        hard_error_one: std::sync::atomic::AtomicBool::new(false),
         rate_limit_all: std::sync::atomic::AtomicBool::new(false),
+        mixed_history_errors: std::sync::atomic::AtomicBool::new(false),
         block_one: std::sync::atomic::AtomicBool::new(false),
         one_started: tokio::sync::Notify::new(),
         release_one: tokio::sync::Notify::new(),
@@ -2630,6 +2709,50 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
             Some("https://github.com/flotilla-org/flotilla/pull/2200#issuecomment-1".to_string()),
         )
     };
+    if mixed {
+        let subjects = crate::checkout_integration::change_request_subjects_from_claim(
+            "https://github.com/flotilla-org/flotilla/pull/2201",
+            &convoys.get("refused-claim").await.expect("convoy").spec.repositories,
+            &[],
+        );
+        assert_eq!(subjects.len(), 1);
+        flotilla_resources::apply_status_patch(&convoys, "refused-claim", &ConvoyStatusPatch::DiscoverSubjects {
+            subjects: vec![(subjects[0].clone(), flotilla_protocol::Relationship::Produces)],
+            source: flotilla_resources::SubjectDiscoverySource::Claim,
+            at: Utc::now(),
+        })
+        .await
+        .expect("second PR discovery");
+        runner.mixed_history_errors.store(true, std::sync::atomic::Ordering::SeqCst);
+        let first = claim().await.expect_err("mixed observations must refuse");
+        assert!(first.contains("history access denied"), "{first}");
+        let calls = runner.calls.lock().expect("calls").len();
+        assert_eq!(calls, 3, "one shared batch and two history outcomes");
+        let second = claim().await.expect_err("cached hard error must still refuse");
+        assert!(second.contains("history access denied"), "{second}");
+        assert_eq!(runner.calls.lock().expect("calls").len(), calls, "cooldown prevents forge calls");
+        let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
+        assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+        assert_eq!(status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal strike").consecutive_count, 2);
+        runner.mixed_history_errors.store(false, std::sync::atomic::Ordering::SeqCst);
+        runner.conflicting.store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(claim().await.expect("recovered claim"), flotilla_protocol::CommandValue::Ok);
+        assert_eq!(
+            convoys.get("refused-claim").await.expect("convoy").status.expect("status").crew_work["work"]["coder"].phase,
+            CrewWorkPhase::Done
+        );
+        for number in [2200, 2201] {
+            let subject = ChangeRequestRef {
+                namespace: "flotilla".into(),
+                service: "github.com".into(),
+                scope: "flotilla-org/flotilla".into(),
+                number,
+            };
+            assert!(daemon.leaf_subscriptions.change_request_observation_error(&subject).await.is_none(), "recovery clears subject errors");
+        }
+        return;
+    }
     if rate_limited {
         runner.rate_limit_all.store(true, std::sync::atomic::Ordering::SeqCst);
         let wait = claim().await.expect("observation wait");

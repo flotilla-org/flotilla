@@ -256,7 +256,7 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
         &self,
         numbers: &[u64],
         _crew_logins: &super::CrewGithubLoginsByRequest,
-    ) -> Result<super::BoundObservations, String> {
+    ) -> Result<super::BoundObservations, super::ObservationError> {
         let mut statuses = std::collections::HashMap::new();
         for number in numbers {
             let result = match self.execute(reqwest::Method::GET, &format!("pulls/{number}"), &[], None).await {
@@ -272,7 +272,7 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
                     };
                     Ok(status)
                 }
-                Err(error) => Err(error),
+                Err(error) => Err(error.into()),
             };
             statuses.insert(*number, result);
         }

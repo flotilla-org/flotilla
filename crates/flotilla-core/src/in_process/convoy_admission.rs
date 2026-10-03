@@ -285,7 +285,7 @@ impl ConvoyAdmission {
                 let repository = match repositories.get(&repository_key.to_string()).await {
                     Ok(repository) => repository,
                     Err(error) => {
-                        failures.push(error.to_string());
+                        failures.push(ObservationError::Forge(error.to_string()));
                         continue;
                     }
                 };
@@ -293,7 +293,7 @@ impl ConvoyAdmission {
                 let address = match change_request_address(remote, id) {
                     Ok(address) => address,
                     Err(error) => {
-                        failures.push(error);
+                        failures.push(ObservationError::Forge(error));
                         continue;
                     }
                 };
@@ -312,10 +312,12 @@ impl ConvoyAdmission {
                     Err(error) => failures.push(error),
                 }
             }
-            if let Some(error) = failures.iter().find(|error| error.contains("rate limited")) {
-                return Err(error.clone());
+            // Preserve classification until the final admission diagnostic, including
+            // classified limits with no retry deadline. Display wording is not policy.
+            if let Some(error) = failures.iter().find(|error| matches!(error, ObservationError::RateLimited { .. })) {
+                return Err(error.to_string());
             }
-            return failures.into_iter().next().map_or(Ok(None), Err);
+            return failures.into_iter().next().map_or(Ok(None), |error| Err(error.to_string()));
         }
 
         let (live_candidates, setup_failures) = self.repository_change_request_candidates(repository_keys).await;
