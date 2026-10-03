@@ -1065,7 +1065,7 @@ impl SqliteBackend {
             .map_err(|_| ResourceError::other("sqlite replica watch lock poisoned"))?
             .entry(key)
             .or_default()
-            .subscribe();
+            .subscribe(T::API_PATHS.kind, namespace);
         Ok(stream::unfold(rx, |mut rx| async {
             let event = match rx.next().await? {
                 Ok(event) => (*event).clone(),
@@ -1907,7 +1907,8 @@ impl SqliteBackend {
                     Some(version) => Self::replay_events::<T>(connection, &key, version)?,
                     None => ReplayedEvents { events: Vec::new(), quarantines: Vec::new() },
                 };
-                let receiver = Self::lock_watchers(&watchers)?.entry(key).or_default().subscribe();
+                let namespace = key.3.clone();
+                let receiver = Self::lock_watchers(&watchers)?.entry(key).or_default().subscribe(T::API_PATHS.kind, &namespace);
                 Ok((replay, receiver))
             })
             .await?;

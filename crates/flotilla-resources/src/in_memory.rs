@@ -305,7 +305,7 @@ impl InMemoryBackend {
         namespace: &str,
     ) -> Result<futures::stream::BoxStream<'static, Result<ReadWatchEvent<T>, ResourceError>>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
-        let rx = self.replicas.lock().await.watchers.entry(key).or_default().subscribe();
+        let rx = self.replicas.lock().await.watchers.entry(key).or_default().subscribe(T::API_PATHS.kind, namespace);
         Ok(stream::unfold(rx, |mut rx| async {
             let event = match rx.next().await? {
                 Ok(event) => (*event).clone(),
@@ -871,7 +871,7 @@ impl InMemoryBackend {
                 Some(version) => store.event_log.iter().filter(|event| event.version > version).cloned().collect(),
                 None => Vec::new(),
             };
-            let receiver = store.watchers.subscribe();
+            let receiver = store.watchers.subscribe(T::API_PATHS.kind, namespace);
             (replay, receiver)
         };
 

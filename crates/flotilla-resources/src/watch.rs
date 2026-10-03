@@ -17,6 +17,8 @@ use crate::{
     resource::{Resource, ResourceObject},
 };
 
+pub(crate) const WATCH_RING_CAPACITY: usize = 256;
+
 // One bounded ring per resource stream, shared by all subscribers. A slow
 // subscriber cannot retain a private, ever-growing queue of full objects.
 #[derive(Debug)]
@@ -26,7 +28,7 @@ pub(crate) struct WatchChannel<E> {
 
 impl<E> Default for WatchChannel<E> {
     fn default() -> Self {
-        Self { sender: broadcast::channel(256).0 }
+        Self { sender: broadcast::channel(WATCH_RING_CAPACITY).0 }
     }
 }
 
@@ -35,19 +37,22 @@ impl<E: Send + Sync + 'static> WatchChannel<E> {
         let _ = self.sender.send(Arc::new(event));
     }
 
-    pub(crate) fn subscribe(&self) -> BoxStream<'static, Result<Arc<E>, ResourceError>> {
-        stream::unfold(Some(self.sender.subscribe()), |receiver| async {
+    pub(crate) fn subscribe(&self, kind: &'static str, namespace: &str) -> BoxStream<'static, Result<Arc<E>, ResourceError>> {
+        stream::unfold((Some(self.sender.subscribe()), namespace.to_owned()), move |(receiver, namespace)| async move {
             let mut receiver = receiver?;
             match receiver.recv().await {
-                Ok(event) => Some((Ok(event), Some(receiver))),
+                Ok(event) => Some((Ok(event), (Some(receiver), namespace))),
                 Err(broadcast::error::RecvError::Closed) => None,
-                Err(broadcast::error::RecvError::Lagged(_)) => Some((
-                    Err(ResourceError::WatchExpired {
-                        requested_version: "live watch lagged; relist required".to_string(),
-                        compacted_through: None,
-                    }),
-                    None,
-                )),
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(kind, %namespace, skipped, capacity = WATCH_RING_CAPACITY, "resource watch lagged; relist required");
+                    Some((
+                        Err(ResourceError::WatchExpired {
+                            requested_version: "live watch lagged; relist required".to_string(),
+                            compacted_through: None,
+                        }),
+                        (None, namespace),
+                    ))
+                }
             }
         })
         .boxed()
@@ -167,15 +172,15 @@ mod tests {
         use futures::StreamExt;
         use hegel::generators as gs;
 
-        use super::WatchChannel;
+        use super::{WatchChannel, WATCH_RING_CAPACITY};
         // Fleet-sized fan-out, and bursts spanning capacity + 1 through 8x capacity.
         let subscribers = tc.draw(gs::integers::<usize>().min_value(1).max_value(64));
-        let updates = tc.draw(gs::integers::<usize>().min_value(257).max_value(2048));
+        let updates = tc.draw(gs::integers::<usize>().min_value(WATCH_RING_CAPACITY + 1).max_value(WATCH_RING_CAPACITY * 8));
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
             let channel = WatchChannel::default();
-            let slow: Vec<_> = (0..subscribers).map(|_| channel.subscribe()).collect();
-            let mut fast = channel.subscribe();
+            let slow: Vec<_> = (0..subscribers).map(|_| channel.subscribe("Convoy", "flotilla")).collect();
+            let mut fast = channel.subscribe("Convoy", "flotilla");
             let mut payloads = Vec::new();
             for index in 0..updates {
                 let payload = Arc::new(vec![(index % 256) as u8; 16 * 1024]);
@@ -186,7 +191,7 @@ mod tests {
                 drop(received);
                 assert_eq!(
                     payloads.iter().filter(|payload| payload.strong_count() > 0).count(),
-                    (index + 1).min(256),
+                    (index + 1).min(WATCH_RING_CAPACITY),
                     "only one ring of payloads may survive, regardless of subscriber count"
                 );
             }
