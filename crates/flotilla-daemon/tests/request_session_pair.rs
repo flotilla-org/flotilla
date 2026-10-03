@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -14,12 +15,18 @@ use flotilla_core::{
     daemon::DaemonHandle,
     in_process::InProcessDaemon,
     providers::{
-        discovery::test_support::{fake_discovery, fake_discovery_with_provider_set, FakeDiscoveryProviders},
+        discovery::{
+            test_support::{fake_discovery, fake_discovery_with_provider_set, FakeDiscoveryProviders},
+            EnvironmentBag,
+        },
+        environment::{ProvisionedEnvironment, ProvisionedMount},
         issue_tracker::IssueProvider,
+        ChannelLabel, CommandOutput, CommandRunner,
     },
 };
 use flotilla_daemon::{
     blob_store::TieredBlobStore,
+    runtime::{DaemonRuntime, RuntimeOptions},
     server::test_support::{
         apply_convoy_replica_feed, seed_trusted_remote_convoy_project, spawn_in_memory_request_mesh, spawn_in_memory_request_topology,
         spawn_in_memory_request_topology_stateful, spawn_in_memory_request_topology_stateful_with_caller,
@@ -29,22 +36,24 @@ use flotilla_daemon::{
 };
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
+    qualified_path::HostId,
     test_support::TestIssue,
-    CallerCrew, CallerProcess, Command, CommandAction, CommandCaller, CommandValue, ConvoyStartIntent, DaemonEvent, HostName, Issue,
-    IssueChangeset, IssueRef, IssueSource, NodeInfo, PeerConnectionState, PrincipalRef, RepoSelector, ResourceRef, SurfaceCharacter,
-    SurfaceDeclaration,
+    CallerCrew, CallerProcess, Command, CommandAction, CommandCaller, CommandValue, ConvoyStartIntent, CrewCommandContext, DaemonEvent,
+    EnvironmentId, EnvironmentStatus, HostName, ImageId, Issue, IssueChangeset, IssueRef, IssueSource, NodeInfo, PeerConnectionState,
+    PrincipalRef, RepoSelector, ResourceRef, SurfaceCharacter, SurfaceDeclaration,
 };
 use flotilla_resources::{
-    api_version, controller::ControllerLoop, list_resource_kind, Artifact, Checkout, CheckoutPhase, CheckoutSpec, CheckoutStatus, Convoy,
-    ConvoyPhase as ResourceConvoyPhase, ConvoyReconciler, ConvoySpec, ConvoyStatus, CredentialConsumer, CredentialGrant,
-    CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource, CredentialSpec,
-    CredentialSpecSpec, CrewSessionStatus, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, FreshCloneCheckoutSpec,
-    FulfilmentKind, FulfilmentKindSpec, Host, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus,
-    InMemoryBackend, InputMeta, LifecycleAuthority, OwnerGarbageCollector, PlacementPolicy, PlacementPolicySpec, Regard, RepositoryKey,
-    Resource, ResourceBackend, ResourceError, ResourceProvenance, Selector, TerminalBrief, TerminalCrewContext, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
-    WorkState, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
-    GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, REGISTERED_RESOURCE_KINDS, ROLE_LABEL,
+    api_version, controller::ControllerLoop, list_resource_kind, Artifact, ArtifactSubjectBinding, Checkout, CheckoutPhase, CheckoutSpec,
+    CheckoutStatus, Convoy, ConvoyPhase as ResourceConvoyPhase, ConvoyReconciler, ConvoySpec, ConvoyStatus, CredentialConsumer,
+    CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialPlacementRequirements, CredentialSource,
+    CredentialSpec, CredentialSpecSpec, CrewCompletionExpectation, CrewSessionStatus, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
+    DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, Host,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, LifecycleAuthority,
+    OwnerGarbageCollector, PlacementPolicy, PlacementPolicySpec, Regard, RepositoryKey, Resource, ResourceBackend, ResourceError,
+    ResourceProvenance, Selector, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
+    TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkState,
+    WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
+    GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, REGISTERED_RESOURCE_KINDS, ROLE_LABEL, VESSEL_LABEL,
 };
 use hegel::generators as gs;
 
@@ -1841,6 +1850,288 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
         .await
         .expect_err("remote apply must report address conflict");
     assert!(error.contains("artifact address cannot change"), "unexpected routed error: {error}");
+}
+
+// #2503: enumerate all production environment-reference variants through the
+// request dispatcher. Each must transfer artifacts and admit completion only
+// after storing a decision ledger. No transport concurrency is involved here.
+#[tokio::test]
+async fn artifact_environment_reference_contract() {
+    for environment_kind in ["local", "remote", "provisioned"] {
+        let leader = empty_daemon_named("artifact-crew-host").await;
+        // Install the real credential collaborator while keeping automatic
+        // resource reconciliation gated; this contract drives requests itself.
+        let (_startup_tx, startup_ready) = tokio::sync::watch::channel(false);
+        let runtime = DaemonRuntime::start_with_options(leader.clone(), leader.config_store(), None, RuntimeOptions {
+            startup_ready: Some(startup_ready),
+            ..Default::default()
+        })
+        .await
+        .expect("runtime credential controller");
+        let follower = empty_daemon_named("artifact-home").await;
+        let namespace = "flotilla";
+        let convoy = "artifact-demo";
+        let workspace = tempfile::tempdir().expect("crew workspace");
+        leader
+            .resource_backend()
+            .using::<Convoy>(namespace)
+            .create(
+                &InputMeta::builder().name(convoy.to_string()).build(),
+                &ConvoySpec::builder().workflow_ref("scratch".to_string()).build(),
+            )
+            .await
+            .expect("create home convoy");
+        let env_ref = match environment_kind {
+            "local" => format!("host-direct-{}", leader.local_host_id().expect("local host")),
+            "remote" => "host-direct-remote-artifact-host".to_string(),
+            "provisioned" => "env-artifact-vessel".to_string(),
+            _ => unreachable!(),
+        };
+        let runner: Arc<dyn CommandRunner> = Arc::new(ArtifactContractRunner { root: workspace.path().to_path_buf() });
+        if environment_kind == "remote" {
+            leader
+                .register_direct_environment_for_test(
+                    EnvironmentId::new(&env_ref),
+                    runner.clone(),
+                    EnvironmentBag::new(),
+                    Some(HostId::new("remote-artifact-host")),
+                )
+                .expect("register remote direct environment");
+        } else if environment_kind == "provisioned" {
+            leader
+                .register_provisioned_environment(
+                    EnvironmentId::new(&env_ref),
+                    Arc::new(ArtifactContractEnvironment { id: EnvironmentId::new(&env_ref), image: ImageId::new("test-image"), runner }),
+                    EnvironmentBag::new(),
+                    None,
+                )
+                .expect("register provisioned handle");
+        }
+        let convoys = leader.resource_backend().using::<Convoy>(namespace);
+        let created = convoys.get(convoy).await.expect("convoy");
+        convoys
+            .update_status(convoy, &created.metadata.resource_version, &ConvoyStatus {
+                phase: ResourceConvoyPhase::Active,
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    vessels: vec![VesselRequirement::builder()
+                        .name("work".into())
+                        .crew(vec![CrewSpec::builder()
+                            .role("coder".into())
+                            .source(CrewSource::Tool { command: "test".into() })
+                            .completion_conditions(vec![CrewCompletionExpectation::artifact_exists(
+                                "coder",
+                                "decision-ledger",
+                                ArtifactSubjectBinding::Convoy,
+                            )])
+                            .build()])
+                        .build()],
+                }),
+                work: BTreeMap::from([("work".into(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                ..Default::default()
+            })
+            .await
+            .expect("active crew work");
+        leader
+            .resource_backend()
+            .using::<Vessel>(namespace)
+            .create(&InputMeta::builder().name("artifact-demo-work".into()).build(), &VesselSpec {
+                convoy_ref: convoy.into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "test".into(),
+                adopted_checkout_refs: BTreeMap::new(),
+            })
+            .await
+            .expect("crew vessel");
+        let sessions = leader.resource_backend().using::<TerminalSession>(namespace);
+        let session = sessions
+            .create(
+                &InputMeta::builder()
+                    .name("terminal-artifact-coder".to_string())
+                    .labels(BTreeMap::from([
+                        (CONVOY_LABEL.into(), convoy.into()),
+                        (VESSEL_LABEL.into(), "work".into()),
+                        (ROLE_LABEL.into(), "coder".into()),
+                    ]))
+                    .build(),
+                &TerminalSessionSpec::builder()
+                    .env_ref(env_ref)
+                    .role("coder".to_string())
+                    .source(TerminalSessionSource::Agent {
+                        selector: Selector::for_capability("coding"),
+                        brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: String::new(), copies: vec![] },
+                        context: Box::new(TerminalCrewContext {
+                            namespace: namespace.into(),
+                            convoy: convoy.into(),
+                            vessel_ref: "artifact-demo-work".into(),
+                        }),
+                        message: None,
+                    })
+                    .cwd(if environment_kind == "local" { workspace.path().to_string_lossy().into_owned() } else { "/crew".into() })
+                    .pool("cleat".to_string())
+                    .build(),
+            )
+            .await
+            .expect("create crew terminal");
+        sessions
+            .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
+                crew: Some(
+                    CrewSessionStatus::builder()
+                        .id("crew-artifact".to_string())
+                        .adapter("codex".to_string())
+                        .stance("trusted".to_string())
+                        .build(),
+                ),
+                ..TerminalSessionStatus::default()
+            })
+            .await
+            .expect("mark crew session");
+        let caller = CommandCaller {
+            principal_ref: PrincipalRef::implicit_for_namespace(namespace),
+            process: None,
+            crew: Some(
+                CallerCrew::builder()
+                    .namespace(namespace.to_string())
+                    .convoy(convoy.to_string())
+                    .vessel("artifact-demo-work".to_string())
+                    .role("coder".to_string())
+                    .crew_id("crew-artifact".to_string())
+                    .build(),
+            ),
+        };
+        let state = tempfile::tempdir().expect("blob state");
+        let store = Arc::new(TieredBlobStore::new(state.path(), vec![]));
+        let topology = spawn_in_memory_request_topology_stateful_with_caller_and_blob_store(
+            Arc::clone(&leader),
+            Arc::clone(&follower),
+            SurfaceDeclaration::focal_for_namespace(namespace),
+            caller,
+            Arc::clone(&store),
+        )
+        .await
+        .expect("connect crew and home");
+
+        // #2503: production session references must support binary artifact put/get
+        // and a decision ledger must admit completion on every environment kind.
+        let bytes = vec![0, 1, 2, 127, 255];
+        let source = workspace.path().join("source.bin");
+        let destination = workspace.path().join("result.bin");
+        tokio::fs::write(&source, &bytes).await.expect("source");
+        let (address, digest, _) = topology
+            .client
+            .artifact_put("review-round".into(), "head-1".into(), BTreeMap::new(), "application/octet-stream".into(), "source.bin".into())
+            .await
+            .unwrap_or_else(|error| panic!("{environment_kind} put: {error}"));
+        for reference in [address, digest] {
+            assert_eq!(topology.client.artifact_get(reference, "result.bin".into()).await.expect("get"), (bytes.len() as u64, None));
+            assert_eq!(tokio::fs::read(&destination).await.expect("destination"), bytes);
+        }
+        let completion = || {
+            Command::builder()
+                .action(CommandAction::CrewComplete {
+                    context: CrewCommandContext { crew_id: Some("crew-artifact".into()), ..Default::default() },
+                    message: Some("finished".into()),
+                    disposition: None,
+                    decision_ledger_ref: None,
+                    force: false,
+                })
+                .build()
+        };
+        let mut events = leader.subscribe();
+        let id = topology.client.execute(completion()).await.expect("dispatch completion");
+        let result = await_command_result(&mut events, id).await;
+        assert!(
+            matches!(&result, CommandValue::Error { message } if message.contains("decision-ledger")),
+            "completion requires the ledger artifact: {result:?}"
+        );
+        let ledger = b"## Decision ledger\n\n1. **Brief silence:** Test setup.\n- **Choice:** Exercise every environment.\n- **Alternative:** Only local.\n- **If asking were free:** Which environment?\n";
+        let source = workspace.path().join("ledger.md");
+        tokio::fs::write(&source, ledger).await.expect("ledger source");
+        let (address, _, _) = topology
+            .client
+            .artifact_put("decision-ledger".into(), String::new(), BTreeMap::new(), "text/markdown".into(), "ledger.md".into())
+            .await
+            .expect("put ledger");
+        topology.client.artifact_get(address, "result.bin".into()).await.expect("get ledger");
+        assert_eq!(tokio::fs::read(destination).await.expect("ledger destination"), ledger);
+        let id = topology.client.execute(completion()).await.expect("dispatch completion with ledger");
+        assert!(matches!(await_command_result(&mut events, id).await, CommandValue::Ok), "ledger admits completion");
+        assert_eq!(
+            convoys.get(convoy).await.expect("completed convoy").status.expect("status").crew_work["work"]["coder"].phase,
+            CrewWorkPhase::Done
+        );
+        runtime.shutdown();
+    }
+}
+
+// Fake handle stands in for the container process boundary; file transfer uses
+// the same runner contract as a registered remote direct environment.
+struct ArtifactContractEnvironment {
+    id: EnvironmentId,
+    image: ImageId,
+    runner: Arc<dyn CommandRunner>,
+}
+
+#[async_trait]
+impl ProvisionedEnvironment for ArtifactContractEnvironment {
+    fn id(&self) -> &EnvironmentId {
+        &self.id
+    }
+    fn image(&self) -> &ImageId {
+        &self.image
+    }
+    fn container_name(&self) -> Option<&str> {
+        Some("artifact-contract")
+    }
+    fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
+        vec![]
+    }
+    async fn status(&self) -> Result<EnvironmentStatus, String> {
+        Ok(EnvironmentStatus::Running)
+    }
+    async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
+        Ok(HashMap::new())
+    }
+    fn runner(&self) -> Arc<dyn CommandRunner> {
+        self.runner.clone()
+    }
+    async fn destroy(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+// Fake SSH/container file-transfer boundary: `/crew` lives in a separate
+// filesystem, so resolving a remote reference to the local runner cannot pass.
+struct ArtifactContractRunner {
+    root: PathBuf,
+}
+
+#[async_trait]
+impl CommandRunner for ArtifactContractRunner {
+    async fn run(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+        Err("unexpected subprocess".into())
+    }
+    async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+        Err("unexpected subprocess".into())
+    }
+    async fn exists(&self, _: &str, _: &[&str]) -> bool {
+        false
+    }
+    async fn read_file_to(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        let relative = source.strip_prefix("/crew").map_err(|error| error.to_string())?;
+        tokio::fs::copy(self.root.join(relative), destination).await.map(|_| ()).map_err(|error| error.to_string())
+    }
+    async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
+        let relative = destination.strip_prefix("/crew").map_err(|error| error.to_string())?;
+        tokio::fs::copy(source, self.root.join(relative)).await.map(|_| ()).map_err(|error| error.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------

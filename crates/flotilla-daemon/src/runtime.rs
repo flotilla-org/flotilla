@@ -1059,11 +1059,7 @@ async fn run_checkout_archive_gc(backend: ResourceBackend, namespace: String, ar
                 Err(error) => warn!(%error, "checkout archive sweep could not list checkouts"),
             }
             for root in roots {
-                let runner = if root.env_ref == archive_sweep.host_direct_environment_name {
-                    archive_sweep.daemon.local_command_runner()
-                } else {
-                    archive_sweep.daemon.command_runner_for_environment(&EnvironmentId::new(&root.env_ref))
-                };
+                let runner = archive_sweep.daemon.command_runner_for_environment_ref(&root.env_ref);
                 if let Some(runner) = runner {
                     let result = if root.env_ref == archive_sweep.host_direct_environment_name {
                         flotilla_core::vcs::prune_checkout_archives(&*runner, &root.path, archive_sweep.retention_days).await
@@ -2187,19 +2183,15 @@ async fn reconcile_work_credentials_filtered(
             continue;
         }
         let result = async {
-            let runner = if environment_ref == state.host_direct_environment_name {
-                state.daemon.local_command_runner().ok_or_else(|| "local command runner unavailable for credential delivery".to_string())?
-            } else {
-                match state.daemon.command_runner_for_environment(&EnvironmentId::new(environment_ref.clone())) {
-                    Some(runner) => runner,
-                    None if !current_environments.contains(&environment_ref) => {
-                        // The vessel and its contained filesystem are gone. Clear
-                        // refresh registrations and cached material as well.
-                        store.forget_environment(&environment_ref).await?;
-                        return Ok(());
-                    }
-                    None => return Err(format!("command runner unavailable for credential delivery to environment {environment_ref}")),
+            let runner = match state.daemon.command_runner_for_environment_ref(&environment_ref) {
+                Some(runner) => runner,
+                None if !current_environments.contains(&environment_ref) => {
+                    // The vessel and its contained filesystem are gone. Clear
+                    // refresh registrations and cached material as well.
+                    store.forget_environment(&environment_ref).await?;
+                    return Ok(());
                 }
+                None => return Err(format!("command runner unavailable for credential delivery to environment {environment_ref}")),
             };
             if !running.is_empty() {
                 store
@@ -4790,12 +4782,11 @@ struct RoutingCloneRuntime {
 
 impl RoutingCloneRuntime {
     async fn runtime_for(&self, env_ref: &str, checkout: &str) -> Result<CloneControllerRuntime, String> {
-        let runner = if env_ref == self.state.host_direct_environment_name {
-            self.state.daemon.local_command_runner()
-        } else {
-            self.state.daemon.command_runner_for_environment(&EnvironmentId::new(env_ref))
-        }
-        .ok_or_else(|| format!("command runner unavailable for clone environment {env_ref}"))?;
+        let runner = self
+            .state
+            .daemon
+            .command_runner_for_environment_ref(env_ref)
+            .ok_or_else(|| format!("command runner unavailable for clone environment {env_ref}"))?;
         let vcs = if env_ref == self.state.host_direct_environment_name {
             self.state.daemon.local_vcs_for_checkout(Path::new(checkout)).await?
         } else {
@@ -4935,12 +4926,11 @@ struct RoutingCheckoutRuntime {
 
 impl RoutingCheckoutRuntime {
     async fn runtime_for(&self, env_ref: &str, checkout: &str) -> Result<CheckoutControllerRuntime, String> {
-        let runner = if env_ref == self.state.host_direct_environment_name {
-            self.state.daemon.local_command_runner()
-        } else {
-            self.state.daemon.command_runner_for_environment(&EnvironmentId::new(env_ref))
-        }
-        .ok_or_else(|| format!("command runner unavailable for checkout environment {env_ref}"))?;
+        let runner = self
+            .state
+            .daemon
+            .command_runner_for_environment_ref(env_ref)
+            .ok_or_else(|| format!("command runner unavailable for checkout environment {env_ref}"))?;
         let vcs = if env_ref == self.state.host_direct_environment_name {
             self.state.daemon.local_vcs_for_checkout(Path::new(checkout)).await?
         } else {
@@ -5773,12 +5763,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
 
 impl TerminalControllerRuntime {
     fn runner_for_env(&self, env_ref: &str) -> Result<Arc<dyn CommandRunner>, String> {
-        if env_ref == self.state.host_direct_environment_name {
-            return self.state.daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string());
-        }
         self.state
             .daemon
-            .command_runner_for_environment(&EnvironmentId::new(env_ref.to_string()))
+            .command_runner_for_environment_ref(env_ref)
             .ok_or_else(|| format!("command runner unavailable for environment {env_ref}"))
     }
 
@@ -11129,7 +11116,10 @@ mod tests {
         reconcile_provisioned_environments(&state, NAMESPACE).await.expect("readopt running environment");
 
         assert!(restarted.environment_registry_for_environment(&env_id).is_some(), "interior provider registry should be restored");
-        assert!(restarted.command_runner_for_environment(&env_id).is_some(), "environment runner should be restored for attach resolution");
+        assert!(
+            restarted.command_runner_for_environment_ref(env_id.as_str()).is_some(),
+            "environment runner should be restored for attach resolution"
+        );
         assert!(state.provisioned_environments.lock().await.contains_key("test-interior"));
     }
 

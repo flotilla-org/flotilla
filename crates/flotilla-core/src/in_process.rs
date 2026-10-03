@@ -2722,8 +2722,9 @@ impl InProcessDaemon {
         }
     }
 
-    pub fn command_runner_for_environment(&self, env_id: &EnvironmentId) -> Option<Arc<dyn CommandRunner>> {
-        self.environment_manager.environment_runner(env_id)
+    /// Resolve a session or checkout's environment resource reference to its runner.
+    pub fn command_runner_for_environment_ref(&self, env_ref: &str) -> Option<Arc<dyn CommandRunner>> {
+        self.environment_manager.runner_for_environment_ref(env_ref)
     }
 
     /// Resolve the VCS through the registered discovery factories once per checkout.

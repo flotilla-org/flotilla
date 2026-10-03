@@ -156,6 +156,19 @@ impl EnvironmentManager {
         }
     }
 
+    /// Resolve the resource reference written into checkout and session specs.
+    /// The local host-direct resource names the existing local environment;
+    /// it must not be registered as a second direct environment. Remote direct
+    /// references and provisioned IDs resolve through their registered state.
+    pub fn runner_for_environment_ref(&self, env_ref: &str) -> Option<Arc<dyn CommandRunner>> {
+        let env_id = if env_ref.strip_prefix("host-direct-") == Some(self.local_host_id.as_str()) {
+            self.local_environment_id.clone()
+        } else {
+            EnvironmentId::new(env_ref)
+        };
+        self.environment_runner(&env_id)
+    }
+
     pub fn environment_runner(&self, env_id: &EnvironmentId) -> Option<Arc<dyn CommandRunner>> {
         match self.managed_environment(env_id)? {
             ManagedEnvironmentKind::Direct(state) => Some(state.runner),
@@ -668,6 +681,17 @@ mod tests {
         assert!(manager.environment_runner(&env_id).is_some());
         assert!(manager.environment_bag(&env_id).is_some());
         assert!(manager.environment_runner(&EnvironmentId::new("missing")).is_none());
+
+        // #2503: the local resource reference aliases the runner, without adding
+        // a direct registration that could collide with the daemon's Host.
+        let local_ref = format!("host-direct-{}", test_local_host_id());
+        assert!(Arc::ptr_eq(&manager.runner_for_environment_ref(&local_ref).expect("local resource runner"), &discovery.runner));
+        assert!(manager.managed_environment(&EnvironmentId::new(&local_ref)).is_none());
+        assert_eq!(manager.managed_environments().len(), 1);
+        // Unknown, empty and near-matching references must never fall back locally.
+        for reference in ["", "missing", "host-direct-test-local-host-id-extra", "host-direct-remote"] {
+            assert!(manager.runner_for_environment_ref(reference).is_none(), "unexpected runner for {reference}");
+        }
     }
 
     #[tokio::test]
