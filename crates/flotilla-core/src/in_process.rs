@@ -10128,6 +10128,12 @@ impl DaemonHandle for InProcessDaemon {
                     Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
                 }
             }
+            CommandAction::QueryCrewStalls { full } => {
+                match read_projections::ReadProjections::crew_stalls(&self.resource_backend, *full, self.clock.now()).await {
+                    Ok(value) => Ok(CommandValue::CrewStalls(Box::new(value))),
+                    Err(message) => Ok(CommandValue::Error { message }),
+                }
+            }
             CommandAction::QueryCrewList { context } => match self.crew_list_internal(context).await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::CrewList(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),

@@ -39,6 +39,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::QueryFleetHealth {}
         | CommandAction::QueryFulfilmentList {}
         | CommandAction::QueryFleetList { .. }
+        | CommandAction::QueryCrewStalls { .. }
         | CommandAction::QueryCrewList { .. }
         | CommandAction::QueryDaemonLogs { .. }
         | CommandAction::QueryExplainConvoy { .. }

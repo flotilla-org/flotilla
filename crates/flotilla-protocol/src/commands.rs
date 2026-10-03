@@ -8,8 +8,8 @@ use crate::{
     issue_query::{IssueQuery, IssueResultPage},
     qualified_path::QualifiedPath,
     query::{
-        CrewCommandContext, CrewListResponse, DispatchQueueResponse, FleetHealthResponse, FleetListResponse, FulfilmentListResponse,
-        HostListResponse, HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoProvidersResponse,
+        CrewCommandContext, CrewListResponse, CrewStallsResponse, DispatchQueueResponse, FleetHealthResponse, FleetListResponse,
+        FulfilmentListResponse, HostListResponse, HostProvidersResponse, HostStatusResponse, ProjectListResponse, RepoProvidersResponse,
     },
     AttachableSetId, IssueRef, PlacementDecision, PrincipalRef, RepoIdentity,
 };
@@ -977,6 +977,9 @@ pub enum CommandAction {
         crew_id: Option<String>,
         convoy: Option<String>,
     },
+    QueryCrewStalls {
+        full: bool,
+    },
     QueryCrewList {
         context: CrewCommandContext,
     },
@@ -1063,6 +1066,7 @@ impl CommandAction {
                 | CommandAction::QueryFleetHealth {}
                 | CommandAction::QueryFulfilmentList {}
                 | CommandAction::QueryFleetList { .. }
+                | CommandAction::QueryCrewStalls { .. }
                 | CommandAction::QueryCrewList { .. }
                 | CommandAction::QueryDaemonLogs { .. }
                 | CommandAction::QueryExplainConvoy { .. }
@@ -1138,6 +1142,7 @@ impl Command {
             CommandAction::QueryFleetHealth {} => "query fleet health",
             CommandAction::QueryFulfilmentList {} => "query fulfilment list",
             CommandAction::QueryFleetList { .. } => "query fleet list",
+            CommandAction::QueryCrewStalls { .. } => "query crew stalls",
             CommandAction::QueryCrewList { .. } => "query crew list",
             CommandAction::QueryDaemonLogs { .. } => "query daemon logs",
             CommandAction::QueryExplainConvoy { .. } => "explain convoy",
@@ -1293,6 +1298,7 @@ pub enum CommandValue {
     FleetHealth(Box<FleetHealthResponse>),
     FulfilmentList(Box<FulfilmentListResponse>),
     FleetList(Box<FleetListResponse>),
+    CrewStalls(Box<CrewStallsResponse>),
     CrewList(Box<CrewListResponse>),
     DaemonLogs {
         /// Complete JSON-lines records, oldest first.

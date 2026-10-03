@@ -48,6 +48,9 @@ pub struct CrewNoun {
     /// Admit a ledger-less completion or failure as the connected operator principal
     #[arg(long)]
     pub force: bool,
+    /// Show complete evidence in the fleet-wide stall listing
+    #[arg(long)]
+    pub full: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -83,6 +86,12 @@ impl CrewNoun {
             self.role.clone(),
             self.crew_id.clone().or(ambient_crew_id.clone()),
         );
+        let stalls_scope_requested = self.crew_id.is_some()
+            || self.namespace.is_some()
+            || self.convoy.is_some()
+            || self.vessel_ref.is_some()
+            || self.vessel.is_some()
+            || self.role.is_some();
         let context = CrewCommandContext::builder()
             .maybe_crew_id(self.crew_id.or(ambient_crew_id))
             .maybe_namespace(self.namespace)
@@ -94,7 +103,25 @@ impl CrewNoun {
         if self.propose.is_some() && subject.value != "stall" {
             return Err("--propose is only valid with `flotilla crew stall`".to_string());
         }
+        if self.full && subject.value != "stalls" {
+            return Err("--full is only valid with `flotilla crew stalls`".to_string());
+        }
         let action = match (subject.value.as_str(), subject.interpretation, self.verb) {
+            ("stalls", SubjectInterpretation::Ordinary, None) => {
+                if stalls_scope_requested {
+                    return Err("`flotilla crew stalls` is fleet-wide and does not accept crew selectors".to_string());
+                }
+                if self.message.is_some()
+                    || self.reason.is_some()
+                    || self.propose.is_some()
+                    || self.disposition.is_some()
+                    || self.decision_ledger_ref.is_some()
+                    || self.force
+                {
+                    return Err("`flotilla crew stalls` does not accept completion options".to_string());
+                }
+                CommandAction::QueryCrewStalls { full: self.full }
+            }
             ("list", SubjectInterpretation::Ordinary, None)
                 if self.message.is_none()
                     && self.reason.is_none()
@@ -240,6 +267,9 @@ impl std::fmt::Display for CrewNoun {
         if let Some(reference) = &self.decision_ledger_ref {
             write!(f, " --decision-ledger-ref {}", quote_value(reference))?;
         }
+        if self.full {
+            write!(f, " --full")?;
+        }
         if self.force {
             write!(f, " --force")?;
         }
@@ -270,6 +300,21 @@ mod tests {
             panic!("crew command should resolve locally");
         };
         command.action
+    }
+
+    // Glue: stalls is fleet-wide even in an ambient crew session; --full round-trips.
+    #[test]
+    fn stalls_resolves_without_crew_scope() {
+        for full in [false, true] {
+            let args = if full { vec!["crew", "stalls", "--full"] } else { vec!["crew", "stalls"] };
+            let noun = CrewNoun::try_parse_from(args).expect("parse stalls");
+            assert_eq!(action(noun.clone(), Some("ambient-crew")), CommandAction::QueryCrewStalls { full });
+            assert_eq!(CrewNoun::try_parse_from(noun.to_string().split_whitespace()).expect("round-trip"), noun);
+        }
+        let invalid = CrewNoun::try_parse_from(["crew", "list", "--full"]).expect("parse");
+        assert!(invalid.resolve().is_err());
+        let scoped = CrewNoun::try_parse_from(["crew", "stalls", "--convoy", "one"]).expect("parse selectors");
+        assert!(scoped.resolve().expect_err("fleet-wide").contains("does not accept crew selectors"));
     }
 
     #[test]

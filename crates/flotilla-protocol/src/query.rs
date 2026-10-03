@@ -739,3 +739,33 @@ mod tests {
         assert_roundtrip(&response);
     }
 }
+
+/// Fleet-wide stalled obligations; evidence remains complete in JSON output.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrewStallsResponse {
+    pub observed_at: DateTime<Utc>,
+    pub full: bool,
+    pub rows: Vec<CrewStallRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct CrewStallRow {
+    pub namespace: String,
+    pub project: Option<String>,
+    pub project_display_name: Option<String>,
+    pub convoy: String,
+    pub convoy_display_name: String,
+    pub vessel: String,
+    pub role: String,
+    pub rung: String,
+    pub supervisor: Option<String>,
+    pub supervisor_absence_reason: Option<String>,
+    pub began_at: Option<DateTime<Utc>>,
+    pub age_seconds: Option<u64>,
+    pub proposed_disposition: Option<crate::StallProposedDisposition>,
+    pub evidence: String,
+    /// Equal keys flag possible shared causes, without guessing from keywords.
+    pub cause_group: String,
+    pub shared_cause_count: usize,
+    pub artifacts: Vec<String>,
+}
