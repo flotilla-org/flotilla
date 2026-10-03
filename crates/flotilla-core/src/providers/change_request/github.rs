@@ -440,7 +440,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::providers::{change_request::ChangeRequestTracker, github_api::GhApiClient, replay, testing::MockRunner};
+    use crate::providers::{
+        change_request::ChangeRequestTracker,
+        github_api::{GhApiClient, GithubRetrySource},
+        replay,
+        testing::MockRunner,
+    };
 
     fn branch_lookup_page(items: serde_json::Value, has_next: bool) -> String {
         let link = if has_next { "Link: <https://api.github.com/repos/team/one/pulls?page=2>; rel=\"next\"\r\n" } else { "" };
@@ -1038,7 +1043,7 @@ mod tests {
         let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
         let error = provider.observe_bound(&[1], &Default::default()).await.expect_err("classified limit");
         assert!(matches!(&error, ObservationError::RateLimited { limit, .. }
-            if limit.kind == GithubRateLimitKind::Primary && limit.retry_source == "unavailable"));
+            if limit.kind == GithubRateLimitKind::Primary && limit.retry_source == GithubRetrySource::Unavailable));
         assert_eq!(error.retry_at(), None, "no fabricated deadline for a cache, completion or Landing wait");
     }
 

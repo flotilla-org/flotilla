@@ -124,11 +124,50 @@ impl GithubRateLimitKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GithubRetrySource {
+    RateLimitReset,
+    RetryAfter,
+    SecondaryFallback,
+    Unavailable,
+}
+
+impl GithubRetrySource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimitReset => "x-ratelimit-reset",
+            Self::RetryAfter => "retry-after",
+            Self::SecondaryFallback => "secondary-fallback-60s",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+impl std::str::FromStr for GithubRetrySource {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "x-ratelimit-reset" => Ok(Self::RateLimitReset),
+            "retry-after" => Ok(Self::RetryAfter),
+            "secondary-fallback-60s" => Ok(Self::SecondaryFallback),
+            "unavailable" => Ok(Self::Unavailable),
+            _ => Err(format!("unknown GitHub retry source: {value}")),
+        }
+    }
+}
+
+impl std::fmt::Display for GithubRetrySource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubRateLimit {
     pub kind: GithubRateLimitKind,
     pub retry_at: Option<DateTime<Utc>>,
-    pub retry_source: &'static str,
+    pub retry_source: GithubRetrySource,
 }
 
 /// Classify only error fields, never text in a successful response (for example
@@ -189,15 +228,15 @@ pub(crate) fn github_rate_limit_from_document(
         return None;
     };
     let (retry_at, retry_source) = match (kind, retry_after, reset) {
-        (GithubRateLimitKind::Primary, Some(after), Some(reset)) if reset > after => (reset, "x-ratelimit-reset"),
-        (_, Some(after), _) => (after, "retry-after"),
-        (GithubRateLimitKind::Primary, None, Some(reset)) => (reset, "x-ratelimit-reset"),
+        (GithubRateLimitKind::Primary, Some(after), Some(reset)) if reset > after => (reset, GithubRetrySource::RateLimitReset),
+        (_, Some(after), _) => (after, GithubRetrySource::RetryAfter),
+        (GithubRateLimitKind::Primary, None, Some(reset)) => (reset, GithubRetrySource::RateLimitReset),
         (GithubRateLimitKind::Secondary, None, _) => {
             // GitHub documents at least a minute when no Retry-After is supplied.
             // This is explicitly a fallback, never represented as a primary reset.
-            (received_at + chrono::Duration::minutes(1), "secondary-fallback-60s")
+            (received_at + chrono::Duration::minutes(1), GithubRetrySource::SecondaryFallback)
         }
-        _ => return Some(GithubRateLimit { kind, retry_at: None, retry_source: "unavailable" }),
+        _ => return Some(GithubRateLimit { kind, retry_at: None, retry_source: GithubRetrySource::Unavailable }),
     };
     Some(GithubRateLimit { kind, retry_at: Some(retry_at), retry_source })
 }
@@ -240,6 +279,9 @@ pub trait GhApi: Send + Sync {
     async fn get_with_headers(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<GhApiResponse, String>;
     /// Admission reads preserve REST classification through repository selection.
     /// Legacy adapters report ordinary failures unless they override this seam.
+    /// Preemptive issue low-budget and cached-backoff refusals retain legacy
+    /// `Forge` diagnostics. Issue callers should keep using the String reads
+    /// until those budget seams migrate; only HTTP response failures classify here.
     async fn get_classified_with_headers(
         &self,
         endpoint: &str,
@@ -478,8 +520,9 @@ mod tests {
             ("HTTP/2 502 Bad Gateway\r\n\r\nnot JSON", None),
         ];
         for (raw, expected) in cases {
-            let actual = github_rate_limit(raw, now)
-                .map(|limit| (limit.kind, limit.retry_at.map(|at| at.signed_duration_since(now).num_seconds()), limit.retry_source));
+            let actual = github_rate_limit(raw, now).map(|limit| {
+                (limit.kind, limit.retry_at.map(|at| at.signed_duration_since(now).num_seconds()), limit.retry_source.as_str())
+            });
             assert_eq!(actual, expected, "{raw}");
         }
     }

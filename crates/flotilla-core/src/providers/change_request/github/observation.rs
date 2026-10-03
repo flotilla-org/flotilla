@@ -120,7 +120,7 @@ impl<'a> ObservationTelemetry<'a> {
             rest_error_message = ?document["message"].as_str(),
             rate_limit_kind = ?limit.as_ref().map(|limit| limit.kind.as_str()),
             response_class = if let Some(limit) = &limit { limit.kind.as_str() } else if parsed.is_none() || parsed.is_some_and(|parsed| !parsed.success || parsed.response.status >= 400 || parsed.document.is_err()) || errors.is_some_and(|errors| !errors.is_empty()) { "other-error" } else { "success" },
-            retry_source = ?limit.as_ref().map(|limit| limit.retry_source),
+            retry_source = ?limit.as_ref().map(|limit| limit.retry_source.as_str()),
             retry_at = ?limit.as_ref().and_then(|limit| limit.retry_at),
             cost = ?cost, elapsed_ms = elapsed.as_millis() as u64,
             "GitHub change request observation call"

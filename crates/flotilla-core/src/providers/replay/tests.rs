@@ -920,6 +920,8 @@ impl GhApi for ClassifiedTestApi {
 #[hegel::test]
 fn classified_rest_recording_round_trips(tc: hegel::TestCase) {
     use hegel::generators as gs;
+
+    use crate::providers::github_api::GithubRetrySource;
     // Exhaust error variants, both kinds, every retry source and absent/present
     // deadlines in each case; generate timestamps across zero and modern dates,
     // pagination boundaries and counts across the empty/100-item page boundary.
@@ -931,7 +933,12 @@ fn classified_rest_recording_round_trips(tc: hegel::TestCase) {
         Ok(GhApiResponse { status: 200, etag: Some("etag".into()), body: "[]".into(), has_next_page, total_count: Some(total_count) }),
     ];
     for kind in [GithubRateLimitKind::Primary, GithubRateLimitKind::Secondary] {
-        for retry_source in ["unavailable", "retry-after", "x-ratelimit-reset", "secondary-fallback-60s"] {
+        for retry_source in [
+            GithubRetrySource::Unavailable,
+            GithubRetrySource::RetryAfter,
+            GithubRetrySource::RateLimitReset,
+            GithubRetrySource::SecondaryFallback,
+        ] {
             for retry_at in [None, Some(chrono::DateTime::from_timestamp(timestamp, 0).expect("deadline"))] {
                 outcomes.push(Err(ObservationError::RateLimited {
                     budget: "REST core".into(),

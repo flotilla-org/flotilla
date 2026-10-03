@@ -551,13 +551,8 @@ fn replay_classified_gh_error(status: u16, body: &str, headers: &HashMap<String,
             "secondary" => GithubRateLimitKind::Secondary,
             other => panic!("unknown recorded observation error kind: {other}"),
         };
-        let retry_source = match headers.get("observation-retry-source").map(String::as_str) {
-            Some("x-ratelimit-reset") => "x-ratelimit-reset",
-            Some("retry-after") => "retry-after",
-            Some("secondary-fallback-60s") => "secondary-fallback-60s",
-            Some("unavailable") => "unavailable",
-            other => panic!("unknown recorded retry source: {other:?}"),
-        };
+        let retry_source =
+            headers.get("observation-retry-source").expect("recorded retry source").parse().expect("known recorded retry source");
         return ObservationError::RateLimited {
             budget: headers.get("observation-budget").expect("recorded budget").clone(),
             limit: GithubRateLimit {
@@ -1012,7 +1007,7 @@ impl GhApi for RecordingGhApi {
                     ObservationError::RateLimited { budget, limit } => {
                         headers.insert("observation-error-kind".into(), limit.kind.as_str().into());
                         headers.insert("observation-budget".into(), budget.clone());
-                        headers.insert("observation-retry-source".into(), limit.retry_source.into());
+                        headers.insert("observation-retry-source".into(), limit.retry_source.as_str().into());
                         if let Some(at) = limit.retry_at {
                             headers.insert("observation-retry-at".into(), at.to_rfc3339());
                         }
