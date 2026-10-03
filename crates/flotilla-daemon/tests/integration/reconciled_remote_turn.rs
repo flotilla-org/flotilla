@@ -175,18 +175,19 @@ async fn reconciled_remote_session_receives_nudge_and_resume_from_convoy_home() 
     replicate::<TerminalSession>(&placement, &home, "placement").await;
 
     // #2287: replication wakes delivery and acknowledgment well before the 300s resync.
-    // Use real time: SQLite work runs on another thread, so paused time can race its completion.
-    let _home_task = AbortOnDropHandle::new(spawn_pending_supervisor_turn_task(
-        Arc::clone(&home_daemon),
-        "flotilla".to_string(),
-        Duration::from_secs(300),
-    ));
-    let _placement_task = AbortOnDropHandle::new(spawn_pending_supervisor_turn_task(
-        Arc::clone(&placement_daemon),
-        "flotilla".to_string(),
-        Duration::from_secs(300),
-    ));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Await the subscribed startup scan so delivery cannot accidentally come from startup.
+    let (home_task, home_ready) =
+        spawn_pending_supervisor_turn_task(Arc::clone(&home_daemon), "flotilla".to_string(), Duration::from_secs(300));
+    let _home_task = AbortOnDropHandle::new(home_task);
+    let (placement_task, placement_ready) =
+        spawn_pending_supervisor_turn_task(Arc::clone(&placement_daemon), "flotilla".to_string(), Duration::from_secs(300));
+    let _placement_task = AbortOnDropHandle::new(placement_task);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        home_ready.await.expect("home turn task ready");
+        placement_ready.await.expect("placement turn task ready");
+    })
+    .await
+    .expect("turn tasks subscribe and complete their startup scans");
 
     let request = TurnDeliveryRequest::builder()
         .namespace("flotilla".to_string())
