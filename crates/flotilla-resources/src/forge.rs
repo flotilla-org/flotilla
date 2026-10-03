@@ -15,6 +15,22 @@ impl Resource for Forge {
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "forges", kind: "Forge" };
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Definitions;
 
+    const VALIDATE_NAMESPACE_SPEC: bool = true;
+
+    fn validate_spec_with_siblings(spec: &Self::Spec, siblings: &[Self::Spec]) -> Result<(), ResourceError> {
+        for sibling in siblings {
+            if spec.overlaps_issue_service(sibling) {
+                return Err(ResourceError::invalid(format!(
+                    "Forge {} overlaps issue-service ownership with Forge {}",
+                    spec.forge_id, sibling.forge_id
+                )));
+            }
+        }
+        // ADR 0051's public GitHub forge is a fallback, not a second resource.
+        // One explicit owner overrides it; sibling checks prevent two owners.
+        Ok(())
+    }
+
     fn validate_spec(meta: &InputMeta, spec: &Self::Spec) -> Result<(), ResourceError> {
         if meta.name != spec.forge_id || spec.forge_id.trim().is_empty() {
             return Err(ResourceError::invalid("Forge resource name must equal a non-empty forge_id"));
@@ -60,6 +76,16 @@ pub enum ForgeKind {
 }
 
 impl ForgeSpec {
+    /// Whether some issue-service URL can be owned by both installations.
+    /// Ownership is exact at the installation path, not a textual prefix.
+    pub fn overlaps_issue_service(&self, other: &Self) -> bool {
+        let canonical_host = self.https_url.strip_prefix("https://").and_then(|front| front.split('/').next());
+        self.hosts.iter().map(String::as_str).chain(std::iter::once(self.git_ssh_host.as_str())).chain(canonical_host).any(|host| {
+            let path = self.https_url.strip_prefix("https://").and_then(|front| front.split_once('/')).map_or("", |(_, path)| path);
+            other.owns_issue_service(&format!("https://{host}/{path}"))
+        })
+    }
+
     /// Whether an issue service URL names this installation, including a
     /// declared host alias and the installation's path prefix.
     pub fn owns_issue_service(&self, service_url: &str) -> bool {

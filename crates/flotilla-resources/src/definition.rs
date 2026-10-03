@@ -95,6 +95,16 @@ impl<T: Resource> DefinitionResolver<T> {
     pub async fn apply_as(&self, writer: &WriterIdentity, meta: &InputMeta, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
         T::validate_spec(meta, spec)?;
+        if T::VALIDATE_NAMESPACE_SPEC {
+            let siblings = self
+                .list()
+                .await?
+                .into_iter()
+                .filter(|object| object.metadata.name != meta.name)
+                .map(|object| object.spec)
+                .collect::<Vec<_>>();
+            T::validate_spec_with_siblings(spec, &siblings)?;
+        }
         let local_root = self.backend.local_root()?;
         let sources = self.sources_for_name(&meta.name).await?;
         let current = (!sources.is_empty()).then(|| merge_sources(&sources)).transpose()?;

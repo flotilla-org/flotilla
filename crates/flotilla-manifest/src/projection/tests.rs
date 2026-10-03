@@ -1494,8 +1494,10 @@ fn replicated_subjects_publish_entities_edges_and_reference_labels() {
     });
     let forges = runtime.block_on(async {
         let mut forges = Vec::new();
-        // Both claim github.com. The exact Forge ID must win, irrespective of input order.
+        // Independently authored legacy input may still overlap after federation.
+        // The exact Forge ID must win, irrespective of input order.
         for id in ["aaa", "github"] {
+            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
             let object = backend
                 .using::<Forge>("flotilla")
                 .create(
