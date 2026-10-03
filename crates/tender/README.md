@@ -1,13 +1,13 @@
 # Tender SSH adapter
 
 `ssh::Server` hosts the slice-1 publication authority behind a private Unix
-listener. `Server::publish_endpoint` publishes an existing Unix socket and pumps
+listener inside a required mode-0700 parent directory. `Server::publish_endpoint` publishes an existing Unix socket and pumps
 ordinary application bytes; it never starts or cleans the application's daemon.
 Host-side grants, browse/connect policy, expiry ticks, and replacement assignment
 remain explicit authority controls on `MemoryTender`.
 
 `ssh::Identity::load_or_create` persists a separate Ed25519 instance key with
-mode 0600. Enrolment supplies the remote key's SHA-256 fingerprint out of band.
+mode 0600, atomically installing a complete synced file without replacement. Existing readable-by-group keys are refused. Enrolment supplies the remote key's SHA-256 fingerprint out of band.
 SSH host authentication is additional transport authentication, not that pin.
 The bounded, version-labelled handshake proves possession of both instance
 keys with fresh challenges. Every channel authenticates before processing a
@@ -24,7 +24,7 @@ stay with their current caller.
 
 `ssh::SshTender` implements `Tender` over that forward. Supply only the caller
 identities this client may use, and the pinned host fingerprint. Control records
-are capped at 64 KiB; after an authorized Open response each connection becomes
+are capped at 64 KiB and the server admits at most 256 live channels; after an authorized Open response each connection becomes
 a raw bidirectional stream. Each accepted exposure connection authenticates and
 checks host authority anew. Stream-local SSH channels provide multiplexing and
 flow control; local byte pumps use bounded buffers and preserve directional EOF.
@@ -42,7 +42,13 @@ configuration remain the hosting application's responsibility.
 After SSH loss, retained browse/watch metadata becomes Unavailable rather than
 Withdrawn. `replace_route` supplies a restored forward; watch re-establishes its
 control subscription and fresh connects use that route. Existing application
-streams are never migrated or replayed. Endpoint-open failure marks the publication Unavailable and closes its
+streams are never migrated or replayed. A remote publisher holds a separate
+registration control channel: transient Accept failures retry while that lease
+is healthy, but losing it reserves the identity and closes its Published
+receiver. The owner explicitly reclaims to obtain the new generation's Lease;
+an automatic reclaim would silently stale the caller's existing Lease.
+Exposure health checks run once a second while healthy and back off to eight
+seconds during unavailability; accept-time admission still checks every open. Endpoint-open failure marks the publication Unavailable and closes its
 streams; it does not manage the application process. The host's
 publication authority and the route are separate, so a consumer SSH outage does
 not withdraw a healthy host-side publication.

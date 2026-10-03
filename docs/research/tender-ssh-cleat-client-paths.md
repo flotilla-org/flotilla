@@ -128,3 +128,9 @@ under `/tmp`; the test run supplied that library directory alongside cleat's
 keys and known_hosts, disables password authentication, listens only on
 127.0.0.1, and tears down its own processes. It needs no production credentials
 or host configuration.
+
+Review follow-up also proved a remote publisher's held registration is lost on
+SSH interruption: the host reserves its identity as Unavailable. After replacing
+the route, explicit reclaim returns the same identity at generation N+1, stale
+lease teardown is rejected, and the fresh channel contains no replayed bytes.
+This adds an eleventh real-SSH check.

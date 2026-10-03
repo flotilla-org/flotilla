@@ -1,4 +1,5 @@
 use std::{
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::{Child, Command},
     time::Duration,
@@ -13,7 +14,11 @@ pub struct Sshd {
 
 impl Sshd {
     pub async fn start() -> Self {
-        let directory = tempfile::Builder::new().prefix("tssh-").tempdir().expect("fixture directory");
+        let directory = tempfile::Builder::new()
+            .prefix("tssh-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("fixture directory");
         let root = directory.path();
         for key in ["host", "client"] {
             assert!(Command::new("ssh-keygen")

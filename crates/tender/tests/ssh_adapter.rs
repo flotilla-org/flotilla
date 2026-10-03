@@ -3,7 +3,7 @@
 #[path = "common/ssh.rs"]
 mod ssh_fixture;
 
-use std::{collections::BTreeSet, path::Path, process::Command, time::Duration};
+use std::{collections::BTreeSet, os::unix::fs::PermissionsExt, path::Path, process::Command, time::Duration};
 
 use tender::{
     memory::MemoryTender,
@@ -22,7 +22,11 @@ struct CleatFixture {
 
 impl CleatFixture {
     fn start() -> Self {
-        let root = tempfile::Builder::new().prefix("tcleat-").tempdir().expect("cleat fixture directory");
+        let root = tempfile::Builder::new()
+            .prefix("tcleat-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .expect("cleat fixture directory");
         let fixture = Self { root };
         let output = fixture
             .command()
@@ -169,7 +173,7 @@ finally: client.close()
 // SSH transport success cannot authorize a substituted Tender instance.
 #[tokio::test]
 async fn identity_pin_and_unknown_caller_are_refused_before_service_bytes() {
-    let root = tempfile::tempdir().expect("directory");
+    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
     let host = Identity::generate();
     let caller = Identity::generate();
     let policy = MemoryTender::new(host.fingerprint());
@@ -187,7 +191,7 @@ async fn identity_pin_and_unknown_caller_are_refused_before_service_bytes() {
 // diagnostic frame into the application's stream.
 #[tokio::test]
 async fn exposure_failure_is_eof_without_protocol_bytes() {
-    let root = tempfile::tempdir().expect("directory");
+    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
     let host = Identity::generate();
     let caller = Identity::generate();
     let policy = MemoryTender::new(host.fingerprint());
@@ -211,7 +215,7 @@ async fn exposure_failure_is_eof_without_protocol_bytes() {
     assert!(bytes.is_empty());
     // Withdrawal is terminal and removes the Tender-owned listener.
     policy.withdraw(&session, &published.lease).await.expect("withdraw unavailable publication");
-    timeout(Duration::from_secs(1), async {
+    timeout(Duration::from_secs(3), async {
         while Path::new(&exposure.local_name).exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -225,7 +229,7 @@ async fn exposure_failure_is_eof_without_protocol_bytes() {
 // the service to write its response through the authenticated channel.
 #[tokio::test]
 async fn endpoint_half_close_preserves_response() {
-    let root = tempfile::tempdir().expect("directory");
+    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
     let service_path = root.path().join("ordinary");
     let listener = UnixListener::bind(&service_path).expect("ordinary listener");
     let service = tokio::spawn(async move {
@@ -264,7 +268,7 @@ async fn endpoint_half_close_preserves_response() {
 #[test]
 fn instance_key_persists_with_user_only_permissions() {
     use std::os::unix::fs::PermissionsExt;
-    let root = tempfile::tempdir().expect("key directory");
+    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("key directory");
     let path = root.path().join("instance.key");
     let original = Identity::load_or_create(&path).expect("first run");
     assert_eq!(std::fs::metadata(&path).expect("key metadata").permissions().mode() & 0o777, 0o600);
@@ -278,7 +282,7 @@ fn instance_key_persists_with_user_only_permissions() {
 // A failed endpoint open closes without bytes and marks it unavailable.
 #[tokio::test]
 async fn missing_service_marks_publication_unavailable() {
-    let root = tempfile::tempdir().expect("directory");
+    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
     let host = Identity::generate();
     let caller = Identity::generate();
     let policy = MemoryTender::new(host.fingerprint());
@@ -309,4 +313,135 @@ async fn missing_service_marks_publication_unavailable() {
     }
     assert_eq!(adapter.browse(&session).await.expect("diagnostics")[0].availability, Availability::Unavailable);
     assert!(matches!(adapter.connect(&session, lease.id).await, Err(Error::Unavailable)));
+}
+
+// The same stable address can be explicitly exposed again after audience
+// permission returns; a dead task must not leave an unusable map entry.
+#[tokio::test]
+async fn reexpose_after_audience_permission_returns() {
+    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
+    let host = Identity::generate();
+    let caller = Identity::generate();
+    let policy = MemoryTender::new(host.fingerprint());
+    policy.allow_connect(caller.fingerprint());
+    let grant = Grant {
+        grantee: caller.fingerprint(),
+        namespace: Namespace("services".into()),
+        audience_ceiling: BTreeSet::from([caller.fingerprint()]),
+        expires_at: 100,
+    };
+    policy.grant(grant.clone());
+    let session = Session { caller: caller.fingerprint(), pinned_host: host.fingerprint(), via: None };
+    let endpoint = root.path().join("server");
+    let _server = Server::bind(endpoint.clone(), host.clone(), policy.clone()).expect("server");
+    let published = policy.publish(&session, request(caller.fingerprint())).await.expect("publish");
+    let adapter = SshTender::new(endpoint, host.fingerprint(), vec![caller]).expect("adapter");
+    let first = adapter.expose_local(&session, published.lease.id).await.expect("exposure");
+    policy.grant(Grant { audience_ceiling: BTreeSet::new(), ..grant.clone() });
+    timeout(Duration::from_secs(3), async {
+        while Path::new(&first.local_name).exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("denial removes listener");
+    policy.grant(grant);
+    let restored = adapter.expose_local(&session, published.lease.id).await.expect("explicit re-exposure");
+    assert_eq!(restored, first);
+    assert!(UnixStream::connect(&restored.local_name).await.is_ok(), "re-exposure has a live listener");
+}
+
+// Atomic first-run creation makes every concurrent enrolment observe one
+// complete key, never a partial file or a silently substituted instance.
+#[test]
+fn concurrent_first_run_keeps_one_complete_instance_key() {
+    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
+    let path = root.path().join("instance.key");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                Identity::load_or_create(&path).expect("atomic key creation").fingerprint()
+            })
+        })
+        .collect();
+    let expected = Identity::load_or_create(&path).expect("instance key").fingerprint();
+    for thread in threads {
+        assert_eq!(thread.join().expect("key creator"), expected);
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("unsafe mode");
+    assert!(Identity::load_or_create(&path).is_err(), "group/world-readable private key is refused");
+}
+
+// The permission window at bind is closed by requiring a private parent;
+// chmod of the socket afterwards is insufficient for a shared directory.
+#[test]
+fn server_refuses_a_shared_parent_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).expect("shared parent");
+    let host = Identity::generate();
+    assert!(Server::bind(root.path().join("server"), host.clone(), MemoryTender::new(host.fingerprint())).is_err());
+    assert!(!root.path().join("server").exists());
+}
+
+// A publisher outage reserves its identity. The public Lease includes its
+// generation, so recovery is an explicit reclaim that returns a fresh Lease;
+// automatically reclaiming would leave the caller's Lease silently stale.
+#[tokio::test]
+#[ignore = "requires a local sshd"]
+async fn ssh_publisher_reclaims_reserved_identity_after_route_replacement() {
+    let sshd = ssh_fixture::Sshd::start().await;
+    let host = Identity::generate();
+    let caller = Identity::generate();
+    let policy = MemoryTender::new(host.fingerprint());
+    policy.allow_browse(caller.fingerprint());
+    policy.allow_connect(caller.fingerprint());
+    policy.grant(Grant {
+        grantee: caller.fingerprint(),
+        namespace: Namespace("services".into()),
+        audience_ceiling: BTreeSet::from([caller.fingerprint()]),
+        expires_at: 100,
+    });
+    let session = Session { caller: caller.fingerprint(), pinned_host: host.fingerprint(), via: None };
+    let endpoint = sshd.directory.path().join("server");
+    let _server = Server::bind(endpoint.clone(), host.clone(), policy.clone()).expect("server");
+    let mut forward = Forward::start(&sshd.destination, &endpoint, &sshd.options).await.expect("SSH");
+    let adapter = SshTender::new(forward.socket().to_owned(), host.fingerprint(), vec![caller.clone()]).expect("adapter");
+    let mut first = adapter.publish(&session, request(caller.fingerprint())).await.expect("publisher");
+    let mut client = adapter.connect(&session, first.lease.id).await.expect("first client");
+    let mut service = first.incoming.recv().await.expect("accepted raw channel");
+    client.write_all(b"before").await.expect("input");
+    let mut before = [0; 6];
+    service.read_exact(&mut before).await.expect("service input");
+    assert_eq!(&before, b"before");
+    forward.stop().await.expect("outage");
+    assert!(timeout(Duration::from_secs(2), first.incoming.recv()).await.expect("publisher receiver closes").is_none());
+    timeout(Duration::from_secs(2), async {
+        while policy.browse(&session).await.expect("host state")[0].availability != Availability::Unavailable {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reserved identity");
+    let restored = Forward::start(&sshd.destination, &endpoint, &sshd.options).await.expect("restored SSH");
+    adapter.replace_route(restored.socket().to_owned());
+    let mut publish = request(caller.fingerprint());
+    publish.reclaim = Some(first.lease.id);
+    let mut next = adapter.publish(&session, publish).await.expect("explicit reclaim");
+    assert_eq!(next.lease.id, first.lease.id);
+    assert_eq!(next.lease.generation, first.lease.generation + 1);
+    assert_eq!(adapter.disconnect(&session, &first.lease).await, Err(Error::StaleGeneration));
+    let mut fresh = adapter.connect(&session, next.lease.id).await.expect("fresh connection");
+    let mut service = next.incoming.recv().await.expect("fresh channel");
+    let mut byte = [0];
+    assert!(timeout(Duration::from_millis(30), service.read(&mut byte)).await.is_err(), "no replay across generations");
+    fresh.write_all(b"after").await.expect("new input");
+    let mut after = [0; 5];
+    service.read_exact(&mut after).await.expect("new service input");
+    assert_eq!(&after, b"after");
 }

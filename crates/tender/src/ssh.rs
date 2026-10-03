@@ -8,9 +8,9 @@
 use std::{
     collections::BTreeMap,
     io,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -23,7 +23,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     process::{Child, Command},
-    sync::{mpsc, Mutex as AsyncMutex},
+    sync::{mpsc, Mutex as AsyncMutex, Semaphore},
     task::JoinHandle,
     time::{sleep, timeout, Instant},
 };
@@ -52,19 +52,30 @@ impl Identity {
     /// Create once, with user-only permissions. Never replace an unreadable or
     /// malformed key: replacement would silently change the instance identity.
     pub fn load_or_create(path: &Path) -> io::Result<Self> {
-        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
-            Ok(mut file) => {
-                let identity = Self::generate();
-                std::io::Write::write_all(&mut file, &identity.0.to_bytes())?;
-                file.sync_all()?;
-                Ok(identity)
-            }
+        let identity = Self::generate();
+        match Self::install_key(path, |file| std::io::Write::write_all(file, &identity.0.to_bytes())) {
+            Ok(()) => Ok(identity),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let metadata = std::fs::symlink_metadata(path)?;
+                if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+                    return Err(io::Error::other("Tender key must be a user-only regular file"));
+                }
                 let bytes: [u8; 32] = std::fs::read(path)?.try_into().map_err(|_| io::Error::other("invalid Tender instance key"))?;
                 Ok(Self(SigningKey::from_bytes(&bytes)))
             }
             Err(error) => Err(error),
         }
+    }
+
+    // Install only after a complete, synced write; injected writer models filesystem failure.
+    fn install_key(path: &Path, write: impl FnOnce(&mut std::fs::File) -> io::Result<()>) -> io::Result<()> {
+        let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        write(temporary.as_file_mut())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist_noclobber(path).map_err(|error| error.error)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
     }
 
     pub fn fingerprint(&self) -> Fingerprint {
@@ -183,24 +194,35 @@ impl Server {
         if identity.fingerprint() != policy.host() {
             return Err(io::Error::other("policy host does not match instance key"));
         }
+        let parent = path.parent().ok_or_else(|| io::Error::other("listener needs a private parent directory"))?;
+        if std::fs::metadata(parent)?.permissions().mode() & 0o077 != 0 {
+            return Err(io::Error::other("Tender listener parent directory must be user-only"));
+        }
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let registrations = Arc::new(Mutex::new(BTreeMap::new()));
         let authority = policy.clone();
         let task = tokio::spawn(async move {
+            let permits = Arc::new(Semaphore::new(256));
+            let mut cleanup = tokio::time::interval(Duration::from_secs(1));
             let mut connections = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break };
+                        let Ok(permit) = permits.clone().try_acquire_owned() else { continue };
                         let policy = authority.clone();
                         let identity = identity.clone();
                         let registrations = registrations.clone();
                         connections.spawn(async move {
+                            let _permit = permit;
                             let _ = serve(stream, identity, policy, registrations).await;
                         });
                     }
                     _ = connections.join_next(), if !connections.is_empty() => {}
+                    _ = cleanup.tick() => {
+                        registrations.lock().expect("registrations lock").retain(|_, registration| authority.lease_active(&registration.lease));
+                    }
                 }
             }
         });
@@ -259,7 +281,24 @@ async fn serve(mut stream: UnixStream, identity: Identity, policy: MemoryTender,
                     (lease.id.0, lease.generation),
                     Arc::new(Registration { lease: lease.clone(), incoming: AsyncMutex::new(published.incoming) }),
                 );
-                Response::Lease(lease)
+                // Cleanup also runs when the client cancels before receiving
+                // its lease response: a failed acknowledgement cannot orphan it.
+                let control = async {
+                    write_control(&mut stream, &Response::Lease(lease.clone())).await?;
+                    let mut byte = [0];
+                    let mut health = tokio::time::interval(Duration::from_secs(1));
+                    loop {
+                        tokio::select! {
+                            result = stream.read(&mut byte) => { result?; break }
+                            _ = health.tick() => { if !policy.lease_active(&lease) { break } }
+                        }
+                    }
+                    Ok::<_, io::Error>(())
+                }
+                .await;
+                let _ = policy.disconnect(&session, &lease).await;
+                registrations.lock().expect("registrations lock").remove(&(lease.id.0, lease.generation));
+                return control;
             }
             Err(error) => Response::Error(error),
         },
@@ -303,9 +342,14 @@ async fn serve(mut stream: UnixStream, identity: Identity, policy: MemoryTender,
             let registration = registrations.lock().expect("registrations lock").get(&(lease.id.0, lease.generation)).cloned();
             match registration {
                 Some(registration) if registration.lease == lease && lease.publisher == session.caller => {
-                    let mut incoming = registration.incoming.lock().await;
-                    // A cancelled accept cannot keep a pending open alive.
                     let mut byte = [0];
+                    // A duplicate accept must observe its own cancellation
+                    // while waiting for the incumbent's receiver lock.
+                    let mut incoming = tokio::select! {
+                        incoming = registration.incoming.lock() => incoming,
+                        _ = stream.read(&mut byte) => return Ok(()),
+                    };
+                    // The held Publish control channel owns publisher lifetime.
                     tokio::select! {
                         service = incoming.recv() => {
                             match service {
@@ -415,16 +459,18 @@ pub async fn wait_for_socket(
 /// exposures so an SSH outage cannot rebind an exposure to a different service.
 pub struct Forward {
     child: Child,
-    directory: tempfile::TempDir,
+    _directory: tempfile::TempDir,
     socket: PathBuf,
 }
 
 impl Forward {
+    /// Destination and extra SSH options are trusted operator configuration,
+    /// not publisher input. This never accepts a remote command argument.
     pub async fn start(destination: &str, remote: &Path, ssh_options: &[String]) -> io::Result<Self> {
         if destination.starts_with('-') || destination.is_empty() {
             return Err(io::Error::other("invalid SSH destination"));
         }
-        let directory = tempfile::Builder::new().prefix("tender-").tempdir()?;
+        let directory = tempfile::Builder::new().prefix("tender-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir()?;
         let socket = directory.path().join("route");
         let mut child = Command::new("ssh")
             .args(["-o", "StreamLocalBindMask=0177", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes"])
@@ -439,7 +485,7 @@ impl Forward {
             let _ = child.kill().await;
             return Err(io::Error::other(error));
         }
-        Ok(Self { child, directory, socket })
+        Ok(Self { child, _directory: directory, socket })
     }
 
     pub fn socket(&self) -> &Path {
@@ -465,14 +511,13 @@ impl Drop for Forward {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
         let _ = std::fs::remove_file(&self.socket);
-        // Keep the private directory alive until the child has been killed.
-        let _ = self.directory.path();
     }
 }
 
 /// Remote Tender operations over an established SSH forward. Credentials are
 /// explicit; accepting an arbitrary Session never lets a caller forge a key.
-type Exposures = Arc<Mutex<BTreeMap<(Fingerprint, PublicationId), Arc<LocalExposure>>>>;
+type ExposureMap = BTreeMap<(Fingerprint, PublicationId), Arc<LocalExposure>>;
+type Exposures = Arc<Mutex<ExposureMap>>;
 
 #[derive(Clone)]
 pub struct SshTender {
@@ -487,6 +532,23 @@ pub struct SshTender {
 struct LocalExposure {
     path: PathBuf,
     task: JoinHandle<()>,
+}
+
+struct ExposureCleanup {
+    path: PathBuf,
+    entries: Weak<Mutex<ExposureMap>>,
+    key: (Fingerprint, PublicationId),
+}
+
+impl Drop for ExposureCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(entries) = self.entries.upgrade() {
+            // Drop the removed handle outside the lock.
+            let removed = entries.lock().expect("exposures lock").remove(&self.key);
+            drop(removed);
+        }
+    }
 }
 
 impl Drop for LocalExposure {
@@ -504,7 +566,9 @@ impl SshTender {
             credentials: Arc::new(identities.into_iter().map(|identity| (identity.fingerprint(), identity)).collect()),
             pin,
             exposures: Arc::new(Mutex::new(BTreeMap::new())),
-            directory: Arc::new(tempfile::Builder::new().prefix("tender-exposures-").tempdir()?),
+            directory: Arc::new(
+                tempfile::Builder::new().prefix("tender-exposures-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir()?,
+            ),
         })
     }
 
@@ -547,12 +611,22 @@ impl SshTender {
 #[async_trait]
 impl Tender for SshTender {
     async fn publish(&self, session: &Session, request: PublishRequest) -> Result<Published, Error> {
-        let Response::Lease(lease) = self.reply(session, Request::Publish(request)).await? else { return Err(Error::Unavailable) };
+        let mut registration_stream = self.request(session, Request::Publish(request)).await?;
+        let response = timeout(OPEN_TIMEOUT, read_control(&mut registration_stream))
+            .await
+            .map_err(|_| Error::Deadline)?
+            .map_err(|_| Error::Unavailable)?;
+        let lease = match response {
+            Response::Lease(lease) => lease,
+            Response::Error(error) => return Err(error),
+            _ => return Err(Error::Unavailable),
+        };
         let (sender, incoming) = mpsc::unbounded_channel();
         let adapter = self.clone();
         let session = session.clone();
         let held_lease = lease.clone();
         tokio::spawn(async move {
+            let mut byte = [0];
             loop {
                 let accept = async {
                     let mut stream = adapter.request(&session, Request::Accept(held_lease.clone())).await?;
@@ -564,14 +638,17 @@ impl Tender for SshTender {
                 };
                 tokio::select! {
                     _ = sender.closed() => break,
+                    _ = registration_stream.read(&mut byte) => break,
                     stream = accept => {
                         match stream {
                             Ok(stream) => { if sender.send(Box::new(stream) as ByteStream).is_err() { break } }
+                            Err(Error::Unavailable | Error::Deadline) => sleep(Duration::from_millis(100)).await,
                             Err(_) => break,
                         }
                     }
                 }
             }
+            drop(registration_stream);
             let _ = adapter.disconnect(&session, &held_lease).await;
         });
         Ok(Published { lease, incoming })
@@ -680,8 +757,11 @@ impl Tender for SshTender {
             let adapter = Self { exposures: Arc::new(Mutex::new(BTreeMap::new())), ..self.clone() };
             let session = session.clone();
             let owned_path = path.clone();
+            let cleanup = ExposureCleanup { path: path.clone(), entries: Arc::downgrade(&self.exposures), key: key.clone() };
             let task = tokio::spawn(async move {
-                let mut health = tokio::time::interval(Duration::from_millis(250));
+                let _cleanup = cleanup;
+                let mut health_delay = Duration::from_secs(1);
+                let mut next_health = Instant::now() + health_delay;
                 let mut streams = tokio::task::JoinSet::new();
                 loop {
                     tokio::select! {
@@ -696,14 +776,17 @@ impl Tender for SshTender {
                             });
                         }
                         _ = streams.join_next(), if !streams.is_empty() => {}
-                        _ = health.tick() => {
-                            if matches!(adapter.reply(&session, Request::Probe(id)).await, Err(Error::Withdrawn | Error::Denied)) {
+                        _ = sleep(next_health.saturating_duration_since(Instant::now())) => {
+                            let result = adapter.reply(&session, Request::Probe(id)).await;
+                            if matches!(result, Err(Error::Withdrawn | Error::Denied)) {
                                 drop(listener);
                                 let _ = std::fs::remove_file(&owned_path);
                                 // Expiry forbids new opens, but established streams run to close.
                                 while streams.join_next().await.is_some() {}
                                 break;
                             }
+                            health_delay = if result.is_err() { (health_delay * 2).min(Duration::from_secs(8)) } else { Duration::from_secs(1) };
+                            next_health = Instant::now() + health_delay;
                         }
                     }
                 }
@@ -734,5 +817,81 @@ impl Tender for SshTender {
             Response::Done => Ok(()),
             _ => Err(Error::Unavailable),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A failed partial write must not install an invalid permanent key file.
+    #[test]
+    fn failed_key_write_leaves_no_destination() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("key");
+        let result = Identity::install_key(&path, |file| {
+            std::io::Write::write_all(file, b"partial")?;
+            Err(io::Error::other("injected filesystem write failure"))
+        });
+        assert!(result.is_err());
+        assert!(!path.exists());
+        assert!(Identity::load_or_create(&path).is_ok());
+    }
+
+    // A duplicate pending accept observes EOF even while another accept holds
+    // the receiver; cancelling the duplicate must not disconnect the incumbent.
+    #[tokio::test]
+    async fn duplicate_accept_can_cancel_while_receiver_is_locked() {
+        let host = Identity::generate();
+        let publisher = Identity::generate();
+        let policy = MemoryTender::new(host.fingerprint());
+        let caller = publisher.fingerprint();
+        policy.allow_browse(caller.clone());
+        policy.grant(crate::Grant {
+            grantee: caller.clone(),
+            namespace: crate::Namespace("n".into()),
+            audience_ceiling: std::collections::BTreeSet::from([caller.clone()]),
+            expires_at: 100,
+        });
+        let session = Session { caller: caller.clone(), pinned_host: host.fingerprint(), via: None };
+        let published = policy
+            .publish(&session, PublishRequest {
+                namespace: crate::Namespace("n".into()),
+                name: "service".into(),
+                audience: std::collections::BTreeSet::from([caller]),
+                reclaim: None,
+            })
+            .await
+            .expect("publish");
+        let lease = published.lease;
+        let registration = Arc::new(Registration { lease: lease.clone(), incoming: AsyncMutex::new(published.incoming) });
+        let incumbent = registration.incoming.lock().await;
+        let registrations = Arc::new(Mutex::new(BTreeMap::from([((lease.id.0, lease.generation), registration.clone())])));
+        let (mut client, server) = UnixStream::pair().expect("transport pair");
+        let authority = policy.clone();
+        let server_identity = host.clone();
+        let pending = tokio::spawn(async move { serve(server, server_identity, authority, registrations).await });
+        client_handshake(&mut client, &publisher, &host.fingerprint()).await.expect("authenticate publisher");
+        write_control(&mut client, &Request::Accept(lease)).await.expect("duplicate accept request");
+        drop(client);
+        timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("duplicate cancelled without releasing incumbent lock")
+            .expect("server task")
+            .expect("cancellation");
+        assert_eq!(policy.browse(&session).await.expect("host metadata")[0].availability, crate::Availability::Available);
+        drop(incumbent);
+    }
+
+    // A stale file cannot hide a dead forward, and process-probe errors are
+    // surfaced instead of falsely certifying readiness from the file alone.
+    #[tokio::test]
+    async fn socket_waiter_checks_process_before_stale_file() {
+        use std::os::unix::process::ExitStatusExt;
+        let directory = tempfile::tempdir().expect("directory");
+        let socket = directory.path().join("stale");
+        std::fs::write(&socket, b"").expect("stale file");
+        assert!(wait_for_socket(&socket, Duration::from_secs(1), || Ok(Some(std::process::ExitStatus::from_raw(256)))).await.is_err());
+        assert_eq!(wait_for_socket(&socket, Duration::from_secs(1), || Err("probe failed".into())).await, Err("probe failed".into()));
     }
 }

@@ -5,7 +5,8 @@
 //! Publication and raw-stream contracts for ordinary local services.
 //!
 //! A transport adapter authenticates the caller and the pinned host before
-//! constructing a [`Session`]. Each connection gets a separate ordered byte
+//! constructing a [`Session`]. Serde derives support adapter control records;
+//! these wire shapes are not a stored-resource schema (ADR 0047). Each connection gets a separate ordered byte
 //! stream. Control and diagnostics never enter that stream.
 
 use std::{collections::BTreeSet, fmt, time::Duration};
