@@ -366,6 +366,8 @@ pub trait CommandRunner: Send + Sync {
     /// Atomically publish content with its final Unix permissions. The
     /// temporary file must be private while it is written. Wrappers that may
     /// deliver credentials must override this method; the default fails closed.
+    /// On Windows, ProcessCommandRunner falls back to an atomic write with
+    /// inherited ACLs and warns that the requested mode is not enforced.
     async fn write_file_with_mode(&self, _path: &Path, _content: &str, _mode: u32) -> Result<(), String> {
         Err("command runner does not support protected file writes".to_string())
     }
@@ -619,50 +621,55 @@ impl CommandRunner for ProcessCommandRunner {
         tokio::fs::rename(&temporary, path).await.map_err(|e| format!("rename {} to {}: {e}", temporary.display(), path.display()))
     }
 
+    #[cfg(unix)]
+    async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if mode > 0o777 {
+            return Err("file mode must contain only permission bits".to_string());
+        }
+
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
+        }
+        let mut temporary = path.as_os_str().to_os_string();
+        temporary.push(format!(".flotilla-tmp-{}", uuid::Uuid::new_v4()));
+        let temporary = PathBuf::from(temporary);
+        let result = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .await
+                .map_err(|e| format!("open {}: {e}", temporary.display()))?;
+            use tokio::io::AsyncWriteExt;
+            file.write_all(content.as_bytes()).await.map_err(|e| format!("write {}: {e}", temporary.display()))?;
+            file.flush().await.map_err(|e| format!("flush {}: {e}", temporary.display()))?;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .await
+                .map_err(|e| format!("protect {}: {e}", temporary.display()))?;
+            file.sync_all().await.map_err(|e| format!("sync {}: {e}", temporary.display()))?;
+            drop(file);
+            tokio::fs::rename(&temporary, path).await.map_err(|e| format!("rename {} to {}: {e}", temporary.display(), path.display()))
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temporary).await;
+        }
+        result
+    }
+
+    #[cfg(not(unix))]
     async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
         if mode > 0o777 {
             return Err("file mode must contain only permission bits".to_string());
         }
-        #[cfg(not(unix))]
-        {
-            // Windows has no POSIX permission bits. ACL policy can be added here
-            // when Windows hosts start materializing daemon credentials.
-            self.write_file(path, content).await
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await.map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
-            }
-            let mut temporary = path.as_os_str().to_os_string();
-            temporary.push(format!(".flotilla-tmp-{}", uuid::Uuid::new_v4()));
-            let temporary = PathBuf::from(temporary);
-            let result = async {
-                let mut file = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&temporary)
-                    .await
-                    .map_err(|e| format!("open {}: {e}", temporary.display()))?;
-                use tokio::io::AsyncWriteExt;
-                file.write_all(content.as_bytes()).await.map_err(|e| format!("write {}: {e}", temporary.display()))?;
-                file.flush().await.map_err(|e| format!("flush {}: {e}", temporary.display()))?;
-                file.set_permissions(std::fs::Permissions::from_mode(mode))
-                    .await
-                    .map_err(|e| format!("protect {}: {e}", temporary.display()))?;
-                file.sync_all().await.map_err(|e| format!("sync {}: {e}", temporary.display()))?;
-                drop(file);
-                tokio::fs::rename(&temporary, path).await.map_err(|e| format!("rename {} to {}: {e}", temporary.display(), path.display()))
-            }
-            .await;
-            if result.is_err() {
-                let _ = tokio::fs::remove_file(&temporary).await;
-            }
-            result
-        }
+        // Windows writes inherit directory ACLs; POSIX mode bits cannot enforce
+        // the requested protection. Explicit ACL policy belongs here when
+        // Windows hosts start materializing daemon credentials (#2468).
+        tracing::warn!(mode, path = %path.display(), "writing with inherited ACLs; requested POSIX file permissions are not enforced");
+        self.write_file(path, content).await
     }
 }
 

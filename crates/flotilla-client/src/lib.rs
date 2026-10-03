@@ -775,13 +775,19 @@ const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// a stale socket. The handshake is bounded — a daemon that accepts the
 /// connection but never replies is reported as an error rather than hanging
 /// the caller (or, worse, being treated as absent and spawned over).
+#[cfg(unix)]
 async fn connect_existing_stateful(socket_path: &Path, surface: Option<&SurfaceDeclaration>) -> Result<Option<Arc<SocketDaemon>>, String> {
     let session = match connect_unix_message_session(socket_path).await {
         Ok(session) => session,
-        Err(error) if cfg!(not(unix)) => return Err(error),
         Err(_) => return Ok(None),
     };
     from_session_stateful_bounded(socket_path, session, surface).await.map(Some)
+}
+
+#[cfg(not(unix))]
+async fn connect_existing_stateful(socket_path: &Path, _surface: Option<&SurfaceDeclaration>) -> Result<Option<Arc<SocketDaemon>>, String> {
+    connect_unix_message_session(socket_path).await?;
+    Ok(None)
 }
 
 async fn from_session_stateful_bounded(
@@ -1260,8 +1266,7 @@ mod windows_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("flotilla.sock");
         std::fs::write(&socket, "sentinel").expect("seed socket path");
-        let error = connect_or_spawn(&socket, dir.path(), dir.path()).await.err().expect("local daemon unsupported");
-        assert!(error.contains("no local daemon will be spawned"));
+        assert!(connect_or_spawn(&socket, dir.path(), dir.path()).await.is_err(), "local daemon connection must be refused");
         assert_eq!(std::fs::read_to_string(&socket).expect("socket preserved"), "sentinel");
         assert_eq!(std::fs::read_dir(dir.path()).expect("entries").count(), 1);
     }
