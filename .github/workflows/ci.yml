@@ -14,8 +14,8 @@ env:
   # Cached dependency artifacts pay off across runs; short-lived incremental
   # generations cost more to upload and store than they save in CI.
   CARGO_INCREMENTAL: "0"
-  # CI needs file:line in backtraces, not full debuginfo — this halves
-  # target size and link time for test binaries.
+  # Workspace crates retain file:line backtraces. Build/check commands below
+  # also set profile.dev.package."*".debug=0 for third-party dependencies.
   CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
 
 jobs:
@@ -74,7 +74,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "clippy"
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo --config 'profile.dev.package."*".debug=0' clippy --workspace --all-targets --locked -- -D warnings
 
   relay-wasm:
     name: Relay Workers target
@@ -88,8 +88,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "relay-wasm"
-      - run: cargo build -p flotilla-relay --target wasm32-unknown-unknown --locked
-      - run: cargo clippy -p flotilla-relay --target wasm32-unknown-unknown --locked -- -D warnings
+      - run: cargo --config 'profile.dev.package."*".debug=0' build -p flotilla-relay --target wasm32-unknown-unknown --locked
+      - run: cargo --config 'profile.dev.package."*".debug=0' clippy -p flotilla-relay --target wasm32-unknown-unknown --locked -- -D warnings
 
   test:
     name: Test
@@ -104,7 +104,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "test"
-      - run: cargo test --workspace --locked
+      - run: cargo --config 'profile.dev.package."*".debug=0' test --workspace --locked
 
   changes:
     name: Platform changes
@@ -160,11 +160,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "windows-client"
-      - run: cargo clippy -p flotilla-client -p flotilla-manifest -p flotilla-transport --locked
-      - run: cargo build --bin flotilla --locked
-      - run: "cargo test -p flotilla-client --locked --lib windows_tests::"
+      - run: cargo --config 'profile.dev.package."*".debug=0' clippy -p flotilla-client -p flotilla-manifest -p flotilla-transport --locked
+      - run: cargo --config 'profile.dev.package."*".debug=0' build --bin flotilla --locked
+      - run: "cargo --config 'profile.dev.package.\"*\".debug=0' test -p flotilla-client --locked --lib windows_tests::"
       - name: Test Wheelhouse named-pipe HTTP contract
-        run: "cargo test -p flotilla-manifest --locked --lib sink::tests::"
+        run: "cargo --config 'profile.dev.package.\"*\".debug=0' test -p flotilla-manifest --locked --lib sink::tests::"
 
   macos-peer-identity:
     name: macOS peer identity
@@ -177,4 +177,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "macos-peer-identity"
-      - run: "cargo test -p flotilla-daemon --locked --lib server::caller::tests::"
+      - run: "cargo --config 'profile.dev.package.\"*\".debug=0' test -p flotilla-daemon --locked --lib server::caller::tests::"
