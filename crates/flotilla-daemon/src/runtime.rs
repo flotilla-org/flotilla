@@ -6097,7 +6097,13 @@ dependency = { path = "../dependency" }
         fs::write(repo.join("src/main.rs"), "fn main() { member::call(); }\n").expect("root source");
         fs::write(repo.join("member/src/lib.rs"), "pub fn call() { dependency::call(); }\n").expect("member source");
         fs::write(repo.join("dependency/src/lib.rs"), "pub fn call() {}\n").expect("dependency source");
-        fs::write(repo.join(".cargo/config.toml"), "[build]\nrustflags = [\"--cfg\", \"profile_repo_config\"]\n").expect("repo config");
+        // Configured compiler caches may skip the recorder on a cache hit.
+        // These unavailable wrappers prove the fixture overrides Cargo config.
+        fs::write(
+            repo.join(".cargo/config.toml"),
+            "[build]\nrustflags = [\"--cfg\", \"profile_repo_config\"]\nrustc-wrapper = \"unavailable-profile-wrapper\"\nrustc-workspace-wrapper = \"unavailable-workspace-profile-wrapper\"\n",
+        )
+        .expect("repo config");
         let staged = super::stage_local_cargo_shim(temp.path()).expect("stage shim");
         let shim_dir = temp.path().join("shim with spaces");
         fs::create_dir_all(&shim_dir).expect("shim directory");
@@ -6157,8 +6163,10 @@ dependency = { path = "../dependency" }
                 .env_remove("CARGO_PROFILE_TEST_DEBUG")
                 .env_remove("RUSTFLAGS")
                 .env_remove("CARGO_ENCODED_RUSTFLAGS")
-                .env_remove("RUSTC_WRAPPER")
-                .env_remove("RUSTC_WORKSPACE_WRAPPER");
+                // Empty values disable wrappers configured outside the process
+                // environment too, so every compilation reaches our recorder.
+                .env("RUSTC_WRAPPER", "")
+                .env("RUSTC_WORKSPACE_WRAPPER", "");
             if let Some(debug) = debug {
                 command.env("CARGO_PROFILE_DEV_DEBUG", debug);
             }
@@ -6175,8 +6183,10 @@ dependency = { path = "../dependency" }
                 );
             }
             for name in ["profile_check", "member", "dependency"] {
-                let unit =
-                    arguments.split("BEGIN\n").find(|unit| unit.contains(&format!("--crate-name\n{name}\n"))).expect("compiled crate");
+                let unit = arguments
+                    .split("BEGIN\n")
+                    .find(|unit| unit.contains(&format!("--crate-name\n{name}\n")))
+                    .unwrap_or_else(|| panic!("missing compiler invocation for {case}/{name}: {arguments}"));
                 let expected = if (name == "dependency" && contained) || debug == Some("0") {
                     None
                 } else if debug == Some("line-tables-only") {

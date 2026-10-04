@@ -8757,9 +8757,9 @@ async fn startup_forgejo_case(
     daemon_credential: Option<&str>,
 ) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
     use flotilla_resources::{Forge, InMemoryBackend};
-    let temp = tempfile::tempdir().expect("create startup fixture directory");
-    let repo = temp.path().join("repo");
-    let healthy = temp.path().join("healthy");
+    let (temp, fixture) = symlinked_fixture();
+    let repo = fixture.join("repo");
+    let healthy = fixture.join("healthy");
     std::fs::create_dir_all(&repo).expect("create Forgejo checkout directory");
     std::fs::create_dir_all(&healthy).expect("create healthy checkout directory");
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -8881,6 +8881,7 @@ async fn startup_forgejo_selects_explicit_daemon_credential() {
 async fn startup_forgejo_discovery_error_preserves_other_repositories() {
     for name in ["missing", "work-0"] {
         let (_temp, repo, daemon) = startup_forgejo_case(3, Some(name)).await;
+        let repo = std::fs::canonicalize(repo).expect("physical startup checkout");
         let status = daemon.get_status().await.expect("read startup provider status");
         assert_eq!(status.repos.len(), 2);
         let failed = status.repos.iter().find(|root| root.path == repo).expect("retain failed repository in status");

@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
+    os::unix::fs::symlink,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
     time::Duration,
@@ -53,6 +54,16 @@ fn test_config(dir: PathBuf) -> Arc<ConfigStore> {
     Arc::new(ConfigStore::with_base(dir))
 }
 
+// Exercise aliased temp paths on Linux as well as macOS. TempDir owns both
+// the physical directory and its alias, so ordinary cleanup removes them.
+fn symlinked_fixture(tmp: &tempfile::TempDir) -> PathBuf {
+    let physical = tmp.path().join("physical");
+    std::fs::create_dir(&physical).expect("physical fixture directory");
+    let alias = tmp.path().join("alias");
+    symlink(&physical, &alias).expect("fixture directory symlink");
+    alias
+}
+
 async fn start_daemon() -> (Arc<InProcessDaemon>, ResourceBackend, Arc<ConfigStore>, DaemonRuntime, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
@@ -86,29 +97,6 @@ struct FixedInspector {
 struct MutableInspector {
     host_ref: String,
     spec: Arc<RwLock<RepositorySpec>>,
-}
-
-#[derive(Clone)]
-struct PerPathInspector {
-    host_ref: String,
-    specs: BTreeMap<PathBuf, RepositorySpec>,
-}
-
-#[async_trait]
-impl RepositoryInspector for PerPathInspector {
-    async fn inspect_path(&self, path: &Path, _remote: Option<&str>) -> Result<RepositoryInspection, String> {
-        Ok(RepositoryInspection {
-            spec: self.specs.get(path).ok_or_else(|| format!("unexpected checkout path {}", path.display()))?.clone(),
-            checkout: LocalCheckoutInspection {
-                path: path.to_path_buf(),
-                host_ref: self.host_ref.clone(),
-                git_ref: "main".to_string(),
-                is_main: true,
-            },
-            transport_url: None,
-            replaces_prior_repository: false,
-        })
-    }
 }
 
 #[derive(Clone)]
@@ -1111,23 +1099,24 @@ async fn tracked_repo_labels_materialized_project_without_overwriting_user_field
 #[tokio::test]
 async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let mirror_root = tmp.path().join("mirror-root");
-    let github_root = tmp.path().join("github-root");
-    std::fs::create_dir_all(&mirror_root).expect("mirror checkout");
-    std::fs::create_dir_all(&github_root).expect("GitHub checkout");
+    let fixture = symlinked_fixture(&tmp);
+    let mirror_root = fixture.join("mirror-root");
+    let github_root = fixture.join("github-root");
+    let canonical_url = "https://github.com/flotilla-org/flotilla";
+    let mirror_url = "https://forgejo.lab/lab/flotilla";
+    init_git_repo_with_remote(&mirror_root, mirror_url);
+    init_git_repo_with_remote(&github_root, canonical_url);
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let config = test_config(tmp.path().join("config"));
     let daemon = InProcessDaemon::new_with_resource_backend(
         vec![],
         Arc::clone(&config),
-        fake_discovery(false),
+        git_process_discovery(false),
         HostName::new("local"),
         backend.clone(),
     )
     .await;
 
-    let canonical_url = "https://github.com/flotilla-org/flotilla";
-    let mirror_url = "https://forgejo.lab/lab/flotilla";
     let canonical = RepositorySpec::remote(mirror_url)
         .expect("mirror observation")
         .with_remotes([canonical_url, mirror_url])
@@ -1157,24 +1146,21 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
         )
         .await
         .expect("old mirror project");
-    daemon
-        .set_repository_inspector(Arc::new(PerPathInspector {
-            host_ref: daemon.local_host_id().expect("local host").to_string(),
-            specs: BTreeMap::from([
-                (mirror_root, RepositorySpec::remote(mirror_url).expect("mirror clone")),
-                (github_root, RepositorySpec::remote(canonical_url).expect("GitHub clone")),
-            ]),
-        }))
-        .await;
-
-    let resolved_mirror = daemon.inspect_repository_path(tmp.path().join("mirror-root").as_path(), None).await.expect("resolve mirror");
+    let resolved_mirror = daemon.inspect_repository_path(&mirror_root, None).await.expect("resolve mirror");
     assert_eq!(resolved_mirror.spec.key(), canonical.key());
     assert_eq!(resolved_mirror.spec.live_remote(), Some(mirror_url));
     let mut events = daemon.subscribe();
-    for path in [tmp.path().join("mirror-root"), tmp.path().join("github-root")] {
-        let command_id =
-            daemon.execute(Command::builder().action(CommandAction::TrackRepoPath { path }).build()).await.expect("track root");
-        assert!(matches!(await_command_result(&mut events, command_id).await, CommandValue::RepoTracked { .. }));
+    for path in [&mirror_root, &github_root] {
+        let physical = std::fs::canonicalize(path).expect("physical checkout");
+        let command_id = daemon
+            .execute(Command::builder().action(CommandAction::TrackRepoPath { path: path.clone() }).build())
+            .await
+            .expect("track root");
+        let result = await_command_result(&mut events, command_id).await;
+        assert!(
+            matches!(&result, CommandValue::RepoTracked { path, resolved_from: None, .. } if *path == physical),
+            "unexpected tracking result: {result:?}"
+        );
     }
 
     let projects = backend.clone().definitions::<Project>("flotilla").list().await.expect("project list");
@@ -1190,11 +1176,10 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
     assert_eq!(repository_items.items.len(), 3, "existing repository records remain durable");
     assert!(repositories.get(&mirror.key().to_string()).await.is_ok(), "provisional mirror repository remains referenced");
     assert!(repositories.get(&fork.key().to_string()).await.expect("fork remains").spec.is_fork());
-    assert_eq!(daemon.repository_key_for_path(&tmp.path().join("mirror-root")).await, Some(canonical.key()));
-    assert_eq!(daemon.repository_key_for_path(&tmp.path().join("github-root")).await, Some(canonical.key()));
+    assert_eq!(daemon.repository_key_for_path(&mirror_root).await, Some(canonical.key()));
+    assert_eq!(daemon.repository_key_for_path(&github_root).await, Some(canonical.key()));
 
-    let mirror_path = tmp.path().join("mirror-root");
-    let configured = daemon.inspect_repository_path(&mirror_path, None).await.expect("live order may differ from stable identity");
+    let configured = daemon.inspect_repository_path(&mirror_root, None).await.expect("live order may differ from stable identity");
     assert_eq!(configured.spec.key(), canonical.key());
     assert_eq!(configured.spec.live_remote(), Some(mirror_url));
 }
@@ -1248,8 +1233,9 @@ async fn tracked_repo_labels_matching_unlabelled_project_once() {
 async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
-    let checkout_path = tmp.path().join("andamento");
+    let checkout_path = symlinked_fixture(&tmp).join("andamento");
     std::fs::create_dir(&checkout_path).expect("checkout dir");
+    let physical_path = std::fs::canonicalize(&checkout_path).expect("physical checkout");
     let local_spec = RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec");
     let local_key = local_spec.key();
     let inspected_spec = Arc::new(RwLock::new(local_spec));
@@ -1293,7 +1279,7 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
         .await
         .expect("repo add after remote appears");
     assert_eq!(await_command_result(&mut rx, second_id).await, CommandValue::RepoTracked {
-        path: checkout_path.clone(),
+        path: physical_path,
         resolved_from: None,
         identity_change: Some(RepositoryIdentityChange {
             previous_display: "local".to_string(),
@@ -1445,8 +1431,9 @@ async fn identity_change_preserves_existing_project_without_ambient_migration() 
 async fn refresh_surfaces_repository_identity_change_without_materializing_a_project() {
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let mut rx = daemon.subscribe();
-    let checkout_path = tmp.path().join("refreshed");
+    let checkout_path = symlinked_fixture(&tmp).join("refreshed");
     std::fs::create_dir(&checkout_path).expect("checkout dir");
+    let physical_path = std::fs::canonicalize(&checkout_path).expect("physical checkout");
     let inspected_spec = Arc::new(RwLock::new(
         RepositorySpec::local("host-01", checkout_path.join(".git").to_string_lossy()).expect("local repository spec"),
     ));
@@ -1472,7 +1459,7 @@ async fn refresh_surfaces_repository_identity_change_without_materializing_a_pro
 
     assert_eq!(await_command_result(&mut rx, refresh_id).await, CommandValue::Refreshed {
         repository_count: 1,
-        repos: vec![checkout_path],
+        repos: vec![physical_path],
         identity_changes: vec![RepositoryIdentityChange {
             previous_display: "local".to_string(),
             current_display: "https://github.com/flotilla-org/refreshed".to_string(),
