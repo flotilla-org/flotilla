@@ -6,10 +6,10 @@ use std::{
 };
 
 pub struct Sshd {
+    _child: ChildGuard,
     pub directory: tempfile::TempDir,
     pub options: Vec<String>,
     pub destination: String,
-    child: Child,
 }
 
 impl Sshd {
@@ -37,18 +37,26 @@ impl Sshd {
         let public = std::fs::read_to_string(root.join("host.pub")).expect("host public key");
         std::fs::write(root.join("known_hosts"), format!("[127.0.0.1]:{port} {public}")).expect("pinned SSH host key");
         let binary = std::env::var_os("TENDER_TEST_SSHD").map(PathBuf::from).unwrap_or_else(|| "/usr/sbin/sshd".into());
-        let mut child = Command::new(binary)
-            .args(["-D", "-e", "-f"])
-            .arg(root.join("config"))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .expect("local sshd (set TENDER_TEST_SSHD if needed)");
+        let mut child = ChildGuard(
+            Command::new(binary)
+                .args(["-D", "-e", "-f"])
+                .arg(root.join("config"))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("local sshd (set TENDER_TEST_SSHD if needed)"),
+        );
         for _ in 0..100 {
-            assert!(child.try_wait().expect("sshd status").is_none(), "sshd fixture exited");
+            assert!(child.0.try_wait().expect("sshd status").is_none(), "sshd fixture exited");
             if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
                 return Self {
                     options: vec![
+                        "-F".into(),
+                        "/dev/null".into(),
+                        "-o".into(),
+                        "GlobalKnownHostsFile=/dev/null".into(),
+                        "-o".into(),
+                        "IdentityAgent=none".into(),
                         "-p".into(),
                         port.to_string(),
                         "-i".into(),
@@ -60,7 +68,7 @@ impl Sshd {
                     ],
                     destination: format!("{}@127.0.0.1", user.trim()),
                     directory,
-                    child,
+                    _child: child,
                 };
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -69,9 +77,11 @@ impl Sshd {
     }
 }
 
-impl Drop for Sshd {
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }

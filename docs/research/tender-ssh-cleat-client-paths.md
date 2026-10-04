@@ -8,7 +8,18 @@ wrapper and a scratch clone outside the vessel checkout.
 
 ## Current proof status
 
-The cleat-specific proof is pending [cleat#302](https://github.com/flotilla-org/cleat/issues/302), which adds connect-only `--socket` attach and packets without metadata checks or daemon spawning. [Flotilla#2562](https://github.com/flotilla-org/flotilla/issues/2562) will run it in a dedicated CI job using cleat’s own client. The bespoke protocol-11 Python client and cleat fixture have been removed from Tender tests at operator review. The historical observations below explain the client limitation; they are not the maintained proof gate. Normal CI now runs the adapter contracts directly over a local Unix socket and a generic Rust ordinary-service interruption/half-close/recovery scenario. Exactly one opt-in loopback-sshd Forward smoke test remains.
+[Cleat#302](https://github.com/flotilla-org/cleat/issues/302) shipped in
+[cleat#303](https://github.com/flotilla-org/cleat/pull/303). The dedicated
+`Tender SSH cleat proof` job builds revision
+`00c072b207dc943f6c93fe3b6b09abaa257695a6` and exercises cleat's own connect-only
+`packets --socket` and `attach --socket` clients through a Tender-owned exposure
+over real loopback SSH. See [the maintained proof](../../ci/tender/README.md)
+for setup, provenance, interruption, refusal and recovery assertions.
+
+The historical protocol-11 Python experiment below is evidence about the old
+client limitation, not maintained CI coverage. Tender maintains no cleat protocol
+client. Normal adapter contracts remain on local Unix sockets, with exactly one
+ignored real-sshd Forward smoke test.
 
 ## Client-path result
 
@@ -66,8 +77,8 @@ select a physical daemon. Source:
 A temporary independent protocol-11 client returned directory and render frames,
 and capture confirmed input reached the `cat` PTY. That helper has been removed:
 maintaining a second cleat protocol implementation is unnecessary for Tender’s
-ordinary-service contract. Reproduce the cleat proof with cleat’s own connect-only
-client after cleat#302 lands, as tracked by #2562. The fixture session and daemon
+ordinary-service contract. The maintained proof now uses cleat’s own connect-only client; see the
+current proof status above. The fixture session and daemon
 used in the investigation were stopped.
 
 ## Historical real SSH adapter experiment
@@ -118,4 +129,4 @@ identity, explicit generation reclaim and fresh opens without replay.
 `TENDER_TEST_SSHD` selects a nonstandard sshd binary. The fixture uses ephemeral
 keys, pinned known_hosts, private directories, loopback only, and cleans its own
 processes. No cleat or Python dependency is needed by Tender tests. The dedicated
-cleat proof remains pending on cleat#302 and #2562.
+cleat proof uses the opt-in target documented in [ci/tender](../../ci/tender/README.md).

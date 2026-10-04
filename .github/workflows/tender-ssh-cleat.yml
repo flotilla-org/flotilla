@@ -1,0 +1,65 @@
+name: Tender SSH cleat proof
+
+# Real-SSH proof is expensive (cleat build + sshd); run it only when Tender,
+# its CI rig, or this workflow changes, plus on demand.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/tender/**"
+      - "ci/tender/**"
+      - ".github/workflows/tender-ssh-cleat.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/tender/**"
+      - "ci/tender/**"
+      - ".github/workflows/tender-ssh-cleat.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+
+jobs:
+  cleat-over-ssh:
+    name: Cleat client through Tender over SSH
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: flotilla-org/cleat
+          ref: 00c072b207dc943f6c93fe3b6b09abaa257695a6
+          path: cleat-source
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tender-ssh-cleat
+      - name: Provision OpenSSH and functional pinned cleat
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-client openssh-server
+          # Only the test-owned loopback sshd should remain running.
+          sudo systemctl stop ssh.service ssh.socket
+          ci/tender/build-cleat.sh "$GITHUB_WORKSPACE/cleat-source" "$RUNNER_TEMP/tender-cleat"
+      - name: Real SSH Forward smoke and cleat client proof
+        env:
+          TENDER_TEST_CLEAT: ${{ runner.temp }}/tender-cleat/cleat
+        run: |
+          unset TMPDIR
+          cargo --config 'profile.dev.package."*".debug=0' clippy -p tender --all-targets --locked --features ssh-cleat-proof -- -D warnings
+          cargo --config 'profile.dev.package."*".debug=0' test -p tender --locked --test ssh_adapter forward_carries_contract_and_reclaims_after_route_replacement -- --ignored --nocapture
+          cargo --config 'profile.dev.package."*".debug=0' test -p tender --locked --features ssh-cleat-proof --test ssh_cleat -- --nocapture
+      - name: Record build and SSH provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tender-cleat-provenance
+          path: ${{ runner.temp }}/tender-cleat/provenance.txt
+          if-no-files-found: warn
