@@ -13,12 +13,12 @@ use flotilla_resources::{
     interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest, ChangeRequestMergeability, ChangeRequestObservation,
     ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestState, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus,
     CheckoutPhase, CheckoutSpec, CheckoutStatus, CheckoutWorktreeSpec, Clock, ConditionValue, Convoy, ConvoyEvent, ConvoyPhase,
-    ConvoyReconciler, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewSource, CrewWorkPhase, InMemoryBackend, InputMeta,
-    InputValue, IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation, ObservedChangeRequestState, ObservedCheckoutSpec,
-    ObservedChecks, ObservedMergeability, OwnerReference, Presentation, PresentationSpec, RepositoryKey, ResourceBackend, ReviewRefPair,
-    SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
-    UnmetSettlementExpectation, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase,
-    WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
+    ConvoyReconciler, ConvoyStatus, ConvoyStatusPatch, ConvoyTeardownRuntime, CrewCompletionRefusalCause, CrewSource, CrewWorkPhase,
+    InMemoryBackend, InputMeta, InputValue, IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation,
+    ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability, OwnerReference, Presentation, PresentationSpec,
+    RepositoryKey, ResourceBackend, ReviewRefPair, SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession,
+    TerminalSessionSource, TerminalSessionSpec, UnmetSettlementExpectation, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus,
+    WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 
 use crate::common;
@@ -113,7 +113,7 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr() {
     // #2211: a bound PR with no observation carries its typed identity, not a prose hint.
     assert!(missing.iter().any(|expectation| matches!(expectation,
         UnmetSettlementExpectation::CompletionConditionUnsatisfied { causes, .. }
-            if causes == &vec![flotilla_resources::CrewCompletionRefusalCause::MissingChangeRequestObservation {
+            if causes == &vec![CrewCompletionRefusalCause::MissingChangeRequestObservation {
                 service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 42,
             }]
     )));
@@ -177,7 +177,7 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr() {
     change_requests.insert(record_name.clone(), conflicting);
     assert!(evaluate("coder", &change_requests, &artifacts).iter().any(|expectation| matches!(expectation,
         UnmetSettlementExpectation::CompletionConditionUnsatisfied { causes, .. }
-            if causes == &vec![flotilla_resources::CrewCompletionRefusalCause::ConflictingChangeRequest {
+            if causes == &vec![CrewCompletionRefusalCause::ConflictingChangeRequest {
                 service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 42,
             }]
     )));

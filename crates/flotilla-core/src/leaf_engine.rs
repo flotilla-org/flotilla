@@ -17,13 +17,14 @@ use flotilla_resources::{
     controller::{SecondaryWatch, WorkQueueSender},
     evaluate_leaf, expected_change_request_leaves, external_patches, instantiate_exit, instantiate_turn_delivery, select_convoy_children,
     subject_relationship_conflicts, Artifact, ArtifactLeafSubject, ChangeRequest, ChangeRequestLeafSubject, Checkout, CheckoutSpec,
-    ControllerRetry, Convoy, ConvoyAttention, ConvoyEnsure, ConvoyLeafSubject, ConvoyPhase, ConvoyStatus, Forge, HoldAct, InstantiatedExit,
-    Issue, IssueLeafSubject, LeafMaker, NudgeObligation, Project, ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError,
-    ResourceObject, ResourceProvenance, RetryCeiling, StallEvidenceSource, StallNudge, StallProposedDisposition, StallRung,
-    StallSupervisor, StalledCondition, StatusPatch, SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule,
-    TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL,
-    ROLE_LABEL, VESSEL_LABEL,
+    ControllerRetry, Convoy, ConvoyAttention, ConvoyEnsure, ConvoyLeafSubject, ConvoyPhase, ConvoyStatus, CrewCompletionRefusal,
+    CrewCompletionRefusalCause, Forge, HoldAct, InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, NudgeObligation, Project,
+    ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RetryCeiling,
+    StallEvidenceSource, StallNudge, StallProposedDisposition, StallRung, StallSupervisor, StalledCondition, StatusPatch,
+    SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Usage,
+    UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL,
+    VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::{
@@ -158,15 +159,16 @@ fn is_conflict_probe(leaf: &Leaf) -> bool {
     leaf.field_path == ".mergeable" && leaf.operator == LeafOperator::Equal && leaf.literal == "conflicting"
 }
 
-fn refusal_nudge_brief(refusal: &flotilla_resources::CrewCompletionRefusal) -> String {
+fn refusal_nudge_brief(refusal: &CrewCompletionRefusal) -> String {
     let conflict = refusal.causes.iter().find_map(|cause| match cause {
-        flotilla_resources::CrewCompletionRefusalCause::ConflictingChangeRequest { number, .. } => Some(*number),
+        CrewCompletionRefusalCause::ConflictingChangeRequest { number, .. } => Some(*number),
         _ => None,
     });
     let missing = refusal.causes.iter().find_map(|cause| match cause {
-        flotilla_resources::CrewCompletionRefusalCause::MissingChangeRequestObservation { number, .. } => Some(*number),
+        CrewCompletionRefusalCause::MissingChangeRequestObservation { number, .. } => Some(*number),
         _ => None,
     });
+    // Prefer actionable conflicts over missing observations when several causes coexist.
     let remedy = if let Some(number) = conflict {
         format!("PR #{number} is conflicting: rebase onto the current base branch, rerun the gates, push, then `flotilla crew complete`.")
     } else if let Some(number) = missing {
@@ -2558,7 +2560,6 @@ mod tests {
     // #2211: typed causes and PR identity select remedies regardless of explanation wording.
     #[hegel::test]
     fn refusal_remedies_ignore_explanation_wording(tc: hegel::TestCase) {
-        use flotilla_resources::{CrewCompletionRefusal, CrewCompletionRefusalCause};
         use hegel::generators as gs;
 
         // Cover both remedies, empty/legacy cause lists, duplicates, combined causes,
@@ -3071,7 +3072,6 @@ mod tests {
     // idle crew even when the explanation omits all former matcher phrases.
     #[tokio::test]
     async fn stored_refusal_nudges_use_typed_causes_after_restore() {
-        use flotilla_resources::{CrewCompletionRefusal, CrewCompletionRefusalCause};
         for (cause, remedy) in [
             (
                 CrewCompletionRefusalCause::ConflictingChangeRequest {

@@ -3159,7 +3159,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         // #2211: a hard observation failure retains its subject even if other PRs have evidence.
         let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
         assert!(status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal").causes.contains(
-            &flotilla_resources::CrewCompletionRefusalCause::MissingChangeRequestObservation {
+            &CrewCompletionRefusalCause::MissingChangeRequestObservation {
                 service: "github.com".into(),
                 scope: "flotilla-org/flotilla".into(),
                 number: 2200,
@@ -3231,7 +3231,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
     );
     // #2211: claim admission persists the cause and exact PR identity before nudging.
     assert_eq!(refused_status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal").causes, vec![
-        flotilla_resources::CrewCompletionRefusalCause::ConflictingChangeRequest {
+        CrewCompletionRefusalCause::ConflictingChangeRequest {
             service: "github.com".into(),
             scope: "flotilla-org/flotilla".into(),
             number: 2200,

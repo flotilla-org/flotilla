@@ -63,9 +63,9 @@ use flotilla_resources::{
     ConditionValue, ControllerRetry, Convoy as ResourceConvoy, ConvoyEnsure, ConvoyEnsureCondition, ConvoyEnsureHoldReason,
     ConvoyEnsureSpec, ConvoyEnsureStatusPatch, ConvoyIssue, ConvoyPhase, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec,
     ConvoyStatusPatch, CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionClaim, CrewCompletionPending,
-    CrewMessageDelivery, CrewMessageSender, CrewSource, CrewSpec, CrewWorkPhase, Demand as ResourceDemand, DemandExpiry,
-    DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, DocumentKey, Environment as ResourceEnvironment, EnvironmentPhase,
-    EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, HoldAct, Host as ResourceHost,
+    CrewCompletionRefusalCause, CrewMessageDelivery, CrewMessageSender, CrewSource, CrewSpec, CrewWorkPhase, Demand as ResourceDemand,
+    DemandExpiry, DemandExpiryDisposition, DemandKind, DemandSpec, DemandState, DocumentKey, Environment as ResourceEnvironment,
+    EnvironmentPhase, EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentGrant, FulfilmentKind, HoldAct, Host as ResourceHost,
     HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IntegrationCondition, IssueSnapshot, IssueSourceResolution,
     IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectEvent, ObjectMeta, ObservedChangeRequestState,
     ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PendingBrief, PlacementPolicy, PlacementPolicySpec, Platform,
@@ -74,8 +74,8 @@ use flotilla_resources::{
     ResourceProvenance, RetryBackoff, RoleHandoff, SupervisionTarget, SystemClock, TerminalAttentionState, TerminalBrief,
     TerminalCrewContext, TerminalCrewMessage, TerminalSession as ResourceTerminalSession, TerminalSessionIdentity,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung,
-    TypedResolver, Vessel, VesselRequirement, WatchEvent, WatchStart, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase,
-    WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
+    TypedResolver, UnmetSettlementExpectation, Vessel, VesselRequirement, WatchEvent, WatchStart, WorkCompletionAuthority,
+    WorkPhase as ResourceWorkPhase, WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL,
     CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, DRIVER_ADMISSION_CONDITION_TYPE,
     GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_REF_LABEL,
 };
@@ -6759,7 +6759,7 @@ impl InProcessDaemon {
                             observation_waits.push((retry_at, format!("PR {} observation: {error}", subject.number)));
                         } else {
                             observation_errors.push(format!("could not observe PR {}: {error}", subject.number));
-                            refusal_causes.push(flotilla_resources::CrewCompletionRefusalCause::MissingChangeRequestObservation {
+                            refusal_causes.push(CrewCompletionRefusalCause::MissingChangeRequestObservation {
                                 service: subject.service.clone(),
                                 scope: subject.scope.clone(),
                                 number: subject.number,
@@ -6816,7 +6816,7 @@ impl InProcessDaemon {
             }
             if !unmet.is_empty() || !observation_errors.is_empty() {
                 for expectation in &unmet {
-                    if let flotilla_resources::UnmetSettlementExpectation::CompletionConditionUnsatisfied { causes, .. } = expectation {
+                    if let UnmetSettlementExpectation::CompletionConditionUnsatisfied { causes, .. } = expectation {
                         for cause in causes {
                             if !refusal_causes.contains(cause) {
                                 refusal_causes.push(cause.clone());
