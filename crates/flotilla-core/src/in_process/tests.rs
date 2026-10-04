@@ -552,6 +552,12 @@ async fn assert_supervisor_turn_passes_are_idle(
     state: &str,
     passes: usize,
 ) {
+    let backend_name = match backend {
+        ResourceBackend::InMemory(_) => "in-memory",
+        ResourceBackend::Sqlite(_) => "sqlite",
+        _ => panic!("unsupported contract backend"),
+    };
+    let state = format!("{backend_name}: {state}");
     let sessions = backend.clone().using::<ResourceTerminalSession>(namespace);
     let convoys = backend.clone().using::<ResourceConvoy>(namespace);
     // This namespace has no concurrent writers, so list-to-subscribe cannot miss a write.
