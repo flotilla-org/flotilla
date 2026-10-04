@@ -33,7 +33,9 @@ use crate::{
         parse_project_declaration, ProjectDeclaration, BOOTSTRAP_COMMIT_ANNOTATION, BOOTSTRAP_PATH_ANNOTATION,
         BOOTSTRAP_REPOSITORY_ANNOTATION, DECLARATION_FILE, DECLARATION_FILE_ANNOTATION,
     },
-    repository_inspection::{OperationalEntriesInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector},
+    repository_inspection::{
+        LocalCheckoutInspection, OperationalEntriesInspection, ProjectDeclarationInspection, RepositoryInspection, RepositoryInspector,
+    },
 };
 
 /// A refresh refusal preserves file identity independently of its display text.
@@ -168,6 +170,25 @@ pub(super) struct RepositoryIndex<'a> {
 }
 
 impl RepositoryIndex<'_> {
+    async fn main_checkout_for(&self, key: &RepositoryKey) -> Result<LocalCheckoutInspection, String> {
+        let namespace = self.namespace.read().expect("namespace lock poisoned").clone();
+        let checkouts = crate::repository_addressing::local_checkouts(self.backend, self.observed, &namespace, self.host).await?;
+        let mut candidates = checkouts.iter().filter(|checkout| checkout.spec.repo_ref() == key).collect::<Vec<_>>();
+        if candidates.len() > 1 {
+            candidates.retain(|checkout| matches!(&checkout.spec, flotilla_resources::CheckoutSpec::Observed(spec) if spec.is_main));
+        }
+        match candidates.as_slice() {
+            [checkout] => Ok(LocalCheckoutInspection::builder()
+                .path(super::checkout_path(checkout).map(PathBuf::from).ok_or_else(|| format!("repository {key} has no local path"))?)
+                .host_ref(self.host.to_string())
+                .git_ref(checkout.spec.branch().to_string())
+                .is_main(matches!(&checkout.spec, flotilla_resources::CheckoutSpec::Observed(spec) if spec.is_main))
+                .build()),
+            [] => Err(format!("repository {key} has no local main checkout on this host")),
+            _ => Err(format!("repository {key} has multiple local main checkouts; register the intended path explicitly")),
+        }
+    }
+
     async fn paths_for(&self, key: &RepositoryKey) -> Result<Vec<PathBuf>, String> {
         let namespace = self.namespace.read().expect("namespace lock poisoned").clone();
         Ok(crate::repository_addressing::local_checkouts(self.backend, self.observed, &namespace, self.host)
@@ -182,6 +203,7 @@ impl RepositoryIndex<'_> {
 /// Repository inspection and convoy teardown operations owned by their existing subsystems.
 #[async_trait]
 pub(super) trait ProjectOperations: Send + Sync {
+    fn remember_bootstrap_checkout(&self, inspection: &RepositoryInspection) -> Result<(), String>;
     async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String>;
     async fn inspect_repository_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String>;
     async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String>;
@@ -191,6 +213,14 @@ pub(super) trait ProjectOperations: Send + Sync {
 
 #[async_trait]
 impl ProjectOperations for InProcessDaemon {
+    fn remember_bootstrap_checkout(&self, inspection: &RepositoryInspection) -> Result<(), String> {
+        use crate::path_context::ExecutionEnvironmentPath;
+        let path = ExecutionEnvironmentPath::new(&inspection.checkout.path);
+        self.config.add_observation_root(&path)?;
+        self.config.set_checkout_config(&path, inspection.spec.vcs().clone());
+        Ok(())
+    }
+
     async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
         InProcessDaemon::repository_inspector(self).await
     }
@@ -302,17 +332,26 @@ impl ProjectService<'_> {
         let namespace = self.provisioning_namespace();
         let project =
             self.resource_backend.clone().definitions::<Project>(&namespace).get(name).await.map_err(|error| error.to_string())?;
-        let bootstrap_path = project
+        let bootstrap_key = project
             .metadata
             .annotations
-            .get(BOOTSTRAP_PATH_ANNOTATION)
+            .get(BOOTSTRAP_REPOSITORY_ANNOTATION)
             .ok_or_else(|| format!("project {name} was registered without a declaration"))?;
-        let inspection = self.operations.repository_inspector().await?.inspect_project_declaration(Path::new(bootstrap_path)).await?;
+        match self.resource_backend.clone().using::<Project>(&namespace).get(name).await {
+            Ok(_) => {}
+            Err(ResourceError::NotFound { .. }) => {
+                debug!(project = %name, "skipping project materialization away from its home");
+                return Ok((project.spec.repositories.len(), false, Vec::new(), Vec::new()));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        let bootstrap_path = self.repository_index.main_checkout_for(&RepositoryKey(bootstrap_key.clone())).await?.path;
+        let inspection = self.operations.repository_inspector().await?.inspect_project_declaration(&bootstrap_path).await?;
         let declaration = parse_project_declaration(&inspection.yaml)?;
         if declaration.name != name {
             return Err(format!(
                 "{} now declares project `{}` instead of `{name}`",
-                Path::new(bootstrap_path).join(DECLARATION_FILE).display(),
+                bootstrap_path.join(DECLARATION_FILE).display(),
                 declaration.name
             ));
         }
@@ -360,8 +399,11 @@ impl ProjectService<'_> {
             .flat_map(|project| &project.spec.repositories)
             .filter_map(|member| member.alias.as_ref().map(|alias| (alias.clone(), member.repo.clone())))
             .collect::<BTreeMap<_, _>>();
+        self.operations.remember_bootstrap_checkout(&inspection.repository)?;
         let bootstrap_key = inspection.repository.key();
-        let bootstrap_path = inspection.repository.checkout.path.to_string_lossy().into_owned();
+        ensure_repository(&repositories, &bootstrap_key, &inspection.repository.spec).await.map_err(|error| error.to_string())?;
+        self.reconcile_project_checkouts(&namespace, &bootstrap_key, &inspection.repository.spec, inspection.repository.checkout.clone())
+            .await?;
         let bootstrap_inspection = inspection.clone();
         let provenance = BTreeMap::from([
             (BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), bootstrap_key.to_string()),
@@ -437,7 +479,9 @@ impl ProjectService<'_> {
         for (annotation, value) in provenance {
             meta.annotations.insert(annotation, value);
         }
-        meta.annotations.insert(BOOTSTRAP_PATH_ANNOTATION.to_string(), bootstrap_path);
+        // ADR 0047: accept old annotations, but never rewrite the retired path.
+        // Remove this cleanup one fleet roll after #2484 ships.
+        meta.annotations.remove(BOOTSTRAP_PATH_ANNOTATION);
         converged |=
             existing_project.as_ref().is_none_or(|project| project.spec != spec || project.metadata.annotations != meta.annotations);
         projects
@@ -511,42 +555,33 @@ impl ProjectService<'_> {
         let mut sources = Vec::new();
         let mut unavailable_source = false;
         for member in project.spec.repositories.iter().filter(|member| member.roles.contains(&ProjectRepositoryRole::Ops)) {
-            let path = if member.repo == bootstrap.repository.key() {
-                bootstrap.repository.checkout.path.clone()
+            let repository = if member.repo == bootstrap.repository.key() {
+                bootstrap.repository.clone()
             } else {
-                let mut paths = self.repository_index.paths_for(&member.repo).await?;
-                paths.sort();
-                match paths.as_slice() {
-                    [] => {
+                let checkout = match self.repository_index.main_checkout_for(&member.repo).await {
+                    Ok(checkout) => checkout,
+                    Err(error) if self.repository_index.paths_for(&member.repo).await?.is_empty() => {
+                        debug!(%error, "ops checkout unavailable");
                         unavailable_source = true;
                         continue;
                     }
-                    [path] => path.clone(),
-                    _ => {
-                        let mut main_paths = Vec::new();
-                        for path in paths {
-                            if inspector.inspect_path(&path, None).await?.checkout.is_main {
-                                main_paths.push(path);
-                            }
-                        }
-                        match main_paths.as_slice() {
-                            [path] => path.clone(),
-                            _ => {
-                                return Err(format!(
-                                    "ops member {} has multiple local checkouts; its main checkout cannot be selected unambiguously",
-                                    member.alias.as_deref().unwrap_or(&member.repo.0)
-                                ));
-                            }
-                        }
-                    }
-                }
+                    Err(error) => return Err(error),
+                };
+                let spec = self
+                    .resource_backend
+                    .clone()
+                    .using::<Repository>(&namespace)
+                    .get(&member.repo.to_string())
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .spec;
+                RepositoryInspection { spec, checkout, transport_url: None, replaces_prior_repository: false }
             };
-            let mut source = inspector.inspect_operational_entries(&path).await?;
-            source.repository.spec = self.operations.resolve_forge_identity(source.repository.spec).await?;
+            let (mut commit, files) = inspector.operational_entry_files_at(&repository.checkout.path).await?;
             if member.repo == bootstrap.repository.key() {
-                source.commit.clone_from(&bootstrap.commit);
-                source.repository = bootstrap.repository.clone();
+                commit.clone_from(&bootstrap.commit);
             }
+            let source = OperationalEntriesInspection { repository, commit, files };
             sources.push(source);
         }
         // Registration remains possible from a bootstrap repository that does
@@ -1256,6 +1291,10 @@ mod tests {
 
     #[async_trait]
     impl ProjectOperations for FakeProjectOperations {
+        fn remember_bootstrap_checkout(&self, _: &RepositoryInspection) -> Result<(), String> {
+            Ok(())
+        }
+
         async fn repository_inspector(&self) -> Result<Arc<dyn RepositoryInspector>, String> {
             Ok(Arc::clone(&self.inspector))
         }

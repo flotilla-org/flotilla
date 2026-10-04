@@ -789,13 +789,10 @@ mod tests {
             .create(
                 &InputMeta::builder()
                     .name("demo".to_string())
-                    .annotations(std::collections::BTreeMap::from([
-                        (
-                            flotilla_core::project_declaration::BOOTSTRAP_PATH_ANNOTATION.into(),
-                            tmp.as_path().to_string_lossy().into_owned(),
-                        ),
-                        (flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(), spec.key().to_string()),
-                    ]))
+                    .annotations(std::collections::BTreeMap::from([(
+                        flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(),
+                        spec.key().to_string(),
+                    )]))
                     .build(),
                 &ProjectSpec::builder()
                     .display_name("Demo".to_string())
@@ -818,9 +815,9 @@ mod tests {
             GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
         );
         let inspector = GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), VALIDATION_INSPECTION_HOST);
-        // The roots pass tolerates the unidentifiable checkout; the bootstrap
-        // annotation still selects it and its entries are parsed.
-        let paths = inspect_validation_roots(std::slice::from_ref(&tmp), &inspector).await;
+        // Issue #2484: selection comes from host-local Checkout facts keyed by
+        // established identity, even when fresh remote inspection is ambiguous.
+        let paths = std::collections::BTreeMap::from([(spec.key(), vec![tmp.clone()])]);
         let error = validate_project_ops(std::slice::from_ref(&project), &paths, &inspector)
             .await
             .expect_err("candidate parses the selected checkout's entries");
@@ -870,13 +867,10 @@ mod tests {
             .create(
                 &InputMeta::builder()
                     .name("demo".to_string())
-                    .annotations(std::collections::BTreeMap::from([
-                        (
-                            flotilla_core::project_declaration::BOOTSTRAP_PATH_ANNOTATION.into(),
-                            tmp.as_path().to_string_lossy().into_owned(),
-                        ),
-                        (flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(), spec.key().to_string()),
-                    ]))
+                    .annotations(std::collections::BTreeMap::from([(
+                        flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(),
+                        spec.key().to_string(),
+                    )]))
                     .build(),
                 &ProjectSpec::builder()
                     .display_name("Demo".to_string())
@@ -899,7 +893,9 @@ mod tests {
             GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
         );
         let inspector = GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), VALIDATION_INSPECTION_HOST);
-        let error = validate_project_ops(std::slice::from_ref(&project), &std::collections::BTreeMap::new(), &inspector)
+        // Bootstrap location comes from local roots, never replicated metadata.
+        let paths = inspect_validation_roots(std::slice::from_ref(&tmp), &inspector).await;
+        let error = validate_project_ops(std::slice::from_ref(&project), &paths, &inspector)
             .await
             .expect_err("candidate rejects unknown ops field");
         assert!(error.to_string().contains("governor.md"));

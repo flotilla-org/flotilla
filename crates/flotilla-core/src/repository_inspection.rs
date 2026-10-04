@@ -125,20 +125,10 @@ pub async fn inspect_project_ops_entries(
     paths: &BTreeMap<RepositoryKey, Vec<PathBuf>>,
     inspector: &dyn RepositoryInspector,
 ) -> Result<OperationalEntryInventory, String> {
-    use crate::project_declaration::{BOOTSTRAP_PATH_ANNOTATION, BOOTSTRAP_REPOSITORY_ANNOTATION};
     let mut inventory = OperationalEntryInventory::default();
     for project in projects {
         for member in project.spec.repositories.iter().filter(|member| member.roles.contains(&ProjectRepositoryRole::Ops)) {
             let mut candidates = paths.get(&member.repo).cloned().unwrap_or_default();
-            if project.metadata.annotations.get(BOOTSTRAP_REPOSITORY_ANNOTATION) == Some(&member.repo.to_string()) {
-                // The annotation travels with the replicated Project, so it may
-                // name another host's checkout.
-                if let Some(path) = project.metadata.annotations.get(BOOTSTRAP_PATH_ANNOTATION).map(PathBuf::from) {
-                    if path.is_dir() {
-                        candidates.push(path);
-                    }
-                }
-            }
             candidates.sort();
             candidates.dedup();
             let path = match candidates.as_slice() {
