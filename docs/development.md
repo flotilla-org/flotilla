@@ -241,3 +241,26 @@ config. The shared clone config and hooks retain their read-only mounts, and the
 host config guard continues to reject `extensions.worktreeConfig` and executable
 configuration. Branches created manually after provisioning can be published with
 an explicit branch.
+
+Queued-turn diagnostics use the `crew turn delivery decision`,
+`pending crew turn delivery decision`, and `terminal crew turn delivery decision`
+events. They record convoy and sender, current attention state, source and
+timestamp, the 120-second hook precedence window, and the queue, release,
+confirmation, or skip reason without logging message contents. Repeated pending
+and skip decisions use debug level; queue, release and confirmation use info.
+Debug-level `terminal attention decision` events show accepted observations and
+precedence/debounce skips. `Codex turn hook configuration` records the effective
+config path, contained detection, and whether notify needs repair. An already
+trusted contained workspace still gets
+`notify = ["flotilla", "hook", "codex", "notify"]`.
+Host-direct launches use an invocation override instead.
+
+Before #2598, Active convoys armed only conflict probes, explaining why the
+hookless incident never queued its review wake. Active Working or Interrupted
+crews now also arm workflow-declared checks and actionable-review rules; queued
+turns still wait for terminal readiness. Debug subscription decisions identify
+`skip_ineligible_active_crew_or_subject` when the target or subject is ineligible.
+Escalation warnings now distinguish `supervisor_lookup_failed`,
+`operator_rung_selected`, and `supervision_policy_exhausted`, and include the policy
+cursor and lookup evidence. A live governor can coexist with an exhausted policy;
+its existence alone does not mean that an escalation lookup failed.

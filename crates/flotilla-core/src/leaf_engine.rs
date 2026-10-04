@@ -1964,7 +1964,12 @@ impl ReconcilerWake {
                             tracing::warn!(
                                 convoy = %convoy.metadata.name,
                                 ?target,
-                                reason = "no live supervisor found",
+                                reason = if unavailable_target.is_some() { "supervisor_lookup_failed" }
+                                    else if start >= policy.len() { "supervision_policy_exhausted" }
+                                    else { "operator_rung_selected" },
+                                supervision_start = start,
+                                supervision_policy_len = policy.len(),
+                                evidence = %condition.evidence,
                                 brief = %stall_supervision_log_brief(convoy, &condition),
                                 "stall escalation fell back to operator"
                             );
@@ -2295,6 +2300,8 @@ impl ReconcilerWake {
                 }
                 for delivery in instantiate_turn_delivery(convoy, &checkouts, &observed_change_requests, &forges)? {
                     if !is_active_change_request_probe(status, &delivery.rule, &delivery.leaf) {
+                        tracing::debug!(convoy = %convoy.metadata.name, source = %delivery.source,
+                            reason = "skip_ineligible_active_crew_or_subject", "turn delivery subscription decision");
                         continue;
                     }
                     desired.push(LeafSubscriptionRow {
@@ -4064,6 +4071,13 @@ mod tests {
                 assert!(warning.contains("convoy=stalled-work"), "{warning}");
                 assert!(warning.contains("target="), "{warning}");
                 assert!(warning.contains("reason="), "{warning}");
+                // DeliveryError logs the transport failure at the attempted send,
+                // before the policy-fallback warning that carries cursor/evidence.
+                if !matches!(unavailable, GovernorUnavailable::DeliveryError) {
+                    assert!(warning.contains("supervision_start="), "{warning}");
+                    assert!(warning.contains("supervision_policy_len="), "{warning}");
+                    assert!(warning.contains("evidence="), "{warning}");
+                }
                 // #2592: operator fallback logs contain the source address and exact actionable crew.
                 assert!(warning.contains("coder@work in convoy graphql-budget@wheelhouse (resource ref: stalled-work)"), "{warning}");
                 assert!(warning.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"), "{warning}");
@@ -4071,11 +4085,46 @@ mod tests {
                     warning.contains(if matches!(unavailable, GovernorUnavailable::DeliveryError) {
                         "supervisor reconnecting"
                     } else {
-                        "no live supervisor found"
+                        "supervisor_lookup_failed"
                     }),
                     "{warning}"
                 );
             }
+        }
+        // A live governor does not turn an explicit/consumed operator policy
+        // into a lookup failure. Both operator routes must explain that choice.
+        for (policy, expected_reason) in
+            [(Vec::new(), "supervision_policy_exhausted"), (vec![SupervisionTarget::Operator], "operator_rung_selected")]
+        {
+            let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = LogWriter(logs.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+            tracing::subscriber::with_default(subscriber, || {
+                runtime.block_on(async {
+                    let (backend, wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
+                    let convoys = backend.using::<Convoy>("flotilla");
+                    let source = convoys.get("stalled-work").await.expect("source");
+                    let now = source.metadata.creation_timestamp + chrono::Duration::seconds(120);
+                    let mut status = source.status.expect("status");
+                    status.workflow_snapshot.as_mut().expect("snapshot").supervision = Some(policy);
+                    let source =
+                        convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("operator policy");
+                    wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), source)]), now).await.expect("judge policy");
+                    assert!(delivery.requests.lock().expect("deliveries").is_empty(), "policy must not contact the live governor");
+                });
+            });
+            let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8 logs");
+            assert_eq!(text.lines().count(), 1, "one operator decision: {text}");
+            assert!(text.contains(expected_reason), "{text}");
+            assert!(text.contains("target=Operator"), "{text}");
+            assert!(text.contains("supervision_start=0"), "{text}");
+            assert!(!text.contains("supervisor_lookup_failed"), "{text}");
         }
     }
 
