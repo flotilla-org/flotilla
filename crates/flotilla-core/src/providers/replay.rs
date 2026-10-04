@@ -536,6 +536,11 @@ impl ReplayGhApi {
     }
 }
 
+fn is_observation_metadata_header(name: &str) -> bool {
+    const PREFIX: &str = "observation-";
+    name.get(..PREFIX.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+}
+
 fn replay_gh_error(status: u16, body: &str, headers: &HashMap<String, String>) -> String {
     if let Some(error) = headers.get("observation-legacy-error") {
         return error.clone();
@@ -552,7 +557,8 @@ fn replay_gh_error(status: u16, body: &str, headers: &HashMap<String, String>) -
 }
 
 // Classified recordings store explicit metadata, never classify Display text.
-// The observation-* recording schema is separate from actual REST headers:
+// The observation-* recording schema is reserved and separate from actual REST
+// headers: discard raw headers in this namespace before adding these keys.
 // - observation-error-kind: forge, primary or secondary classification;
 // - observation-budget / observation-retry-source: rate-limit provenance;
 // - observation-retry-at: optional absolute deadline, never inferred on replay;
@@ -727,7 +733,7 @@ impl GhApi for ReplayGhApi {
                 status,
                 headers: headers
                     .iter()
-                    .filter(|(key, _)| !key.starts_with("observation-"))
+                    .filter(|(key, _)| !is_observation_metadata_header(key))
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
                 body,
@@ -1048,7 +1054,13 @@ impl GhApi for RecordingGhApi {
             Err(failure) => {
                 let error = &failure.error;
                 if let Some(response) = &failure.response {
-                    headers.extend(response.headers.clone());
+                    headers.extend(
+                        response
+                            .headers
+                            .iter()
+                            .filter(|(name, _)| !is_observation_metadata_header(name))
+                            .map(|(name, value)| (name.clone(), value.clone())),
+                    );
                     headers.insert("observation-legacy-error".into(), response.legacy_error.clone());
                 }
                 headers.insert("observation-diagnostic".into(), error.to_string());

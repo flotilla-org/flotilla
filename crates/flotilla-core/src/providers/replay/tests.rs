@@ -1032,6 +1032,9 @@ fn classified_rest_failures_preserve_response_metadata(tc: hegel::TestCase) {
                     chrono::DateTime::from_timestamp(reset + i64::from(delay), 0).expect("retry time").to_rfc2822()
                 ));
             }
+            // Reserved recording keys cannot be injected by a REST response:
+            // an untimed primary limit must not inherit this fabricated reset.
+            raw.push_str("Observation-Retry-At: 2040-01-01T00:00:00+00:00\r\n");
             raw.push_str(&format!("\r\n{body}"));
             let runner = Arc::new(RestFailureRunner {
                 stdout: raw,
