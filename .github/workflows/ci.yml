@@ -165,7 +165,8 @@ jobs:
       - name: Run the client on Windows' default 1 MiB main-thread stack
         # Building is not enough: unoptimised clap frames once overflowed the
         # main thread before `main` did anything (#2588). Without a daemon
-        # endpoint, `status` must fail cleanly rather than spawn one.
+        # endpoint, `status` must fail cleanly rather than spawn one; the grep
+        # matches the refusal in flotilla-client's Windows `connect_unix_message_session`.
         shell: bash
         run: |
           target/debug/flotilla.exe --version

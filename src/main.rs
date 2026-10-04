@@ -78,6 +78,9 @@ fn binary_version() -> &'static str {
 // clap builds each variant's arguments in its own call. Inline fields share
 // one frame per enum, which overflowed Windows' 1 MiB main thread in
 // unoptimised builds (#2588).
+// Parsed once per process, so the size gap between `Domain` and the other
+// variants costs nothing; boxing would only add derefs to every match.
+#[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand)]
 enum SubCommand {
     /// Run the daemon server
@@ -2917,31 +2920,6 @@ fn uninstall_claude_code_hooks(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
 
-    /// Windows gives the main thread 1 MiB of stack. Unoptimised clap-derive
-    /// builders need frames that grow with the command tree, and the nested
-    /// noun/verb derives add up along the deepest path (#2588). Parsing that
-    /// path needed about 520 KiB when this budget was set. An overflow aborts the
-    /// test binary with "thread 'cli-parse-stack-budget' has overflowed its
-    /// stack": split large variants into `Args` structs rather than raising this.
-    #[test]
-    fn cli_parse_fits_within_windows_main_thread_stack_budget() {
-        const BUDGET: usize = 768 * 1024;
-        std::thread::Builder::new()
-            .name("cli-parse-stack-budget".into())
-            .stack_size(BUDGET)
-            .spawn(|| {
-                for args in [
-                    &["flotilla", "--version"][..],
-                    &["flotilla", "status"][..],
-                    &["flotilla", "convoy", "start", "--project", "p", "--name", "n", "--input", "k=v"][..],
-                ] {
-                    let _ = Cli::try_parse_from(args);
-                }
-            })
-            .expect("spawn stack-budget thread")
-            .join()
-            .expect("CLI parsing completes within the stack budget");
-    }
     use std::path::{Path, PathBuf};
 
     use clap::Parser;
@@ -2961,6 +2939,35 @@ mod tests {
         ResourceListArgs, ResourceManifestResolutionArgs, ResourceReconcileNowArgs, ResourceStatusPatchArgs, ResourceSubCommand,
         ResourceWatchArgs, SubCommand, TopologyArgs, WaitArgs,
     };
+
+    /// Windows gives the main thread 1 MiB of stack. Unoptimised clap-derive
+    /// builders need frames that grow with the command tree, and the nested
+    /// noun/verb derives add up along the deepest path (#2588). Parsing that
+    /// path needed about 520 KiB when this budget was set. An overflow aborts the
+    /// test binary with "thread 'cli-parse-stack-budget' has overflowed its
+    /// stack": split large variants into `Args` structs rather than raising this.
+    /// Frame sizes differ by platform and toolchain, so this is a portable
+    /// growth tripwire; the Windows CI job running the binary is the
+    /// authoritative check.
+    #[test]
+    fn cli_parse_fits_within_windows_main_thread_stack_budget() {
+        const BUDGET: usize = 768 * 1024;
+        std::thread::Builder::new()
+            .name("cli-parse-stack-budget".into())
+            .stack_size(BUDGET)
+            .spawn(|| {
+                for args in [
+                    &["flotilla", "--version"][..],
+                    &["flotilla", "status"][..],
+                    &["flotilla", "convoy", "start", "--project", "p", "--name", "n", "--input", "k=v"][..],
+                ] {
+                    let _ = Cli::try_parse_from(args);
+                }
+            })
+            .expect("spawn stack-budget thread")
+            .join()
+            .expect("CLI parsing completes within the stack budget");
+    }
 
     #[tokio::test]
     async fn drifted_batch_selection_decodes_typed_status_and_deduplicates_replicas() {
