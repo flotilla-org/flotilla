@@ -13,11 +13,11 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
-    BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
-    DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PreparedCheckout,
-    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalDeliveryFailure,
-    TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime, TerminalRuntimeState,
-    TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
+    checkout_path_component, BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime,
+    CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, ForgeDefaultBranchResolver,
+    HopChainContext, PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime,
+    RepositoryReconciler, TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness,
+    TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentAdapter, AgentLaunchRequest, CapabilityTable},
@@ -5573,7 +5573,7 @@ async fn sweep_host_empty_convoy_directories(backend: &ResourceBackend, host: &s
                 .map_err(|error| error.to_string())?
                 .items
                 .into_iter()
-                .map(|convoy| convoy.object.metadata.name),
+                .map(|convoy| checkout_path_component(&convoy.object.metadata.name)),
         );
     }
     let mut roots = BTreeSet::new();
@@ -10048,8 +10048,9 @@ dependency = { path = "../dependency" }
         }
     }
 
-    // #2610: a convoy in another namespace protects its shared host root;
-    // roots belonging to another host must never be swept by this daemon.
+    // #2610: a convoy in another namespace protects its shared host root,
+    // using the same sanitized directory name as checkout provisioning.
+    // Roots belonging to another host must never be swept by this daemon.
     #[tokio::test]
     async fn empty_convoy_sweep_respects_namespaces_and_hosts() {
         let temp = TempDir::new().expect("test fixture operation succeeds");
@@ -10074,7 +10075,7 @@ dependency = { path = "../dependency" }
         }
         backend
             .using::<Convoy>("another-project")
-            .create(&empty_meta("convoy-live"), &ConvoySpec::builder().workflow_ref("test".into()).build())
+            .create(&empty_meta("convoy/live"), &ConvoySpec::builder().workflow_ref("test".into()).build())
             .await
             .expect("test fixture operation succeeds");
         sweep_host_empty_convoy_directories(&backend, "local").await.expect("test fixture operation succeeds");
