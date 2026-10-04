@@ -209,23 +209,7 @@ impl ReferenceCloneStrategy {
         &self,
         _repo_root: &ExecutionEnvironmentPath,
     ) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
-        self.enumerate_checkouts().await.map(|checkouts| {
-            checkouts
-                .into_iter()
-                .map(|checkout| {
-                    (checkout.path, Checkout {
-                        branch: checkout.git_ref,
-                        is_main: checkout.is_main,
-                        trunk_ahead_behind: None,
-                        remote_ahead_behind: None,
-                        working_tree: None,
-                        last_commit: None,
-                        host_name: None,
-                        environment_id: None,
-                    })
-                })
-                .collect()
-        })
+        self.enumerate_checkouts().await.map(|checkouts| checkouts.into_iter().map(EnumeratedCheckout::into_provider_checkout).collect())
     }
 
     pub(crate) async fn create_checkout(
@@ -314,7 +298,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::providers::{vcs::checkout_test_support::git, ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner};
+    use crate::{
+        providers::{vcs::checkout_test_support::git, ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner},
+        vcs::{FlotillaVcs, GitCheckoutStrategy, Vcs},
+    };
 
     /// A test runner that records all (cmd, args) calls and returns queued responses.
     struct RecordingRunner {
@@ -605,7 +592,6 @@ mod tests {
                 Err("fatal: not a git repository".into()),
             ]));
 
-            use crate::vcs::{FlotillaVcs, GitCheckoutStrategy, Vcs};
             let mgr = ReferenceCloneStrategy::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
             let vcs = FlotillaVcs::new(
                 ExecutionEnvironmentPath::new("/workspace/feat-a"),
@@ -615,12 +601,7 @@ mod tests {
             let checkouts = if lightweight {
                 vcs.enumerate_checkouts().await.expect("enumerate clones")
             } else {
-                vcs.list_checkouts()
-                    .await
-                    .expect("list clones")
-                    .into_iter()
-                    .map(|(path, checkout)| EnumeratedCheckout { path, git_ref: checkout.branch, is_main: checkout.is_main })
-                    .collect()
+                vcs.list_checkouts().await.expect("list clones").into_iter().map(EnumeratedCheckout::from).collect()
             };
             assert_eq!(checkouts, vec![
                 EnumeratedCheckout { path: ExecutionEnvironmentPath::new("/workspace/feat-a"), git_ref: "feat/a".into(), is_main: false },

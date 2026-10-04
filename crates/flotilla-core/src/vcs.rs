@@ -566,6 +566,28 @@ pub struct EnumeratedCheckout {
     pub is_main: bool,
 }
 
+impl EnumeratedCheckout {
+    /// Adapt identity facts for consumers of provider data without inventing enrichment.
+    pub fn into_provider_checkout(self) -> (ExecutionEnvironmentPath, Checkout) {
+        (self.path, Checkout {
+            branch: self.git_ref,
+            is_main: self.is_main,
+            trunk_ahead_behind: None,
+            remote_ahead_behind: None,
+            working_tree: None,
+            last_commit: None,
+            host_name: None,
+            environment_id: None,
+        })
+    }
+}
+
+impl From<(ExecutionEnvironmentPath, Checkout)> for EnumeratedCheckout {
+    fn from((path, checkout): (ExecutionEnvironmentPath, Checkout)) -> Self {
+        Self { path, git_ref: checkout.branch, is_main: checkout.is_main }
+    }
+}
+
 /// A VCS backend bound to one checkout path in its execution environment.
 #[async_trait]
 pub trait VcsBackend: Send + Sync {
@@ -1324,6 +1346,8 @@ impl VcsBackend for GitCliBackend<'_> {
         if let Some(GitCheckoutStrategy::ReferenceClone(strategy)) = self.strategy {
             return strategy.enumerate_checkouts().await;
         }
+        // Reading worktree identity needs no creation strategy; unlike enriched listing,
+        // bare CLI backends can enumerate directly with their injected runner.
         let output = self.run(&["worktree", "list", "--porcelain"]).await?;
         Ok(GitWorktreeStrategy::parse_porcelain(&output)
             .into_iter()
