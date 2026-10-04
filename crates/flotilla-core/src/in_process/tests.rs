@@ -32,6 +32,36 @@ use crate::{
     repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector},
 };
 
+// #2592: attribution uses role/project addresses, preserves legacy resource names,
+// and remains available when a supervisor convoy is absent from the replica view.
+// Formatting glue: these rows exhaust empty/nonempty role and absent/present project.
+#[tokio::test]
+async fn convoy_sender_addresses_preserve_legacy_and_missing_convoy_identity() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    for (name, role, project, expected) in [
+        ("legacy", "", None, "legacy"),
+        ("legacy-project", "", Some("project"), "legacy-project"),
+        ("named", "graphql-budget", None, "graphql-budget"),
+        ("named-project", "graphql-budget", Some("project"), "graphql-budget@project"),
+    ] {
+        let convoy = convoys
+            .create(
+                &test_meta(name),
+                &ConvoySpec::builder()
+                    .workflow_ref("workflow".to_string())
+                    .role(role.to_string())
+                    .maybe_project_ref(project.map(str::to_string))
+                    .build(),
+            )
+            .await
+            .expect("convoy");
+        assert_eq!(convoy_message_address(&convoy), expected);
+        assert_eq!(convoy_sender_address(&backend, "flotilla", name).await, expected);
+    }
+    assert_eq!(convoy_sender_address(&backend, "flotilla", "missing-governor").await, "missing-governor");
+}
+
 #[tokio::test]
 async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_providers() {
     let temp = tempfile::tempdir().expect("tempdir");

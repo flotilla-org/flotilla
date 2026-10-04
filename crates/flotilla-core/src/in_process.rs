@@ -30,10 +30,9 @@ use async_trait::async_trait;
 use attach::AttachResolver;
 pub use attach::ResolvedAttach;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-pub(crate) use convoy_admission::convoy_address;
 pub use convoy_admission::RoleAddress;
 use convoy_admission::{
-    allocate_convoy_generation, convoy_ensure_name, convoy_record_name, discover_repository_change_request_with,
+    allocate_convoy_generation, convoy_address, convoy_ensure_name, convoy_record_name, discover_repository_change_request_with,
     normalize_convoy_start_intent, project_not_ready_error, resolve_and_validate_workflow_credentials, resolve_convoy_candidate_indices,
     validate_convoy_name, ConvoyAddressIdentity, ConvoyAdmission, ConvoyCreateAdmission, ConvoyStartKey, ConvoyStartTask,
     PlacementResolution, PreparedConvoyAdmission, StaticFulfilmentDecider,
@@ -1376,6 +1375,25 @@ async fn crew_brief_repo_roots(
         roots.push(PathBuf::from(path));
     }
     roots
+}
+
+/// Legacy convoys may have no role; retain their resource identity instead of
+/// rendering an empty address or a bare project suffix.
+pub(crate) fn convoy_message_address(convoy: &ResourceObject<ResourceConvoy>) -> String {
+    if convoy.spec.role.is_empty() {
+        convoy.metadata.name.clone()
+    } else {
+        convoy_address(&convoy.spec.role, convoy.spec.project_ref.as_deref())
+    }
+}
+
+async fn convoy_sender_address(backend: &ResourceBackend, namespace: &str, name: &str) -> String {
+    backend
+        .including_replicas::<ResourceConvoy>(namespace)
+        .get(name)
+        .await
+        .map(|source| convoy_message_address(&source.object))
+        .unwrap_or_else(|_| name.to_string())
 }
 
 fn safe_header_value(value: &str) -> String {
@@ -7044,14 +7062,9 @@ impl InProcessDaemon {
             flotilla_protocol::CrewSupervisionAction::Resume => {
                 let sender = if actor_crew_id.is_some() {
                     let supervisor = stalled.supervisor.as_ref().expect("checked supervisor above");
-                    let supervisor_convoy = self
-                        .resource_backend
-                        .including_replicas::<ResourceConvoy>(namespace)
-                        .get(&supervisor.convoy)
-                        .await
-                        .map_err(|error| error.to_string())?
-                        .object;
-                    let address = convoy_address(&supervisor_convoy.spec.role, supervisor_convoy.spec.project_ref.as_deref());
+                    // Attribution must not prevent authorized guidance when the convoy
+                    // is temporarily absent from the replica view.
+                    let address = convoy_sender_address(&self.resource_backend, namespace, &supervisor.convoy).await;
                     if stalled.rung == flotilla_resources::StallRung::Governor {
                         CrewMessageSender::Governor { name: address }
                     } else if stalled.rung == flotilla_resources::StallRung::Bosun {
@@ -7488,12 +7501,7 @@ impl InProcessDaemon {
         }
 
         let sender = CrewMessageSender::Handoff {
-            from: format!(
-                "{}@{} in {}",
-                context.caller_role,
-                context.vessel,
-                convoy_address(&convoy.spec.role, convoy.spec.project_ref.as_deref())
-            ),
+            from: format!("{}@{} in {}", context.caller_role, context.vessel, convoy_message_address(&convoy)),
         };
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&context.namespace);
         let identity = TerminalSessionIdentity::builder()

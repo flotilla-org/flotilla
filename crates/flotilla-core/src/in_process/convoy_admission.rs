@@ -2271,7 +2271,7 @@ pub(super) fn convoy_ensure_name(project: &str, role: &str) -> String {
     format!("ensure-{digest:x}")
 }
 
-pub(crate) fn convoy_address(role: &str, project: Option<&str>) -> String {
+pub(super) fn convoy_address(role: &str, project: Option<&str>) -> String {
     project.map_or_else(|| role.to_string(), |project| format!("{role}@{project}"))
 }
 
