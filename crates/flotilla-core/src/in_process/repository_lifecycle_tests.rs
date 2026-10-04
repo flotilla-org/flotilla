@@ -40,6 +40,9 @@ impl Factory for CountingVcsFactory {
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn crate::vcs::Vcs>, Vec<UnmetRequirement>> {
         self.probes.fetch_add(1, Ordering::SeqCst);
+        // Real discovery awaits subprocess I/O. Keep this fake probe in flight
+        // so concurrent callers exercise OnceCell initialization, not just hits.
+        tokio::task::yield_now().await;
         self.inner.probe(bag, config, path, runner).await
     }
 }
@@ -99,7 +102,11 @@ fn observed_checkout_provider_lifetimes(tc: hegel::TestCase) {
         for cycle in 0..cycles {
             observe(&daemon, backend, "lifetime", path, &key).await;
             assert_eq!(probes.load(Ordering::SeqCst), cycle * 2, "observation is not provider demand");
-            let (first, concurrent) = tokio::join!(daemon.local_vcs_for_checkout(path), daemon.local_vcs_for_checkout(path));
+            let (first, concurrent) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(daemon.local_vcs_for_checkout(path), daemon.local_vcs_for_checkout(path))
+            })
+            .await
+            .expect("concurrent discovery must complete without deadlock");
             let first = first.expect("first demand");
             assert!(Arc::ptr_eq(&first, &concurrent.expect("concurrent demand")));
             for _ in 0..duplicates {
@@ -344,4 +351,73 @@ async fn checkout_provider_watch_follows_namespace_changes() {
         .await
         .expect("watch in the new namespace retires the provider without demand");
     }
+}
+
+// #1722 bindings select an issue source independently of the live checkout
+// transport. A canonical Forgejo source must stay usable after a Github mirror
+// becomes the live transport, without a checkout or presentation row.
+#[tokio::test]
+async fn project_issue_binding_uses_source_forge_instead_of_mirror_transport() {
+    use flotilla_resources::{Forge, ForgeKind, ForgeSpec};
+
+    use crate::providers::discovery::factories::github::ForgejoIssueProviderFactory;
+
+    let temp = tempfile::tempdir().expect("config");
+    let config_dir = temp.path().join("config");
+    std::fs::create_dir(&config_dir).expect("config dir");
+    std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"source-forge\"\n").expect("config");
+    std::fs::write(temp.path().join("lab-forgejo-source-token"), "test-token\n").expect("credential");
+    let mut discovery = fake_discovery(false);
+    discovery.factories.issue_trackers = vec![Box::new(ForgejoIssueProviderFactory)];
+    let daemon = InProcessDaemon::new(Vec::new(), Arc::new(ConfigStore::with_base(config_dir)), discovery, HostName::new("test")).await;
+    let forge = ForgeSpec::builder()
+        .forge_id("source-forge".into())
+        .kind(ForgeKind::Forgejo)
+        .hosts(BTreeSet::from(["forge.example".into()]))
+        .https_url("https://forge.example".into())
+        .git_ssh_host("forge.example".into())
+        .build();
+    daemon
+        .resource_backend
+        .definitions::<Forge>("flotilla")
+        .create(&InputMeta::builder().name("source-forge".into()).build(), &forge)
+        .await
+        .expect("Forge");
+    let spec = RepositorySpec::remote("https://forge.example/acme/issues")
+        .expect("canonical source")
+        .update_remotes("https://github.com/acme/issues")
+        .expect("mirror transport");
+    let source = flotilla_protocol::IssueSource { service: "https://forge.example".into(), scope: "acme/issues".into() };
+    assert_eq!(spec.forge().expect("live forge").service_url, "https://github.com");
+    assert_eq!(spec.issue_source_forge().expect("issue source").service_url, source.service);
+    daemon
+        .resource_backend
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(spec.key().to_string()).build(), &spec)
+        .await
+        .expect("Repository");
+    daemon
+        .resource_backend
+        .definitions::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name("issues".into()).build(),
+            &ProjectSpec::builder()
+                .display_name("Issues".into())
+                .default_workflow_ref("single-agent".into())
+                .repositories(vec![flotilla_resources::ProjectRepositorySpec::builder().repo(spec.key()).build()])
+                .issue_source_bindings(vec![source.clone().into()])
+                .build(),
+        )
+        .await
+        .expect("Project binding");
+    let first = daemon.issue_provider_for_source(&source).await.expect("source-owned Forgejo capability");
+    assert!(first.supports(&source));
+    let second = daemon.issue_provider_for_source(&source).await.expect("retained source capability");
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(
+        daemon.resource_backend.using::<Repository>("flotilla").get(&spec.key().to_string()).await.expect("stored Repository").spec,
+        spec,
+        "source selection must not rewrite checkout transport intent"
+    );
+    assert!(daemon.list_repos().await.expect("presentation rows").is_empty());
 }

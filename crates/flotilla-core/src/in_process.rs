@@ -268,12 +268,30 @@ impl IssueQueryPort for ProviderIssueQueryPort {
         );
         let bag = match declared {
             Some(repository) => {
+                // Issue bindings can keep their canonical forge when a mirror
+                // becomes the live checkout transport. Scope a copy of provider
+                // intent to the source; do not rewrite the stored Repository.
+                let live_source = repository.spec.forge().map(|forge| {
+                    flotilla_resources::normalize_issue_source(&flotilla_protocol::IssueSource {
+                        service: forge.service_url.clone(),
+                        scope: forge.repository.clone(),
+                    })
+                });
+                let intent = if live_source.as_ref() == Some(&selected_source) {
+                    repository.spec
+                } else {
+                    repository.spec.update_remotes(format!(
+                        "{}/{}",
+                        selected_source.service.trim_end_matches('/'),
+                        selected_source.scope
+                    ))?
+                };
                 convoy_admission::repository_provider_bag(
                     &self.backend,
                     &self.environment_manager,
                     &self.local_environment_id,
                     &namespace,
-                    &repository.spec,
+                    &intent,
                 )
                 .await?
             }
