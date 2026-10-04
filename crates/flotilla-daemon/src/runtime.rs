@@ -35,10 +35,7 @@ use flotilla_core::{
     placement_policy::reconcile_registered_policy,
     providers::{
         discovery::{run_provisioned_host_detectors, EnvVars, EnvironmentBag},
-        environment::{
-            CreateOpts, EnvironmentHandle, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess, EnvironmentToolAssetKind,
-            EnvironmentVariableUpdate,
-        },
+        environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate},
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize},
         ChannelLabel, CommandRunner,
@@ -69,7 +66,7 @@ use futures::{
 };
 use serde_json::{json, Value};
 use tokio::{
-    sync::{oneshot, watch, Mutex, RwLock, Semaphore},
+    sync::{oneshot, watch, Mutex, OnceCell, RwLock, Semaphore},
     task::JoinHandle,
 };
 use tokio_util::task::AbortOnDropHandle;
@@ -81,7 +78,7 @@ use crate::{
     codex_central::{codex_central_auth_path, CodexCentralRefresher},
     credential::{CredentialRefreshError, CredentialStore, GithubAppScope},
     dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
-    environment_tools::EnvironmentToolProvisioner,
+    environment_tools::{stage_local_rustc_wrapper_async, EnvironmentToolContext, EnvironmentToolProvisioner, RUSTC_LINKER_WRAPPER},
     issue_materializer::IssuePollingHealth,
     resource_limits::file_descriptor_pressure_condition,
     resource_manifest::{manifest_root_name, materialize_manifest_root, ResourceManifestReconciler},
@@ -1443,119 +1440,6 @@ struct ControllerRuntimeState {
     archive_catalog_lock: Mutex<()>,
     checkout_removal_concurrency: NonZeroUsize,
     checkout_removals: Semaphore,
-}
-
-/// Cargo invokes this with the rustc path as its first argument. Keeping the
-/// linker option in a wrapper leaves repository Cargo config and RUSTFLAGS to
-/// Cargo's own resolution rules instead of replacing either source. The cap is
-/// limited to x86_64 Linux, where rustc's default lld path is known here.
-const RUSTC_LINKER_WRAPPER: &str = r#"#!/bin/sh
-compiler=$1
-shift
-if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ]; then
-  # rustc defaults to lld on x86_64-unknown-linux-gnu. Respect a repository
-  # that explicitly selects another linker or disables lld.
-  linker=default
-  target=host
-  target_next=0
-  for arg in "$@"; do
-    if [ "$target_next" = 1 ]; then
-      target=$arg
-      target_next=0
-    fi
-    case "$arg" in
-      --target) target_next=1 ;;
-      --target=*) target=${arg#--target=} ;;
-      *fuse-ld=lld*|*linker-features=+lld*) linker=lld ;;
-      *linker-features=-lld*|*fuse-ld=*) linker=other ;;
-      *linker=*)
-        case "$arg" in *lld*) linker=lld ;; *) linker=other ;; esac ;;
-    esac
-  done
-  if [ -n "${FLOTILLA_LINKER_THREADS:-}" ] && { [ "$target" = host ] || [ "$target" = x86_64-unknown-linux-gnu ]; } && { [ "$linker" = default ] || [ "$linker" = lld ]; }; then
-    exec "$compiler" "$@" -C "link-arg=-Wl,--threads=$FLOTILLA_LINKER_THREADS"
-  fi
-fi
-exec "$compiler" "$@"
-"#;
-
-const CONTAINED_RUSTC_WRAPPER_PATH: &str = "/usr/local/bin/flotilla-rustc-wrapper";
-
-const CONTAINED_CARGO_SHIM_DIRECTORY: &str = "/usr/local/lib/flotilla-rust-build-limits";
-const CONTAINED_CARGO_SHIM_PATH: &str = "/usr/local/lib/flotilla-rust-build-limits/cargo";
-const CARGO_BUILD_PROFILE_SHIM: &str = r#"#!/bin/sh
-# flotilla-cargo-profile-shim
-# Remove our directory before resolving Cargo (including rustup's Cargo proxy).
-case "$0" in
-  */*) shim_dir=${0%/*} ;;
-  *) shim_dir=. ;;
-esac
-shim_dir=$(CDPATH= cd -- "$shim_dir" && pwd -P) || exit 127
-remaining=$PATH
-filtered=
-while :; do
-  entry=${remaining%%:*}
-  # Empty entries mean cwd. Preserve their spelling unless they lead back
-  # to this shim, just as for trailing slashes and directory symlinks.
-  entry_dir=$(CDPATH= cd -- "${entry:-.}" 2>/dev/null && pwd -P) || entry_dir=$entry
-  if [ "$entry_dir" != "$shim_dir" ]; then
-    filtered=$filtered:$entry
-  fi
-  case "$remaining" in
-    *:*) remaining=${remaining#*:} ;;
-    *) break ;;
-  esac
-done
-# Resolve with a filtered PATH, but preserve the caller's PATH for Cargo's
-# subprocesses and external subcommands that may invoke Cargo themselves.
-missing_cargo() {
-  echo "flotilla cargo profile shim: no Cargo executable found after removing the shim directory from PATH" >&2
-  exit 127
-}
-[ -n "$filtered" ] || missing_cargo
-cargo=$(PATH=${filtered#:} command -v cargo) || missing_cargo
-# A different directory may contain a file symlink to this same shim.
-# The contained sh must support test -ef (dash, bash, BusyBox and macOS sh do).
-[ "$cargo" -ef "$0" ] && missing_cargo
-# rustup's +toolchain selector must precede Cargo options.
-case "${1:-}" in
-  +*) toolchain=$1; shift
-      exec "$cargo" "$toolchain" --config 'profile.dev.package."*".debug=0' "$@" ;;
-  *) exec "$cargo" --config 'profile.dev.package."*".debug=0' "$@" ;;
-esac
-"#;
-
-fn stage_local_cargo_shim(state_dir: &Path) -> Result<PathBuf, String> {
-    stage_local_build_tool(state_dir, "cargo-profile-shim", CARGO_BUILD_PROFILE_SHIM)
-}
-
-fn stage_local_rustc_wrapper(state_dir: &Path) -> Result<PathBuf, String> {
-    stage_local_build_tool(state_dir, "rustc-linker-cap", RUSTC_LINKER_WRAPPER)
-}
-
-fn stage_local_build_tool(state_dir: &Path, name: &str, contents: &str) -> Result<PathBuf, String> {
-    let directory = state_dir.join("environment-tools");
-    std::fs::create_dir_all(&directory).map_err(|error| format!("create build tool directory: {error}"))?;
-    let path = directory.join(name);
-    if std::fs::read_to_string(&path).ok().as_deref() == Some(contents) {
-        return Ok(path);
-    }
-    let staged = directory.join(format!("{name}-{}.tmp", uuid::Uuid::new_v4()));
-    std::fs::write(&staged, contents).map_err(|error| format!("stage build tool {name}: {error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
-            .map_err(|error| format!("mark build tool {name} executable: {error}"))?;
-    }
-    std::fs::rename(&staged, &path).map_err(|error| format!("install build tool {name}: {error}"))?;
-    Ok(path)
-}
-
-async fn stage_local_rustc_wrapper_async(state_dir: PathBuf) -> Result<PathBuf, String> {
-    tokio::task::spawn_blocking(move || stage_local_rustc_wrapper(&state_dir))
-        .await
-        .map_err(|error| format!("stage rustc wrapper task: {error}"))?
 }
 
 async fn stage_remote_rustc_wrapper(runner: &dyn CommandRunner, base: &Path) -> Result<PathBuf, String> {
@@ -4467,50 +4351,33 @@ fn spawn_aggregator_task(
     })
 }
 
+#[cfg(test)]
+use crate::environment_tools::{
+    stage_local_cargo_shim, stage_local_rustc_wrapper, CARGO_BUILD_PROFILE_SHIM, CONTAINED_CARGO_SHIM_DIRECTORY, CONTAINED_CARGO_SHIM_PATH,
+    CONTAINED_RUSTC_WRAPPER_PATH,
+};
+
 struct DockerControllerRuntime {
     state: Arc<ControllerRuntimeState>,
+}
+
+struct DockerToolContext<'a> {
+    state: &'a ControllerRuntimeState,
+    host_ref: &'a str,
+    jobs: OnceCell<usize>,
+}
+#[async_trait]
+impl EnvironmentToolContext for DockerToolContext<'_> {
+    async fn rust_build_jobs(&self) -> Result<usize, String> {
+        self.jobs.get_or_try_init(|| self.state.rust_build_jobs(self.host_ref)).await.copied()
+    }
 }
 
 #[async_trait]
 impl DockerEnvironmentRuntime for DockerControllerRuntime {
     async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
-        let jobs = self.state.rust_build_jobs(&spec.host_ref).await?;
-        let wrapper_host = stage_local_rustc_wrapper_async(self.state.config.state_dir().as_path().to_path_buf()).await?;
-        let state_dir = self.state.config.state_dir().as_path().to_path_buf();
-        let cargo_shim_host = tokio::task::spawn_blocking(move || stage_local_cargo_shim(&state_dir))
-            .await
-            .map_err(|error| format!("stage Cargo shim task: {error}"))??;
-        let mut tools = self.state.environment_tools.prepare(name).await?;
-        tools.push(
-            EnvironmentTool::new("rust-build-limits", CONTAINED_RUSTC_WRAPPER_PATH)
-                .with_asset(EnvironmentToolAsset::new(
-                    wrapper_host,
-                    CONTAINED_RUSTC_WRAPPER_PATH,
-                    EnvironmentToolAssetKind::File,
-                    EnvironmentToolAssetAccess::ReadOnly,
-                    "the Rust linker cap",
-                ))
-                .with_asset(EnvironmentToolAsset::new(
-                    cargo_shim_host,
-                    CONTAINED_CARGO_SHIM_PATH,
-                    EnvironmentToolAssetKind::File,
-                    EnvironmentToolAssetAccess::ReadOnly,
-                    "the Rust dependency debug profile",
-                ))
-                .with_environment(EnvironmentVariableUpdate::prepend_path("PATH", CONTAINED_CARGO_SHIM_DIRECTORY))
-                .with_environment(EnvironmentVariableUpdate::set(
-                    "CARGO_PROFILE_DEV_DEBUG",
-                    "line-tables-only",
-                    "the Rust workspace debug profile",
-                ))
-                .with_environment(EnvironmentVariableUpdate::set(
-                    "RUSTC_WORKSPACE_WRAPPER",
-                    CONTAINED_RUSTC_WRAPPER_PATH,
-                    "the Rust linker cap",
-                ))
-                .with_environment(EnvironmentVariableUpdate::set("CARGO_BUILD_JOBS", jobs.to_string(), "the Rust build share"))
-                .with_environment(EnvironmentVariableUpdate::set("FLOTILLA_LINKER_THREADS", jobs.to_string(), "the Rust linker cap")),
-        );
+        let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new() };
+        let tools = self.state.environment_tools.prepare("docker", name, &context).await?;
         for tool in &tools {
             for asset in &tool.assets {
                 let reserved_path = match asset.kind {
@@ -4638,7 +4505,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 provisioned_mounts,
                 tools,
                 docker_config_dir,
-                cpu_limit: Some(jobs),
+                cpu_limit: Some(context.rust_build_jobs().await?),
             })
             .await
         {
@@ -8703,7 +8570,9 @@ dependency = { path = "../dependency" }
                 None,
                 "host-direct-host-test".to_string(),
             )
-            .with_environment_tools(fixed_environment_tools(config.state_dir().join("contained-cleat").as_path().to_path_buf())),
+            .with_environment_tools(
+                fixed_environment_tools(config.state_dir().join("contained-cleat").as_path().to_path_buf()).with_fourth_tool(),
+            ),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
             host_ref: "host-test".to_string(),
@@ -8721,6 +8590,7 @@ dependency = { path = "../dependency" }
             .expect_err("capture provider should stop provision");
 
         assert_eq!(error.to_string(), "stop after capturing create options");
+        // Glue: an extra enrollment reaches provider delivery without changing CreateOpts.
         let opts = provider.create_opts.lock().await.take().expect("captured create options");
         assert!(opts.provisioned_mounts.is_empty(), "tool assets remain provider-neutral until the environment provider delivers them");
         assert_eq!(
@@ -8728,7 +8598,12 @@ dependency = { path = "../dependency" }
             compose(TargetId::AgentEnvironment, crew_git_identity_environment_fragments()).expect("crew Git identity").environment,
             "tool environment belongs to the tool description; crew Git identity is a container baseline"
         );
-        assert_eq!(opts.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), vec!["flotilla", "cleat", "rust-build-limits"]);
+        assert_eq!(opts.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), vec![
+            "flotilla",
+            "cleat",
+            "rust-build-limits",
+            "fourth"
+        ]);
         // The contained tool delivers both the workspace default and dependency profile shim.
         assert!(opts.tools[2].environment.contains(&EnvironmentVariableUpdate::set(
             "CARGO_PROFILE_DEV_DEBUG",

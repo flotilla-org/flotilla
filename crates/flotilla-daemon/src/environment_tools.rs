@@ -37,8 +37,28 @@ const FLEET_INSTALL_LAUNCHER_PREFIX: &[u8] = b"#!/usr/bin/env bash\n# managed by
 
 #[async_trait]
 pub(crate) trait EnvironmentToolFactory: Send + Sync {
-    async fn prepare(&self, environment_name: &str) -> Result<EnvironmentTool, String>;
+    fn provider_kinds(&self) -> &[&str];
+    async fn prepare(&self, environment_name: &str, context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String>;
 }
+
+/// Per-provisioning host facts, shared with the runtime's resource limits.
+/// Factories query only the facts their tool needs.
+#[async_trait]
+pub(crate) trait EnvironmentToolContext: Send + Sync {
+    async fn rust_build_jobs(&self) -> Result<usize, String>;
+}
+
+struct LocalToolContext<'a> {
+    daemon: &'a Arc<InProcessDaemon>,
+    config: &'a Arc<ConfigStore>,
+    daemon_socket_path: Option<DaemonHostPath>,
+}
+
+// Enrollment order is delivery order. Add new local-host tools here; runtime
+// and provider delivery plumbing do not need to know their identities.
+type ToolRegistration = fn(&LocalToolContext<'_>) -> Arc<dyn EnvironmentToolFactory>;
+const REGISTERED_TOOLS: &[ToolRegistration] =
+    &[FlotillaCliTool::for_local_host, CleatTool::for_local_host, RustBuildLimitsTool::for_local_host];
 
 /// Prepares the provider-neutral set of tools required by a new environment.
 ///
@@ -55,37 +75,25 @@ impl EnvironmentToolProvisioner {
         config: &Arc<ConfigStore>,
         daemon_socket_path: Option<DaemonHostPath>,
     ) -> Self {
-        let cleat_binary_path = daemon
-            .local_environment_bag()
-            .and_then(|bag| bag.find_binary("cleat").cloned())
-            .map(|path| resolve_cleat_binary(path.as_path()))
-            .transpose()
-            .and_then(|path| path.ok_or_else(|| "binary unavailable for contained environment delivery".to_string()));
-        let flotilla_binary_path = running_daemon_flotilla_binary()
-            .and_then(|path| stage_flotilla_binary(&path, config.state_dir().join("environment-tools/flotilla-bin").as_path()));
-        let runner = daemon.local_command_runner();
-        Self::new(vec![
-            Arc::new(FlotillaCliTool {
-                binary_path: flotilla_binary_path,
-                daemon_socket_path: daemon_socket_path.ok_or_else(|| "daemon socket path unavailable".to_string()),
-            }),
-            Arc::new(CleatTool {
-                binary_path: cleat_binary_path,
-                ghostty_library_path: OnceCell::new(),
-                state_root: config.state_dir().join("contained-cleat").as_path().to_path_buf(),
-                runner,
-            }),
-        ])
+        let context = LocalToolContext { daemon, config, daemon_socket_path };
+        Self::new(REGISTERED_TOOLS.iter().map(|register| register(&context)).collect())
     }
 
     pub(crate) fn new(factories: Vec<Arc<dyn EnvironmentToolFactory>>) -> Self {
         Self { factories }
     }
 
-    pub(crate) async fn prepare(&self, environment_name: &str) -> Result<Vec<EnvironmentTool>, String> {
+    pub(crate) async fn prepare(
+        &self,
+        provider_kind: &str,
+        environment_name: &str,
+        context: &dyn EnvironmentToolContext,
+    ) -> Result<Vec<EnvironmentTool>, String> {
         let mut tools = Vec::with_capacity(self.factories.len());
         for factory in &self.factories {
-            tools.push(factory.prepare(environment_name).await?);
+            if factory.provider_kinds().contains(&provider_kind) {
+                tools.push(factory.prepare(environment_name, context).await?);
+            }
         }
         Ok(tools)
     }
@@ -103,9 +111,10 @@ impl EnvironmentToolProvisioner {
             Arc::new(CleatTool {
                 binary_path: Ok(cleat_binary_path),
                 ghostty_library_path: OnceCell::new_with(Some(cleat_ghostty_library_path)),
-                state_root,
+                state_root: state_root.clone(),
                 runner: None,
             }),
+            Arc::new(RustBuildLimitsTool { state_dir: state_root }),
         ])
     }
 
@@ -129,7 +138,10 @@ struct FlotillaCliTool {
 
 #[async_trait]
 impl EnvironmentToolFactory for FlotillaCliTool {
-    async fn prepare(&self, _environment_name: &str) -> Result<EnvironmentTool, String> {
+    fn provider_kinds(&self) -> &[&str] {
+        &["docker"]
+    }
+    async fn prepare(&self, _environment_name: &str, _context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
         let binary_path =
             self.binary_path.as_ref().map_err(|error| format!("flotilla CLI unavailable for environment provisioning: {error}"))?;
         let daemon_socket_path =
@@ -230,7 +242,10 @@ struct CleatTool {
 
 #[async_trait]
 impl EnvironmentToolFactory for CleatTool {
-    async fn prepare(&self, environment_name: &str) -> Result<EnvironmentTool, String> {
+    fn provider_kinds(&self) -> &[&str] {
+        &["docker"]
+    }
+    async fn prepare(&self, environment_name: &str, _context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
         let binary_path = self.binary_path.as_ref().map_err(|error| format!("cleat unavailable for environment provisioning: {error}"))?;
         let ghostty_library_path = self
             .ghostty_library_path
@@ -278,7 +293,10 @@ struct FailingTool {
 #[cfg(test)]
 #[async_trait]
 impl EnvironmentToolFactory for FailingTool {
-    async fn prepare(&self, _environment_name: &str) -> Result<EnvironmentTool, String> {
+    fn provider_kinds(&self) -> &[&str] {
+        &["docker"]
+    }
+    async fn prepare(&self, _environment_name: &str, _context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
         Err(format!("{} unavailable for environment provisioning: {}", self.name, self.error))
     }
 }
@@ -429,6 +447,196 @@ async fn resolve_cleat_ghostty_library(
     Ok(DaemonHostPath::new(path))
 }
 
+/// Cargo invokes this with the rustc path as its first argument. Keeping the
+/// linker option in a wrapper leaves repository Cargo config and RUSTFLAGS to
+/// Cargo's own resolution rules instead of replacing either source. The cap is
+/// limited to x86_64 Linux, where rustc's default lld path is known here.
+pub(crate) const RUSTC_LINKER_WRAPPER: &str = r#"#!/bin/sh
+compiler=$1
+shift
+if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ]; then
+  # rustc defaults to lld on x86_64-unknown-linux-gnu. Respect a repository
+  # that explicitly selects another linker or disables lld.
+  linker=default
+  target=host
+  target_next=0
+  for arg in "$@"; do
+    if [ "$target_next" = 1 ]; then
+      target=$arg
+      target_next=0
+    fi
+    case "$arg" in
+      --target) target_next=1 ;;
+      --target=*) target=${arg#--target=} ;;
+      *fuse-ld=lld*|*linker-features=+lld*) linker=lld ;;
+      *linker-features=-lld*|*fuse-ld=*) linker=other ;;
+      *linker=*)
+        case "$arg" in *lld*) linker=lld ;; *) linker=other ;; esac ;;
+    esac
+  done
+  if [ -n "${FLOTILLA_LINKER_THREADS:-}" ] && { [ "$target" = host ] || [ "$target" = x86_64-unknown-linux-gnu ]; } && { [ "$linker" = default ] || [ "$linker" = lld ]; }; then
+    exec "$compiler" "$@" -C "link-arg=-Wl,--threads=$FLOTILLA_LINKER_THREADS"
+  fi
+fi
+exec "$compiler" "$@"
+"#;
+
+pub(crate) const CONTAINED_RUSTC_WRAPPER_PATH: &str = "/usr/local/bin/flotilla-rustc-wrapper";
+
+pub(crate) const CONTAINED_CARGO_SHIM_DIRECTORY: &str = "/usr/local/lib/flotilla-rust-build-limits";
+pub(crate) const CONTAINED_CARGO_SHIM_PATH: &str = "/usr/local/lib/flotilla-rust-build-limits/cargo";
+pub(crate) const CARGO_BUILD_PROFILE_SHIM: &str = r#"#!/bin/sh
+# flotilla-cargo-profile-shim
+# Remove our directory before resolving Cargo (including rustup's Cargo proxy).
+case "$0" in
+  */*) shim_dir=${0%/*} ;;
+  *) shim_dir=. ;;
+esac
+shim_dir=$(CDPATH= cd -- "$shim_dir" && pwd -P) || exit 127
+remaining=$PATH
+filtered=
+while :; do
+  entry=${remaining%%:*}
+  # Empty entries mean cwd. Preserve their spelling unless they lead back
+  # to this shim, just as for trailing slashes and directory symlinks.
+  entry_dir=$(CDPATH= cd -- "${entry:-.}" 2>/dev/null && pwd -P) || entry_dir=$entry
+  if [ "$entry_dir" != "$shim_dir" ]; then
+    filtered=$filtered:$entry
+  fi
+  case "$remaining" in
+    *:*) remaining=${remaining#*:} ;;
+    *) break ;;
+  esac
+done
+# Resolve with a filtered PATH, but preserve the caller's PATH for Cargo's
+# subprocesses and external subcommands that may invoke Cargo themselves.
+missing_cargo() {
+  echo "flotilla cargo profile shim: no Cargo executable found after removing the shim directory from PATH" >&2
+  exit 127
+}
+[ -n "$filtered" ] || missing_cargo
+cargo=$(PATH=${filtered#:} command -v cargo) || missing_cargo
+# A different directory may contain a file symlink to this same shim.
+# The contained sh must support test -ef (dash, bash, BusyBox and macOS sh do).
+[ "$cargo" -ef "$0" ] && missing_cargo
+# rustup's +toolchain selector must precede Cargo options.
+case "${1:-}" in
+  +*) toolchain=$1; shift
+      exec "$cargo" "$toolchain" --config 'profile.dev.package."*".debug=0' "$@" ;;
+  *) exec "$cargo" --config 'profile.dev.package."*".debug=0' "$@" ;;
+esac
+"#;
+
+pub(crate) fn stage_local_cargo_shim(state_dir: &Path) -> Result<PathBuf, String> {
+    stage_local_build_tool(state_dir, "cargo-profile-shim", CARGO_BUILD_PROFILE_SHIM)
+}
+
+pub(crate) fn stage_local_rustc_wrapper(state_dir: &Path) -> Result<PathBuf, String> {
+    stage_local_build_tool(state_dir, "rustc-linker-cap", RUSTC_LINKER_WRAPPER)
+}
+
+pub(crate) fn stage_local_build_tool(state_dir: &Path, name: &str, contents: &str) -> Result<PathBuf, String> {
+    let directory = state_dir.join("environment-tools");
+    std::fs::create_dir_all(&directory).map_err(|error| format!("create build tool directory: {error}"))?;
+    let path = directory.join(name);
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(contents) {
+        return Ok(path);
+    }
+    let staged = directory.join(format!("{name}-{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&staged, contents).map_err(|error| format!("stage build tool {name}: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("mark build tool {name} executable: {error}"))?;
+    }
+    std::fs::rename(&staged, &path).map_err(|error| format!("install build tool {name}: {error}"))?;
+    Ok(path)
+}
+
+pub(crate) async fn stage_local_rustc_wrapper_async(state_dir: PathBuf) -> Result<PathBuf, String> {
+    tokio::task::spawn_blocking(move || stage_local_rustc_wrapper(&state_dir))
+        .await
+        .map_err(|error| format!("stage rustc wrapper task: {error}"))?
+}
+
+impl FlotillaCliTool {
+    fn for_local_host(context: &LocalToolContext<'_>) -> Arc<dyn EnvironmentToolFactory> {
+        Arc::new(Self {
+            binary_path: running_daemon_flotilla_binary()
+                .and_then(|path| stage_flotilla_binary(&path, context.config.state_dir().join("environment-tools/flotilla-bin").as_path())),
+            daemon_socket_path: context.daemon_socket_path.clone().ok_or_else(|| "daemon socket path unavailable".to_string()),
+        })
+    }
+}
+impl CleatTool {
+    fn for_local_host(context: &LocalToolContext<'_>) -> Arc<dyn EnvironmentToolFactory> {
+        Arc::new(Self {
+            binary_path: context
+                .daemon
+                .local_environment_bag()
+                .and_then(|bag| bag.find_binary("cleat").cloned())
+                .map(|path| resolve_cleat_binary(path.as_path()))
+                .transpose()
+                .and_then(|path| path.ok_or_else(|| "binary unavailable for contained environment delivery".to_string())),
+            ghostty_library_path: OnceCell::new(),
+            state_root: context.config.state_dir().join("contained-cleat").as_path().to_path_buf(),
+            runner: context.daemon.local_command_runner(),
+        })
+    }
+}
+struct RustBuildLimitsTool {
+    state_dir: PathBuf,
+}
+impl RustBuildLimitsTool {
+    fn for_local_host(context: &LocalToolContext<'_>) -> Arc<dyn EnvironmentToolFactory> {
+        Arc::new(Self { state_dir: context.config.state_dir().as_path().to_path_buf() })
+    }
+}
+#[async_trait]
+impl EnvironmentToolFactory for RustBuildLimitsTool {
+    fn provider_kinds(&self) -> &[&str] {
+        &["docker"]
+    }
+    async fn prepare(&self, _environment_name: &str, context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
+        let jobs = context.rust_build_jobs().await?;
+        let state_dir = self.state_dir.clone();
+        let (wrapper_host, cargo_shim_host) = tokio::task::spawn_blocking(move || {
+            Ok::<_, String>((stage_local_rustc_wrapper(&state_dir)?, stage_local_cargo_shim(&state_dir)?))
+        })
+        .await
+        .map_err(|error| format!("stage Rust build limits task: {error}"))??;
+        Ok(EnvironmentTool::new("rust-build-limits", CONTAINED_RUSTC_WRAPPER_PATH)
+            .with_asset(EnvironmentToolAsset::new(
+                wrapper_host,
+                CONTAINED_RUSTC_WRAPPER_PATH,
+                EnvironmentToolAssetKind::File,
+                EnvironmentToolAssetAccess::ReadOnly,
+                "the Rust linker cap",
+            ))
+            .with_asset(EnvironmentToolAsset::new(
+                cargo_shim_host,
+                CONTAINED_CARGO_SHIM_PATH,
+                EnvironmentToolAssetKind::File,
+                EnvironmentToolAssetAccess::ReadOnly,
+                "the Rust dependency debug profile",
+            ))
+            .with_environment(EnvironmentVariableUpdate::prepend_path("PATH", CONTAINED_CARGO_SHIM_DIRECTORY))
+            .with_environment(EnvironmentVariableUpdate::set(
+                "CARGO_PROFILE_DEV_DEBUG",
+                "line-tables-only",
+                "the Rust workspace debug profile",
+            ))
+            .with_environment(EnvironmentVariableUpdate::set(
+                "RUSTC_WORKSPACE_WRAPPER",
+                CONTAINED_RUSTC_WRAPPER_PATH,
+                "the Rust linker cap",
+            ))
+            .with_environment(EnvironmentVariableUpdate::set("CARGO_BUILD_JOBS", jobs.to_string(), "the Rust build share"))
+            .with_environment(EnvironmentVariableUpdate::set("FLOTILLA_LINKER_THREADS", jobs.to_string(), "the Rust linker cap")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, os::unix::fs::PermissionsExt};
@@ -481,7 +689,7 @@ mod tests {
             state_root: temp.path().join("state"),
             runner: None,
         }
-        .prepare("contained-work")
+        .prepare("contained-work", &TestToolContext)
         .await
         .expect("prepare cleat from fleet launcher");
 
@@ -570,7 +778,7 @@ mod tests {
             binary_path: Ok(DaemonHostPath::new("/opt/flotilla/bin/flotilla")),
             daemon_socket_path: Ok(DaemonHostPath::new(socket_path)),
         }
-        .prepare("contained-work")
+        .prepare("contained-work", &TestToolContext)
         .await
         .expect("prepare flotilla CLI");
 
@@ -610,5 +818,69 @@ mod tests {
         let resolved = resolve_cleat_ghostty_library(None, &DaemonHostPath::new(binary)).await.expect("resolve bundled ghostty library");
 
         assert_eq!(resolved.as_path(), library.canonicalize().expect("canonical bundled library"));
+    }
+}
+
+#[cfg(test)]
+struct TestToolContext;
+#[cfg(test)]
+#[async_trait]
+impl EnvironmentToolContext for TestToolContext {
+    async fn rust_build_jobs(&self) -> Result<usize, String> {
+        Ok(2)
+    }
+}
+
+#[cfg(test)]
+struct FourthTool;
+#[cfg(test)]
+#[async_trait]
+impl EnvironmentToolFactory for FourthTool {
+    fn provider_kinds(&self) -> &[&str] {
+        &["docker"]
+    }
+    async fn prepare(&self, _name: &str, _context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
+        Ok(EnvironmentTool::new("fourth", "/usr/local/bin/fourth"))
+    }
+}
+#[cfg(test)]
+impl EnvironmentToolProvisioner {
+    pub(crate) fn with_fourth_tool(mut self) -> Self {
+        self.factories.push(Arc::new(FourthTool));
+        self
+    }
+}
+
+#[cfg(test)]
+mod enrollment_tests {
+    use super::*;
+    // Behaviour: only applicable factories prepare, including failures. Empty
+    // registries and duplicate enrollments preserve ordered delivery.
+    #[hegel::test]
+    fn filters_registered_tools(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Cover empty through duplicate registration, supported and unsupported kinds.
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+        let docker = tc.draw(gs::booleans());
+        let fail = tc.draw(gs::booleans());
+        let mut factories: Vec<Arc<dyn EnvironmentToolFactory>> =
+            (0..count).map(|_| Arc::new(FourthTool) as Arc<dyn EnvironmentToolFactory>).collect();
+        if fail {
+            factories.push(Arc::new(FailingTool { name: "test", error: "unavailable".into() }));
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let result = runtime.block_on(EnvironmentToolProvisioner::new(factories).prepare(
+            if docker { "docker" } else { "other" },
+            "work",
+            &TestToolContext,
+        ));
+        if docker && fail {
+            assert!(result.unwrap_err().contains("unavailable"));
+        } else {
+            assert_eq!(result.unwrap().iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), vec![
+                "fourth";
+                if docker { count } else { 0 }
+            ]);
+        }
     }
 }
