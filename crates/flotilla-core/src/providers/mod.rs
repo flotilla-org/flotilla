@@ -1018,11 +1018,15 @@ pub(crate) mod testing {
             Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: false }),
         ]);
         let label = ChannelLabel::Default;
+        // Exit failure still exposes both streams through the raw-output API.
         let output = runner.run_output("gh", &["api"], Path::new("/"), &label).await.expect("output");
         assert_eq!((output.stdout.as_str(), output.stderr.as_str(), output.success), ("headers/body", "exit failure", false));
+        // A spawn failure has no command output.
         assert_eq!(runner.run_output("missing", &[], Path::new("/"), &label).await.err().as_deref(), Some("spawn failure"));
+        // Successful raw output also preserves stderr.
         let output = runner.run_output("raw-ok", &[], Path::new("/"), &label).await.expect("successful output");
         assert_eq!((output.stdout.as_str(), output.stderr.as_str(), output.success), ("success", "warning", true));
+        // The convenience API selects stdout on success, stderr on failure.
         assert_eq!(runner.run("ok", &[], Path::new("/"), &label).await, Ok("success".into()));
         assert_eq!(runner.run("empty", &[], Path::new("/"), &label).await, Err(String::new()));
         assert_eq!(runner.remaining(), 0);

@@ -48,6 +48,8 @@ async fn convoy_sender_lookup_diagnostics_preserve_fallbacks() {
     for (backend, name, expected, failure) in
         [(&memory, "supervisor", "governor", false), (&memory, "missing", "missing", true), (&invalid, "unavailable", "unavailable", true)]
     {
+        // Mirror the sender lookup's replica-inclusive read to check the exact backend error.
+        // Keep this read aligned if the attribution lookup path changes.
         let read = backend.including_replicas::<ResourceConvoy>("attribution").get(name).await;
         let (address, logs) = capture_logs(tracing::Level::DEBUG, convoy_sender_address(backend, "attribution", name)).await;
         assert_eq!(address, expected);
