@@ -90,21 +90,31 @@ pub fn hints(event: &str, delivery_id: &str, payload: &[u8]) -> Result<Vec<Hint>
 mod tests {
     use super::*;
 
-    fn fixture(name: &str) -> Vec<u8> {
-        // Test binaries may be reused after their build checkout is removed.
-        // Embedding also makes fixture changes Cargo-tracked build inputs.
-        let bytes: &[u8] = match name {
-            "pull_request" => include_bytes!("../../flotilla-relay/fixtures/pull_request.json"),
-            "pull_request_review" => include_bytes!("../../flotilla-relay/fixtures/pull_request_review.json"),
-            "pull_request_review_comment" => include_bytes!("../../flotilla-relay/fixtures/pull_request_review_comment.json"),
-            "pull_request_review_thread" => include_bytes!("../../flotilla-relay/fixtures/pull_request_review_thread.json"),
-            "check_run" => include_bytes!("../../flotilla-relay/fixtures/check_run.json"),
-            "check_suite" => include_bytes!("../../flotilla-relay/fixtures/check_suite.json"),
-            "issues" => include_bytes!("../../flotilla-relay/fixtures/issues.json"),
-            "issue_comment" => include_bytes!("../../flotilla-relay/fixtures/issue_comment.json"),
-            _ => panic!("unknown fixture {name}"),
+    macro_rules! fixtures {
+        ($($name:literal),+ $(,)?) => {
+            &[$(($name, include_bytes!(concat!("../../flotilla-relay/fixtures/", $name, ".json")) as &[u8]),)+]
         };
-        bytes.to_vec()
+    }
+
+    // Test binaries may be reused after their build checkout is removed.
+    // Names also supply filenames, and embedded bytes are Cargo-tracked inputs.
+    const FIXTURES: &[(&str, &[u8])] = fixtures!(
+        "pull_request",
+        "pull_request_review",
+        "pull_request_review_comment",
+        "pull_request_review_thread",
+        "check_run",
+        "check_suite",
+        "issues",
+        "issue_comment",
+    );
+
+    fn fixture(name: &str) -> Vec<u8> {
+        FIXTURES
+            .iter()
+            .find_map(|(key, bytes)| (*key == name).then_some(*bytes))
+            .unwrap_or_else(|| panic!("unknown fixture {name}"))
+            .to_vec()
     }
 
     fn only_subject(event: &str, payload: &[u8]) -> String {
