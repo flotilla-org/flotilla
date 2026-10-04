@@ -12,8 +12,9 @@ use serde_json::json;
 
 use super::{
     controller_patches, expected_change_request_leaves, expected_checkout_refs, instantiate_exit, observed_change_request_subjects,
-    provisioning_patches, select_convoy_children, Convoy, ConvoyPhase, ConvoyStatusPatch, CrewWorkPhase, CrewWorkState, InstantiatedExit,
-    SubjectDiscoverySource, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
+    provisioning_patches, select_convoy_children, Convoy, ConvoyPhase, ConvoyStatusPatch, CrewCompletionRefusalCause, CrewWorkPhase,
+    CrewWorkState, InstantiatedExit, SubjectDiscoverySource, VesselRequirement, WorkCompletionAuthority, WorkPhase, WorkState,
+    WorkflowSnapshot,
 };
 use crate::{
     checkout::Checkout,
@@ -243,23 +244,76 @@ pub enum SettlementMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "reason", rename_all = "snake_case")]
 pub enum UnmetSettlementExpectation {
-    ChangeRequestNotReady { record: String, detail: String },
-    SubjectDiscoveryPending { convoy: String, error: Option<String> },
-    InvalidExpectedCheckouts { message: String },
-    ExitEntryAwaitingBinding { disposition: String, subject: String },
-    MissingCheckout { checkout: String },
-    MissingCheckoutStatus { checkout: String },
-    CheckoutConditionFalse { checkout: String, condition: String },
-    CheckoutConditionUnknown { checkout: String, condition: String },
-    StaleCheckoutEvidence { checkout: String, condition: String, observed_at: Option<String> },
-    MissingChangeRequest { record: String },
-    StaleChangeRequest { record: String, observed_at: Option<DateTime<Utc>> },
-    ChangeRequestConditionFalse { record: String, value: Option<String> },
-    CompletionConditionUnsatisfied { subject: String, field_path: String, value: Option<String> },
-    InvalidCondition { subject: String, message: String },
-    MissingObservedRef { reference: String },
-    StaleObservedRef { reference: String, observed_at: String },
-    ObservedDigestMismatch { reference: String, claimed: String, observed: String },
+    ChangeRequestNotReady {
+        record: String,
+        detail: String,
+    },
+    SubjectDiscoveryPending {
+        convoy: String,
+        error: Option<String>,
+    },
+    InvalidExpectedCheckouts {
+        message: String,
+    },
+    ExitEntryAwaitingBinding {
+        disposition: String,
+        subject: String,
+    },
+    MissingCheckout {
+        checkout: String,
+    },
+    MissingCheckoutStatus {
+        checkout: String,
+    },
+    CheckoutConditionFalse {
+        checkout: String,
+        condition: String,
+    },
+    CheckoutConditionUnknown {
+        checkout: String,
+        condition: String,
+    },
+    StaleCheckoutEvidence {
+        checkout: String,
+        condition: String,
+        observed_at: Option<String>,
+    },
+    MissingChangeRequest {
+        record: String,
+    },
+    StaleChangeRequest {
+        record: String,
+        observed_at: Option<DateTime<Utc>>,
+    },
+    ChangeRequestConditionFalse {
+        record: String,
+        value: Option<String>,
+    },
+    CompletionConditionUnsatisfied {
+        subject: String,
+        field_path: String,
+        value: Option<String>,
+        // Previous serialized evaluations omit causes; remove this compatibility
+        // default one fleet roll after deployment (ADR 0047).
+        #[serde(default)]
+        causes: Vec<CrewCompletionRefusalCause>,
+    },
+    InvalidCondition {
+        subject: String,
+        message: String,
+    },
+    MissingObservedRef {
+        reference: String,
+    },
+    StaleObservedRef {
+        reference: String,
+        observed_at: String,
+    },
+    ObservedDigestMismatch {
+        reference: String,
+        claimed: String,
+        observed: String,
+    },
 }
 
 /// Preconditions for a crew member's claim, selected by the pinned workflow
@@ -295,8 +349,8 @@ pub fn evaluate_crew_completion(
             crate::CrewCompletionExpectation::Condition(condition) => {
                 let result =
                     evaluate_declared_completion_condition(convoy, condition, checkouts, change_requests, artifacts, stale_after, now)?;
-                if let Some((subject, field_path, value)) = result {
-                    unmet.push(UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, field_path, value });
+                if let Some(expectation) = result {
+                    unmet.push(expectation);
                 }
             }
             crate::CrewCompletionExpectation::Legacy(_) => {
@@ -315,12 +369,16 @@ fn evaluate_declared_completion_condition(
     artifacts: &BTreeMap<String, ResourceObject<Artifact>>,
     stale_after: std::time::Duration,
     now: DateTime<Utc>,
-) -> Result<Option<(String, String, Option<String>)>, String> {
+) -> Result<Option<UnmetSettlementExpectation>, String> {
     let change_request_leaves = || expected_change_request_leaves(convoy, checkouts);
-    let evaluate = |leaf: Leaf, subject: Option<&dyn crate::LeafSubject>| -> Result<Option<(String, String, Option<String>)>, String> {
+    let evaluate = |leaf: Leaf, subject: Option<&dyn crate::LeafSubject>| -> Result<Option<UnmetSettlementExpectation>, String> {
         let result = crate::evaluate_leaf(&leaf, subject, None)?;
-        Ok((result.result != ThreeValue::True)
-            .then(|| (leaf.address.to_string(), leaf.field_path, result.value.map(|value| value.to_string()))))
+        Ok((result.result != ThreeValue::True).then(|| UnmetSettlementExpectation::CompletionConditionUnsatisfied {
+            subject: leaf.address.to_string(),
+            field_path: leaf.field_path,
+            value: result.value.map(|value| value.to_string()),
+            causes: Vec::new(),
+        }))
     };
     match condition {
         CompletionCondition::Artifact { producer, kind, about, field_path, operator, literal } => {
@@ -346,7 +404,12 @@ fn evaluate_declared_completion_condition(
                             .and(status.head_sha.value.as_ref())
                     });
                     let Some(head) = head else {
-                        return Ok(Some((format!("cr/{name}"), ".head-sha".to_string(), None)));
+                        return Ok(Some(UnmetSettlementExpectation::CompletionConditionUnsatisfied {
+                            subject: format!("cr/{name}"),
+                            field_path: ".head-sha".to_string(),
+                            value: None,
+                            causes: Vec::new(),
+                        }));
                     };
                     head.clone()
                 }
@@ -364,16 +427,39 @@ fn evaluate_declared_completion_condition(
                 return Ok(None);
             }
             if leaves.is_empty() {
-                return Ok(Some(("cr/unbound".to_string(), field_path.clone(), None)));
+                return Ok(Some(UnmetSettlementExpectation::CompletionConditionUnsatisfied {
+                    subject: "cr/unbound".to_string(),
+                    field_path: field_path.clone(),
+                    value: None,
+                    causes: Vec::new(),
+                }));
             }
             for expected in leaves {
                 let LeafAddress::ChangeRequest { service, scope, number } = &expected.address else { continue };
                 let name = crate::change_request_record_name(service, scope, *number);
                 let subject =
                     change_requests.get(&name).map(|change_request| ChangeRequestLeafSubject { change_request, now, stale_after });
+                let cause = match change_requests.get(&name).and_then(|record| record.status.as_ref()) {
+                    None => Some(CrewCompletionRefusalCause::MissingChangeRequestObservation {
+                        service: service.clone(),
+                        scope: scope.clone(),
+                        number: *number,
+                    }),
+                    Some(status) if status.mergeable.value == Some(crate::ObservedMergeability::Conflicting) => {
+                        Some(CrewCompletionRefusalCause::ConflictingChangeRequest {
+                            service: service.clone(),
+                            scope: scope.clone(),
+                            number: *number,
+                        })
+                    }
+                    _ => None,
+                };
                 let leaf =
                     Leaf { address: expected.address, field_path: field_path.clone(), operator: *operator, literal: literal.clone() };
-                if let Some(unmet) = evaluate(leaf, subject.as_ref().map(|subject| subject as &dyn crate::LeafSubject))? {
+                if let Some(mut unmet) = evaluate(leaf, subject.as_ref().map(|subject| subject as &dyn crate::LeafSubject))? {
+                    if let UnmetSettlementExpectation::CompletionConditionUnsatisfied { causes, .. } = &mut unmet {
+                        causes.extend(cause);
+                    }
                     return Ok(Some(unmet));
                 }
             }

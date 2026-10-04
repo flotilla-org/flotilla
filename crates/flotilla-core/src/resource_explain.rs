@@ -215,7 +215,7 @@ pub(crate) fn explain_condition(condition: &IntegrationCondition, now: DateTime<
 
 pub(crate) fn explain_unmet_expectation(expectation: UnmetSettlementExpectation) -> ExplainedUnmetExpectation {
     match expectation {
-        UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, field_path, value } => ExplainedUnmetExpectation {
+        UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, field_path, value, .. } => ExplainedUnmetExpectation {
             reason: "completion_condition_unsatisfied".to_string(),
             detail: format!("{field_path} is {}", value.unwrap_or_else(|| "unavailable".to_string())),
             subject,

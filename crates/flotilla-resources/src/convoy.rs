@@ -1244,9 +1244,21 @@ pub struct CrewWorkState {
     pub completion_refusal: Option<CrewCompletionRefusal>,
 }
 
+/// Machine-readable remedies, independent of the human-facing expectation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CrewCompletionRefusalCause {
+    ConflictingChangeRequest { service: String, scope: String, number: u64 },
+    MissingChangeRequestObservation { service: String, scope: String, number: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewCompletionRefusal {
     pub expectation: String,
+    /// Previous-generation refusals have no typed causes. Remove the default
+    /// one fleet roll after deployment (ADR 0047). Always write the new shape.
+    #[serde(default)]
+    pub causes: Vec<CrewCompletionRefusalCause>,
     pub consecutive_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -1415,6 +1427,7 @@ pub enum ConvoyStatusPatch {
         vessel: String,
         role: String,
         expectation: String,
+        causes: Vec<CrewCompletionRefusalCause>,
         message: Option<String>,
     },
     MarkCrewFailed {
@@ -1795,7 +1808,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 clear_stall_for_crew(status, vessel, role);
                 enter_landing_if_completion_claims_settled(status);
             }
-            Self::RefuseCrewCompletion { vessel, role, expectation, message } => {
+            Self::RefuseCrewCompletion { vessel, role, expectation, causes, message } => {
                 clear_nudge_budget(status, vessel, role);
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     let new_expectation = state.completion_refusal.as_ref().is_none_or(|prior| prior.expectation != *expectation);
@@ -1804,8 +1817,14 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         .as_ref()
                         .filter(|prior| prior.expectation == *expectation)
                         .map_or(1, |prior| prior.consecutive_count.saturating_add(1));
-                    state.completion_refusal =
-                        Some(CrewCompletionRefusal { expectation: expectation.clone(), consecutive_count, message: message.clone() });
+                    state.completion_refusal = Some(
+                        CrewCompletionRefusal::builder()
+                            .expectation(expectation.clone())
+                            .causes(causes.clone())
+                            .consecutive_count(consecutive_count)
+                            .maybe_message(message.clone())
+                            .build(),
+                    );
                     if new_expectation
                         && status.stalled.as_ref().is_some_and(|stalled| {
                             stalled.leaves.iter().any(|leaf| {
