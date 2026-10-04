@@ -54,6 +54,27 @@ derivatives, run pristine-runtime proofs, publish the complete cohort, copy it
 offsite, and only then write an immutable completed generation. It must not
 rebuild either project.
 
+## Installed generation retention
+
+After health confirmation, `fleet-install` retains `current`, `previous`, and
+three additional generations by default. Set `FLEET_INSTALL_KEEP_OTHERS` to a
+non-negative integer to change that count (zero keeps only protected releases).
+Additional generations are ordered by generation ID, whose leading UTC
+publication timestamp is stable across reinstalls and validator synchronization.
+Every generation containing a running `flotillad` executable is also kept,
+using `/proc/<pid>/exe` on Linux and `proc_pidpath` on macOS. Unreadable process
+information refuses pruning. Pruning errors are reported without undoing a
+healthy install; activation with health confirmation disabled does not prune.
+
+Operators can preview with `fleet-install --prune-dry-run` or apply with
+`fleet-install --prune`. These modes need no package credentials or network.
+Mutating pruning shares the install/rollback lock. Removed releases include
+their bundled validator and generation-prefixed file/symlink sidecars under
+`releases/` (for example `<generation>.validator.bak`); shared host validators
+and retained-generation backups remain untouched. Keep the host's validator
+compatible with the retained rollback set; pruning does not synchronize it.
+Live pruning on fleet hosts is an operator check after deployment.
+
 ## Promoted generation consumer contract
 
 `scripts/fleet-install` consumes immutable versions of the Forgejo Generic

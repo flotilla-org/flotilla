@@ -566,14 +566,23 @@ grep -Fq 'daemon stop requested' "$test_root/first-install-retry.out" || fail 'f
 test "$(link_generation "$first_install_home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
   || fail 'first-install retry did not select the generation'
 
+# Successful health confirmation prunes automatically with default K=3.
+for old in 00 01 02 03; do
+  mkdir -p "$test_root/home/.local/opt/flotilla-fleet/releases/$old"
+done
 run_installer "$generation_one" >"$test_root/install-one.out"
+test ! -d "$test_root/home/.local/opt/flotilla-fleet/releases/00" || fail 'healthy install did not prune'
+for old in 01 02 03; do
+  test -d "$test_root/home/.local/opt/flotilla-fleet/releases/$old" || fail 'default retention lost old release'
+done
 if grep -Fq 'handing off activation' "$test_root/install-one.out"; then
   fail 'fresh install handed activation to the incoming installer'
 fi
 grep -Fq "generation $generation_one confirmed healthy" "$test_root/install-one.out" \
   || fail 'healthy Linux install was not confirmed'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'exact generation was not selected'
-if FLEET_HEALTH_FAIL_FOR="$generation_one" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=0 \
+# Failed health confirmation never prunes even when K=0.
+if FLEET_INSTALL_KEEP_OTHERS=0 FLEET_HEALTH_FAIL_FOR="$generation_one" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=0 \
   run_installer "$generation_one" >"$test_root/no-previous.out" 2>&1; then
   fail 'unhealthy reinstall without a previous generation was accepted'
 fi
@@ -581,6 +590,10 @@ grep -Fq "generation $generation_one failed health confirmation and no healthy p
   "$test_root/no-previous.out" || fail 'unhealthy reinstall without a rollback target was not reported clearly'
 test ! -L "$test_root/home/.local/opt/flotilla-fleet/previous" \
   || fail 'unhealthy reinstall created a self-referential previous generation'
+test -d "$test_root/home/.local/opt/flotilla-fleet/releases/01" || fail 'unhealthy install pruned releases'
+# A pruning failure is reported, but the healthy installation still succeeds.
+FLEET_INSTALL_KEEP_OTHERS=invalid run_installer "$generation_one" >"$test_root/prune-failure-install.out" 2>&1
+grep -Fq 'healthy installation remains active' "$test_root/prune-failure-install.out" || fail 'prune failure was not reported'
 run_installer "$generation_one" >/dev/null
 test -x "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/bin/flotilla" || fail 'candidate binaries were not staged'
 test ! -w "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_one/manifest.json" || fail 'selected generation is writable'
@@ -1055,5 +1068,102 @@ if HOME="$shadow_home" PATH="$shadow_bin:$shadow_home/.local/bin:$fake_bin:$PATH
 fi
 grep -Fq 'PATH shadows the fleet launcher for cleat' "$test_root/shadow.out" || fail 'cleat PATH shadow error was unclear'
 test ! -L "$shadow_home/.local/opt/flotilla-fleet/current" || fail 'PATH shadow switched current'
+
+# Keep current, previous and every running generation in addition to the most
+# recent K others. Generate K across empty, zero, default and over-capacity sets.
+prune_root="$test_root/pruning"
+process_paths="$test_root/process-paths.json"
+run_pruner() {
+  FLEET_INSTALL_ROOT="$prune_root" FLEET_INSTALL_UNAME_S=Linux FLEET_INSTALL_UNAME_M=x86_64 \
+    FLEET_INSTALL_TESTING=1 FLEET_INSTALL_TEST_PROCESS_PATHS="$process_paths" \
+    FLEET_INSTALL_KEEP_OTHERS="$1" "$installer" "$2"
+}
+for keep in 0 1 3 9; do
+  rm -rf "$prune_root"
+  mkdir -p "$prune_root/releases"
+  for generation in 01 02 03 04 05 06 07 08; do
+    mkdir -p "$prune_root/releases/$generation/bin"
+    printf 'validator\n' >"$prune_root/releases/$generation/generation_validation.py"
+    printf 'backup\n' >"$prune_root/releases/$generation.validator.bak"
+  done
+  ln -s releases/01 "$prune_root/current"
+  ln -s releases/02 "$prune_root/previous"
+  printf '["%s/releases/03/bin/flotillad", "%s/releases/04/bin/flotillad"]\n' \
+    "$prune_root" "$prune_root" >"$process_paths"
+  # Dry run preserves every release, validator, backup and symlink byte.
+  before="$(find "$prune_root" -print | sort)"
+  run_pruner "$keep" --prune-dry-run >"$test_root/prune-dry-run.out"
+  test "$(find "$prune_root" -print | sort)" = "$before" || fail 'dry run changed the fleet tree'
+  chmod -R a-w "$prune_root/releases/05"
+  run_pruner "$keep" --prune >"$test_root/prune.out"
+  for generation in 01 02 03 04; do
+    test -f "$prune_root/releases/$generation/generation_validation.py" || fail "pruned protected $generation"
+    test -f "$prune_root/releases/$generation.validator.bak" || fail "pruned protected backup $generation"
+  done
+  for generation in 05 06 07 08; do
+    if ((10#$generation > 8 - keep)); then
+      test -d "$prune_root/releases/$generation" || fail "lost retained $generation at K=$keep"
+      test -f "$prune_root/releases/$generation.validator.bak" || fail 'lost retained validator backup'
+    else
+      test ! -e "$prune_root/releases/$generation" || fail "kept stale $generation at K=$keep"
+      test ! -e "$prune_root/releases/$generation.validator.bak" || fail 'kept pruned validator backup'
+    fi
+  done
+  # A repeated prune is idempotent.
+  before="$(find "$prune_root" -print | sort)"
+  run_pruner "$keep" --prune >/dev/null
+  test "$(find "$prune_root" -print | sort)" = "$before" || fail 'pruning was not idempotent'
+  chmod -R u+w "$prune_root"
+done
+# Linux process-boundary check: inspect a real executable inode after current
+# has flipped elsewhere, rather than relying only on injected resolved paths.
+if [[ "$(uname -s)" == Linux ]]; then
+  python3 - "$installer" "$test_root" <<'PYPROCESS'
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+installer, temporary = sys.argv[1:]
+root = Path(temporary) / "real-process-pruning"
+release = root / "releases" / "old"
+(release / "bin").mkdir(parents=True)
+shutil.copyfile("/bin/sleep", release / "bin" / "flotillad")
+(release / "bin" / "flotillad").chmod(0o755)
+(root / "releases" / "new").mkdir()
+(root / "current").symlink_to("releases/new")
+process = subprocess.Popen([str(release / "bin" / "flotillad"), "60"])
+try:
+    # Double only PID enumeration, preserving the real /proc executable lookup.
+    boundary = root / "process-bin"
+    boundary.mkdir()
+    (boundary / "pgrep").write_text(f"#!/bin/sh\necho {process.pid}\n")
+    (boundary / "pgrep").chmod(0o755)
+    environment = dict(os.environ, FLEET_INSTALL_ROOT=str(root),
+                       FLEET_INSTALL_UNAME_S="Linux", FLEET_INSTALL_UNAME_M="x86_64",
+                       FLEET_INSTALL_KEEP_OTHERS="0", PATH=str(boundary) + ":" + os.environ["PATH"])
+    environment.pop("FLEET_INSTALL_TEST_PROCESS_PATHS", None)
+    subprocess.run([installer, "--prune"], env=environment, check=True)
+    assert release.is_dir(), "pruned the real running executable generation"
+finally:
+    process.terminate()
+    process.wait()
+PYPROCESS
+fi
+# Invalid configuration and unreadable process evidence refuse all deletion.
+before="$(find "$prune_root" -print | sort)"
+if run_pruner -1 --prune >"$test_root/prune-invalid.out" 2>&1; then
+  fail 'negative retention accepted'
+fi
+printf 'invalid json\n' >"$process_paths"
+if run_pruner 0 --prune >"$test_root/prune-process.out" 2>&1; then
+  fail 'unreadable process evidence accepted'
+fi
+test "$(find "$prune_root" -print | sort)" = "$before" || fail 'unsafe prune changed releases'
+# No generations is a successful no-op.
+rm -rf "$prune_root"
+printf '[]\n' >"$process_paths"
+run_pruner 0 --prune-dry-run >/dev/null
 
 echo 'fleet-install contract passed'
