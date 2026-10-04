@@ -22,6 +22,7 @@ pub fn labels_from_registry(registry: &ProviderRegistry) -> RepoLabels {
     }
 }
 
+#[derive(Clone)]
 pub struct ProviderNameEntry {
     pub display_name: String,
     pub implementation: String,
@@ -59,12 +60,28 @@ pub struct RepoModel {
     pub registry: Arc<ProviderRegistry>,
     pub labels: RepoLabels,
     pub environment_id: Option<EnvironmentId>,
+    pub(crate) checkout_names: Vec<ProviderNameEntry>,
 }
 
 impl RepoModel {
     pub fn new(registry: ProviderRegistry, environment_id: Option<EnvironmentId>) -> Self {
         let labels = labels_from_registry(&registry);
-        Self { registry: Arc::new(registry), labels, environment_id }
+        Self { registry: Arc::new(registry), labels, environment_id, checkout_names: Vec::new() }
+    }
+
+    pub(crate) fn new_observation(mut registry: ProviderRegistry, environment_id: Option<EnvironmentId>) -> Self {
+        let labels = labels_from_registry(&registry);
+        let checkout_names = provider_names_from_registry(&registry).remove("vcs").unwrap_or_default();
+        registry.vcs.clear();
+        Self { registry: Arc::new(registry), labels, environment_id, checkout_names }
+    }
+
+    pub(crate) fn provider_names(&self) -> HashMap<String, Vec<ProviderNameEntry>> {
+        let mut names = provider_names_from_registry(&self.registry);
+        if !self.checkout_names.is_empty() {
+            names.insert("vcs".into(), self.checkout_names.clone());
+        }
+        names
     }
 
     pub fn new_virtual() -> Self {
@@ -77,6 +94,7 @@ impl RepoModel {
                 cloud_agents: CategoryLabels::new("Sessions", "session", "S"),
             },
             environment_id: None,
+            checkout_names: Vec::new(),
         }
     }
 }

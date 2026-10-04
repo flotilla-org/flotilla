@@ -6,7 +6,7 @@ use std::{
 };
 
 use flotilla_protocol::NodeId;
-use flotilla_resources::RepositorySpec;
+use flotilla_resources::RepositoryVcsSpec;
 use serde::{Deserialize, Serialize};
 
 use crate::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
@@ -605,7 +605,7 @@ pub struct ConfigStore {
     state_dir: DaemonHostPath,
     global_config: OnceLock<Mutex<FlotillaConfig>>,
     observation_roots: Mutex<()>,
-    repository_specs: Mutex<HashMap<PathBuf, RepositorySpec>>,
+    checkout_configs: Mutex<HashMap<PathBuf, RepositoryVcsSpec>>,
 }
 
 impl ConfigStore {
@@ -617,7 +617,7 @@ impl ConfigStore {
             state_dir,
             global_config: OnceLock::new(),
             observation_roots: Mutex::new(()),
-            repository_specs: Mutex::new(HashMap::new()),
+            checkout_configs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -777,30 +777,21 @@ impl ConfigStore {
         }
     }
 
-    pub fn set_repository_spec(&self, repo_root: &ExecutionEnvironmentPath, spec: RepositorySpec) {
-        self.repository_specs.lock().expect("repository specs mutex poisoned").insert(repo_root.as_path().to_path_buf(), spec);
+    pub fn set_checkout_config(&self, repo_root: &ExecutionEnvironmentPath, vcs: RepositoryVcsSpec) {
+        self.checkout_configs.lock().expect("checkout configs mutex poisoned").insert(repo_root.as_path().to_path_buf(), vcs);
     }
 
-    pub fn remove_repository_spec(&self, repo_root: &ExecutionEnvironmentPath) {
-        self.repository_specs.lock().expect("repository specs mutex poisoned").remove(repo_root.as_path());
+    pub fn remove_checkout_config(&self, repo_root: &ExecutionEnvironmentPath) {
+        self.checkout_configs.lock().expect("checkout configs mutex poisoned").remove(repo_root.as_path());
     }
 
     pub fn resolve_checkout_config(&self, repo_root: &ExecutionEnvironmentPath) -> ResolvedCheckoutConfig {
         let global = self.load_config();
-        let specs = self.repository_specs.lock().expect("repository specs mutex poisoned");
-        let git = specs.get(repo_root.as_path()).map(RepositorySpec::vcs).map(|vcs| &vcs.git);
+        let specs = self.checkout_configs.lock().expect("checkout configs mutex poisoned");
+        let git = specs.get(repo_root.as_path()).map(|vcs| &vcs.git);
         ResolvedCheckoutConfig {
             path: git.and_then(|git| git.checkout_path.clone()).unwrap_or_else(|| global.vcs.git.checkout_path.clone()),
         }
-    }
-
-    pub fn resolve_change_request_backend(&self, repo_root: &ExecutionEnvironmentPath) -> Option<String> {
-        self.repository_specs
-            .lock()
-            .expect("repository specs mutex poisoned")
-            .get(repo_root.as_path())
-            .and_then(|spec| spec.change_request().backend.clone())
-            .or_else(|| self.load_config().change_request.preference.backend)
     }
 }
 

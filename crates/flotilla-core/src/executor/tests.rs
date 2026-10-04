@@ -2204,6 +2204,13 @@ async fn run_build_plan_to_completion_with(
     let providers_data = Arc::new(providers_data);
     let runner: Arc<dyn CommandRunner> = Arc::new(runner);
 
+    let vcs_resolver: Arc<dyn crate::vcs::CheckoutVcsResolver> = match registry.vcs.preferred() {
+        Some(vcs) => Arc::new(crate::vcs::FixedVcsResolver(vcs.clone())),
+        None if matches!(action, CommandAction::Checkout { .. } | CommandAction::RemoveCheckout { .. }) => {
+            Arc::new(crate::vcs::FixedVcsResolver(Arc::new(MockCheckoutManager::failing("No VCS provider available"))))
+        }
+        None => test_vcs_resolver(runner.clone()),
+    };
     let plan = build_plan(
         local_command(action),
         repo.clone(),
@@ -2226,7 +2233,7 @@ async fn run_build_plan_to_completion_with(
                 registry,
                 providers_data,
                 runner: runner.clone(),
-                vcs_resolver: test_vcs_resolver(runner),
+                vcs_resolver,
                 env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
                 config_base,
                 attachable_store,
@@ -2611,10 +2618,10 @@ async fn checkout_plan_end_to_end_creates_workspace() {
     let (cancel, tx) = (CancellationToken::new(), Arc::new(RecordingEventSink::default()));
     let resolver = ExecutorStepResolver {
         repo,
+        vcs_resolver: Arc::new(crate::vcs::FixedVcsResolver(registry.vcs.preferred().expect("fixture vcs").clone())),
         registry,
         providers_data,
         runner: runner.clone(),
-        vcs_resolver: test_vcs_resolver(runner),
         env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
         config_base: cb,
         attachable_store: attachable.clone(),
@@ -2753,10 +2760,10 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
     let (cancel, tx) = (CancellationToken::new(), Arc::new(RecordingEventSink::default()));
     let resolver = ExecutorStepResolver {
         repo,
+        vcs_resolver: Arc::new(crate::vcs::FixedVcsResolver(registry.vcs.preferred().expect("fixture vcs").clone())),
         registry,
         providers_data,
         runner: runner.clone(),
-        vcs_resolver: test_vcs_resolver(runner),
         env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
         config_base: cb,
         attachable_store: attachable,
@@ -3446,7 +3453,7 @@ async fn write_branch_issue_links_empty_is_noop() {
 async fn checkout_service_validate_target_uses_checkout_manager() {
     let mut registry = ProviderRegistry::new();
     registry.vcs.insert("checkout", desc("checkout"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/tmp/feat-x")));
-    let service = CheckoutService::new(&registry);
+    let service = CheckoutService::new(registry.vcs.preferred().expect("fixture VCS").as_ref());
 
     let result = service.validate_target(&repo_root(), "new-branch", CheckoutIntent::FreshBranch).await;
 
@@ -3457,7 +3464,7 @@ async fn checkout_service_validate_target_uses_checkout_manager() {
 async fn checkout_service_validate_target_propagates_checkout_manager_error() {
     let mut registry = ProviderRegistry::new();
     registry.vcs.insert("checkout", desc("checkout"), Arc::new(MockCheckoutManager::failing("branch already exists: existing")));
-    let service = CheckoutService::new(&registry);
+    let service = CheckoutService::new(registry.vcs.preferred().expect("fixture VCS").as_ref());
 
     let result = service.validate_target(&repo_root(), "existing", CheckoutIntent::FreshBranch).await;
 

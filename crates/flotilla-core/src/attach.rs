@@ -519,6 +519,7 @@ impl<'a> AttachResolver<'a> {
             self.local_environment_id,
             self.local_environment_id,
             cwd.as_path(),
+            None,
         )
         .await
         .map_err(|error| format!("checkout {} provider discovery failed: {error}", checkout.path))?;
@@ -725,6 +726,7 @@ impl<'a> AttachResolver<'a> {
             self.local_environment_id,
             &environment_id,
             cwd,
+            None,
         )
         .await
         .map(|result| Arc::new(result.registry))
