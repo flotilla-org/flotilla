@@ -49,6 +49,9 @@ impl InProcessDaemon {
     /// uses a transient discovered provider that is never retained by the daemon.
     pub(super) async fn checkout_provider(&self, env_id: &EnvironmentId, path: &Path) -> Result<Arc<CheckoutProvider>, String> {
         let namespace = self.provisioning_namespace().await;
+        if let Some(provider) = self.cached_checkout_provider(&namespace, env_id, path).await? {
+            return Ok(provider);
+        }
         let checkouts = self.checkout_provider_facts(&namespace).await?;
         let observed = checkouts.iter().find(|checkout| {
             checkout_path(checkout).is_some_and(|candidate| Path::new(candidate) == path)
@@ -95,8 +98,43 @@ impl InProcessDaemon {
         let provider = cell.get_or_try_init(discover).await.map(Arc::clone)?;
         // Discovery may have awaited I/O while the Checkout was retired. Keep
         // only current instances, including delete/recreate at the same path.
+        // Retirement is part of lease admission. A successful probe cannot prove
+        // that a cached resource instance remains current if inventory reads fail;
+        // propagate that failure rather than masking it behind a usable provider.
         self.retire_checkout_providers().await?;
         Ok(provider)
+    }
+
+    async fn cached_checkout_provider(
+        &self,
+        namespace: &str,
+        env_id: &EnvironmentId,
+        path: &Path,
+    ) -> Result<Option<Arc<CheckoutProvider>>, String> {
+        let candidate = self.checkout_vcs.lock().await.iter().find_map(|(key, cell)| {
+            if key.namespace == namespace && key.environment == *env_id && key.path == path {
+                cell.get().map(|provider| (key.clone(), provider.clone()))
+            } else {
+                None
+            }
+        });
+        let Some((key, provider)) = candidate else {
+            return Ok(None);
+        };
+        // Validate the resource instance synchronously: watch delivery may lag
+        // behind deletion/recreation. Durable resources still take precedence.
+        let checkout = match self.resource_backend.including_replicas::<ResourceCheckout>(namespace).get(&key.name).await {
+            Ok(source) => source.object,
+            Err(ResourceError::NotFound { .. }) => {
+                match self.observed_resource_backend.clone().using::<ResourceCheckout>(namespace).get(&key.name).await {
+                    Ok(checkout) => checkout,
+                    Err(ResourceError::NotFound { .. }) => return Ok(None),
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        Ok((self.checkout_lifetime_key(namespace, &checkout).as_ref() == Some(&key)).then_some(provider))
     }
 
     fn checkout_environment(&self, checkout: &ResourceObject<ResourceCheckout>) -> Option<EnvironmentId> {
