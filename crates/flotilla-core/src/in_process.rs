@@ -139,6 +139,7 @@ use crate::{
 };
 
 type ObservationScope = (String, String, String);
+const OBSERVATION_CACHE_FALLBACK_DELAY: Duration = Duration::from_secs(9);
 
 fn forge_service_matches(service_url: &str, service: &str) -> bool {
     service_url.split_once("://").is_some_and(|(_, authority)| authority.trim_end_matches('/').eq_ignore_ascii_case(service))
@@ -170,14 +171,41 @@ fn observation_cache_delay(retry_at: Option<chrono::DateTime<Utc>>, now: chrono:
     retry_at
         .and_then(|retry_at| retry_at.signed_duration_since(now).to_std().ok())
         .filter(|delay| !delay.is_zero())
-        .unwrap_or(Duration::from_secs(9))
+        .unwrap_or(OBSERVATION_CACHE_FALLBACK_DELAY)
 }
 
 fn observation_rate_limit_error(result: &Result<BoundObservations, ObservationError>) -> Option<&ObservationError> {
     match result {
         Err(error) => error.retry_at().map(|_| error),
-        Ok(statuses) => statuses.values().filter_map(|status| status.as_ref().err()).find(|error| error.retry_at().is_some()),
+        // Latest reset controls the entire scope. Lowest subject number breaks ties,
+        // keeping diagnostics stable across HashMap insertion/iteration orders.
+        Ok(statuses) => statuses
+            .iter()
+            .filter_map(|(number, status)| {
+                let error = status.as_ref().err()?;
+                Some((error.retry_at()?, std::cmp::Reverse(*number), error))
+            })
+            .max_by_key(|(deadline, number, _)| (*deadline, *number))
+            .map(|(_, _, error)| error),
     }
+}
+
+// Timed observations (and successes) inherit the controlling scope deadline on
+// both the initial read and cache hits, so Completion and Landing cannot shorten
+// the wait. Hard refusals and untimed limits keep their original diagnostics.
+fn observation_during_cooldown(
+    result: &Result<BoundObservations, ObservationError>,
+    number: u64,
+    controlling: &ObservationError,
+) -> Result<flotilla_resources::ChangeRequestStatus, ObservationError> {
+    if let Ok(statuses) = result {
+        if let Some(Err(error)) = statuses.get(&number) {
+            if error.retry_at().is_none() {
+                return Err(error.clone());
+            }
+        }
+    }
+    Err(controlling.clone())
 }
 
 struct ProviderChangeRequestObservationSource {
@@ -446,19 +474,7 @@ impl ProviderChangeRequestObservationSource {
         // cooldown too. Check before discovery and regardless of the cached batch.
         if let Some(entry) = cache.as_ref().filter(|entry| tokio::time::Instant::now() < entry.expires_at) {
             if let Some(error) = entry.rate_limit_error() {
-                // Preserve an already-observed hard failure for this subject. A scope
-                // cooldown must not conceal a substantive completion refusal.
-                // A whole-batch Err has no per-subject outcomes to preserve.
-                // A classified limit without a deadline also stays visible here:
-                // a sibling's timed cooldown cannot supply this subject's retry time.
-                if let Ok(statuses) = &entry.result {
-                    if let Some(Err(hard_error)) = statuses.get(&subject.number) {
-                        if hard_error.retry_at().is_none() {
-                            return Err(hard_error.clone());
-                        }
-                    }
-                }
-                return Err(error.clone());
+                return observation_during_cooldown(&entry.result, subject.number, error);
             }
         }
 
@@ -583,9 +599,16 @@ impl ProviderChangeRequestObservationSource {
         let crew_logins = crew_logins.into_iter().map(|(number, logins)| (number, logins.into_iter().collect())).collect();
         let result = provider.observe_bound(&numbers, &crew_logins).await;
         let delay = observation_cache_delay(observation_rate_limit_error(&result).and_then(ObservationError::retry_at), Utc::now());
-        let status = result.as_ref().map_err(Clone::clone).and_then(|statuses| {
-            statuses.get(&subject.number).cloned().unwrap_or_else(|| Err(format!("change request {} was not found", subject.number).into()))
-        });
+        let status = if let Some(error) = observation_rate_limit_error(&result) {
+            observation_during_cooldown(&result, subject.number, error)
+        } else {
+            result.as_ref().map_err(Clone::clone).and_then(|statuses| {
+                statuses
+                    .get(&subject.number)
+                    .cloned()
+                    .unwrap_or_else(|| Err(format!("change request {} was not found", subject.number).into()))
+            })
+        };
         *cache = Some(
             CachedObservation::builder()
                 .expires_at(tokio::time::Instant::now() + delay)

@@ -63,9 +63,46 @@ pub struct GhApiResponse {
     pub total_count: Option<u32>,
 }
 
+/// REST-only failure envelope; admission sees only `error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhApiFailure {
+    pub error: ObservationError,
+    pub response: Option<Box<GhApiFailureResponse>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhApiFailureResponse {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub body: String,
+    pub legacy_error: String,
+}
+
+impl From<ObservationError> for GhApiFailure {
+    fn from(error: ObservationError) -> Self {
+        Self { error, response: None }
+    }
+}
+impl From<String> for GhApiFailure {
+    fn from(error: String) -> Self {
+        ObservationError::Forge(error).into()
+    }
+}
+impl From<&str> for GhApiFailure {
+    fn from(error: &str) -> Self {
+        error.to_string().into()
+    }
+}
+
 /// Parse the combined headers+body output from `gh api --include`.
 pub fn parse_gh_api_response(raw: &str) -> GhApiResponse {
-    // Split on first blank line (headers end with \r\n\r\n or \n\n)
+    parse_gh_api_response_with_headers(raw).0
+}
+
+// One header interpretation for response projection and failure recording. Link
+// is a comma-delimited HTTP field: retain all repeated lines before pagination
+// is interpreted. Other fields use their last value, matching gh's projection.
+fn parse_gh_api_response_with_headers(raw: &str) -> (GhApiResponse, HashMap<String, String>) {
     let (header_section, body) = if let Some(pos) = raw.find("\r\n\r\n") {
         (&raw[..pos], raw[pos + 4..].trim().to_string())
     } else if let Some(pos) = raw.find("\n\n") {
@@ -73,25 +110,34 @@ pub fn parse_gh_api_response(raw: &str) -> GhApiResponse {
     } else {
         (raw, String::new())
     };
-
-    let mut status = 0u16;
-    let mut etag = None;
-    let mut has_next_page = false;
-
-    for (i, line) in header_section.lines().enumerate() {
-        if i == 0 {
-            // "HTTP/2.0 200 OK" or "HTTP/1.1 304 Not Modified"
-            if let Some(code_str) = line.split_whitespace().nth(1) {
-                status = code_str.parse().unwrap_or(0);
+    let mut lines = header_section.lines();
+    let status = lines.next().and_then(|line| line.split_whitespace().nth(1)).and_then(|code| code.parse().ok()).unwrap_or(0);
+    let mut headers = HashMap::<String, String>::new();
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.to_ascii_lowercase();
+            let value = value.trim();
+            if name == "link" {
+                headers
+                    .entry(name)
+                    .and_modify(|prior| {
+                        prior.push_str(", ");
+                        prior.push_str(value);
+                    })
+                    .or_insert_with(|| value.to_string());
+            } else {
+                headers.insert(name, value.to_string());
             }
-        } else if line.len() >= 6 && line[..5].eq_ignore_ascii_case("etag:") {
-            etag = Some(line[5..].trim().to_string());
-        } else if line.len() >= 6 && line[..5].eq_ignore_ascii_case("link:") {
-            has_next_page = line.contains("rel=\"next\"");
         }
     }
-
-    GhApiResponse { status, etag, body, has_next_page, total_count: None }
+    let response = GhApiResponse {
+        status,
+        etag: headers.get("etag").cloned(),
+        body,
+        has_next_page: headers.get("link").is_some_and(|link| link.contains("rel=\"next\"")),
+        total_count: None,
+    };
+    (response, headers)
 }
 
 pub(crate) fn rate_limit_error_for(budget: &str, reset: &str) -> String {
@@ -290,6 +336,10 @@ pub trait GhApi: Send + Sync {
     ) -> Result<GhApiResponse, ObservationError> {
         self.get_with_headers(endpoint, repo_root, label).await.map_err(ObservationError::Forge)
     }
+    /// Recording seam retaining raw REST failures. Non-REST adapters have no response.
+    async fn get_classified_response(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<GhApiResponse, GhApiFailure> {
+        self.get_classified_with_headers(endpoint, repo_root, label).await.map_err(Into::into)
+    }
 }
 
 /// Cache entry: ETag + the JSON response body from last 200.
@@ -326,21 +376,30 @@ impl GhApi for GhApiClient {
     }
 
     async fn get_with_headers(&self, endpoint: &str, repo_root: &Path, _label: &ChannelLabel) -> Result<GhApiResponse, String> {
-        self.fetch(endpoint, repo_root, RestErrorMode::LegacyDiagnostic).await.map_err(|error| error.to_string())
+        self.fetch(endpoint, repo_root, RestErrorMode::LegacyDiagnostic).await.map_err(|failure| failure.error.to_string())
     }
 
     async fn get_classified_with_headers(
         &self,
         endpoint: &str,
         repo_root: &Path,
-        _label: &ChannelLabel,
+        label: &ChannelLabel,
     ) -> Result<GhApiResponse, ObservationError> {
+        self.get_classified_response(endpoint, repo_root, label).await.map_err(|failure| failure.error)
+    }
+
+    async fn get_classified_response(
+        &self,
+        endpoint: &str,
+        repo_root: &Path,
+        _label: &ChannelLabel,
+    ) -> Result<GhApiResponse, GhApiFailure> {
         self.fetch(endpoint, repo_root, RestErrorMode::Classified).await
     }
 }
 
 impl GhApiClient {
-    async fn fetch(&self, endpoint: &str, repo_root: &Path, error_mode: RestErrorMode) -> Result<GhApiResponse, ObservationError> {
+    async fn fetch(&self, endpoint: &str, repo_root: &Path, error_mode: RestErrorMode) -> Result<GhApiResponse, GhApiFailure> {
         if is_issue_observation(endpoint) {
             if let Some((reset, message)) = self.budget_backoff.lock().expect("GitHub budget lock poisoned").as_ref() {
                 if *reset > Utc::now() {
@@ -365,7 +424,7 @@ impl GhApiClient {
         let output = run_output!(self.runner, "gh", &args_refs, repo_root)?;
 
         // Always parse stdout — gh api --include writes headers even on 304
-        let parsed = parse_gh_api_response(&output.stdout);
+        let (parsed, headers) = parse_gh_api_response_with_headers(&output.stdout);
 
         if parsed.status == 304 {
             // Serve from cache
@@ -383,19 +442,22 @@ impl GhApiClient {
         }
 
         if !output.success {
-            if matches!(error_mode, RestErrorMode::Classified) {
-                if let Some(limit) = github_rate_limit(&output.stdout, Utc::now()) {
-                    let budget = response_header(&output.stdout, "x-ratelimit-resource")
-                        .map(|resource| format!("REST {resource}"))
-                        .unwrap_or_else(|| "REST core".into());
-                    return Err(ObservationError::RateLimited { budget, limit });
-                }
-                return Err(output.stderr.into());
-            }
-            if let Some(error) = rate_limit_error_from_response(&output.stdout, "REST core") {
-                return Err(error.into());
-            }
-            return Err(output.stderr.into());
+            let legacy_error = rate_limit_error_from_response(&output.stdout, "REST core").unwrap_or_else(|| output.stderr.clone());
+            let error = if matches!(error_mode, RestErrorMode::Classified) {
+                github_rate_limit(&output.stdout, Utc::now())
+                    .map(|limit| {
+                        let budget = response_header(&output.stdout, "x-ratelimit-resource")
+                            .map(|resource| format!("REST {resource}"))
+                            .unwrap_or_else(|| "REST core".into());
+                        ObservationError::RateLimited { budget, limit }
+                    })
+                    .unwrap_or_else(|| ObservationError::Forge(output.stderr.clone()))
+            } else {
+                ObservationError::Forge(legacy_error.clone())
+            };
+            let response = (parsed.status != 0)
+                .then(|| Box::new(GhApiFailureResponse { status: parsed.status, headers, body: parsed.body, legacy_error }));
+            return Err(GhApiFailure { error, response });
         }
 
         if let Some(ref etag) = parsed.etag {
@@ -588,5 +650,35 @@ mod tests {
             .await
             .expect("core issue observation remains available");
         assert_eq!(runner.calls().len(), 2);
+    }
+    // Review finding 1: pagination and raw failure metadata share one header
+    // interpretation, preserving every repeated comma-delimited Link value.
+    #[hegel::test]
+    fn repeated_link_headers_preserve_metadata_and_pagination(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Span no Link, one Link and repeated Link fields, every placement of
+        // next (including absent), both header casings and both line endings.
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+        let next = tc.draw(gs::integers::<usize>().min_value(0).max_value(count));
+        let header_name = if tc.draw(gs::booleans()) { "Link" } else { "lInK" };
+        let newline = if tc.draw(gs::booleans()) { "\r\n" } else { "\n" };
+        let links: Vec<_> = (0..count)
+            .map(|index| {
+                let relation = if index == next { "next" } else { "prev" };
+                format!("<https://api.github.com/items?page={index}>; rel=\"{relation}\"")
+            })
+            .collect();
+        let mut raw = format!("HTTP/2 403 Forbidden{newline}ETag: example{newline}");
+        for link in &links {
+            raw.push_str(&format!("{header_name}: {link}{newline}"));
+        }
+        raw.push_str(&format!("{newline}{{}}"));
+        let (response, headers) = parse_gh_api_response_with_headers(&raw);
+        assert_eq!(response.has_next_page, next < count);
+        assert_eq!(headers.get("link"), (count != 0).then(|| links.join(", ")).as_ref());
+        assert_eq!(response.etag.as_deref(), Some("example"));
+        assert_eq!(headers.get("etag").map(String::as_str), Some("example"));
+        assert_eq!(response.status, 403);
+        assert_eq!(response.body, "{}");
     }
 }
