@@ -377,6 +377,8 @@ pub async fn create_stopped_terminal(
             delivered_message_id: None,
             attention: None,
             last_tool_activity_at: None,
+            last_output_digest: None,
+            last_output_activity_at: None,
             occupancy: Default::default(),
             completion_pending: None,
             degraded: None,

@@ -941,14 +941,22 @@ async fn resume_staging_fixture() -> (Arc<InProcessDaemon>, ResourceBackend, Arc
 async fn resume_staging_fixture_with_backend(
     backend: ResourceBackend,
 ) -> (Arc<InProcessDaemon>, ResourceBackend, Arc<SessionStagingProbe>) {
+    resume_staging_fixture_with_clock(backend, Arc::new(flotilla_resources::SystemClock)).await
+}
+
+async fn resume_staging_fixture_with_clock(
+    backend: ResourceBackend,
+    clock: Arc<dyn flotilla_resources::Clock>,
+) -> (Arc<InProcessDaemon>, ResourceBackend, Arc<SessionStagingProbe>) {
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"resume-staging-test\"\n").expect("daemon config");
-    let daemon = InProcessDaemon::new_with_resource_backend(
+    let daemon = InProcessDaemon::new_with_resource_backend_and_clock(
         Vec::new(),
         Arc::new(ConfigStore::with_base(temp.path())),
         fake_discovery(false),
         HostName::new("test-host"),
         backend.clone(),
+        clock,
     )
     .await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
@@ -1024,6 +1032,79 @@ async fn resume_staging_fixture_with_backend(
     });
     daemon.set_work_credential_reconciler(probe.clone()).await;
     (daemon, backend, probe)
+}
+
+// #2560: an idle prompt after interruption releases the operator's queued
+// brief without a notify hook, through the same credential-staged delivery path.
+#[tokio::test]
+async fn interrupted_prompt_releases_pending_brief_without_hook() {
+    let clock = Arc::new(VirtualClock::new(Utc::now()));
+    let (daemon, backend, probe) =
+        resume_staging_fixture_with_clock(ResourceBackend::InMemory(InMemoryBackend::default()), clock.clone()).await;
+    probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let convoy = convoys.get("resume-staging").await.expect("convoy");
+    let mut status = convoy.status.expect("status");
+    status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("coder").phase = CrewWorkPhase::Working;
+    convoys.update_status("resume-staging", &convoy.metadata.resource_version, &status).await.expect("working crew");
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let session = sessions.get("resume-staging-session").await.expect("session");
+    let mut status = session.status.unwrap_or_default();
+    status.phase = ResourceTerminalSessionPhase::Running;
+    status.attention = Some(TerminalAttention {
+        state: TerminalAttentionState::Working,
+        source: TerminalAttentionSource::Screen,
+        as_of: daemon.clock.now(),
+    });
+    sessions.update_status(&session.metadata.name, &session.metadata.resource_version, &status).await.expect("working observation");
+    daemon
+        .convoy_resume_internal("flotilla", "resume-staging", "operator guidance", Some("work"), Some("coder"))
+        .await
+        .expect("queue brief");
+    assert!(convoys.get("resume-staging").await.expect("convoy").status.expect("status").pending_brief().is_some());
+    daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("busy pass");
+    // Stale idle, questions, and unknown screens cannot consume a pending brief.
+    for (state, age) in
+        [(TerminalAttentionState::Idle, 121), (TerminalAttentionState::NeedsInput, 0), (TerminalAttentionState::Unobservable, 0)]
+    {
+        let session = sessions.get("resume-staging-session").await.expect("session");
+        let mut status = session.status.expect("status");
+        status.attention = Some(TerminalAttention {
+            state,
+            source: TerminalAttentionSource::Screen,
+            as_of: daemon.clock.now() - chrono::Duration::seconds(age),
+        });
+        sessions
+            .update_status(&session.metadata.name, &session.metadata.resource_version, &status)
+            .await
+            .expect("non-boundary observation");
+        daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("non-boundary pass");
+        assert!(convoys.get("resume-staging").await.expect("convoy").status.expect("status").pending_brief().is_some());
+    }
+    clock.advance(chrono::Duration::seconds(10));
+    let session = sessions.get("resume-staging-session").await.expect("session");
+    let mut status = session.status.expect("status");
+    status.attention =
+        Some(TerminalAttention { state: TerminalAttentionState::Idle, source: TerminalAttentionSource::Screen, as_of: daemon.clock.now() });
+    sessions.update_status(&session.metadata.name, &session.metadata.resource_version, &status).await.expect("interrupted idle prompt");
+    probe.fail_next.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(daemon
+        .reconcile_pending_supervisor_turns_once("flotilla")
+        .await
+        .expect_err("staging failure")
+        .contains("credential staging failed"));
+    assert!(
+        convoys.get("resume-staging").await.expect("convoy").status.expect("status").pending_brief().is_some(),
+        "failed staging preserves the queued brief"
+    );
+    daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("release queued brief");
+    assert!(convoys.get("resume-staging").await.expect("convoy").status.expect("status").pending_brief().is_none());
+    let session = sessions.get("resume-staging-session").await.expect("session");
+    let TerminalSessionSource::Agent { message: Some(message), .. } = session.spec.source else { panic!("queued delivery") };
+    assert!(message.text.contains("operator guidance"));
+    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
+    daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("duplicate observation");
+    assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

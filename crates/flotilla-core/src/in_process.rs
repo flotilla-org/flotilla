@@ -7710,6 +7710,19 @@ impl InProcessDaemon {
         }
         let message_lock = self.convoy_message_lock(namespace, name).await;
         let _message_guard = message_lock.lock().await;
+        self.convoy_resume_with_sender_locked(namespace, name, prompt, requested_vessel, requested_role, sender).await
+    }
+
+    // The caller holds the convoy message lock, including when consuming a pending brief.
+    async fn convoy_resume_with_sender_locked(
+        &self,
+        namespace: &str,
+        name: &str,
+        prompt: &str,
+        requested_vessel: Option<&str>,
+        requested_role: Option<&str>,
+        sender: CrewMessageSender,
+    ) -> Result<ConvoyResumeOutcome, String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = convoys.get(name).await.map_err(|err| err.to_string())?;
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{name}` has no status"))?;
@@ -7772,7 +7785,9 @@ impl InProcessDaemon {
         let at_turn_boundary = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
             session.object.status.as_ref().is_some_and(|status| {
                 status.phase == ResourceTerminalSessionPhase::Running
-                    && status.attention.as_ref().is_some_and(|attention| attention.state == TerminalAttentionState::Idle)
+                    && status.attention.as_ref().is_some_and(|attention| {
+                        attention.state == TerminalAttentionState::Idle && !attention.is_stale_at(self.clock.now())
+                    })
             })
         });
         let agent_exited = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
@@ -7788,7 +7803,7 @@ impl InProcessDaemon {
                         .vessel(vessel)
                         .role(role)
                         .content(prompt.to_string())
-                        .queued_at(chrono::Utc::now())
+                        .queued_at(self.clock.now())
                         .sender(sender)
                         .build(),
                 ),
@@ -7811,7 +7826,7 @@ impl InProcessDaemon {
             &convoy_external_patches::resume_crew_work(
                 vessel.clone(),
                 role.clone(),
-                chrono::Utc::now(),
+                self.clock.now(),
                 prompt.to_string(),
                 Some(resume_message.id.clone()),
             ),
@@ -8180,6 +8195,46 @@ impl InProcessDaemon {
         let local_convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let visible_sessions = self.resource_backend.clone().including_replicas::<ResourceTerminalSession>(namespace);
         for convoy in local_convoys.list().await.map_err(|error| error.to_string())?.items {
+            // Serialize the observation-driven boundary with operator replacement,
+            // withdrawal, and crew completion so stale scans cannot displace a newer brief.
+            let message_lock = self.convoy_message_lock(namespace, &convoy.metadata.name).await;
+            let _message_guard = message_lock.lock().await;
+            let convoy = local_convoys.get(&convoy.metadata.name).await.map_err(|error| error.to_string())?;
+            if !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+                if let Some(pending) = convoy.status.as_ref().and_then(|status| status.pending_brief()) {
+                    let selector = BTreeMap::from([
+                        (CONVOY_LABEL.to_string(), convoy.metadata.name.clone()),
+                        (VESSEL_LABEL.to_string(), pending.vessel.clone()),
+                        (ROLE_LABEL.to_string(), pending.role.clone()),
+                    ]);
+                    let visible = visible_sessions.list_matching_labels(&selector).await.map_err(|error| error.to_string())?;
+                    let boundary = visible.items.iter().any(|session| {
+                        session.object.status.as_ref().is_some_and(|status| {
+                            status.phase == ResourceTerminalSessionPhase::Running
+                                && status.attention.as_ref().is_some_and(|attention| {
+                                    attention.state == TerminalAttentionState::Idle
+                                        && !attention.is_stale_at(self.clock.now())
+                                        && attention.as_of > pending.queued_at
+                                })
+                        })
+                    });
+                    if boundary {
+                        if let Err(error) = self
+                            .convoy_resume_with_sender_locked(
+                                namespace,
+                                &convoy.metadata.name,
+                                &pending.content,
+                                Some(&pending.vessel),
+                                Some(&pending.role),
+                                pending.sender.clone(),
+                            )
+                            .await
+                        {
+                            errors.push(format!("convoy {} pending brief: {error}", convoy.metadata.name));
+                        }
+                    }
+                }
+            }
             let Some(status) = convoy.status else { continue };
             for (message_id, turn) in
                 status.turn_deliveries.into_iter().filter_map(|(id, delivery)| delivery.pending_supervisor_turn.map(|turn| (id, turn)))

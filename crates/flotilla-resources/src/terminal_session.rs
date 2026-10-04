@@ -309,6 +309,12 @@ pub struct TerminalSessionStatus {
     /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_tool_activity_at: Option<DateTime<Utc>>,
+    /// Meaningful screen output excludes harness animation. Remove the decoder
+    /// defaults one fleet roll after these fields land (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_activity_at: Option<DateTime<Utc>>,
     /// Whether the principal currently occupies the terminal's controller
     /// seat. Cleat's attachment state is authoritative for this observation.
     #[serde(default)]
@@ -499,6 +505,8 @@ pub enum TerminalSessionStatusPatch {
     Observe {
         attention: Option<TerminalAttention>,
         occupancy: TerminalOccupancy,
+        output_digest: Option<String>,
+        observed_at: DateTime<Utc>,
     },
     MarkCompletionPending {
         pending: CrewCompletionPending,
@@ -624,8 +632,14 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.message = None;
                 status.degraded = None;
             }
-            Self::Observe { attention, occupancy } => {
+            Self::Observe { attention, occupancy, output_digest, observed_at } => {
                 status.occupancy = *occupancy;
+                if let Some(digest) = output_digest {
+                    if status.last_output_digest.as_ref() != Some(digest) {
+                        status.last_output_digest = Some(digest.clone());
+                        status.last_output_activity_at = Some(*observed_at);
+                    }
+                }
                 if let Some(attention) = attention {
                     let replace = status.attention.as_ref().is_none_or(|previous| previous.should_replace_with(attention));
                     if replace {
@@ -680,6 +694,24 @@ mod tests {
 
         assert_eq!(status.phase, TerminalSessionPhase::Running);
         assert_eq!(status.attention.expect("attention").state, TerminalAttentionState::Idle);
+    }
+
+    // #2560: repeating an output fingerprint cannot invent progress; changed
+    // fingerprints advance the durable output time, independently of hooks.
+    #[test]
+    fn output_activity_changes_only_with_meaningful_content() {
+        let start = attention(TerminalAttentionState::Working, TerminalAttentionSource::Screen, 0).as_of;
+        let mut status = TerminalSessionStatus::default();
+        for (digest, second, expected) in [("first", 0, 0), ("first", 30, 0), ("second", 60, 60), ("second", 90, 60)] {
+            TerminalSessionStatusPatch::Observe {
+                attention: None,
+                occupancy: TerminalOccupancy::Vacant,
+                output_digest: Some(digest.into()),
+                observed_at: start + chrono::Duration::seconds(second),
+            }
+            .apply(&mut status);
+            assert_eq!(status.last_output_activity_at, Some(start + chrono::Duration::seconds(expected)));
+        }
     }
 
     #[test]

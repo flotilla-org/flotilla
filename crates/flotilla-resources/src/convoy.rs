@@ -936,6 +936,10 @@ pub struct NudgeObligation {
     pub quiet_since: Option<DateTime<Utc>>,
     pub last_hook_at: Option<DateTime<Utc>>,
     pub last_attention_at: Option<DateTime<Utc>>,
+    /// Beginning of a continuously observed turn; screen redraws are not tool progress.
+    /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_since: Option<DateTime<Utc>>,
     // Stored-data compatibility: defaults may be removed one fleet roll later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_after: Option<DateTime<Utc>>,

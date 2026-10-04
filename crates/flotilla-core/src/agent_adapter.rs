@@ -562,6 +562,10 @@ pub trait AgentAdapter: Send + Sync {
     fn classify_screen_attention(&self, _screen: &str) -> Option<TerminalAttentionState> {
         None
     }
+    /// Optional meaningful-output fingerprint, excluding harness animation.
+    fn screen_output_digest(&self, _screen: &str) -> Option<String> {
+        None
+    }
     fn classify_screen_failure(&self, _screen: &str) -> Option<&'static str> {
         None
     }
@@ -703,7 +707,26 @@ impl AgentAdapter for CliAgentAdapter {
             // Claude Code reports its own permission prompts through the hook
             // path, which is more precise than matching rendered text.
             AdapterFlavor::ClaudeCode { .. } => None,
-            AdapterFlavor::Codex { .. } => codex_screen_needs_input(screen).then_some(TerminalAttentionState::NeedsInput),
+            AdapterFlavor::Codex { .. } => Some(if codex_screen_needs_input(screen) {
+                TerminalAttentionState::NeedsInput
+            } else if screen.contains("esc to interrupt") {
+                TerminalAttentionState::Working
+            } else if screen.lines().any(|line| line.trim_start().starts_with('›')) {
+                TerminalAttentionState::Idle
+            } else {
+                TerminalAttentionState::Unobservable
+            }),
+        }
+    }
+
+    fn screen_output_digest(&self, screen: &str) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        match self.flavor {
+            AdapterFlavor::ClaudeCode { .. } => None,
+            AdapterFlavor::Codex { .. } => {
+                let output = screen.lines().filter(|line| !line.contains("esc to interrupt")).collect::<Vec<_>>().join("\n");
+                Some(format!("{:x}", Sha256::digest(output.as_bytes())))
+            }
         }
     }
 
@@ -2106,7 +2129,46 @@ mod tests {
         let codex = registry.get("codex").expect("codex adapter");
         let screen = "• Working (57s • esc to interrupt)\n\n› Run /review on my current changes\n\ngpt-5.6-sol high · /workspace";
 
-        assert_eq!(codex.classify_screen_attention(screen), None);
+        assert_eq!(codex.classify_screen_attention(screen), Some(TerminalAttentionState::Working));
+    }
+
+    // #2560: elapsed-time spinner redraws are not output progress, but actual
+    // screen content changes are. Cover varied turn ages with explicit generation.
+    #[hegel::test]
+    fn codex_output_digest_ignores_spinner_age(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let age = tc.draw(gs::integers::<u64>());
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+        let first = "tool output\n• Working (1s • esc to interrupt)\n› Ask Codex";
+        let redraw = format!("tool output\n• Working ({age}s • esc to interrupt)\n› Ask Codex");
+        assert_eq!(codex.screen_output_digest(first), codex.screen_output_digest(&redraw));
+        assert_ne!(codex.screen_output_digest(first), codex.screen_output_digest(&format!("new tool output\n{redraw}")));
+    }
+
+    // #2560: interrupt returns to the composer without emitting a notify hook.
+    #[test]
+    fn codex_interrupted_composer_is_a_turn_boundary() {
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+        assert_eq!(
+            codex.classify_screen_attention(
+                "■ Conversation interrupted
+
+› Ask Codex to do something
+
+gpt-6.1-sol · /workspace"
+            ),
+            Some(TerminalAttentionState::Idle)
+        );
+        assert_eq!(
+            codex.classify_screen_attention(
+                "• Working (2h • esc to interrupt)
+
+› Ask Codex to do something"
+            ),
+            Some(TerminalAttentionState::Working)
+        );
     }
 
     #[test]

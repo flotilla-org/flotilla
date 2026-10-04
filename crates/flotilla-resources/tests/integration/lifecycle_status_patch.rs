@@ -663,6 +663,8 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             exercise: || {
                 let mut status = TerminalSessionStatus {
                     last_tool_activity_at: None,
+                    last_output_digest: None,
+                    last_output_activity_at: None,
                     phase: TerminalSessionPhase::Running,
                     session_id: Some("session-a".to_string()),
                     cleat_endpoint: None,
