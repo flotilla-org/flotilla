@@ -1925,7 +1925,12 @@ impl ReconcilerWake {
                             tracing::warn!(
                                 convoy = %convoy.metadata.name,
                                 ?target,
-                                reason = "no live supervisor found",
+                                reason = if unavailable_target.is_some() { "supervisor_lookup_failed" }
+                                    else if start >= policy.len() { "supervision_policy_exhausted" }
+                                    else { "operator_rung_selected" },
+                                supervision_start = start,
+                                supervision_policy_len = policy.len(),
+                                evidence = %condition.evidence,
                                 brief = %stall_supervision_log_brief(convoy, &condition),
                                 "stall escalation fell back to operator"
                             );
@@ -2256,6 +2261,8 @@ impl ReconcilerWake {
                 }
                 for delivery in instantiate_turn_delivery(convoy, &checkouts, &observed_change_requests, &forges)? {
                     if !is_conflict_probe(&delivery.leaf) {
+                        tracing::debug!(convoy = %convoy.metadata.name, source = %delivery.source,
+                            reason = "skip_until_settlement_claim", "turn delivery subscription decision");
                         continue;
                     }
                     desired.push(LeafSubscriptionRow {
@@ -4025,6 +4032,11 @@ mod tests {
                 assert!(warning.contains("convoy=stalled-work"), "{warning}");
                 assert!(warning.contains("target="), "{warning}");
                 assert!(warning.contains("reason="), "{warning}");
+                if !matches!(unavailable, GovernorUnavailable::DeliveryError) {
+                    assert!(warning.contains("supervision_start="), "{warning}");
+                    assert!(warning.contains("supervision_policy_len="), "{warning}");
+                    assert!(warning.contains("evidence="), "{warning}");
+                }
                 // #2592: operator fallback logs contain the source address and exact actionable crew.
                 assert!(warning.contains("coder@work in convoy graphql-budget@wheelhouse (resource ref: stalled-work)"), "{warning}");
                 assert!(warning.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"), "{warning}");
@@ -4032,7 +4044,7 @@ mod tests {
                     warning.contains(if matches!(unavailable, GovernorUnavailable::DeliveryError) {
                         "supervisor reconnecting"
                     } else {
-                        "no live supervisor found"
+                        "supervisor_lookup_failed"
                     }),
                     "{warning}"
                 );
