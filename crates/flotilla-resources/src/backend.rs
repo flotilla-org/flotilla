@@ -288,7 +288,7 @@ impl<T: Resource> ReplicaReadResolver<T> {
             ResourceBackend::Sqlite(backend) => backend.list_replicas_typed::<T>(&self.namespace).await?,
             ResourceBackend::Http(_) => unreachable!("HTTP handled above"),
         };
-        replicas.retain(|item| required.iter().all(|(key, expected)| item.object.metadata.labels.get(key) == Some(expected)));
+        replicas.retain(|item| crate::labels_match(&item.object.metadata.labels, required));
         items.extend(replicas);
         if self.suppress_self_origin {
             let local_root = self.backend.local_root()?;

@@ -372,3 +372,35 @@ async fn filtered_list_encodes_exact_match_label_selector() {
         "unexpected request: {request}"
     );
 }
+
+#[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
+async fn renamed_label_selector_reads_legacy_http_metadata() {
+    // #588 / ADR 0047: HTTP must fetch legacy labels too, then apply all
+    // selector requirements locally, excluding unrelated resources.
+    let mut matching = convoy_meta("legacy");
+    matching.labels.insert("flotilla.work/vessel_ref".to_string(), "work".to_string());
+    let body = serde_json::json!({
+        "metadata": {"resourceVersion": "9"},
+        "items": [
+            {"apiVersion": "flotilla.work/v1", "kind": "Convoy", "metadata": {
+                "name": matching.name, "namespace": "flotilla", "resourceVersion": "8", "labels": matching.labels, "creationTimestamp": "2026-04-13T12:00:00Z"
+            }, "spec": convoy_spec("template")},
+            {"apiVersion": "flotilla.work/v1", "kind": "Convoy", "metadata": {
+                "name": "unrelated", "namespace": "flotilla", "resourceVersion": "7", "creationTimestamp": "2026-04-13T12:00:00Z"
+            }, "spec": convoy_spec("template")}
+        ]
+    })
+    .to_string();
+    let (base_url, request_rx) = spawn_one_shot_server(response("200 OK", &body)).await;
+    let backend = ResourceBackend::Http(HttpBackend::new(flotilla_resources::tls::client(), base_url));
+    let listed = backend
+        .using::<Convoy>("flotilla")
+        .list_matching_labels(&BTreeMap::from([(flotilla_resources::VESSEL_REF_LABEL.to_string(), "work".to_string())]))
+        .await
+        .expect("dual-read HTTP list");
+    assert_eq!(listed.items.len(), 1);
+    assert_eq!(listed.items[0].metadata.name, "legacy");
+    let request = request_rx.await.expect("request");
+    assert!(!request.contains("labelSelector"), "equality selector would hide legacy labels: {request}");
+}

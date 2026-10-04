@@ -533,7 +533,7 @@ where
 
         let mut tags = [
             obj.metadata.labels.get(CONVOY_LABEL).map(|value| TerminalSessionTag::new("convoy", value)),
-            obj.metadata.labels.get(VESSEL_REF_LABEL).map(|value| TerminalSessionTag::new("vessel", value)),
+            flotilla_resources::label_value(&obj.metadata.labels, VESSEL_REF_LABEL).map(|value| TerminalSessionTag::new("vessel", value)),
         ]
         .into_iter()
         .flatten()

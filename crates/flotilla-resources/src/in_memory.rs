@@ -596,7 +596,7 @@ impl InMemoryBackend {
             let mut items = Vec::new();
             for value in store.objects.values().cloned() {
                 let object = Self::decode_object::<T>(value)?;
-                let matches = required.iter().all(|(key, expected)| object.metadata.labels.get(key) == Some(expected));
+                let matches = crate::labels_match(&object.metadata.labels, required);
                 if matches {
                     items.push(object);
                 }

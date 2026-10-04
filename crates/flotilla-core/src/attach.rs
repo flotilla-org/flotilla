@@ -773,7 +773,7 @@ fn attach_reference_keys(session_name: &str, labels: &BTreeMap<String, String>, 
     let convoy = labels.get(CONVOY_LABEL);
     let task = labels.get(VESSEL_LABEL);
     let role = labels.get(ROLE_LABEL);
-    let vessel = labels.get(VESSEL_REF_LABEL);
+    let vessel = flotilla_resources::label_value(labels, VESSEL_REF_LABEL);
 
     if let Some(convoy) = convoy {
         refs.push(convoy.clone());

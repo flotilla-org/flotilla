@@ -133,8 +133,9 @@ pub use http::{ensure_crd, ensure_namespace, HttpBackend};
 pub use in_memory::InMemoryBackend;
 pub use issue::{issue_record_name, Issue, IssueSpec, IssueStatus, IssueStatusPatch, ObservedIssueState};
 pub use labels::{
-    LifecycleAuthority, AUTHORITY_LABEL, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREW_ORDINAL_LABEL, GENERATION_LABEL, MANAGED_BY_LABEL,
-    PROJECT_LABEL, REPO_KEY_LABEL, REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    label_value, labels_match, LifecycleAuthority, AUTHORITY_LABEL, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREW_ORDINAL_LABEL,
+    GENERATION_LABEL, MANAGED_BY_LABEL, PROJECT_LABEL, REPO_KEY_LABEL, REPO_LABEL, RESERVED_PREFIX, ROLE_LABEL, VESSEL_LABEL,
+    VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 pub use landing_gate::{evaluate_landing_gate, settlement_human_gate, LandingGateDecision, LANDING_APPROVE_OPTION, LANDING_REFUSE_OPTION};
 pub use leaf::{

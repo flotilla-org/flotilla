@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use flotilla_resources::{
     decode_stored_resource_document, CrewMessageDelivery, CrewMessageSender, PendingBrief, TerminalCrewMessage, TurnDeliveryEpisode,
@@ -105,4 +109,17 @@ fn prior_generation_crew_delivery_records_decode_without_sender() {
     }))
     .expect("old turn episode");
     assert_eq!(episode.sender, CrewMessageSender::Unknown);
+}
+
+#[test]
+fn prior_generation_label_spellings_remain_selectable() {
+    // #588: the stored metadata fixture remains selectable via canonical keys.
+    // The deployed corpus contains only specs/statuses, without metadata labels.
+    let content = include_str!("../fixtures/terminal_session_pending_finalization.json");
+    let document: Value = serde_json::from_str(content).expect("stored session");
+    let labels: BTreeMap<String, String> = serde_json::from_value(document["metadata"]["labels"].clone()).expect("labels");
+    for key in [flotilla_resources::VESSEL_REF_LABEL, flotilla_resources::VESSEL_ORDINAL_LABEL, flotilla_resources::CREW_ORDINAL_LABEL] {
+        let value = labels.get(&key.replace('-', "_")).expect("fixture must exercise each previous-generation key");
+        assert!(flotilla_resources::labels_match(&labels, &BTreeMap::from([(key.to_string(), value.clone())])));
+    }
 }
