@@ -532,7 +532,7 @@ impl Default for AdmissionConfig {
     }
 }
 
-/// Host-local credential health settings.
+/// Host-local credential settings: health warning windows and explicit daemon identities.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CredentialHealthConfig {
     /// Explicit host-daemon identities, keyed by Forge ID. Grant-delivered
