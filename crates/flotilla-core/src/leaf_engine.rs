@@ -2534,7 +2534,6 @@ fn evaluate_row(
 
 #[cfg(test)]
 mod tests {
-
     use std::{
         collections::BTreeMap,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
