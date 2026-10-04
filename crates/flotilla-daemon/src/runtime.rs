@@ -13,11 +13,12 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
-    checkout_path_component, BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime,
-    CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, ForgeDefaultBranchResolver,
-    HopChainContext, PreparedCheckout, PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime,
-    RepositoryReconciler, TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness,
-    TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
+    checkout_path_component, convoy_ensure::EnsureReconciler, BranchPreservationReason, CheckoutReconciler, CheckoutRemoval,
+    CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, DockerProvisioning,
+    EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PreparedCheckout, PresentationPolicyRegistry,
+    PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalDeliveryFailure, TerminalDeliveryOutcome,
+    TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler,
+    VesselPlacementProjector, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentAdapter, AgentLaunchRequest, CapabilityTable},
@@ -779,6 +780,11 @@ impl DaemonRuntime {
         }
 
         let mut controller_state = None;
+        daemon
+            .install_convoy_ensure_reconciler(Arc::new(
+                EnsureReconciler::builder().resource_backend(daemon.resource_backend()).clock(Arc::new(SystemClock)).build(),
+            ))
+            .await;
         if options.start_controllers {
             let local_repo_root =
                 phase("tracked_repo_paths", daemon.tracked_repo_paths()).await.into_iter().next().map(ExecutionEnvironmentPath::new);
@@ -11181,6 +11187,9 @@ mod tests {
         })
         .await
         .expect("publish initial heartbeat");
+        // #2220: runtime installs the ensure controller even when background
+        // loops are disabled, so explicit daemon entry points still delegate.
+        assert!(daemon.reconcile_convoy_ensures_once(NAMESPACE).await.expect("installed ensure controller").is_empty());
         let backend = daemon.resource_backend();
         backend
             .definitions::<CredentialSpec>(NAMESPACE)

@@ -1,5 +1,6 @@
 pub mod checkout;
 pub mod clone;
+pub mod convoy_ensure;
 pub mod environment;
 pub mod presentation;
 pub mod repository;

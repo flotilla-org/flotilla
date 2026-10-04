@@ -16,6 +16,7 @@ pub mod command_target;
 pub mod config;
 pub mod convert;
 pub mod convoy_branch_refresh;
+pub mod convoy_ensure;
 pub mod daemon;
 pub mod data;
 pub mod demand_lifecycle;
@@ -26,7 +27,7 @@ pub(crate) mod fleet;
 pub mod hop_chain;
 pub mod host_identity;
 pub(crate) mod host_registry;
-pub(crate) mod host_resolution;
+pub mod host_resolution;
 pub mod host_summary;
 pub mod in_process;
 pub mod issue_observer;
@@ -63,3 +64,6 @@ pub const DAEMON_LIFECYCLE_LOCK_FILE: &str = "flotillad-lifecycle.lock";
 // Re-export shared infrastructure and host types for convenience.
 pub use flotilla_protocol::HostName;
 pub use flotilla_resources::tls;
+
+#[cfg(test)]
+extern crate self as flotilla_core;

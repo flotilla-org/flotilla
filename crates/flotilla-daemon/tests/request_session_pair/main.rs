@@ -8,7 +8,9 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flotilla_controllers::reconcilers::{CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout};
+use flotilla_controllers::reconcilers::{
+    convoy_ensure::EnsureReconciler, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
+};
 use flotilla_core::{
     command_target::TargetHost,
     config::ConfigStore,
@@ -50,10 +52,11 @@ use flotilla_resources::{
     DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, FreshCloneCheckoutSpec, FulfilmentKind, FulfilmentKindSpec, Host,
     HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, InMemoryBackend, InputMeta, LifecycleAuthority,
     OwnerGarbageCollector, PlacementPolicy, PlacementPolicySpec, Regard, RepositoryKey, Resource, ResourceBackend, ResourceError,
-    ResourceProvenance, Selector, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority, WorkPhase as ResourceWorkPhase, WorkState,
-    WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION, AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL,
-    GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, REGISTERED_RESOURCE_KINDS, ROLE_LABEL, VESSEL_LABEL,
+    ResourceProvenance, Selector, SystemClock, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource,
+    TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkCompletionAuthority,
+    WorkPhase as ResourceWorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, WorkflowTemplateSpec, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    AGENT_ADAPTERS_CAPABILITY, CONVOY_LABEL, GENERATION_LABEL, HELD_CREDENTIALS_CAPABILITY, PROJECT_LABEL, REGISTERED_RESOURCE_KINDS,
+    ROLE_LABEL, VESSEL_LABEL,
 };
 use hegel::generators as gs;
 
@@ -243,7 +246,13 @@ async fn empty_daemon_named(host_name: &str) -> Arc<InProcessDaemon> {
 async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Option<u64>) -> Arc<InProcessDaemon> {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = test_config_store_with_floor(tmp.keep(), free_space_floor_gib);
-    InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::new(host_name)).await
+    let daemon = InProcessDaemon::new(vec![], config, fake_discovery(false), HostName::new(host_name)).await;
+    daemon
+        .install_convoy_ensure_reconciler(Arc::new(
+            EnsureReconciler::builder().resource_backend(daemon.resource_backend()).clock(Arc::new(SystemClock)).build(),
+        ))
+        .await;
+    daemon
 }
 
 async fn seed_host_capacity(daemon: &Arc<InProcessDaemon>, free_bytes: u64, floor_bytes: u64) {

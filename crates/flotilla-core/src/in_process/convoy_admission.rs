@@ -1981,7 +1981,7 @@ pub(super) struct ConvoyStartTask {
 }
 
 #[derive(bon::Builder)]
-pub(super) struct PreparedConvoyAdmission {
+pub struct PreparedConvoyAdmission {
     pub(super) name: String,
     pub(super) spec: ConvoySpec,
     pub(super) workflow: WorkflowTemplateSpec,
