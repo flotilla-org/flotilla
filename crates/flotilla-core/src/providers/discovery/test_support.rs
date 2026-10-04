@@ -407,11 +407,11 @@ fn minimal_discovery_runtime(runner: std::sync::Arc<dyn CommandRunner>) -> super
         // Runtime tests use real Git but must never make model API calls.
         env: std::sync::Arc::new(TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")])),
         available_space_probe: fixed_available_space_probe(),
-        host_detectors: vec![Box::new(super::detectors::generic::CommandDetector::new(
+        host_detectors: std::sync::Arc::new(vec![Box::new(super::detectors::generic::CommandDetector::new(
             "git",
             &["--version"],
             super::detectors::generic::parse_first_dotted_version,
-        ))],
+        ))]),
         repo_detectors: super::detectors::default_repo_detectors(),
         factories: super::FactoryRegistry::default_all(),
         attachable_store: OnceLock::new(),
@@ -1386,7 +1386,7 @@ pub fn fake_discovery_with_provider_set(providers: FakeDiscoveryProviders) -> Di
         runner,
         env: Arc::new(TestEnvVars::default()),
         available_space_probe: fixed_available_space_probe(),
-        host_detectors: vec![],
+        host_detectors: std::sync::Arc::new(vec![]),
         repo_detectors: vec![],
         factories: FactoryRegistry {
             vcs,
