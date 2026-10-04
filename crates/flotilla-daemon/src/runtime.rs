@@ -78,7 +78,9 @@ use crate::{
     codex_central::{codex_central_auth_path, CodexCentralRefresher},
     credential::{CredentialRefreshError, CredentialStore, GithubAppScope},
     dispatch_reconciler::{DaemonDispatchIssueSource, DispatchIssueSource, DispatchReconciler},
-    environment_tools::{stage_local_rustc_wrapper_async, EnvironmentToolContext, EnvironmentToolProvisioner, RUSTC_LINKER_WRAPPER},
+    environment_tools::{
+        stage_local_rustc_wrapper_async, EnvironmentToolContext, EnvironmentToolProvisioner, DOCKER_PROVIDER_KIND, RUSTC_LINKER_WRAPPER,
+    },
     issue_materializer::IssuePollingHealth,
     resource_limits::file_descriptor_pressure_condition,
     resource_manifest::{manifest_root_name, materialize_manifest_root, ResourceManifestReconciler},
@@ -4351,12 +4353,6 @@ fn spawn_aggregator_task(
     })
 }
 
-#[cfg(test)]
-use crate::environment_tools::{
-    stage_local_cargo_shim, stage_local_rustc_wrapper, CARGO_BUILD_PROFILE_SHIM, CONTAINED_CARGO_SHIM_DIRECTORY, CONTAINED_CARGO_SHIM_PATH,
-    CONTAINED_RUSTC_WRAPPER_PATH,
-};
-
 struct DockerControllerRuntime {
     state: Arc<ControllerRuntimeState>,
 }
@@ -4377,7 +4373,7 @@ impl EnvironmentToolContext for DockerToolContext<'_> {
 impl DockerEnvironmentRuntime for DockerControllerRuntime {
     async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
         let context = DockerToolContext { state: &self.state, host_ref: &spec.host_ref, jobs: OnceCell::new() };
-        let tools = self.state.environment_tools.prepare("docker", name, &context).await?;
+        let tools = self.state.environment_tools.prepare(DOCKER_PROVIDER_KIND, name, &context).await?;
         for tool in &tools {
             for asset in &tool.assets {
                 let reserved_path = match asset.kind {
@@ -6054,7 +6050,7 @@ dependency = { path = "../dependency" }
             "[build]\nrustflags = [\"--cfg\", \"profile_repo_config\"]\nrustc-wrapper = \"unavailable-profile-wrapper\"\nrustc-workspace-wrapper = \"unavailable-workspace-profile-wrapper\"\n",
         )
         .expect("repo config");
-        let staged = super::stage_local_cargo_shim(temp.path()).expect("stage shim");
+        let staged = stage_cargo_shim(temp.path()).expect("stage shim");
         let shim_dir = temp.path().join("shim with spaces");
         fs::create_dir_all(&shim_dir).expect("shim directory");
         fs::copy(staged, shim_dir.join("cargo")).expect("install shim");
@@ -6070,8 +6066,7 @@ dependency = { path = "../dependency" }
         // Layering two copies would make each resolve the other as the next Cargo.
         let stale_shim = temp.path().join("stale-shim");
         fs::create_dir_all(&stale_shim).expect("stale shim directory");
-        fs::write(stale_shim.join("cargo"), format!("{}\n# previous staged revision\n", super::CARGO_BUILD_PROFILE_SHIM))
-            .expect("stale shim");
+        fs::write(stale_shim.join("cargo"), format!("{}\n# previous staged revision\n", CARGO_BUILD_PROFILE_SHIM)).expect("stale shim");
         fs::set_permissions(stale_shim.join("cargo"), fs::Permissions::from_mode(0o755)).expect("executable stale shim");
         let parent_path =
             std::env::join_paths(std::iter::once(stale_shim).chain(std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))))
@@ -6163,7 +6158,7 @@ dependency = { path = "../dependency" }
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let staged = super::stage_local_cargo_shim(temp.path()).expect("stage shim");
+        let staged = stage_cargo_shim(temp.path()).expect("stage shim");
         let directory = staged.parent().expect("shim directory");
         let cargo = directory.join("cargo");
         fs::copy(&staged, &cargo).expect("install fixture shim");
@@ -6206,7 +6201,7 @@ dependency = { path = "../dependency" }
         )
         .expect("manifest");
         fs::write(repo.join(".cargo/config.toml"), "[build]\nrustflags = [\"--cfg\", \"repo_config_flag\"]\n").expect("repo cargo config");
-        let wrapper = super::stage_local_rustc_wrapper(temp.path()).expect("stage wrapper");
+        let wrapper = stage_local_rustc_wrapper(temp.path()).expect("stage wrapper");
         let compiler_probe = temp.path().join("compiler-probe");
         let compiler_log = temp.path().join("compiler-args");
         fs::write(&compiler_probe, "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$FLOTILLA_RUSTC_ARG_LOG\"\nexec rustc \"$@\"\n")
@@ -6247,7 +6242,7 @@ dependency = { path = "../dependency" }
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let wrapper = super::stage_local_rustc_wrapper(temp.path()).expect("stage wrapper");
+        let wrapper = stage_local_rustc_wrapper(temp.path()).expect("stage wrapper");
         let compiler = temp.path().join("fake-rustc");
         fs::write(&compiler, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").expect("fake rustc");
         fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).expect("executable fake rustc");
@@ -6338,6 +6333,9 @@ dependency = { path = "../dependency" }
         agent_material::{CONTAINER_CODEX_HOME, FLOTILLA_SKILLS_DIR_ENV},
         blob_store::{BlobStore, MemoryBlobStore},
         environment_tools::{
+            stage_local_rustc_wrapper,
+            tests::{stage_cargo_shim, with_fourth_tool},
+            CARGO_BUILD_PROFILE_SHIM, CONTAINED_CARGO_SHIM_DIRECTORY, CONTAINED_CARGO_SHIM_PATH, CONTAINED_RUSTC_WRAPPER_PATH,
             ENVIRONMENT_CLEAT_GHOSTTY_LIBRARY_PATH, ENVIRONMENT_CLEAT_LIBRARY_DIR, ENVIRONMENT_CLEAT_PATH, ENVIRONMENT_CLEAT_RUNTIME_DIR,
             ENVIRONMENT_DAEMON_SOCKET_PATH, ENVIRONMENT_FLOTILLA_PATH,
         },
@@ -6500,13 +6498,13 @@ dependency = { path = "../dependency" }
         assert_eq!(pinned.fixed_repositories, repositories);
     }
 
-    fn fixed_environment_tools(state_root: impl Into<PathBuf>) -> EnvironmentToolProvisioner {
+    fn fixed_environment_tools(state_dir: impl Into<PathBuf>) -> EnvironmentToolProvisioner {
         EnvironmentToolProvisioner::fixed(
             DaemonHostPath::new("/opt/flotilla/bin/flotilla"),
             DaemonHostPath::new("/tmp/flotilla.sock"),
             DaemonHostPath::new("/opt/flotilla/bin/cleat"),
             DaemonHostPath::new("/opt/flotilla/lib/libghostty-vt.so.0"),
-            state_root.into(),
+            state_dir.into(),
         )
     }
 
@@ -8570,9 +8568,7 @@ dependency = { path = "../dependency" }
                 None,
                 "host-direct-host-test".to_string(),
             )
-            .with_environment_tools(
-                fixed_environment_tools(config.state_dir().join("contained-cleat").as_path().to_path_buf()).with_fourth_tool(),
-            ),
+            .with_environment_tools(with_fourth_tool(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
             host_ref: "host-test".to_string(),
@@ -8807,7 +8803,7 @@ dependency = { path = "../dependency" }
                 None,
                 "host-direct-host-test".to_string(),
             )
-            .with_environment_tools(fixed_environment_tools(config.state_dir().join("contained-cleat").as_path().to_path_buf()))
+            .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))
             .with_credential_store(credential_store)
             .with_agent_material(agent_material),
         );
@@ -8892,7 +8888,7 @@ dependency = { path = "../dependency" }
                 None,
                 "host-direct-host-test".to_string(),
             )
-            .with_environment_tools(fixed_environment_tools(config.state_dir().join("contained-cleat").as_path().to_path_buf()))
+            .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))
             .with_credential_store(credential_store)
             .with_agent_material(agent_material),
         );
@@ -9087,7 +9083,7 @@ dependency = { path = "../dependency" }
                 None,
                 "host-direct-host-test".to_string(),
             )
-            .with_environment_tools(fixed_environment_tools(config.state_dir().join("contained-cleat").as_path().to_path_buf()))
+            .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))
             .with_credential_store(credential_store)
             .with_agent_material(agent_material),
         );
@@ -9171,7 +9167,7 @@ dependency = { path = "../dependency" }
                 None,
                 "host-direct-host-test".to_string(),
             )
-            .with_environment_tools(fixed_environment_tools(config.state_dir().join("contained-cleat").as_path().to_path_buf()))
+            .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))
             .with_credential_store(credential_store)
             .with_agent_material(agent_material),
         );
@@ -9527,7 +9523,7 @@ dependency = { path = "../dependency" }
                 None,
                 "host-direct-host-test".to_string(),
             )
-            .with_environment_tools(fixed_environment_tools(config.state_dir().join("contained-cleat").as_path().to_path_buf())),
+            .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf())),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
             host_ref: "host-test".to_string(),
@@ -10822,7 +10818,7 @@ dependency = { path = "../dependency" }
                 None,
                 feta_profile.host_direct_environment_name(),
             )
-            .with_environment_tools(fixed_environment_tools(temp.path().join("contained-cleat"))),
+            .with_environment_tools(fixed_environment_tools(temp.path())),
         );
         let mut controller_handles = spawn_controller_loops(
             kiwi_state,
@@ -11972,7 +11968,7 @@ dependency = { path = "../dependency" }
                 None,
                 "host-direct-host-test".to_string(),
             )
-            .with_environment_tools(fixed_environment_tools(config.state_dir().join("contained-cleat").as_path().to_path_buf())),
+            .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf())),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
             host_ref: "host-test".to_string(),

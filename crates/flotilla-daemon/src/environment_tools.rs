@@ -20,6 +20,8 @@ use flotilla_core::{
 };
 use tokio::sync::OnceCell;
 
+pub(crate) const DOCKER_PROVIDER_KIND: &str = "docker";
+
 pub(crate) const ENVIRONMENT_FLOTILLA_DIRECTORY: &str = "/opt/flotilla/bin";
 pub(crate) const ENVIRONMENT_FLOTILLA_PATH: &str = "/usr/local/bin/flotilla";
 const FLOTILLA_LAUNCHER_NAME: &str = "contained-flotilla-launcher";
@@ -83,6 +85,8 @@ impl EnvironmentToolProvisioner {
         Self { factories }
     }
 
+    /// Delivery order also determines error precedence: stop at the first
+    /// applicable factory failure, without preparing any later tools.
     pub(crate) async fn prepare(
         &self,
         provider_kind: &str,
@@ -93,6 +97,8 @@ impl EnvironmentToolProvisioner {
         for factory in &self.factories {
             if factory.provider_kinds().contains(&provider_kind) {
                 tools.push(factory.prepare(environment_name, context).await?);
+            } else {
+                tracing::debug!(provider_kind, supported_kinds = ?factory.provider_kinds(), "skip inapplicable environment tool factory");
             }
         }
         Ok(tools)
@@ -104,17 +110,17 @@ impl EnvironmentToolProvisioner {
         daemon_socket_path: DaemonHostPath,
         cleat_binary_path: DaemonHostPath,
         cleat_ghostty_library_path: DaemonHostPath,
-        state_root: PathBuf,
+        state_dir: PathBuf,
     ) -> Self {
         Self::new(vec![
             Arc::new(FlotillaCliTool { binary_path: Ok(flotilla_binary_path), daemon_socket_path: Ok(daemon_socket_path) }),
             Arc::new(CleatTool {
                 binary_path: Ok(cleat_binary_path),
                 ghostty_library_path: OnceCell::new_with(Some(cleat_ghostty_library_path)),
-                state_root: state_root.clone(),
+                state_root: state_dir.join("contained-cleat"),
                 runner: None,
             }),
-            Arc::new(RustBuildLimitsTool { state_dir: state_root }),
+            Arc::new(RustBuildLimitsTool { state_dir }),
         ])
     }
 
@@ -139,7 +145,7 @@ struct FlotillaCliTool {
 #[async_trait]
 impl EnvironmentToolFactory for FlotillaCliTool {
     fn provider_kinds(&self) -> &[&str] {
-        &["docker"]
+        &[DOCKER_PROVIDER_KIND]
     }
     async fn prepare(&self, _environment_name: &str, _context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
         let binary_path =
@@ -243,7 +249,7 @@ struct CleatTool {
 #[async_trait]
 impl EnvironmentToolFactory for CleatTool {
     fn provider_kinds(&self) -> &[&str] {
-        &["docker"]
+        &[DOCKER_PROVIDER_KIND]
     }
     async fn prepare(&self, environment_name: &str, _context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
         let binary_path = self.binary_path.as_ref().map_err(|error| format!("cleat unavailable for environment provisioning: {error}"))?;
@@ -294,7 +300,7 @@ struct FailingTool {
 #[async_trait]
 impl EnvironmentToolFactory for FailingTool {
     fn provider_kinds(&self) -> &[&str] {
-        &["docker"]
+        &[DOCKER_PROVIDER_KIND]
     }
     async fn prepare(&self, _environment_name: &str, _context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
         Err(format!("{} unavailable for environment provisioning: {}", self.name, self.error))
@@ -527,7 +533,7 @@ case "${1:-}" in
 esac
 "#;
 
-pub(crate) fn stage_local_cargo_shim(state_dir: &Path) -> Result<PathBuf, String> {
+fn stage_local_cargo_shim(state_dir: &Path) -> Result<PathBuf, String> {
     stage_local_build_tool(state_dir, "cargo-profile-shim", CARGO_BUILD_PROFILE_SHIM)
 }
 
@@ -596,7 +602,7 @@ impl RustBuildLimitsTool {
 #[async_trait]
 impl EnvironmentToolFactory for RustBuildLimitsTool {
     fn provider_kinds(&self) -> &[&str] {
-        &["docker"]
+        &[DOCKER_PROVIDER_KIND]
     }
     async fn prepare(&self, _environment_name: &str, context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
         let jobs = context.rust_build_jobs().await?;
@@ -638,8 +644,15 @@ impl EnvironmentToolFactory for RustBuildLimitsTool {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt};
+pub(crate) mod tests {
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            LazyLock,
+        },
+    };
 
     use flotilla_core::providers::discovery::test_support::DiscoveryMockRunner;
     use tempfile::TempDir;
@@ -819,58 +832,62 @@ mod tests {
 
         assert_eq!(resolved.as_path(), library.canonicalize().expect("canonical bundled library"));
     }
-}
 
-#[cfg(test)]
-struct TestToolContext;
-#[cfg(test)]
-#[async_trait]
-impl EnvironmentToolContext for TestToolContext {
-    async fn rust_build_jobs(&self) -> Result<usize, String> {
-        Ok(2)
+    struct TestToolContext;
+    #[async_trait]
+    impl EnvironmentToolContext for TestToolContext {
+        async fn rust_build_jobs(&self) -> Result<usize, String> {
+            Ok(2)
+        }
     }
-}
 
-#[cfg(test)]
-struct FourthTool;
-#[cfg(test)]
-#[async_trait]
-impl EnvironmentToolFactory for FourthTool {
-    fn provider_kinds(&self) -> &[&str] {
-        &["docker"]
+    #[derive(Default)]
+    struct FourthTool {
+        preparations: Arc<AtomicUsize>,
     }
-    async fn prepare(&self, _name: &str, _context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
-        Ok(EnvironmentTool::new("fourth", "/usr/local/bin/fourth"))
+    #[async_trait]
+    impl EnvironmentToolFactory for FourthTool {
+        fn provider_kinds(&self) -> &[&str] {
+            &[DOCKER_PROVIDER_KIND]
+        }
+        async fn prepare(&self, _name: &str, _context: &dyn EnvironmentToolContext) -> Result<EnvironmentTool, String> {
+            self.preparations.fetch_add(1, Ordering::Relaxed);
+            Ok(EnvironmentTool::new("fourth", "/usr/local/bin/fourth"))
+        }
     }
-}
-#[cfg(test)]
-impl EnvironmentToolProvisioner {
-    pub(crate) fn with_fourth_tool(mut self) -> Self {
-        self.factories.push(Arc::new(FourthTool));
-        self
+    pub(crate) fn with_fourth_tool(mut provisioner: EnvironmentToolProvisioner) -> EnvironmentToolProvisioner {
+        provisioner.factories.push(Arc::new(FourthTool::default()));
+        provisioner
     }
-}
 
-#[cfg(test)]
-mod enrollment_tests {
-    use super::*;
+    // The shim is production-private; existing runtime script tests share staging
+    // through this test-only adapter.
+    pub(crate) fn stage_cargo_shim(state_dir: &Path) -> Result<PathBuf, String> {
+        stage_local_cargo_shim(state_dir)
+    }
+
     // Behaviour: only applicable factories prepare, including failures. Empty
-    // registries and duplicate enrollments preserve ordered delivery.
+    // registries and duplicate enrollments preserve ordered delivery. Preparation stops at the first applicable failure.
     #[hegel::test]
     fn filters_registered_tools(tc: hegel::TestCase) {
         use hegel::generators as gs;
-        // Cover empty through duplicate registration, supported and unsupported kinds.
+        // Cover empty through duplicate registration, supported and unsupported kinds,
+        // and failure at every position (before, between, or after successful factories).
         let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
         let docker = tc.draw(gs::booleans());
         let fail = tc.draw(gs::booleans());
-        let mut factories: Vec<Arc<dyn EnvironmentToolFactory>> =
-            (0..count).map(|_| Arc::new(FourthTool) as Arc<dyn EnvironmentToolFactory>).collect();
+        let fail_at = tc.draw(gs::integers::<usize>().min_value(0).max_value(count));
+        let preparations = Arc::new(AtomicUsize::new(0));
+        let mut factories: Vec<Arc<dyn EnvironmentToolFactory>> = (0..count)
+            .map(|_| Arc::new(FourthTool { preparations: Arc::clone(&preparations) }) as Arc<dyn EnvironmentToolFactory>)
+            .collect();
         if fail {
-            factories.push(Arc::new(FailingTool { name: "test", error: "unavailable".into() }));
+            factories.insert(fail_at, Arc::new(FailingTool { name: "test", error: "unavailable".into() }));
         }
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
-        let result = runtime.block_on(EnvironmentToolProvisioner::new(factories).prepare(
-            if docker { "docker" } else { "other" },
+        static RUNTIME: LazyLock<tokio::runtime::Runtime> =
+            LazyLock::new(|| tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime"));
+        let result = RUNTIME.block_on(EnvironmentToolProvisioner::new(factories).prepare(
+            if docker { DOCKER_PROVIDER_KIND } else { "other" },
             "work",
             &TestToolContext,
         ));
@@ -882,5 +899,15 @@ mod enrollment_tests {
                 if docker { count } else { 0 }
             ]);
         }
+        assert_eq!(
+            preparations.load(Ordering::Relaxed),
+            if !docker {
+                0
+            } else if fail {
+                fail_at
+            } else {
+                count
+            }
+        );
     }
 }
