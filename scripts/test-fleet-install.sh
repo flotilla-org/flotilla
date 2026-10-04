@@ -1115,9 +1115,9 @@ for keep in 0 1 3 9; do
   test "$(find "$prune_root" -print | sort)" = "$before" || fail 'pruning was not idempotent'
   chmod -R u+w "$prune_root"
 done
-# Linux process-boundary check: inspect a real executable inode after current
-# has flipped elsewhere, rather than relying only on injected resolved paths.
-if [[ "$(uname -s)" == Linux ]]; then
+# Native process-boundary check: inspect the actual executable after current
+# has flipped elsewhere, covering /proc on Linux and proc_pidpath on macOS.
+if [[ "$(uname -s)" == Linux || "$(uname -s)" == Darwin ]]; then
   python3 - "$installer" "$test_root" <<'PYPROCESS'
 import os
 from pathlib import Path
@@ -1135,13 +1135,14 @@ shutil.copyfile("/bin/sleep", release / "bin" / "flotillad")
 (root / "current").symlink_to("releases/new")
 process = subprocess.Popen([str(release / "bin" / "flotillad"), "60"])
 try:
-    # Double only PID enumeration, preserving the real /proc executable lookup.
+    # Double only PID enumeration, preserving the native executable lookup.
     boundary = root / "process-bin"
     boundary.mkdir()
     (boundary / "pgrep").write_text(f"#!/bin/sh\necho {process.pid}\n")
     (boundary / "pgrep").chmod(0o755)
     environment = dict(os.environ, FLEET_INSTALL_ROOT=str(root),
-                       FLEET_INSTALL_UNAME_S="Linux", FLEET_INSTALL_UNAME_M="x86_64",
+                       FLEET_INSTALL_UNAME_S=os.uname().sysname,
+                       FLEET_INSTALL_UNAME_M="arm64" if os.uname().sysname == "Darwin" else "x86_64",
                        FLEET_INSTALL_KEEP_OTHERS="0", PATH=str(boundary) + ":" + os.environ["PATH"])
     environment.pop("FLEET_INSTALL_TEST_PROCESS_PATHS", None)
     subprocess.run([installer, "--prune"], env=environment, check=True)
@@ -1165,5 +1166,19 @@ test "$(find "$prune_root" -print | sort)" = "$before" || fail 'unsafe prune cha
 rm -rf "$prune_root"
 printf '[]\n' >"$process_paths"
 run_pruner 0 --prune-dry-run >/dev/null
+
+# Dotted IDs own their sidecars independently of a pruned prefix generation.
+# Current and running nested generations retain both ordinary and symlink backups.
+mkdir -p "$prune_root/releases/a" "$prune_root/releases/a.b" "$prune_root/releases/a.b.c/bin"
+ln -s releases/a.b "$prune_root/current"
+printf '["%s/releases/a.b.c/bin/flotillad"]\n' "$prune_root" >"$process_paths"
+printf 'prune me\n' >"$prune_root/releases/a.validator.bak"
+printf 'keep me\n' >"$prune_root/releases/a.b.validator.bak"
+ln -s a.b.validator.bak "$prune_root/releases/a.b.c.validator.bak"
+run_pruner 0 --prune >/dev/null
+test ! -e "$prune_root/releases/a" || fail 'kept pruned prefix generation'
+test ! -e "$prune_root/releases/a.validator.bak" || fail 'kept prefix generation backup'
+test "$(cat "$prune_root/releases/a.b.validator.bak")" = 'keep me' || fail 'deleted retained dotted generation backup'
+test -L "$prune_root/releases/a.b.c.validator.bak" || fail 'deleted running dotted generation symlink backup'
 
 echo 'fleet-install contract passed'

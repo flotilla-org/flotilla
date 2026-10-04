@@ -68,10 +68,14 @@ healthy install; activation with health confirmation disabled does not prune.
 
 Operators can preview with `fleet-install --prune-dry-run` or apply with
 `fleet-install --prune`. These modes need no package credentials or network.
-Mutating pruning shares the install/rollback lock. Removed releases include
-their bundled validator and generation-prefixed file/symlink sidecars under
+Mutating pruning shares the install/rollback lock. Dry runs do not take that
+lock or change the fleet tree, so a concurrent install can make the preview
+stale; `--prune` always recomputes its selection under the lock. Removed releases
+include their bundled validator and generation-prefixed file/symlink sidecars under
 `releases/` (for example `<generation>.validator.bak`); shared host validators
-and retained-generation backups remain untouched. Keep the host's validator
+and retained-generation backups remain untouched. For dotted generation IDs,
+sidecars belong to the longest matching generation name, so pruning `A` cannot
+remove a retained `A.b` generation's backup. Keep the host's validator
 compatible with the retained rollback set; pruning does not synchronize it.
 Live pruning on fleet hosts is an operator check after deployment.
 

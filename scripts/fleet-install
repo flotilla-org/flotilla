@@ -1206,6 +1206,9 @@ try:
     generations = sorted((p for p in releases.iterdir() if p.is_dir() and not p.is_symlink()
                           and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", p.name)),
                          key=lambda p: p.name, reverse=True)
+    # Longest-prefix ownership disambiguates dotted generation IDs: pruning
+    # A must not delete A.b.validator.bak when generation A.b is retained.
+    generation_names = sorted((p.name for p in generations), key=len, reverse=True)
     others = [p for p in generations if p not in protected_paths(False)]
     retained = set(others[:keep]) | protected
     for release in others[keep:]:
@@ -1221,7 +1224,8 @@ try:
             # Host-staged validator copies/backups are generation-scoped
             # siblings. Do not touch the host's shared validator or kept ones.
             for sibling in releases.iterdir():
-                if sibling.name.startswith(release.name + ".") and (sibling.is_symlink() or not sibling.is_dir()):
+                owner = next((name for name in generation_names if sibling.name.startswith(name + ".")), None)
+                if owner == release.name and (sibling.is_symlink() or not sibling.is_dir()):
                     sibling.unlink()
 except (OSError, ValueError, RuntimeError) as error:
     raise SystemExit(f"fleet-install: pruning failed: {error}")
