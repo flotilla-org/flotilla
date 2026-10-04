@@ -2143,7 +2143,8 @@ impl InProcessDaemon {
                         .map_err(|error| error.to_string())?;
                         let mut providers = ProviderData::default();
                         if let Some(vcs) = registry.vcs.preferred() {
-                            for (checkout_path, checkout) in vcs.list_checkouts().await? {
+                            for checkout in vcs.enumerate_checkouts().await? {
+                                let (checkout_path, checkout) = checkout.into_provider_checkout();
                                 providers
                                     .checkouts
                                     .insert(QualifiedPath::host(local_host_id.clone(), checkout_path.into_path_buf()), checkout);
