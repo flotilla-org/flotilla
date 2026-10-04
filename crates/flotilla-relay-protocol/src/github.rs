@@ -90,9 +90,31 @@ pub fn hints(event: &str, delivery_id: &str, payload: &[u8]) -> Result<Vec<Hint>
 mod tests {
     use super::*;
 
+    macro_rules! fixtures {
+        ($($name:literal),+ $(,)?) => {
+            &[$(($name, include_bytes!(concat!("../../flotilla-relay/fixtures/", $name, ".json")) as &[u8]),)+]
+        };
+    }
+
+    // Test binaries may be reused after their build checkout is removed.
+    // Names also supply filenames, and embedded bytes are Cargo-tracked inputs.
+    const FIXTURES: &[(&str, &[u8])] = fixtures!(
+        "pull_request",
+        "pull_request_review",
+        "pull_request_review_comment",
+        "pull_request_review_thread",
+        "check_run",
+        "check_suite",
+        "issues",
+        "issue_comment",
+    );
+
     fn fixture(name: &str) -> Vec<u8> {
-        let path = format!("{}/../flotilla-relay/fixtures/{name}.json", env!("CARGO_MANIFEST_DIR"));
-        std::fs::read(&path).unwrap_or_else(|error| panic!("read {path}: {error}"))
+        FIXTURES
+            .iter()
+            .find_map(|(key, bytes)| (*key == name).then_some(*bytes))
+            .unwrap_or_else(|| panic!("unknown fixture {name}"))
+            .to_vec()
     }
 
     fn only_subject(event: &str, payload: &[u8]) -> String {

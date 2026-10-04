@@ -304,7 +304,8 @@ mod tests {
     }
 
     fn fixture() -> Vec<u8> {
-        std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/pull_request.json")).expect("fixture")
+        // Cached test binaries must survive removal of their build checkout.
+        include_bytes!("../fixtures/pull_request.json").to_vec()
     }
 
     fn headers(signature: &str) -> IngressHeaders<'_> {
@@ -491,7 +492,7 @@ mod tests {
         store.create_install("lab", 0, "token", &digest("token")).expect("create");
         let secret = "a-secret-long-enough-for-github-webhooks";
         store.add_secret("github", "s", secret, 0).expect("secret");
-        let payload = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/check_run.json")).expect("fixture");
+        let payload = include_bytes!("../fixtures/check_run.json").to_vec();
         let signature = github::signature(secret, &payload);
         let deliver = |id: &str| {
             ingress(

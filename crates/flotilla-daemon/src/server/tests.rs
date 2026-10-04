@@ -3481,6 +3481,7 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     init_git_repo_with_remote(&repo, "git@github.com:owner/repo.git");
+    let physical_repo = std::fs::canonicalize(&repo).expect("physical fixture checkout");
     let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
     daemon.add_repo(&repo).await.expect("adopt repo resources");
@@ -3542,7 +3543,7 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
                             assert!(event_repo.is_none(), "refresh-all has no single checkout context");
                             assert_eq!(result, &CommandValue::Refreshed {
                                 repository_count: 1,
-                                repos: vec![repo.clone()],
+                                repos: vec![physical_repo.clone()],
                                 identity_changes: Vec::new()
                             });
                             saw_finished = true;
@@ -3562,7 +3563,7 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
                     assert_eq!(responder_node_id, daemon.node_id());
                     assert_eq!(result.as_ref(), &CommandValue::Refreshed {
                         repository_count: 1,
-                        repos: vec![repo.clone()],
+                        repos: vec![physical_repo.clone()],
                         identity_changes: Vec::new()
                     });
                     saw_response = true;
