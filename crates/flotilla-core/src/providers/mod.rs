@@ -833,11 +833,47 @@ pub mod replay;
 
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::collections::VecDeque;
+    use std::{
+        collections::VecDeque,
+        future::Future,
+        io::{self, Write},
+        sync::{Arc, Mutex},
+    };
 
     use async_trait::async_trait;
+    use tracing::instrument::WithSubscriber;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("log capture lock should be healthy").write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Capture tracing for one future without changing the process-wide subscriber.
+    pub async fn capture_logs<F: Future>(level: tracing::Level, future: F) -> (F::Output, String) {
+        let log_output = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogWriter(Arc::clone(&log_output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(level)
+            .with_writer(move || writer.clone())
+            .finish();
+
+        let output = future.with_subscriber(subscriber).await;
+        let logs = String::from_utf8(log_output.lock().expect("log capture lock should be healthy").clone()).expect("logs should be utf-8");
+        (output, logs)
+    }
 
     pub type TimeoutCall = (String, Vec<String>, PathBuf, Duration);
 
@@ -886,14 +922,30 @@ pub(crate) mod testing {
     }
 
     /// A mock command runner that returns canned responses in order.
-    /// Each call to `run()` pops the next response from the queue.
+    /// Each call to `run()` or `run_output()` pops the next response from the queue.
     pub struct MockRunner {
-        responses: std::sync::Mutex<VecDeque<Result<String, String>>>,
+        responses: std::sync::Mutex<VecDeque<Result<CommandOutput, String>>>,
         calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
     }
 
     impl MockRunner {
         pub fn new(responses: Vec<Result<String, String>>) -> Self {
+            Self::with_outputs(
+                responses
+                    .into_iter()
+                    .map(|response| {
+                        Ok(match response {
+                            Ok(stdout) => CommandOutput { stdout, stderr: String::new(), success: true },
+                            Err(stderr) => CommandOutput { stdout: String::new(), stderr, success: false },
+                        })
+                    })
+                    .collect(),
+            )
+        }
+
+        /// Queue raw subprocess outputs or spawn errors, preserving both output streams.
+        /// `new` retains its legacy stderr-only unsuccessful-command semantics.
+        pub fn with_outputs(responses: Vec<Result<CommandOutput, String>>) -> Self {
             Self { responses: std::sync::Mutex::new(responses.into()), calls: std::sync::Mutex::new(vec![]) }
         }
 
@@ -910,16 +962,18 @@ pub(crate) mod testing {
 
     #[async_trait]
     impl CommandRunner for MockRunner {
-        async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-            self.calls.lock().expect("calls").push((cmd.into(), args.iter().map(|a| (*a).into()).collect()));
-            self.responses.lock().unwrap().pop_front().expect("MockRunner: no more responses")
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            let output = self.run_output(cmd, args, cwd, label).await?;
+            if output.success {
+                Ok(output.stdout)
+            } else {
+                Err(output.stderr)
+            }
         }
 
-        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-            match self.run(cmd, args, cwd, label).await {
-                Ok(stdout) => Ok(CommandOutput { stdout, stderr: String::new(), success: true }),
-                Err(stderr) => Ok(CommandOutput { stdout: String::new(), stderr, success: false }),
-            }
+        async fn run_output(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            self.calls.lock().expect("calls").push((cmd.into(), args.iter().map(|a| (*a).into()).collect()));
+            self.responses.lock().expect("responses").pop_front().expect("MockRunner: no more responses")
         }
 
         async fn run_with_input(
@@ -950,6 +1004,46 @@ pub(crate) mod testing {
         async fn write_file(&self, _path: &Path, _content: &str) -> Result<(), String> {
             Ok(())
         }
+    }
+
+    // #2586: the subprocess fake preserves both streams and distinguishes exit failure
+    // from spawn failure. Glue: explicit rows cover success, failure, empty output, and spawn errors.
+    #[tokio::test]
+    async fn mock_runner_preserves_outputs_and_order() {
+        let runner = MockRunner::with_outputs(vec![
+            Ok(CommandOutput { stdout: "headers/body".into(), stderr: "exit failure".into(), success: false }),
+            Err("spawn failure".into()),
+            Ok(CommandOutput { stdout: "success".into(), stderr: "warning".into(), success: true }),
+            Ok(CommandOutput { stdout: "success".into(), stderr: "warning".into(), success: true }),
+            Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: false }),
+        ]);
+        let label = ChannelLabel::Default;
+        let output = runner.run_output("gh", &["api"], Path::new("/"), &label).await.expect("output");
+        assert_eq!((output.stdout.as_str(), output.stderr.as_str(), output.success), ("headers/body", "exit failure", false));
+        assert_eq!(runner.run_output("missing", &[], Path::new("/"), &label).await.err().as_deref(), Some("spawn failure"));
+        let output = runner.run_output("raw-ok", &[], Path::new("/"), &label).await.expect("successful output");
+        assert_eq!((output.stdout.as_str(), output.stderr.as_str(), output.success), ("success", "warning", true));
+        assert_eq!(runner.run("ok", &[], Path::new("/"), &label).await, Ok("success".into()));
+        assert_eq!(runner.run("empty", &[], Path::new("/"), &label).await, Err(String::new()));
+        assert_eq!(runner.remaining(), 0);
+        assert_eq!(runner.calls(), vec![
+            ("gh".into(), vec!["api".into()]),
+            ("missing".into(), vec![]),
+            ("raw-ok".into(), vec![]),
+            ("ok".into(), vec![]),
+            ("empty".into(), vec![])
+        ]);
+        let legacy = MockRunner::new(vec![Ok("legacy success".into()), Err("legacy failure".into())]);
+        assert_eq!(legacy.run("ok", &[], Path::new("/"), &label).await, Ok("legacy success".into()));
+        let output = legacy.run_output("fail", &[], Path::new("/"), &label).await.expect("legacy output");
+        assert_eq!((output.stdout.as_str(), output.stderr.as_str(), output.success), ("", "legacy failure", false));
+    }
+
+    // Exhausting the subprocess queue remains a hard failure, even for raw output calls.
+    #[tokio::test]
+    #[should_panic(expected = "MockRunner: no more responses")]
+    async fn mock_runner_rejects_unexpected_command() {
+        MockRunner::with_outputs(vec![]).run_output("unexpected", &[], Path::new("/"), &ChannelLabel::Default).await.ok();
     }
 
     /// Build the path to a provider fixture file.

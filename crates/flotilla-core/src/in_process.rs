@@ -1393,7 +1393,10 @@ async fn convoy_sender_address(backend: &ResourceBackend, namespace: &str, name:
         .get(name)
         .await
         .map(|source| convoy_message_address(&source.object))
-        .unwrap_or_else(|_| name.to_string())
+        .unwrap_or_else(|error| {
+            debug!(%namespace, convoy_ref = %name, %error, "convoy sender attribution lookup failed");
+            name.to_string()
+        })
 }
 
 fn safe_header_value(value: &str) -> String {

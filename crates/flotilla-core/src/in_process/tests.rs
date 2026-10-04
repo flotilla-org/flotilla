@@ -32,6 +32,38 @@ use crate::{
     repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector},
 };
 
+// #2597: failed reads retain the resource identity and emit scoped debug diagnostics;
+// successful reads never emit fallback diagnostics. Glue: exhaust the three read outcomes.
+#[tokio::test]
+async fn convoy_sender_lookup_diagnostics_preserve_fallbacks() {
+    use crate::providers::testing::capture_logs;
+    let memory = ResourceBackend::InMemory(InMemoryBackend::default());
+    memory
+        .using::<ResourceConvoy>("attribution")
+        .create(&test_meta("supervisor"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).role("governor".to_string()).build())
+        .await
+        .expect("convoy");
+    // Real HTTP collaborator with an invalid URL fails before any network request.
+    let invalid = ResourceBackend::Http(flotilla_resources::HttpBackend::new(crate::tls::client(), "://invalid"));
+    for (backend, name, expected, failure) in
+        [(&memory, "supervisor", "governor", false), (&memory, "missing", "missing", true), (&invalid, "unavailable", "unavailable", true)]
+    {
+        let read = backend.including_replicas::<ResourceConvoy>("attribution").get(name).await;
+        let (address, logs) = capture_logs(tracing::Level::DEBUG, convoy_sender_address(backend, "attribution", name)).await;
+        assert_eq!(address, expected);
+        if failure {
+            let error = read.expect_err("failed read").to_string();
+            assert!(logs.contains("DEBUG"), "{logs}");
+            assert!(logs.contains("namespace=attribution"), "{logs}");
+            assert!(logs.contains(&format!("convoy_ref={name}")), "{logs}");
+            assert!(logs.contains(&format!("error={error}")), "{logs}");
+            assert_eq!(logs.matches("convoy sender attribution lookup failed").count(), 1, "{logs}");
+        } else {
+            assert!(!logs.contains("convoy sender attribution lookup failed"), "{logs}");
+        }
+    }
+}
+
 // #2592: attribution uses role/project addresses, preserves legacy resource names,
 // and remains available when a supervisor convoy is absent from the replica view.
 // Formatting glue: these rows exhaust empty/nonempty role and absent/present project.
