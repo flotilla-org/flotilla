@@ -5561,6 +5561,8 @@ async fn sweep_host_empty_convoy_directories(backend: &ResourceBackend, host: &s
     // and fail closed on any listing error before touching the filesystem.
     // VesselReconciler reads its existing Convoy before creating Checkouts;
     // checkout provisioning therefore starts after the owner is in this store.
+    // A late Git materialisation after owner deletion recreates missing parents;
+    // rmdir can race only while empty and cannot remove materialised files.
     let mut live = BTreeSet::new();
     for namespace in backend.stored_namespaces::<Convoy>().await.map_err(|error| error.to_string())? {
         live.extend(
@@ -5600,6 +5602,8 @@ async fn sweep_empty_convoy_directories(root: &Path, live: &BTreeSet<String>) ->
     };
     while let Some(entry) = entries.next_entry().await.map_err(|error| error.to_string())? {
         let name = entry.file_name().to_string_lossy().into_owned();
+        // Managed roots reserve this prefix for convoy directories. An empty
+        // user-created directory with the same prefix is indistinguishable.
         if !name.starts_with("convoy-") || live.contains(&name) || !entry.file_type().await.map_err(|error| error.to_string())?.is_dir() {
             continue;
         }
@@ -9984,7 +9988,8 @@ dependency = { path = "../dependency" }
     }
 
     // #2610: teardown removes only empty convoy parents, and logs retained contents.
-    #[tokio::test]
+    // Thread-local log capture must remain on this current-thread runtime.
+    #[tokio::test(flavor = "current_thread")]
     async fn convoy_parent_cleanup_contract() {
         for extra in [None, Some("another-checkout"), Some("unexpected-file")] {
             let temp = TempDir::new().expect("tempdir");
@@ -9993,6 +9998,7 @@ dependency = { path = "../dependency" }
             let clone = TestGitRepo::init(temp.path().join("clone")).with_initial_commit();
             let runtime =
                 CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+            assert!(!parent.exists(), "materialisation must recreate missing convoy parents");
             runtime
                 .create_worktree(
                     clone.path().to_str().expect("test fixture operation succeeds"),
