@@ -1138,15 +1138,21 @@ if not re.fullmatch(r"[0-9]+", keep_text):
     raise SystemExit("fleet-install: FLEET_INSTALL_KEEP_OTHERS must be a non-negative integer")
 keep = int(keep_text)
 releases = root / "releases"
+proc_pidpath = None
+path_buffer = None
 
 def protected_paths():
+    global proc_pidpath, path_buffer
     protected = set()
     for name in ("current", "previous"):
         link = root / name
         if link.is_symlink():
             target = link.resolve()
             if target.parent != releases or not target.is_dir():
-                raise RuntimeError(f"unsafe or missing {name} target: {link}")
+                recovery = "inspect and restore the link to an installed release"
+                if name == "previous":
+                    recovery += ", or remove the stale previous link"
+                raise RuntimeError(f"unsafe or missing {name} target: {link}; {recovery} before retrying")
             protected.add(target)
         elif link.exists():
             raise RuntimeError(f"{name} is not a symlink")
@@ -1162,6 +1168,12 @@ def protected_paths():
         if result.returncode == 0 and not result.stdout.strip():
             raise RuntimeError("process discovery returned no executable PIDs")
         executables = []
+        if platform.startswith("darwin") and result.stdout.strip() and proc_pidpath is None:
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            proc_pidpath = libproc.proc_pidpath
+            proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+            proc_pidpath.restype = ctypes.c_int
+            path_buffer = ctypes.create_string_buffer(4096)
         for value in result.stdout.split():
             pid = int(value)
             try:
@@ -1171,11 +1183,10 @@ def protected_paths():
                 else:
                     # proc_pidpath reads the actual executable, not argv or the
                     # current symlink, including launchd's pre-flip respawns.
-                    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-                    buffer = ctypes.create_string_buffer(4096)
-                    if libproc.proc_pidpath(pid, buffer, len(buffer)) <= 0:
+                    path_buffer.value = b""
+                    if proc_pidpath(pid, path_buffer, len(path_buffer)) <= 0:
                         raise OSError(ctypes.get_errno(), "proc_pidpath failed")
-                    executable = os.fsdecode(buffer.value)
+                    executable = os.fsdecode(path_buffer.value)
                 executables.append(executable)
             except OSError:
                 # An exited process cannot hold a generation. Any process that

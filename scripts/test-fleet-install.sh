@@ -1187,4 +1187,33 @@ test ! -e "$prune_root/releases/a.validator.bak" || fail 'kept prefix generation
 test "$(cat "$prune_root/releases/a.b.validator.bak")" = 'keep me' || fail 'deleted retained dotted generation backup'
 test -L "$prune_root/releases/a.b.c.validator.bak" || fail 'deleted running dotted generation symlink backup'
 
+# Dangling current/previous links refuse pruning without changing releases,
+# and explain how the operator can restore valid link state before retrying.
+for link in current previous; do
+  python3 - "$prune_root/$link" <<'PYLINK'
+from pathlib import Path
+import sys
+
+link = Path(sys.argv[1])
+link.unlink(missing_ok=True)
+link.symlink_to("releases/missing")
+PYLINK
+  before="$(find "$prune_root" -print | sort)"
+  if run_pruner 0 --prune >"$test_root/prune-dangling.out" 2>&1; then
+    fail "dangling $link allowed pruning"
+  fi
+  grep -Fq "unsafe or missing $link target:" "$test_root/prune-dangling.out" || fail 'dangling-link error omitted the link'
+  grep -Fq 'restore the link to an installed release' "$test_root/prune-dangling.out" || fail 'dangling-link error omitted recovery guidance'
+  test "$(find "$prune_root" -print | sort)" = "$before" || fail 'dangling-link refusal changed the tree'
+  python3 - "$prune_root/$link" "$link" <<'PYLINK'
+from pathlib import Path
+import sys
+
+link = Path(sys.argv[1])
+link.unlink()
+if sys.argv[2] == "current":
+    link.symlink_to("releases/a.b")
+PYLINK
+done
+
 echo 'fleet-install contract passed'
