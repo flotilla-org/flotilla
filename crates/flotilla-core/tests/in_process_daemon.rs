@@ -11,6 +11,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use flotilla_controllers::reconcilers::convoy_ensure::EnsureReconciler;
 use flotilla_core::{
     attachable::{shared_in_memory_attachable_store, AttachableSet, AttachableSetId, ProviderBinding, TerminalPurpose},
     config::ConfigStore,
@@ -6245,6 +6246,14 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
         ..Default::default()
     });
     hosts.update_status(&host_ref, &host.metadata.resource_version, &status).await.expect("publish governor model facts");
+    daemon
+        .install_convoy_ensure_reconciler(Arc::new(
+            EnsureReconciler::builder()
+                .resource_backend(daemon.resource_backend())
+                .clock(Arc::new(flotilla_resources::SystemClock))
+                .build(),
+        ))
+        .await;
     daemon.reconcile_convoy_ensures_once("flotilla").await.expect("pre-sweep ensure admits");
     let first = admitted_convoy(&daemon.resource_backend(), "governor").await;
     assert!(first.spec.repositories.iter().any(|repository| repository.repo_ref == alias.key()));

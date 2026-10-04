@@ -3,7 +3,7 @@
 use flotilla_protocol::PlacementTargetHost;
 use flotilla_resources::{Host as ResourceHost, ReadResourceObject};
 
-pub(crate) fn canonical_placement_host_ref_from_sources(
+pub fn canonical_placement_host_ref_from_sources(
     hosts: &[ReadResourceObject<ResourceHost>],
     host_ref: &str,
 ) -> Result<Option<PlacementTargetHost>, String> {

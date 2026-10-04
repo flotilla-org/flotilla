@@ -104,13 +104,13 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 
 | Crate | Role |
 |-------|------|
-| `flotilla-core` | Providers, refresh, observed-resource projection, executor, config, agents, attachables, step plans, `DaemonHandle` trait, `InProcessDaemon` |
+| `flotilla-core` | Providers, refresh, observed-resource projection, convoy admission and controller ports, executor, config, agents, attachables, step plans, `DaemonHandle` trait, `InProcessDaemon` composition root |
 | `flotilla-protocol` | Serde-only types: commands, query result sets, provider snapshots, events, envelope |
 | `flotilla-client` | Socket client: `SocketDaemon`, `connect_or_spawn`, gap recovery |
 | `flotilla-tui` | UI rendering (widget tree), input handling, binding table, keymap, event loop, CLI parsing |
 | `flotilla-daemon` | Runtime, Aggregator, socket server, resource replication, peer networking, multi-host command routing |
 | `flotilla-resources` | Resource kinds, typed resolvers, lifecycle authority, and storage backends |
-| `flotilla-controllers` | Reconcilers for resource-driven control-plane behavior |
+| `flotilla-controllers` | Reconcilers for resource-driven control-plane behavior, including standing-convoy ensures, retries, attention and rolls |
 | `flotilla-commands` | Resource-oriented command preparation and execution |
 | `flotilla-transport` | Framed message sessions over Unix sockets or in-memory channels for daemon client and peer connections |
 | `tender` | Publication, discovery, pinned-exposure, and raw-stream contracts with an in-memory adapter and shared behavior tests |
@@ -123,7 +123,10 @@ User actions flow: **TableIntent/UI action → Command → daemon executor → p
 |------|------|
 | `src/main.rs` | Entry point, CLI dispatch |
 | `crates/flotilla-core/src/daemon.rs` | `DaemonHandle` trait |
-| `crates/flotilla-core/src/in_process.rs` | `InProcessDaemon` implementation |
+| `crates/flotilla-core/src/in_process.rs` | `InProcessDaemon` composition root and narrow controller ports |
+| `crates/flotilla-core/src/convoy_ensure.rs` | Narrow admission and controller ports for standing convoys |
+| `crates/flotilla-core/src/in_process/convoy_admission.rs` | Transaction-owning convoy admission primitive |
+| `crates/flotilla-controllers/src/reconcilers/convoy_ensure.rs` | Standing-convoy reconciliation, retry state and the complete ensure transaction guard |
 | `crates/flotilla-core/src/executor.rs` | Executes provider-backed command steps and returns `CommandValue` |
 | `crates/flotilla-core/src/executor/` | Executor submodules: checkout, workspace, terminals, session actions |
 | `crates/flotilla-core/src/model.rs` | `RepoModel` and provider label/name helpers |

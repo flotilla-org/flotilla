@@ -1239,6 +1239,7 @@ dependencies = [
  "color-eyre",
  "dirs",
  "ed25519-dalek",
+ "flotilla-controllers",
  "flotilla-manifest",
  "flotilla-protocol",
  "flotilla-relay-protocol",

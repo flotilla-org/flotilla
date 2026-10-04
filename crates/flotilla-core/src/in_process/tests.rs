@@ -5043,6 +5043,13 @@ async fn reconcile_now_waits_for_periodic_backing_inspection_and_keeps_one_gener
         async move { daemon.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &*backing).await }
     });
     backing.entered.notified().await;
+    // Rebuilding runtime around this daemon must retain the in-flight guard.
+    daemon
+        .install_convoy_ensure_reconciler(Arc::new(
+            ensure_controller_under_test::EnsureReconciler::builder().resource_backend(backend.clone()).clock(clock.clone()).build(),
+        ))
+        .await;
+
     let mut forced = Box::pin(daemon.reconcile_convoy_ensure_now("flotilla", "quartermaster", &RecordlessBacking));
     assert!(
         tokio::time::timeout(Duration::from_millis(100), &mut forced).await.is_err(),
@@ -5161,12 +5168,14 @@ async fn driver_reconcile_now_acknowledges_recordless_teardown_and_readmits_the_
     let (driver, backend, clock, _temp) = standing_ensure_fixture_for("udder", true).await;
     let driver_id = driver.local_host_id().expect("driver host identity").to_string();
     set_ensure_driver(&backend, &driver_id).await;
-    let ensure = backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("driver ensure");
-    driver.reconcile_driver_convoy_ensure("flotilla", &ensure, &RecordlessBacking, false).await.expect("initial driver admission");
+    // The public pass resolves the declared driver before exercising admission.
+    backend.using::<ResourceHost>("flotilla").create(&test_meta(&driver_id), &HostSpec::default()).await.expect("driver host");
+
+    driver.reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &RecordlessBacking).await.expect("initial driver admission");
     fail_latest_ensured_generation(&backend, &clock).await;
 
     let refusal = driver
-        .reconcile_driver_convoy_ensure("flotilla", &ensure, &RecordlessBacking, false)
+        .reconcile_convoy_ensures_once_with_backing_inspector("flotilla", &RecordlessBacking)
         .await
         .expect_err("automatic driver reconcile must hold on missing backing evidence");
     assert!(refusal.contains("no backing environment evidence is available"), "unexpected refusal: {refusal}");
@@ -5293,13 +5302,12 @@ async fn declared_driver_derives_bounded_backoff_from_its_homed_generations() {
         .is_empty());
     assert_eq!(driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("bounded generations").items.len(), 3);
 
-    let ensure = authority_backend.definitions::<ConvoyEnsure>("flotilla").get("quartermaster").await.expect("authority ensure");
     assert_eq!(
         driver
-            .reconcile_driver_convoy_ensure("flotilla", &ensure, &VerifiedDeadBacking, true)
+            .reconcile_convoy_ensure_now("flotilla", "quartermaster", &VerifiedDeadBacking)
             .await
             .expect("forced reconcile bypasses active driver escalation"),
-        Some("started quartermaster@standing-project".to_string())
+        "started quartermaster@standing-project".to_string()
     );
     assert!(matches!(demands.get("ensure-attention-quartermaster").await, Err(ResourceError::NotFound { .. })));
     assert_eq!(driver_backend.using::<ResourceConvoy>("flotilla").list().await.expect("resumed generations").items.len(), 4);
