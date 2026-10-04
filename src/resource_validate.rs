@@ -153,33 +153,43 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
             if status.is_success() { (Some(response.json::<Value>().await?), None) } else { (None, Some(response.text().await?)) };
         let result = if let Some(document) = success {
             validate_ops_inventory(&serde_json::from_value(document)?)
-        } else if ops_inventory_endpoint_absent(status, body.as_deref().unwrap_or_default()) {
-            // An absent endpoint (including on older daemons) does not prove
-            // a particular version. Candidate-side local inspection is still
-            // mandatory; never interpret a 404 as an empty input inventory.
-            async {
-                let roots = local_roots
-                    .ok_or_else(|| eyre!("ops inventory endpoint not found on peer; run the candidate validation on that host"))?;
-                if local_inventory.is_none() {
-                    let runner = Arc::new(ProcessCommandRunner);
-                    // Inspection only reads absolute repository paths. The checkout
-                    // strategy is required by the resolver but never creates worktrees.
-                    let vcs = FlotillaVcs::new(
-                        ExecutionEnvironmentPath::new("/"),
-                        runner.clone(),
-                        GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
-                    );
-                    let inspector =
-                        GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), VALIDATION_INSPECTION_HOST);
-                    let paths = inspect_validation_roots(roots, &inspector).await;
-                    local_inventory = Some((inspector, paths));
-                }
-                let (inspector, paths) = local_inventory.as_ref().expect("initialized local inventory");
-                validate_project_ops(&registered, paths, inspector).await
-            }
-            .await
         } else {
-            Err(eyre!("{namespace}: cannot inspect operational entries: {}", body.unwrap_or_default()))
+            let body = body.unwrap_or_default();
+            let absent = ops_inventory_endpoint_absent(status, &body);
+            match local_roots {
+                // A peer's inventory can only be replaced by inspection on that host.
+                None if absent => Err(eyre!("ops inventory endpoint not found on peer; run the candidate validation on that host")),
+                None => Err(eyre!("{namespace}: cannot inspect operational entries: {body}")),
+                Some(roots) => {
+                    // The gate checks the candidate's selection and parsing rules, so on
+                    // this host a refusal from the running daemon's inventory (which applies
+                    // the previous generation's rules) is re-inspected by the candidate
+                    // rather than blocking the fix for it. An absent endpoint never means
+                    // an empty inventory either.
+                    if !absent {
+                        eprintln!("{namespace}: running daemon refused its ops inventory ({status}: {body}); inspecting this host's checkouts with the candidate");
+                    }
+                    async {
+                        if local_inventory.is_none() {
+                            let runner = Arc::new(ProcessCommandRunner);
+                            // Inspection only reads absolute repository paths. The checkout
+                            // strategy is required by the resolver but never creates worktrees.
+                            let vcs = FlotillaVcs::new(
+                                ExecutionEnvironmentPath::new("/"),
+                                runner.clone(),
+                                GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner.clone()))),
+                            );
+                            let inspector =
+                                GitRepositoryInspector::new(runner, Arc::new(FixedVcsResolver(Arc::new(vcs))), VALIDATION_INSPECTION_HOST);
+                            let paths = inspect_validation_roots(roots, &inspector).await;
+                            local_inventory = Some((inspector, paths));
+                        }
+                        let (inspector, paths) = local_inventory.as_ref().expect("initialized local inventory");
+                        validate_project_ops(&registered, paths, inspector).await
+                    }
+                    .await
+                }
+            }
         };
         match result {
             Ok(0) => {}
@@ -231,8 +241,9 @@ fn discovery_kind_namespaces(document: &Value) -> Result<Vec<(String, Vec<String
 
 /// Whether a daemon lacks the operational-entries inventory endpoint. Previous
 /// generations either have no route (404) or reject the kind as unknown (400),
-/// and both fall back to candidate-side local inspection. Other errors, such as
-/// 422 for an unavailable ops source, are real refusals.
+/// and both fall back to candidate-side local inspection. Validating a peer
+/// without local roots fails closed either way; on the daemon's own host the
+/// candidate also re-inspects after any other inventory refusal.
 ///
 /// The 400 match is coupled to the previous generation's wire message for an
 /// unregistered kind ("unknown resource kind '<kind>' (supported: ...)").
@@ -1013,6 +1024,85 @@ mod tests {
         let paths = inspect_validation_roots(&[tmp.clone(), duplicate.clone()], &inspector).await;
         let error = validate_project_ops(&[project], &paths, &inspector).await.expect_err("ambiguous main checkouts fail the gate");
         assert!(error.to_string().contains("no unambiguous main checkout"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn on_host_candidate_reinspects_after_a_daemon_inventory_refusal() {
+        use std::collections::BTreeSet;
+
+        use flotilla_resources::{InMemoryBackend, ProjectRepositoryRole, ProjectRepositorySpec, RepositoryKey, ResourceBackend};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::UnixListener,
+        };
+        // A previous-generation daemon refuses its inventory under rules the
+        // candidate fixes (#2579): on the daemon's own host the candidate's
+        // inspection decides; validating a peer without local roots fails closed.
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let project = backend
+            .using::<Project>("flotilla")
+            .create(
+                &InputMeta::builder().name("demo".to_string()).build(),
+                &ProjectSpec::builder()
+                    .display_name("Demo".to_string())
+                    .default_workflow_ref("default".to_string())
+                    .repositories(vec![ProjectRepositorySpec {
+                        repo: RepositoryKey("ops-elsewhere".into()),
+                        alias: None,
+                        roles: BTreeSet::from([ProjectRepositoryRole::Ops]),
+                        subpath: None,
+                        default_branch: None,
+                    }])
+                    .build(),
+            )
+            .await
+            .expect("project with an ops member held elsewhere");
+        let document = serde_json::to_value(project.to_k8s_object()).expect("project API record");
+        let socket_dir = TestSocketDir::new();
+        let socket = socket_dir.socket_path("refusing.sock");
+        let listener = UnixListener::bind(&socket).expect("refusing daemon socket");
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept validator");
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut bytes = [0; 1024];
+                    let count = stream.read(&mut bytes).await.expect("request bytes");
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&bytes[..count]);
+                }
+                let request = String::from_utf8(request).expect("HTTP request");
+                let path = request.split_whitespace().nth(1).expect("request path").split('?').next().expect("path").to_string();
+                let (status, body) = if path == "/apis/flotilla.work/v1" {
+                    ("200 OK", serde_json::json!({"kinds":["projects"], "namespaces":{"projects":["flotilla"]}}))
+                } else if path.ends_with("/projects") {
+                    ("200 OK", serde_json::json!({"items":[document.clone()]}))
+                } else {
+                    assert!(path.ends_with("/operationalentries"), "{path}");
+                    (
+                        "422 Unprocessable Entity",
+                        serde_json::json!({"message":"Project/demo: ops member ops-elsewhere has no unambiguous main checkout"}),
+                    )
+                };
+                let body = body.to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("refusal response");
+            }
+        });
+        validate_daemon(&socket, Some(&[]), None).await.expect("the candidate reports the source unavailable on this host");
+        let error = validate_daemon(&socket, None, None).await.expect_err("a peer's refusal stands without local roots");
+        assert!(error.to_string().contains("resource validation failed"), "{error}");
+        server.abort();
     }
 
     #[cfg(unix)]
