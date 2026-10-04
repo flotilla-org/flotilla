@@ -120,7 +120,7 @@ pub fn convoy_reference_context<'a>(
             let alias = project
                 .and_then(|project| project.repositories.iter().find(|member| member.repo == repository.repo_ref))
                 .and_then(|member| member.alias.clone())
-                .unwrap_or_else(|| scope.rsplit('/').next().unwrap_or(&scope).to_string());
+                .unwrap_or_else(|| scope.rsplit('/').next().expect("rsplit always yields an item").to_string());
             Some(flotilla_protocol::RepositoryAlias {
                 project: project_ref.map(str::to_string),
                 alias,
@@ -2335,6 +2335,41 @@ pub mod external_patches {
 mod subject_tests {
     use super::*;
     use crate::{CrewMessageDelivery, CrewMessageSender, TerminalCrewMessage};
+
+    // Glue: web roots are normalized consistently across configured Forge
+    // and resolved Repository inputs. This pinned SSH installation makes the
+    // transport URL's canonical root different from the public web root, so
+    // using URL fallback instead of the resolved service_url cannot pass.
+    #[test]
+    fn convoy_reference_context_normalizes_and_reuses_public_web_root() {
+        let forge = crate::ForgeSpec {
+            forge_id: "lab".into(),
+            kind: crate::ForgeKind::Forgejo,
+            hosts: BTreeSet::from(["transport.example".into()]),
+            https_url: "https://forge.example/install/".into(),
+            git_ssh_host: "transport.example".into(),
+        };
+        let resolved = crate::RepositorySpec::remote("https://forge.example/install/team/repo")
+            .expect("repository")
+            .on_forge(&forge)
+            .expect("forge repository");
+        let snapshot = ConvoyRepositorySpec::builder()
+            .repo_ref(resolved.key())
+            .url("git@transport.example:install/team/repo.git".into())
+            .source_ref("main".into())
+            .target_ref("main".into())
+            .workspace_slug("repo".into())
+            .subpaths(Vec::new())
+            .build();
+        let configured =
+            convoy_reference_context(std::slice::from_ref(&snapshot), None, None, std::slice::from_ref(&forge), |_| Some(&resolved));
+        let from_repository = convoy_reference_context(std::slice::from_ref(&snapshot), None, None, &[], |_| Some(&resolved));
+        assert_eq!(configured.repositories.len(), 1);
+        assert_eq!(configured.repositories, from_repository.repositories);
+        assert_eq!(configured.repositories[0].web_base, "https://forge.example/install");
+        let subject = configured.parse("https://forge.example/install/team/repo/pulls/7").expect("public PR URL");
+        assert_eq!(subject.url(&from_repository).as_deref(), Some("https://forge.example/install/team/repo/pulls/7"));
+    }
 
     // #2202: every caller builds the same source, alias, and URL context
     // whether it has a resolved Repository or only the admitted URL and Forge.
