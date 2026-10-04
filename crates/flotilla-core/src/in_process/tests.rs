@@ -8518,3 +8518,139 @@ async fn event_publication_preserves_spawned_watch_order() {
     .await
     .expect("watch lifecycle completes");
 }
+
+// #2543: scope waits use the latest deadline independently of batch ordering;
+// hard errors and untimed limits remain substantive refusals for their subjects.
+#[hegel::test]
+fn observation_cooldown_is_deterministic(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+
+    use crate::providers::github_api::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource};
+    // Deadlines span expired, current and future resets; duplicates exercise the
+    // lowest-subject tie break. Generated permutations, their reversals and fresh HashMaps vary order.
+    let now = Utc.timestamp_opt(1800000000, 0).single().expect("now");
+    let offsets: Vec<i64> = (0..tc.draw(gs::integers::<usize>().min_value(0).max_value(8)))
+        .map(|_| tc.draw(gs::integers::<i64>().min_value(-2).max_value(2)))
+        .collect();
+    let timed = |number: u64, offset: Option<i64>| ObservationError::RateLimited {
+        budget: format!("subject-{number}"),
+        limit: GithubRateLimit {
+            kind: GithubRateLimitKind::Primary,
+            retry_at: offset.map(|offset| now + chrono::Duration::seconds(offset)),
+            retry_source: if offset.is_some() { GithubRetrySource::RateLimitReset } else { GithubRetrySource::Unavailable },
+        },
+    };
+    let expected = offsets
+        .iter()
+        .enumerate()
+        .max_by_key(|(index, offset)| (**offset, std::cmp::Reverse(*index)))
+        .map(|(index, offset)| timed(index as u64, Some(*offset)));
+    for reverse in [false, true] {
+        let mut entries: Vec<_> =
+            offsets.iter().enumerate().map(|(index, offset)| (index as u64, Err(timed(index as u64, Some(*offset))))).collect();
+        entries.push((100, Err(ObservationError::Forge("hard refusal".into()))));
+        entries.push((101, Err(timed(101, None))));
+        for index in 0..entries.len() {
+            let other = tc.draw(gs::integers::<usize>().min_value(0).max_value(entries.len() - 1));
+            entries.swap(index, other);
+        }
+        if reverse {
+            entries.reverse();
+        }
+        let result = Ok(entries.into_iter().collect::<BoundObservations>());
+        let actual = observation_rate_limit_error(&result);
+        assert_eq!(actual, expected.as_ref());
+        if let Some(error) = actual {
+            assert_eq!(
+                observation_during_cooldown(&result, 100, error).expect_err("hard refusal"),
+                ObservationError::Forge("hard refusal".into())
+            );
+            assert_eq!(observation_during_cooldown(&result, 101, error).expect_err("untimed limit"), timed(101, None));
+            for number in 0..offsets.len() as u64 {
+                assert_eq!(observation_during_cooldown(&result, number, error).expect_err("scope cooldown"), *error);
+            }
+            assert_eq!(observation_during_cooldown(&result, 102, error).expect_err("new subject waits"), *error);
+            let offset = *offsets.iter().max().expect("timed limits");
+            assert_eq!(observation_cache_delay(error.retry_at(), now), Duration::from_secs(if offset > 0 { offset as u64 } else { 9 }));
+        }
+    }
+    assert!(observation_rate_limit_error(&Ok(BoundObservations::new())).is_none());
+}
+
+struct NoCooldownForgeReads;
+#[async_trait]
+impl ChangeRequestQueryPort for NoCooldownForgeReads {
+    async fn discover_repository_change_request(
+        &self,
+        _namespace: &str,
+        _repository: &RepositorySpec,
+    ) -> Result<Arc<dyn ChangeRequestTracker>, String> {
+        panic!("cooldown must prevent forge discovery and reads")
+    }
+}
+
+// #2543: normal, fresh completion, and Landing/batch reads all respect the same
+// cached scope cooldown, including new subjects and prior successful outcomes.
+#[tokio::test(start_paused = true)]
+async fn distinct_cooldowns_block_all_observation_reads() {
+    use crate::providers::github_api::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource};
+    let source =
+        ProviderChangeRequestObservationSource::new(ResourceBackend::InMemory(InMemoryBackend::default()), Arc::new(NoCooldownForgeReads));
+    let now = Utc::now();
+    let timed = |seconds| ObservationError::RateLimited {
+        budget: format!("reset-{seconds}"),
+        limit: GithubRateLimit {
+            kind: GithubRateLimitKind::Primary,
+            retry_at: Some(now + chrono::Duration::seconds(seconds)),
+            retry_source: GithubRetrySource::RateLimitReset,
+        },
+    };
+    let controlling = timed(60);
+    let successful = flotilla_resources::ChangeRequestStatus {
+        title: Default::default(),
+        author: Default::default(),
+        review_decision: Default::default(),
+        review_requested_from_owner: Default::default(),
+        state: Default::default(),
+        head_sha: Default::default(),
+        checks: Default::default(),
+        review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+        mergeable: Default::default(),
+    };
+    let result = Ok([
+        (1, Err(timed(10))),
+        (2, Err(controlling.clone())),
+        (3, Ok(successful)),
+        (4, Err(ObservationError::Forge("hard refusal".into()))),
+    ]
+    .into_iter()
+    .collect());
+    let expires_at = tokio::time::Instant::now()
+        + observation_cache_delay(observation_rate_limit_error(&result).and_then(ObservationError::retry_at), now);
+    source.cache.lock().await.insert(
+        ("flotilla".into(), "github.com".into(), "team/repo".into()),
+        Arc::new(Mutex::new(Some(
+            CachedObservation::builder()
+                .expires_at(expires_at)
+                .queried([1, 2, 3, 4].into_iter().collect())
+                .next_history_start(0)
+                .result(result)
+                .build(),
+        ))),
+    );
+    for seconds in [0, 11, 48] {
+        tokio::time::advance(Duration::from_secs(seconds)).await;
+        for number in [1, 2, 3, 4, 5] {
+            let subject =
+                ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "team/repo".into(), number };
+            let expected = if number == 4 { ObservationError::Forge("hard refusal".into()) } else { controlling.clone() };
+            assert_eq!(source.observe(&subject).await.expect_err("ordinary read waits"), expected);
+            assert_eq!(source.observe_for_completion(&subject).await.expect_err("completion waits"), expected);
+            assert_eq!(source.observe_group(std::slice::from_ref(&subject), &subject).await.expect_err("batch waits"), expected);
+        }
+    }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let subject = ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "team/repo".into(), number: 1 };
+    let expired = source.observe_for_completion(&subject).await.expect_err("no repository after cache expires");
+    assert!(matches!(expired, ObservationError::Forge(_)), "cache expires at controlling deadline");
+}

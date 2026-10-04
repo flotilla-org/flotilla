@@ -974,3 +974,168 @@ fn classified_rest_recording_round_trips(tc: hegel::TestCase) {
         }
     });
 }
+
+// Substitute only the gh subprocess boundary; run the real REST client and recorder.
+struct RestFailureRunner {
+    stdout: String,
+    stderr: String,
+    transport_failure: bool,
+}
+
+#[async_trait]
+impl CommandRunner for RestFailureRunner {
+    async fn run(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        panic!("REST uses full process output")
+    }
+    async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+        if self.transport_failure {
+            return Err(self.stderr.clone());
+        }
+        Ok(CommandOutput { stdout: self.stdout.clone(), stderr: self.stderr.clone(), success: false })
+    }
+    async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+        true
+    }
+}
+
+// #2557: actual HTTP status, headers and body survive classification/recording;
+// both replay interfaces retain the corresponding live diagnostics/classification.
+#[hegel::test]
+fn classified_rest_failures_preserve_response_metadata(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+
+    use crate::providers::github_api::{GhApiClient, GithubRetrySource};
+    // Exhaust ordinary 403/404, primary and secondary 403/429, missing reset,
+    // and transport failure each run. Generate reset boundaries and retry delay.
+    let reset = tc.draw(gs::integers::<i64>().min_value(0).max_value(1893456000));
+    let delay = tc.draw(gs::integers::<u32>().min_value(0).max_value(120));
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for (status, remaining, message, deadline, retry_after) in [
+            (403, "4999", "Resource not accessible by integration", true, false),
+            (404, "4999", "Not Found", false, false),
+            (403, "0", "API rate limit exceeded", true, false),
+            (429, "0", "API rate limit exceeded", true, false),
+            (403, "0", "API rate limit exceeded", false, false),
+            (403, "4999", "secondary rate limit exceeded", true, true),
+            (429, "4999", "secondary rate limit exceeded", true, true),
+            (0, "", "transport failure", false, false),
+        ] {
+            let body = format!("{{\"message\":\"{message}\"}}");
+            let mut raw = format!("HTTP/2 {status}\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Remaining: {remaining}\r\n");
+            if deadline {
+                raw.push_str(&format!("X-RateLimit-Reset: {reset}\r\n"));
+            }
+            if retry_after {
+                raw.push_str(&format!(
+                    "Retry-After: {}\r\n",
+                    chrono::DateTime::from_timestamp(reset + i64::from(delay), 0).expect("retry time").to_rfc2822()
+                ));
+            }
+            raw.push_str(&format!("\r\n{body}"));
+            let runner = Arc::new(RestFailureRunner {
+                stdout: raw,
+                stderr: format!("gh: {message} (HTTP {status})"),
+                transport_failure: status == 0,
+            });
+            let endpoint = "repos/team/one/pulls";
+            let label = super::super::gh_api_channel_label("GET", endpoint);
+            let path = temp.path().join("recording.yaml");
+            let live = GhApiClient::new(runner.clone());
+            let expected_legacy = live.get_with_headers(endpoint, Path::new("/"), &label).await.expect_err("live failure");
+            let recording = Session::recording(&path, Masks::new());
+            let api = RecordingGhApi::new(recording.clone(), Arc::new(live));
+            let classified = api.get_classified_with_headers(endpoint, Path::new("/"), &label).await.expect_err("classified failure");
+            recording.finish();
+            let detailed = Session::replaying(&path, Masks::new());
+            let failure = ReplayGhApi::new(detailed.clone())
+                .get_classified_response(endpoint, Path::new("/"), &label)
+                .await
+                .expect_err("detailed replay");
+            assert_eq!(failure.error, classified);
+            assert_eq!(failure.response.is_some(), status != 0);
+            if let Some(response) = failure.response {
+                assert_eq!(response.status, status);
+                assert_eq!(response.body, body);
+                assert_eq!(response.legacy_error, expected_legacy);
+                assert!(!response.headers.keys().any(|key| key.starts_with("observation-")));
+            }
+            detailed.finish();
+            let log: RoundLog = serde_yml::from_str(&std::fs::read_to_string(&path).expect("recording")).expect("log");
+            let Interaction::GhApi { status: actual_status, body: actual_body, headers, .. } = &log.rounds[0].interactions[0] else {
+                panic!("REST recording")
+            };
+            assert_eq!(*actual_status, status);
+            if status != 0 {
+                assert_eq!(*actual_body, body);
+                assert_eq!(headers.get("x-ratelimit-remaining").expect("remaining"), remaining);
+                assert_eq!(headers.get("x-ratelimit-resource").expect("resource"), "core");
+                assert_eq!(headers.get("x-ratelimit-reset"), deadline.then(|| reset.to_string()).as_ref());
+                assert_eq!(
+                    headers.get("retry-after"),
+                    retry_after
+                        .then(|| chrono::DateTime::from_timestamp(reset + i64::from(delay), 0).expect("retry time").to_rfc2822())
+                        .as_ref()
+                );
+            }
+            if status == 403 && remaining == "0" && !deadline {
+                let ObservationError::RateLimited { limit, .. } = &classified else { panic!("primary limit") };
+                assert_eq!(limit.retry_at, None);
+                assert_eq!(limit.retry_source, GithubRetrySource::Unavailable);
+            }
+            let replay = Session::replaying(&path, Masks::new());
+            assert_eq!(
+                ReplayGhApi::new(replay.clone())
+                    .get_classified_with_headers(endpoint, Path::new("/"), &label)
+                    .await
+                    .expect_err("classified replay"),
+                classified
+            );
+            replay.finish();
+            for with_headers in [false, true] {
+                let replay = Session::replaying(&path, Masks::new());
+                let api = ReplayGhApi::new(replay.clone());
+                let actual = if with_headers {
+                    api.get_with_headers(endpoint, Path::new("/"), &label).await.expect_err("legacy headers")
+                } else {
+                    api.get(endpoint, Path::new("/"), &label).await.expect_err("legacy body")
+                };
+                assert_eq!(actual, expected_legacy);
+                replay.finish();
+            }
+        }
+    });
+}
+
+// #2557: preemptive issue-budget refusals have no HTTP failure response, and a
+// cached refusal makes no further subprocess call; replay retains that distinction.
+#[tokio::test]
+async fn classified_issue_budget_recording_has_no_failure_response() {
+    use crate::providers::{github_api::GhApiClient, testing::MockRunner};
+    let reset = chrono::Utc::now().timestamp() + 3600;
+    // Substitute the gh subprocess boundary with one successful low-budget response.
+    let runner = Arc::new(MockRunner::new(vec![Ok(format!(
+        "HTTP/2 200 OK\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Remaining: 75\r\nX-RateLimit-Reset: {reset}\r\n\r\n[]"
+    ))]));
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("recording.yaml");
+    let recording = Session::recording(&path, Masks::new());
+    let api = RecordingGhApi::new(recording.clone(), Arc::new(GhApiClient::new(runner.clone())));
+    let endpoint = "repos/team/one/issues?state=all";
+    let label = super::super::gh_api_channel_label("GET", endpoint);
+    let first = api.get_classified_response(endpoint, Path::new("/"), &label).await.expect_err("budget refusal");
+    let second = api.get_classified_response(endpoint, Path::new("/"), &label).await.expect_err("cached refusal");
+    assert!(first.response.is_none());
+    assert!(second.response.is_none());
+    assert_eq!(first.error, second.error);
+    assert_eq!(runner.calls().len(), 1);
+    recording.finish();
+    let replay = Session::replaying(&path, Masks::new());
+    let api = ReplayGhApi::new(replay.clone());
+    for _ in 0..2 {
+        let failure = api.get_classified_response(endpoint, Path::new("/"), &label).await.expect_err("replayed refusal");
+        assert!(failure.response.is_none());
+        assert_eq!(failure.error, first.error);
+    }
+    replay.finish();
+}

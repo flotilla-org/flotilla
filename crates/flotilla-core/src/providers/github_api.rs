@@ -63,6 +63,37 @@ pub struct GhApiResponse {
     pub total_count: Option<u32>,
 }
 
+/// REST-only failure envelope; admission sees only `error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhApiFailure {
+    pub error: ObservationError,
+    pub response: Option<GhApiFailureResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhApiFailureResponse {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub body: String,
+    pub legacy_error: String,
+}
+
+impl From<ObservationError> for GhApiFailure {
+    fn from(error: ObservationError) -> Self {
+        Self { error, response: None }
+    }
+}
+impl From<String> for GhApiFailure {
+    fn from(error: String) -> Self {
+        ObservationError::Forge(error).into()
+    }
+}
+impl From<&str> for GhApiFailure {
+    fn from(error: &str) -> Self {
+        error.to_string().into()
+    }
+}
+
 /// Parse the combined headers+body output from `gh api --include`.
 pub fn parse_gh_api_response(raw: &str) -> GhApiResponse {
     // Split on first blank line (headers end with \r\n\r\n or \n\n)
@@ -290,6 +321,10 @@ pub trait GhApi: Send + Sync {
     ) -> Result<GhApiResponse, ObservationError> {
         self.get_with_headers(endpoint, repo_root, label).await.map_err(ObservationError::Forge)
     }
+    /// Recording seam retaining raw REST failures. Non-REST adapters have no response.
+    async fn get_classified_response(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<GhApiResponse, GhApiFailure> {
+        self.get_classified_with_headers(endpoint, repo_root, label).await.map_err(Into::into)
+    }
 }
 
 /// Cache entry: ETag + the JSON response body from last 200.
@@ -326,7 +361,7 @@ impl GhApi for GhApiClient {
     }
 
     async fn get_with_headers(&self, endpoint: &str, repo_root: &Path, _label: &ChannelLabel) -> Result<GhApiResponse, String> {
-        self.fetch(endpoint, repo_root, RestErrorMode::LegacyDiagnostic).await.map_err(|error| error.to_string())
+        self.fetch(endpoint, repo_root, RestErrorMode::LegacyDiagnostic).await.map_err(|failure| failure.error.to_string())
     }
 
     async fn get_classified_with_headers(
@@ -335,12 +370,21 @@ impl GhApi for GhApiClient {
         repo_root: &Path,
         _label: &ChannelLabel,
     ) -> Result<GhApiResponse, ObservationError> {
+        self.get_classified_response(endpoint, repo_root, _label).await.map_err(|failure| failure.error)
+    }
+
+    async fn get_classified_response(
+        &self,
+        endpoint: &str,
+        repo_root: &Path,
+        _label: &ChannelLabel,
+    ) -> Result<GhApiResponse, GhApiFailure> {
         self.fetch(endpoint, repo_root, RestErrorMode::Classified).await
     }
 }
 
 impl GhApiClient {
-    async fn fetch(&self, endpoint: &str, repo_root: &Path, error_mode: RestErrorMode) -> Result<GhApiResponse, ObservationError> {
+    async fn fetch(&self, endpoint: &str, repo_root: &Path, error_mode: RestErrorMode) -> Result<GhApiResponse, GhApiFailure> {
         if is_issue_observation(endpoint) {
             if let Some((reset, message)) = self.budget_backoff.lock().expect("GitHub budget lock poisoned").as_ref() {
                 if *reset > Utc::now() {
@@ -383,19 +427,33 @@ impl GhApiClient {
         }
 
         if !output.success {
-            if matches!(error_mode, RestErrorMode::Classified) {
-                if let Some(limit) = github_rate_limit(&output.stdout, Utc::now()) {
-                    let budget = response_header(&output.stdout, "x-ratelimit-resource")
-                        .map(|resource| format!("REST {resource}"))
-                        .unwrap_or_else(|| "REST core".into());
-                    return Err(ObservationError::RateLimited { budget, limit });
-                }
-                return Err(output.stderr.into());
-            }
-            if let Some(error) = rate_limit_error_from_response(&output.stdout, "REST core") {
-                return Err(error.into());
-            }
-            return Err(output.stderr.into());
+            let legacy_error = rate_limit_error_from_response(&output.stdout, "REST core").unwrap_or_else(|| output.stderr.clone());
+            let error = if matches!(error_mode, RestErrorMode::Classified) {
+                github_rate_limit(&output.stdout, Utc::now())
+                    .map(|limit| {
+                        let budget = response_header(&output.stdout, "x-ratelimit-resource")
+                            .map(|resource| format!("REST {resource}"))
+                            .unwrap_or_else(|| "REST core".into());
+                        ObservationError::RateLimited { budget, limit }
+                    })
+                    .unwrap_or_else(|| ObservationError::Forge(output.stderr.clone()))
+            } else {
+                ObservationError::Forge(legacy_error.clone())
+            };
+            let response = (parsed.status != 0).then(|| GhApiFailureResponse {
+                status: parsed.status,
+                headers: output
+                    .stdout
+                    .lines()
+                    .skip(1)
+                    .take_while(|line| !line.is_empty())
+                    .filter_map(|line| line.split_once(':'))
+                    .map(|(key, value)| (key.to_ascii_lowercase(), value.trim().to_string()))
+                    .collect(),
+                body: parsed.body,
+                legacy_error,
+            });
+            return Err(GhApiFailure { error, response });
         }
 
         if let Some(ref etag) = parsed.etag {

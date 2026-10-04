@@ -10,7 +10,10 @@ use tracing::warn;
 
 use super::{
     change_request::ObservationError,
-    github_api::{github_rate_limit, rate_limit_error, rate_limit_reset, GhApi, GhApiResponse, GithubRateLimit, GithubRateLimitKind},
+    github_api::{
+        github_rate_limit, rate_limit_error, rate_limit_reset, GhApi, GhApiFailure, GhApiFailureResponse, GhApiResponse, GithubRateLimit,
+        GithubRateLimitKind,
+    },
     ChannelLabel, ChannelLabeler, ChannelRequest, CommandOutput, CommandRunner, DefaultLabeler,
 };
 
@@ -534,6 +537,12 @@ impl ReplayGhApi {
 }
 
 fn replay_gh_error(status: u16, body: &str, headers: &HashMap<String, String>) -> String {
+    if let Some(error) = headers.get("observation-legacy-error") {
+        return error.clone();
+    }
+    if status == 0 {
+        return headers.get("observation-diagnostic").cloned().unwrap_or_else(|| body.to_string());
+    }
     if status == 403 {
         if let Some(reset) = headers.iter().find_map(|(name, value)| name.eq_ignore_ascii_case("x-ratelimit-reset").then_some(value)) {
             return rate_limit_error(reset);
@@ -546,7 +555,7 @@ fn replay_gh_error(status: u16, body: &str, headers: &HashMap<String, String>) -
 fn replay_classified_gh_error(status: u16, body: &str, headers: &HashMap<String, String>) -> ObservationError {
     if let Some(kind) = headers.get("observation-error-kind") {
         let kind = match kind.as_str() {
-            "forge" => return ObservationError::Forge(body.to_string()),
+            "forge" => return ObservationError::Forge(headers.get("observation-diagnostic").cloned().unwrap_or_else(|| body.to_string())),
             "primary" => GithubRateLimitKind::Primary,
             "secondary" => GithubRateLimitKind::Secondary,
             other => panic!("unknown recorded observation error kind: {other}"),
@@ -678,6 +687,15 @@ impl GhApi for ReplayGhApi {
         _repo_root: &Path,
         label: &ChannelLabel,
     ) -> Result<GhApiResponse, ObservationError> {
+        self.get_classified_response(endpoint, _repo_root, label).await.map_err(|failure| failure.error)
+    }
+
+    async fn get_classified_response(
+        &self,
+        endpoint: &str,
+        _repo_root: &Path,
+        label: &ChannelLabel,
+    ) -> Result<GhApiResponse, GhApiFailure> {
         let interaction = self.session.next(label);
         let Interaction::GhApi { endpoint: expected_endpoint, status, body, headers, .. } = interaction else {
             panic!("ReplayGhApi: expected gh_api interaction");
@@ -692,7 +710,20 @@ impl GhApi for ReplayGhApi {
                 total_count: headers.get("total_count").and_then(|value| value.parse().ok()),
             });
         }
-        Err(replay_classified_gh_error(status, &body, &headers))
+        let error = replay_classified_gh_error(status, &body, &headers);
+        // Only new recordings explicitly attest to a real REST response; old
+        // classified recordings used synthetic 500 and must not invent metadata.
+        let response = headers.get("observation-legacy-error").map(|legacy_error| GhApiFailureResponse {
+            status,
+            headers: headers
+                .iter()
+                .filter(|(key, _)| !key.starts_with("observation-"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            body,
+            legacy_error: legacy_error.clone(),
+        });
+        Err(GhApiFailure { error, response })
     }
 }
 
@@ -983,7 +1014,11 @@ impl GhApi for RecordingGhApi {
         repo_root: &Path,
         label: &ChannelLabel,
     ) -> Result<GhApiResponse, ObservationError> {
-        let result = self.inner.get_classified_with_headers(endpoint, repo_root, label).await;
+        self.get_classified_response(endpoint, repo_root, label).await.map_err(|failure| failure.error)
+    }
+
+    async fn get_classified_response(&self, endpoint: &str, repo_root: &Path, label: &ChannelLabel) -> Result<GhApiResponse, GhApiFailure> {
+        let result = self.inner.get_classified_response(endpoint, repo_root, label).await;
         let default = DefaultLabeler.label_for(&ChannelRequest::GhApi { method: "GET", endpoint });
         let mut headers = HashMap::new();
         let (status, body) = match &result {
@@ -999,7 +1034,13 @@ impl GhApi for RecordingGhApi {
                 }
                 (response.status, response.body.clone())
             }
-            Err(error) => {
+            Err(failure) => {
+                let error = &failure.error;
+                if let Some(response) = &failure.response {
+                    headers.extend(response.headers.clone());
+                    headers.insert("observation-legacy-error".into(), response.legacy_error.clone());
+                }
+                headers.insert("observation-diagnostic".into(), error.to_string());
                 match error {
                     ObservationError::Forge(_) => {
                         headers.insert("observation-error-kind".into(), "forge".into());
@@ -1013,7 +1054,7 @@ impl GhApi for RecordingGhApi {
                         }
                     }
                 }
-                (500, error.to_string())
+                failure.response.as_ref().map(|response| (response.status, response.body.clone())).unwrap_or_else(|| (0, error.to_string()))
             }
         };
         self.session.record(Interaction::GhApi {
