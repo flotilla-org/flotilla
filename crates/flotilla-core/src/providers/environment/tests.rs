@@ -36,15 +36,24 @@ fn test_daemon_tool(socket_path: impl Into<PathBuf>) -> EnvironmentTool {
 struct RecordingRunner {
     calls: Mutex<Vec<(String, Vec<String>, PathBuf)>>,
     result: Result<String, String>,
+    image_environment: Mutex<VecDeque<Result<String, String>>>,
 }
 
 impl RecordingRunner {
     fn new_ok(output: &str) -> Self {
-        Self { calls: Mutex::new(vec![]), result: Ok(output.to_string()) }
+        Self { calls: Mutex::new(vec![]), result: Ok(output.to_string()), image_environment: Mutex::new(VecDeque::new()) }
     }
 
     fn new_err(msg: &str) -> Self {
-        Self { calls: Mutex::new(vec![]), result: Err(msg.to_string()) }
+        Self { calls: Mutex::new(vec![]), result: Err(msg.to_string()), image_environment: Mutex::new(VecDeque::new()) }
+    }
+
+    /// Answers the next `docker image inspect --format '{{json .Config.Env}}'`
+    /// with `output`. Repeated calls queue successive answers; the last one
+    /// answers every later inspection.
+    fn with_image_environment(self, output: Result<&str, &str>) -> Self {
+        self.image_environment.lock().expect("image environment mutex").push_back(output.map(str::to_string).map_err(str::to_string));
+        self
     }
 
     fn calls(&self) -> Vec<(String, Vec<String>, PathBuf)> {
@@ -58,6 +67,13 @@ impl CommandRunner for RecordingRunner {
         self.calls.lock().expect("calls mutex").push((cmd.to_string(), args.iter().map(|a| a.to_string()).collect(), cwd.to_path_buf()));
         if cmd == "docker" && args.starts_with(&["inspect", "--format", "{{.Image}}"]) {
             return Ok("sha256:test-image-digest\n".to_string());
+        }
+        if cmd == "docker" && args.starts_with(&["image", "inspect", "--format", "{{json .Config.Env}}"]) {
+            let mut image_environment = self.image_environment.lock().expect("image environment mutex");
+            let answer = if image_environment.len() > 1 { image_environment.pop_front() } else { image_environment.front().cloned() };
+            if let Some(answer) = answer {
+                return answer;
+            }
         }
         self.result.clone()
     }
@@ -578,6 +594,172 @@ async fn create_delivers_tool_assets_and_applies_tool_environment() {
     assert!(args.contains(&"/host/state/terminal:/var/lib/terminal:rw".to_string()));
     assert!(args.contains(&"TERMINAL_STATE=/var/lib/terminal".to_string()));
     assert!(args.contains(&"LD_LIBRARY_PATH=/usr/local/lib/terminal:/image/lib".to_string()));
+}
+
+fn path_prepending_tool() -> EnvironmentTool {
+    EnvironmentTool::new("cargo-shim", "/opt/flotilla/cargo-shim/cargo")
+        .with_environment(EnvironmentVariableUpdate::prepend_path("PATH", "/opt/flotilla/cargo-shim"))
+}
+
+fn path_prepending_opts(image_pull_policy: ImagePullPolicy) -> CreateOpts {
+    CreateOpts {
+        tokens: Vec::new(),
+        working_directory: None,
+        provisioned_mounts: Vec::new(),
+        tools: vec![path_prepending_tool()],
+        image_pull_policy,
+        docker_config_dir: None,
+        cpu_limit: None,
+    }
+}
+
+fn docker_run_args(runner: &RecordingRunner) -> Vec<String> {
+    runner
+        .calls()
+        .into_iter()
+        .map(|(_, args, _)| args)
+        .find(|args| args.first().map(String::as_str) == Some("run"))
+        .expect("docker run call")
+}
+
+#[tokio::test]
+async fn create_prepends_to_the_image_path_when_no_value_is_supplied() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(
+        RecordingRunner::new_ok("container-id-123")
+            .with_image_environment(Ok(r#"["PATH=/usr/local/cargo/bin:/usr/bin:/bin","RUSTUP_HOME=/usr/local/rustup"]"#)),
+    );
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+
+    provider
+        .create(EnvironmentId::new("image-path"), &ImageId::new("crew:latest"), path_prepending_opts(ImagePullPolicy::IfNotPresent))
+        .await
+        .expect("create environment");
+
+    let args = docker_run_args(&runner);
+    assert!(args.contains(&"PATH=/opt/flotilla/cargo-shim:/usr/local/cargo/bin:/usr/bin:/bin".to_string()), "{args:?}");
+    let pull = args.iter().position(|arg| arg == "--pull").expect("--pull flag");
+    assert_eq!(args[pull + 1], "never", "the inspected image is the one that must run: {args:?}");
+}
+
+#[tokio::test]
+async fn create_prepends_to_the_docker_default_path_when_the_image_sets_none() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123").with_image_environment(Ok("null")));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+
+    provider
+        .create(EnvironmentId::new("default-path"), &ImageId::new("scratch-ish"), path_prepending_opts(ImagePullPolicy::IfNotPresent))
+        .await
+        .expect("create environment");
+
+    let args = docker_run_args(&runner);
+    assert!(
+        args.contains(&"PATH=/opt/flotilla/cargo-shim:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()),
+        "{args:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_pulls_before_inspecting_when_the_policy_is_always() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123").with_image_environment(Ok(r#"["PATH=/usr/bin"]"#)));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+
+    provider
+        .create(EnvironmentId::new("always-pull"), &ImageId::new("crew:latest"), path_prepending_opts(ImagePullPolicy::Always))
+        .await
+        .expect("create environment");
+
+    let calls: Vec<Vec<String>> = runner.calls().into_iter().map(|(_, args, _)| args).collect();
+    assert_eq!(calls[0], vec!["pull".to_string(), "crew:latest".to_string()]);
+    assert_eq!(calls[1][..4], ["image", "inspect", "--format", "{{json .Config.Env}}"]);
+    assert!(docker_run_args(&runner).contains(&"PATH=/opt/flotilla/cargo-shim:/usr/bin".to_string()));
+}
+
+#[tokio::test]
+async fn create_refuses_when_the_image_environment_cannot_be_inspected() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123").with_image_environment(Err("No such image: crew:latest")));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+
+    let error = provider
+        .create(EnvironmentId::new("missing-image"), &ImageId::new("crew:latest"), path_prepending_opts(ImagePullPolicy::Never))
+        .await
+        .err()
+        .expect("an uninspectable image should refuse provisioning");
+
+    assert!(error.contains("crew:latest is not available locally"), "{error}");
+    assert!(runner.calls().iter().all(|(_, args, _)| args.first().map(String::as_str) != Some("run")), "no container may start");
+}
+
+#[tokio::test]
+async fn create_pulls_a_missing_image_before_reading_its_environment_when_the_policy_is_if_not_present() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(
+        RecordingRunner::new_ok("container-id-123")
+            .with_image_environment(Err("No such image: crew:latest"))
+            .with_image_environment(Ok(r#"["PATH=/usr/local/cargo/bin:/usr/bin"]"#)),
+    );
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+
+    provider
+        .create(
+            EnvironmentId::new("missing-then-pulled"),
+            &ImageId::new("crew:latest"),
+            path_prepending_opts(ImagePullPolicy::IfNotPresent),
+        )
+        .await
+        .expect("create environment");
+
+    let calls: Vec<Vec<String>> = runner.calls().into_iter().map(|(_, args, _)| args).collect();
+    assert_eq!(calls[0][..4], ["image", "inspect", "--format", "{{json .Config.Env}}"]);
+    assert_eq!(calls[1], vec!["pull".to_string(), "crew:latest".to_string()]);
+    assert_eq!(calls[2][..4], ["image", "inspect", "--format", "{{json .Config.Env}}"]);
+    let args = docker_run_args(&runner);
+    assert!(args.contains(&"PATH=/opt/flotilla/cargo-shim:/usr/local/cargo/bin:/usr/bin".to_string()), "{args:?}");
+    let pull = args.iter().position(|arg| arg == "--pull").expect("--pull flag");
+    assert_eq!(args[pull + 1], "never", "{args:?}");
+}
+
+#[tokio::test]
+async fn create_reports_both_inspect_and_pull_failures_when_a_missing_image_cannot_be_pulled() {
+    use flotilla_protocol::ImageId;
+
+    let runner =
+        Arc::new(RecordingRunner::new_err("pull access denied for crew").with_image_environment(Err("No such image: crew:latest")));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+
+    let error = provider
+        .create(EnvironmentId::new("unpullable"), &ImageId::new("crew:latest"), path_prepending_opts(ImagePullPolicy::IfNotPresent))
+        .await
+        .err()
+        .expect("an unpullable missing image should refuse provisioning");
+
+    assert!(error.contains("No such image: crew:latest"), "{error}");
+    assert!(error.contains("pull access denied for crew"), "{error}");
+    assert!(runner.calls().iter().all(|(_, args, _)| args.first().map(String::as_str) != Some("run")), "no container may start");
+}
+
+#[tokio::test]
+async fn create_uses_the_bare_value_for_a_non_path_variable_the_image_does_not_set() {
+    use flotilla_protocol::ImageId;
+
+    let runner = Arc::new(RecordingRunner::new_ok("container-id-123").with_image_environment(Ok(r#"["PATH=/usr/bin"]"#)));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let mut opts = path_prepending_opts(ImagePullPolicy::IfNotPresent);
+    opts.tools = vec![EnvironmentTool::new("terminal", "/usr/local/bin/terminal")
+        .with_environment(EnvironmentVariableUpdate::prepend_path("LD_LIBRARY_PATH", "/usr/local/lib/terminal"))];
+
+    provider.create(EnvironmentId::new("bare-value"), &ImageId::new("crew:latest"), opts).await.expect("create environment");
+
+    let args = docker_run_args(&runner);
+    assert!(args.contains(&"LD_LIBRARY_PATH=/usr/local/lib/terminal".to_string()), "{args:?}");
 }
 
 #[tokio::test]

@@ -11,12 +11,15 @@ use sha2::{Digest, Sha256};
 
 use super::{
     runner::DockerEnvironmentRunner, CreateOpts, EnvironmentHandle, EnvironmentProvider, EnvironmentToolAssetAccess,
-    EnvironmentToolAssetKind, EnvironmentVariableUpdate, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode,
+    EnvironmentToolAssetKind, EnvironmentVariableUpdate, ImagePullPolicy, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode,
 };
 use crate::providers::{ChannelLabel, CommandRunner};
 
 /// Bump this when the short-term Dockerfile image fingerprint inputs change.
 const DOCKERFILE_IMAGE_TAG_VERSION: &str = "v1";
+
+/// The `PATH` Docker gives a container whose image does not set one.
+const DOCKER_DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 // ---------------------------------------------------------------------------
 // DockerEnvironmentProvider
@@ -73,6 +76,11 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         let requested_mounts = opts.provisioned_mounts;
         let mut provisioned_mounts = Vec::new();
         let mut tokens = opts.tokens;
+        let docker_config = opts.docker_config_dir.as_ref().map(ToString::to_string);
+        let mut pull_policy = opts.image_pull_policy.docker_value();
+        // Docker replaces an image's variable outright when `-e` names it, so a
+        // prepend with no caller-supplied value must start from the image's own.
+        let mut image_environment: Option<HashMap<String, String>> = None;
         for tool in &opts.tools {
             for asset in &tool.assets {
                 let mode = match asset.access {
@@ -112,7 +120,30 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
                     EnvironmentVariableUpdate::PrependPath { name, value } => {
                         match tokens.iter_mut().find(|(existing, _)| existing == name) {
                             Some((_, existing)) => *existing = format!("{value}:{existing}"),
-                            None => tokens.push((name.clone(), value.clone())),
+                            None => {
+                                if image_environment.is_none() {
+                                    image_environment = Some(
+                                        self.inner
+                                            .image_environment(image.as_str(), opts.image_pull_policy, docker_config.as_deref())
+                                            .await?,
+                                    );
+                                    // The inspected image is now local; run exactly that one.
+                                    pull_policy = ImagePullPolicy::Never.docker_value();
+                                }
+                                let base = image_environment
+                                    .as_ref()
+                                    .and_then(|environment| environment.get(name))
+                                    .map(String::as_str)
+                                    .or_else(|| (name == "PATH").then_some(DOCKER_DEFAULT_PATH))
+                                    // An image that sets the variable to empty gets the bare
+                                    // value, not a trailing `:` (which would mean the cwd).
+                                    .filter(|base| !base.is_empty());
+                                let combined = match base {
+                                    Some(base) => format!("{value}:{base}"),
+                                    None => value.clone(),
+                                };
+                                tokens.push((name.clone(), combined));
+                            }
                         }
                     }
                 }
@@ -128,7 +159,6 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         #[cfg(unix)]
         let user = host_user();
 
-        let docker_config = opts.docker_config_dir.as_ref().map(ToString::to_string);
         let mut args = Vec::new();
         if let Some(config) = &docker_config {
             args.extend(["--config", config.as_str()]);
@@ -138,7 +168,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             "-d",
             "--init",
             "--pull",
-            opts.image_pull_policy.docker_value(),
+            pull_policy,
             "--name",
             &container_name,
             "--label",
@@ -316,6 +346,61 @@ impl DockerEnvironmentProviderInner {
             runner,
             provisioned_mounts,
         })
+    }
+
+    /// Resolves `image` locally under `pull_policy` and returns the environment
+    /// its config declares.
+    async fn image_environment(
+        &self,
+        image: &str,
+        pull_policy: ImagePullPolicy,
+        docker_config: Option<&str>,
+    ) -> Result<HashMap<String, String>, String> {
+        let output = match pull_policy {
+            ImagePullPolicy::Always => {
+                self.pull(image, docker_config)
+                    .await
+                    .map_err(|error| format!("pulling image {image} to read its environment failed: {error}"))?;
+                self.inspect_environment(image).await?
+            }
+            ImagePullPolicy::IfNotPresent => match self.inspect_environment(image).await {
+                Ok(output) => output,
+                Err(inspect_error) => {
+                    self.pull(image, docker_config).await.map_err(|error| {
+                        format!(
+                            "image {image} could not be inspected ({inspect_error}) and pulling it to read its environment failed: {error}"
+                        )
+                    })?;
+                    self.inspect_environment(image).await?
+                }
+            },
+            ImagePullPolicy::Never => self
+                .inspect_environment(image)
+                .await
+                .map_err(|error| format!("image {image} is not available locally and the pull policy is never: {error}"))?,
+        };
+        let entries: Option<Vec<String>> = serde_json::from_str(output.trim())
+            .map_err(|error| format!("docker returned invalid environment for image {image}: {error}"))?;
+        Ok(entries
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| entry.split_once('=').map(|(name, value)| (name.to_string(), value.to_string())))
+            .collect())
+    }
+
+    async fn inspect_environment(&self, image: &str) -> Result<String, String> {
+        self.runner
+            .run("docker", &["image", "inspect", "--format", "{{json .Config.Env}}", image], Path::new("/"), &ChannelLabel::Default)
+            .await
+    }
+
+    async fn pull(&self, image: &str, docker_config: Option<&str>) -> Result<(), String> {
+        let mut args = Vec::new();
+        if let Some(config) = docker_config {
+            args.extend(["--config", config]);
+        }
+        args.extend(["pull", image]);
+        self.runner.run("docker", &args, Path::new("/"), &ChannelLabel::Default).await.map(|_| ())
     }
 
     async fn image_digest(&self, container_name: &str) -> Result<String, String> {
