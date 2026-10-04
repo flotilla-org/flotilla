@@ -33,6 +33,13 @@ pub(crate) enum CheckoutResolutionScope {
     RemoteAny,
 }
 
+fn checkout_is_local(checkout_path: &QualifiedPath, checkout: &Checkout, local_host: &HostName) -> bool {
+    match checkout.host_name.as_ref().or_else(|| checkout_path.host_name()) {
+        Some(host_name) => host_name == local_host,
+        None => checkout_is_local_owned(checkout_path, local_host),
+    }
+}
+
 pub(crate) fn checkout_matches_scope(
     checkout_path: &QualifiedPath,
     checkout: &Checkout,
@@ -42,14 +49,8 @@ pub(crate) fn checkout_matches_scope(
     let effective_host_name = checkout.host_name.as_ref().or_else(|| checkout_path.host_name());
     match scope {
         CheckoutResolutionScope::Any => true,
-        CheckoutResolutionScope::Local => match effective_host_name {
-            Some(host_name) => host_name == local_host,
-            None => checkout_is_local_owned(checkout_path, local_host),
-        },
-        CheckoutResolutionScope::RemoteAny => match effective_host_name {
-            Some(host_name) => host_name != local_host,
-            None => !checkout_is_local_owned(checkout_path, local_host),
-        },
+        CheckoutResolutionScope::Local => checkout_is_local(checkout_path, checkout, local_host),
+        CheckoutResolutionScope::RemoteAny => !checkout_is_local(checkout_path, checkout, local_host),
         CheckoutResolutionScope::Host(target_host) => effective_host_name == Some(target_host),
     }
 }
@@ -105,21 +106,24 @@ pub(super) fn resolve_checkout_branch(
     scope: &CheckoutResolutionScope,
 ) -> Result<String, String> {
     match selector {
-        CheckoutSelector::Path(path) => providers_data
-            .checkouts
-            .iter()
-            .find(|(host_path, checkout)| {
-                if !checkout_matches_scope(host_path, checkout, local_host, scope) {
-                    return false;
-                }
-                if checkout_matches_scope(host_path, checkout, local_host, &CheckoutResolutionScope::Local) {
-                    canonical_or_original(&host_path.path) == canonical_or_original(path)
-                } else {
-                    host_path.path == *path
-                }
-            })
-            .map(|(_, checkout)| checkout.branch.clone())
-            .ok_or_else(|| format!("checkout not found: {}", path.display())),
+        CheckoutSelector::Path(path) => {
+            let physical_path = canonical_or_original(path);
+            providers_data
+                .checkouts
+                .iter()
+                .find(|(host_path, checkout)| {
+                    if !checkout_matches_scope(host_path, checkout, local_host, scope) {
+                        return false;
+                    }
+                    if checkout_is_local(host_path, checkout, local_host) {
+                        canonical_or_original(&host_path.path) == physical_path
+                    } else {
+                        host_path.path == *path
+                    }
+                })
+                .map(|(_, checkout)| checkout.branch.clone())
+                .ok_or_else(|| format!("checkout not found: {}", path.display()))
+        }
         CheckoutSelector::Query(query) => {
             let matches: Vec<String> = providers_data
                 .checkouts

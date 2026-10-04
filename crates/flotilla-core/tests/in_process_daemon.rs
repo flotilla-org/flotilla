@@ -733,6 +733,11 @@ impl ChangeRequestTracker for CountingChangeRequestTracker {
     }
 }
 
+// Fake fixtures model Git's physical paths even when TMPDIR is aliased.
+fn physical_tempdir_path(temp: &tempfile::TempDir) -> PathBuf {
+    std::fs::canonicalize(temp.path()).expect("physical fixture")
+}
+
 // #2570: exercise cosmetic filesystem aliases on Linux as well as macOS.
 // The TempDir owns both the physical directory and its symlink for cleanup.
 fn symlinked_fixture() -> (tempfile::TempDir, PathBuf) {
@@ -755,7 +760,7 @@ async fn daemon_for_cwd() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) 
 
 async fn daemon_for_plain_dir() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let repo = std::fs::canonicalize(temp.path()).expect("physical fixture").join("repo");
+    let repo = physical_tempdir_path(&temp).join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
     let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
@@ -5383,7 +5388,7 @@ fn init_git_repo_with_local_bare_remote(path: &Path, remote_path: &Path) -> Repo
 
 async fn daemon_for_fake_repo() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, RepoIdentity) {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let repo = std::fs::canonicalize(temp.path()).expect("physical fixture").join("repo");
+    let repo = physical_tempdir_path(&temp).join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
 
     let state =
@@ -5445,8 +5450,8 @@ async fn strict_refresh_surfaces_repository_inspection_failures() {
 
 async fn daemon_for_duplicate_fake_repos() -> (tempfile::TempDir, PathBuf, PathBuf, Arc<InProcessDaemon>) {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let repo_a = std::fs::canonicalize(temp.path()).expect("physical fixture").join("repo-a");
-    let repo_b = std::fs::canonicalize(temp.path()).expect("physical fixture").join("repo-b");
+    let repo_a = physical_tempdir_path(&temp).join("repo-a");
+    let repo_b = physical_tempdir_path(&temp).join("repo-b");
     std::fs::create_dir_all(&repo_a).expect("create repo-a dir");
     std::fs::create_dir_all(&repo_b).expect("create repo-b dir");
 
@@ -6693,7 +6698,7 @@ async fn fetch_checkout_status_accepts_identity_context_repo() {
 #[tokio::test]
 async fn add_and_remove_repo_updates_state_and_emits_events() {
     let temp = tempfile::tempdir().unwrap();
-    let repo = std::fs::canonicalize(temp.path()).expect("physical fixture").join("new-repo");
+    let repo = physical_tempdir_path(&temp).join("new-repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
     init_git_repo(&repo);
 
@@ -6939,8 +6944,8 @@ async fn stop_observing_missing_checkout_refuses_without_started_event() {
 #[tokio::test]
 async fn refresh_all_command_refreshes_every_tracked_repo() {
     let temp = tempfile::tempdir().unwrap();
-    let repo_a = std::fs::canonicalize(temp.path()).expect("physical fixture").join("repo-a");
-    let repo_b = std::fs::canonicalize(temp.path()).expect("physical fixture").join("repo-b");
+    let repo_a = physical_tempdir_path(&temp).join("repo-a");
+    let repo_b = physical_tempdir_path(&temp).join("repo-b");
     std::fs::create_dir_all(&repo_a).unwrap();
     std::fs::create_dir_all(&repo_b).unwrap();
 
@@ -7004,7 +7009,12 @@ async fn symlinked_remove_repo_retires_tracked_and_persisted_roots() {
     init_git_repo(&repo);
     let config = test_config_store(temp.path().join("config"));
     config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("alias observation root");
-    let daemon = InProcessDaemon::new(vec![repo.clone()], Arc::clone(&config), git_process_discovery(false), HostName::local()).await;
+    let physical = std::fs::canonicalize(&repo).expect("physical checkout");
+    config.add_observation_root(&ExecutionEnvironmentPath::new(&physical)).expect("physical observation root");
+    let daemon =
+        InProcessDaemon::new(vec![repo.clone(), physical], Arc::clone(&config), git_process_discovery(false), HostName::local()).await;
+    // Legacy persisted spellings produce one physical root, and removal retires both.
+    assert_eq!(daemon.tracked_repo_paths().await.len(), 1);
     daemon.remove_repo(&repo).await.expect("remove alias checkout");
     assert!(daemon.tracked_repo_paths().await.is_empty());
     assert!(config.load_observation_roots().expect("roots").is_empty());
@@ -7191,7 +7201,7 @@ async fn get_repo_providers_returns_structured_unmet_requirements_and_discovery(
 #[tokio::test]
 async fn add_repo_uses_manager_backed_local_environment_for_repo_identity() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let repo = std::fs::canonicalize(temp.path()).expect("physical fixture").join("repo");
+    let repo = physical_tempdir_path(&temp).join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
     let config = test_config_store(temp.path().join("config"));
     let daemon =
@@ -8452,7 +8462,7 @@ fn repository_operations_without_tracked_roots(tc: hegel::TestCase) {
             )
             .await
             .expect("declare alias");
-        let path = std::fs::canonicalize(temp.path()).expect("physical fixture").join("checkout");
+        let path = physical_tempdir_path(&temp).join("checkout");
         if checkout {
             daemon
                 .observed_resource_backend()

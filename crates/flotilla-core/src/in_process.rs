@@ -3733,12 +3733,16 @@ impl InProcessDaemon {
             self.environment_manager.local_host_id().as_str(),
         )
         .await?;
+        let physical_selector_path = match selector {
+            flotilla_protocol::CheckoutSelector::Path(path) => Some(canonical_or_original(path)),
+            flotilla_protocol::CheckoutSelector::Query(_) => None,
+        };
         let mut matches = Vec::new();
         for checkout in checkouts {
             let Some(path) = checkout_path(&checkout) else { continue };
             let branch = checkout.spec.branch();
             let matched = match selector {
-                flotilla_protocol::CheckoutSelector::Path(candidate) => Path::new(path) == canonical_or_original(candidate),
+                flotilla_protocol::CheckoutSelector::Path(_) => physical_selector_path.as_deref() == Some(Path::new(path)),
                 flotilla_protocol::CheckoutSelector::Query(query) => branch == query || branch.contains(query) || path.contains(query),
             };
             if !matched {
