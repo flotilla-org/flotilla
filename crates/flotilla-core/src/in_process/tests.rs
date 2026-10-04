@@ -413,6 +413,178 @@ async fn operator_brief_survives_a_racing_nudge_until_delivery() {
     assert!(std::iter::once(&head).chain(head.following.iter()).any(|message| message.text.contains("New guidance")));
 }
 
+// #2559: an idle reconciliation pass must neither write resources nor emit
+// events, because its runtime caller is triggered by those same watches.
+#[hegel::test]
+fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+
+    // Generate repeated idle passes and both queue positions (head/following).
+    // Each case runs every lifecycle state against both real storage backends.
+    // The convoy turn stays a single message; its position in the terminal queue varies.
+    let passes = tc.draw(gs::integers::<usize>().min_value(2).max_value(4));
+    let following = tc.draw(gs::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        for sqlite in [false, true] {
+            let temp = tempfile::tempdir().expect("contract directory");
+            std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"noop-contract\"\n").expect("daemon identity");
+            let backend = if sqlite {
+                ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open(temp.path().join("resources.db")).expect("sqlite backend"))
+            } else {
+                ResourceBackend::InMemory(InMemoryBackend::default())
+            };
+            let daemon = InProcessDaemon::new_with_resource_backend(
+                Vec::new(),
+                Arc::new(ConfigStore::with_base(temp.path())),
+                fake_discovery(false),
+                HostName::new("noop-contract"),
+                backend.clone(),
+            )
+            .await;
+            // Keep contract resources outside the daemon's background provisioning namespace.
+            let namespace = "noop-contract";
+            let sessions = backend.clone().using::<ResourceTerminalSession>(namespace);
+            let convoys = backend.clone().using::<ResourceConvoy>(namespace);
+            assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "empty store", passes).await;
+
+            let message = TerminalCrewMessage {
+                id: "supervisor-turn".to_string(),
+                text: "Supervise".to_string(),
+                sender: CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
+                delivery: CrewMessageDelivery::Queued,
+                acknowledged: Default::default(),
+                following: Vec::new(),
+            };
+            let mut head = message.clone();
+            if following {
+                head.id = "earlier-turn".to_string();
+                head.append(message.clone());
+            }
+            let spec = ResourceTerminalSessionSpec {
+                env_ref: "env".to_string(),
+                role: "governor".to_string(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("governor"),
+                    brief: flotilla_resources::TerminalBrief {
+                        path: "brief.md".to_string(),
+                        content: "standing brief".to_string(),
+                        artifact_digest: None,
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: namespace.to_string(),
+                        convoy: "convoy".to_string(),
+                        vessel_ref: "govern".to_string(),
+                    }),
+                    message: Some(head),
+                },
+                cwd: "/workspace".to_string(),
+                pool: "cleat".to_string(),
+            };
+            sessions.create(&test_meta("unrelated"), &spec).await.expect("unrelated terminal");
+            assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "unrelated terminal", passes).await;
+
+            let convoy = convoys
+                .create(&test_meta("convoy"), &ConvoySpec::builder().workflow_ref("governor".to_string()).build())
+                .await
+                .expect("convoy");
+            convoys
+                .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
+                    turn_deliveries: BTreeMap::from([(message.id.clone(), flotilla_resources::TurnDeliveryStatus {
+                        pending_supervisor_turn: Some(flotilla_resources::PendingSupervisorTurn {
+                            vessel: "govern".to_string(),
+                            role: "governor".to_string(),
+                            message: message.clone(),
+                            queued_order: 1,
+                        }),
+                        ..Default::default()
+                    })]),
+                    ..Default::default()
+                })
+                .await
+                .expect("pending turn");
+            let session = sessions
+                .create(
+                    &InputMeta::builder()
+                        .name("governor".to_string())
+                        .labels(BTreeMap::from([
+                            (CONVOY_LABEL.to_string(), "convoy".to_string()),
+                            (VESSEL_LABEL.to_string(), "govern".to_string()),
+                            (ROLE_LABEL.to_string(), "governor".to_string()),
+                        ]))
+                        .build(),
+                    &spec,
+                )
+                .await
+                .expect("queued terminal");
+            let session = sessions
+                .update_status(&session.metadata.name, &session.metadata.resource_version, &ResourceTerminalSessionStatus {
+                    phase: ResourceTerminalSessionPhase::Running,
+                    ..Default::default()
+                })
+                .await
+                .expect("running terminal");
+            assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "already queued turn", passes).await;
+
+            let mut status = session.status.expect("running status");
+            status.delivered_message_id = Some(message.id);
+            sessions.update_status("governor", &session.metadata.resource_version, &status).await.expect("delivered turn");
+            daemon.reconcile_pending_supervisor_turns_once(namespace).await.expect("acknowledge delivered turn");
+            // The real acknowledgment clears the pending convoy turn while retaining
+            // the terminal queue and its delivered-message status.
+            let acknowledged = convoys.get("convoy").await.expect("acknowledged convoy");
+            assert!(acknowledged
+                .status
+                .expect("convoy status")
+                .turn_deliveries
+                .values()
+                .all(|turn| turn.pending_supervisor_turn.is_none()));
+            assert_supervisor_turn_passes_are_idle(&daemon, &backend, namespace, "already acknowledged turn", passes).await;
+        }
+    });
+}
+
+async fn assert_supervisor_turn_passes_are_idle(
+    daemon: &InProcessDaemon,
+    backend: &ResourceBackend,
+    namespace: &str,
+    state: &str,
+    passes: usize,
+) {
+    let backend_name = match backend {
+        ResourceBackend::InMemory(_) => "in-memory",
+        ResourceBackend::Sqlite(_) => "sqlite",
+        _ => panic!("unsupported contract backend"),
+    };
+    let state = format!("{backend_name}: {state}");
+    let sessions = backend.clone().using::<ResourceTerminalSession>(namespace);
+    let convoys = backend.clone().using::<ResourceConvoy>(namespace);
+    // This namespace has no concurrent writers, so list-to-subscribe cannot miss a write.
+    let before_sessions = serde_json::to_value(sessions.list().await.expect("terminal baseline")).expect("serialize terminal baseline");
+    let before_convoys = serde_json::to_value(convoys.list().await.expect("convoy baseline")).expect("serialize convoy baseline");
+    let mut session_watch = sessions.watch(flotilla_resources::WatchStart::Now).await.expect("terminal watch");
+    let mut convoy_watch = convoys.watch(flotilla_resources::WatchStart::Now).await.expect("convoy watch");
+    for pass in 0..passes {
+        daemon.reconcile_pending_supervisor_turns_once(namespace).await.expect("idle pass succeeds");
+        // Resource objects and list versions expose even writes of unchanged values.
+        assert_eq!(
+            serde_json::to_value(sessions.list().await.expect("terminal after pass")).expect("serialize terminals"),
+            before_sessions,
+            "{state}, pass {pass}: terminal write"
+        );
+        assert_eq!(
+            serde_json::to_value(convoys.list().await.expect("convoy after pass")).expect("serialize convoys"),
+            before_convoys,
+            "{state}, pass {pass}: convoy write"
+        );
+        // Both local backends publish before their write completes. Poll directly:
+        // an idle watch must be pending, never an event, error, or closed stream.
+        assert!(session_watch.next().now_or_never().is_none(), "{state}, pass {pass}: terminal watch activity");
+        assert!(convoy_watch.next().now_or_never().is_none(), "{state}, pass {pass}: convoy watch activity");
+    }
+}
+
 #[test]
 fn turn_delivery_restarts_a_lost_session() {
     assert_eq!(
