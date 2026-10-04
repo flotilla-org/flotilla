@@ -17,8 +17,9 @@ use flotilla_resources::{
     InMemoryBackend, InputMeta, InputValue, IntegrationCondition, LandedEvidence, LifecycleAuthority, Observation,
     ObservedChangeRequestState, ObservedCheckoutSpec, ObservedChecks, ObservedMergeability, OwnerReference, Presentation, PresentationSpec,
     RepositoryKey, ResourceBackend, ReviewRefPair, SettlementClaimEvidence, StatusPatch, TargetMismatch, TerminalSession,
-    TerminalSessionSource, TerminalSessionSpec, UnmetSettlementExpectation, ValidationError, Vessel, VesselPhase, VesselSpec, VesselStatus,
-    WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL, VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, UnmetSettlementExpectation, ValidationError,
+    Vessel, VesselPhase, VesselSpec, VesselStatus, WorkCompletionAuthority, WorkPhase, WorkflowSnapshot, WorkflowTemplate, CONVOY_LABEL,
+    VESSEL_LABEL, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 
 use crate::common;
@@ -1565,7 +1566,7 @@ async fn reconcile_terminal_bound_change_request(
     checkout_present: bool,
     vessel_present: bool,
     untouched_checkout: bool,
-) -> (flotilla_resources::SettlementEvaluation, flotilla_resources::controller::ReconcileOutcome<Convoy>) {
+) -> (flotilla_resources::SettlementEvaluation, flotilla_resources::controller::ReconcileOutcome<Convoy>, ResourceBackend) {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
@@ -1751,33 +1752,33 @@ async fn reconcile_terminal_bound_change_request(
         .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), std::time::Duration::from_secs(180))
         .with_clock(Arc::new(FixedClock(timestamp(40))));
     let deps = reconciler.prepare(&current).await.expect("dependencies");
-    (evaluation, reconciler.reconcile(&current, &deps, timestamp(40)))
+    (evaluation, reconciler.reconcile(&current, &deps, timestamp(40)), backend)
 }
 
 #[tokio::test]
 async fn terminal_bound_change_request_settles_checkout_without_own_landed_evidence() {
-    let (_, outcome) = reconcile_terminal_bound_change_request(true, true, false).await;
+    let (_, outcome, _) = reconcile_terminal_bound_change_request(true, true, false).await;
 
     assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
 }
 
 #[tokio::test]
 async fn terminal_bound_change_request_discharges_missing_checkout_after_vessel_teardown() {
-    let (_, outcome) = reconcile_terminal_bound_change_request(false, false, false).await;
+    let (_, outcome, _) = reconcile_terminal_bound_change_request(false, false, false).await;
 
     assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
 }
 
 #[tokio::test]
 async fn terminal_bound_change_request_keeps_missing_checkout_expectation_for_live_vessel() {
-    let (_, outcome) = reconcile_terminal_bound_change_request(false, true, false).await;
+    let (_, outcome, _) = reconcile_terminal_bound_change_request(false, true, false).await;
 
     assert_eq!(outcome.patch, None);
 }
 
 #[tokio::test]
 async fn merged_change_request_discharges_present_context_checkout_without_change_request() {
-    let (evaluation, outcome) = reconcile_terminal_bound_change_request(true, true, true).await;
+    let (evaluation, outcome, _) = reconcile_terminal_bound_change_request(true, true, true).await;
 
     assert!(evaluation.satisfied, "the untouched context checkout must not block the merged exit: {:?}", evaluation.unmet);
     assert!(evaluation.unmet.is_empty());
@@ -2935,4 +2936,180 @@ async fn one_task_completed_deletes_only_that_presentation() {
         })
         .collect();
     assert!(deletes.is_empty(), "per-vessel warmth remains until the convoy reaches a terminal phase");
+}
+
+// #2613: settlement is terminal once merge has been recognised. Collecting the
+// evidence afterwards must not undo it; without recognition, absence still holds.
+#[hegel::test]
+fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
+    // Cover both deletion orders, recognised/unrecognised merge, and legacy
+    // Landed records that predate the persisted disposition.
+    let recognise_merge = tc.draw(hegel::generators::booleans());
+    let checkout_first = tc.draw(hegel::generators::booleans());
+    let legacy_disposition = tc.draw(hegel::generators::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let (_, outcome, backend) = reconcile_terminal_bound_change_request(true, true, false).await;
+        let convoys = backend.using::<Convoy>("flotilla");
+        let checkouts = backend.using::<Checkout>("flotilla");
+        let changes = backend.using::<ChangeRequest>("flotilla");
+        let vessels = backend.using::<Vessel>("flotilla");
+        let sessions = backend.using::<TerminalSession>("flotilla");
+        if recognise_merge {
+            let current = convoys.get("convoy-a").await.expect("convoy");
+            let mut status = current.status.clone().expect("status");
+            outcome.patch.expect("merged exit").apply(&mut status);
+            if legacy_disposition {
+                status.disposition = None;
+            }
+            convoys.update_status("convoy-a", &current.metadata.resource_version, &status).await.expect("persist settlement");
+        }
+        if !recognise_merge {
+            let name = change_request_record_name("example.com", "repo-a", 42);
+            let record = changes.get(&name).await.expect("CR");
+            let mut status = record.status.expect("CR status");
+            status.state = Observation::known(ObservedChangeRequestState::Open, timestamp(40));
+            changes.update_status(&name, &record.metadata.resource_version, &status).await.expect("publish open CR");
+        }
+        sessions
+            .create(
+                &InputMeta::builder()
+                    .name("orphan-session".to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]))
+                    .build(),
+                &TerminalSessionSpec {
+                    env_ref: "host-direct-feta".to_string(),
+                    role: "coder".to_string(),
+                    source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                    cwd: "/workspace".to_string(),
+                    pool: "cleat".to_string(),
+                },
+            )
+            .await
+            .expect("orphan session");
+        let session = sessions.get("orphan-session").await.expect("session");
+        sessions
+            .update_status("orphan-session", &session.metadata.resource_version, &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                session_id: Some("already-removed-container-session".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("running orphan session");
+        let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+            .with_vessels(vessels.clone())
+            .with_checkouts(checkouts.clone())
+            .with_terminal_sessions(sessions.clone())
+            .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
+            .with_teardown_runtime(Arc::new(AlwaysEligible))
+            .with_clock(Arc::new(FixedClock(timestamp(40))));
+        for (step, delete_checkout) in [checkout_first, !checkout_first].into_iter().enumerate() {
+            if delete_checkout {
+                checkouts.delete("checkout-a").await.expect("collect checkout");
+            } else {
+                changes.delete(&change_request_record_name("example.com", "repo-a", 42)).await.expect("collect CR");
+            }
+            let current = convoys.get("convoy-a").await.expect("convoy");
+            let checkout_objects =
+                checkouts.list().await.expect("checkouts").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
+            let change_objects =
+                changes.list().await.expect("changes").items.into_iter().map(|object| (object.metadata.name.clone(), object)).collect();
+            let evaluation = evaluate_landing_settlement(
+                &current,
+                &BTreeMap::new(),
+                &checkout_objects,
+                &change_objects,
+                Duration::from_secs(180),
+                Duration::from_secs(30),
+                timestamp(40),
+            );
+            let prepared = reconciler.prepare(&current).await.expect("prepare after collection");
+            let outcome = reconciler.reconcile(&current, &prepared, timestamp(40));
+            if recognise_merge {
+                assert!(evaluation.satisfied, "Landed settlement must survive collection: {:?}", evaluation.unmet);
+                assert!(evaluation.unmet.is_empty());
+                if step == 0 {
+                    assert!(outcome.actuations.iter().any(|actuation| matches!(actuation,
+                        Actuation::DeleteVessel { name } if name == "convoy-a-implement")));
+                    vessels.delete("convoy-a-implement").await.expect("vessel collected before orphan session");
+                }
+                assert!(
+                    outcome.actuations.iter().any(|actuation| matches!(actuation,
+                    Actuation::DeleteTerminalSession { name } if name == "orphan-session")),
+                    "terminal cleanup must sweep sessions even without vessel ownership"
+                );
+                assert_eq!(outcome.requeue_after, None);
+            } else {
+                assert!(!evaluation.satisfied, "unrecognised merge cannot discharge missing evidence");
+                assert!(outcome.patch.is_none());
+                assert!(outcome
+                    .actuations
+                    .iter()
+                    .all(|actuation| !matches!(actuation, Actuation::DeleteVessel { .. } | Actuation::DeleteTerminalSession { .. })));
+            }
+        }
+        if recognise_merge {
+            let current = convoys.get("convoy-a").await.expect("convoy");
+            reconciler.run_finalizer(&current).await.expect("teardown after evidence collection");
+            assert!(vessels.list().await.expect("vessels").items.is_empty());
+            assert!(sessions.list().await.expect("sessions").items.is_empty());
+        }
+    });
+}
+
+// Terminal cleanup must obey the reclaim refusal and lifecycle authority,
+// and must not repeatedly request deletion while a session finalizer runs.
+#[hegel::test]
+fn terminal_session_cleanup_respects_reclaim_and_authority(tc: hegel::TestCase) {
+    let phases = [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Cancelled, ConvoyPhase::Abandoned];
+    let authorities = [LifecycleAuthority::Managed, LifecycleAuthority::Adopted, LifecycleAuthority::Observed];
+    // Cover every terminal phase and authority on both sides of the gate.
+    let phase = phases[tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3))];
+    let authority = authorities[tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2))];
+    let eligible = tc.draw(hegel::generators::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let sessions = backend.using::<TerminalSession>("flotilla");
+        sessions
+            .create(
+                &InputMeta::builder()
+                    .name("orphan-session".to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string())]))
+                    .finalizers(vec!["test-terminal-teardown".to_string()])
+                    .build()
+                    .with_lifecycle_authority(authority),
+                &TerminalSessionSpec {
+                    env_ref: "host-direct-feta".to_string(),
+                    role: "coder".to_string(),
+                    source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                    cwd: "/workspace".to_string(),
+                    pool: "cleat".to_string(),
+                },
+            )
+            .await
+            .expect("orphan session");
+        let mut status = bootstrapped_tool_only_convoy_status();
+        status.phase = phase;
+        let convoy = convoy_object("convoy-a", task_provisioning_convoy_spec(), Some(status));
+        // Inject only the daemon verification boundary; resource discovery uses the real backend.
+        let gate: Arc<dyn ConvoyTeardownRuntime> = if eligible { Arc::new(AlwaysEligible) } else { Arc::new(NeverEligible) };
+        let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+            .with_terminal_sessions(sessions.clone())
+            .with_teardown_runtime(gate);
+        let prepared = reconciler.prepare(&convoy).await.expect("prepare");
+        let outcome = reconciler.reconcile(&convoy, &prepared, timestamp(40));
+        assert_eq!(
+            outcome.actuations.iter().any(|actuation| matches!(actuation,
+            Actuation::DeleteTerminalSession { name } if name == "orphan-session")),
+            eligible && authority == LifecycleAuthority::Managed
+        );
+        sessions.delete("orphan-session").await.expect("request deletion");
+        let prepared = reconciler.prepare(&convoy).await.expect("prepare deleting session");
+        let outcome = reconciler.reconcile(&convoy, &prepared, timestamp(40));
+        assert!(
+            !outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::DeleteTerminalSession { .. })),
+            "in-flight deletion must not be requested again"
+        );
+    });
 }

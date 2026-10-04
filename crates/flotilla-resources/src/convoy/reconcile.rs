@@ -102,6 +102,7 @@ pub struct ConvoyPrepared {
     template: Option<ResourceObject<WorkflowTemplate>>,
     vessels: BTreeMap<String, ResourceObject<Vessel>>,
     presentations: BTreeMap<String, ResourceObject<Presentation>>,
+    terminal_sessions: Vec<ResourceObject<TerminalSession>>,
     checkouts: BTreeMap<String, ResourceObject<Checkout>>,
     observed_subjects: Vec<Subject>,
     exit_disposition: Option<String>,
@@ -201,6 +202,7 @@ impl ConvoyReconciler {
         vec![
             Box::new(LabelMappedWatch::<Vessel, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<Presentation, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
+            Box::new(LabelMappedWatch::<TerminalSession, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(LabelMappedWatch::<Checkout, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
         ]
     }
@@ -216,6 +218,7 @@ impl ConvoyReconciler {
                 _marker: PhantomData,
             }),
             Box::new(LabelMappedWatch::<Presentation, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
+            Box::new(LabelMappedWatch::<TerminalSession, Convoy> { label_key: CONVOY_LABEL, _marker: PhantomData }),
             Box::new(ReplicaLabelMappedWatch::<Checkout, Convoy> {
                 label_key: CONVOY_LABEL,
                 resolver: backend.including_replicas::<Checkout>(namespace),
@@ -482,7 +485,8 @@ struct LandingSettlement {
 
 /// Evaluate the exact Landing settlement condition and retain the evidence for
 /// every branch that held it false. Reconciliation and diagnostics share this
-/// function so an explanation cannot drift from the condition writer.
+/// function so an explanation cannot drift from the condition writer. Landed
+/// preserves its recognised terminal outcome after the supporting records expire.
 pub fn evaluate_landing_settlement(
     convoy: &ResourceObject<Convoy>,
     vessels: &BTreeMap<String, ResourceObject<Vessel>>,
@@ -513,6 +517,21 @@ fn evaluate_landing_settlement_with_disposition(
     landing_evidence_stale_after: std::time::Duration,
     now: DateTime<Utc>,
 ) -> LandingSettlement {
+    // Landed materialises a recognised terminal outcome (ADR 0021). Its
+    // evidence may subsequently be collected by the checkout authority or
+    // change-request GC; consulting it again would turn settled history into
+    // a missing-record hold. Legacy Landed records need no new receipt.
+    if let Some(status) = convoy.status.as_ref().filter(|status| status.phase == ConvoyPhase::Landed) {
+        let mode = match status.disposition.as_deref() {
+            Some("observed-digest") => SettlementMode::ObservedDigest,
+            Some("claim") => SettlementMode::ClaimExit,
+            _ => SettlementMode::WorldTerminal,
+        };
+        return LandingSettlement {
+            evaluation: SettlementEvaluation { mode, satisfied: true, unmet: Vec::new() },
+            disposition: status.disposition.clone(),
+        };
+    }
     let observed_digest = evaluate_observed_digest_anchor(convoy, checkouts, landing_evidence_stale_after, now);
     let expected = match expected_checkout_refs(convoy) {
         Ok(expected) => expected,
@@ -894,6 +913,12 @@ impl Reconciler for ConvoyReconciler {
                 .collect(),
             _ => BTreeMap::new(),
         };
+        let terminal_sessions = match &self.terminal_sessions {
+            Some(sessions) if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) => {
+                sessions.list_matching_labels(&BTreeMap::from([(CONVOY_LABEL.to_string(), obj.metadata.name.clone())])).await?.items
+            }
+            _ => Vec::new(),
+        };
         let forges = match &self.forges {
             Some(forges) => forges.list().await?.into_iter().map(|forge| forge.spec).collect::<Vec<_>>(),
             None => Vec::new(),
@@ -947,6 +972,7 @@ impl Reconciler for ConvoyReconciler {
             template,
             vessels,
             presentations,
+            terminal_sessions,
             checkouts,
             observed_subjects,
             exit_disposition,
@@ -1034,6 +1060,19 @@ impl Reconciler for ConvoyReconciler {
             LifecycleConditions { exit_disposition: prepared.exit_disposition.clone(), reclaim_eligible: prepared.reclaim_eligible },
             now,
         );
+        // Landed convoy records are retained, so their deletion finalizer may
+        // never run. Sweep sessions here too: a missing vessel must not strand
+        // an orphan session after the independently verified reclaim gate.
+        if prepared.reclaim_eligible && obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            outcome.actuations.extend(
+                prepared
+                    .terminal_sessions
+                    .iter()
+                    .filter(|session| session.metadata.deletion_timestamp.is_none())
+                    .filter(|session| matches!(session.metadata.lifecycle_authority(), Ok(None | Some(LifecycleAuthority::Managed))))
+                    .map(|session| Actuation::DeleteTerminalSession { name: session.metadata.name.clone() }),
+            );
+        }
         if outcome.patch.is_none() {
             if let Some(attention) = &prepared.settlement_attention {
                 let changed = obj
