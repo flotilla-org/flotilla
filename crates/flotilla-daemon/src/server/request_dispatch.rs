@@ -92,6 +92,9 @@ async fn project_decision_ledger(
     Ok(urls)
 }
 
+/// Projects a machine-owned comment: revisions replace the whole body, including
+/// manual edits. Identity is carried by the generated marker on the final line.
+/// Listing and writing are not atomic; concurrent first projections can race.
 #[allow(clippy::too_many_arguments)]
 async fn project_ledger_comment(
     convoy_name: &str,
@@ -202,6 +205,8 @@ curl --fail-with-body --silent --show-error \
         .max_by_key(|comment| comment.get("id").and_then(serde_json::Value::as_u64));
     let (method, endpoint) = if let Some(comment) = selected {
         if comment["body"].as_str().is_some_and(|body| body.trim_end().ends_with(&marker)) {
+            // Refuse malformed URLs rather than POSTing a duplicate of an
+            // unchanged ledger whose existing comment was already found.
             return comment
                 .get("html_url")
                 .and_then(serde_json::Value::as_str)
@@ -1221,6 +1226,30 @@ mod ledger_projection_tests {
         }
     }
 
+    // A same-digest match with no HTTPS URL must fail without creating a duplicate.
+    #[tokio::test]
+    async fn ledger_retry_refuses_missing_or_insecure_url_without_writing() {
+        for service in ["github.com", "forgejo.example"] {
+            for url in [serde_json::Value::Null, serde_json::json!("http://forge.example/comment/1")] {
+                let body = b"## Decision ledger\nfirst";
+                let name = flotilla_resources::artifact_record_name("demo", "coder", "decision-ledger", "demo");
+                let runner = CommentRunner::default();
+                runner.comments.lock().expect("comments lock").push(serde_json::json!({
+                    "id": 1, "html_url": url,
+                    "body": format!("ledger\n<!-- flotilla-decision-ledger:{name}:{} -->", BlobDigest::of(body).as_str())
+                }));
+                let address = LeafAddress::ChangeRequest { service: service.into(), scope: "acme/repo".into(), number: 42 };
+                let env = if service == "github.com" { github_delivery_env() } else { forgejo_delivery_env() };
+                let error = project_ledger_comment("demo", "coder", body, &address, &runner, Path::new("/"), &env)
+                    .await
+                    .expect_err("existing comment URL is unusable");
+                assert!(error.contains("no HTTPS URL"), "{error}");
+                assert!(runner.writes.lock().expect("writes lock").is_empty());
+                assert_eq!(runner.comments.lock().expect("comments lock").len(), 1);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn ledger_projection_sends_file_content_on_stdin() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -1459,5 +1488,4 @@ mod ledger_projection_tests {
 }
 
 #[cfg(all(test, not(feature = "skip-no-sandbox-tests")))]
-#[path = "ledger_forgejo_contract.rs"]
 mod ledger_forgejo_contract;
