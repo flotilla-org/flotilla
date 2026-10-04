@@ -2022,6 +2022,7 @@ impl InProcessDaemon {
         let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());
         let checkout_vcs = CheckoutVcsCache::new();
         for path in repo_paths {
+            let path = canonical_or_original(&path);
             if repos.values().any(|state| state.contains_path(&path)) {
                 continue;
             }
@@ -2588,6 +2589,7 @@ impl InProcessDaemon {
     }
 
     async fn observed_repository_key_for_path(&self, path: &Path) -> Result<Option<RepositoryKey>, String> {
+        let path = canonical_or_original(path);
         let namespace = self.provisioning_namespace().await;
         let checkouts = crate::repository_addressing::local_checkouts(
             &self.resource_backend,
@@ -3660,7 +3662,8 @@ impl InProcessDaemon {
 
     /// Resolve a tracked local or synthetic repo path to its stable repo identity.
     pub async fn tracked_repo_identity_for_path(&self, repo_path: &Path) -> Option<flotilla_protocol::RepoIdentity> {
-        self.repos.read().await.values().find(|state| state.contains_path(repo_path)).map(|state| state.identity().clone())
+        let repo_path = canonical_or_original(repo_path);
+        self.repos.read().await.values().find(|state| state.contains_path(&repo_path)).map(|state| state.identity().clone())
     }
 
     async fn detect_repo_identity(&self, repo_path: &Path) -> flotilla_protocol::RepoIdentity {
@@ -3701,8 +3704,14 @@ impl InProcessDaemon {
     fn resolve_observation_root_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
         let roots = self.config.load_observation_roots()?;
         match selector {
-            flotilla_protocol::RepoSelector::Path(path) if roots.iter().any(|root| root.as_path() == path) => Ok(path.clone()),
-            flotilla_protocol::RepoSelector::Path(path) => Err(format!("repo not observed: {}", path.display())),
+            flotilla_protocol::RepoSelector::Path(path) => {
+                let physical = canonical_or_original(path);
+                roots
+                    .iter()
+                    .find(|root| canonical_or_original(root.as_path()) == physical)
+                    .map(|root| root.as_path().to_path_buf())
+                    .ok_or_else(|| format!("repo not observed: {}", path.display()))
+            }
             flotilla_protocol::RepoSelector::Query(query) => {
                 crate::resolve::resolve_repo(query, roots.iter().map(|root| (root.as_path(), None))).map_err(|error| error.to_string())
             }
@@ -3724,12 +3733,16 @@ impl InProcessDaemon {
             self.environment_manager.local_host_id().as_str(),
         )
         .await?;
+        let physical_selector_path = match selector {
+            flotilla_protocol::CheckoutSelector::Path(path) => Some(canonical_or_original(path)),
+            flotilla_protocol::CheckoutSelector::Query(_) => None,
+        };
         let mut matches = Vec::new();
         for checkout in checkouts {
             let Some(path) = checkout_path(&checkout) else { continue };
             let branch = checkout.spec.branch();
             let matched = match selector {
-                flotilla_protocol::CheckoutSelector::Path(candidate) => Path::new(path) == candidate,
+                flotilla_protocol::CheckoutSelector::Path(_) => physical_selector_path.as_deref() == Some(Path::new(path)),
                 flotilla_protocol::CheckoutSelector::Query(query) => branch == query || branch.contains(query) || path.contains(query),
             };
             if !matched {
@@ -5904,7 +5917,7 @@ impl InProcessDaemon {
                     (canonical_root, None)
                 }
             }
-            None => (path.to_path_buf(), None),
+            None => (canonical_or_original(path), None),
         }
     }
 
@@ -6053,7 +6066,7 @@ impl InProcessDaemon {
     // Identity migration replaces a presentation row after the resources have
     // reconciled. It must preserve those new facts and the observation root.
     async fn remove_repo_presentation(&self, path: &Path, stop_observing: bool) -> Result<(), String> {
-        let path = path.to_path_buf();
+        let path = canonical_or_original(path);
         let repo_identity = self.tracked_repo_identity_for_path(&path).await.unwrap_or_else(|| fallback_repo_identity(&path));
         let observed_reconciliation = self.observed_checkout_reconciliation.lock().await;
         let tracked = self.repos.read().await.get(&repo_identity).is_some_and(|state| state.contains_path(&path));

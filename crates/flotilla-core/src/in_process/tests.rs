@@ -3635,7 +3635,8 @@ async fn managed_terminal_refresh_assigns_nested_cwd_to_most_specific_repo() {
         })
         .collect::<Vec<_>>();
     assert_eq!(deltas.len(), 1, "one pane must be attributed to one repository");
-    assert_eq!(deltas[0].repo_identity, fallback_repo_identity(&configured_inner));
+    // Startup records the physical root even when observation configured an alias.
+    assert_eq!(deltas[0].repo_identity, fallback_repo_identity(&canonical_or_original(&configured_inner)));
     assert!(matches!(
         deltas[0].changes.as_slice(),
         [Change::ManagedTerminal { key, op: EntryOp::Added(terminal) }]

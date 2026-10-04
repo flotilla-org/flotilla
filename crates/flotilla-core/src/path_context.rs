@@ -2,6 +2,7 @@ pub use flotilla_protocol::path_context::{DaemonHostPath, ExecutionEnvironmentPa
 
 /// Resolve cosmetic filesystem aliases through the nearest existing ancestor,
 /// while preserving any not-yet-created suffix lexically.
+/// In that suffix, `..` components and dangling symlinks remain unresolved.
 pub fn canonical_or_original(path: &std::path::Path) -> std::path::PathBuf {
     let mut existing = path;
     let mut missing_suffix = Vec::new();
