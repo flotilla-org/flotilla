@@ -135,6 +135,8 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
                                     .and_then(|environment| environment.get(name))
                                     .map(String::as_str)
                                     .or_else(|| (name == "PATH").then_some(DOCKER_DEFAULT_PATH))
+                                    // An image that sets the variable to empty gets the bare
+                                    // value, not a trailing `:` (which would mean the cwd).
                                     .filter(|base| !base.is_empty());
                                 let combined = match base {
                                     Some(base) => format!("{value}:{base}"),
@@ -356,13 +358,19 @@ impl DockerEnvironmentProviderInner {
     ) -> Result<HashMap<String, String>, String> {
         let output = match pull_policy {
             ImagePullPolicy::Always => {
-                self.pull(image, docker_config).await?;
+                self.pull(image, docker_config)
+                    .await
+                    .map_err(|error| format!("pulling image {image} to read its environment failed: {error}"))?;
                 self.inspect_environment(image).await?
             }
             ImagePullPolicy::IfNotPresent => match self.inspect_environment(image).await {
                 Ok(output) => output,
-                Err(_) => {
-                    self.pull(image, docker_config).await?;
+                Err(inspect_error) => {
+                    self.pull(image, docker_config).await.map_err(|error| {
+                        format!(
+                            "image {image} could not be inspected ({inspect_error}) and pulling it to read its environment failed: {error}"
+                        )
+                    })?;
                     self.inspect_environment(image).await?
                 }
             },
