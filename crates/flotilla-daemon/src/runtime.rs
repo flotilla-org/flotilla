@@ -35,7 +35,7 @@ use flotilla_core::{
     placement_policy::reconcile_registered_policy,
     providers::{
         discovery::{run_provisioned_host_detectors, EnvVars, EnvironmentBag},
-        environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate},
+        environment::{CreateOpts, EnvironmentHandle, EnvironmentToolAssetKind, EnvironmentVariableUpdate, PreparedEnvironmentAuth},
         registry::ProviderRegistry,
         terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize},
         ChannelLabel, CommandRunner,
@@ -4500,7 +4500,10 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                     .await)
                 }
             },
-            None if credential_refs.is_empty() => Default::default(),
+            None if credential_refs.is_empty() => PreparedEnvironmentAuth::NoRegistryCredential,
+            // Defence in depth: the earlier credential-config step rejects this
+            // state today. Keep registry preflight independently fail-closed if
+            // the provisioning steps are reordered in a future change.
             None => {
                 return Err(discard_uncreated_environment(
                     None,
@@ -8378,9 +8381,17 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RegistryPreflightOutcome {
+        Success,
+        LoginFailure,
+        PullFailure,
+        MissingStore,
+    }
+
     // Stands in for the registry CLI process, retaining the exact preflight artifact.
     struct RegistryPreflightRunner {
-        outcome: &'static str,
+        outcome: RegistryPreflightOutcome,
         calls: AtomicUsize,
         directory: Mutex<Option<PathBuf>>,
     }
@@ -8389,8 +8400,9 @@ mod tests {
     impl CommandRunner for RegistryPreflightRunner {
         async fn run(&self, _cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            *self.directory.lock().await = Some(PathBuf::from(args[1]));
-            if self.outcome == "pull-failure" {
+            *self.directory.lock().await =
+                Some(PathBuf::from(args.get(1).expect("registry CLI must receive a config directory after --config")));
+            if self.outcome == RegistryPreflightOutcome::PullFailure {
                 Err("pull refused".to_string())
             } else {
                 Ok(String::new())
@@ -8405,9 +8417,10 @@ mod tests {
             input: &[u8],
         ) -> Result<String, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            *self.directory.lock().await = Some(PathBuf::from(args[1]));
+            *self.directory.lock().await =
+                Some(PathBuf::from(args.get(1).expect("registry CLI must receive a config directory after --config")));
             assert_eq!(input, b"registry-secret");
-            if self.outcome == "login-failure" {
+            if self.outcome == RegistryPreflightOutcome::LoginFailure {
                 Err("login refused".to_string())
             } else {
                 Ok(String::new())
@@ -9110,7 +9123,12 @@ mod tests {
 
     #[tokio::test]
     async fn registry_preflight_delivers_exact_auth_to_non_docker_provider_and_refuses_failures() {
-        for outcome in ["success", "login-failure", "pull-failure", "missing"] {
+        for outcome in [
+            RegistryPreflightOutcome::Success,
+            RegistryPreflightOutcome::LoginFailure,
+            RegistryPreflightOutcome::PullFailure,
+            RegistryPreflightOutcome::MissingStore,
+        ] {
             let temp = TempDir::new().expect("tempdir");
             let config_base = temp.path().join("config");
             fs::create_dir_all(&config_base).expect("config directory");
@@ -9170,7 +9188,11 @@ mod tests {
             )
             .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))
             .with_agent_material(agent_material);
-            let state = Arc::new(if outcome == "missing" { state } else { state.with_credential_store(credential_store) });
+            let state = Arc::new(if outcome == RegistryPreflightOutcome::MissingStore {
+                state
+            } else {
+                state.with_credential_store(credential_store)
+            });
             let spec = flotilla_resources::DockerEnvironmentSpec {
                 host_ref: "host-test".to_string(),
                 image: "registry.example/crew:latest".to_string(),
@@ -9193,7 +9215,7 @@ mod tests {
             // to a non-Docker provider, and refuse creation on absent/failed preflight.
             assert!(!delivered_auth.exists(), "refused creation must discard delivered agent credentials");
             let opts = provider.create_opts.lock().await.take();
-            if outcome == "success" {
+            if outcome == RegistryPreflightOutcome::Success {
                 assert_eq!(error, "stop after capturing create options");
                 let admitted = registry_runner.directory.lock().await.clone().expect("preflight directory");
                 assert_eq!(opts.expect("provider invoked").prepared_auth, PreparedEnvironmentAuth::RegistryConfig {
@@ -9203,7 +9225,14 @@ mod tests {
                 assert_eq!(registry_runner.calls.load(Ordering::SeqCst), 2);
             } else {
                 assert!(opts.is_none(), "provider must not run without successful preflight");
-                assert!(error.contains(if outcome == "missing" { "credential store unavailable" } else { "preflight failed" }), "{error}");
+                assert!(
+                    error.contains(if outcome == RegistryPreflightOutcome::MissingStore {
+                        "credential store unavailable"
+                    } else {
+                        "preflight failed"
+                    }),
+                    "{error}"
+                );
                 if let Some(directory) = registry_runner.directory.lock().await.as_ref() {
                     assert!(!directory.exists(), "failed preflight must remove its auth artifact");
                 }

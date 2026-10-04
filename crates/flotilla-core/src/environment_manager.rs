@@ -20,7 +20,8 @@ use crate::{
         },
         environment::{
             contained_daemon_socket_path, CreateOpts, EnvironmentHandle, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess,
-            EnvironmentToolAssetKind, EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode, CONTAINED_DAEMON_REQUIRED_ENV,
+            EnvironmentToolAssetKind, EnvironmentVariableUpdate, PreparedEnvironmentAuth, ProvisionedMount, ProvisionedMountMode,
+            CONTAINED_DAEMON_REQUIRED_ENV,
         },
         registry::ProviderRegistry,
         CommandRunner,
@@ -352,7 +353,7 @@ impl EnvironmentManager {
                     "the contained host-daemon requirement",
                 ))],
             image_pull_policy: Default::default(),
-            prepared_auth: Default::default(),
+            prepared_auth: PreparedEnvironmentAuth::NoRegistryCredential,
             cpu_limit: None,
         };
         let handle = env_provider.create(env_id.clone(), &image, opts).await?;
