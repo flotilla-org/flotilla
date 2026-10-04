@@ -954,3 +954,233 @@ async fn subscribe_queries_replays_result_set_after_seq() {
         .expect("expected a ResultSet for the convoys query in subscribe replay");
     assert!(convoy_rows(result_set).iter().any(|row| row.name == "convoy-b"), "replayed result set must contain convoy-b");
 }
+
+// The inspector replaces the Git subprocess boundary. Publishing a rival convoy
+// during inspection models an identity becoming occupied after the first check.
+struct ConflictCheckoutInspector {
+    backend: ResourceBackend,
+    daemon: std::sync::Weak<InProcessDaemon>,
+}
+
+#[async_trait::async_trait]
+impl flotilla_core::repository_inspection::RepositoryInspector for ConflictCheckoutInspector {
+    async fn inspect_path(
+        &self,
+        path: &std::path::Path,
+        _remote: Option<&str>,
+    ) -> Result<flotilla_core::repository_inspection::RepositoryInspection, String> {
+        use flotilla_core::repository_inspection::{LocalCheckoutInspection, RepositoryInspection};
+        self.backend
+            .using::<Convoy>("flotilla")
+            .create(
+                &InputMeta::builder().name("rival".to_string()).build(),
+                &ConvoySpec::builder().role("cleanup".to_string()).workflow_ref("cleanup-workflow".to_string()).build(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(RepositoryInspection {
+            spec: RepositorySpec::remote("https://github.com/widgets/api.git")?,
+            checkout: LocalCheckoutInspection::builder()
+                .path(path.to_path_buf())
+                .host_ref("host".to_string())
+                .git_ref("feature/cleanup".to_string())
+                .is_main(false)
+                .build(),
+            transport_url: Some("https://github.com/widgets/api.git".to_string()),
+            replaces_prior_repository: false,
+        })
+    }
+
+    async fn resolve_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
+        // Admission resolves the remote after publishing the adopted checkout.
+        // Let the real Aggregator show that row before triggering final cleanup.
+        let daemon = self.daemon.upgrade().expect("daemon remains alive");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if cleanup_checkout_rows(&daemon).await.iter().any(|row| row.authority == LifecycleAuthority::Adopted) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("adopted Aggregator row before admission conflict cleanup");
+        RepositorySpec::remote(remote)
+    }
+}
+
+async fn cleanup_checkout_rows(daemon: &InProcessDaemon) -> Vec<flotilla_protocol::result_set::CheckoutRow> {
+    let query = QueryId::Checkouts { scope: None };
+    let events = daemon
+        .subscribe_queries(uuid::Uuid::new_v4(), &[QueryCursor { query: query.clone(), since: None }])
+        .await
+        .expect("subscribe checkout query");
+    events
+        .into_iter()
+        .find_map(|event| match event {
+            DaemonEvent::ResultSet(set) if set.query() == query => Some(set.rows.as_checkouts().expect("checkout rows").to_vec()),
+            _ => None,
+        })
+        .expect("checkout result set")
+}
+
+// #768: both deletion paths remove adopted projections and their Aggregator
+// rows without periodic reconciliation. Non-adopted observations survive.
+#[tokio::test]
+async fn resource_delete_removes_adopted_projection_and_aggregator_row() {
+    assert_adopted_checkout_cleanup(false).await;
+}
+
+#[tokio::test]
+async fn admission_conflict_removes_adopted_projection_and_aggregator_row() {
+    assert_adopted_checkout_cleanup(true).await;
+}
+
+async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
+    use flotilla_protocol::{CommandAction, CommandValue};
+    use flotilla_resources::{CrewSource, CrewSpec, WorkflowTemplate, WorkflowTemplateSpec};
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let config = test_config(tmp.path().join("config"));
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![],
+        Arc::clone(&config),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+    let options = RuntimeOptions::builder()
+        .namespace("flotilla".to_string())
+        .heartbeat_interval(Duration::from_secs(300))
+        .controller_resync_interval(Duration::from_secs(300))
+        .controller_supervision(Default::default())
+        .start_controllers(false)
+        .codex_central_refresh_interval(Duration::from_secs(300))
+        .build();
+    let _runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, options).await.expect("runtime");
+    let repository = RepositorySpec::remote("https://github.com/widgets/api.git").expect("repository");
+    backend
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(repository.key().to_string()).build(), &repository)
+        .await
+        .expect("repository");
+    let spec = CheckoutSpec::Observed(
+        ObservedCheckoutSpec::builder()
+            .r#ref("feature/cleanup".to_string())
+            .path("/work/widgets".to_string())
+            .repo_ref(repository.key())
+            .host_ref(daemon.local_host_id().expect("host").to_string())
+            .is_main(false)
+            .build(),
+    );
+    let observed = daemon.observed_resource_backend().using::<Checkout>("flotilla");
+    observed
+        .create(&InputMeta::builder().name("unrelated".to_string()).build().with_lifecycle_authority(LifecycleAuthority::Observed), &spec)
+        .await
+        .expect("unrelated observation");
+    let action = if admission_conflict {
+        std::fs::create_dir(tmp.path().join("checkout")).expect("checkout directory");
+        backend
+            .using::<WorkflowTemplate>("flotilla")
+            .create(
+                &InputMeta::builder().name("cleanup-workflow".to_string()).build(),
+                &WorkflowTemplateSpec::builder()
+                    .vessels(vec![VesselRequirement::builder()
+                        .name("work".to_string())
+                        .crew(vec![CrewSpec::builder()
+                            .role("coder".to_string())
+                            .source(CrewSource::Tool { command: "true".to_string() })
+                            .build()])
+                        .build()])
+                    .build(),
+            )
+            .await
+            .expect("workflow");
+        daemon
+            .set_repository_inspector(Arc::new(ConflictCheckoutInspector { backend: backend.clone(), daemon: Arc::downgrade(&daemon) }))
+            .await;
+        CommandAction::ConvoyCreate {
+            name: "cleanup".to_string(),
+            workflow_ref: "cleanup-workflow".to_string(),
+            inputs: vec![],
+            repository_url: None,
+            r#ref: None,
+            project_ref: None,
+            placement_policy: None,
+            adopted_checkout: Some(Box::new(tmp.path().join("checkout"))),
+        }
+    } else {
+        backend
+            .using::<Checkout>("flotilla")
+            .create(&InputMeta::builder().name("adopted".to_string()).build().with_lifecycle_authority(LifecycleAuthority::Adopted), &spec)
+            .await
+            .expect("adopt");
+        daemon.reconcile_adopted_checkouts("flotilla").await.expect("project adopted checkout");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if cleanup_checkout_rows(&daemon).await.iter().any(|row| row.authority == LifecycleAuthority::Adopted) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("adopted Aggregator row");
+        CommandAction::ResourceDelete {
+            namespace: "flotilla".to_string(),
+            kind: "checkouts".to_string(),
+            name: "adopted".to_string(),
+            replica_origin: None,
+        }
+    };
+    let result = cleanup_command_result(&daemon, action.clone()).await;
+    if admission_conflict {
+        assert!(matches!(result, CommandValue::Error { ref message } if message.contains("already exists")), "{result:?}");
+    } else {
+        assert!(matches!(result, CommandValue::ResourceDeleted(_)), "{result:?}");
+    }
+    assert!(backend.using::<Checkout>("flotilla").list().await.expect("durable checkouts").items.is_empty());
+    let remaining = observed.list().await.expect("observed checkouts").items;
+    assert!(matches!(remaining.as_slice(), [checkout] if checkout.metadata.name == "unrelated"), "{remaining:?}");
+    if !admission_conflict {
+        // A cleanup failure can leave an orphan after the durable delete. A
+        // repeated command must accept the tombstone and retry projection cleanup.
+        observed
+            .create(&InputMeta::builder().name("adopted".to_string()).build().with_lifecycle_authority(LifecycleAuthority::Adopted), &spec)
+            .await
+            .expect("orphan left by interrupted cleanup");
+        let repeated = cleanup_command_result(&daemon, action).await;
+        assert!(matches!(repeated, CommandValue::ResourceAlreadyDeleted(_)), "{repeated:?}");
+        let remaining = observed.list().await.expect("observed checkouts after retry").items;
+        assert!(matches!(remaining.as_slice(), [checkout] if checkout.metadata.name == "unrelated"), "{remaining:?}");
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = cleanup_checkout_rows(&daemon).await;
+            if rows.len() == 1 && rows[0].authority == LifecycleAuthority::Observed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("only unrelated Aggregator row remains without periodic reconciliation");
+}
+
+async fn cleanup_command_result(daemon: &InProcessDaemon, action: flotilla_protocol::CommandAction) -> flotilla_protocol::CommandValue {
+    use flotilla_protocol::Command;
+    let mut events = daemon.subscribe();
+    let id = daemon.execute(Command::builder().action(action).build()).await.expect("command");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let DaemonEvent::CommandFinished { command_id, result, .. } = events.recv().await.expect("event") {
+                if command_id == id {
+                    break result;
+                }
+            }
+        }
+    })
+    .await
+    .expect("command completes")
+}

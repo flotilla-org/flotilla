@@ -56,6 +56,7 @@ pub(super) struct ConvoyCreateAdmission<'a> {
 pub(super) struct ConvoyAdmission {
     backend: ResourceBackend,
     observed_backend: ResourceBackend,
+    observed_checkout_reconciliation: Arc<Mutex<()>>,
     config: Arc<ConfigStore>,
     discovery: Arc<DiscoveryRuntime>,
     environment_manager: Arc<EnvironmentManager>,
@@ -1876,7 +1877,13 @@ impl ConvoyAdmission {
             Ok(generation) => generation,
             Err(message) => {
                 if let Some(checkout_ref) = adopted_checkout_ref_to_cleanup {
-                    if let Err(error) = self.backend.clone().using::<ResourceCheckout>(namespace).delete(&checkout_ref).await {
+                    let _reconciliation = self.observed_checkout_reconciliation.lock().await;
+                    let cleanup = async {
+                        self.backend.clone().using::<ResourceCheckout>(namespace).delete(&checkout_ref).await?;
+                        crate::observed_resources::delete_stale_adopted_checkouts(&self.backend, &self.observed_backend, namespace).await
+                    }
+                    .await;
+                    if let Err(error) = cleanup {
                         warn!(%error, %checkout_ref, "failed to clean up adopted checkout after convoy identity conflict");
                     }
                 }

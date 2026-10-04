@@ -39,10 +39,51 @@ pub async fn reconcile_adopted_checkouts(
         }
     }
 
+    if let Err(error) = delete_stale_adopted_checkouts(durable_backend, observed_backend, namespace).await {
+        failures.push(error.to_string());
+    }
+
     if failures.is_empty() {
         Ok(())
     } else {
         Err(ResourceError::other(format!("failed to reconcile adopted checkouts: {}", failures.join("; "))))
+    }
+}
+
+/// Remove adopted projections whose durable adopted source no longer exists.
+/// Callers serialize this with adoption and projection so a stale reconcile
+/// cannot republish a checkout after its deletion.
+pub async fn delete_stale_adopted_checkouts(
+    durable_backend: &ResourceBackend,
+    observed_backend: &ResourceBackend,
+    namespace: &str,
+) -> Result<(), ResourceError> {
+    let selector = BTreeMap::from([(AUTHORITY_LABEL.to_string(), LifecycleAuthority::Adopted.as_label_value().to_string())]);
+    let durable_checkouts = durable_backend.clone().using::<ResourceCheckout>(namespace);
+    let observed_checkouts = observed_backend.clone().using::<ResourceCheckout>(namespace);
+    let mut failures = Vec::new();
+    for checkout in observed_checkouts.list_matching_labels(&selector).await?.items {
+        let name = &checkout.metadata.name;
+        let result = async {
+            match durable_checkouts.get(name).await {
+                Ok(source) if source.metadata.lifecycle_authority()? == Some(LifecycleAuthority::Adopted) => return Ok(()),
+                Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+            match observed_checkouts.delete(name).await {
+                Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
+        .await;
+        if let Err(error) = result {
+            failures.push(format!("{name}: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ResourceError::other(format!("failed to delete stale adopted checkouts: {}", failures.join("; "))))
     }
 }
 
@@ -268,5 +309,74 @@ mod tests {
 
         let stored = checkouts.list().await.expect("checkout list should succeed").items;
         assert!(matches!(stored.as_slice(), [checkout] if checkout.spec.repo_ref() == &repository_key));
+    }
+
+    // #768: reconciliation removes only adopted projections without a durable
+    // adopted source. Generate authority traversal order and reconcile repeats;
+    // exhaust source/observation presence and authorities in each draw so the
+    // profile's case limit cannot miss deletion or preservation boundaries.
+    #[hegel::test]
+    fn adopted_projection_cleanup_preserves_other_authorities(tc: hegel::TestCase) {
+        use flotilla_resources::{CheckoutSpec, InputMeta, LifecycleAuthority, ObservedCheckoutSpec};
+        let authority_start = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3));
+        let repeats = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(3));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let spec = CheckoutSpec::Observed(
+                ObservedCheckoutSpec::builder()
+                    .r#ref("main".to_string())
+                    .path("/work/repo".to_string())
+                    .repo_ref(RepositoryKey("repo".to_string()))
+                    .host_ref("host".to_string())
+                    .is_main(false)
+                    .build(),
+            );
+            let authorities =
+                [None, Some(LifecycleAuthority::Observed), Some(LifecycleAuthority::Managed), Some(LifecycleAuthority::Adopted)];
+            for offset in 0..authorities.len() {
+                let authority = authorities[(authority_start + offset) % authorities.len()];
+                for observed_present in [false, true] {
+                    for durable_authority in [None, Some(LifecycleAuthority::Managed), Some(LifecycleAuthority::Adopted)] {
+                        let durable = ResourceBackend::InMemory(InMemoryBackend::default());
+                        let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+                        let mut meta = InputMeta::builder().name("checkout".to_string()).build();
+                        if let Some(authority) = authority {
+                            meta = meta.with_lifecycle_authority(authority);
+                        }
+                        let original = if observed_present {
+                            Some(observed.using::<ResourceCheckout>("flotilla").create(&meta, &spec).await.expect("observation"))
+                        } else {
+                            None
+                        };
+                        if let Some(authority) = durable_authority {
+                            let durable_meta =
+                                InputMeta::builder().name("checkout".to_string()).build().with_lifecycle_authority(authority);
+                            durable.using::<ResourceCheckout>("flotilla").create(&durable_meta, &spec).await.expect("durable checkout");
+                        }
+                        for _ in 0..repeats {
+                            let result = super::reconcile_adopted_checkouts(&durable, &observed, "flotilla").await;
+                            if observed_present
+                                && durable_authority == Some(LifecycleAuthority::Adopted)
+                                && authority != Some(LifecycleAuthority::Adopted)
+                            {
+                                assert!(result.is_err(), "non-adopted name collisions are refused");
+                            } else {
+                                result.expect("reconcile");
+                            }
+                            let stored = observed.using::<ResourceCheckout>("flotilla").list().await.expect("list").items;
+                            let should_remain = (observed_present && authority != Some(LifecycleAuthority::Adopted))
+                                || durable_authority == Some(LifecycleAuthority::Adopted);
+                            assert_eq!(stored.len(), usize::from(should_remain));
+                            if observed_present && authority != Some(LifecycleAuthority::Adopted) {
+                                let original = original.as_ref().expect("original observation");
+                                assert_eq!(stored[0].metadata, original.metadata, "unrelated metadata is untouched");
+                                assert_eq!(stored[0].spec, original.spec, "unrelated specs are untouched");
+                                assert_eq!(stored[0].status, original.status, "unrelated statuses are untouched");
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 }

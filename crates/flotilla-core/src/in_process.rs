@@ -1805,7 +1805,8 @@ pub struct InProcessDaemon {
     observed_resource_backend: ResourceBackend,
     /// Serializes observed Checkout publication with repository removal so a
     /// refresh captured before untracking cannot recreate deleted resources.
-    observed_checkout_reconciliation: Mutex<()>,
+    /// Admission cleanup and resource deletion share this lock with adoption.
+    observed_checkout_reconciliation: Arc<Mutex<()>>,
     aggregator_projection_state: AggregatorProjectionState,
     /// Provisioning namespace used by daemon-side resource operations (e.g.
     /// looking up the Convoy whose task is being marked complete). Set by the
@@ -2246,6 +2247,7 @@ impl InProcessDaemon {
             ChronoDuration::seconds(DEFAULT_REGARD_DECAY_SECONDS),
         ));
         let admission_free_space_path = Arc::new(std::sync::RwLock::new(admission_free_space_path));
+        let observed_checkout_reconciliation = Arc::new(Mutex::new(()));
         let daemon = Arc::new_cyclic(|self_weak| Self {
             repos: Arc::clone(&repos),
             repo_order: RwLock::new(order),
@@ -2273,6 +2275,7 @@ impl InProcessDaemon {
             convoy_admission: ConvoyAdmission::builder()
                 .backend(resource_backend.clone())
                 .observed_backend(observed_resource_backend.clone())
+                .observed_checkout_reconciliation(Arc::clone(&observed_checkout_reconciliation))
                 .config(Arc::clone(&config))
                 .discovery(Arc::clone(&discovery))
                 .environment_manager(Arc::clone(&environment_manager))
@@ -2300,7 +2303,7 @@ impl InProcessDaemon {
             regard_lifecycle: Arc::clone(&regard_lifecycle),
             resource_backend: resource_backend.clone(),
             observed_resource_backend: observed_resource_backend.clone(),
-            observed_checkout_reconciliation: Mutex::new(()),
+            observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
             aggregator_projection_state: aggregator_projection_state.clone(),
             provisioning_namespace: Arc::clone(&provisioning_namespace),
             fleet: FleetService::new(
@@ -8720,7 +8723,22 @@ impl InProcessDaemon {
                     Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
                 }
             } else {
-                match flotilla_resources::delete_resource_kind(&self.resource_backend, namespace, kind, name).await {
+                // Serialize deletion and cleanup with adopted checkout writes.
+                let _reconciliation = self.observed_checkout_reconciliation.lock().await;
+                let deleted = async {
+                    let deleted = flotilla_resources::delete_resource_kind(&self.resource_backend, namespace, kind, name).await?;
+                    if deleted.object.kind == ResourceCheckout::API_PATHS.kind {
+                        crate::observed_resources::delete_stale_adopted_checkouts(
+                            &self.resource_backend,
+                            &self.observed_resource_backend,
+                            namespace,
+                        )
+                        .await?;
+                    }
+                    Ok::<_, ResourceError>(deleted)
+                }
+                .await;
+                match deleted {
                     Ok(deleted) => {
                         let response = Box::new(ResourceJsonResponse {
                             kind: deleted.object.kind,
