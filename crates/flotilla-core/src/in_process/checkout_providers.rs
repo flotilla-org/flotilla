@@ -1,15 +1,48 @@
 //! Observed Checkout lifetimes own discovered VCS capabilities. Active commands
 //! retain leases; presentation rows retain descriptors, never provider instances.
 
-use super::*;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::{Arc, Weak},
+    time::Duration,
+};
+
+use chrono::{DateTime, Utc};
+use flotilla_protocol::EnvironmentId;
+use flotilla_resources::{
+    Checkout as ResourceCheckout, CheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, Repository, RepositoryKey, ResourceBackend,
+    ResourceError, ResourceObject, WatchEvent, WatchStart,
+};
+use futures::StreamExt;
+use tokio::sync::{watch, OnceCell};
+use tracing::warn;
+
+use super::{checkout_path, discover_vcs_for_checkout, InProcessDaemon};
+use crate::{
+    config::ConfigStore,
+    environment_manager::ManagedEnvironmentKind,
+    path_context::ExecutionEnvironmentPath,
+    providers::{discovery::ProviderDescriptor, registry::ProviderRegistry},
+    vcs::Vcs,
+};
 
 pub(super) struct CheckoutProvider {
-    pub(super) descriptor: crate::providers::discovery::ProviderDescriptor,
-    pub(super) vcs: Arc<dyn crate::vcs::Vcs>,
+    pub(super) descriptor: ProviderDescriptor,
+    pub(super) vcs: Arc<dyn Vcs>,
 }
 
-pub(super) type CheckoutVcsCache =
-    HashMap<(String, EnvironmentId, String, DateTime<Utc>, PathBuf), Arc<tokio::sync::OnceCell<Arc<CheckoutProvider>>>>;
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct CheckoutLifetimeKey {
+    namespace: String,
+    environment: EnvironmentId,
+    name: String,
+    created_at: DateTime<Utc>,
+    path: PathBuf,
+    repository: RepositoryKey,
+}
+
+pub(super) type CheckoutVcsCache = HashMap<CheckoutLifetimeKey, Arc<OnceCell<Arc<CheckoutProvider>>>>;
 
 impl InProcessDaemon {
     /// Observed Checkouts own cached providers. Before observation, inspection
@@ -21,32 +54,43 @@ impl InProcessDaemon {
             checkout_path(checkout).is_some_and(|candidate| Path::new(candidate) == path)
                 && self.checkout_environment(checkout).as_ref() == Some(env_id)
         });
-        // Settings come from the Checkout's Repository, in an isolated overlay
-        // so identical paths in different environments cannot overwrite intent.
-        let scoped_config = ConfigStore::with_base(self.config.base_path().as_path());
-        if let Some(checkout) = observed {
+        let Some(observed) = observed else {
+            return discover_vcs_for_checkout(
+                &self.environment_manager,
+                &self.discovery,
+                &self.config,
+                &self.local_environment_id,
+                env_id,
+                path,
+            )
+            .await
+            .map(Arc::new);
+        };
+        let key = self.checkout_lifetime_key(&namespace, observed).expect("eligible Checkout");
+        let cell = {
+            let mut cache = self.checkout_vcs.lock().await;
+            self.retain_checkout_providers(&mut cache, &namespace, &checkouts);
+            cache.entry(key).or_insert_with(|| Arc::new(OnceCell::new())).clone()
+        };
+        // A hit has already been validated against the current Checkout instance.
+        // Avoid fetching Repository settings and repeating the inventory read.
+        if let Some(provider) = cell.get() {
+            return Ok(provider.clone());
+        }
+        let discover = || async {
+            // Isolate Repository settings from identical paths in other environments.
+            let scoped_config = ConfigStore::with_base(self.config.base_path().as_path());
             let repository = self
                 .resource_backend
                 .including_replicas::<Repository>(&namespace)
-                .get(&checkout.spec.repo_ref().to_string())
+                .get(&observed.spec.repo_ref().to_string())
                 .await
                 .map_err(|error| error.to_string())?
                 .object;
             scoped_config.set_checkout_config(&ExecutionEnvironmentPath::new(path), repository.spec.vcs().clone());
-        }
-        let config = if observed.is_some() { &scoped_config } else { &self.config };
-        let discover = || async {
-            discover_vcs_for_checkout(&self.environment_manager, &self.discovery, config, &self.local_environment_id, env_id, path)
+            discover_vcs_for_checkout(&self.environment_manager, &self.discovery, &scoped_config, &self.local_environment_id, env_id, path)
                 .await
                 .map(Arc::new)
-        };
-        let Some(observed) = observed else { return discover().await };
-        let key =
-            (namespace.clone(), env_id.clone(), observed.metadata.name.clone(), observed.metadata.creation_timestamp, path.to_path_buf());
-        let cell = {
-            let mut cache = self.checkout_vcs.lock().await;
-            self.retain_checkout_providers(&mut cache, &namespace, &checkouts);
-            cache.entry(key).or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())).clone()
         };
         let provider = cell.get_or_try_init(discover).await.map(Arc::clone)?;
         // Discovery may have awaited I/O while the Checkout was retired. Keep
@@ -62,9 +106,7 @@ impl InProcessDaemon {
             }
             ResourceCheckoutSpec::Observed(spec) => {
                 self.environment_manager.managed_environments().into_iter().find_map(|(id, state)| match state {
-                    crate::environment_manager::ManagedEnvironmentKind::Direct(state)
-                        if state.host_id.as_ref().is_some_and(|host| host.as_str() == spec.host_ref) =>
-                    {
+                    ManagedEnvironmentKind::Direct(state) if state.host_id.as_ref().is_some_and(|host| host.as_str() == spec.host_ref) => {
                         Some(id)
                     }
                     _ => None,
@@ -86,6 +128,7 @@ impl InProcessDaemon {
             .into_iter()
             .map(|checkout| (checkout.metadata.name.clone(), checkout))
             .collect::<BTreeMap<_, _>>();
+        // Durable resources (including replicas) override ephemeral observations by name.
         for source in
             self.resource_backend.including_replicas::<ResourceCheckout>(namespace).list().await.map_err(|error| error.to_string())?.items
         {
@@ -95,21 +138,30 @@ impl InProcessDaemon {
             .into_values()
             .filter(|checkout| {
                 checkout.metadata.deletion_timestamp.is_none()
-                    && checkout.status.as_ref().is_none_or(|status| status.phase == flotilla_resources::CheckoutPhase::Ready)
+                    && checkout.status.as_ref().is_none_or(|status| status.phase == CheckoutPhase::Ready)
             })
             .collect())
     }
 
+    fn checkout_lifetime_key(&self, namespace: &str, checkout: &ResourceObject<ResourceCheckout>) -> Option<CheckoutLifetimeKey> {
+        if checkout.metadata.deletion_timestamp.is_some()
+            || checkout.status.as_ref().is_some_and(|status| status.phase != CheckoutPhase::Ready)
+        {
+            return None;
+        }
+        Some(CheckoutLifetimeKey {
+            namespace: namespace.into(),
+            environment: self.checkout_environment(checkout)?,
+            name: checkout.metadata.name.clone(),
+            created_at: checkout.metadata.creation_timestamp,
+            path: PathBuf::from(checkout_path(checkout)?),
+            repository: checkout.spec.repo_ref().clone(),
+        })
+    }
+
     fn retain_checkout_providers(&self, cache: &mut CheckoutVcsCache, namespace: &str, checkouts: &[ResourceObject<ResourceCheckout>]) {
-        cache.retain(|(cached_namespace, environment, name, created_at, path), _| {
-            cached_namespace == namespace
-                && checkouts.iter().any(|checkout| {
-                    checkout.metadata.name == *name
-                        && checkout.metadata.creation_timestamp == *created_at
-                        && self.checkout_environment(checkout).as_ref() == Some(environment)
-                        && checkout_path(checkout).is_some_and(|candidate| Path::new(candidate) == path)
-                })
-        });
+        let live: HashSet<_> = checkouts.iter().filter_map(|checkout| self.checkout_lifetime_key(namespace, checkout)).collect();
+        cache.retain(|key, _| live.contains(key));
     }
 
     pub(super) async fn retire_checkout_providers(&self) -> Result<(), String> {
@@ -120,7 +172,7 @@ impl InProcessDaemon {
     }
 
     /// Resolve capabilities through discovery once for each observed Checkout.
-    pub async fn vcs_for_checkout(&self, env_id: &EnvironmentId, checkout: &Path) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
+    pub async fn vcs_for_checkout(&self, env_id: &EnvironmentId, checkout: &Path) -> Result<Arc<dyn Vcs>, String> {
         self.checkout_provider(env_id, checkout).await.map(|provider| Arc::clone(&provider.vcs))
     }
 
@@ -137,59 +189,87 @@ impl InProcessDaemon {
     }
 
     pub(super) fn spawn_checkout_provider_retirement(self: &Arc<Self>) {
-        // Both stores contribute Checkout lifetimes. List/watch handoff ensures
-        // deletion cannot be lost between the initial inventory and subscription.
         for backend in [self.resource_backend.clone(), self.observed_resource_backend.clone()] {
-            let weak = Arc::downgrade(self);
-            tokio::spawn(async move {
-                while let Some(daemon) = weak.upgrade() {
-                    let namespace = daemon.provisioning_namespace().await;
-                    let checkouts = backend.clone().using::<ResourceCheckout>(&namespace);
-                    let listed = match checkouts.list().await {
-                        Ok(listed) => listed,
-                        Err(error) => {
-                            warn!(%error, "list checkouts for provider retirement failed");
-                            drop(daemon);
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue;
-                        }
-                    };
-                    let mut watch = match checkouts.watch(WatchStart::resuming_from(&listed)).await {
-                        Ok(watch) => watch,
-                        Err(error) => {
-                            warn!(%error, "watch checkouts for provider retirement failed");
-                            drop(daemon);
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            continue;
-                        }
-                    };
+            tokio::spawn(Self::watch_checkout_provider_lifetimes(
+                Arc::downgrade(self),
+                backend,
+                self.checkout_namespace_changes.subscribe(),
+            ));
+        }
+    }
+
+    async fn watch_checkout_provider_lifetimes(weak: Weak<Self>, backend: ResourceBackend, mut namespace_changes: watch::Receiver<()>) {
+        while let Some(daemon) = weak.upgrade() {
+            // Mark the current notification before listing; changes during setup
+            // stay pending and immediately restart the subscription below.
+            namespace_changes.borrow_and_update();
+            let namespace = daemon.provisioning_namespace().await;
+            let checkouts = backend.clone().using::<ResourceCheckout>(&namespace);
+            let setup = async {
+                let listed = checkouts.list().await?;
+                let watch = checkouts.watch(WatchStart::resuming_from(&listed)).await?;
+                Ok::<_, ResourceError>((listed, watch))
+            }
+            .await;
+            let (listed, mut watch) = match setup {
+                Ok(setup) => setup,
+                Err(error) => {
+                    warn!(%error, "subscribe to checkout provider lifetimes failed");
+                    drop(daemon);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            let mut known: HashMap<_, _> = listed
+                .items
+                .iter()
+                .map(|checkout| (checkout.metadata.name.clone(), daemon.checkout_lifetime_key(&namespace, checkout)))
+                .collect();
+            if let Err(error) = daemon.retire_checkout_providers().await {
+                warn!(%error, "retire checkout providers failed");
+            }
+            drop(daemon);
+            let mut retry = false;
+            loop {
+                let event = tokio::select! {
+                    event = watch.next() => match event {
+                        Some(Ok(event)) => event,
+                        Some(Err(error)) => { warn!(%error, "checkout provider lifetime watch failed"); retry = true; break; },
+                        None => { retry = true; break; },
+                    },
+                    changed = namespace_changes.changed() => {
+                        if changed.is_err() { return; }
+                        break;
+                    }
+                };
+                let Some(daemon) = weak.upgrade() else {
+                    return;
+                };
+                let changed = match event {
+                    WatchEvent::Added(checkout) | WatchEvent::Modified(checkout) => {
+                        let key = daemon.checkout_lifetime_key(&namespace, &checkout);
+                        known.insert(checkout.metadata.name, key.clone()) != Some(key)
+                    }
+                    WatchEvent::Deleted(checkout) => {
+                        known.remove(&checkout.metadata.name);
+                        true
+                    }
+                    WatchEvent::DeletedByName(tombstone) => {
+                        known.remove(&tombstone.name);
+                        true
+                    }
+                };
+                // Status-only changes that leave the eligible instance unchanged
+                // cannot alter any cached capability and need no full inventory.
+                if changed {
                     if let Err(error) = daemon.retire_checkout_providers().await {
                         warn!(%error, "retire checkout providers failed");
                     }
-                    drop(daemon);
-                    let mut namespace_check = tokio::time::interval(Duration::from_secs(1));
-                    namespace_check.tick().await;
-                    loop {
-                        tokio::select! {
-                            event = watch.next() => match event {
-                                Some(Ok(_)) => {},
-                                Some(Err(error)) => { warn!(%error, "checkout provider lifetime watch failed"); break },
-                                None => break,
-                            },
-                            _ = namespace_check.tick() => {
-                                let Some(daemon) = weak.upgrade() else { return };
-                                if daemon.provisioning_namespace().await != namespace { break }
-                                continue;
-                            }
-                        }
-                        let Some(daemon) = weak.upgrade() else { return };
-                        if let Err(error) = daemon.retire_checkout_providers().await {
-                            warn!(%error, "retire checkout providers failed");
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-            });
+            }
+            if retry {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         }
     }
 }

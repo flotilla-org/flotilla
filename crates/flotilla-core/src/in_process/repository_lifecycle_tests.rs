@@ -47,7 +47,7 @@ impl Factory for CountingVcsFactory {
 async fn observe(daemon: &InProcessDaemon, backend: &ResourceBackend, name: &str, path: &Path, key: &RepositoryKey) {
     backend
         .clone()
-        .using::<ResourceCheckout>("flotilla")
+        .using::<ResourceCheckout>(&daemon.provisioning_namespace().await)
         .create(
             &InputMeta::builder().name(name.to_string()).build(),
             &ResourceCheckoutSpec::Observed(
@@ -293,4 +293,55 @@ async fn project_issue_binding_keeps_conditional_lease_after_checkout_removal() 
     assert_eq!(calls.len(), 2, "one request per poll; no reload or extra quota use");
     assert_eq!(calls[0].1[2], calls[1].1[2], "stable conditional endpoint");
     assert!(calls[1].1.contains(&"If-None-Match: \"issue-window\"".to_string()));
+}
+
+// Namespace changes retire idle providers immediately and move both resource
+// watchers to the new namespace; deletion there still needs no subsequent demand.
+#[tokio::test]
+async fn checkout_provider_watch_follows_namespace_changes() {
+    let temp = tempfile::tempdir().expect("config");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"namespace-lifetime\"\n").expect("config");
+    let path = Path::new("/checkouts/namespace");
+    let mut discovery = fake_discovery(false);
+    discovery.factories.vcs = vec![Box::new(FakeVcsFactory::new(FakeVcsState::builder(path).build()))];
+    let daemon = InProcessDaemon::new(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), discovery, HostName::new("test")).await;
+    let spec = RepositorySpec::remote("https://github.com/example/namespace").expect("repository");
+    let key = spec.key();
+    for namespace in ["flotilla", "other"] {
+        daemon
+            .resource_backend
+            .using::<Repository>(namespace)
+            .create(&InputMeta::builder().name(key.to_string()).build(), &spec)
+            .await
+            .expect("repository");
+    }
+    observe(&daemon, &daemon.observed_resource_backend, "namespace", path, &key).await;
+    let first = daemon.local_vcs_for_checkout(path).await.expect("first provider");
+    let first_lifetime = Arc::downgrade(&first);
+    // Let both in-memory watch subscriptions reach their pending receive before
+    // switching; this exercises notification rather than initial inventory.
+    tokio::task::yield_now().await;
+    drop(first);
+    daemon.set_provisioning_namespace("other".into()).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while first_lifetime.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("namespace change retires the previous cached lifetime without demand");
+    for backend in [&daemon.resource_backend, &daemon.observed_resource_backend] {
+        observe(&daemon, backend, "namespace", path, &key).await;
+        let provider = daemon.local_vcs_for_checkout(path).await.expect("new namespace provider");
+        let retired = Arc::downgrade(&provider);
+        drop(provider);
+        backend.using::<ResourceCheckout>("other").delete("namespace").await.expect("delete checkout");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while retired.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watch in the new namespace retires the provider without demand");
+    }
 }

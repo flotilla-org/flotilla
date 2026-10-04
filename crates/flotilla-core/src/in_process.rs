@@ -1745,6 +1745,7 @@ pub struct InProcessDaemon {
     /// looking up the Convoy whose task is being marked complete). Set by the
     /// daemon runtime at startup; defaults to [`DEFAULT_PROVISIONING_NAMESPACE`].
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
+    checkout_namespace_changes: tokio::sync::watch::Sender<()>,
     fleet: FleetService,
     repository_inspector: RwLock<Option<Arc<dyn RepositoryInspector>>>,
     operator_reconciler: RwLock<Option<Arc<dyn OperatorReconciler>>>,
@@ -2185,6 +2186,7 @@ impl InProcessDaemon {
             discovery: Arc::clone(&discovery),
             issue_query_port: Arc::clone(&issue_query_port),
             checkout_vcs: Mutex::new(checkout_vcs),
+            checkout_namespace_changes: tokio::sync::watch::channel(()).0,
             repository_providers: Mutex::new(HashMap::new()),
             active_commands: Arc::new(Mutex::new(HashMap::new())),
             self_weak: self_weak.clone(),
@@ -3016,6 +3018,7 @@ impl InProcessDaemon {
     /// `RuntimeOptions::namespace`.
     pub async fn set_provisioning_namespace(&self, namespace: String) {
         *self.provisioning_namespace.write().expect("provisioning namespace lock poisoned") = namespace;
+        self.checkout_namespace_changes.send_replace(());
     }
 
     pub async fn provisioning_namespace(&self) -> String {
