@@ -349,18 +349,31 @@ fn stock_workflows_transcribe_the_standard_exit_table() {
 }
 
 #[test]
-fn stock_landing_workflows_validate_with_review_and_conflicting_turn_delivery() {
+fn stock_landing_workflows_validate_with_checks_review_and_conflicting_turn_delivery() {
     for (name, spec, role) in [
         ("single-agent-shepherd", single_agent_shepherd_workflow_spec(), "shepherd"),
         ("single-agent", single_agent_workflow_spec(), "coder"),
         ("implement-review", implement_review_workflow_spec(), "coder"),
     ] {
         validate(&spec).unwrap_or_else(|errors| panic!("stock workflow {name} must validate: {errors:?}"));
-        assert_eq!(spec.turn_delivery.keys().map(String::as_str).collect::<Vec<_>>(), ["actionable-review", "conflicting"]);
-        for rule in spec.turn_delivery.values() {
+        assert_eq!(spec.turn_delivery.keys().filter(|source| !source.starts_with("reviewer-")).map(String::as_str).collect::<Vec<_>>(), [
+            "checks-settled",
+            "actionable-review",
+            "conflicting"
+        ]);
+        for (source, rule) in &spec.turn_delivery {
             assert_eq!(rule.to.vessel, "work", "wrong vessel in {name}");
-            assert_eq!(rule.to.role, role, "wrong role in {name}");
+            assert_eq!(rule.to.role, if source.starts_with("reviewer-") { "reviewer" } else { role }, "wrong role in {name}");
         }
+        if name == "implement-review" {
+            assert_eq!(spec.turn_delivery.len(), 5);
+            assert_eq!(spec.turn_delivery["reviewer-checks-settled"].on.to_string(), "$cr.checks != pending");
+            assert_eq!(spec.turn_delivery["reviewer-actionable-review"].on.to_string(), "$cr.review.actionable-at-head == true");
+        } else {
+            assert_eq!(spec.turn_delivery.len(), 3);
+        }
+        // #2596: stock delivery wakes the crew for either settled checks outcome.
+        assert_eq!(spec.turn_delivery["checks-settled"].on.to_string(), "$cr.checks != pending");
         assert_eq!(spec.turn_delivery["conflicting"].on.to_string(), "$cr.mergeable == conflicting");
     }
 }
