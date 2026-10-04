@@ -960,13 +960,33 @@ impl Reconciler for ConvoyReconciler {
             })
         });
         let reclaim_eligible = if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
-            match &self.teardown_runtime {
+            let result = match &self.teardown_runtime {
                 Some(runtime) => {
                     let checkout_list = checkouts.values().cloned().collect::<Vec<_>>();
-                    runtime.verify_reclaim(obj, &checkout_list).await.is_ok()
+                    runtime.verify_reclaim(obj, &checkout_list).await
                 }
-                None => false,
+                None => Err("convoy reclaim verifier unavailable".to_string()),
+            };
+            for session in &terminal_sessions {
+                let (session_disposition, reason) = if session.metadata.deletion_timestamp.is_some() {
+                    ("already_deleting", "session deletion already requested")
+                } else if !matches!(session.metadata.lifecycle_authority(), Ok(None | Some(LifecycleAuthority::Managed))) {
+                    ("unmanaged", "session lifecycle is not managed")
+                } else if let Err(reason) = &result {
+                    ("retain", reason.as_str())
+                } else {
+                    ("request_deletion", "convoy teardown verified")
+                };
+                tracing::info!(
+                    convoy = %obj.metadata.name,
+                    session = %session.metadata.name,
+                    gate_outcome = if result.is_ok() { "allowed" } else { "refused" },
+                    session_disposition,
+                    reason,
+                    "terminal session reclaim decision"
+                );
             }
+            result.is_ok()
         } else {
             false
         };
