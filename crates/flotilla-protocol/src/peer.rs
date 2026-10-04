@@ -6,6 +6,9 @@ use crate::{CommandValue, HostIdentity, NodeId, RepoIdentity, Step, StepOutcome,
 
 /// Unified peer-to-peer wire payload used inside `Message::Peer`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// Windows type layouts have triggered this lint for the legacy peer payload. Keep its
+// representation intact while the peer layer is bugfix-only (#2520).
+#[cfg_attr(windows, allow(clippy::large_enum_variant))]
 #[serde(tag = "peer_type")]
 pub enum PeerWireMessage {
     HostIdentity(HostIdentity),
