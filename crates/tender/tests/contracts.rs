@@ -21,28 +21,28 @@ trait HostControls {
 
 impl HostControls for MemoryTender {
     fn grant(&self, grant: Grant) {
-        self.grant(grant);
+        self.grant(grant).expect("host policy");
     }
     fn allow_browse(&self, caller: Fingerprint) {
-        self.allow_browse(caller);
+        self.allow_browse(caller).expect("host policy");
     }
     fn allow_connect(&self, caller: Fingerprint) {
-        self.allow_connect(caller);
+        self.allow_connect(caller).expect("host policy");
     }
     fn trust_intermediary(&self, relay: Fingerprint) {
-        self.trust_intermediary(relay);
+        self.trust_intermediary(relay).expect("host policy");
     }
     fn assign_replacement(&self, id: PublicationId, replacement: Fingerprint) {
-        self.assign_replacement(id, replacement);
+        self.assign_replacement(id, replacement).expect("host policy");
     }
     fn revoke(&self, grantee: &Fingerprint, namespace: &Namespace) {
-        self.revoke(grantee, namespace);
+        self.revoke(grantee, namespace).expect("host policy");
     }
     fn advance_to(&self, now: u64) {
-        self.advance_to(now);
+        self.advance_to(now).expect("host policy");
     }
     fn restart(&self) {
-        self.restart();
+        self.restart().expect("host policy");
     }
 }
 
