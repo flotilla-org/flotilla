@@ -246,7 +246,8 @@ for declared Forge resources, including replicated declarations. It does not
 require a local checkout or block placement. Diagnosis waits for the configured
 manifest source's first published pass and connected peers' Forge snapshots;
 the next heartbeat clears it when a Forge declaration arrives or the mapping is
-corrected or removed.
+corrected or removed. Failures in the diagnostic are logged and skipped so they
+do not prevent the heartbeat from publishing.
 
 This host-local setting leaves resource schemas unchanged. Existing project-map
 crew/governor declarations need no edits; enabling authenticated observation
