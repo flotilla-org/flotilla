@@ -8,7 +8,7 @@ use common::{
 };
 use flotilla_resources::{
     change_request_record_name,
-    controller::{Actuation, Reconciler},
+    controller::{Actuation, ReconcileOutcome as ControllerReconcileOutcome, Reconciler},
     controller_patches, evaluate_crew_completion, evaluate_landing_settlement, external_patches, implement_review_workflow_spec,
     interactive_single_workflow_spec, reconcile, BoundChangeRequest, ChangeRequest, ChangeRequestMergeability, ChangeRequestObservation,
     ChangeRequestReviewObservation, ChangeRequestSpec, ChangeRequestState, ChangeRequestStatus, Checkout, CheckoutIntegrationStatus,
@@ -1562,11 +1562,17 @@ async fn landing_discharges_checkout_without_change_request_despite_stale_landed
     assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
 }
 
+struct TerminalChangeRequestReconcile {
+    evaluation: flotilla_resources::SettlementEvaluation,
+    outcome: ControllerReconcileOutcome<Convoy>,
+    backend: ResourceBackend,
+}
+
 async fn reconcile_terminal_bound_change_request(
     checkout_present: bool,
     vessel_present: bool,
     untouched_checkout: bool,
-) -> (flotilla_resources::SettlementEvaluation, flotilla_resources::controller::ReconcileOutcome<Convoy>, ResourceBackend) {
+) -> TerminalChangeRequestReconcile {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let templates = backend.definitions::<WorkflowTemplate>("flotilla");
     let convoys = backend.clone().using::<Convoy>("flotilla");
@@ -1752,33 +1758,33 @@ async fn reconcile_terminal_bound_change_request(
         .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), std::time::Duration::from_secs(180))
         .with_clock(Arc::new(FixedClock(timestamp(40))));
     let deps = reconciler.prepare(&current).await.expect("dependencies");
-    (evaluation, reconciler.reconcile(&current, &deps, timestamp(40)), backend)
+    TerminalChangeRequestReconcile { evaluation, outcome: reconciler.reconcile(&current, &deps, timestamp(40)), backend }
 }
 
 #[tokio::test]
 async fn terminal_bound_change_request_settles_checkout_without_own_landed_evidence() {
-    let (_, outcome, _) = reconcile_terminal_bound_change_request(true, true, false).await;
+    let TerminalChangeRequestReconcile { outcome, .. } = reconcile_terminal_bound_change_request(true, true, false).await;
 
     assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
 }
 
 #[tokio::test]
 async fn terminal_bound_change_request_discharges_missing_checkout_after_vessel_teardown() {
-    let (_, outcome, _) = reconcile_terminal_bound_change_request(false, false, false).await;
+    let TerminalChangeRequestReconcile { outcome, .. } = reconcile_terminal_bound_change_request(false, false, false).await;
 
     assert_eq!(outcome.patch, Some(controller_patches::settle("merged".to_string(), Vec::new(), timestamp(40))));
 }
 
 #[tokio::test]
 async fn terminal_bound_change_request_keeps_missing_checkout_expectation_for_live_vessel() {
-    let (_, outcome, _) = reconcile_terminal_bound_change_request(false, true, false).await;
+    let TerminalChangeRequestReconcile { outcome, .. } = reconcile_terminal_bound_change_request(false, true, false).await;
 
     assert_eq!(outcome.patch, None);
 }
 
 #[tokio::test]
 async fn merged_change_request_discharges_present_context_checkout_without_change_request() {
-    let (evaluation, outcome, _) = reconcile_terminal_bound_change_request(true, true, true).await;
+    let TerminalChangeRequestReconcile { evaluation, outcome, .. } = reconcile_terminal_bound_change_request(true, true, true).await;
 
     assert!(evaluation.satisfied, "the untouched context checkout must not block the merged exit: {:?}", evaluation.unmet);
     assert!(evaluation.unmet.is_empty());
@@ -2949,7 +2955,7 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
     let legacy_disposition = tc.draw(hegel::generators::booleans());
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(async {
-        let (_, outcome, backend) = reconcile_terminal_bound_change_request(true, true, false).await;
+        let TerminalChangeRequestReconcile { outcome, backend, .. } = reconcile_terminal_bound_change_request(true, true, false).await;
         let convoys = backend.using::<Convoy>("flotilla");
         let checkouts = backend.using::<Checkout>("flotilla");
         let changes = backend.using::<ChangeRequest>("flotilla");

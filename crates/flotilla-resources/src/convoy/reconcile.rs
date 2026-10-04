@@ -525,6 +525,8 @@ fn evaluate_landing_settlement_with_disposition(
         let mode = match status.disposition.as_deref() {
             Some("observed-digest") => SettlementMode::ObservedDigest,
             Some("claim") => SettlementMode::ClaimExit,
+            // This is a diagnostic label for legacy or unrecognised dispositions;
+            // Landed itself records the recognised terminal settlement.
             _ => SettlementMode::WorldTerminal,
         };
         return LandingSettlement {
