@@ -4071,6 +4071,8 @@ mod tests {
                 assert!(warning.contains("convoy=stalled-work"), "{warning}");
                 assert!(warning.contains("target="), "{warning}");
                 assert!(warning.contains("reason="), "{warning}");
+                // DeliveryError logs the transport failure at the attempted send,
+                // before the policy-fallback warning that carries cursor/evidence.
                 if !matches!(unavailable, GovernorUnavailable::DeliveryError) {
                     assert!(warning.contains("supervision_start="), "{warning}");
                     assert!(warning.contains("supervision_policy_len="), "{warning}");

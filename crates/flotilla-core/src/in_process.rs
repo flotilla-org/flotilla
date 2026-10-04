@@ -8269,30 +8269,25 @@ impl InProcessDaemon {
                         .filter_map(|session| session.object.status.as_ref())
                         .filter_map(|status| status.attention.as_ref())
                         .max_by_key(|attention| attention.as_of);
+                    macro_rules! log_pending_decision {
+                        ($level:ident, $reason:expr) => {{
+                            tracing::$level!(
+                                convoy = %convoy.metadata.name, source = ?pending.sender,
+                                vessel = %pending.vessel, role = %pending.role,
+                                attention_state = ?attention.map(|attention| attention.state),
+                                attention_source = ?attention.map(|attention| attention.source),
+                                attention_as_of = ?attention.map(|attention| attention.as_of),
+                                queued_at = %pending.queued_at,
+                                hook_precedence_seconds = flotilla_resources::TerminalAttention::FRESH_FOR.num_seconds(),
+                                reason = $reason,
+                                "pending crew turn delivery decision"
+                            );
+                        }};
+                    }
                     if boundary {
-                        tracing::info!(
-                            convoy = %convoy.metadata.name, source = ?pending.sender,
-                            vessel = %pending.vessel, role = %pending.role,
-                            attention_state = ?attention.map(|attention| attention.state),
-                            attention_source = ?attention.map(|attention| attention.source),
-                            attention_as_of = ?attention.map(|attention| attention.as_of),
-                            queued_at = %pending.queued_at,
-                            hook_precedence_seconds = flotilla_resources::TerminalAttention::FRESH_FOR.num_seconds(),
-                            reason = if boundary { "release_fresh_idle_after_queue" } else { "skip_without_fresh_idle_after_queue" },
-                            "pending crew turn delivery decision"
-                        );
+                        log_pending_decision!(info, "release_fresh_idle_after_queue");
                     } else {
-                        tracing::debug!(
-                            convoy = %convoy.metadata.name, source = ?pending.sender,
-                            vessel = %pending.vessel, role = %pending.role,
-                            attention_state = ?attention.map(|attention| attention.state),
-                            attention_source = ?attention.map(|attention| attention.source),
-                            attention_as_of = ?attention.map(|attention| attention.as_of),
-                            queued_at = %pending.queued_at,
-                            hook_precedence_seconds = flotilla_resources::TerminalAttention::FRESH_FOR.num_seconds(),
-                            reason = if boundary { "release_fresh_idle_after_queue" } else { "skip_without_fresh_idle_after_queue" },
-                            "pending crew turn delivery decision"
-                        );
+                        log_pending_decision!(debug, "skip_without_fresh_idle_after_queue");
                     }
                     if boundary {
                         if let Err(error) = self
