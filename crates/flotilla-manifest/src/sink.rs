@@ -252,6 +252,10 @@ impl PatchSink for WheelhouseHttpSink {
 
 #[cfg(test)]
 mod tests {
+    // HTTP audit (#1512): Wheelhouse is an owned local IPC protocol, documented
+    // in wheelhouse/docs/protocol/pm-connect.md. The HTTP socket stand-in below
+    // checks POST routing and shared payloads. No external forge requirements or
+    // live identity recording applies to this boundary.
     #[cfg(windows)]
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     #[cfg(unix)]

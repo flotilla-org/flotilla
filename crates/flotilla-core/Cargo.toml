@@ -8,6 +8,7 @@ license.workspace = true
 default = []
 aws-lc-provider = ["flotilla-resources/aws-lc-provider"]
 replay = []
+skip-no-sandbox-tests = ["flotilla-resources/skip-no-sandbox-tests"]
 test-support = ["flotilla-protocol/test-support", "flotilla-resources/test-support"]
 
 [dependencies]
@@ -47,6 +48,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 libc = "0.2"
 
 [dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 hegeltest = "=0.48.1"
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
 flotilla-resources = { path = "../flotilla-resources", features = ["test-support"] }

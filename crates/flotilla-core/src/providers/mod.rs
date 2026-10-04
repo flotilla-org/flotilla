@@ -1146,6 +1146,10 @@ pub(crate) mod github_test_support {
 
 #[cfg(test)]
 mod tests {
+    // HTTP audit (#1512): ReqwestHttpClient is service-neutral transport, including
+    // execute_to_file. Service rules belong to its callers' contract/replay tests;
+    // it has no separate remote service contract or fixture. TLS User-Agent wire
+    // coverage lives in flotilla-resources/src/tls.rs.
     use std::path::PathBuf;
 
     use super::*;
@@ -1236,3 +1240,6 @@ mod tests {
         assert_eq!(label, ChannelLabel::Default);
     }
 }
+
+#[cfg(test)]
+pub(crate) mod http_contract;

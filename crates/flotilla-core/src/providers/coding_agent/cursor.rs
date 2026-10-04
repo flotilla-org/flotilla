@@ -356,4 +356,25 @@ mod tests {
         let cmd = agent.attach_command("sess-42").await.unwrap();
         assert_eq!(cmd, "agent --resume sess-42");
     }
+    // Cursor's agent-list boundary uses HTTP Basic authentication and a limit
+    // query: https://cursor.com/docs/cloud-agent/api/v0
+    // Glue: listing an empty page exercises the single outbound request builder.
+    #[tokio::test]
+    #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "requires loopback listener")]
+    async fn agent_list_satisfies_http_contract() {
+        use axum::{routing::get, Router};
+        use http::{HeaderMap, StatusCode, Uri};
+
+        use crate::providers::http_contract::StandIn;
+        async fn receive(headers: HeaderMap, uri: Uri) -> (StatusCode, &'static str) {
+            if headers.get("authorization").is_some_and(|v| v == "Basic dGVzdC1rZXk6") && uri.query() == Some("limit=100") {
+                (StatusCode::OK, r#"{"agents":[]}"#)
+            } else {
+                (StatusCode::UNAUTHORIZED, "invalid agent-list request")
+            }
+        }
+        let server = StandIn::start("https://api.cursor.com", Router::new().route("/v0/agents", get(receive))).await;
+        let provider = CursorCodingAgent::new("cursor".into(), "test-key".into(), server.http.clone());
+        assert!(provider.fetch_agents().await.expect("accepted request").is_empty());
+    }
 }

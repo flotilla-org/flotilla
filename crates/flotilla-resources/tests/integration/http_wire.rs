@@ -1,3 +1,9 @@
+// HTTP audit (#1512): HttpBackend CRUD/list/watch, bootstrap namespace/CRD calls,
+// and kubeconfig authentication target the owned resource-store/Kubernetes wire
+// protocol. These wire tests and provisioning_http_wire cover request encoding;
+// no external forge header contract or live recorded identity applies. Bootstrap
+// and TLS identity setup are not claimed to have external service contract coverage.
+
 use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
 
 use common::{convoy_meta, convoy_spec, convoy_status};

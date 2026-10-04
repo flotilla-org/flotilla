@@ -482,6 +482,9 @@ fn parse_documents(path: &Path, content: &str) -> Result<Vec<Value>> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    // HTTP audit (#1512): inventory/resource validation speaks the owned daemon
+    // API over a local Unix socket. The socket integration tests below exercise
+    // its actual server; no external-service stand-in or recorded replay applies.
     use std::{path::Path, sync::Arc, time::Duration};
 
     use flotilla_core::{config::ConfigStore, providers::discovery::test_support::fake_discovery};

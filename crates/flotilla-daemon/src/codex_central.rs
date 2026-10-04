@@ -275,6 +275,12 @@ fn decode_jwt_exp(token: &str) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
+    // HTTP audit (#1512): the ChatGPT OAuth refresh endpoint is a first-party
+    // Codex consumer endpoint, without a published service request contract for
+    // this adapter. A fabricated enforcing server would claim rules we cannot
+    // substantiate, and recording refreshes would capture live rotating tokens.
+    // Neither applies here; fixed responses below cover decoding/classification,
+    // not compatibility with the remote OAuth service.
     use std::{collections::VecDeque, os::unix::fs::PermissionsExt, sync::Mutex as StdMutex};
 
     use chrono::Duration;
