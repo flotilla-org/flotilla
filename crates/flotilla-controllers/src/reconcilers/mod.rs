@@ -1,5 +1,6 @@
 pub mod checkout;
 pub mod clone;
+pub mod convoy_ensure;
 pub mod environment;
 pub mod presentation;
 pub mod repository;
@@ -24,5 +25,3 @@ pub use terminal_session::{
 };
 pub use vessel::{checkout_path_component, VesselPrepared, VesselReconciler};
 pub use vessel_placement::{VesselPlacementProjector, VesselPlacementSync};
-
-pub mod convoy_ensure;

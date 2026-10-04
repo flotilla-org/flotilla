@@ -4321,6 +4321,8 @@ impl InProcessDaemon {
 
     /// Install the controller before driving standing-convoy operations.
     /// Repeated runtime construction retains the transaction guard and retries.
+    /// First install wins: subsequent reconcilers are dropped without replacing
+    /// the installed controller, including when a different instance is passed.
     pub async fn install_convoy_ensure_reconciler(&self, reconciler: Arc<dyn ConvoyEnsureReconciler>) {
         self.convoy_ensure_reconciler.write().await.get_or_insert(reconciler);
     }

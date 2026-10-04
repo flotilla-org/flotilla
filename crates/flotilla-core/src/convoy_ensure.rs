@@ -61,6 +61,7 @@ pub trait ConvoyEnsureAdmission: Send + Sync {
     async fn abandon(&self, namespace: &str, name: &str, reason: &str, principal_ref: Option<&PrincipalRef>) -> Result<(), String>;
     async fn reap(&self, namespace: &str, name: &str, force: bool) -> Result<(), String>;
 }
+
 /// Verifies the provider backing of a terminal standing convoy before the
 /// ensure controller may reclaim it. Implementations must fail closed: `Ok`
 /// means the backing was positively observed dead, while any live, unknown,
