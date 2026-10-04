@@ -55,6 +55,13 @@ Refresh reads `project.yaml` from the bootstrap checkout's committed
 watch for changes continuously, and it does not use uncommitted working-tree
 contents.
 
+Projects registered before the host-local lookup may have no bootstrap Checkout
+fact on this host, particularly when the bootstrap is not a Project member.
+Re-register those once with `flotilla project register /path/to/bootstrap` on the
+Project's home host. A replicated legacy path is never used to infer a local
+checkout. If multiple local checkouts exist, refresh requires a unique main
+checkout; a sole checkout remains usable even if it is a worktree.
+
 Aliases preserve each member's RepositoryKey if its URL changes between
 refreshes. This follows the repository identity model: forge renames are served
 through redirects while resource references retain their established key.

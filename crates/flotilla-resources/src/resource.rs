@@ -190,19 +190,25 @@ pub struct MergeMetadata {
     pub conflicts: BTreeMap<String, Vec<MergeConflictSibling>>,
 }
 
+// ADR 0047: this reserved key is retired across every kind's metadata, including
+// Projects from the previous generation. Remove it one fleet roll after #2484 ships.
+pub const BOOTSTRAP_PATH_ANNOTATION: &str = "flotilla.work/project-bootstrap-path";
+
 // ADR 0047: previous-generation metadata carried a host-local bootstrap path.
+// The reserved key is stripped for all resource kinds, not only Projects.
 // Accept and drop it; remove this decode shim one fleet roll after #2484 ships.
 fn decode_annotations<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<BTreeMap<String, String>, D::Error> {
     let mut annotations = BTreeMap::<String, String>::deserialize(decoder)?;
-    annotations.remove("flotilla.work/project-bootstrap-path");
+    annotations.remove(BOOTSTRAP_PATH_ANNOTATION);
     Ok(annotations)
 }
 
 fn encode_annotations<S: serde::Serializer>(annotations: &BTreeMap<String, String>, encoder: S) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeMap;
-    let mut map = encoder.serialize_map(None)?;
+    let length = annotations.len() - usize::from(annotations.contains_key(BOOTSTRAP_PATH_ANNOTATION));
+    let mut map = encoder.serialize_map(Some(length))?;
     for (key, value) in annotations {
-        if key != "flotilla.work/project-bootstrap-path" {
+        if key != BOOTSTRAP_PATH_ANNOTATION {
             map.serialize_entry(key, value)?;
         }
     }
@@ -587,7 +593,7 @@ mod retired_annotation_tests {
         let mut annotations = (0..count).map(|i| (format!("example/key-{i}"), "v".repeat(length))).collect::<BTreeMap<_, _>>();
         let expected = annotations.clone();
         if retired {
-            annotations.insert("flotilla.work/project-bootstrap-path".into(), format!("/other-host/{}", "p".repeat(length)));
+            annotations.insert(BOOTSTRAP_PATH_ANNOTATION.into(), format!("/other-host/{}", "p".repeat(length)));
         }
         let old = serde_json::json!({"name": "project", "annotations": annotations});
         let decoded: InputMeta = serde_json::from_value(old).expect("old metadata decodes");

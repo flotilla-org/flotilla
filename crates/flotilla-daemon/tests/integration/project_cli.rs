@@ -410,6 +410,34 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
     }
 }
 
+// An upgraded Project may have portable bootstrap identity but no observed
+// bootstrap on this host. Never adopt a replicated legacy path; explain how to
+// establish the host-local observation explicitly.
+#[tokio::test]
+async fn legacy_project_without_local_bootstrap_requires_reregistration() {
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+    daemon.set_repository_inspector(Arc::new(FailingInspector)).await;
+    let key = RepositorySpec::remote("https://github.com/example/bootstrap").expect("repository").key();
+    backend
+        .definitions::<Project>("flotilla")
+        .apply(
+            &InputMeta::builder()
+                .name("legacy".to_string())
+                .annotations(BTreeMap::from([
+                    (BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), key.to_string()),
+                    (BOOTSTRAP_PATH_ANNOTATION.to_string(), "/another-host/bootstrap".to_string()),
+                ]))
+                .build(),
+            &ProjectSpec::builder().display_name("Legacy".to_string()).default_workflow_ref("single-agent".to_string()).build(),
+        )
+        .await
+        .expect("legacy Project");
+    let mut rx = daemon.subscribe();
+    let result = execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "legacy".to_string() }).await;
+    assert!(matches!(result, CommandValue::Error { message }
+        if message.contains("no local bootstrap checkout") && message.contains("flotilla project register /path/to/bootstrap")));
+}
+
 // Issue #2484: a selected ops checkout keeps its catalog identity even when
 // detached HEAD and distinct remotes make fresh identity inspection ambiguous.
 #[tokio::test]
