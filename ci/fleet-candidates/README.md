@@ -61,9 +61,12 @@ three additional generations by default. Set `FLEET_INSTALL_KEEP_OTHERS` to a
 non-negative integer to change that count (zero keeps only protected releases).
 Additional generations are ordered by generation ID, whose leading UTC
 publication timestamp is stable across reinstalls and validator synchronization.
-Every generation containing a running `flotillad` executable is also kept,
+Every generation containing a running `flotillad` executable is also kept
+without consuming one of the K additional slots,
 using `/proc/<pid>/exe` on Linux and `proc_pidpath` on macOS. Unreadable process
-information refuses pruning. Pruning errors are reported without undoing a
+information refuses pruning. On Linux, an unreaped zombie whose executable
+cannot be inspected also blocks pruning until its parent reaps it; retry after
+that process disappears. Pruning errors are reported without undoing a
 healthy install; activation with health confirmation disabled does not prune.
 
 Operators can preview with `fleet-install --prune-dry-run` or apply with

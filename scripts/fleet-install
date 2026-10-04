@@ -1139,7 +1139,7 @@ if not re.fullmatch(r"[0-9]+", keep_text):
 keep = int(keep_text)
 releases = root / "releases"
 
-def protected_paths(include_processes=True):
+def protected_paths():
     protected = set()
     for name in ("current", "previous"):
         link = root / name
@@ -1150,8 +1150,6 @@ def protected_paths(include_processes=True):
             protected.add(target)
         elif link.exists():
             raise RuntimeError(f"{name} is not a symlink")
-    if not include_processes:
-        return protected
     # Fixture seam at the process boundary, never enabled in normal installs.
     fixture = os.environ.get("FLEET_INSTALL_TEST_PROCESS_PATHS")
     if os.environ.get("FLEET_INSTALL_TESTING") == "1" and fixture:
@@ -1209,7 +1207,8 @@ try:
     # Longest-prefix ownership disambiguates dotted generation IDs: pruning
     # A must not delete A.b.validator.bak when generation A.b is retained.
     generation_names = sorted((p.name for p in generations), key=len, reverse=True)
-    others = [p for p in generations if p not in protected_paths(False)]
+    # Running releases are protected in addition to the K recent others.
+    others = [p for p in generations if p not in protected]
     retained = set(others[:keep]) | protected
     for release in others[keep:]:
         # Recheck immediately before deletion in case a daemon respawned since

@@ -1078,42 +1078,48 @@ run_pruner() {
     FLEET_INSTALL_TESTING=1 FLEET_INSTALL_TEST_PROCESS_PATHS="$process_paths" \
     FLEET_INSTALL_KEEP_OTHERS="$1" "$installer" "$2"
 }
-for keep in 0 1 3 9; do
-  rm -rf "$prune_root"
-  mkdir -p "$prune_root/releases"
-  for generation in 01 02 03 04 05 06 07 08; do
-    mkdir -p "$prune_root/releases/$generation/bin"
-    printf 'validator\n' >"$prune_root/releases/$generation/generation_validation.py"
-    printf 'backup\n' >"$prune_root/releases/$generation.validator.bak"
+# Generate older and newest running positions (including a duplicate executable path).
+# Running releases do not consume the K additional-generation slots.
+for newest_running in 0 1; do
+  for keep in 0 1 3 9; do
+    rm -rf "$prune_root"
+    mkdir -p "$prune_root/releases"
+    for generation in 01 02 03 04 05 06 07 08; do
+      mkdir -p "$prune_root/releases/$generation/bin"
+      printf 'validator\n' >"$prune_root/releases/$generation/generation_validation.py"
+      printf 'backup\n' >"$prune_root/releases/$generation.validator.bak"
+    done
+    ln -s releases/01 "$prune_root/current"
+    ln -s releases/02 "$prune_root/previous"
+    latest_running_generation=03
+    if ((newest_running)); then latest_running_generation=08; fi
+    printf '["%s/releases/03/bin/flotillad", "%s/releases/04/bin/flotillad", "%s/releases/%s/bin/flotillad"]\n' \
+      "$prune_root" "$prune_root" "$prune_root" "$latest_running_generation" >"$process_paths"
+    # Dry run preserves every release, validator, backup and symlink byte.
+    before="$(find "$prune_root" -print | sort)"
+    run_pruner "$keep" --prune-dry-run >"$test_root/prune-dry-run.out"
+    test "$(find "$prune_root" -print | sort)" = "$before" || fail 'dry run changed the fleet tree'
+    chmod -R a-w "$prune_root/releases/05"
+    run_pruner "$keep" --prune >"$test_root/prune.out"
+    for generation in 01 02 03 04; do
+      test -f "$prune_root/releases/$generation/generation_validation.py" || fail "pruned protected $generation"
+      test -f "$prune_root/releases/$generation.validator.bak" || fail "pruned protected backup $generation"
+    done
+    for generation in 05 06 07 08; do
+      if ((newest_running && 10#$generation == 8 || 10#$generation > 8 - newest_running - keep)); then
+        test -d "$prune_root/releases/$generation" || fail "lost retained $generation at K=$keep"
+        test -f "$prune_root/releases/$generation.validator.bak" || fail 'lost retained validator backup'
+      else
+        test ! -e "$prune_root/releases/$generation" || fail "kept stale $generation at K=$keep"
+        test ! -e "$prune_root/releases/$generation.validator.bak" || fail 'kept pruned validator backup'
+      fi
+    done
+    # A repeated prune is idempotent.
+    before="$(find "$prune_root" -print | sort)"
+    run_pruner "$keep" --prune >/dev/null
+    test "$(find "$prune_root" -print | sort)" = "$before" || fail 'pruning was not idempotent'
+    chmod -R u+w "$prune_root"
   done
-  ln -s releases/01 "$prune_root/current"
-  ln -s releases/02 "$prune_root/previous"
-  printf '["%s/releases/03/bin/flotillad", "%s/releases/04/bin/flotillad"]\n' \
-    "$prune_root" "$prune_root" >"$process_paths"
-  # Dry run preserves every release, validator, backup and symlink byte.
-  before="$(find "$prune_root" -print | sort)"
-  run_pruner "$keep" --prune-dry-run >"$test_root/prune-dry-run.out"
-  test "$(find "$prune_root" -print | sort)" = "$before" || fail 'dry run changed the fleet tree'
-  chmod -R a-w "$prune_root/releases/05"
-  run_pruner "$keep" --prune >"$test_root/prune.out"
-  for generation in 01 02 03 04; do
-    test -f "$prune_root/releases/$generation/generation_validation.py" || fail "pruned protected $generation"
-    test -f "$prune_root/releases/$generation.validator.bak" || fail "pruned protected backup $generation"
-  done
-  for generation in 05 06 07 08; do
-    if ((10#$generation > 8 - keep)); then
-      test -d "$prune_root/releases/$generation" || fail "lost retained $generation at K=$keep"
-      test -f "$prune_root/releases/$generation.validator.bak" || fail 'lost retained validator backup'
-    else
-      test ! -e "$prune_root/releases/$generation" || fail "kept stale $generation at K=$keep"
-      test ! -e "$prune_root/releases/$generation.validator.bak" || fail 'kept pruned validator backup'
-    fi
-  done
-  # A repeated prune is idempotent.
-  before="$(find "$prune_root" -print | sort)"
-  run_pruner "$keep" --prune >/dev/null
-  test "$(find "$prune_root" -print | sort)" = "$before" || fail 'pruning was not idempotent'
-  chmod -R u+w "$prune_root"
 done
 # Native process-boundary check: inspect the actual executable after current
 # has flipped elsewhere, covering /proc on Linux and proc_pidpath on macOS.
