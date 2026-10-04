@@ -968,17 +968,20 @@ impl Reconciler for ConvoyReconciler {
                 None => Err("convoy reclaim verifier unavailable".to_string()),
             };
             for session in &terminal_sessions {
-                let reason = if session.metadata.deletion_timestamp.is_some() {
-                    "session deletion already requested"
+                let (session_disposition, reason) = if session.metadata.deletion_timestamp.is_some() {
+                    ("already_deleting", "session deletion already requested")
                 } else if !matches!(session.metadata.lifecycle_authority(), Ok(None | Some(LifecycleAuthority::Managed))) {
-                    "session lifecycle is not managed"
+                    ("unmanaged", "session lifecycle is not managed")
+                } else if let Err(reason) = &result {
+                    ("retain", reason.as_str())
                 } else {
-                    result.as_ref().err().map(String::as_str).unwrap_or("convoy teardown verified")
+                    ("request_deletion", "convoy teardown verified")
                 };
                 tracing::info!(
                     convoy = %obj.metadata.name,
                     session = %session.metadata.name,
                     gate_outcome = if result.is_ok() { "allowed" } else { "refused" },
+                    session_disposition,
                     reason,
                     "terminal session reclaim decision"
                 );

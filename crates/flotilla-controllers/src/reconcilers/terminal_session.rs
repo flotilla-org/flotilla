@@ -233,12 +233,12 @@ impl<R> TerminalSessionReconciler<R> {
         {
             match self.vessels.get(&owner.name).await {
                 Ok(vessel) if vessel.metadata.deletion_timestamp.is_some() => {
-                    log_reclaim_decision(session, "allowed", "owning vessel deletion requested");
+                    log_reclaim_decision(session, "not_required", "owning vessel deletion requested");
                     return Ok(TerminalOwnerState::Gone);
                 }
                 Ok(_) => {}
                 Err(ResourceError::NotFound { .. }) => {
-                    log_reclaim_decision(session, "allowed", "owning vessel is absent");
+                    log_reclaim_decision(session, "not_required", "owning vessel is absent");
                     return Ok(TerminalOwnerState::Gone);
                 }
                 Err(err) => return Err(err),
@@ -257,7 +257,7 @@ impl<R> TerminalSessionReconciler<R> {
                 if convoy.metadata.deletion_timestamp.is_some()
                     || convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Abandoned) =>
             {
-                log_reclaim_decision(session, "allowed", "convoy deleted or abandoned");
+                log_reclaim_decision(session, "not_required", "convoy deleted or abandoned");
                 Ok(TerminalOwnerState::Gone)
             }
             Ok(convoy) if convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()) => {
@@ -277,7 +277,7 @@ impl<R> TerminalSessionReconciler<R> {
             }
             Ok(_) => Ok(TerminalOwnerState::Active),
             Err(ResourceError::NotFound { .. }) => {
-                log_reclaim_decision(session, "allowed", "owning convoy is absent");
+                log_reclaim_decision(session, "not_required", "owning convoy is absent");
                 Ok(TerminalOwnerState::Gone)
             }
             Err(err) => Err(err),
@@ -287,10 +287,18 @@ impl<R> TerminalSessionReconciler<R> {
 
 fn log_reclaim_decision(session: &ResourceObject<TerminalSession>, gate_outcome: &str, reason: &str) {
     let convoy = match &session.spec.source {
-        TerminalSessionSource::Agent { context, .. } => context.convoy.as_str(),
-        TerminalSessionSource::Tool { .. } => session.metadata.labels.get(CONVOY_LABEL).map(String::as_str).unwrap_or("<independent>"),
+        TerminalSessionSource::Agent { context, .. } => Some(context.convoy.as_str()),
+        TerminalSessionSource::Tool { .. } => session.metadata.labels.get(CONVOY_LABEL).map(String::as_str),
     };
-    tracing::info!(%convoy, session = %session.metadata.name, gate_outcome, reason, "terminal session reclaim decision");
+    tracing::info!(
+        convoy,
+        independent = convoy.is_none(),
+        session = %session.metadata.name,
+        gate_outcome,
+        session_disposition = if gate_outcome == "refused" { "retain" } else { "request_deletion" },
+        reason,
+        "terminal session reclaim decision"
+    );
 }
 
 enum TerminalOwnerState {
@@ -351,7 +359,7 @@ where
         let environment = match self.environments.get(&obj.spec.env_ref).await {
             Ok(environment) => environment,
             Err(ResourceError::NotFound { .. }) => {
-                log_reclaim_decision(obj, "allowed", "owning environment is absent");
+                log_reclaim_decision(obj, "not_required", "owning environment is absent");
                 return Ok(TerminalPrepared::OwnerMissing);
             }
             Err(err) => return Err(err),

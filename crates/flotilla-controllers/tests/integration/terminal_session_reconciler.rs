@@ -20,11 +20,11 @@ use flotilla_resources::{
         run_transition_sequence, FixpointPredicate, LivenessEnrollment, LivenessScenario, LivenessStep, ReconcileStep, Transition,
         TransitionDriver, TransitionSequence, WorldBuilder,
     },
-    Convoy, ConvoyPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec, InputMeta,
-    LifecycleAuthority, OwnerReference, Resource, ResourceBackend, ResourceError, ResourceObject, StatusPatch, TerminalAttention,
-    TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSpec,
-    TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, VesselSpec, VirtualClock, ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL,
-    CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
+    Checkout, Convoy, ConvoyPhase, ConvoyReconciler, ConvoyTeardownRuntime, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch,
+    HostDirectEnvironmentSpec, InputMeta, LifecycleAuthority, OwnerReference, Resource, ResourceBackend, ResourceError, ResourceObject,
+    StatusPatch, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, VesselSpec, VirtualClock,
+    ACTUATOR_HOST_REF_ANNOTATION, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG, VESSEL_REF_LABEL,
 };
 use tracing::instrument::WithSubscriber;
 
@@ -2380,6 +2380,13 @@ async fn receipt_lifecycle_survives_failed_relaunch_cleanup_outage_and_restart()
     assert!(cwd.path().join(exit_receipt("other-role")).exists());
 }
 
+#[async_trait]
+impl ConvoyTeardownRuntime for CleanupRecordingTerminalRuntime {
+    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>, _checkouts: &[ResourceObject<Checkout>]) -> Result<(), String> {
+        TerminalRuntime::verify_reclaim(self, convoy).await
+    }
+}
+
 #[derive(Clone, Default)]
 struct ReclaimLogBuffer(Arc<Mutex<Vec<u8>>>);
 
@@ -2394,14 +2401,13 @@ impl std::io::Write for ReclaimLogBuffer {
     }
 }
 
-// A retained Landed convoy may be a replica at the terminal's authority.
-// Its pre-existing orphan must be reclaimed by the startup list without writes.
-// Exhaustive scenario matrix: local/replicated owners, every terminal phase,
-// immediate/recovered gates, and all lifecycle authorities. Fixed cases make
-// startup versus periodic progress observable without clock or store writes.
+// Retained terminal convoy orphans must be reclaimed at startup and resync
+// without resource writes; refused and unmanaged sessions must be preserved.
+// Exhaustive matrix covers local/replicated owners, all terminal phases plus
+// Landing, immediate/recovered gates, and all lifecycle authorities.
 #[rstest::rstest]
 #[tokio::test(start_paused = true)]
-async fn landed_orphan_predating_startup_is_reaped(
+async fn retained_terminal_convoy_orphans_follow_reclaim_matrix(
     #[values(ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Cancelled, ConvoyPhase::Abandoned, ConvoyPhase::Landing)]
     phase: ConvoyPhase,
     #[values(false, true)] replicated: bool,
@@ -2486,9 +2492,10 @@ async fn landed_orphan_predating_startup_is_reaped(
     if managed && initially_refused && phase.is_terminal() && phase != ConvoyPhase::Abandoned {
         let output = String::from_utf8(logs.0.lock().expect("logs").clone()).expect("UTF-8 logs");
         assert!(
-            output.contains("convoy=demo")
+            output.contains("convoy=\"demo\"")
                 && output.contains("session=old-orphan")
                 && output.contains("gate_outcome=\"refused\"")
+                && output.contains("session_disposition=\"retain\"")
                 && output.contains("reason=\"checkout evidence is stale\""),
             "every refusal must name the convoy, session, gate outcome and reason: {output}"
         );
@@ -2510,13 +2517,119 @@ async fn landed_orphan_predating_startup_is_reaped(
     if reclaimed {
         let output = String::from_utf8(logs.0.lock().expect("logs").clone()).expect("UTF-8 logs");
         assert!(
-            output.contains("convoy=demo")
+            output.contains("convoy=\"demo\"")
                 && output.contains("session=old-orphan")
-                && output.contains("gate_outcome=\"allowed\"")
+                && output.contains(if phase == ConvoyPhase::Abandoned {
+                    "gate_outcome=\"not_required\""
+                } else {
+                    "gate_outcome=\"allowed\""
+                })
+                && output.contains("session_disposition=\"request_deletion\"")
                 && output.contains("reason="),
             "successful reclaim must be logged: {output}"
         );
     }
     assert_eq!(*runtime.killed.lock().expect("killed"), if reclaimed { vec!["old-process"] } else { vec![] });
     assert_eq!(convoys.get("demo").await.expect("retained convoy").status.expect("status").phase, phase);
+}
+
+// Gate approval is independent of session eligibility. Logs must distinguish
+// refused gates, unmanaged sessions, and deletion already in flight.
+#[rstest::rstest]
+#[tokio::test]
+async fn convoy_reclaim_logs_distinguish_gate_from_session_disposition(
+    #[values(LifecycleAuthority::Managed, LifecycleAuthority::Adopted, LifecycleAuthority::Observed)] authority: LifecycleAuthority,
+    #[values(false, true)] deleting: bool,
+    #[values(false, true)] refused: bool,
+) {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
+    let convoys = backend.using::<Convoy>("flotilla");
+    let convoy = convoys.get("demo").await.expect("convoy");
+    let mut status = convoy.status.expect("status");
+    status.phase = ConvoyPhase::Landed;
+    let convoy = convoys.update_status("demo", &convoy.metadata.resource_version, &status).await.expect("landed");
+    let sessions = backend.using::<TerminalSession>("flotilla");
+    sessions
+        .create(
+            &InputMeta::builder()
+                .name("old-orphan".to_string())
+                .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "demo".to_string())]))
+                .finalizers(vec!["test-teardown".to_string()])
+                .build()
+                .with_lifecycle_authority(authority),
+            &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: "/workspace".to_string(),
+                pool: "cleat".to_string(),
+            },
+        )
+        .await
+        .expect("session");
+    if deleting {
+        sessions.delete("old-orphan").await.expect("request deletion");
+    }
+    let runtime = Arc::new(CleanupRecordingTerminalRuntime::default());
+    runtime.reclaim_refused.store(refused, Ordering::SeqCst);
+    let reconciler = ConvoyReconciler::new(backend.definitions::<flotilla_resources::WorkflowTemplate>("flotilla"))
+        .with_terminal_sessions(sessions)
+        .with_teardown_runtime(runtime);
+    let logs = ReclaimLogBuffer::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(move || writer.clone()).finish();
+    let prepared = reconciler.prepare(&convoy).with_subscriber(subscriber).await.expect("prepare");
+    let output = String::from_utf8(logs.0.lock().expect("logs").clone()).expect("UTF-8 logs");
+    let disposition = if deleting {
+        "already_deleting"
+    } else if authority != LifecycleAuthority::Managed {
+        "unmanaged"
+    } else if refused {
+        "retain"
+    } else {
+        "request_deletion"
+    };
+    assert!(output.contains(&format!("session_disposition=\"{disposition}\"")), "{output}");
+    let gate = if refused { "refused" } else { "allowed" };
+    assert!(output.contains(&format!("gate_outcome=\"{gate}\"")), "{output}");
+    assert_eq!(
+        reconciler
+            .reconcile(&convoy, &prepared, Utc::now())
+            .actuations
+            .iter()
+            .any(|actuation| matches!(actuation, Actuation::DeleteTerminalSession { name } if name == "old-orphan")),
+        disposition == "request_deletion"
+    );
+}
+
+// Owner absence sanctions deletion without running the convoy gate. An
+// independent session must not acquire a fabricated convoy name in the log.
+#[tokio::test]
+async fn independent_owner_absence_log_does_not_claim_gate_approval() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let sessions = backend.using::<TerminalSession>("flotilla");
+    let session = sessions
+        .create(&meta("independent"), &TerminalSessionSpec {
+            env_ref: "missing-env".to_string(),
+            role: "shell".to_string(),
+            source: flotilla_resources::TerminalSessionSource::Tool { command: "bash".to_string() },
+            cwd: "/workspace".to_string(),
+            pool: "cleat".to_string(),
+        })
+        .await
+        .expect("session");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(CleanupRecordingTerminalRuntime::default()), backend, "flotilla");
+    let logs = ReclaimLogBuffer::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(move || writer.clone()).finish();
+    let prepared = reconciler.prepare(&session).with_subscriber(subscriber).await.expect("prepare");
+    let output = String::from_utf8(logs.0.lock().expect("logs").clone()).expect("UTF-8 logs");
+    assert!(output.contains("independent=true") && !output.contains("convoy=") && !output.contains("<independent>"), "{output}");
+    assert!(output.contains("gate_outcome=\"not_required\"") && output.contains("reason=\"owning environment is absent\""), "{output}");
+    assert!(reconciler
+        .reconcile(&session, &prepared, Utc::now())
+        .actuations
+        .iter()
+        .any(|actuation| matches!(actuation, Actuation::DeleteTerminalSession { name } if name == "independent")));
 }
