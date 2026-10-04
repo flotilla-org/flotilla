@@ -30,9 +30,10 @@ use async_trait::async_trait;
 use attach::AttachResolver;
 pub use attach::ResolvedAttach;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+pub(crate) use convoy_admission::convoy_address;
 pub use convoy_admission::RoleAddress;
 use convoy_admission::{
-    allocate_convoy_generation, convoy_address, convoy_ensure_name, convoy_record_name, discover_repository_change_request_with,
+    allocate_convoy_generation, convoy_ensure_name, convoy_record_name, discover_repository_change_request_with,
     normalize_convoy_start_intent, project_not_ready_error, resolve_and_validate_workflow_credentials, resolve_convoy_candidate_indices,
     validate_convoy_name, ConvoyAddressIdentity, ConvoyAdmission, ConvoyCreateAdmission, ConvoyStartKey, ConvoyStartTask,
     PlacementResolution, PreparedConvoyAdmission, StaticFulfilmentDecider,
@@ -7043,10 +7044,18 @@ impl InProcessDaemon {
             flotilla_protocol::CrewSupervisionAction::Resume => {
                 let sender = if actor_crew_id.is_some() {
                     let supervisor = stalled.supervisor.as_ref().expect("checked supervisor above");
+                    let supervisor_convoy = self
+                        .resource_backend
+                        .including_replicas::<ResourceConvoy>(namespace)
+                        .get(&supervisor.convoy)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .object;
+                    let address = convoy_address(&supervisor_convoy.spec.role, supervisor_convoy.spec.project_ref.as_deref());
                     if stalled.rung == flotilla_resources::StallRung::Governor {
-                        CrewMessageSender::Governor { name: supervisor.convoy.clone() }
+                        CrewMessageSender::Governor { name: address }
                     } else if stalled.rung == flotilla_resources::StallRung::Bosun {
-                        CrewMessageSender::Bosun { name: format!("{}@{}", supervisor.role, supervisor.vessel) }
+                        CrewMessageSender::Bosun { name: format!("{}@{} in {address}", supervisor.role, supervisor.vessel) }
                     } else {
                         return Err("crew supervisor has no governor or Bosun rung".to_string());
                     }
@@ -7478,7 +7487,14 @@ impl InProcessDaemon {
             return Err(format!("crew target `{target}` has failed work and cannot receive a handoff"));
         }
 
-        let sender = CrewMessageSender::Handoff { from: format!("{}@{}", context.caller_role, context.vessel) };
+        let sender = CrewMessageSender::Handoff {
+            from: format!(
+                "{}@{} in {}",
+                context.caller_role,
+                context.vessel,
+                convoy_address(&convoy.spec.role, convoy.spec.project_ref.as_deref())
+            ),
+        };
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&context.namespace);
         let identity = TerminalSessionIdentity::builder()
             .vessel_ref(context.vessel_ref.clone())

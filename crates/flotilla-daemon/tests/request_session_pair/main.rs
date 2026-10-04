@@ -3514,7 +3514,18 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
         let TerminalSessionSource::Agent { message: Some(message), .. } = session.spec.source else {
             panic!("governor must receive escalation in same pass")
         };
-        assert!(message.text.contains("Supervise stalled crew .crew.coder.phase in convoy stalled-work"), "{}", message.text);
+        // #2592: every routed escalation identifies its source convoy and exact stalled crew.
+        assert!(
+            message.text.starts_with("[flotilla · escalated from coder@work in coder@project · supervise the stalled crew]"),
+            "{}",
+            message.text
+        );
+        assert!(
+            message.text.contains("Supervise stalled crew coder@work in convoy coder@project (resource ref: stalled-work)"),
+            "{}",
+            message.text
+        );
+        assert!(message.text.contains("--convoy stalled-work --vessel work --role coder resume"), "{}", message.text);
         assert!(message.following.is_empty(), "repeat passes must not redeliver");
     }
     // The governor may issue supervision from B: route back to A and
