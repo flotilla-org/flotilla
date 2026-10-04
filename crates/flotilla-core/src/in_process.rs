@@ -7819,6 +7819,7 @@ impl InProcessDaemon {
         let agent_exited = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
             session.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped)
         });
+        let queue_until_boundary = crew_phase == flotilla_resources::CrewWorkPhase::Working && !at_turn_boundary && !agent_exited;
         let attention = session
             .as_ref()
             .ok()
@@ -7831,14 +7832,14 @@ impl InProcessDaemon {
             attention_source = ?attention.map(|attention| attention.source),
             attention_as_of = ?attention.map(|attention| attention.as_of),
             hook_precedence_seconds = flotilla_resources::TerminalAttention::FRESH_FOR.num_seconds(),
-            reason = if crew_phase == flotilla_resources::CrewWorkPhase::Working && !at_turn_boundary && !agent_exited {
+            reason = if queue_until_boundary {
                 "queue_until_turn_boundary"
             } else if agent_exited { "release_after_agent_exit" }
             else if at_turn_boundary { "release_at_turn_boundary" }
-            else { "release_completed_work" },
+            else { "release_non_working_crew" },
             "crew turn delivery decision"
         );
-        if crew_phase == flotilla_resources::CrewWorkPhase::Working && !at_turn_boundary && !agent_exited {
+        if queue_until_boundary {
             let displaced = status.pending_brief().map(|brief| brief.content.clone());
             apply_resource_status_patch(
                 &convoys,
