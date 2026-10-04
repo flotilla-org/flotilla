@@ -838,6 +838,8 @@ fn codex_composer_visible(screen: &str) -> bool {
     if text.starts_with(|character: char| character.is_ascii_digit()) {
         return false;
     }
+    // The footer ties arbitrary trailing prompt text to the live composer,
+    // rather than a transcript row that merely begins with the same marker.
     let footer = lines[index + 1..].iter().any(|line| line.contains(" · /") || line.contains(" · ~"));
     // Known empty-composer hints also work on cropped captures without the footer.
     footer || text.starts_with("Ask Codex") || text.starts_with("Run /review")

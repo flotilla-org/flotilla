@@ -1480,6 +1480,20 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
     let runtime = Arc::new(DeliveringTerminalRuntime::default());
     let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
 
+    // #2599 review: optional observation failure must not back off or starve
+    // a pending delivery. No queued message is acknowledged until it succeeds.
+    runtime.pending.store(true, Ordering::SeqCst);
+    runtime.observation_failed.store(true, Ordering::SeqCst);
+    let now = chrono::DateTime::parse_from_rfc3339("2026-10-04T15:45:11Z").expect("epoch").with_timezone(&Utc);
+    for step in 0..3 {
+        let prepared = reconciler.prepare(&session).await.expect("observation failure must preserve delivery retry");
+        let outcome = reconciler.reconcile(&session, &prepared, now + chrono::Duration::milliseconds(step * 200));
+        assert!(!matches!(outcome.patch, Some(TerminalSessionStatusPatch::MarkMessageDelivered { .. })));
+        assert_eq!(outcome.requeue_after, Some(Duration::from_millis(200)));
+        assert!(runtime.delivered.lock().expect("delivered mutex").is_empty());
+    }
+    runtime.pending.store(false, Ordering::SeqCst);
+
     let deps = reconciler.prepare(&session).await.expect("observe pending message");
     assert_eq!(runtime.delivered.lock().expect("delivered mutex").as_slice(), &[(
         "cleat-session".to_string(),
@@ -1512,6 +1526,7 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
     outcome.patch.expect("nudge acknowledgment").apply(&mut status);
     let acknowledged =
         sessions.update_status("term-a", &acknowledged.metadata.resource_version, &status).await.expect("nudge acknowledged");
+    runtime.observation_failed.store(false, Ordering::SeqCst);
     let deps = reconciler.prepare(&acknowledged).await.expect("observe completed queue");
     assert!(matches!(deps, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
 }
@@ -1564,7 +1579,14 @@ async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
     }
     .apply(&mut status);
     let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
-    let runtime = Arc::new(DeliveringTerminalRuntime { delivered: Mutex::default(), unconfirmed: true });
+    let runtime = Arc::new(
+        DeliveringTerminalRuntime::builder()
+            .delivered(Mutex::default())
+            .unconfirmed(true)
+            .pending(AtomicBool::new(false))
+            .observation_failed(AtomicBool::new(false))
+            .build(),
+    );
     let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
 
     let pending = reconciler.reconcile(
@@ -1734,10 +1756,14 @@ async fn terminal_finalizer_cleans_agent_artifacts() {
     assert_eq!(runtime.cleaned.lock().expect("cleaned mutex").as_slice(), &[".flotilla/briefs/coder.md".to_string()]);
 }
 
-#[derive(Default)]
+// Fake for the external terminal process: pending delivery and observation
+// failures are independent responses from that boundary.
+#[derive(Default, bon::Builder)]
 struct DeliveringTerminalRuntime {
     delivered: Mutex<Vec<(String, String, TerminalDeliveryReadiness)>>,
     unconfirmed: bool,
+    pending: AtomicBool,
+    observation_failed: AtomicBool,
 }
 
 #[derive(Default)]
@@ -1788,6 +1814,9 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
         message: &str,
         readiness: TerminalDeliveryReadiness,
     ) -> Result<TerminalDeliveryOutcome, String> {
+        if self.pending.load(Ordering::SeqCst) {
+            return Ok(TerminalDeliveryOutcome::Pending);
+        }
         self.delivered.lock().expect("delivered mutex").push((session_id.to_string(), message.to_string(), readiness));
         Ok(if self.unconfirmed {
             TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)
@@ -1797,6 +1826,9 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
     }
 
     async fn observe_attention(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {
+        if self.observation_failed.load(Ordering::SeqCst) {
+            return Err("attention observation unavailable".into());
+        }
         Ok(Some(TerminalObservation {
             output_digest: None,
             attention: Some(TerminalAttention {

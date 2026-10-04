@@ -397,12 +397,14 @@ where
                         {
                             // Waiting for a turn boundary must not suppress the
                             // observation that releases other queued deliveries.
-                            TerminalDeliveryOutcome::Pending => {
-                                match self.runtime.observe_attention(session_id, &obj.spec).await.map_err(ResourceError::other)? {
-                                    Some(observation) => TerminalPrepared::Attention(observation),
-                                    None => TerminalPrepared::MessageDeliveryPending,
+                            TerminalDeliveryOutcome::Pending => match self.runtime.observe_attention(session_id, &obj.spec).await {
+                                Ok(Some(observation)) => TerminalPrepared::Attention(observation),
+                                Ok(None) => TerminalPrepared::MessageDeliveryPending,
+                                Err(error) => {
+                                    tracing::warn!(%session_id, %error, "attention observation failed during pending delivery");
+                                    TerminalPrepared::MessageDeliveryPending
                                 }
-                            }
+                            },
                             TerminalDeliveryOutcome::Confirmed => TerminalPrepared::MessageDelivered(message.id.clone()),
                             TerminalDeliveryOutcome::Unconfirmed(failure) => TerminalPrepared::MessageDeliveryUnconfirmed {
                                 message_id: message.id.clone(),

@@ -5597,6 +5597,8 @@ async fn wait_for_delivery_ready(
             return Ok(true);
         }
         polls += 1;
+        // Startup alone has a deadline (and reports StartupNotReady). A queued
+        // mid-session turn waits for its boundary without that startup timeout.
         if readiness == TerminalDeliveryReadiness::Startup && polls >= DELIVERY_READY_POLLS {
             return Ok(false);
         }
@@ -5921,19 +5923,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
         spec: &flotilla_resources::TerminalSessionSpec,
     ) -> Result<Option<TerminalObservation>, String> {
         let pool = self.pool_for_spec(spec)?;
-        let adapter = if let TerminalSessionSource::Agent { selector, .. } = &spec.source {
-            let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
-            let registry = self.registry_for_env(&spec.env_ref)?;
-            Some(
-                registry
-                    .agent_adapters
-                    .get(&requirement.adapter)
-                    .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?
-                    .clone(),
-            )
-        } else {
-            None
-        };
+        let adapter = self.adapter_for_spec(spec)?;
         observe_terminal_screen(&*pool, adapter.as_deref(), session_id, Utc::now()).await
     }
 
@@ -5983,17 +5973,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
         message: &str,
         readiness: TerminalDeliveryReadiness,
     ) -> Result<TerminalDeliveryOutcome, String> {
-        let TerminalSessionSource::Agent { selector, .. } = &spec.source else {
+        let TerminalSessionSource::Agent { .. } = &spec.source else {
             return Err("crew message delivery requires an agent terminal".to_string());
         };
-        let pool = self.pool_for_spec(spec)?;
-        let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
-        let registry = self.registry_for_env(&spec.env_ref)?;
-        let adapter = registry
-            .agent_adapters
-            .get(&requirement.adapter)
-            .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?
-            .clone();
         let clear_before_delivery = match lookup_terminal_delivery(&self.state.terminal_deliveries, session_id, message) {
             TerminalDeliveryLookup::InFlight => return Ok(TerminalDeliveryOutcome::Pending),
             TerminalDeliveryLookup::Taken(delivery) if delivery.message == message => {
@@ -6006,10 +5988,12 @@ impl TerminalRuntime for TerminalControllerRuntime {
             }
             TerminalDeliveryLookup::Vacant => false,
         };
+        let pool = self.pool_for_spec(spec)?;
+        let adapter = self.adapter_for_spec(spec)?;
         let session_id_owned = session_id.to_string();
         let message_owned = message.to_string();
         let task = tokio::spawn(async move {
-            deliver_and_confirm(&*pool, Some(&*adapter), &session_id_owned, &message_owned, readiness, clear_before_delivery).await
+            deliver_and_confirm(&*pool, adapter.as_deref(), &session_id_owned, &message_owned, readiness, clear_before_delivery).await
         });
         self.state
             .terminal_deliveries
@@ -6080,6 +6064,18 @@ impl TerminalControllerRuntime {
             .daemon
             .environment_registry_for_environment(&EnvironmentId::new(env_ref.to_string()))
             .ok_or_else(|| format!("provider registry unavailable for environment {env_ref}"))
+    }
+
+    fn adapter_for_spec(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<Option<Arc<dyn AgentAdapter>>, String> {
+        let TerminalSessionSource::Agent { selector, .. } = &spec.source else { return Ok(None) };
+        let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
+        let registry = self.registry_for_env(&spec.env_ref)?;
+        registry
+            .agent_adapters
+            .get(&requirement.adapter)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))
     }
 
     fn pool_for_spec(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<Arc<dyn TerminalPool>, String> {
@@ -13218,6 +13214,40 @@ dependency = { path = "../dependency" }
         .await
         .expect("submit");
         assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
+        assert_eq!(pool.inner.delivered.lock().await.len(), 1);
+    }
+
+    // A new turn may retain its idle composer and active redraws briefly after
+    // submission. Working evidence within the grace window confirms it once.
+    #[tokio::test(start_paused = true)]
+    async fn hookless_submission_waits_for_delayed_working_evidence_with_composer_visible() {
+        let pool = Arc::new(HooklessComposerPool { inner: FakeTerminalPool::new(), submitted_screen: "› Ask Codex to do anything" });
+        pool.inner
+            .add_sessions(vec![ProviderTerminalSession::builder()
+                .session_name("agent".into())
+                .status(TerminalStatus::Running)
+                .screen_activity(ScreenActivity::Active)
+                .build()])
+            .await;
+        pool.inner.set_captured_screen("agent", "› Ask Codex to do anything").await;
+        let adapters = AgentAdapterRegistry::discover(
+            &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
+            Arc::new(DiscoveryMockRunner::builder().build()),
+        );
+        let adapter = adapters.get("codex").expect("adapter").clone();
+        let submit_pool = pool.clone();
+        let submit = tokio::spawn(async move {
+            deliver_and_confirm(&*submit_pool, Some(&*adapter), "agent", "review wake", TerminalDeliveryReadiness::TurnBoundary, false)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(pool.inner.delivered.lock().await.len(), 1);
+        tokio::time::advance(Duration::from_millis(1900)).await;
+        assert!(!submit.is_finished());
+        assert_eq!(pool.inner.delivered.lock().await.len(), 1);
+        pool.inner.set_captured_screen("agent", "• Working (1s • esc to interrupt)\n› Ask Codex to do anything").await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert_eq!(submit.await.expect("task").expect("delivery"), TerminalDeliveryOutcome::Confirmed);
         assert_eq!(pool.inner.delivered.lock().await.len(), 1);
     }
 
