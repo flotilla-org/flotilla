@@ -1283,6 +1283,17 @@ mod spawn_lock_tests {
         use std::os::unix::fs::PermissionsExt;
         let (_dir, socket, config, state) = spawn_socket_paths();
         let parent = socket.parent().expect("socket parent");
+        struct PermissionsGuard<'a> {
+            path: &'a Path,
+            original: fs::Permissions,
+        }
+        impl Drop for PermissionsGuard<'_> {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(self.path, self.original.clone());
+            }
+        }
+        // Restore before TestSocketDir cleans up, including during unwinding.
+        let _permissions = PermissionsGuard { path: parent, original: fs::metadata(parent).expect("parent metadata").permissions() };
         // Root bypasses directory permissions; a directory at the lock path
         // supplies the same lock-open failure on privileged test runners.
         if unsafe { libc::geteuid() } == 0 {
@@ -1297,7 +1308,6 @@ mod spawn_lock_tests {
             Ok(())
         };
         let result = connect_or_spawn_with_optional_surface_using(&socket, &config, &state, None, &supervisor, &spawner).await;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).expect("restore permissions");
         let Err(error) = result else { panic!("lock open must fail") };
         assert!(error.contains("spawn lock failed"), "unexpected error: {error}");
         assert_eq!(spawns.load(Ordering::SeqCst), 0);

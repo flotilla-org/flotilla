@@ -698,6 +698,15 @@ mod tests {
         ));
     }
 
+    // Empty quoted arguments retain their arity: convoy list accepts no
+    // subject, and unfinished noun/verb commands remain undispatchable.
+    #[test]
+    fn empty_quoted_arguments_preserve_palette_arity() {
+        for input in ["\"\"", "convoy \"\"", "convoy \"\" list", "convoy \"\" work"] {
+            assert_eq!(palette_input_state(input), PaletteInputState::Incomplete, "{input}");
+        }
+    }
+
     #[test]
     fn parse_palette_input_unknown_errors() {
         assert!(parse_palette_input("bogus command").is_err());
