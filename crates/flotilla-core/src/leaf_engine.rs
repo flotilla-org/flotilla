@@ -237,6 +237,12 @@ fn is_conflict_probe(leaf: &Leaf) -> bool {
     leaf.field_path == ".mergeable" && leaf.operator == LeafOperator::Equal && leaf.literal == "conflicting"
 }
 
+fn is_active_change_request_probe(leaf: &Leaf) -> bool {
+    is_conflict_probe(leaf)
+        || matches!(leaf.address, LeafAddress::ChangeRequest { .. })
+            && matches!(leaf.field_path.as_str(), ".checks" | ".review.actionable-at-head")
+}
+
 fn refusal_nudge_brief(refusal: &CrewCompletionRefusal) -> String {
     let conflict = refusal.causes.iter().find_map(|cause| match cause {
         CrewCompletionRefusalCause::ConflictingChangeRequest { number, .. } => Some(*number),
@@ -733,7 +739,7 @@ impl LeafSubscriptionTable {
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{convoy_name}` has no status"))?;
         let claim = status.crew_work.get(&rule.to.vessel).and_then(|crew| crew.get(&rule.to.role));
         let claim_at = claim.and_then(|claim| claim.finished_at);
-        let active_conflict = status.phase == ConvoyPhase::Active && claim_at.is_none() && is_conflict_probe(leaf);
+        let active_probe = status.phase == ConvoyPhase::Active && claim_at.is_none() && is_active_change_request_probe(leaf);
         let (subject_revision, evidence_at, brief) = match &leaf.address {
             LeafAddress::ChangeRequest { service, scope, number } => {
                 let record_name = flotilla_resources::change_request_record_name(service, scope, *number);
@@ -756,8 +762,13 @@ impl LeafSubscriptionTable {
                     ".mergeable" => cr.mergeable.observed_at,
                     _ => return Err(format!("turn-delivery leaf path `{}` has no firing evidence timestamp", leaf.field_path)),
                 };
-                let brief = if active_conflict {
+                let brief = if active_probe && is_conflict_probe(leaf) {
                     format!("PR #{number} is conflicting. Rebase onto the current base branch, rerun the gates, push, then file a settlement claim.")
+                } else if active_probe {
+                    format!(
+                        "{}\n\n## Turn firing context\n\n- Condition source: `{source}`\n- Head SHA: `{head_sha}`\n- Checks: {:?}\n- Review actionable at head: {:?}\n- Durable convoy record: `{namespace}/{convoy_name}`\n- Target crew: `{}/{}`\n",
+                        rule.brief.trim(), cr.checks.value, cr.review.actionable_at_head.value, rule.to.vessel, rule.to.role,
+                    )
                 } else {
                     claim_at
                         .map(|claim_at| {
@@ -891,9 +902,9 @@ impl LeafSubscriptionTable {
             return Ok(());
         }
         let judged_at = claim_at
-            .or_else(|| active_conflict.then(|| status.started_at.unwrap_or(convoy.metadata.creation_timestamp)))
+            .or_else(|| active_probe.then(|| status.started_at.unwrap_or(convoy.metadata.creation_timestamp)))
             .ok_or_else(|| format!("turn-delivery target {}/{} has no settlement claim", rule.to.vessel, rule.to.role))?;
-        if !active_conflict && evidence_at <= judged_at {
+        if evidence_at <= judged_at && !(active_probe && is_conflict_probe(leaf)) {
             return Ok(());
         }
 
@@ -2255,7 +2266,13 @@ impl ReconcilerWake {
                     }
                 }
                 for delivery in instantiate_turn_delivery(convoy, &checkouts, &observed_change_requests, &forges)? {
-                    if !is_conflict_probe(&delivery.leaf) {
+                    if !is_active_change_request_probe(&delivery.leaf)
+                        || status
+                            .crew_work
+                            .get(&delivery.rule.to.vessel)
+                            .and_then(|crew| crew.get(&delivery.rule.to.role))
+                            .is_none_or(|work| work.finished_at.is_some())
+                    {
                         continue;
                     }
                     desired.push(LeafSubscriptionRow {
@@ -4916,6 +4933,181 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].1.len(), 1);
         assert_eq!(diagnostics[0].1[0].value, "Landed");
+    }
+
+    // #2596: an active crew with a produced PR yields while checks are pending;
+    // settled checks deliver once per head, with the existing episode ceiling.
+    async fn active_checks_scenario(outcomes: &[bool], watch_events: bool) {
+        use flotilla_protocol::Relationship;
+        use flotilla_resources::{Observation, ObservedChecks, SubjectDiscoverySource};
+
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let wake = supervision_wake(&backend);
+        let table = &wake.subscriptions;
+        let actuator = Arc::new(RecordingTurnDelivery::default());
+        table.set_turn_delivery_actuator(actuator.clone()).await;
+        let workflow = flotilla_resources::single_agent_workflow_spec();
+        let convoys = backend.using::<Convoy>("flotilla");
+        let created = convoys
+            .create(
+                &InputMeta::builder().name("checks-wake".into()).build(),
+                &ConvoySpec::builder().workflow_ref("single-agent".into()).build(),
+            )
+            .await
+            .expect("convoy");
+        let base = Utc::now() - chrono::Duration::seconds(2);
+        let mut status = ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            started_at: Some(base),
+            workflow_snapshot: Some(WorkflowSnapshot {
+                stall_nudges: workflow.stall_nudges,
+                supervision: workflow.supervision,
+                exit: workflow.exit,
+                turn_delivery: workflow.turn_delivery,
+                vessels: workflow.vessels,
+            }),
+            work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
+            crew_work: BTreeMap::from([(
+                "work".into(),
+                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+            )]),
+            ..Default::default()
+        };
+        status.discover_subject(
+            flotilla_protocol::Subject {
+                kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+                id: "2596".into(),
+            },
+            Relationship::Produces,
+            SubjectDiscoverySource::Claim,
+            base,
+        );
+        convoys.update_status("checks-wake", &created.metadata.resource_version, &status).await.expect("active crew");
+        let records = backend.using::<ChangeRequest>("flotilla");
+        let name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 2596);
+        records
+            .create(
+                &InputMeta::builder().name(name.clone()).build(),
+                &flotilla_resources::ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("flotilla-org/flotilla".into())
+                    .number(2596)
+                    .observing_authority("authority".into())
+                    .build(),
+            )
+            .await
+            .expect("PR record");
+        let objects = HashMap::from([("checks-wake".into(), convoys.get("checks-wake").await.expect("convoy"))]);
+        wake.sync_rows("flotilla", &objects).await.expect("derive active subscriptions");
+        // Drive each evaluation deterministically, using the same evaluator and
+        // firing path as the resource watch, rather than scheduling background watches.
+        if !watch_events {
+            for task in table.inner.tasks.lock().await.drain().map(|(_, task)| task) {
+                task.abort();
+            }
+        }
+        let row = table
+            .rows()
+            .await
+            .into_iter()
+            .find(|row| {
+                matches!(&row.watcher,
+                    LeafWatcher::TurnDelivery { source, .. } if source == "checks-settled"
+                )
+            })
+            .expect("active checks-settled subscription");
+        let LeafWatcher::TurnDelivery { source, rule, .. } = &row.watcher else { unreachable!() };
+        for (index, pass) in outcomes.iter().enumerate() {
+            for checks in [None, Some(ObservedChecks::Pending), Some(if *pass { ObservedChecks::Pass } else { ObservedChecks::Fail })] {
+                let observed = flotilla_resources::ChangeRequestStatus {
+                    title: Default::default(),
+                    author: Default::default(),
+                    review_decision: Default::default(),
+                    review_requested_from_owner: Default::default(),
+                    state: Default::default(),
+                    head_sha: Observation::known(format!("head-{index}"), Utc::now()),
+                    checks: Observation { value: checks, observed_at: Utc::now() },
+                    review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+                    mergeable: Default::default(),
+                };
+                let updated = loop {
+                    let current = records.get(&name).await.expect("record");
+                    match records.update_status(&name, &current.metadata.resource_version, &observed).await {
+                        Ok(updated) => break updated,
+                        Err(ResourceError::Conflict { .. }) => continue,
+                        Err(error) => panic!("observe checks: {error}"),
+                    }
+                };
+                let empty = HashMap::new();
+                let change_requests = HashMap::from([(name.clone(), updated)]);
+                let fire = evaluate_row(
+                    &row,
+                    &LeafSubjects {
+                        convoys: &objects,
+                        vessels: &empty,
+                        change_requests: &change_requests,
+                        usages: &HashMap::new(),
+                        issues: &HashMap::new(),
+                        artifacts: &HashMap::new(),
+                    },
+                    LeafObservationStaleness { change_request: Duration::from_secs(60), issue: Duration::from_secs(60) },
+                )
+                .expect("evaluate checks");
+                assert_eq!(fire.is_some(), checks.is_some_and(|value| value != ObservedChecks::Pending));
+                if let Some(fire) = fire {
+                    if watch_events {
+                        tokio::time::timeout(Duration::from_secs(2), async {
+                            loop {
+                                let current = convoys.get("checks-wake").await.expect("convoy").status.expect("status");
+                                if current.turn_deliveries.get(source).is_some_and(|state| state.episodes.len() == index + 1) {
+                                    break;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("resource watch delivers settled checks");
+                    } else {
+                        table.fire(row.id, fire).await;
+                    }
+                    table.deliver_turn(row.id, "checks-wake", source, rule, &row.leaves[0]).await.expect("duplicate observation");
+                }
+                let status = convoys.get("checks-wake").await.expect("convoy").status.expect("status");
+                let settled = checks.is_some_and(|value| value != ObservedChecks::Pending);
+                assert_eq!(status.turn_deliveries.get(source).map_or(0, |state| state.episodes.len()), index + usize::from(settled));
+                assert_eq!(actuator.requests.lock().expect("requests").len(), (index + usize::from(settled)).min(3));
+            }
+        }
+        assert_eq!(actuator.holds.load(Ordering::SeqCst), outcomes.len().saturating_sub(3));
+        {
+            let requests = actuator.requests.lock().expect("requests");
+            assert!(requests[0].brief.contains("Head SHA: `head-0`"));
+            assert!(requests[0].brief.contains("Inspect checks and reviews"));
+        }
+        for row in table.rows().await {
+            table.finish(row.id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn active_produced_pr_checks_settle_to_pass_or_fail_once_per_head() {
+        for pass in [false, true] {
+            active_checks_scenario(&[pass, !pass, pass, !pass], true).await;
+        }
+    }
+
+    #[hegel::test]
+    fn generated_active_checks_settlement_deduplicates_heads(tc: hegel::TestCase) {
+        // Generate pass/fail sequences across the delivery ceiling (3), including
+        // new heads, unknown and pending observations, and duplicate settlement.
+        let count = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(5));
+        let outcomes = (0..count).map(|_| tc.draw(hegel::generators::booleans())).collect::<Vec<_>>();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(active_checks_scenario(&outcomes, false));
     }
 
     async fn assert_turn_delivery_enforces_head_identity_records_rungs_and_escalates(

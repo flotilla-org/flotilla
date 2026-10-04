@@ -624,6 +624,17 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
     let target = || TurnDeliveryTarget::builder().vessel(vessel.to_string()).role(role.to_string()).build();
     IndexMap::from([
         (
+            "checks-settled".to_string(),
+            TurnDeliveryRule::builder()
+                .on("$cr.checks != pending".parse().expect("valid stock checks leaf"))
+                .to(target())
+                .brief("Inspect checks and reviews at the bound head. Fix failures caused by this PR and continue shepherding; complete when checks pass, review findings are handled, and the PR is mergeable.".to_string())
+                .hold(HoldAct::ChangeRequestComment {
+                    body: "Flotilla paused automatic turn delivery after repeated checks-settled episodes; human attention is required.".to_string(),
+                })
+                .build(),
+        ),
+        (
             "actionable-review".to_string(),
             TurnDeliveryRule::builder()
                 .on("$cr.review.actionable-at-head == true".parse().expect("valid stock review leaf"))
