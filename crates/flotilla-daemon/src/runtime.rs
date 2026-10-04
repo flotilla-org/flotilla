@@ -5606,8 +5606,10 @@ async fn sweep_empty_convoy_directories(root: &Path, live: &BTreeSet<String>) ->
         // Never recurse: nonempty leftovers (even empty child directories) and
         // symlinks are preserved, as required by the never-nonempty contract.
         if let Err(error) = tokio::fs::remove_dir(entry.path()).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                debug!(convoy_ref = %name, %error, "keeping stale convoy directory");
+            match error.kind() {
+                std::io::ErrorKind::NotFound => {}
+                std::io::ErrorKind::DirectoryNotEmpty => debug!(convoy_ref = %name, %error, "keeping nonempty stale convoy directory"),
+                _ => warn!(convoy_ref = %name, path = %entry.path().display(), %error, "could not remove stale convoy directory"),
             }
         }
     }
