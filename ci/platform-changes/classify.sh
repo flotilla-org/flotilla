@@ -30,10 +30,12 @@ fi
 # touching any Rust source.
 shared='^(Cargo\.(toml|lock)|crates/[^/]+/Cargo\.toml|rust-toolchain\.toml|\.github/workflows/ci\.yml|ci/platform-changes/)'
 
-# The Windows client job builds `flotilla` and tests its client, transport and
-# Wheelhouse sink. Its platform seams live in these paths; elsewhere, a change
-# reaches Windows only through platform-conditional code, matched in the diff.
-windows_paths="${shared}|^(src/|crates/flotilla-client/|crates/flotilla-transport/|crates/flotilla-manifest/src/sink|crates/flotilla-tui/src/(terminal|run|cli))"
+# The Windows client job builds and runs `flotilla` and tests its client,
+# transport and Wheelhouse sink. Its platform seams live in these paths, plus
+# the CLI definitions whose unoptimised stack frames must fit Windows' 1 MiB
+# main thread (#2588). Elsewhere, a change reaches Windows only through
+# platform-conditional code, matched in the diff.
+windows_paths="${shared}|^(src/|crates/flotilla-client/|crates/flotilla-commands/|crates/flotilla-transport/|crates/flotilla-manifest/src/sink|crates/flotilla-tui/src/(terminal|run|cli))"
 windows_content='^[+-].*(cfg(_attr|!)?\(.*(windows|unix|target_os|target_family|target_vendor)|std::os::(unix|windows)|libc::|nix::|Unix(Stream|Listener|Datagram)|::unix::|pre_exec|setsid)'
 
 # The macOS job runs the daemon's peer-identity tests (server::caller).

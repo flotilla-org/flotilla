@@ -74,109 +74,38 @@ fn binary_version() -> &'static str {
     })
 }
 
+// Variants with arguments take an `Args` struct rather than inline fields, so
+// clap builds each variant's arguments in its own call. Inline fields share
+// one frame per enum, which overflowed Windows' 1 MiB main thread in
+// unoptimised builds (#2588).
 #[derive(clap::Subcommand)]
 enum SubCommand {
     /// Run the daemon server
-    Daemon {
-        #[command(subcommand)]
-        command: Option<DaemonSubCommand>,
-        /// Idle timeout in seconds (0 = no timeout)
-        #[arg(long, default_value = "300")]
-        timeout: u64,
-    },
+    Daemon(DaemonArgs),
     /// Open the TUI scoped to one View (e.g. `flotilla view convoys/flotilla`).
     ///
     /// Scoped mode shows exactly that View: no tab bar, and the persisted
     /// open-view set is untouched. This is the deep-link entry Presentation
     /// Manager recipes embed (ADR 0013).
-    View {
-        /// View address: `overview`, `repo/<authority>/<path>`, `convoys/<namespace>`, ...
-        /// A `flotilla://` prefix is accepted.
-        address: String,
-    },
+    View(ViewArgs),
     /// Print repo list and state
     Status,
     /// Stream daemon events to stdout
     Watch,
     /// Block until one condition leaf becomes true
-    Wait {
-        /// Condition leaf; repeat to wait for any leaf (OR)
-        #[arg(long = "for", required = true)]
-        leaves: Vec<flotilla_protocol::Leaf>,
-        /// Resource namespace
-        #[arg(long, default_value = "flotilla")]
-        namespace: String,
-        /// Require claim evidence observed at or after this RFC3339 instant
-        ///
-        /// Observation and claim leaves remain Unknown until their evidence
-        /// is at least this fresh.
-        #[arg(long)]
-        fresher_than: Option<chrono::DateTime<chrono::Utc>>,
-        /// Maximum seconds to block
-        #[arg(long)]
-        timeout: Option<u64>,
-    },
+    Wait(WaitArgs),
     /// Show the daemon's current multi-host routing view
-    Topology {
-        /// Output the topology as a Graphviz DOT graph
-        #[arg(long, conflicts_with = "json")]
-        dot: bool,
-    },
+    Topology(TopologyArgs),
     /// Read structured daemon logs from this host or a peer
-    Logs {
-        /// Peer host name; omit to read this host
-        #[arg(long)]
-        host: Option<String>,
-        /// Only show records this old or newer (for example `2h` or `30m`)
-        #[arg(long, value_parser = parse_log_duration)]
-        since: Option<Duration>,
-        /// Minimum level: trace, debug, info, warn, or error
-        #[arg(long, value_parser = ["trace", "debug", "info", "warn", "error"])]
-        level: Option<String>,
-        /// Exact tracing module target and its children
-        #[arg(long)]
-        target: Option<String>,
-    },
+    Logs(LogsArgs),
     /// Show fleet-wide host health without collapsing independent observations
     Fleet,
     /// List convoy vessels and crew sessions
-    Ls {
-        /// Show only one project's convoys
-        #[arg(long, conflicts_with = "all")]
-        project: Option<String>,
-        /// Show the whole fleet, including inside a crew
-        #[arg(long, conflicts_with = "project")]
-        all: bool,
-    },
+    Ls(LsArgs),
     /// Attach to a running convoy crew session
-    Attach {
-        /// Observe without taking the controller seat from another client
-        #[arg(long, conflicts_with_all = ["strict", "take"])]
-        watch: bool,
-        /// Refuse when another attachment holds the controller seat
-        #[arg(long, conflicts_with_all = ["watch", "take"])]
-        strict: bool,
-        /// Take control and demote the current controller to watcher
-        #[arg(long, conflicts_with_all = ["watch", "strict"])]
-        take: bool,
-        /// Convoy, vessel, role, terminal session, or unique prefix
-        reference: String,
-        /// Internal attach mode used by temporary TUI excursions.
-        #[arg(long, hide = true)]
-        transient: bool,
-        /// Restrict internal attach resolution to the daemon owning this row.
-        #[arg(long, hide = true)]
-        host: Option<String>,
-    },
+    Attach(AttachArgs),
     /// Receive agent hook events (called by agent hook systems)
-    Hook {
-        /// Agent harness name (e.g. claude-code, codex, gemini)
-        harness: String,
-        /// Event type (e.g. session-start, stop, notification)
-        event_type: String,
-        /// Codex notify supplies its JSON payload as one command argument.
-        payload: Option<String>,
-    },
+    Hook(HookArgs),
     /// Install or uninstall agent hook configuration
     Hooks {
         #[command(subcommand)]
@@ -208,18 +137,151 @@ enum SubCommand {
         command: ArtifactSubCommand,
     },
     /// List recent object-scoped events fleet-wide
-    Events {
-        /// Resource namespace
-        #[arg(long, default_value = "flotilla")]
-        namespace: String,
-        /// Route the query to a peer host
-        #[arg(long)]
-        host: Option<String>,
-        /// Show only events authored by the queried host
-        #[arg(long)]
-        local_only: bool,
-    },
+    Events(EventsArgs),
     // --- Domain nouns (generated by flotilla-commands) ---
+    #[command(flatten)]
+    Domain(DomainCommand),
+
+    /// Generate completions (hidden, called by shell scripts)
+    #[command(hide = true)]
+    Complete(CompleteArgs),
+    /// Output shell completion setup scripts
+    Completions(CompletionsArgs),
+}
+
+#[derive(clap::Args)]
+struct DaemonArgs {
+    #[command(subcommand)]
+    command: Option<DaemonSubCommand>,
+    /// Idle timeout in seconds (0 = no timeout)
+    #[arg(long, default_value = "300")]
+    timeout: u64,
+}
+
+#[derive(clap::Args)]
+struct ViewArgs {
+    /// View address: `overview`, `repo/<authority>/<path>`, `convoys/<namespace>`, ...
+    /// A `flotilla://` prefix is accepted.
+    address: String,
+}
+
+#[derive(clap::Args)]
+struct WaitArgs {
+    /// Condition leaf; repeat to wait for any leaf (OR)
+    #[arg(long = "for", required = true)]
+    leaves: Vec<flotilla_protocol::Leaf>,
+    /// Resource namespace
+    #[arg(long, default_value = "flotilla")]
+    namespace: String,
+    /// Require claim evidence observed at or after this RFC3339 instant
+    ///
+    /// Observation and claim leaves remain Unknown until their evidence
+    /// is at least this fresh.
+    #[arg(long)]
+    fresher_than: Option<chrono::DateTime<chrono::Utc>>,
+    /// Maximum seconds to block
+    #[arg(long)]
+    timeout: Option<u64>,
+}
+
+#[derive(clap::Args)]
+struct TopologyArgs {
+    /// Output the topology as a Graphviz DOT graph
+    #[arg(long, conflicts_with = "json")]
+    dot: bool,
+}
+
+#[derive(clap::Args)]
+struct LogsArgs {
+    /// Peer host name; omit to read this host
+    #[arg(long)]
+    host: Option<String>,
+    /// Only show records this old or newer (for example `2h` or `30m`)
+    #[arg(long, value_parser = parse_log_duration)]
+    since: Option<Duration>,
+    /// Minimum level: trace, debug, info, warn, or error
+    #[arg(long, value_parser = ["trace", "debug", "info", "warn", "error"])]
+    level: Option<String>,
+    /// Exact tracing module target and its children
+    #[arg(long)]
+    target: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct LsArgs {
+    /// Show only one project's convoys
+    #[arg(long, conflicts_with = "all")]
+    project: Option<String>,
+    /// Show the whole fleet, including inside a crew
+    #[arg(long, conflicts_with = "project")]
+    all: bool,
+}
+
+#[derive(clap::Args)]
+struct AttachArgs {
+    /// Observe without taking the controller seat from another client
+    #[arg(long, conflicts_with_all = ["strict", "take"])]
+    watch: bool,
+    /// Refuse when another attachment holds the controller seat
+    #[arg(long, conflicts_with_all = ["watch", "take"])]
+    strict: bool,
+    /// Take control and demote the current controller to watcher
+    #[arg(long, conflicts_with_all = ["watch", "strict"])]
+    take: bool,
+    /// Convoy, vessel, role, terminal session, or unique prefix
+    reference: String,
+    /// Internal attach mode used by temporary TUI excursions.
+    #[arg(long, hide = true)]
+    transient: bool,
+    /// Restrict internal attach resolution to the daemon owning this row.
+    #[arg(long, hide = true)]
+    host: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct HookArgs {
+    /// Agent harness name (e.g. claude-code, codex, gemini)
+    harness: String,
+    /// Event type (e.g. session-start, stop, notification)
+    event_type: String,
+    /// Codex notify supplies its JSON payload as one command argument.
+    payload: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct EventsArgs {
+    /// Resource namespace
+    #[arg(long, default_value = "flotilla")]
+    namespace: String,
+    /// Route the query to a peer host
+    #[arg(long)]
+    host: Option<String>,
+    /// Show only events authored by the queried host
+    #[arg(long)]
+    local_only: bool,
+}
+
+#[derive(clap::Args)]
+struct CompleteArgs {
+    /// The input line to complete
+    line: String,
+    /// Cursor position within the line
+    #[arg(default_value = "0")]
+    cursor_pos: usize,
+}
+
+#[derive(clap::Args)]
+struct CompletionsArgs {
+    /// Shell type
+    #[arg(value_enum)]
+    shell: CompletionShell,
+}
+
+/// Domain nouns, flattened into `SubCommand`. Keeping them in their own enum
+/// lets clap build them in a separate call, which keeps unoptimised stack
+/// frames small (#2588).
+#[derive(clap::Subcommand)]
+enum DomainCommand {
     /// Manage repositories
     Repo(flotilla_commands::commands::repo::RepoNoun),
     /// Manage environments
@@ -248,22 +310,31 @@ enum SubCommand {
     WorkflowTemplate(flotilla_commands::commands::workflow_template::WorkflowTemplateNoun),
     /// Manage projects
     Project(flotilla_commands::commands::project::ProjectNoun),
+}
 
-    /// Generate completions (hidden, called by shell scripts)
-    #[command(hide = true)]
-    Complete {
-        /// The input line to complete
-        line: String,
-        /// Cursor position within the line
-        #[arg(default_value = "0")]
-        cursor_pos: usize,
-    },
-    /// Output shell completion setup scripts
-    Completions {
-        /// Shell type
-        #[arg(value_enum)]
-        shell: CompletionShell,
-    },
+impl DomainCommand {
+    fn resolve(self) -> Result<flotilla_commands::Resolved> {
+        match self {
+            DomainCommand::Repo(noun) => noun.resolve(),
+            DomainCommand::Environment(noun) => noun.resolve(),
+            DomainCommand::Checkout(noun) => noun.resolve(),
+            DomainCommand::Convoy(noun) => noun.resolve(),
+            DomainCommand::Dispatch(noun) => noun.resolve(),
+            DomainCommand::Crew(noun) => noun.resolve_with_crew_id(std::env::var("FLOTILLA_CREW_ID").ok()),
+            DomainCommand::Cr(noun) => noun.resolve(),
+            DomainCommand::Issue(noun) => noun.resolve(),
+            DomainCommand::Agent(noun) => noun.resolve(),
+            DomainCommand::Workspace(noun) => noun.resolve(),
+            DomainCommand::Host(partial) => {
+                use flotilla_commands::Refinable;
+                partial.refine().and_then(|noun| noun.resolve())
+            }
+            DomainCommand::Fulfilment(noun) => noun.resolve(),
+            DomainCommand::WorkflowTemplate(noun) => noun.resolve(),
+            DomainCommand::Project(noun) => noun.resolve(),
+        }
+        .map_err(|e| color_eyre::eyre::eyre!(e))
+    }
 }
 
 #[derive(clap::Subcommand)]
@@ -743,16 +814,35 @@ fn cli_surface_from(crew_role: Option<&str>, namespace: Option<&str>) -> flotill
     flotilla_protocol::SurfaceDeclaration { principal_ref, character: flotilla_protocol::SurfaceCharacter::Focal }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// Parsing and dispatch run in sequence rather than nested: clap's derived
+// builders and the dispatch future both need large frames in unoptimised
+// builds, and stacking them overflowed Windows' 1 MiB main thread (#2588).
+fn main() -> Result<()> {
     flotilla_core::tls::install_default_provider();
     color_eyre::install()?;
     let mut cli = Cli::try_parse().unwrap_or_else(|error| exit_cli_parse_error(error));
     let format = OutputFormat::from_json_flag(cli.json);
     let command = cli.command.take();
 
-    let result = match command {
-        Some(SubCommand::View { address }) => {
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let result = runtime.block_on(Box::pin(run_command(cli, command, format)));
+
+    if let Err(error) = &result {
+        let message = format!("{error:?}");
+        let already_reexecuted = std::env::var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV).ok();
+        if should_reexec_for_incompatible_daemon(&message, already_reexecuted.as_deref()) {
+            std::env::set_var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV, flotilla_tui::socket::BUILD_ID);
+            if let Err(reexec_error) = reexec_current_process() {
+                return Err(color_eyre::eyre::eyre!(incompatible_daemon_reexec_failure(&message, &reexec_error)));
+            }
+        }
+    }
+    result
+}
+
+async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat) -> Result<()> {
+    match command {
+        Some(SubCommand::View(ViewArgs { address })) => {
             // Parse before touching the terminal so a bad address in a
             // recipe fails loudly at the shell (ADR 0013).
             let address: flotilla_protocol::ViewAddress = match address.parse() {
@@ -764,29 +854,33 @@ async fn main() -> Result<()> {
             };
             run_tui(cli, Some(address)).await
         }
-        Some(SubCommand::Daemon { command: Some(DaemonSubCommand::Stop), .. }) => run_daemon_stop(&cli).await,
-        Some(SubCommand::Daemon { command: Some(DaemonSubCommand::DevMode { command }), .. }) => run_daemon_dev_mode(&cli, command).await,
-        Some(SubCommand::Daemon { command: None, timeout }) => run_daemon(&cli, timeout).await,
+        Some(SubCommand::Daemon(DaemonArgs { command: Some(DaemonSubCommand::Stop), .. })) => run_daemon_stop(&cli).await,
+        Some(SubCommand::Daemon(DaemonArgs { command: Some(DaemonSubCommand::DevMode { command }), .. })) => {
+            run_daemon_dev_mode(&cli, command).await
+        }
+        Some(SubCommand::Daemon(DaemonArgs { command: None, timeout })) => run_daemon(&cli, timeout).await,
         Some(SubCommand::Status) => run_status(&cli, format).await,
         Some(SubCommand::Watch) => run_watch(&cli, format).await,
-        Some(SubCommand::Wait { leaves, namespace, fresher_than, timeout }) => {
+        Some(SubCommand::Wait(WaitArgs { leaves, namespace, fresher_than, timeout })) => {
             run_wait(&cli, leaves, namespace, fresher_than, timeout, format).await
         }
-        Some(SubCommand::Topology { dot }) => run_topology_command(&cli, format, dot).await,
-        Some(SubCommand::Logs { host, since, level, target }) => run_logs(&cli, host.as_deref(), since, level, target).await,
+        Some(SubCommand::Topology(TopologyArgs { dot })) => run_topology_command(&cli, format, dot).await,
+        Some(SubCommand::Logs(LogsArgs { host, since, level, target })) => run_logs(&cli, host.as_deref(), since, level, target).await,
         Some(SubCommand::Fleet) => run_fleet_health(&cli, format).await,
-        Some(SubCommand::Ls { project, all }) => run_fleet_list(&cli, format, project, all).await,
-        Some(SubCommand::Attach { reference, watch, strict, take, transient, host }) => {
+        Some(SubCommand::Ls(LsArgs { project, all })) => run_fleet_list(&cli, format, project, all).await,
+        Some(SubCommand::Attach(AttachArgs { reference, watch, strict, take, transient, host })) => {
             run_attach(&cli, &reference, attach_mode(watch, strict, take), transient, host.as_deref(), format).await
         }
-        Some(SubCommand::Hook { harness, event_type, payload }) => run_hook(&cli, &harness, &event_type, payload.as_deref()).await,
+        Some(SubCommand::Hook(HookArgs { harness, event_type, payload })) => {
+            run_hook(&cli, &harness, &event_type, payload.as_deref()).await
+        }
         Some(SubCommand::Hooks { command }) => run_hooks_command(&command).await,
         Some(SubCommand::Pm { command }) => run_pm_command(&cli, command).await,
         Some(SubCommand::Ensure { command }) => run_ensure_command(&cli, command, format).await,
         Some(SubCommand::Resource { command }) => run_resource_command(&cli, command, format).await,
         Some(SubCommand::Manifest { command }) => run_manifest_command(&cli, command, format).await,
         Some(SubCommand::Artifact { command }) => run_artifact_command(&cli, command, format).await,
-        Some(SubCommand::Events { namespace, host, local_only }) => {
+        Some(SubCommand::Events(EventsArgs { namespace, host, local_only })) => {
             run_resource_command(
                 &cli,
                 ResourceSubCommand::List(ResourceListArgs {
@@ -801,50 +895,19 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(SubCommand::Repo(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
-        Some(SubCommand::Environment(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
-        Some(SubCommand::Checkout(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
-        Some(SubCommand::Convoy(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
-        Some(SubCommand::Dispatch(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
-        Some(SubCommand::Crew(noun)) => {
-            let crew_id = std::env::var("FLOTILLA_CREW_ID").ok();
-            dispatch(noun.resolve_with_crew_id(crew_id).map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await
-        }
-        Some(SubCommand::Cr(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
-        Some(SubCommand::Issue(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
-        Some(SubCommand::Agent(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
-        Some(SubCommand::Workspace(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
-        Some(SubCommand::Host(partial)) => {
-            use flotilla_commands::Refinable;
-            dispatch(partial.refine().and_then(|n| n.resolve()).map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await
-        }
-        Some(SubCommand::Fulfilment(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
-        Some(SubCommand::WorkflowTemplate(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
-        Some(SubCommand::Project(noun)) => dispatch(noun.resolve().map_err(|e| color_eyre::eyre::eyre!(e))?, &cli, format).await,
+        Some(SubCommand::Domain(command)) => dispatch(command.resolve()?, &cli, format).await,
 
-        Some(SubCommand::Complete { line, cursor_pos }) => {
+        Some(SubCommand::Complete(CompleteArgs { line, cursor_pos })) => {
             run_complete(&line, cursor_pos);
             Ok(())
         }
-        Some(SubCommand::Completions { shell }) => {
+        Some(SubCommand::Completions(CompletionsArgs { shell })) => {
             run_completions(shell);
             Ok(())
         }
 
         None => run_tui(cli, None).await,
-    };
-
-    if let Err(error) = &result {
-        let message = format!("{error:?}");
-        let already_reexecuted = std::env::var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV).ok();
-        if should_reexec_for_incompatible_daemon(&message, already_reexecuted.as_deref()) {
-            std::env::set_var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV, flotilla_tui::socket::BUILD_ID);
-            if let Err(reexec_error) = reexec_current_process() {
-                return Err(color_eyre::eyre::eyre!(incompatible_daemon_reexec_failure(&message, &reexec_error)));
-            }
-        }
     }
-    result
 }
 
 fn should_reexec_for_incompatible_daemon(error: &str, already_reexecuted_build: Option<&str>) -> bool {
@@ -2853,6 +2916,32 @@ fn uninstall_claude_code_hooks(path: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Windows gives the main thread 1 MiB of stack. Unoptimised clap-derive
+    /// builders need frames that grow with the command tree, and the nested
+    /// noun/verb derives add up along the deepest path (#2588). Parsing that
+    /// path needed about 520 KiB when this budget was set. An overflow aborts the
+    /// test binary with "thread 'cli-parse-stack-budget' has overflowed its
+    /// stack": split large variants into `Args` structs rather than raising this.
+    #[test]
+    fn cli_parse_fits_within_windows_main_thread_stack_budget() {
+        const BUDGET: usize = 768 * 1024;
+        std::thread::Builder::new()
+            .name("cli-parse-stack-budget".into())
+            .stack_size(BUDGET)
+            .spawn(|| {
+                for args in [
+                    &["flotilla", "--version"][..],
+                    &["flotilla", "status"][..],
+                    &["flotilla", "convoy", "start", "--project", "p", "--name", "n", "--input", "k=v"][..],
+                ] {
+                    let _ = Cli::try_parse_from(args);
+                }
+            })
+            .expect("spawn stack-budget thread")
+            .join()
+            .expect("CLI parsing completes within the stack budget");
+    }
     use std::path::{Path, PathBuf};
 
     use clap::Parser;
@@ -2867,9 +2956,10 @@ mod tests {
         format_human_resource_value, host_daemon_socket_required, incompatible_daemon_reexec_failure, install_codex_hook,
         provisioning_target_for_environment, replace_host_ids, resolve_pm_flotilla_bin, select_host_target, select_startup_repo_roots,
         should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, topology_output_format,
-        uninstall_codex_hook, ArtifactSubCommand, Cli, CliPaths, CommandValue, DaemonSubCommand, DevModeSubCommand, PmSubCommand,
-        ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs, ResourceReconcileNowArgs,
-        ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand,
+        uninstall_codex_hook, ArtifactSubCommand, AttachArgs, Cli, CliPaths, CommandValue, DaemonArgs, DaemonSubCommand, DevModeSubCommand,
+        DomainCommand, EventsArgs, LogsArgs, LsArgs, PmSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs,
+        ResourceListArgs, ResourceManifestResolutionArgs, ResourceReconcileNowArgs, ResourceStatusPatchArgs, ResourceSubCommand,
+        ResourceWatchArgs, SubCommand, TopologyArgs, WaitArgs,
     };
 
     #[tokio::test]
@@ -3006,7 +3096,7 @@ mod tests {
             "30",
         ])
         .expect("parse wait command");
-        let Some(SubCommand::Wait { leaves, timeout, .. }) = cli.command else { panic!("expected wait command") };
+        let Some(SubCommand::Wait(WaitArgs { leaves, timeout, .. })) = cli.command else { panic!("expected wait command") };
         assert_eq!(leaves.len(), 2);
         assert_eq!(timeout, Some(30));
     }
@@ -3156,21 +3246,21 @@ mod tests {
     #[test]
     fn cli_parses_topology_subcommand() {
         let cli = Cli::try_parse_from(["flotilla", "topology"]).expect("topology cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Topology { dot: false })));
+        assert!(matches!(cli.command, Some(SubCommand::Topology(TopologyArgs { dot: false }))));
         assert!(!cli.json);
     }
 
     #[test]
     fn cli_parses_topology_with_global_json() {
         let cli = Cli::try_parse_from(["flotilla", "topology", "--json"]).expect("topology json should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Topology { dot: false })));
+        assert!(matches!(cli.command, Some(SubCommand::Topology(TopologyArgs { dot: false }))));
         assert!(cli.json);
     }
 
     #[test]
     fn cli_parses_topology_dot() {
         let cli = Cli::try_parse_from(["flotilla", "topology", "--dot"]).expect("topology dot should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Topology { dot: true })));
+        assert!(matches!(cli.command, Some(SubCommand::Topology(TopologyArgs { dot: true }))));
         assert!(!cli.json);
     }
 
@@ -3179,7 +3269,7 @@ mod tests {
         assert!(Cli::try_parse_from(["flotilla", "topology", "--dot", "--json"]).is_err());
 
         let cli = Cli::try_parse_from(["flotilla", "--json", "topology", "--dot"]).expect("clap accepts this global flag order");
-        let Some(SubCommand::Topology { dot }) = cli.command else {
+        let Some(SubCommand::Topology(TopologyArgs { dot })) = cli.command else {
             panic!("expected topology command");
         };
         assert_eq!(
@@ -3193,7 +3283,7 @@ mod tests {
         let cli = Cli::try_parse_from(["flotilla", "events", "--host", "kiwi", "--json"]).expect("events cli should parse");
         assert!(matches!(
             cli.command,
-            Some(SubCommand::Events { namespace, host: Some(host), local_only: false })
+            Some(SubCommand::Events(EventsArgs { namespace, host: Some(host), local_only: false }))
                 if namespace == "flotilla" && host == "kiwi"
         ));
         assert!(cli.json);
@@ -3217,12 +3307,12 @@ mod tests {
 
         assert!(matches!(
             cli.command,
-            Some(SubCommand::Logs {
+            Some(SubCommand::Logs(LogsArgs {
                 host: Some(host),
                 since: Some(since),
                 level: Some(level),
                 target: Some(target),
-            }) if host == "feta"
+            })) if host == "feta"
                 && since == std::time::Duration::from_secs(7200)
                 && level == "warn"
                 && target == "flotilla_daemon::peer"
@@ -3232,11 +3322,11 @@ mod tests {
     #[test]
     fn cli_parses_ls_subcommand() {
         let cli = Cli::try_parse_from(["flotilla", "ls"]).expect("ls cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Ls { project: None, all: false })));
+        assert!(matches!(cli.command, Some(SubCommand::Ls(LsArgs { project: None, all: false }))));
         let scoped = Cli::try_parse_from(["flotilla", "ls", "--project", "island"]).expect("scoped ls should parse");
-        assert!(matches!(scoped.command, Some(SubCommand::Ls { project: Some(project), all: false }) if project == "island"));
+        assert!(matches!(scoped.command, Some(SubCommand::Ls(LsArgs { project: Some(project), all: false })) if project == "island"));
         let all = Cli::try_parse_from(["flotilla", "ls", "--all"]).expect("fleet ls should parse");
-        assert!(matches!(all.command, Some(SubCommand::Ls { project: None, all: true })));
+        assert!(matches!(all.command, Some(SubCommand::Ls(LsArgs { project: None, all: true }))));
         assert!(Cli::try_parse_from(["flotilla", "ls", "--all", "--project", "island"]).is_err());
     }
 
@@ -3508,7 +3598,7 @@ mod tests {
         let cli = Cli::try_parse_from(["flotilla", "attach", "convoy-a/implement/coder"]).expect("attach cli should parse");
         assert!(matches!(
             cli.command,
-            Some(SubCommand::Attach { reference, watch: false, strict: false, take: false, transient: false, host: None })
+            Some(SubCommand::Attach(AttachArgs { reference, watch: false, strict: false, take: false, transient: false, host: None }))
                 if reference == "convoy-a/implement/coder"
         ));
         assert_eq!(attach_mode(false, false, false), flotilla_protocol::commands::AttachMode::PreferTake);
@@ -3520,20 +3610,20 @@ mod tests {
             Cli::try_parse_from(["flotilla", "attach", "--strict", "convoy-a/implement/coder"]).expect("strict attach cli should parse");
         assert!(matches!(
             strict.command,
-            Some(SubCommand::Attach { reference, watch: false, strict: true, take: false, transient: false, host: None })
+            Some(SubCommand::Attach(AttachArgs { reference, watch: false, strict: true, take: false, transient: false, host: None }))
                 if reference == "convoy-a/implement/coder"
         ));
         let take = Cli::try_parse_from(["flotilla", "attach", "--take", "convoy-a/implement/coder"]).expect("take attach cli should parse");
         assert!(matches!(
             take.command,
-            Some(SubCommand::Attach { reference, watch: false, strict: false, take: true, transient: false, host: None })
+            Some(SubCommand::Attach(AttachArgs { reference, watch: false, strict: false, take: true, transient: false, host: None }))
                 if reference == "convoy-a/implement/coder"
         ));
         let watch =
             Cli::try_parse_from(["flotilla", "attach", "--watch", "convoy-a/implement/coder"]).expect("watch attach cli should parse");
         assert!(matches!(
             watch.command,
-            Some(SubCommand::Attach { reference, watch: true, strict: false, take: false, transient: false, host: None })
+            Some(SubCommand::Attach(AttachArgs { reference, watch: true, strict: false, take: false, transient: false, host: None }))
                 if reference == "convoy-a/implement/coder"
         ));
         assert_eq!(attach_mode(true, false, false), flotilla_protocol::commands::AttachMode::Default);
@@ -3629,21 +3719,21 @@ mod tests {
     #[test]
     fn daemon_stop_is_a_nested_daemon_command() {
         let cli = Cli::try_parse_from(["flotilla", "daemon", "stop"]).expect("daemon stop should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Daemon { command: Some(DaemonSubCommand::Stop), .. })));
+        assert!(matches!(cli.command, Some(SubCommand::Daemon(DaemonArgs { command: Some(DaemonSubCommand::Stop), .. }))));
 
         let foreground = Cli::try_parse_from(["flotilla", "daemon", "--timeout", "0"]).expect("foreground daemon should still parse");
-        assert!(matches!(foreground.command, Some(SubCommand::Daemon { command: None, timeout: 0 })));
+        assert!(matches!(foreground.command, Some(SubCommand::Daemon(DaemonArgs { command: None, timeout: 0 }))));
 
         let dev_mode = Cli::try_parse_from(["flotilla", "daemon", "dev-mode", "enable"]).expect("daemon dev-mode enable should parse");
         assert!(matches!(
             dev_mode.command,
-            Some(SubCommand::Daemon { command: Some(DaemonSubCommand::DevMode { command: DevModeSubCommand::Enable }), .. })
+            Some(SubCommand::Daemon(DaemonArgs { command: Some(DaemonSubCommand::DevMode { command: DevModeSubCommand::Enable }), .. }))
         ));
 
         let fleet_mode = Cli::try_parse_from(["flotilla", "daemon", "dev-mode", "disable"]).expect("daemon dev-mode disable should parse");
         assert!(matches!(
             fleet_mode.command,
-            Some(SubCommand::Daemon { command: Some(DaemonSubCommand::DevMode { command: DevModeSubCommand::Disable }), .. })
+            Some(SubCommand::Daemon(DaemonArgs { command: Some(DaemonSubCommand::DevMode { command: DevModeSubCommand::Disable }), .. }))
         ));
     }
 
@@ -3693,7 +3783,7 @@ mod tests {
             .expect("transient attach cli should parse");
         assert!(matches!(
             cli.command,
-            Some(SubCommand::Attach { reference, watch: false, strict: false, take: false, transient: true, host: Some(host) })
+            Some(SubCommand::Attach(AttachArgs { reference, watch: false, strict: false, take: false, transient: true, host: Some(host) }))
                 if reference == "terminal-scratch" && host == "feta"
         ));
     }
@@ -3704,7 +3794,7 @@ mod tests {
             .expect("host-qualified attach cli should parse");
         assert!(matches!(
             cli.command,
-            Some(SubCommand::Attach { reference, watch: false, strict: false, take: false, transient: false, host: Some(host) })
+            Some(SubCommand::Attach(AttachArgs { reference, watch: false, strict: false, take: false, transient: false, host: Some(host) }))
                 if reference == "terminal-scratch" && host == "feta"
         ));
     }
@@ -3712,7 +3802,7 @@ mod tests {
     #[test]
     fn cli_parses_repo_noun() {
         let cli = Cli::try_parse_from(["flotilla", "repo", "owner/repo"]).expect("repo cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Repo(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Repo(_)))));
     }
 
     #[test]
@@ -3727,7 +3817,7 @@ mod tests {
     #[test]
     fn issue_list_without_repo_infers_cwd_without_adopting_it() {
         let cli = Cli::try_parse_from(["flotilla", "issue"]).expect("issue list");
-        let Some(SubCommand::Issue(noun)) = &cli.command else { panic!("issue noun") };
+        let Some(SubCommand::Domain(DomainCommand::Issue(noun))) = &cli.command else { panic!("issue noun") };
         let flotilla_commands::Resolved::NeedsContext { mut command, .. } = noun.clone().resolve().expect("issue list command") else {
             panic!("issue list requires repo context");
         };
@@ -3803,8 +3893,8 @@ mod tests {
         ]] {
             let cli = Cli::try_parse_from(args).expect("CLI");
             let resolved = match cli.command.as_ref().expect("noun") {
-                SubCommand::Cr(noun) => noun.clone().resolve(),
-                SubCommand::Agent(noun) => noun.clone().resolve(),
+                SubCommand::Domain(DomainCommand::Cr(noun)) => noun.clone().resolve(),
+                SubCommand::Domain(DomainCommand::Agent(noun)) => noun.clone().resolve(),
                 _ => unreachable!(),
             }
             .expect("command");
@@ -3854,7 +3944,7 @@ mod tests {
         // Single CLI call-through: the diagnostic directs users to identity or cwd inference.
         for path in ["/work/widgets", "/work/widgets/src", "./widgets", "../widgets", ".", ".."] {
             let cli = Cli::try_parse_from(["flotilla", "repo", path, "checkout", "--fresh", "feature"]).expect("CLI");
-            let SubCommand::Repo(noun) = cli.command.expect("repo noun") else { panic!("repo noun") };
+            let SubCommand::Domain(DomainCommand::Repo(noun)) = cli.command.expect("repo noun") else { panic!("repo noun") };
             let flotilla_commands::Resolved::Ready(mut command) = noun.resolve().expect("checkout command") else {
                 panic!("ready checkout")
             };
@@ -3904,32 +3994,32 @@ mod tests {
     #[test]
     fn cli_parses_checkout_noun() {
         let cli = Cli::try_parse_from(["flotilla", "checkout", "my-feature", "remove"]).expect("checkout cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Checkout(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Checkout(_)))));
     }
 
     #[test]
     fn cli_parses_convoy_noun() {
         let cli =
             Cli::try_parse_from(["flotilla", "convoy", "convoy-a", "work", "implement", "complete"]).expect("convoy cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Convoy(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Convoy(_)))));
     }
 
     #[test]
     fn cli_parses_crew_list_and_handoff_grammar() {
         let list = Cli::try_parse_from(["flotilla", "crew", "list"]).expect("crew list should parse");
-        assert!(matches!(list.command, Some(SubCommand::Crew(_))));
+        assert!(matches!(list.command, Some(SubCommand::Domain(DomainCommand::Crew(_)))));
 
         let handoff = Cli::try_parse_from(["flotilla", "crew", "reviewer", "handoff", "--message", "Review commit abc123"])
             .expect("crew handoff should parse");
-        assert!(matches!(handoff.command, Some(SubCommand::Crew(_))));
+        assert!(matches!(handoff.command, Some(SubCommand::Domain(DomainCommand::Crew(_)))));
 
         let marked = Cli::try_parse_from(["flotilla", "crew", "@list", "handoff", "--message", "Review commit abc123"])
             .expect("marked crew role should parse");
-        assert!(matches!(marked.command, Some(SubCommand::Crew(_))));
+        assert!(matches!(marked.command, Some(SubCommand::Domain(DomainCommand::Crew(_)))));
 
         let literal = Cli::try_parse_from(["flotilla", "crew", "--subject", "@reviewer", "handoff", "--message", "Review commit abc123"])
             .expect("literal crew role should parse");
-        assert!(matches!(literal.command, Some(SubCommand::Crew(_))));
+        assert!(matches!(literal.command, Some(SubCommand::Domain(DomainCommand::Crew(_)))));
     }
 
     #[test]
@@ -3980,66 +4070,66 @@ mod tests {
     #[test]
     fn cli_parses_cr_noun() {
         let cli = Cli::try_parse_from(["flotilla", "cr", "42", "open"]).expect("cr cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Cr(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Cr(_)))));
     }
 
     #[test]
     fn cli_parses_pr_alias() {
         let cli = Cli::try_parse_from(["flotilla", "pr", "42", "open"]).expect("pr alias should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Cr(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Cr(_)))));
     }
 
     #[test]
     fn cli_parses_issue_noun() {
         let cli = Cli::try_parse_from(["flotilla", "issue", "1", "open"]).expect("issue cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Issue(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Issue(_)))));
     }
 
     #[test]
     fn cli_parses_agent_noun() {
         let cli = Cli::try_parse_from(["flotilla", "agent", "claude-1", "teleport"]).expect("agent cli should parse");
-        let Some(SubCommand::Agent(noun)) = cli.command else { panic!("expected agent command") };
+        let Some(SubCommand::Domain(DomainCommand::Agent(noun))) = cli.command else { panic!("expected agent command") };
         assert!(matches!(noun.verb, Some(flotilla_commands::commands::agent::AgentVerb::Teleport { .. })));
     }
 
     #[test]
     fn cli_parses_workspace_noun() {
         let cli = Cli::try_parse_from(["flotilla", "workspace", "feat-ws", "select"]).expect("workspace cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Workspace(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Workspace(_)))));
     }
 
     #[test]
     fn cli_parses_workflow_template_noun() {
         let cli = Cli::try_parse_from(["flotilla", "workflow-template", "scratch", "apply", "--file", "/tmp/x.yaml"])
             .expect("workflow-template cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::WorkflowTemplate(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::WorkflowTemplate(_)))));
     }
 
     #[test]
     fn cli_parses_project_noun() {
         let cli = Cli::try_parse_from(["flotilla", "project", "add", "https://example.com/repo.git", "--name", "my-project"])
             .expect("project cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Project(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Project(_)))));
     }
 
     #[test]
     fn cli_parses_convoy_create() {
         let cli = Cli::try_parse_from(["flotilla", "convoy", "my-convoy", "create", "--template", "scratch", "--input", "topic=hi"])
             .expect("convoy create cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Convoy(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Convoy(_)))));
     }
 
     #[test]
     fn cli_parses_dispatch_queue_with_json() {
         let cli = Cli::try_parse_from(["flotilla", "--json", "dispatch", "queue"]).expect("dispatch queue should parse");
         assert!(cli.json);
-        assert!(matches!(cli.command, Some(SubCommand::Dispatch(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Dispatch(_)))));
     }
 
     #[test]
     fn cli_parses_host_noun() {
         let cli = Cli::try_parse_from(["flotilla", "host", "list"]).expect("host list should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Host(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Host(_)))));
     }
 
     #[test]
@@ -4051,26 +4141,26 @@ mod tests {
     #[test]
     fn cli_parses_environment_noun() {
         let cli = Cli::try_parse_from(["flotilla", "environment", "host:alpha", "refresh"]).expect("environment cli should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Environment(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Environment(_)))));
     }
 
     #[test]
     fn cli_parses_env_alias() {
         let cli = Cli::try_parse_from(["flotilla", "env", "prov:builder-1", "refresh"]).expect("env alias should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Environment(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Environment(_)))));
     }
 
     #[test]
     fn cli_parses_host_status_with_json() {
         let cli = Cli::try_parse_from(["flotilla", "host", "alpha", "status", "--json"]).expect("host status json should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Host(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Host(_)))));
         assert!(cli.json);
     }
 
     #[test]
     fn cli_global_json_before_subcommand() {
         let cli = Cli::try_parse_from(["flotilla", "--json", "topology"]).expect("json before subcommand should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Topology { dot: false })));
+        assert!(matches!(cli.command, Some(SubCommand::Topology(TopologyArgs { dot: false }))));
         assert!(cli.json);
     }
 
@@ -4078,7 +4168,7 @@ mod tests {
     fn cli_repo_context_flag() {
         let cli = Cli::try_parse_from(["flotilla", "--repo", "owner/repo", "checkout", "create", "--branch", "feat-x"])
             .expect("repo context should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Checkout(_))));
+        assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Checkout(_)))));
         assert_eq!(cli.repo.as_deref(), Some("owner/repo"));
     }
 
