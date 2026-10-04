@@ -160,6 +160,16 @@ pub async fn inspect_project_ops_entries(
                     }
                     match main_paths.as_slice() {
                         [path] => path.clone(),
+                        // Several branch checkouts (such as convoy worktrees) and none
+                        // on main: the hosts holding the main checkout validate it.
+                        [] => {
+                            inventory.unavailable.push(format!(
+                                "Project/{}: ops member {} has no main checkout on this host",
+                                project.metadata.name,
+                                member.alias.as_deref().unwrap_or(&member.repo.0)
+                            ));
+                            continue;
+                        }
                         _ => {
                             return Err(format!(
                                 "Project/{}: ops member {} has no unambiguous main checkout",

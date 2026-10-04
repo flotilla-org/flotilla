@@ -3485,6 +3485,8 @@ async fn execute_forwarded_command_proxies_lifecycle_and_response() {
     let config = test_config_store(tmp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::new("local")).await;
     daemon.add_repo(&repo).await.expect("adopt repo resources");
+    // Refresh reports physical checkout paths (#2574); macOS tempdirs sit behind /var -> /private/var.
+    let physical_repo = std::fs::canonicalize(&repo).expect("canonical repo path");
     let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
     let pending_remote_commands = Arc::new(Mutex::new(HashMap::new()));
     let forwarded_commands = Arc::new(Mutex::new(HashMap::new()));

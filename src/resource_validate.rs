@@ -975,6 +975,26 @@ mod tests {
             .await
             .expect("a source without a local checkout is reported, not refused");
         assert_eq!(validated, 0);
+        let worktree_guard = tempfile::tempdir().expect("worktree directory");
+        let mut worktrees = Vec::new();
+        for name in ["convoy-a", "convoy-b"] {
+            let worktree = worktree_guard.path().join(name);
+            assert!(std::process::Command::new("git")
+                .args(["worktree", "add", "-b", &format!("convoy/{name}")])
+                .arg(&worktree)
+                .current_dir(&tmp)
+                .status()
+                .expect("convoy worktree")
+                .success());
+            worktrees.push(worktree);
+        }
+        let mut worktrees_only = project.clone();
+        worktrees_only.metadata.annotations.clear();
+        let worktree_paths = inspect_validation_roots(&worktrees, &inspector).await;
+        let validated = validate_project_ops(&[worktrees_only], &worktree_paths, &inspector)
+            .await
+            .expect("a host holding only convoy worktrees reports the source unavailable");
+        assert_eq!(validated, 0);
         let duplicate_guard = tempfile::tempdir().expect("duplicate checkout directory");
         let duplicate = duplicate_guard.path().to_path_buf();
         assert!(std::process::Command::new("git")
