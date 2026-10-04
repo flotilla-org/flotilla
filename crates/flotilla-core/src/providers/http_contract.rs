@@ -9,17 +9,22 @@ use url::Url;
 
 use super::{ChannelLabel, HttpClient, ReqwestHttpClient};
 
-pub(crate) struct StandIn {
+/// Loopback HTTP server with a production executor that preserves request shape.
+pub struct StandIn {
+    /// Redirects requests for the declared service origin to this server.
     pub http: Arc<dyn HttpClient>,
+    /// Base URL for sending malformed requests directly to the stand-in.
+    pub url: Url,
     task: JoinHandle<()>,
 }
 
 impl StandIn {
+    /// Start service routes and reject requests intended for any other origin.
     pub async fn start(origin: &'static str, router: Router) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("stand-in listener");
         let base = Url::parse(&format!("http://{}", listener.local_addr().expect("address"))).expect("URL");
         let task = tokio::spawn(async move { axum::serve(listener, router).await.expect("stand-in server") });
-        Self { http: Arc::new(Redirect { origin, base }), task }
+        Self { http: Arc::new(Redirect { origin, base: base.clone() }), url: base, task }
     }
 }
 
@@ -44,6 +49,6 @@ impl HttpClient for Redirect {
         *request.url_mut() = url;
         tokio::time::timeout(Duration::from_secs(5), ReqwestHttpClient::new().execute(request, label))
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|_| "HTTP contract stand-in request timed out after 5 seconds".to_string())?
     }
 }

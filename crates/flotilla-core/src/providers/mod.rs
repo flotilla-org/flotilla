@@ -1241,5 +1241,5 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod http_contract;
+#[cfg(any(test, feature = "test-support"))]
+pub mod http_contract;

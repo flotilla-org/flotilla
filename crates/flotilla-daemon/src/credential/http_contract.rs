@@ -5,20 +5,19 @@
 
 use axum::{
     body::Bytes,
-    extract::State,
     routing::{get, post},
     Router,
 };
-use flotilla_core::providers::discovery::test_support::TestEnvVars;
+use flotilla_core::providers::{discovery::test_support::TestEnvVars, http_contract::StandIn};
 use flotilla_resources::VirtualClock;
 use http::{HeaderMap, StatusCode};
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use serde_json::{json, Value};
-use tokio::task::JoinHandle;
 
 use super::*;
 
 const NOW: i64 = 1_791_072_000;
+// Throwaway RSA test key pair, never registered with an App or used for live authentication.
 const KEY: &[u8] = include_bytes!("../fixtures/github_app_test.pem");
 const PUBLIC_KEY: &[u8] = include_bytes!("../fixtures/github_app_test.pub.pem");
 
@@ -30,16 +29,13 @@ struct Claims {
 }
 
 // Validate the remote contract independently of the client's serialization types.
-fn validate(headers: &HeaderMap, body: &[u8]) -> Result<(), String> {
+fn validate_headers(headers: &HeaderMap) -> Result<(), String> {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).ok_or_else(|| format!("missing {name}"));
     if header("user-agent")?.trim().is_empty() {
         return Err("empty User-Agent".into());
     }
     if header("accept")? != "application/vnd.github+json" || header("x-github-api-version")? != "2022-11-28" {
         return Err("unsupported media type or API version".into());
-    }
-    if header("content-type")? != "application/json" {
-        return Err("expected JSON".into());
     }
     let authorization = header("authorization")?;
     let jwt = authorization.strip_prefix("Bearer ").ok_or("JWT requires Bearer authorization")?;
@@ -54,6 +50,10 @@ fn validate(headers: &HeaderMap, body: &[u8]) -> Result<(), String> {
     if claims.iss != "12345" || claims.iat > NOW || claims.iat >= claims.exp || claims.exp <= NOW || claims.exp > NOW + 600 {
         return Err("invalid JWT claims".into());
     }
+    Ok(())
+}
+
+fn validate_payload(body: &[u8]) -> Result<(), String> {
     let body: Value = serde_json::from_slice(body).map_err(|error| error.to_string())?;
     let object = body.as_object().ok_or("expected object")?;
     if object.keys().any(|key| key != "repositories" && key != "permissions") {
@@ -74,61 +74,32 @@ fn validate(headers: &HeaderMap, body: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-async fn receive(State(()): State<()>, headers: HeaderMap, body: Bytes) -> (StatusCode, String) {
-    match validate(&headers, &body) {
+async fn receive(headers: HeaderMap, body: Bytes) -> (StatusCode, String) {
+    let result = validate_headers(&headers).and_then(|_| {
+        if headers.get("content-type").is_none_or(|value| value != "application/json") {
+            return Err("expected JSON".into());
+        }
+        validate_payload(&body)
+    });
+    match result {
         Ok(()) => (StatusCode::CREATED, json!({"token":"stand-in-token", "expires_at":"2026-10-04T01:00:00Z"}).to_string()),
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error),
     }
 }
 
 async fn resolve(headers: HeaderMap) -> (StatusCode, String) {
-    // Installation discovery uses the same GitHub App authentication contract.
-    let mut headers = headers;
-    headers.insert("content-type", "application/json".parse().expect("header"));
-    match validate(&headers, br#"{"repositories":["flotilla"]}"#) {
+    // Discovery is a GET without a payload, sharing only the App header/JWT rules.
+    match validate_headers(&headers) {
         Ok(()) => (StatusCode::OK, json!({"id":9876}).to_string()),
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error),
     }
 }
 
-struct Server {
-    url: Url,
-    task: JoinHandle<()>,
-}
-
-impl Server {
-    async fn start() -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind stand-in");
-        let url = Url::parse(&format!("http://{}", listener.local_addr().expect("address"))).expect("stand-in URL");
-        let router = Router::new()
-            .route("/app/installations/9876/access_tokens", post(receive))
-            .route("/repos/example/flotilla/installation", get(resolve))
-            .with_state(());
-        let task = tokio::spawn(async move { axum::serve(listener, router).await.expect("serve stand-in") });
-        Self { url, task }
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-// Network boundary: redirect only the authority, preserving the production path,
-// method, headers and body. Execute through the production HTTP collaborator.
-struct RedirectHttp(Url);
-
-#[async_trait]
-impl HttpClient for RedirectHttp {
-    async fn execute(&self, mut request: reqwest::Request, _: &ChannelLabel) -> Result<http::Response<Bytes>, String> {
-        assert_eq!(request.url().origin().ascii_serialization(), "https://api.github.com");
-        let mut url = self.0.clone();
-        url.set_path(request.url().path());
-        url.set_query(request.url().query());
-        *request.url_mut() = url;
-        ReqwestHttpClient::new().execute(request, &ChannelLabel::Default).await
-    }
+async fn stand_in() -> StandIn {
+    let router = Router::new()
+        .route("/app/installations/9876/access_tokens", post(receive))
+        .route("/repos/example/flotilla/installation", get(resolve));
+    StandIn::start("https://api.github.com", router).await
 }
 
 // #1512: the real mint must satisfy GitHub's HTTP and signed-JWT contract.
@@ -137,7 +108,7 @@ impl HttpClient for RedirectHttp {
 #[tokio::test]
 #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "requires loopback listener")]
 async fn github_app_mint_satisfies_http_contract() {
-    let server = Server::start().await;
+    let server = stand_in().await;
     let temp = tempfile::tempdir().expect("test App files");
     let app = temp.path().join("app.id");
     let key = temp.path().join("key.pem");
@@ -145,7 +116,7 @@ async fn github_app_mint_satisfies_http_contract() {
     tokio::fs::write(&key, KEY).await.expect("test key");
     let minter = RealGithubAppTokenMinter {
         env: Arc::new(TestEnvVars::default()),
-        http: Arc::new(RedirectHttp(server.url.clone())),
+        http: server.http.clone(),
         clock: Arc::new(VirtualClock::new(DateTime::from_timestamp(NOW, 0).expect("fixed clock"))),
     };
     assert_eq!(
@@ -185,7 +156,7 @@ async fn github_app_mint_satisfies_http_contract() {
 #[tokio::test]
 #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "requires loopback listener")]
 async fn github_app_stand_in_rejects_contract_violations() {
-    let server = Server::start().await;
+    let server = stand_in().await;
     flotilla_resources::tls::install_default_provider();
     let client = reqwest::Client::builder().no_proxy().build().expect("test client");
     let claims = json!({"iss":"12345", "iat":NOW-60, "exp":NOW+540});
