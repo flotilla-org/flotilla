@@ -54,6 +54,42 @@ derivatives, run pristine-runtime proofs, publish the complete cohort, copy it
 offsite, and only then write an immutable completed generation. It must not
 rebuild either project.
 
+## Installed generation retention
+
+After health confirmation, `fleet-install` retains `current`, `previous`, and
+three additional generations by default. Set `FLEET_INSTALL_KEEP_OTHERS` to a
+non-negative integer to change that count (zero keeps only protected releases).
+Additional generations are ordered by generation ID, whose leading UTC
+publication timestamp is stable across reinstalls and validator synchronization.
+Discovery assumes the managed launchers and services exec the unrenamed
+`bin/flotillad` binary: process enumeration matches the exact name `flotillad`.
+Custom wrappers must exec that binary; renamed daemon binaries are outside this
+process-discovery contract. Every generation containing a running `flotillad` executable is also kept
+without consuming one of the K additional slots,
+using `/proc/<pid>/exe` on Linux and `proc_pidpath` on macOS. Unreadable process
+information refuses pruning. On Linux, an unreaped zombie whose executable
+cannot be inspected also blocks pruning until its parent reaps it; retry after
+that process disappears. Pruning errors are reported without undoing a
+healthy install; activation with health confirmation disabled does not prune.
+A missing or unsafe current/previous link also refuses pruning. Inspect and
+restore the link to an installed release before retrying; a stale `previous`
+link can instead be removed if that rollback target is no longer available.
+
+Operators can preview with `fleet-install --prune-dry-run` or apply with
+`fleet-install --prune`. These modes need no package credentials or network.
+Mutating pruning shares the install/rollback lock. Dry runs do not take that
+lock or change the fleet tree, so a concurrent install can make the preview
+stale; `--prune` always recomputes its selection under the lock. Removed releases
+include their bundled validator and generation-prefixed file/symlink sidecars under
+`releases/` (for example `<generation>.validator.bak`); shared host validators
+and retained-generation backups remain untouched. For dotted generation IDs,
+sidecars belong to the longest matching generation name, so pruning `A` cannot
+remove a retained `A.b` generation's backup. Keep the host's validator
+compatible with the retained rollback set; pruning does not synchronize it.
+Pruning performs no separate sweep of orphan sidecars: it only removes files
+attributed to a release being pruned. Unmatched files remain for manual inspection.
+Live pruning on fleet hosts is an operator check after deployment.
+
 ## Promoted generation consumer contract
 
 `scripts/fleet-install` consumes immutable versions of the Forgejo Generic
