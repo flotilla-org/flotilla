@@ -350,7 +350,7 @@ async fn execute_project_command(
 
 #[tokio::test]
 async fn project_declarations_register_single_and_multi_member_projects_with_provenance() {
-    let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
+    let (daemon, backend, config, _runtime, tmp) = start_daemon().await;
     let bootstrap = RepositorySpec::remote("https://github.com/example/bootstrap").expect("bootstrap spec");
     let commit = Arc::new(RwLock::new("0123456789abcdef".to_string()));
     daemon
@@ -373,6 +373,11 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
         CommandValue::ProjectRegistered { name: "flotilla".to_string(), members: 1 }
     );
     let flotilla = backend.using::<Project>("flotilla").get("flotilla").await.expect("flotilla project");
+    // Issue #2484: only portable provenance may be replicated.
+    assert!(!flotilla.metadata.annotations.contains_key(BOOTSTRAP_PATH_ANNOTATION));
+    // The host-local observation root survives restart even when the bootstrap
+    // repository is not itself a Project member.
+    assert!(config.load_observation_roots().expect("local roots").iter().any(|root| root.as_ref() == tmp.path()));
     assert_eq!(flotilla.spec.default_workflow_ref, "single-agent");
     assert_eq!(flotilla.spec.repositories[0].alias.as_deref(), Some("flotilla"));
     assert_eq!(
@@ -403,6 +408,78 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
         assert_eq!(repository.metadata.annotations.get(BOOTSTRAP_COMMIT_ANNOTATION).map(String::as_str), Some("0123456789abcdef"));
         assert!(!repository.metadata.annotations.contains_key(BOOTSTRAP_PATH_ANNOTATION));
     }
+}
+
+// An upgraded Project may have portable bootstrap identity but no observed
+// bootstrap on this host. Never adopt a replicated legacy path; explain how to
+// establish the host-local observation explicitly.
+#[tokio::test]
+async fn legacy_project_without_local_bootstrap_requires_reregistration() {
+    let (daemon, backend, _config, _runtime, _tmp) = start_daemon().await;
+    daemon.set_repository_inspector(Arc::new(FailingInspector)).await;
+    let key = RepositorySpec::remote("https://github.com/example/bootstrap").expect("repository").key();
+    backend
+        .definitions::<Project>("flotilla")
+        .apply(
+            &InputMeta::builder()
+                .name("legacy".to_string())
+                .annotations(BTreeMap::from([
+                    (BOOTSTRAP_REPOSITORY_ANNOTATION.to_string(), key.to_string()),
+                    (BOOTSTRAP_PATH_ANNOTATION.to_string(), "/another-host/bootstrap".to_string()),
+                ]))
+                .build(),
+            &ProjectSpec::builder().display_name("Legacy".to_string()).default_workflow_ref("single-agent".to_string()).build(),
+        )
+        .await
+        .expect("legacy Project");
+    let mut rx = daemon.subscribe();
+    let result = execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "legacy".to_string() }).await;
+    assert!(matches!(result, CommandValue::Error { message }
+        if message.contains("no local bootstrap checkout") && message.contains("flotilla project register /path/to/bootstrap")));
+}
+
+// Issue #2484: a selected ops checkout keeps its catalog identity even when
+// detached HEAD and distinct remotes make fresh identity inspection ambiguous.
+#[tokio::test]
+async fn selected_detached_ops_checkout_loads_without_rederiving_identity() {
+    let tmp = tempfile::tempdir().expect("fixture directory");
+    let bootstrap = tmp.path().join("bootstrap");
+    let ops = tmp.path().join("ops");
+    init_git_repo_with_remote(&bootstrap, "https://github.com/example/bootstrap");
+    init_git_repo_with_remote(&ops, "https://github.com/example/ops");
+    let git = |path: &Path, args: &[&str]| {
+        let result = std::process::Command::new("git").arg("-C").arg(path).args(args).output().expect("git fixture command");
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    };
+    std::fs::write(bootstrap.join("project.yaml"),
+        "name: detached-ops\nmembers:\n  - alias: app\n    url: https://github.com/example/bootstrap\n    roles: [code]\n  - alias: ops\n    url: https://github.com/example/ops\n    roles: [ops]\n").expect("declaration");
+    git(&bootstrap, &["add", "project.yaml"]);
+    git(&bootstrap, &["commit", "-m", "declare project"]);
+    std::fs::write(ops.join("verify.md"), "---\nkind: verification_command\nname: test\n---\ncommand: cargo test --workspace\n")
+        .expect("ops entry");
+    git(&ops, &["add", "verify.md"]);
+    git(&ops, &["commit", "-m", "declare verification"]);
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = Arc::new(
+        InProcessDaemon::new_with_resource_backend(
+            vec![ops.clone()],
+            test_config(tmp.path().join("config")),
+            git_process_discovery(false),
+            HostName::new("local"),
+            backend.clone(),
+        )
+        .await,
+    );
+    git(&ops, &["remote", "add", "lab", "https://forgejo.example.org/example/ops"]);
+    git(&ops, &["checkout", "--detach"]);
+    let mut rx = daemon.subscribe();
+    let result =
+        execute_project_command(&daemon, &mut rx, CommandAction::ProjectRegister { target: bootstrap.to_string_lossy().into_owned() })
+            .await;
+    assert_eq!(result, CommandValue::ProjectRegistered { name: "detached-ops".into(), members: 2 });
+    let key = RepositorySpec::remote("https://github.com/example/bootstrap").expect("repository").key();
+    let repository = backend.using::<Repository>("flotilla").get(&key.to_string()).await.expect("code repository");
+    assert_eq!(repository.spec.verification_commands().get("test").map(String::as_str), Some("cargo test --workspace"));
 }
 
 #[tokio::test]
@@ -543,7 +620,11 @@ async fn project_refresh_rebinds_alias_when_a_superseding_declaration_changes_it
         original.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("app")).expect("app member").repo.clone();
     let mut drifted = original.spec.clone();
     drifted.display_name = "hand edited".to_string();
-    projects.apply(&InputMeta::from(&original.metadata), &drifted).await.expect("introduce drift");
+    // Issue #2484: legacy metadata may name another host's bootstrap checkout;
+    // refresh must use this host's observations and retire that annotation.
+    let mut old_meta = InputMeta::from(&original.metadata);
+    old_meta.annotations.insert(BOOTSTRAP_PATH_ANNOTATION.to_string(), "/another-host/bootstrap".to_string());
+    projects.apply(&old_meta, &drifted).await.expect("introduce drift");
 
     *commit.write().expect("commit lock should not be poisoned") = "commit-two".to_string();
     std::fs::write(
@@ -562,6 +643,7 @@ async fn project_refresh_rebinds_alias_when_a_superseding_declaration_changes_it
         }
     );
     let refreshed = projects.get("demo").await.expect("refreshed project");
+    assert!(!refreshed.metadata.annotations.contains_key(BOOTSTRAP_PATH_ANNOTATION));
     assert_eq!(refreshed.spec.display_name, "demo");
     assert_eq!(refreshed.spec.default_workflow_ref, "single-agent");
     let app = refreshed.spec.repositories.iter().find(|member| member.alias.as_deref() == Some("app")).expect("app member");

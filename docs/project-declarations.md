@@ -44,13 +44,23 @@ flotilla project refresh example
 ```
 
 Registration creates or updates the Project and member Repository resources.
-It records the bootstrap RepositoryKey, exact commit, declaration filename, and
-local bootstrap path as provenance annotations on the Project; member
+It records the bootstrap RepositoryKey, exact commit, and declaration filename
+as portable provenance annotations on the Project; member
 Repositories receive only the portable repository, commit, and filename
-provenance. Refresh reads `project.yaml` from the bootstrap checkout's committed
+provenance. Registration saves the bootstrap checkout in the host-local
+observation roots. Refresh resolves the bootstrap RepositoryKey through this
+host's Checkout facts; bootstrap paths are never Project annotations.
+Refresh reads `project.yaml` from the bootstrap checkout's committed
 `HEAD` and converges materialized state back to the declaration. It does not
 watch for changes continuously, and it does not use uncommitted working-tree
 contents.
+
+Projects registered before the host-local lookup may have no bootstrap Checkout
+fact on this host, particularly when the bootstrap is not a Project member.
+Re-register those once with `flotilla project register /path/to/bootstrap` on the
+Project's home host. A replicated legacy path is never used to infer a local
+checkout. If multiple local checkouts exist, refresh requires a unique main
+checkout; a sole checkout remains usable even if it is a worktree.
 
 Aliases preserve each member's RepositoryKey if its URL changes between
 refreshes. This follows the repository identity model: forge renames are served

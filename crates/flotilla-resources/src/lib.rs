@@ -186,7 +186,7 @@ pub use repository::{
 };
 pub use resource::{
     api_version, ApiPaths, CausalDot, FieldMergeMetadata, InputMeta, K8sListMeta, K8sObjectMeta, K8sResourceList, K8sResourceObject,
-    K8sWatchEvent, MergeConflictSibling, MergeMetadata, ObjectMeta, OwnerReference, Resource, ResourceObject,
+    K8sWatchEvent, MergeConflictSibling, MergeMetadata, ObjectMeta, OwnerReference, Resource, ResourceObject, BOOTSTRAP_PATH_ANNOTATION,
 };
 pub use retention::{
     EventRetention, ResourceDecodeQuarantine, ResourceEventDecodeQuarantine, ResourceStoreDiagnostics, ResourceStoreWarning,

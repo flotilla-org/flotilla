@@ -190,6 +190,31 @@ pub struct MergeMetadata {
     pub conflicts: BTreeMap<String, Vec<MergeConflictSibling>>,
 }
 
+// ADR 0047: this reserved key is retired across every kind's metadata, including
+// Projects from the previous generation. Remove it one fleet roll after #2484 ships.
+pub const BOOTSTRAP_PATH_ANNOTATION: &str = "flotilla.work/project-bootstrap-path";
+
+// ADR 0047: previous-generation metadata carried a host-local bootstrap path.
+// The reserved key is stripped for all resource kinds, not only Projects.
+// Accept and drop it; remove this decode shim one fleet roll after #2484 ships.
+fn decode_annotations<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<BTreeMap<String, String>, D::Error> {
+    let mut annotations = BTreeMap::<String, String>::deserialize(decoder)?;
+    annotations.remove(BOOTSTRAP_PATH_ANNOTATION);
+    Ok(annotations)
+}
+
+fn encode_annotations<S: serde::Serializer>(annotations: &BTreeMap<String, String>, encoder: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let length = annotations.len() - usize::from(annotations.contains_key(BOOTSTRAP_PATH_ANNOTATION));
+    let mut map = encoder.serialize_map(Some(length))?;
+    for (key, value) in annotations {
+        if key != BOOTSTRAP_PATH_ANNOTATION {
+            map.serialize_entry(key, value)?;
+        }
+    }
+    map.end()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, bon::Builder)]
 pub struct InputMeta {
     pub name: String,
@@ -198,6 +223,7 @@ pub struct InputMeta {
     pub labels: BTreeMap<String, String>,
     #[builder(default)]
     #[serde(default)]
+    #[serde(deserialize_with = "decode_annotations", serialize_with = "encode_annotations")]
     pub annotations: BTreeMap<String, String>,
     #[builder(default)]
     #[serde(default, rename = "ownerReferences", skip_serializing_if = "Vec::is_empty")]
@@ -246,6 +272,7 @@ pub struct ObjectMeta {
     pub namespace: String,
     pub resource_version: String,
     pub labels: BTreeMap<String, String>,
+    #[serde(deserialize_with = "decode_annotations", serialize_with = "encode_annotations")]
     pub annotations: BTreeMap<String, String>,
     #[serde(default, rename = "ownerReferences", skip_serializing_if = "Vec::is_empty")]
     pub owner_references: Vec<OwnerReference>,
@@ -351,6 +378,7 @@ pub struct K8sObjectMeta {
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
     #[serde(default)]
+    #[serde(deserialize_with = "decode_annotations", serialize_with = "encode_annotations")]
     pub annotations: BTreeMap<String, String>,
     #[serde(default, rename = "ownerReferences", skip_serializing_if = "Vec::is_empty")]
     pub owner_references: Vec<OwnerReference>,
@@ -447,6 +475,7 @@ pub(crate) struct K8sInputMetadata<'a> {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) labels: &'a BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(serialize_with = "encode_annotations")]
     pub(crate) annotations: &'a BTreeMap<String, String>,
     #[serde(default, rename = "ownerReferences", skip_serializing_if = "Vec::is_empty")]
     pub(crate) owner_references: &'a Vec<OwnerReference>,
@@ -545,5 +574,46 @@ impl From<&ObjectMeta> for InputMeta {
             finalizers: value.finalizers.clone(),
             deletion_timestamp: value.deletion_timestamp,
         }
+    }
+}
+
+#[cfg(test)]
+mod retired_annotation_tests {
+    use super::*;
+
+    // ADR 0047: old metadata decodes, retired paths never reserialize, and all
+    // unrelated annotations survive. Cover empty and populated maps, both
+    // presence states of the retired key, and path/value lengths including zero.
+    #[hegel::test]
+    fn bootstrap_path_is_decode_only(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
+        let length = tc.draw(gs::integers::<usize>().min_value(0).max_value(256));
+        let retired = tc.draw(gs::booleans());
+        let mut annotations = (0..count).map(|i| (format!("example/key-{i}"), "v".repeat(length))).collect::<BTreeMap<_, _>>();
+        let expected = annotations.clone();
+        if retired {
+            annotations.insert(BOOTSTRAP_PATH_ANNOTATION.into(), format!("/other-host/{}", "p".repeat(length)));
+        }
+        let old = serde_json::json!({"name": "project", "annotations": annotations});
+        let decoded: InputMeta = serde_json::from_value(old).expect("old metadata decodes");
+        let old_object = serde_json::json!({
+            "name": "project", "namespace": "flotilla", "resource_version": "1", "resourceVersion": "1",
+            "labels": {}, "annotations": annotations,
+            "creation_timestamp": "2026-10-01T00:00:00Z", "creationTimestamp": "2026-10-01T00:00:00Z",
+        });
+        let object: ObjectMeta = serde_json::from_value(old_object.clone()).expect("old stored metadata");
+        let k8s: K8sObjectMeta = serde_json::from_value(old_object).expect("old API metadata");
+        assert_eq!(object.annotations, expected);
+        assert_eq!(k8s.annotations, expected);
+        assert_eq!(decoded.annotations, expected);
+        let input = InputMeta::builder().name("project".to_string()).annotations(annotations).build();
+        let written = serde_json::to_value(&input).expect("new metadata encodes");
+        assert_eq!(written["annotations"], serde_json::to_value(&expected).expect("annotations"));
+        let spec = crate::RepositorySpec::remote("https://github.com/example/bootstrap").expect("repository spec");
+        let request = K8sInputResourceObject::<crate::Repository>::for_spec(&input, None, &spec);
+        let request = serde_json::to_value(request).expect("API write request");
+        let request_annotations = request["metadata"].get("annotations").cloned().unwrap_or_else(|| serde_json::json!({}));
+        assert_eq!(request_annotations, serde_json::to_value(expected).expect("annotations"));
     }
 }

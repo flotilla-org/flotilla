@@ -6,7 +6,8 @@ use serde::Deserialize;
 pub const DECLARATION_FILE: &str = "project.yaml";
 pub const BOOTSTRAP_REPOSITORY_ANNOTATION: &str = "flotilla.work/project-bootstrap-repository";
 pub const BOOTSTRAP_COMMIT_ANNOTATION: &str = "flotilla.work/project-bootstrap-commit";
-pub const BOOTSTRAP_PATH_ANNOTATION: &str = "flotilla.work/project-bootstrap-path";
+// ADR 0047: retired key used only for cleanup; remove one fleet roll after #2484 ships.
+pub use flotilla_resources::BOOTSTRAP_PATH_ANNOTATION;
 pub const DECLARATION_FILE_ANNOTATION: &str = "flotilla.work/project-declaration-file";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
