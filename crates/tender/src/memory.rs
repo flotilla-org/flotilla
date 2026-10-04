@@ -63,6 +63,21 @@ impl MemoryTender {
         }
     }
 
+    /// Authorization and current reachability without opening application data.
+    #[cfg(unix)]
+    pub(crate) fn check_connect(&self, session: &Session, id: PublicationId) -> Result<(), Error> {
+        self.inner.lock().expect("state lock").record_for_connect(session, id).map(|_| ())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn lease_active(&self, lease: &Lease) -> bool {
+        self.inner.lock().expect("state lock").records.get(&lease.id).is_some_and(|record| {
+            record.publication.publisher == lease.publisher
+                && record.publication.generation == lease.generation
+                && record.publication.availability == Availability::Available
+        })
+    }
+
     pub fn host(&self) -> Fingerprint {
         self.inner.lock().expect("state lock").host.clone()
     }

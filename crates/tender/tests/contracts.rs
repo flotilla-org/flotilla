@@ -50,17 +50,65 @@ struct Rig {
     tender: Box<dyn Tender>,
     host: Box<dyn HostControls>,
     host_id: Fingerprint,
+    #[cfg(unix)]
+    _server: Option<(tender::ssh::Server, tempfile::TempDir)>,
 }
 
 fn memory() -> Rig {
     let host_id = fp("host-key");
     let host = MemoryTender::new(host_id.clone());
-    Rig { tender: Box::new(host.clone()), host: Box::new(host), host_id }
+    Rig {
+        tender: Box::new(host.clone()),
+        host: Box::new(host),
+        host_id,
+        #[cfg(unix)]
+        _server: None,
+    }
 }
 
 fn fp(value: &str) -> Fingerprint {
-    Fingerprint(value.into())
+    #[cfg(unix)]
+    {
+        identity(value).fingerprint()
+    }
+    #[cfg(not(unix))]
+    {
+        Fingerprint(value.into())
+    }
 }
+#[cfg(unix)]
+fn identity(label: &str) -> tender::ssh::Identity {
+    use sha2::{Digest, Sha256};
+    tender::ssh::Identity::from_secret(Sha256::digest(label.as_bytes()).into())
+}
+
+#[cfg(unix)]
+async fn local_adapter() -> Rig {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("private directory");
+    let host_identity = identity("host-key");
+    let host_id = host_identity.fingerprint();
+    let host = MemoryTender::new(host_id.clone());
+    let endpoint = directory.path().join("tender");
+    let server = tender::ssh::Server::bind(endpoint.clone(), host_identity, host.clone()).expect("Tender listener");
+    let names = [
+        "host-user",
+        "laptop",
+        "container-key",
+        "parent",
+        "outsider",
+        "owner",
+        "consumer",
+        "contender",
+        "first-helper",
+        "second-helper",
+        "kept",
+        "removed",
+    ];
+    let adapter = tender::ssh::SshTender::new(endpoint, host_id.clone(), names.into_iter().map(identity).collect()).expect("adapter");
+    Rig { tender: Box::new(adapter), host: Box::new(host), host_id, _server: Some((server, directory)) }
+}
+
 fn ns(value: &str) -> Namespace {
     Namespace(value.into())
 }
@@ -332,8 +380,10 @@ async fn backpressure_and_cancel(rig: Rig) {
     let mut published = rig.tender.publish(&publisher, request("n", "service", &["consumer"], None)).await.expect("publish");
     let mut connection = rig.tender.connect_with_deadline(&client, published.lease.id, Duration::from_secs(1)).await.expect("bounded open");
     let mut service = published.incoming.recv().await.expect("incoming");
+    // Exceeds SSH channel windows and OS socket buffers as well as the
+    // in-memory pipe, without assuming an adapter-specific capacity.
     assert!(
-        timeout(Duration::from_millis(30), connection.write_all(&vec![7; 1_000_000])).await.is_err(),
+        timeout(Duration::from_millis(30), connection.write_all(&vec![7; 16_000_000])).await.is_err(),
         "bounded stream must apply backpressure"
     );
     drop(connection); // Cooperative cancellation closes this one raw channel.
@@ -346,7 +396,7 @@ async fn backpressure_and_cancel(rig: Rig) {
         }
         total += n;
     }
-    assert!(total < 1_000_000);
+    assert!(total < 16_000_000);
 }
 
 macro_rules! contract {
@@ -356,13 +406,32 @@ macro_rules! contract {
             async fn run() {
                 super::$name(super::memory()).await;
             }
+            #[cfg(unix)]
+            #[tokio::test]
+            async fn local_socket() {
+                super::$name(super::local_adapter().await).await;
+            }
         }
     };
 }
 
 contract!(existing_service_on_ssh_host);
 contract!(scoped_container_publisher);
-contract!(roaming_via_pinned_intermediary);
+// Authenticated intermediary routing belongs to slice 3; this adapter refuses it.
+mod roaming_via_pinned_intermediary {
+    #[tokio::test]
+    async fn run() {
+        super::roaming_via_pinned_intermediary(super::memory()).await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_socket_refuses_intermediary() {
+        let rig = super::local_adapter().await;
+        let mut client = super::session("consumer", &rig.host_id);
+        client.via = Some(super::fp("relay-key"));
+        assert_eq!(rig.tender.browse(&client).await, Err(super::Error::UntrustedIntermediary));
+    }
+}
 contract!(lifecycle_and_stale_teardown);
 contract!(reclaim_cannot_probe_other_namespaces);
 contract!(grant_loss_and_expiry);

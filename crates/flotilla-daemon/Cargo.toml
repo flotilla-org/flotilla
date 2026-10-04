@@ -19,6 +19,7 @@ flotilla-protocol = { path = "../flotilla-protocol" }
 flotilla-relay-protocol = { path = "../flotilla-relay-protocol" }
 flotilla-resources = { path = "../flotilla-resources" }
 flotilla-transport = { path = "../flotilla-transport" }
+tender = { path = "../tender" }
 tokio = { workspace = true }
 tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
