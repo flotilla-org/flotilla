@@ -1217,15 +1217,62 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
             r#"{"type":"agent-turn-complete","thread-id":"codex-1"}"#,
         ),
     ] {
+        // #2634: delivered notify/Stop hooks must reach the actor obligation,
+        // not just transient terminal attention.
+        let convoy_name = format!("hook-{harness_name}");
+        let convoys = daemon.resource_backend().using::<Convoy>("flotilla");
+        let created_convoy = convoys
+            .create(
+                &InputMeta::builder().name(convoy_name.clone()).build(),
+                &ConvoySpec::builder().workflow_ref("hook-test".into()).build(),
+            )
+            .await
+            .expect("convoy");
+        let workflow = flotilla_resources::single_agent_workflow_spec();
+        convoys
+            .update_status(&convoy_name, &created_convoy.metadata.resource_version, &flotilla_resources::ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Active,
+                work: BTreeMap::from([(
+                    "work".into(),
+                    flotilla_resources::WorkState::builder().phase(flotilla_resources::WorkPhase::Running).build(),
+                )]),
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([(
+                        "coder".into(),
+                        flotilla_resources::CrewWorkState::builder().phase(flotilla_resources::CrewWorkPhase::Working).build(),
+                    )]),
+                )]),
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    vessels: workflow.vessels,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("convoy status");
         let name = format!("terminal-{harness_name}");
         let created = sessions
-            .create(&InputMeta::builder().name(name.clone()).build(), &TerminalSessionSpec {
-                env_ref: "host-direct".into(),
-                role: "coder".into(),
-                source: TerminalSessionSource::Tool { command: harness_name.into() },
-                cwd: "/repo".into(),
-                pool: "cleat".into(),
-            })
+            .create(
+                &InputMeta::builder()
+                    .name(name.clone())
+                    .labels(BTreeMap::from([
+                        (flotilla_resources::CONVOY_LABEL.into(), convoy_name.clone()),
+                        (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
+                        (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
+                    ]))
+                    .build(),
+                &TerminalSessionSpec {
+                    env_ref: "host-direct".into(),
+                    role: "coder".into(),
+                    source: TerminalSessionSource::Tool { command: harness_name.into() },
+                    cwd: "/repo".into(),
+                    pool: "cleat".into(),
+                },
+            )
             .await
             .expect("terminal create");
         let mut status = TerminalSessionStatus::default();
@@ -1279,6 +1326,14 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                 flotilla_resources::TerminalAttentionSource::Hook
             };
             assert_eq!(attention.source, source);
+            daemon.reconcile_crew_stalls_once("flotilla").await.expect("observe actor hook");
+            let convoy_status = convoys.get(&convoy_name).await.expect("convoy").status.expect("status");
+            let obligation = convoy_status.nudge_obligations.first().expect("actor obligation");
+            if source == flotilla_resources::TerminalAttentionSource::Hook {
+                assert_eq!(obligation.last_hook_at, Some(attention.as_of));
+            } else {
+                assert!(obligation.last_hook_at.is_none(), "screen evidence must not masquerade as a hook");
+            }
         }
     }
 }

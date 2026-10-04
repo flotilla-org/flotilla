@@ -1428,6 +1428,11 @@ pub enum ConvoyStatusPatch {
     SetSettlementAttention {
         attention: Option<ConvoyAttention>,
     },
+    /// Advisory hook health must neither replace nor clear another attention source.
+    ObserveTurnHookHealth {
+        reason: Option<String>,
+        observed_at: DateTime<Utc>,
+    },
     QueueSupervisorTurn {
         turn: PendingSupervisorTurn,
     },
@@ -1697,6 +1702,18 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 clear_operator_pending_brief(status);
             }
             Self::SetSettlementAttention { attention } => status.attention = attention.clone(),
+            Self::ObserveTurnHookHealth { reason, observed_at } => {
+                if status.attention.as_ref().is_none_or(|attention| attention.source == "missing-turn-hook") {
+                    match reason {
+                        Some(reason) => {
+                            let raised_at = status.attention.as_ref().map_or(*observed_at, |attention| attention.raised_at);
+                            status.attention =
+                                Some(ConvoyAttention { source: "missing-turn-hook".into(), reason: reason.clone(), raised_at });
+                        }
+                        None => status.attention = None,
+                    }
+                }
+            }
             Self::QueueSupervisorTurn { turn } => {
                 let existing_order = status
                     .turn_deliveries
@@ -2337,6 +2354,27 @@ pub mod external_patches {
 mod subject_tests {
     use super::*;
     use crate::{CrewMessageDelivery, CrewMessageSender, TerminalCrewMessage};
+
+    // #2634: hook health is advisory; a settlement attention raised between
+    // reading health and applying its patch must survive both raise and clear.
+    #[hegel::test]
+    fn turn_hook_health_preserves_other_attention(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Both raise/clear operations, duplicate patches, and observation times
+        // before/after the existing attention cover optimistic retry interleavings.
+        let raised_at = Utc::now();
+        let observed_at = raised_at + chrono::Duration::seconds(tc.draw(gs::integers::<i64>().min_value(-1).max_value(1)));
+        let reason = tc.draw(gs::booleans()).then(|| "no hook".to_string());
+        let mut status = ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() };
+        let health = ConvoyStatusPatch::ObserveTurnHookHealth { reason, observed_at };
+        health.apply(&mut status);
+        let settlement = ConvoyAttention { source: "settlement".into(), reason: "review pending".into(), raised_at };
+        ConvoyStatusPatch::SetSettlementAttention { attention: Some(settlement.clone()) }.apply(&mut status);
+        for _ in 0..2 {
+            health.apply(&mut status);
+            assert_eq!(status.attention, Some(settlement.clone()));
+        }
+    }
 
     // Glue: web roots are normalized consistently across configured Forge
     // and resolved Repository inputs. This pinned SSH installation makes the
