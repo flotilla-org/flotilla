@@ -2487,7 +2487,7 @@ pub(super) async fn discover_repository_change_request_with(
     repository: &RepositorySpec,
 ) -> Result<Arc<dyn ChangeRequestTracker>, String> {
     let identity = repository.forge().ok_or("no forge identity")?;
-    let bag = repository_provider_bag(resource_backend, environment_manager, local_environment_id, namespace, repository).await?;
+    let bag = repository_provider_bag(resource_backend, config, environment_manager, local_environment_id, namespace, repository).await?;
     let probe_root = ExecutionEnvironmentPath::new(config.base_path().as_ref());
     let mut unmet = Vec::new();
     for factory in &discovery.factories.change_requests {
@@ -2501,6 +2501,7 @@ pub(super) async fn discover_repository_change_request_with(
 
 pub(super) async fn repository_provider_bag(
     resource_backend: &ResourceBackend,
+    config: &ConfigStore,
     environment_manager: &EnvironmentManager,
     local_environment_id: &EnvironmentId,
     namespace: &str,
@@ -2513,6 +2514,9 @@ pub(super) async fn repository_provider_bag(
         .iter()
         .filter(|assertion| {
             !matches!(
+                assertion,
+                EnvironmentAssertion::AuthFileExists { provider, .. } if provider == "forgejo"
+            ) && !matches!(
                 assertion,
                 EnvironmentAssertion::RemoteHost { .. }
                     | EnvironmentAssertion::OriginForge { .. }
@@ -2541,20 +2545,20 @@ pub(super) async fn repository_provider_bag(
     if let Some(forge) = &forge {
         bag = bag.with(EnvironmentAssertion::origin_forge(forge.clone()));
         if forge.kind == ForgeKind::Forgejo {
-            let credentials = resource_backend.definitions::<CredentialSpec>(namespace).list().await.map_err(|error| error.to_string())?;
-            let paths = credentials
-                .into_iter()
-                .filter_map(|credential| match (&credential.spec.consumer, &credential.spec.source) {
+            if let Some(name) = config.load_daemon_config()?.credentials.forgejo.get(&forge.forge_id) {
+                let credential = resource_backend
+                    .definitions::<CredentialSpec>(namespace)
+                    .get(name)
+                    .await
+                    .map_err(|error| format!("daemon Forgejo credential {name}: {error}"))?;
+                match (&credential.spec.consumer, &credential.spec.source) {
                     (CredentialConsumer::Forgejo { forge_ref, .. }, CredentialSource::File { path }) if forge_ref == &forge.forge_id => {
-                        Some(path.clone())
+                        bag = bag.with(EnvironmentAssertion::auth_file("forgejo", path));
                     }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            match paths.as_slice() {
-                [path] => bag = bag.with(EnvironmentAssertion::auth_file("forgejo", path)),
-                [] => {}
-                _ => return Err(format!("multiple Forgejo credentials for Forge {}", forge.forge_id)),
+                    _ => {
+                        return Err(format!("daemon Forgejo credential {name} must use a file source and target Forge {}", forge.forge_id))
+                    }
+                }
             }
         }
     }

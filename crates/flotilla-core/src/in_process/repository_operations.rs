@@ -96,6 +96,7 @@ impl InProcessDaemon {
         let namespace = self.provisioning_namespace().await;
         let bag = repository_provider_bag(
             &self.resource_backend,
+            &self.config,
             &self.environment_manager,
             &self.local_environment_id,
             &namespace,

@@ -198,6 +198,9 @@ fn forgejo_provider_config(
 }
 
 fn resolve_forgejo_auth(env: &EnvironmentBag, config: &ConfigStore, forgejo: &ForgejoIssueTrackerConfig) -> Result<ForgejoAuth, String> {
+    if env.find_origin_forge().is_some_and(|forge| forge.kind == ForgeKind::Forgejo) && env.find_auth_path("forgejo").is_none() {
+        return Err("no explicit daemon credential configured for Forgejo Forge".into());
+    }
     let path = env
         .find_auth_path("forgejo")
         .map(|path| path.as_path().to_path_buf())
@@ -472,7 +475,8 @@ mod tests {
             .build();
         let bag = EnvironmentBag::new()
             .with(EnvironmentAssertion::remote_host("forgejo.lab.flotilla.work", "lab", "flotilla", "origin"))
-            .with(EnvironmentAssertion::origin_forge(forge));
+            .with(EnvironmentAssertion::origin_forge(forge))
+            .with(EnvironmentAssertion::auth_file("forgejo", dir.path().join("lab-forgejo-coder-token")));
         let root = ExecutionEnvironmentPath::new("/repo");
         let runner = Arc::new(DiscoveryMockRunner::builder().build());
         let issues = ForgejoIssueProviderFactory.probe(&bag, &config, &root, runner.clone()).await.expect("Forgejo issue source");
@@ -496,7 +500,9 @@ mod tests {
             .https_url("https://forgejo.lab.flotilla.work".into())
             .git_ssh_host("forgejo.lab.flotilla.work".into())
             .build();
-        let bag = EnvironmentBag::new().with(EnvironmentAssertion::origin_forge(forge));
+        let bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::origin_forge(forge))
+            .with(EnvironmentAssertion::auth_file("forgejo", dir.path().join("lab-forgejo-coder-token")));
 
         let resolved = forgejo_provider_config(&bag, &config, &config.load_config()).expect("Forgejo config");
         assert_eq!(resolved.service_url, "https://forgejo.lab.flotilla.work");

@@ -216,6 +216,31 @@ and the TUI fleet health pane. Override the near-expiry warning window
 warning_window_days = 14
 ```
 
+## Daemon Forgejo identity
+
+Declare each host daemon's Forgejo credential explicitly in that host's
+`~/.config/flotilla/daemon.toml`. Keys are Forge IDs and values are
+`CredentialSpec` names in the repository's namespace:
+
+```toml
+[credentials.forgejo]
+flotilla-lab = "lab-forgejo-daemon"
+```
+
+The named credential must have a `forgejo` consumer targeting that Forge and a
+file source readable in the discovery environment. Its token file uses the
+existing Forgejo provider format. Crew and governor credentials delivered by
+grants are never selected implicitly, even when only one credential exists.
+Without a mapping, Forgejo providers report missing authentication. A missing
+or incompatible named credential reports a discovery diagnosis; startup keeps
+the repository and independently discovered checkout facts observable, and
+continues observing the other roots. Repository operations refuse the same
+invalid declaration rather than switching identities.
+
+This host-local setting leaves resource schemas unchanged. Existing project-map
+crew/governor declarations need no edits; enabling authenticated observation
+requires a separate daemon credential declaration and this host configuration.
+
 ## Blob stores
 
 Every daemon stores blobs by SHA-256 beneath its state directory in

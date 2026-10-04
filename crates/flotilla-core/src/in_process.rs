@@ -120,7 +120,8 @@ use crate::{
         ai_utility::{AiUtility, ConvoyNames},
         change_request::{BoundObservations, ChangeRequestTracker, ObservationError},
         discovery::{
-            discover_checkout_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag,
+            discover_checkout_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion,
+            EnvironmentBag, UnmetRequirement,
         },
         issue_tracker::IssueProvider,
         registry::ProviderRegistry,
@@ -316,6 +317,7 @@ impl IssueQueryPort for ProviderIssueQueryPort {
                 };
                 convoy_admission::repository_provider_bag(
                     &self.backend,
+                    &self.config,
                     &self.environment_manager,
                     &self.local_environment_id,
                     &namespace,
@@ -331,6 +333,7 @@ impl IssueQueryPort for ProviderIssueQueryPort {
                     Ok(intent) => {
                         convoy_admission::repository_provider_bag(
                             &self.backend,
+                            &self.config,
                             &self.environment_manager,
                             &self.local_environment_id,
                             &namespace,
@@ -1199,7 +1202,8 @@ async fn discover_repo_for_environment(
         environment_manager.environment_runner(environment_id).ok_or_else(|| format!("environment runner not found: {environment_id}"))?;
     if let Some(spec) = repository_spec {
         host_bag =
-            convoy_admission::repository_provider_bag(resource_backend, environment_manager, environment_id, namespace, spec).await?;
+            convoy_admission::repository_provider_bag(resource_backend, config, environment_manager, environment_id, namespace, spec)
+                .await?;
     }
     let ee_path = ExecutionEnvironmentPath::new(repo_path);
     let remote_env = StaticEnvVars::from_bag(&host_bag);
@@ -2028,17 +2032,17 @@ impl InProcessDaemon {
             let initial_vcs =
                 discover_vcs_for_checkout(&environment_manager, &discovery, &config, &local_environment_id, &local_environment_id, &path)
                     .await;
-            let mut startup_inspection = match initial_vcs {
+            let mut startup_inspection = match &initial_vcs {
                 Ok(vcs) => {
                     GitRepositoryInspector::new(
                         discovery.runner.clone(),
-                        Arc::new(crate::vcs::FixedVcsResolver(vcs.vcs)),
+                        Arc::new(crate::vcs::FixedVcsResolver(Arc::clone(&vcs.vcs))),
                         local_host_id.to_string(),
                     )
                     .inspect_path(&path, None)
                     .await
                 }
-                Err(error) => Err(error),
+                Err(error) => Err(error.clone()),
             };
             if let Ok(inspection) = &mut startup_inspection {
                 let mut spec = inspection.spec.clone();
@@ -2067,7 +2071,22 @@ impl InProcessDaemon {
                 startup_inspection.as_ref().ok().map(|inspection| &inspection.spec),
             )
             .await
-            .expect("local direct environment discovery should always be available");
+            .unwrap_or_else(|error| {
+                warn!(repo = %path.display(), %error, "startup repository discovery failed");
+                // Keep independently discovered checkout facts available. No
+                // forge-dependent provider may activate after bag resolution fails.
+                let mut registry = ProviderRegistry::default();
+                if let Ok(vcs) = &initial_vcs {
+                    registry.vcs.insert(vcs.descriptor.backend.clone(), vcs.descriptor.clone(), Arc::clone(&vcs.vcs));
+                }
+                DiscoveryResult {
+                    registry,
+                    host_repo_bag: EnvironmentBag::new(),
+                    repo_bag: EnvironmentBag::new(),
+                    repo_slug: startup_inspection.as_ref().ok().map(|inspection| inspection.spec.catalog_slug()),
+                    unmet: vec![("repository discovery".into(), UnmetRequirement::MissingConfig(error))],
+                }
+            });
             if !unmet.is_empty() {
                 debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
             }
