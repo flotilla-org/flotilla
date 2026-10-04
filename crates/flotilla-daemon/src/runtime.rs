@@ -1035,6 +1035,8 @@ async fn run_checkout_archive_gc(backend: ResourceBackend, namespace: String, ar
                 if let Err(error) = sweep_host_empty_convoy_directories(&backend, host.as_str()).await {
                     warn!(%error, "empty convoy directory sweep failed");
                 }
+            } else {
+                debug!("empty convoy directory sweep skipped: local host identity unavailable");
             }
             let mut roots = archive_sweep.roots.iter().cloned().collect::<BTreeSet<_>>();
             match load_checkout_archive_roots(&archive_sweep.catalog_path).await {
@@ -5540,6 +5542,8 @@ async fn cleanup_convoy_checkout_parents(runner: &dyn CommandRunner, target: &Pa
         match runner.run_output("rmdir", &["--", &path], Path::new("/"), &ChannelLabel::Default).await {
             Ok(output) if output.success => {}
             result => {
+                // If the existence probe fails, keep the parent and stop:
+                // uncertainty must never authorize further pruning.
                 if runner.path_exists(parent).await.unwrap_or(true) {
                     let error = match result {
                         Ok(output) => output.stderr,
