@@ -1457,3 +1457,7 @@ mod ledger_projection_tests {
         }
     }
 }
+
+#[cfg(all(test, not(feature = "skip-no-sandbox-tests")))]
+#[path = "ledger_forgejo_contract.rs"]
+mod ledger_forgejo_contract;
