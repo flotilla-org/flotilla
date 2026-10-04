@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 pub use flotilla_protocol::LifecycleAuthority;
 
 pub const AUTHORITY_LABEL: &str = "flotilla.work/authority";
@@ -15,42 +17,53 @@ pub const REPO_LABEL: &str = "flotilla.work/repo";
 pub const CHANGE_REQUEST_ID_LABEL: &str = "flotilla.work/change-request-id";
 pub const RESERVED_PREFIX: &str = "flotilla.work/";
 
+// ADR 0047: remove this rename table one fleet roll after #588 lands.
+const RENAMED: [(&str, &str); 3] = [
+    (VESSEL_REF_LABEL, "flotilla.work/vessel_ref"),
+    (VESSEL_ORDINAL_LABEL, "flotilla.work/vessel_ordinal"),
+    (CREW_ORDINAL_LABEL, "flotilla.work/crew_ordinal"),
+];
+
+fn renamed_label(key: &str) -> Option<(&'static str, &'static str)> {
+    RENAMED.iter().copied().find(|(canonical, legacy)| key == *canonical || key == *legacy)
+}
+
 /// Read renamed labels with canonical spelling taking precedence.
 /// ADR 0047: remove the underscored fallbacks one fleet roll after #588 lands.
-pub fn label_value<'a>(labels: &'a std::collections::BTreeMap<String, String>, key: &str) -> Option<&'a String> {
-    let (canonical, legacy) = match key {
-        VESSEL_REF_LABEL | "flotilla.work/vessel_ref" => (VESSEL_REF_LABEL, "flotilla.work/vessel_ref"),
-        VESSEL_ORDINAL_LABEL | "flotilla.work/vessel_ordinal" => (VESSEL_ORDINAL_LABEL, "flotilla.work/vessel_ordinal"),
-        CREW_ORDINAL_LABEL | "flotilla.work/crew_ordinal" => (CREW_ORDINAL_LABEL, "flotilla.work/crew_ordinal"),
-        _ => return labels.get(key),
+pub fn label_value<'a>(labels: &'a BTreeMap<String, String>, key: &str) -> Option<&'a String> {
+    let Some((canonical, legacy)) = renamed_label(key) else {
+        return labels.get(key);
     };
     labels.get(canonical).or_else(|| labels.get(legacy))
 }
 
-pub fn labels_match(labels: &std::collections::BTreeMap<String, String>, required: &std::collections::BTreeMap<String, String>) -> bool {
+pub fn labels_match(labels: &BTreeMap<String, String>, required: &BTreeMap<String, String>) -> bool {
     required.iter().all(|(key, expected)| label_value(labels, key) == Some(expected))
 }
 
 // ADR 0047: remove broad HTTP selection one fleet roll after #588 lands.
-pub(crate) fn selector_needs_legacy_read(required: &std::collections::BTreeMap<String, String>) -> bool {
-    required.keys().any(|key| {
-        matches!(
-            key.as_str(),
-            VESSEL_REF_LABEL
-                | VESSEL_ORDINAL_LABEL
-                | CREW_ORDINAL_LABEL
-                | "flotilla.work/vessel_ref"
-                | "flotilla.work/vessel_ordinal"
-                | "flotilla.work/crew_ordinal"
-        )
-    })
+pub(crate) fn selector_needs_legacy_read(required: &BTreeMap<String, String>) -> bool {
+    required.keys().any(|key| renamed_label(key).is_some())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
+
+    #[test]
+    fn rename_pairs_drive_lookup_and_http_selection() {
+        // #588: every rename pairs a hyphenated key with its previous spelling;
+        // HTTP must broaden selection for either spelling of each fixed pair.
+        for (canonical, legacy) in RENAMED {
+            assert_eq!(legacy, canonical.replace('-', "_"));
+            for key in [canonical, legacy] {
+                assert_eq!(renamed_label(key), Some((canonical, legacy)));
+                assert!(selector_needs_legacy_read(&BTreeMap::from([(key.to_string(), "value".to_string())])));
+            }
+        }
+        assert!(!selector_needs_legacy_read(&BTreeMap::new()));
+        assert!(!selector_needs_legacy_read(&BTreeMap::from([("custom/vessel_ref".to_string(), "value".to_string())])));
+    }
 
     #[test]
     fn well_known_keys_are_hyphenated() {

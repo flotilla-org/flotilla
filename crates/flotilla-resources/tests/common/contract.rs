@@ -65,6 +65,8 @@ pub async fn assert_terminal_session_label_lookup_with_backend(backend: Resource
         legacy_meta.labels.insert(key.replace('-', "_"), value);
     }
     sessions.create(&legacy_meta, &spec).await.expect("store prior-generation labels");
+    // Ordinal selectors match all four new sessions plus the one legacy session.
+    // The vessel reference selector matches only the legacy session.
     for (key, value, expected_count) in [
         (flotilla_resources::VESSEL_REF_LABEL, "legacy-work", 1),
         (flotilla_resources::VESSEL_ORDINAL_LABEL, "000", 5),
