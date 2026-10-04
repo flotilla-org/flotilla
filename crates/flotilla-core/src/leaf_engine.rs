@@ -146,7 +146,7 @@ fn stalled_source_actor(condition: &StalledCondition) -> Option<(&str, &str)> {
 }
 
 /// Shared by supervisor delivery and the operator backstop, so both identify
-/// the same crew and provide commands targeting the exact resource generation.
+/// the same crew and provide commands targeting the exact convoy record and crew.
 fn stall_supervision_brief(convoy: &ResourceObject<Convoy>, condition: &StalledCondition) -> String {
     let address = convoy_message_address(convoy);
     let actor =
@@ -171,6 +171,11 @@ fn stall_supervision_brief(convoy: &ResourceObject<Convoy>, condition: &StalledC
         }
     }
     brief
+}
+
+// Keep each warning one event line while retaining copyable command text.
+fn stall_supervision_log_brief(convoy: &ResourceObject<Convoy>, condition: &StalledCondition) -> String {
+    stall_supervision_brief(convoy, condition).replace('\n', " ")
 }
 
 const DEFAULT_REFUSAL_LIMIT: u32 = 2;
@@ -1670,7 +1675,7 @@ impl ReconcilerWake {
                                             target = %role,
                                             %vessel,
                                             reason = %error,
-                                            brief = %stall_supervision_brief(convoy, &condition).replace('\n', " "),
+                                            brief = %stall_supervision_log_brief(convoy, &condition),
                                             "stall nudge fell back to operator"
                                         );
                                         condition.rung = StallRung::Operator;
@@ -1833,7 +1838,7 @@ impl ReconcilerWake {
                                         %target_vessel,
                                         %target_role,
                                         reason = %error,
-                                        brief = %stall_supervision_brief(convoy, &condition).replace('\n', " "),
+                                        brief = %stall_supervision_log_brief(convoy, &condition),
                                         "stall escalation fell back to operator"
                                     );
                                     condition.evidence.push_str(&format!("; supervisor delivery failed: {error}"));
@@ -1867,7 +1872,7 @@ impl ReconcilerWake {
                                 convoy = %convoy.metadata.name,
                                 ?target,
                                 reason = "no live supervisor found",
-                                brief = %stall_supervision_brief(convoy, &condition).replace('\n', " "),
+                                brief = %stall_supervision_log_brief(convoy, &condition),
                                 "stall escalation fell back to operator"
                             );
                             if unavailable_target.is_some() {

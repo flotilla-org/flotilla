@@ -1408,6 +1408,10 @@ pub struct CheckoutStatus {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    use super::*;
+
     // Formatting glue: every declared stall reason displays its wire/CLI label.
     #[test]
     fn stall_reason_display_matches_serialized_label() {
@@ -1422,9 +1426,17 @@ mod tests {
         }
     }
 
-    use serde_json::json;
+    // Formatting glue: every proposed disposition displays its serialized label.
+    #[test]
+    fn stall_proposed_disposition_display_matches_serialized_label() {
+        for disposition in [StallProposedDisposition::Resume, StallProposedDisposition::ReduceScope, StallProposedDisposition::Fail] {
+            assert_eq!(
+                serde_json::to_value(disposition).expect("serialize disposition"),
+                serde_json::Value::String(disposition.to_string())
+            );
+        }
+    }
 
-    use super::*;
     use crate::{
         arg::Arg,
         query::{
