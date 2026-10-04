@@ -3868,6 +3868,9 @@ async fn apply_host_heartbeat_with_credentials(
     if let Some(condition) = resource_replication_content_condition(daemon, namespace).await? {
         conditions.push(condition);
     }
+    if let Some(condition) = daemon_forgejo_credential_condition(daemon, namespace).await {
+        conditions.push(condition);
+    }
     let mut capabilities = host_capabilities(&summary, profile, &held_credentials, &credential_expiry);
     if let Some(snapshot) = crate::resource_limits::io_pressure_snapshot().await {
         capabilities.insert("io_pressure".to_string(), snapshot);
@@ -3891,6 +3894,74 @@ async fn apply_host_heartbeat_with_credentials(
     .await
     .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+/// Diagnose host-local intent against namespace-scoped declarations, never checkout observations.
+/// Recompute on every heartbeat so late definitions and config edits clear the advisory.
+async fn daemon_forgejo_credential_condition(daemon: &Arc<InProcessDaemon>, namespace: &str) -> Option<HostCondition> {
+    match resolve_daemon_forgejo_credential_condition(daemon, namespace).await {
+        Ok(condition) => condition,
+        Err(error) => {
+            warn!(%error, %namespace, "could not diagnose daemon Forgejo credential mappings; retrying next heartbeat");
+            None
+        }
+    }
+}
+
+async fn resolve_daemon_forgejo_credential_condition(
+    daemon: &Arc<InProcessDaemon>,
+    namespace: &str,
+) -> Result<Option<HostCondition>, String> {
+    // Deliberately re-read config and scan current definitions on each heartbeat:
+    // config corrections and new declarations must clear the advisory without restart.
+    let config = daemon.config_store().load_daemon_config()?;
+    if config.credentials.forgejo.is_empty() {
+        return Ok(None);
+    }
+    let backend = daemon.resource_backend();
+    // A configured manifest source may not have completed even its first pass.
+    // Its status is published only after the directory has been processed.
+    if let Some(manifests) = &config.manifests {
+        let name = manifest_root_name(&manifests.reconciler_root, &manifests.dir, &manifests.source);
+        match backend.including_replicas::<ManifestRoot>(namespace).get(&name).await {
+            Ok(root) if root.object.status.is_some() => {}
+            Ok(_) | Err(ResourceError::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    // A cursor for some other kind does not establish that Forge definitions
+    // have arrived. Wait for each connected peer's Forge snapshot bookmark.
+    for peer in daemon.connected_peer_node_ids().await {
+        if backend.replica_writer::<Forge>(peer, namespace).cursor().await.map_err(|error| error.to_string())?.is_none() {
+            return Ok(None);
+        }
+    }
+    // The host-local map applies to source-addressed requests in any namespace.
+    // A declaration outside the runtime namespace is still a valid use of a key.
+    let mut namespaces =
+        backend.stored_namespaces::<Forge>().await.map_err(|error| error.to_string())?.into_iter().collect::<BTreeSet<_>>();
+    namespaces.insert(namespace.to_string());
+    let mut declared = BTreeSet::new();
+    for declared_namespace in &namespaces {
+        let forges = backend.definitions::<Forge>(declared_namespace).list().await.map_err(|error| error.to_string())?;
+        declared.extend(forges.into_iter().map(|forge| forge.spec.forge_id));
+    }
+    let unresolved = config.credentials.forgejo.keys().filter(|id| !declared.contains(*id)).map(|id| format!("`{id}`")).collect::<Vec<_>>();
+    if unresolved.is_empty() {
+        return Ok(None);
+    }
+    let namespace_context = namespaces.iter().map(|namespace| format!("`{namespace}`")).collect::<Vec<_>>().join(", ");
+    Ok(Some(HostCondition::builder()
+        .condition_type("DaemonForgejoCredentials")
+        .value(ConditionValue::False)
+        .reason("UnresolvedForgeMappings")
+        .message(format!(
+            "daemon.toml [credentials.forgejo] keys {} do not resolve to declared Forge resources in namespaces {namespace_context}; check the Forge IDs or declare the missing Forges",
+            unresolved.join(", ")
+        ))
+        .observed_at(Utc::now())
+        .blocks_readiness(false)
+        .build()))
 }
 
 async fn resource_authorship_collision_condition(daemon: &Arc<InProcessDaemon>, namespace: &str) -> Result<Option<HostCondition>, String> {
@@ -7085,6 +7156,246 @@ dependency = { path = "../dependency" }
 
         assert_eq!(profile.docker_pool, "cleat");
         assert!(!profile.docker_available, "a host must not advertise contained placement until it can deliver interior cleat");
+    }
+
+    fn credential_mapping_config(path: &Path, key: Option<&str>) {
+        let mut config = "machine_id = \"credential-mapping-test\"\n".to_string();
+        if let Some(key) = key {
+            config.push_str(&format!("[credentials.forgejo]\n{key} = \"daemon-token\"\n"));
+        }
+        fs::write(path.join("daemon.toml"), config).expect("write daemon config");
+    }
+
+    async fn declare_mapping_forge(backend: &ResourceBackend, namespace: &str) {
+        let spec = ForgeSpec::builder()
+            .forge_id("lab".to_string())
+            .kind(flotilla_resources::ForgeKind::Forgejo)
+            .hosts(BTreeSet::from(["lab.example".to_string()]))
+            .https_url("https://lab.example".to_string())
+            .git_ssh_host("lab.example".to_string())
+            .build();
+        backend.using::<Forge>(namespace).create(&empty_meta("lab"), &spec).await.expect("declare Forge");
+    }
+
+    // #2577: misspelled mappings surface at host level, while a valid Forge
+    // needs no checkout. Late declarations and config corrections clear them.
+    #[tokio::test]
+    async fn daemon_forgejo_credential_mapping_heartbeat_lifecycle() {
+        let temp = TempDir::new().expect("tempdir");
+        credential_mapping_config(temp.path(), Some("lba"));
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+        let backend = daemon.resource_backend();
+        declare_mapping_forge(&backend, NAMESPACE).await;
+        let host_id = daemon.local_host_id().expect("host id").to_string();
+        let profile = manual_profile(&host_id, false);
+        apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("heartbeat");
+        let status = backend.using::<Host>(NAMESPACE).get(&host_id).await.expect("host").status.expect("status");
+        let condition = status
+            .conditions
+            .iter()
+            .find(|condition| condition.condition_type == "DaemonForgejoCredentials")
+            .expect("misspelled mapping diagnosis");
+        assert_eq!(condition.reason, "UnresolvedForgeMappings");
+        assert!(condition.message.contains("`lba`"));
+        assert!(condition.message.contains(&format!("namespaces `{NAMESPACE}`")));
+        assert!(!condition.blocks_readiness());
+        assert!(status.ready, "an unresolved mapping must not block unrelated placement");
+        let fleet = daemon.fleet_health_internal().await.expect("fleet health");
+        assert!(fleet
+            .hosts
+            .iter()
+            .find(|host| host.is_local)
+            .expect("local host")
+            .degraded_conditions
+            .iter()
+            .any(|message| message.contains("`lba`")));
+
+        credential_mapping_config(temp.path(), Some("lab"));
+        apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("corrected heartbeat");
+        let status = backend.using::<Host>(NAMESPACE).get(&host_id).await.expect("host").status.expect("status");
+        assert!(status.conditions.iter().all(|condition| condition.condition_type != "DaemonForgejoCredentials"));
+        assert!(backend.using::<Checkout>(NAMESPACE).list().await.expect("checkouts").items.is_empty());
+
+        backend.using::<Forge>(NAMESPACE).delete("lab").await.expect("delete Forge");
+        apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("unresolved heartbeat");
+        assert!(backend
+            .using::<Host>(NAMESPACE)
+            .get(&host_id)
+            .await
+            .expect("host")
+            .status
+            .expect("status")
+            .conditions
+            .iter()
+            .any(|condition| condition.condition_type == "DaemonForgejoCredentials"));
+        declare_mapping_forge(&backend, NAMESPACE).await;
+        apply_host_heartbeat(&daemon, NAMESPACE, &profile, &test_health_identity()).await.expect("late declaration heartbeat");
+        assert!(backend
+            .using::<Host>(NAMESPACE)
+            .get(&host_id)
+            .await
+            .expect("host")
+            .status
+            .expect("status")
+            .conditions
+            .iter()
+            .all(|condition| condition.condition_type != "DaemonForgejoCredentials"));
+
+        credential_mapping_config(temp.path(), Some("lba"));
+        assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("diagnosis").is_some());
+        credential_mapping_config(temp.path(), None);
+        assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("removed mapping").is_none());
+    }
+
+    // Advisory diagnosis errors must not propagate into the heartbeat. The
+    // wrapper's Option result enforces that boundary even for malformed config.
+    #[tokio::test]
+    async fn daemon_forgejo_credential_mapping_errors_are_advisory_and_retry() {
+        let temp = TempDir::new().expect("tempdir");
+        credential_mapping_config(temp.path(), None);
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+        fs::write(temp.path().join("daemon.toml"), "[credentials.forgejo\n").expect("malformed config");
+        assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_err());
+        assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_none());
+        credential_mapping_config(temp.path(), Some("lba"));
+        assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_some(), "later heartbeats retry the diagnosis");
+    }
+
+    // An unqualified host-local mapping can serve a source-addressed request
+    // whose Forge is replicated into a namespace with no local checkout.
+    #[tokio::test]
+    async fn daemon_forgejo_credential_mapping_resolves_replica_in_another_namespace() {
+        let temp = TempDir::new().expect("tempdir");
+        credential_mapping_config(temp.path(), Some("lab"));
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+        assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_some());
+        let authority = ResourceBackend::InMemory(Default::default());
+        declare_mapping_forge(&authority, "other").await;
+        daemon
+            .resource_backend()
+            .replica_writer::<Forge>(NodeId::new("forge-authority"), "other")
+            .replace(&authority.using::<Forge>("other").list().await.expect("Forge snapshot"), Utc::now())
+            .await
+            .expect("replicate Forge outside runtime namespace");
+        assert!(daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.is_none());
+        assert!(daemon.resource_backend().using::<Checkout>("other").list().await.expect("checkouts").items.is_empty());
+    }
+
+    // #2577: startup manifests must finish a pass before absence is diagnosed;
+    // their late Forge declarations satisfy the mapping without a checkout.
+    #[tokio::test]
+    async fn daemon_forgejo_credential_mapping_waits_for_manifest_pass() {
+        let temp = TempDir::new().expect("tempdir");
+        credential_mapping_config(temp.path(), Some("lab"));
+        let mut config = fs::read_to_string(temp.path().join("daemon.toml")).expect("config");
+        config
+            .push_str("[manifests]\ndir = \"/test/manifests\"\nsource = \"test-source\"\nreconciler_root = \"credential-mapping-test\"\n");
+        fs::write(temp.path().join("daemon.toml"), config).expect("manifest config");
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+        let backend = daemon.resource_backend();
+        assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("pending source").is_none());
+        let root = materialize_manifest_root(&backend, NAMESPACE, Path::new("/test/manifests"), "test-source", "credential-mapping-test")
+            .await
+            .expect("manifest root");
+        assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("pending pass").is_none());
+        backend
+            .using::<ManifestRoot>(NAMESPACE)
+            .update_status(&root.metadata.name, &root.metadata.resource_version, &flotilla_resources::ManifestRootStatus::default())
+            .await
+            .expect("completed empty pass");
+        assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("settled source").is_some());
+        declare_mapping_forge(&backend, NAMESPACE).await;
+        assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("late declaration").is_none());
+    }
+
+    // #2577: an unrelated replica cursor cannot establish Forge absence. The
+    // Forge snapshot can be empty or contain the declaration after startup.
+    #[tokio::test]
+    async fn daemon_forgejo_credential_mapping_waits_for_forge_replication() {
+        let temp = TempDir::new().expect("tempdir");
+        credential_mapping_config(temp.path(), Some("lab"));
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+        let peer_id = NodeId::new("forge-authority");
+        let peer = NodeInfo::new(peer_id.clone(), "authority");
+        daemon.set_configured_peers(vec![peer.clone()]).await;
+        daemon
+            .publish_peer_summary(
+                HostSummary::builder()
+                    .environment_id(EnvironmentId::host(flotilla_protocol::qualified_path::HostId::new("authority-host")))
+                    .host_name(flotilla_protocol::HostName::new("authority"))
+                    .node(peer.clone())
+                    .system(flotilla_protocol::SystemInfo::default())
+                    .providers(Vec::new())
+                    .build(),
+            )
+            .await;
+        daemon.publish_peer_connection_status(&peer, PeerConnectionState::Connected).await;
+        let backend = daemon.resource_backend();
+        let authority = ResourceBackend::InMemory(Default::default());
+        backend
+            .replica_writer::<Host>(peer_id.clone(), NAMESPACE)
+            .replace(&authority.using::<Host>(NAMESPACE).list().await.expect("host snapshot"), Utc::now())
+            .await
+            .expect("unrelated replication");
+        assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("pending Forge replication").is_none());
+        let writer = backend.replica_writer::<Forge>(peer_id, NAMESPACE);
+        writer
+            .replace(&authority.using::<Forge>(NAMESPACE).list().await.expect("empty Forge snapshot"), Utc::now())
+            .await
+            .expect("empty Forge replication settled");
+        assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("settled absence").is_some());
+        declare_mapping_forge(&authority, NAMESPACE).await;
+        writer
+            .replace(&authority.using::<Forge>(NAMESPACE).list().await.expect("Forge snapshot"), Utc::now())
+            .await
+            .expect("late Forge replication");
+        assert!(resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("replicated declaration").is_none());
+    }
+
+    // #2577: source-addressed requests can use declarations outside the runtime
+    // namespace. Exercise config removal/correction and declaration arrival/deletion
+    // in generated order, checking the invariant after every step.
+    #[hegel::test]
+    fn daemon_forgejo_credential_mapping_sequences(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Empty map, typo, valid key, declaration present/absent, duplicate ops.
+        let operations = (0..tc.draw(gs::integers::<usize>().min_value(1).max_value(12)))
+            .map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(5)))
+            .collect::<Vec<_>>();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = TempDir::new().expect("tempdir");
+            credential_mapping_config(temp.path(), None);
+            let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+            let backend = daemon.resource_backend();
+            let mut key = None;
+            let mut declared = false;
+            let mut other_declared = false;
+            for op in operations {
+                match op {
+                    0 => key = None,
+                    1 => key = Some("lba"),
+                    2 => key = Some("lab"),
+                    3 if !declared => {
+                        declare_mapping_forge(&backend, NAMESPACE).await;
+                        declared = true;
+                    }
+                    4 if declared => {
+                        backend.using::<Forge>(NAMESPACE).delete("lab").await.expect("delete Forge");
+                        declared = false;
+                    }
+                    5 if !other_declared => {
+                        declare_mapping_forge(&backend, "other").await;
+                        other_declared = true;
+                    }
+                    _ => {}
+                }
+                credential_mapping_config(temp.path(), key);
+                let diagnosis = resolve_daemon_forgejo_credential_condition(&daemon, NAMESPACE).await.expect("diagnosis");
+                let resolves = key == Some("lab") && (declared || other_declared);
+                assert_eq!(diagnosis.is_some(), key.is_some() && !resolves);
+            }
+        });
     }
 
     #[tokio::test]

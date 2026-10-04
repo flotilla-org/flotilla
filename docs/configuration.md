@@ -240,6 +240,15 @@ the repository and independently discovered checkout facts observable, and
 continues observing the other roots. Repository operations refuse the same
 invalid declaration rather than switching identities.
 
+Unresolved mapping keys appear as an advisory `DaemonForgejoCredentials` host
+condition in fleet health. The diagnosis lists the keys and namespaces searched
+for declared Forge resources, including replicated declarations. It does not
+require a local checkout or block placement. Diagnosis waits for the configured
+manifest source's first published pass and connected peers' Forge snapshots;
+the next heartbeat clears it when a Forge declaration arrives or the mapping is
+corrected or removed. Failures in the diagnostic are logged and skipped so they
+do not prevent the heartbeat from publishing.
+
 This host-local setting leaves resource schemas unchanged. Existing project-map
 crew/governor declarations need no edits; enabling authenticated observation
 requires a separate daemon credential declaration and this host configuration.
