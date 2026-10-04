@@ -139,6 +139,7 @@ use crate::{
 };
 
 type ObservationScope = (String, String, String);
+const OBSERVATION_CACHE_FALLBACK_DELAY: Duration = Duration::from_secs(9);
 
 fn forge_service_matches(service_url: &str, service: &str) -> bool {
     service_url.split_once("://").is_some_and(|(_, authority)| authority.trim_end_matches('/').eq_ignore_ascii_case(service))
@@ -170,7 +171,7 @@ fn observation_cache_delay(retry_at: Option<chrono::DateTime<Utc>>, now: chrono:
     retry_at
         .and_then(|retry_at| retry_at.signed_duration_since(now).to_std().ok())
         .filter(|delay| !delay.is_zero())
-        .unwrap_or(Duration::from_secs(9))
+        .unwrap_or(OBSERVATION_CACHE_FALLBACK_DELAY)
 }
 
 fn observation_rate_limit_error(result: &Result<BoundObservations, ObservationError>) -> Option<&ObservationError> {

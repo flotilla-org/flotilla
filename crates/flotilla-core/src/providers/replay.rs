@@ -552,6 +552,15 @@ fn replay_gh_error(status: u16, body: &str, headers: &HashMap<String, String>) -
 }
 
 // Classified recordings store explicit metadata, never classify Display text.
+// The observation-* recording schema is separate from actual REST headers:
+// - observation-error-kind: forge, primary or secondary classification;
+// - observation-budget / observation-retry-source: rate-limit provenance;
+// - observation-retry-at: optional absolute deadline, never inferred on replay;
+// - observation-diagnostic: original classified Display diagnostic;
+// - observation-legacy-error: original legacy diagnostic, and attestation that
+//   status/body/non-observation headers belong to a real HTTP failure response.
+// Response-less failures use status zero. Older classified recordings omit the
+// attestation and may contain synthetic 500; do not invent raw response metadata.
 fn replay_classified_gh_error(status: u16, body: &str, headers: &HashMap<String, String>) -> ObservationError {
     if let Some(kind) = headers.get("observation-error-kind") {
         let kind = match kind.as_str() {
@@ -713,15 +722,17 @@ impl GhApi for ReplayGhApi {
         let error = replay_classified_gh_error(status, &body, &headers);
         // Only new recordings explicitly attest to a real REST response; old
         // classified recordings used synthetic 500 and must not invent metadata.
-        let response = headers.get("observation-legacy-error").map(|legacy_error| GhApiFailureResponse {
-            status,
-            headers: headers
-                .iter()
-                .filter(|(key, _)| !key.starts_with("observation-"))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-            body,
-            legacy_error: legacy_error.clone(),
+        let response = headers.get("observation-legacy-error").map(|legacy_error| {
+            Box::new(GhApiFailureResponse {
+                status,
+                headers: headers
+                    .iter()
+                    .filter(|(key, _)| !key.starts_with("observation-"))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+                body,
+                legacy_error: legacy_error.clone(),
+            })
         });
         Err(GhApiFailure { error, response })
     }

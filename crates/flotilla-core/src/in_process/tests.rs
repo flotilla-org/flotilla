@@ -8571,7 +8571,10 @@ fn observation_cooldown_is_deterministic(tc: hegel::TestCase) {
             }
             assert_eq!(observation_during_cooldown(&result, 102, error).expect_err("new subject waits"), *error);
             let offset = *offsets.iter().max().expect("timed limits");
-            assert_eq!(observation_cache_delay(error.retry_at(), now), Duration::from_secs(if offset > 0 { offset as u64 } else { 9 }));
+            assert_eq!(
+                observation_cache_delay(error.retry_at(), now),
+                if offset > 0 { Duration::from_secs(offset as u64) } else { OBSERVATION_CACHE_FALLBACK_DELAY }
+            );
         }
     }
     assert!(observation_rate_limit_error(&Ok(BoundObservations::new())).is_none());
