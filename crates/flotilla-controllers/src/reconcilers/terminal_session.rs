@@ -395,7 +395,16 @@ where
                             .await
                             .map_err(ResourceError::other)?
                         {
-                            TerminalDeliveryOutcome::Pending => TerminalPrepared::MessageDeliveryPending,
+                            // Waiting for a turn boundary must not suppress the
+                            // observation that releases other queued deliveries.
+                            TerminalDeliveryOutcome::Pending => match self.runtime.observe_attention(session_id, &obj.spec).await {
+                                Ok(Some(observation)) => TerminalPrepared::Attention(observation),
+                                Ok(None) => TerminalPrepared::MessageDeliveryPending,
+                                Err(error) => {
+                                    tracing::warn!(%session_id, %error, "attention observation failed during pending delivery");
+                                    TerminalPrepared::MessageDeliveryPending
+                                }
+                            },
                             TerminalDeliveryOutcome::Confirmed => TerminalPrepared::MessageDelivered(message.id.clone()),
                             TerminalDeliveryOutcome::Unconfirmed(failure) => TerminalPrepared::MessageDeliveryUnconfirmed {
                                 message_id: message.id.clone(),
@@ -641,7 +650,10 @@ where
             }
         }
         let mut outcome = ReconcileOutcome::with_actuations(patch, actuations);
-        if matches!(prepared, TerminalPrepared::MessageDeliveryPending) {
+        let observing_pending_delivery = matches!(prepared, TerminalPrepared::Attention(_))
+            && matches!(&obj.spec.source, TerminalSessionSource::Agent { message: Some(head), .. }
+                if head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())).is_some());
+        if matches!(prepared, TerminalPrepared::MessageDeliveryPending) || observing_pending_delivery {
             outcome.requeue_after = Some(Duration::from_millis(200));
         } else if (phase == TerminalSessionPhase::Lost && matches!(prepared, TerminalPrepared::None))
             || matches!(prepared, TerminalPrepared::BriefWaiting)
