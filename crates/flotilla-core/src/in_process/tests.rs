@@ -1270,7 +1270,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
         assert!(framed.contains("repository permission missing"), "{framed}");
         for action in ["resume", "convert-to-failed", "escalate"] {
             assert!(
-                framed.contains(&format!("flotilla crew supervise --convoy resume-staging --vessel work --role coder {action}")),
+                framed.contains(&format!("flotilla crew supervise --convoy 'resume-staging' --vessel 'work' --role 'coder' {action}")),
                 "{framed}"
             );
         }

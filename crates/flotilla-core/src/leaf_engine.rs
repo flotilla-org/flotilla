@@ -12,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, LeafOperator, NodeId, WaitSubscriptionRequest};
+use flotilla_protocol::{arg::shell_quote, DaemonEvent, Leaf, LeafAddress, LeafFire, LeafOperator, NodeId, WaitSubscriptionRequest};
 use flotilla_resources::{
     actor_obligation, admit_leaf,
     controller::{SecondaryWatch, WorkQueueSender},
@@ -162,8 +162,10 @@ fn stall_supervision_brief(convoy: &ResourceObject<Convoy>, condition: &StalledC
         for action in ["resume", "convert-to-failed", "escalate"] {
             write!(
                 brief,
-                "\n`flotilla crew supervise --convoy {} --vessel {vessel} --role {role} {action} --message 'guidance'`",
-                convoy.metadata.name,
+                "\n`flotilla crew supervise --convoy {} --vessel {} --role {} {action} --message 'guidance'`",
+                shell_quote(&convoy.metadata.name),
+                shell_quote(vessel),
+                shell_quote(role),
             )
             .expect("writing to a String cannot fail");
         }
@@ -3841,7 +3843,7 @@ mod tests {
                 assert!(warning.contains("reason="), "{warning}");
                 // #2592: operator fallback logs contain the source address and exact actionable crew.
                 assert!(warning.contains("coder@work in convoy graphql-budget@wheelhouse (resource ref: stalled-work)"), "{warning}");
-                assert!(warning.contains("--convoy stalled-work --vessel work --role coder resume"), "{warning}");
+                assert!(warning.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"), "{warning}");
                 assert!(
                     warning.contains(if matches!(unavailable, GovernorUnavailable::DeliveryError) {
                         "supervisor reconnecting"
@@ -3972,6 +3974,28 @@ mod tests {
         assert!(delivery.requests.lock().expect("deliveries").is_empty());
     }
 
+    // Supervision commands must preserve identifiers containing shell metacharacters.
+    // Formatting glue: spaces and an apostrophe exercise the shared shell quoting helper.
+    #[tokio::test]
+    async fn stall_supervision_commands_quote_role_and_vessel_identifiers() {
+        let (backend, wake, _) = project_supervision_case(&[]).await;
+        let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
+        wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source)])).await.expect("judge");
+        let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
+        let mut condition = source.status.as_ref().expect("status").stalled.clone().expect("stall");
+        let leaf = condition.leaves.first_mut().expect("actor leaf");
+        let LeafAddress::Work { work, .. } = &mut leaf.address else { panic!("work leaf") };
+        *work = "work space".to_string();
+        leaf.field_path = ".crew.coder's role.phase".to_string();
+        let brief = stall_supervision_brief(&source, &condition);
+        for action in ["resume", "convert-to-failed", "escalate"] {
+            assert!(
+                brief.contains(&format!(r"--convoy 'stalled-work' --vessel 'work space' --role 'coder'\''s role' {action}")),
+                "{brief}"
+            );
+        }
+    }
+
     // #2592: a non-actor stall retains convoy identity and evidence, without
     // fabricating role/vessel supervision commands for an unknown actor.
     #[tokio::test]
@@ -4008,7 +4032,7 @@ mod tests {
         let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
         let brief = stall_supervision_brief(&source, &stalled);
         assert!(brief.contains("coder@work in convoy graphql-budget@wheelhouse (resource ref: stalled-work)"), "{brief}");
-        assert!(brief.contains("--convoy stalled-work --vessel work --role coder resume"), "{brief}");
+        assert!(brief.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"), "{brief}");
         assert!(stalled.evidence.contains("no live governor for project wheelhouse"), "{}", stalled.evidence);
         assert!(delivery.requests.lock().expect("deliveries").is_empty());
     }

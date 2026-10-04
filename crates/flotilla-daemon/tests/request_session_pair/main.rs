@@ -3525,7 +3525,7 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
             "{}",
             message.text
         );
-        assert!(message.text.contains("--convoy stalled-work --vessel work --role coder resume"), "{}", message.text);
+        assert!(message.text.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"), "{}", message.text);
         assert!(message.following.is_empty(), "repeat passes must not redeliver");
     }
     // The governor may issue supervision from B: route back to A and
