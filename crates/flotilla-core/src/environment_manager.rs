@@ -352,7 +352,7 @@ impl EnvironmentManager {
                     "the contained host-daemon requirement",
                 ))],
             image_pull_policy: Default::default(),
-            docker_config_dir: None,
+            prepared_auth: Default::default(),
             cpu_limit: None,
         };
         let handle = env_provider.create(env_id.clone(), &image, opts).await?;

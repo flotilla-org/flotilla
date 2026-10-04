@@ -76,7 +76,10 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         let requested_mounts = opts.provisioned_mounts;
         let mut provisioned_mounts = Vec::new();
         let mut tokens = opts.tokens;
-        let docker_config = opts.docker_config_dir.as_ref().map(ToString::to_string);
+        let docker_config = match &opts.prepared_auth {
+            super::PreparedEnvironmentAuth::NoRegistryCredential => None,
+            super::PreparedEnvironmentAuth::RegistryConfig { directory } => Some(directory.to_string()),
+        };
         let mut pull_policy = opts.image_pull_policy.docker_value();
         // Docker replaces an image's variable outright when `-e` names it, so a
         // prepend with no caller-supplied value must start from the image's own.

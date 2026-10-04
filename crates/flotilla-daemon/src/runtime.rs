@@ -4436,7 +4436,15 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 }
             },
             None if credential_refs.is_empty() => Vec::new(),
-            None => return Err("host-local credential store unavailable".to_string()),
+            None => {
+                return Err(discard_uncreated_environment(
+                    None,
+                    self.state.agent_material.as_deref(),
+                    name,
+                    "host-local credential store unavailable".to_string(),
+                )
+                .await)
+            }
         };
         let agent_material_fragments = self
             .state
@@ -4479,9 +4487,9 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             },
             None => Vec::new(),
         };
-        let docker_config_dir = match &self.state.credential_store {
+        let prepared_auth = match &self.state.credential_store {
             Some(store) => match store.prepare_registry_pull(name, &credential_refs, &spec.image).await {
-                Ok(config) => config.map(DaemonHostPath::new),
+                Ok(auth) => auth,
                 Err(error) => {
                     return Err(discard_uncreated_environment(
                         self.state.credential_store.as_deref(),
@@ -4492,8 +4500,16 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                     .await)
                 }
             },
-            None if credential_refs.is_empty() => None,
-            None => return Err("host-local credential store unavailable".to_string()),
+            None if credential_refs.is_empty() => Default::default(),
+            None => {
+                return Err(discard_uncreated_environment(
+                    None,
+                    self.state.agent_material.as_deref(),
+                    name,
+                    "host-local credential store unavailable".to_string(),
+                )
+                .await)
+            }
         };
         let mut provisioned_mounts = Vec::with_capacity(spec.mounts.len() + material_deliveries.len());
         provisioned_mounts.extend(spec.mounts.iter().map(flotilla_controllers::actuators::provisioned_mount));
@@ -4507,7 +4523,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 image_pull_policy: spec.pull_policy.into(),
                 provisioned_mounts,
                 tools,
-                docker_config_dir,
+                prepared_auth,
                 cpu_limit: Some(context.rust_build_jobs().await?),
             })
             .await
@@ -6151,7 +6167,10 @@ mod tests {
                 },
                 EnvironmentAssertion, EnvironmentBag, ProviderCategory, ProviderDescriptor,
             },
-            environment::{EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount, ProvisionedMountMode},
+            environment::{
+                EnvironmentHandle, EnvironmentProvider, PreparedEnvironmentAuth, ProvisionedEnvironment, ProvisionedMount,
+                ProvisionedMountMode,
+            },
             replay::{Masks, ReplayHttpClient, Session},
             terminal::{TerminalEnvVars, TerminalPool, TerminalSession as ProviderTerminalSession, TerminalSessionTag},
             ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
@@ -8359,6 +8378,49 @@ mod tests {
         }
     }
 
+    // Stands in for the registry CLI process, retaining the exact preflight artifact.
+    struct RegistryPreflightRunner {
+        outcome: &'static str,
+        calls: AtomicUsize,
+        directory: Mutex<Option<PathBuf>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for RegistryPreflightRunner {
+        async fn run(&self, _cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.directory.lock().await = Some(PathBuf::from(args[1]));
+            if self.outcome == "pull-failure" {
+                Err("pull refused".to_string())
+            } else {
+                Ok(String::new())
+            }
+        }
+        async fn run_with_input(
+            &self,
+            _cmd: &str,
+            args: &[&str],
+            _cwd: &Path,
+            _label: &ChannelLabel,
+            input: &[u8],
+        ) -> Result<String, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.directory.lock().await = Some(PathBuf::from(args[1]));
+            assert_eq!(input, b"registry-secret");
+            if self.outcome == "login-failure" {
+                Err("login refused".to_string())
+            } else {
+                Ok(String::new())
+            }
+        }
+        async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            Err("unused".to_string())
+        }
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+    }
+
     struct ListingEnvironmentProvider {
         handle: EnvironmentHandle,
     }
@@ -9044,6 +9106,109 @@ mod tests {
             !config.state_dir().as_path().join("credential-runtime").exists(),
             "a failed provision must not leave a credential cache on disk"
         );
+    }
+
+    #[tokio::test]
+    async fn registry_preflight_delivers_exact_auth_to_non_docker_provider_and_refuses_failures() {
+        for outcome in ["success", "login-failure", "pull-failure", "missing"] {
+            let temp = TempDir::new().expect("tempdir");
+            let config_base = temp.path().join("config");
+            fs::create_dir_all(&config_base).expect("config directory");
+            fs::write(config_base.join("daemon.toml"), "machine_id = \"prepared-registry-auth-test\"\n").expect("daemon config");
+            let home = temp.path().join("home");
+            let skill_sources = write_test_skill_sources(temp.path());
+            // A previous aborted attempt may have left a delivered agent credential.
+            // Every refusal, including a missing credential store, must discard it.
+            let delivered_auth = home.join(".local/share/flotilla/agent-homes/prepared-auth-environment/codex/auth.json");
+            fs::create_dir_all(delivered_auth.parent().expect("credential parent")).expect("agent home");
+            fs::write(&delivered_auth, "test credential").expect("delivered credential");
+            let config = Arc::new(ConfigStore::with_base(config_base));
+            let discovery = fake_discovery_with_provider_set(FakeDiscoveryProviders::new());
+            let daemon = InProcessDaemon::new(Vec::new(), Arc::clone(&config), discovery, flotilla_protocol::HostName::new("dinghy")).await;
+            daemon
+                .resource_backend()
+                .definitions::<CredentialSpec>(NAMESPACE)
+                .create(&InputMeta::builder().name("private-registry".to_string()).build(), &CredentialSpecSpec {
+                    consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".to_string(), username: "crew".to_string() },
+                    source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                })
+                .await
+                .expect("create registry credential");
+            let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None) });
+            let mut local_registry = ProviderRegistry::new();
+            local_registry.environment_providers.insert(
+                "sandbox",
+                flotilla_core::providers::discovery::ProviderDescriptor::named(
+                    flotilla_core::providers::discovery::ProviderCategory::EnvironmentProvider,
+                    "sandbox",
+                ),
+                Arc::clone(&provider) as Arc<dyn EnvironmentProvider>,
+            );
+            let registry_runner = Arc::new(RegistryPreflightRunner { outcome, calls: AtomicUsize::new(0), directory: Mutex::new(None) });
+            let credential_store = Arc::new(CredentialStore::new(
+                daemon.resource_backend(),
+                NAMESPACE,
+                Arc::new(TestEnvVars::new([("HOME", home.display().to_string()), ("TEST_REGISTRY_TOKEN", "registry-secret".to_string())])),
+                EnvironmentBag::new(),
+                registry_runner.clone(),
+                config.state_dir().as_path().to_path_buf(),
+            ));
+            let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+                ("HOME", home.display().to_string()),
+                (FLOTILLA_SKILLS_DIR_ENV, skill_sources.display().to_string()),
+            ]))));
+            let state = ControllerRuntimeState::new(
+                daemon,
+                Arc::clone(&config),
+                Arc::new(local_registry),
+                Some(DaemonHostPath::new("/tmp/flotilla.sock")),
+                "host-test".to_string(),
+                None,
+                "host-direct-host-test".to_string(),
+            )
+            .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))
+            .with_agent_material(agent_material);
+            let state = Arc::new(if outcome == "missing" { state } else { state.with_credential_store(credential_store) });
+            let spec = flotilla_resources::DockerEnvironmentSpec {
+                host_ref: "host-test".to_string(),
+                image: "registry.example/crew:latest".to_string(),
+                declared_agent_adapters: BTreeSet::new(),
+                required_agent_adapters: BTreeSet::new(),
+                pull_policy: Default::default(),
+                mounts: Vec::new(),
+                env: BTreeMap::from([(
+                    CREDENTIAL_REFS_ENV.to_string(),
+                    serde_json::to_string(&BTreeSet::from(["private-registry".to_string()])).expect("encode credential refs"),
+                )]),
+            };
+
+            let error = DockerControllerRuntime { state }
+                .provision("prepared-auth-environment", &spec)
+                .await
+                .expect_err("capture provider or preflight must stop provision");
+
+            // Glue: the runtime must deliver exactly the artifact admitted by preflight
+            // to a non-Docker provider, and refuse creation on absent/failed preflight.
+            assert!(!delivered_auth.exists(), "refused creation must discard delivered agent credentials");
+            let opts = provider.create_opts.lock().await.take();
+            if outcome == "success" {
+                assert_eq!(error, "stop after capturing create options");
+                let admitted = registry_runner.directory.lock().await.clone().expect("preflight directory");
+                assert_eq!(opts.expect("provider invoked").prepared_auth, PreparedEnvironmentAuth::RegistryConfig {
+                    directory: DaemonHostPath::new(admitted.clone()),
+                });
+                assert!(!admitted.exists(), "failed create must remove the admitted auth artifact");
+                assert_eq!(registry_runner.calls.load(Ordering::SeqCst), 2);
+            } else {
+                assert!(opts.is_none(), "provider must not run without successful preflight");
+                assert!(error.contains(if outcome == "missing" { "credential store unavailable" } else { "preflight failed" }), "{error}");
+                if let Some(directory) = registry_runner.directory.lock().await.as_ref() {
+                    assert!(!directory.exists(), "failed preflight must remove its auth artifact");
+                }
+            }
+        }
     }
 
     #[tokio::test]

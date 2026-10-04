@@ -36,7 +36,7 @@ impl DockerEnvironmentActuator {
             tokens: self.tokens.clone(),
             working_directory: None,
             image_pull_policy: spec.pull_policy.into(),
-            docker_config_dir: None,
+            prepared_auth: Default::default(),
             provisioned_mounts: spec.mounts.iter().map(provisioned_mount).collect(),
             tools: vec![EnvironmentTool::new("flotilla-daemon-access", "/usr/local/bin/flotilla")
                 .with_asset(EnvironmentToolAsset::new(
