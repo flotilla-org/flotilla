@@ -7254,6 +7254,33 @@ async fn checkout_vcs_discovery_is_cached_per_checkout() {
     let daemon =
         InProcessDaemon::new(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), discovery, HostName::new("local-host")).await;
 
+    // #1770: only observed Checkout lifetimes retain discovered providers.
+    for (name, path) in [("first", &first_path), ("second", &second_path)] {
+        let repository = RepositorySpec::remote(format!("https://github.com/example/{name}")).expect("repository");
+        daemon
+            .resource_backend
+            .using::<Repository>("flotilla")
+            .create(&test_meta(&repository.key().to_string()), &repository)
+            .await
+            .expect("repository");
+        daemon
+            .observed_resource_backend
+            .clone()
+            .using::<ResourceCheckout>("flotilla")
+            .create(
+                &test_meta(name),
+                &ResourceCheckoutSpec::Observed(ResourceObservedCheckoutSpec {
+                    r#ref: "main".into(),
+                    path: path.to_string_lossy().into(),
+                    repo_ref: repository.key(),
+                    host_ref: daemon.environment_manager.local_host_id().to_string(),
+                    is_main: true,
+                }),
+            )
+            .await
+            .expect("observed checkout");
+    }
+
     let first = daemon.local_vcs_for_checkout(&first_path).await.expect("first checkout VCS");
     let first_again = daemon.local_vcs_for_checkout(&first_path).await.expect("cached first checkout VCS");
     let second = daemon.local_vcs_for_checkout(&second_path).await.expect("second checkout VCS");

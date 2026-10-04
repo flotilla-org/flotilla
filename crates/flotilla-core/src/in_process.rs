@@ -5,9 +5,11 @@
 
 #[path = "attach.rs"]
 mod attach;
+mod checkout_providers;
 #[path = "in_process/convoy_admission.rs"]
 mod convoy_admission;
 mod project_ops;
+use checkout_providers::{CheckoutProvider, CheckoutVcsCache};
 mod repository_operations;
 use std::{
     cmp::Reverse,
@@ -98,7 +100,7 @@ use crate::{
     environment_manager::{EnvironmentManager, ResolvedEnvironment},
     event_sink::{BroadcastEventSink, EventSink},
     executor,
-    executor::checkout::{checkout_matches_scope, CheckoutResolutionScope},
+    executor::checkout::CheckoutResolutionScope,
     fleet::{crew_attention, FleetService},
     host_identity::{
         resolve_local_environment_state_dir, resolve_local_host_id, resolve_local_node_id, resolve_or_create_environment_id,
@@ -118,8 +120,7 @@ use crate::{
         ai_utility::{AiUtility, ConvoyNames},
         change_request::{BoundObservations, ChangeRequestTracker, ObservationError},
         discovery::{
-            discover_providers_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion,
-            EnvironmentBag,
+            discover_checkout_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag,
         },
         issue_tracker::IssueProvider,
         registry::ProviderRegistry,
@@ -230,7 +231,6 @@ struct HostIssueProviderLease {
 struct ProviderIssueQueryPort {
     host_providers: Mutex<HashMap<flotilla_protocol::IssueSource, HostIssueProviderLease>>,
     backend: ResourceBackend,
-    repos: Arc<RwLock<HashMap<RepoIdentity, RepoState>>>,
     config: Arc<ConfigStore>,
     discovery: Arc<DiscoveryRuntime>,
     environment_manager: Arc<EnvironmentManager>,
@@ -241,42 +241,86 @@ struct ProviderIssueQueryPort {
 #[async_trait]
 impl IssueQueryPort for ProviderIssueQueryPort {
     async fn provider_for_source(&self, source: &flotilla_protocol::IssueSource) -> Result<Arc<dyn IssueProvider>, String> {
-        for repo in self.repos.read().await.values() {
-            if let Some(provider) = repo.registry().issue_provider_for(source) {
-                return Ok(provider);
+        let namespace = self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone();
+        let source = flotilla_resources::normalize_issue_source(source);
+        let repositories = self.backend.including_replicas::<Repository>(&namespace);
+        // Project bindings choose portable sources; local checkout presence never
+        // changes which provider or credential can serve that source.
+        let projects = self.backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let mut selected_source = source.clone();
+        for project in projects {
+            if let IssueSourceResolution::Available { bindings } = resolve_project_issue_sources(&repositories, &project.spec).await {
+                if let Some(binding) = bindings.into_iter().find(|binding| binding.source == source) {
+                    selected_source = binding.source;
+                    break;
+                }
             }
         }
-        let host_bag = self
-            .environment_manager
-            .environment_bag(&self.local_environment_id)
-            .ok_or_else(|| format!("environment not found: {}", self.local_environment_id))?;
+        let declared = repositories.list().await.map_err(|error| error.to_string())?.items.into_iter().map(|source| source.object).find(
+            |repository| {
+                repository.spec.issue_source_forge().is_some_and(|forge| {
+                    flotilla_resources::normalize_issue_source(&flotilla_protocol::IssueSource {
+                        service: forge.service_url,
+                        scope: forge.repository,
+                    }) == selected_source
+                })
+            },
+        );
+        let bag = match declared {
+            Some(repository) => {
+                convoy_admission::repository_provider_bag(
+                    &self.backend,
+                    &self.environment_manager,
+                    &self.local_environment_id,
+                    &namespace,
+                    &repository.spec,
+                )
+                .await?
+            }
+            None => {
+                // Explicit Project bindings can name a forge source without a
+                // Repository member. Use the same forge construction and
+                // credential selection as repository-backed bindings.
+                match RepositorySpec::remote(format!("{}/{}", selected_source.service.trim_end_matches('/'), selected_source.scope)) {
+                    Ok(intent) => {
+                        convoy_admission::repository_provider_bag(
+                            &self.backend,
+                            &self.environment_manager,
+                            &self.local_environment_id,
+                            &namespace,
+                            &intent,
+                        )
+                        .await?
+                    }
+                    Err(_) => self
+                        .environment_manager
+                        .environment_bag(&self.local_environment_id)
+                        .ok_or_else(|| format!("environment not found: {}", self.local_environment_id))?,
+                }
+            }
+        };
         let runner = self
             .environment_manager
             .environment_runner(&self.local_environment_id)
             .ok_or_else(|| format!("environment runner not found: {}", self.local_environment_id))?;
-        let mut bag = host_bag;
-        let namespace = self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone();
-        if let Some(forge) = forge_for_remote(&self.backend, &namespace, &format!("{}/{}", source.service, source.scope)).await? {
-            bag = bag.with(EnvironmentAssertion::origin_forge(forge));
-        }
         // Source observers retain a strong lease. Re-resolving a host-only
         // capability must not recreate its ETag cache while that lease lives.
         // Environment or configuration changes invalidate the old capability.
         let config = serde_json::to_value(self.config.load_config()).map_err(|error| error.to_string())?;
         let mut host_providers = self.host_providers.lock().await;
         host_providers.retain(|_, lease| lease.provider.strong_count() > 0);
-        if let Some(lease) = host_providers.get(source) {
+        if let Some(lease) = host_providers.get(&source) {
             if lease.bag.assertions() == bag.assertions() && Arc::ptr_eq(&lease.runner, &runner) && lease.config == config {
                 if let Some(provider) = lease.provider.upgrade() {
                     return Ok(provider);
                 }
             }
         }
-        host_providers.remove(source);
+        host_providers.remove(&source);
         let probe_root = ExecutionEnvironmentPath::new(self.config.base_path().as_ref());
         for factory in &self.discovery.factories.issue_trackers {
             if let Ok(provider) = factory.probe(&bag, &self.config, &probe_root, Arc::clone(&runner)).await {
-                if provider.supports(source) {
+                if provider.supports(&source) {
                     host_providers.insert(
                         source.clone(),
                         HostIssueProviderLease::builder()
@@ -634,6 +678,8 @@ fn static_ssh_environment_id(config_key: &str) -> EnvironmentId {
 }
 
 mod read_projections;
+#[cfg(test)]
+mod repository_lifecycle_tests;
 #[cfg(test)]
 mod tests;
 
@@ -1041,10 +1087,6 @@ async fn placement_actuator_host_ref(
     }
 }
 
-fn repo_identity_from_bag_or_path(path: &Path, bag: &EnvironmentBag) -> flotilla_protocol::RepoIdentity {
-    bag.repo_identity().unwrap_or_else(|| fallback_repo_identity(path))
-}
-
 /// Resolve one remote independently; callers choose which remote's forge to carry.
 async fn forge_for_remote(
     resource_backend: &ResourceBackend,
@@ -1074,7 +1116,7 @@ async fn discover_vcs_for_checkout(
     local_environment_id: &EnvironmentId,
     environment_id: &EnvironmentId,
     checkout_path: &Path,
-) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
+) -> Result<CheckoutProvider, String> {
     let runner = environment_manager
         .environment_runner(environment_id)
         .ok_or_else(|| format!("command runner unavailable for environment {environment_id}"))?;
@@ -1091,7 +1133,7 @@ async fn discover_vcs_for_checkout(
     let mut unmet = Vec::new();
     for factory in &discovery.factories.vcs {
         match factory.probe(&bag, config, &checkout, Arc::clone(&runner)).await {
-            Ok(provider) => return Ok(provider),
+            Ok(provider) => return Ok(CheckoutProvider { descriptor: factory.descriptor(), vcs: provider }),
             Err(requirements) => unmet.extend(requirements),
         }
     }
@@ -1108,20 +1150,15 @@ async fn discover_repo_for_environment(
     local_environment_id: &EnvironmentId,
     environment_id: &EnvironmentId,
     repo_path: &Path,
+    repository_spec: Option<&RepositorySpec>,
 ) -> Result<DiscoveryResult, String> {
     let mut host_bag =
         environment_manager.environment_bag(environment_id).ok_or_else(|| format!("environment not found: {environment_id}"))?;
     let runner =
         environment_manager.environment_runner(environment_id).ok_or_else(|| format!("environment runner not found: {environment_id}"))?;
-    // Resolve the forge while the resource backend is available. Factories only
-    // receive assertions, so their probe interface remains independent of storage.
-    if let Ok(origin_url) = crate::providers::vcs::detection::origin_url(&*runner, repo_path).await {
-        if let Some(remote) = crate::providers::discovery::detectors::git::remote_assertion(origin_url.trim(), "origin") {
-            host_bag = host_bag.with(remote);
-        }
-        if let Some(spec) = forge_for_remote(resource_backend, namespace, origin_url.trim()).await? {
-            host_bag = host_bag.with(crate::providers::discovery::EnvironmentAssertion::origin_forge(spec));
-        }
+    if let Some(spec) = repository_spec {
+        host_bag =
+            convoy_admission::repository_provider_bag(resource_backend, environment_manager, environment_id, namespace, spec).await?;
     }
     let ee_path = ExecutionEnvironmentPath::new(repo_path);
     let remote_env = StaticEnvVars::from_bag(&host_bag);
@@ -1131,7 +1168,7 @@ async fn discover_repo_for_environment(
         .host_scoped_providers
         .discover_for_environment(environment_id, &host_bag, &discovery.factories, config, &ee_path, Arc::clone(&runner))
         .await;
-    Ok(discover_providers_with_host_scoped(
+    Ok(discover_checkout_with_host_scoped(
         &host_bag,
         &ee_path,
         &discovery.repo_detectors,
@@ -1657,8 +1694,6 @@ impl crate::vcs::CheckoutVcsResolver for InProcessDaemon {
     }
 }
 
-type CheckoutVcsCache = HashMap<(EnvironmentId, PathBuf), Arc<tokio::sync::OnceCell<Arc<dyn crate::vcs::Vcs>>>>;
-
 pub struct InProcessDaemon {
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
@@ -1668,15 +1703,6 @@ pub struct InProcessDaemon {
     next_command_id: AtomicU64,
     node_id: NodeId,
     host_name: HostName,
-    /// Maps local tracked paths (including virtual synthetic paths) to RepoIdentity.
-    // Lock ordering: do not hold path_identities across awaits that later take
-    // repos/repo_order; add_repo intentionally takes it last while already
-    // holding those write locks.
-    path_identities: RwLock<HashMap<PathBuf, flotilla_protocol::RepoIdentity>>,
-    /// Repository identity last projected for each local tracked path.
-    /// Mutated under `observed_checkout_reconciliation` so removal deletes
-    /// observations using the identity that originally created them.
-    repository_keys_by_path: Arc<RwLock<HashMap<PathBuf, RepositoryKey>>>,
     #[cfg(test)]
     change_request_observation_source: Arc<ProviderChangeRequestObservationSource>,
     host_registry: crate::host_registry::HostRegistry,
@@ -1907,8 +1933,6 @@ impl InProcessDaemon {
         let event_sink: Arc<dyn EventSink> = event_source.clone();
         let mut repos: HashMap<flotilla_protocol::RepoIdentity, RepoState> = HashMap::new();
         let mut order = Vec::new();
-        let mut path_identities = HashMap::new();
-        let mut repository_keys_by_path = HashMap::new();
 
         let daemon_config = config.load_daemon_config().expect("failed to load daemon config");
         let config_machine_id = daemon_config.machine_id.as_deref();
@@ -1954,9 +1978,9 @@ impl InProcessDaemon {
             )
             .await;
         let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());
-        let mut checkout_vcs = CheckoutVcsCache::new();
+        let checkout_vcs = CheckoutVcsCache::new();
         for path in repo_paths {
-            if path_identities.contains_key(&path) {
+            if repos.values().any(|state| state.contains_path(&path)) {
                 continue;
             }
             let initial_vcs =
@@ -1966,7 +1990,7 @@ impl InProcessDaemon {
                 Ok(vcs) => {
                     GitRepositoryInspector::new(
                         discovery.runner.clone(),
-                        Arc::new(crate::vcs::FixedVcsResolver(vcs)),
+                        Arc::new(crate::vcs::FixedVcsResolver(vcs.vcs)),
                         local_host_id.to_string(),
                     )
                     .inspect_path(&path, None)
@@ -1987,7 +2011,7 @@ impl InProcessDaemon {
                     }
                 }
                 inspection.spec = spec.clone();
-                config.set_repository_spec(&ExecutionEnvironmentPath::new(&path), spec);
+                config.set_checkout_config(&ExecutionEnvironmentPath::new(&path), spec.vcs().clone());
             }
             let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag: _, unmet } = discover_repo_for_environment(
                 &environment_manager,
@@ -1998,6 +2022,7 @@ impl InProcessDaemon {
                 &local_environment_id,
                 &local_environment_id,
                 &path,
+                startup_inspection.as_ref().ok().map(|inspection| &inspection.spec),
             )
             .await
             .expect("local direct environment discovery should always be available");
@@ -2005,7 +2030,18 @@ impl InProcessDaemon {
                 debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
             }
 
-            let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
+            if let (Ok(inspection), Some(forge)) = (&mut startup_inspection, host_repo_bag.find_origin_forge()) {
+                match inspection.spec.clone().on_forge(forge) {
+                    Ok(spec) => inspection.spec = spec,
+                    Err(error) => warn!(%error, "could not resolve startup repository forge"),
+                }
+            }
+            let identity = startup_inspection
+                .as_ref()
+                .ok()
+                .map(|inspection| repository_operations::repository_event_identity(&inspection.spec, None))
+                .unwrap_or_else(|| fallback_repo_identity(&path));
+            let mut repository_key = None;
             match startup_inspection {
                 Ok(inspection) => {
                     // Observation roots are producers of Repository/Checkout facts.
@@ -2046,7 +2082,7 @@ impl InProcessDaemon {
                     .await;
                     match publish {
                         Ok(key) => {
-                            repository_keys_by_path.insert(path.clone(), key);
+                            repository_key = Some(key);
                         }
                         Err(error) => warn!(repo = %path.display(), %error, "startup repository observation failed"),
                     }
@@ -2056,12 +2092,7 @@ impl InProcessDaemon {
                 }
             }
             let slug = repo_slug.clone();
-            if let Some(vcs) = registry.vcs.preferred() {
-                let cell = tokio::sync::OnceCell::new();
-                let _ = cell.set(Arc::clone(vcs));
-                checkout_vcs.insert((local_environment_id.clone(), path.clone()), Arc::new(cell));
-            }
-            let model = RepoModel::new(registry, Some(local_environment_id.clone()));
+            let model = RepoModel::new_observation(registry, Some(local_environment_id.clone()));
             let root = RepoRootState { path: path.clone(), model, slug, unmet, is_local: true };
 
             if let Some(state) = repos.get_mut(&identity) {
@@ -2070,7 +2101,7 @@ impl InProcessDaemon {
                 order.push(identity.clone());
                 repos.insert(identity.clone(), RepoState::new(identity.clone(), root));
             }
-            path_identities.insert(path.clone(), identity);
+            repos.get_mut(&identity).expect("inserted repository presentation").repository_key = repository_key;
         }
 
         let local_provider_statuses = local_host_discovery.provider_statuses();
@@ -2107,7 +2138,6 @@ impl InProcessDaemon {
         let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(ProviderIssueQueryPort {
             host_providers: Mutex::new(HashMap::new()),
             backend: resource_backend.clone(),
-            repos: Arc::clone(&repos),
             config: Arc::clone(&config),
             discovery: Arc::clone(&discovery),
             environment_manager: Arc::clone(&environment_manager),
@@ -2127,7 +2157,6 @@ impl InProcessDaemon {
             LeafSubscriptionTable::with_issues(resource_backend.clone(), event_sink.clone(), change_request_refresher, issue_refresher);
         let admission_free_space_path = config.state_dir().as_path().to_path_buf();
         let aggregator_projection_state = AggregatorProjectionState::new();
-        let repository_keys_by_path = Arc::new(RwLock::new(repository_keys_by_path));
         let repository_change_requests = Arc::new(RwLock::new(HashMap::new()));
         let brief_artifact_writer = Arc::new(RwLock::new(None));
         let regard_lifecycle = Arc::new(RegardLifecycle::new(
@@ -2145,8 +2174,6 @@ impl InProcessDaemon {
             next_command_id: AtomicU64::new(1),
             node_id: local_node_id.clone(),
             host_name: host_name.clone(),
-            path_identities: RwLock::new(path_identities),
-            repository_keys_by_path: Arc::clone(&repository_keys_by_path),
             #[cfg(test)]
             change_request_observation_source: Arc::clone(&observation_source),
             host_registry: crate::host_registry::HostRegistry::new(
@@ -2163,7 +2190,7 @@ impl InProcessDaemon {
             self_weak: self_weak.clone(),
             convoy_admission: ConvoyAdmission::builder()
                 .backend(resource_backend.clone())
-                .repository_keys_by_path(Arc::clone(&repository_keys_by_path))
+                .observed_backend(observed_resource_backend.clone())
                 .config(Arc::clone(&config))
                 .discovery(Arc::clone(&discovery))
                 .environment_manager(Arc::clone(&environment_manager))
@@ -2210,6 +2237,8 @@ impl InProcessDaemon {
             remote_turn_delivery: std::sync::RwLock::new(None),
         });
         leaf_subscriptions.set_turn_delivery_actuator(Arc::new(DaemonTurnDeliveryActuator { daemon: Arc::downgrade(&daemon) })).await;
+
+        daemon.spawn_checkout_provider_retirement();
 
         let weak = Arc::downgrade(&daemon);
         tokio::spawn(async move {
@@ -2460,7 +2489,7 @@ impl InProcessDaemon {
     }
 
     async fn configure_inspected_repository(&self, path: &Path, spec: RepositorySpec) -> Result<(RepositorySpec, bool), String> {
-        let repository_key = self.repository_keys_by_path.read().await.get(path).cloned();
+        let repository_key = self.observed_repository_key_for_path(path).await?;
         self.configure_repository_for_checkout(path, spec, repository_key.as_ref()).await
     }
 
@@ -2512,7 +2541,35 @@ impl InProcessDaemon {
     }
 
     pub async fn repository_key_for_path(&self, path: &Path) -> Option<RepositoryKey> {
-        self.repository_keys_by_path.read().await.get(path).cloned()
+        self.observed_repository_key_for_path(path).await.ok().flatten()
+    }
+
+    async fn observed_repository_key_for_path(&self, path: &Path) -> Result<Option<RepositoryKey>, String> {
+        let namespace = self.provisioning_namespace().await;
+        let checkouts = crate::repository_addressing::local_checkouts(
+            &self.resource_backend,
+            &self.observed_resource_backend,
+            &namespace,
+            self.environment_manager.local_host_id().as_str(),
+        )
+        .await?;
+        let mut keys = checkouts
+            .into_iter()
+            .filter(|checkout| match &checkout.spec {
+                ResourceCheckoutSpec::Observed(spec) => Path::new(&spec.path) == path,
+                _ => {
+                    checkout.status.as_ref().and_then(|status| status.path.as_deref()).is_some_and(|candidate| Path::new(candidate) == path)
+                }
+            })
+            .map(|checkout| checkout.spec.repo_ref().clone())
+            .collect::<BTreeSet<_>>();
+        if keys.len() == 1 {
+            Ok(keys.pop_first())
+        } else if keys.is_empty() {
+            Ok(None)
+        } else {
+            Err(format!("multiple repositories have an observed checkout at {}", path.display()))
+        }
     }
 
     async fn resolve_repository_remote(&self, remote: &str) -> Result<RepositorySpec, String> {
@@ -2699,9 +2756,9 @@ impl InProcessDaemon {
             }
             Some(_) => {}
         }
-        for tracked in self.repository_keys_by_path.write().await.values_mut() {
-            if replacements.contains(tracked) {
-                *tracked = target_key.clone();
+        for state in self.repos.write().await.values_mut() {
+            if state.repository_key.as_ref().is_some_and(|key| replacements.contains(key)) {
+                state.repository_key = Some(target_key.clone());
             }
         }
         for (meta, spec) in project_updates {
@@ -2870,26 +2927,6 @@ impl InProcessDaemon {
     /// Resolve once when a caller needs both the runner and its registered identity.
     pub fn resolve_environment_ref(&self, env_ref: &str) -> Option<ResolvedEnvironment> {
         self.environment_manager.resolve_environment_ref(env_ref)
-    }
-
-    /// Resolve the VCS through the registered discovery factories once per checkout.
-    /// The key includes the environment because the same path may name different
-    /// checkouts on the host and inside a provisioned environment.
-    pub async fn vcs_for_checkout(&self, env_id: &EnvironmentId, checkout: &Path) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
-        let key = (env_id.clone(), checkout.to_path_buf());
-        let cell = self.checkout_vcs.lock().await.entry(key).or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())).clone();
-        cell.get_or_try_init(|| {
-            discover_vcs_for_checkout(
-                &self.environment_manager,
-                &self.discovery,
-                &self.config,
-                &self.local_environment_id,
-                env_id,
-                checkout,
-            )
-        })
-        .await
-        .map(Arc::clone)
     }
 
     pub async fn local_vcs_for_checkout(&self, checkout: &Path) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
@@ -3269,6 +3306,16 @@ impl InProcessDaemon {
         repo_path: &Path,
         environment_id: &EnvironmentId,
     ) -> Result<DiscoveryResult, String> {
+        let repository = match self.repository_key_for_path(repo_path).await {
+            Some(key) => self
+                .resource_backend
+                .including_replicas::<Repository>(&self.provisioning_namespace().await)
+                .get(&key.to_string())
+                .await
+                .ok()
+                .map(|source| source.object),
+            None => None,
+        };
         discover_repo_for_environment(
             &self.environment_manager,
             &self.discovery,
@@ -3278,6 +3325,7 @@ impl InProcessDaemon {
             &self.local_environment_id,
             environment_id,
             repo_path,
+            repository.as_ref().map(|repository| &repository.spec),
         )
         .await
     }
@@ -3568,23 +3616,12 @@ impl InProcessDaemon {
 
     /// Resolve a tracked local or synthetic repo path to its stable repo identity.
     pub async fn tracked_repo_identity_for_path(&self, repo_path: &Path) -> Option<flotilla_protocol::RepoIdentity> {
-        self.path_identities.read().await.get(repo_path).cloned()
+        self.repos.read().await.values().find(|state| state.contains_path(repo_path)).map(|state| state.identity().clone())
     }
 
     async fn detect_repo_identity(&self, repo_path: &Path) -> flotilla_protocol::RepoIdentity {
-        match discover_repo_for_environment(
-            &self.environment_manager,
-            &self.discovery,
-            &self.config,
-            &self.resource_backend,
-            &self.provisioning_namespace().await,
-            &self.local_environment_id,
-            &self.local_environment_id,
-            repo_path,
-        )
-        .await
-        {
-            Ok(result) => repo_identity_from_bag_or_path(repo_path, &result.host_repo_bag),
+        match self.inspect_repository_path(repo_path, None).await {
+            Ok(inspection) => repository_operations::repository_event_identity(&inspection.spec, None),
             Err(_) => fallback_repo_identity(repo_path),
         }
     }
@@ -3612,32 +3649,9 @@ impl InProcessDaemon {
     }
 
     async fn resolve_repo_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
-        match selector {
-            flotilla_protocol::RepoSelector::Repository(key) => self
-                .local_checkout_for_repository(key)
-                .await?
-                .ok_or_else(|| format!("Repository {key} has no available checkout on this host")),
-            flotilla_protocol::RepoSelector::Path(path) => {
-                let identities = self.path_identities.read().await;
-                if identities.contains_key(path) {
-                    Ok(path.clone())
-                } else {
-                    Err(format!("no observed checkout at {}", path.display()))
-                }
-            }
-            flotilla_protocol::RepoSelector::Query(query) => {
-                let repos = self.repos.read().await;
-                let entries: Vec<_> = repos.values().map(|state| (state.preferred_path(), state.slug())).collect();
-                crate::resolve::resolve_repo(query, entries.into_iter()).map_err(|e| e.to_string())
-            }
-            flotilla_protocol::RepoSelector::Identity(identity) => self
-                .repos
-                .read()
-                .await
-                .get(identity)
-                .map(|state| state.preferred_path().to_path_buf())
-                .ok_or_else(|| format!("no available checkout for {identity}")),
-        }
+        let repository = self.repository_for_selector(selector).await?;
+        let key = repository.spec.key();
+        self.local_checkout_for_repository(&key).await?.ok_or_else(|| format!("Repository {key} has no available checkout on this host"))
     }
 
     fn resolve_observation_root_selector(&self, selector: &flotilla_protocol::RepoSelector) -> Result<PathBuf, String> {
@@ -3658,28 +3672,36 @@ impl InProcessDaemon {
         selector: &flotilla_protocol::CheckoutSelector,
         scope: &CheckoutResolutionScope,
     ) -> Result<(PathBuf, String), String> {
-        let repos = self.repos.read().await;
+        let namespace = self.provisioning_namespace().await;
+        let checkouts = crate::repository_addressing::local_checkouts(
+            &self.resource_backend,
+            &self.observed_resource_backend,
+            &namespace,
+            self.environment_manager.local_host_id().as_str(),
+        )
+        .await?;
         let mut matches = Vec::new();
-        for state in repos.values() {
-            let root = state.preferred_root();
-            let Some((_, vcs)) = root.model.registry.vcs.preferred_with_desc() else { continue };
-            let checkouts = vcs.list_checkouts().await.map_err(|error| format!("checkout discovery failed: {error}"))?;
-            for (checkout_path, checkout) in checkouts {
-                let host_path =
-                    QualifiedPath::host(self.environment_manager.local_host_id().clone(), checkout_path.as_path().to_path_buf());
-                if !checkout_matches_scope(&host_path, &checkout, &self.host_name, scope) {
-                    continue;
-                }
-                let matched = match selector {
-                    flotilla_protocol::CheckoutSelector::Path(path) => host_path.path == *path,
-                    flotilla_protocol::CheckoutSelector::Query(query) => {
-                        checkout.branch == *query || checkout.branch.contains(query) || host_path.path.to_string_lossy().contains(query)
-                    }
-                };
-                if matched {
-                    matches.push((state.preferred_path().to_path_buf(), checkout.branch));
-                }
+        for checkout in checkouts {
+            let Some(path) = checkout_path(&checkout) else { continue };
+            let branch = checkout.spec.branch();
+            let matched = match selector {
+                flotilla_protocol::CheckoutSelector::Path(candidate) => Path::new(path) == candidate,
+                flotilla_protocol::CheckoutSelector::Query(query) => branch == query || branch.contains(query) || path.contains(query),
+            };
+            if !matched {
+                continue;
             }
+            // These are local facts; remote targeting remains a router concern.
+            if matches!(scope, CheckoutResolutionScope::RemoteAny)
+                || matches!(scope, CheckoutResolutionScope::Host(host) if host != &self.host_name)
+            {
+                continue;
+            }
+            let root = self
+                .local_checkout_for_repository(checkout.spec.repo_ref())
+                .await?
+                .ok_or_else(|| format!("Repository {} has no observed checkout", checkout.spec.repo_ref()))?;
+            matches.push((root, branch.to_string()));
         }
         match matches.len() {
             0 => Err("checkout not found".into()),
@@ -3969,9 +3991,15 @@ impl InProcessDaemon {
     ) -> Result<(), String> {
         let _reconciliation = self.observed_checkout_reconciliation.lock().await;
         let existing_path = self.repos.read().await.get(&identity).map(|state| state.preferred_path().to_path_buf());
-        if let Some(existing_path) = existing_path {
+        if existing_path.is_some() {
             let key_became_available = if let Some(repository_key) = repository_key {
-                self.repository_keys_by_path.write().await.insert(existing_path, repository_key.clone()).as_ref() != Some(&repository_key)
+                {
+                    let mut repos = self.repos.write().await;
+                    let state = repos.get_mut(&identity).expect("existing repository presentation");
+                    let changed = state.repository_key.as_ref() != Some(&repository_key);
+                    state.repository_key = Some(repository_key);
+                    changed
+                }
             } else {
                 false
             };
@@ -4018,10 +4046,7 @@ impl InProcessDaemon {
             order.push(identity.clone());
         }
 
-        self.path_identities.write().await.insert(synthetic_path.clone(), identity);
-        if let Some(repository_key) = repository_key {
-            self.repository_keys_by_path.write().await.insert(synthetic_path.clone(), repository_key);
-        }
+        self.repos.write().await.get_mut(&identity).expect("inserted virtual presentation").repository_key = repository_key;
 
         // Virtual repos are not persisted to config — they come and go
         // with peer connections.
@@ -5457,7 +5482,12 @@ impl InProcessDaemon {
             observed_resource_backend: &self.observed_resource_backend,
             clock: &self.clock,
             namespace: &self.provisioning_namespace,
-            repository_index: project_ops::RepositoryIndex { keys_by_path: &self.repository_keys_by_path },
+            repository_index: project_ops::RepositoryIndex {
+                backend: &self.resource_backend,
+                observed: &self.observed_resource_backend,
+                namespace: &self.provisioning_namespace,
+                host: self.environment_manager.local_host_id().as_str(),
+            },
             operations: self,
         }
     }
@@ -5493,7 +5523,7 @@ impl InProcessDaemon {
         &self,
         inspection: &crate::repository_inspection::RepositoryInspection,
     ) -> Result<Option<RepositoryIdentityChange>, String> {
-        let previous = self.repository_keys_by_path.read().await.get(&inspection.checkout.path).cloned();
+        let previous = self.observed_repository_key_for_path(&inspection.checkout.path).await?;
         self.reconcile_inspected_repository(inspection, previous.as_ref()).await
     }
 
@@ -5702,11 +5732,9 @@ impl InProcessDaemon {
                     self.reconcile_project_checkouts(&namespace, &key, &inspection.spec, inspection.checkout.clone()).await?;
                     None
                 };
-                // Maintain the retiring observation projection; this never decides
-                // whether refresh is admitted or what response it returns.
                 if changed {
-                    if let Some(projected_key) = self.repository_keys_by_path.write().await.get_mut(&path) {
-                        *projected_key = inspection.key();
+                    for state in self.repos.write().await.values_mut().filter(|state| state.contains_path(&path)) {
+                        state.repository_key = Some(inspection.key());
                     }
                 }
                 Ok(result)
@@ -5867,10 +5895,10 @@ impl InProcessDaemon {
             .inspect_repository_path(&path, None)
             .await
             .map_err(|error| format!("cannot adopt checkout {}: {error}", path.display()))?;
-        self.config.set_repository_spec(&ExecutionEnvironmentPath::new(&path), repository_inspection.spec.clone());
+        self.config.set_checkout_config(&ExecutionEnvironmentPath::new(&path), repository_inspection.spec.vcs().clone());
 
         // Create the model outside the lock (spawns provider detection and refresh)
-        let DiscoveryResult { registry, repo_slug, host_repo_bag, repo_bag: _, unmet } = discover_repo_for_environment(
+        let DiscoveryResult { registry, repo_slug, host_repo_bag: _, repo_bag: _, unmet } = discover_repo_for_environment(
             &self.environment_manager,
             &self.discovery,
             &self.config,
@@ -5879,12 +5907,13 @@ impl InProcessDaemon {
             &self.local_environment_id,
             &self.local_environment_id,
             &path,
+            Some(&repository_inspection.spec),
         )
         .await?;
         if !unmet.is_empty() {
             debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
         }
-        let identity = repo_identity_from_bag_or_path(&path, &host_repo_bag);
+        let identity = repository_operations::repository_event_identity(&repository_inspection.spec, None);
         // Resolve the storage identity before publishing RepoTracked so a
         // surface can subscribe to issues{repository} immediately. The
         // background refresh also reconciles the Repository resource and
@@ -5898,8 +5927,11 @@ impl InProcessDaemon {
                     if self.tracked_repo_identity_for_path(&path).await.as_ref() != Some(&identity) {
                         false
                     } else if let Some(repository_key) = repository_key.as_ref() {
-                        self.repository_keys_by_path.write().await.insert(path.clone(), repository_key.clone()).as_ref()
-                            != Some(repository_key)
+                        let mut repos = self.repos.write().await;
+                        let state = repos.get_mut(&identity).expect("observed presentation");
+                        let changed = state.repository_key.as_ref() != Some(repository_key);
+                        state.repository_key = Some(repository_key.clone());
+                        changed
                     } else {
                         false
                     }
@@ -5911,7 +5943,7 @@ impl InProcessDaemon {
                     return Ok(AddRepoOutcome { tracked_path: path, resolved_from, identity_change });
                 }
             }
-            if let Err(error) = self.remove_repo(&path).await {
+            if let Err(error) = self.remove_repo_presentation(&path, false).await {
                 // Another add_repo call may have removed or migrated this path
                 // after our identity lookup. Continue through the idempotent
                 // insertion path unless it is still tracked elsewhere.
@@ -5921,7 +5953,7 @@ impl InProcessDaemon {
             }
         }
         let slug = repo_slug.clone();
-        let model = RepoModel::new(registry, Some(self.local_environment_id.clone()));
+        let model = RepoModel::new_observation(registry, Some(self.local_environment_id.clone()));
         let root = RepoRootState { path: path.clone(), model, slug, unmet, is_local: true };
 
         let repo_info = RepoInfo {
@@ -5930,7 +5962,9 @@ impl InProcessDaemon {
             path: Some(path.clone()),
             name: repo_name(&path),
             labels: root.model.labels.clone(),
-            provider_names: provider_names_from_registry(&root.model.registry)
+            provider_names: root
+                .model
+                .provider_names()
                 .into_iter()
                 .map(|(category, entries)| (category, entries.into_iter().map(|e| e.display_name).collect()))
                 .collect(),
@@ -5941,7 +5975,7 @@ impl InProcessDaemon {
         // Insert under write lock — re-check to avoid TOCTOU duplicate
         let mut added_new_identity = false;
         let _reconciliation = self.observed_checkout_reconciliation.lock().await;
-        let already_tracked = self.path_identities.read().await.contains_key(&path);
+        let already_tracked = self.tracked_repo_identity_for_path(&path).await.is_some();
         if already_tracked {
             return Ok(AddRepoOutcome { tracked_path: path, resolved_from, identity_change });
         }
@@ -5955,10 +5989,7 @@ impl InProcessDaemon {
                 order.push(identity.clone());
                 added_new_identity = true;
             }
-            self.path_identities.write().await.insert(path.clone(), identity.clone());
-        }
-        if let Some(repository_key) = repository_key {
-            self.repository_keys_by_path.write().await.insert(path.clone(), repository_key);
+            repos.get_mut(&identity).expect("inserted presentation").repository_key = repository_key.clone();
         }
 
         // Persist to config. Tab order is Surface-owned (open-views.toml,
@@ -5972,21 +6003,26 @@ impl InProcessDaemon {
     }
 
     pub async fn remove_repo(&self, path: &Path) -> Result<(), String> {
+        self.remove_repo_presentation(path, true).await
+    }
+
+    // Identity migration replaces a presentation row after the resources have
+    // reconciled. It must preserve those new facts and the observation root.
+    async fn remove_repo_presentation(&self, path: &Path, stop_observing: bool) -> Result<(), String> {
         let path = path.to_path_buf();
         let repo_identity = self.tracked_repo_identity_for_path(&path).await.unwrap_or_else(|| fallback_repo_identity(&path));
         let observed_reconciliation = self.observed_checkout_reconciliation.lock().await;
         let tracked = self.repos.read().await.get(&repo_identity).is_some_and(|state| state.contains_path(&path));
         // Persist first so both tracked repositories and observation roots
         // whose initial inspection failed remain removable and retryable.
-        self.config.remove_observation_root(&ExecutionEnvironmentPath::new(&path))?;
+        if stop_observing {
+            self.config.remove_observation_root(&ExecutionEnvironmentPath::new(&path))?;
+        }
         if !tracked {
-            self.config.remove_repository_spec(&ExecutionEnvironmentPath::new(&path));
+            self.config.remove_checkout_config(&ExecutionEnvironmentPath::new(&path));
             return Ok(());
         }
-        let repository_key = match self.repository_keys_by_path.read().await.get(&path).cloned() {
-            Some(key) => Some(key),
-            None => self.inspect_repository_path(&path, None).await.ok().map(|inspection| inspection.key()),
-        };
+        let repository_key = if stop_observing { self.observed_repository_key_for_path(&path).await? } else { None };
         let mut removed_identity = false;
         let removed_final_local_root;
         {
@@ -5995,7 +6031,6 @@ impl InProcessDaemon {
             let Some(state) = repos.get_mut(&repo_identity) else {
                 return Err(format!("no observed checkout at {}", path.display()));
             };
-            let previous_preferred = state.preferred_path().to_path_buf();
             if !state.remove_root(&path) {
                 return Err(format!("no observed checkout at {}", path.display()));
             }
@@ -6004,15 +6039,10 @@ impl InProcessDaemon {
                 repos.remove(&repo_identity);
                 order.retain(|repo| repo != &repo_identity);
                 removed_identity = true;
-            } else if previous_preferred == path {
             }
         }
 
-        // Remove from identity maps.
-        self.path_identities.write().await.remove(&path);
-        self.repository_keys_by_path.write().await.remove(&path);
-
-        if removed_final_local_root {
+        if stop_observing && removed_final_local_root {
             let namespace = self.provisioning_namespace().await;
             if let Some(repository_key) = repository_key {
                 if let Err(error) =
@@ -6024,9 +6054,12 @@ impl InProcessDaemon {
                 warn!(repo = %repo_identity.path, "could not resolve repository identity while deleting observed checkouts");
             }
         }
+        self.retire_checkout_providers().await?;
         drop(observed_reconciliation);
 
-        self.config.remove_repository_spec(&ExecutionEnvironmentPath::new(&path));
+        if stop_observing {
+            self.config.remove_checkout_config(&ExecutionEnvironmentPath::new(&path));
+        }
 
         info!(repo = %path.display(), "removed repo");
         if removed_identity {
@@ -6096,8 +6129,18 @@ impl InProcessDaemon {
             return Ok(Default::default());
         }
         let mut paths = BTreeMap::<RepositoryKey, Vec<PathBuf>>::new();
-        for (path, key) in self.repository_keys_by_path.read().await.iter() {
-            paths.entry(key.clone()).or_default().push(path.clone());
+        for checkout in crate::repository_addressing::local_checkouts(
+            &self.resource_backend,
+            &self.observed_resource_backend,
+            namespace,
+            self.environment_manager.local_host_id().as_str(),
+        )
+        .await?
+        {
+            let key = checkout.spec.repo_ref().clone();
+            if let Some(path) = checkout_path(&checkout) {
+                paths.entry(key).or_default().push(PathBuf::from(path));
+            }
         }
         let inspector = self.repository_inspector().await?;
         crate::repository_inspection::inspect_project_ops_entries(&projects, &paths, &*inspector).await
@@ -8310,7 +8353,7 @@ impl InProcessDaemon {
     async fn executor_provider_data(&self, repo_identity: &RepoIdentity, _repo_root: &Path, registry: &ProviderRegistry) -> ProviderData {
         let mut providers = ProviderData::default();
 
-        if let Some(vcs) = registry.vcs.preferred() {
+        if let Ok(vcs) = self.local_vcs_for_checkout(_repo_root).await {
             match vcs.list_checkouts().await {
                 Ok(checkouts) => {
                     for (path, mut checkout) in checkouts {
@@ -8343,15 +8386,12 @@ impl InProcessDaemon {
         progress_sink: Arc<dyn RemoteStepProgressSink>,
         cancel: CancellationToken,
     ) -> Result<Vec<StepOutcome>, String> {
+        let repository = self.repository_for_selector(&flotilla_protocol::RepoSelector::Identity(request.repo_identity.clone())).await?;
         let local_repo_path = self
-            .preferred_local_path_for_identity(&request.repo_identity)
-            .await
-            .ok_or_else(|| format!("repo not tracked locally: {}", request.repo_identity))?;
-        let registry = {
-            let repos = self.repos.read().await;
-            let state = repos.get(&request.repo_identity).ok_or_else(|| format!("repo not tracked locally: {}", request.repo_identity))?;
-            state.registry()
-        };
+            .local_checkout_for_repository(&repository.spec.key())
+            .await?
+            .ok_or_else(|| format!("Repository {} has no observed checkout on this host", repository.spec.key()))?;
+        let registry = self.execution_registry(&repository, &local_repo_path).await?;
         let providers_data = Arc::new(self.executor_provider_data(&request.repo_identity, &local_repo_path, &registry).await);
 
         let config_base = DaemonHostPath::new(self.config.base_path().as_path());
@@ -9837,13 +9877,9 @@ impl InProcessDaemon {
         let runner = Arc::clone(&self.discovery.runner);
         let env = Arc::clone(&self.discovery.env);
         let event_sink = self.event_sink.clone();
-        let (repo_identity, registry) = {
-            let repos = self.repos.read().await;
-            let identity =
-                self.tracked_repo_identity_for_path(&repo).await.ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
-            let state = repos.get(&identity).ok_or_else(|| format!("repo not tracked: {}", repo.display()))?;
-            (state.identity().clone(), state.registry())
-        };
+        let repository = self.repository_for_selector(&flotilla_protocol::RepoSelector::Path(repo.clone())).await?;
+        let repo_identity = repository_operations::repository_event_identity(&repository.spec, None);
+        let registry = self.execution_registry(&repository, &repo).await?;
         let providers_data = Arc::new(self.executor_provider_data(&repo_identity, &repo, &registry).await);
 
         let description = command.description().to_string();
@@ -10051,7 +10087,6 @@ impl DaemonHandle for InProcessDaemon {
     }
 
     async fn list_repos(&self) -> Result<Vec<RepoInfo>, String> {
-        let repository_keys = self.repository_keys_by_path.read().await;
         let repos = self.repos.read().await;
         let order = self.repo_order.read().await;
         let mut result = Vec::new();
@@ -10059,7 +10094,7 @@ impl DaemonHandle for InProcessDaemon {
             if let Some(state) = repos.get(identity) {
                 result.push(RepoInfo {
                     identity: state.identity().clone(),
-                    repository_key: repository_keys.get(state.preferred_path()).cloned(),
+                    repository_key: state.repository_key.clone(),
                     path: Some(state.preferred_path().to_path_buf()),
                     name: repo_name(state.preferred_path()),
                     labels: state.labels().clone(),

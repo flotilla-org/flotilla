@@ -20,6 +20,9 @@ pub(crate) async fn resolve_repository(
         // Resolve it only through checkout facts. Remove when the Plane-A callers
         // all carry Repository keys (the path-identity retirement slice of #1721).
         RepoSelector::Identity(identity) if identity.authority == "local" => RepoSelector::Path(identity.path.clone().into()),
+        RepoSelector::Identity(identity) if identity.authority == "repository" => {
+            RepoSelector::Repository(RepositoryKey(identity.path.clone()))
+        }
         selector => selector.clone(),
     };
     let label = selector.to_string();

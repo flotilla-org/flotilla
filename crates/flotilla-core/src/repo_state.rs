@@ -6,10 +6,7 @@ use std::{
 
 use flotilla_protocol::EnvironmentId;
 
-use crate::{
-    model::{provider_names_from_registry, RepoModel},
-    providers::discovery::UnmetRequirement,
-};
+use crate::{model::RepoModel, providers::discovery::UnmetRequirement};
 
 pub(crate) struct RepoRootState {
     pub(crate) path: PathBuf,
@@ -21,12 +18,14 @@ pub(crate) struct RepoRootState {
 
 pub(crate) struct RepoState {
     identity: flotilla_protocol::RepoIdentity,
+    /// Repository key retained for legacy row presentation, never path resolution.
+    pub(crate) repository_key: Option<flotilla_resources::RepositoryKey>,
     pub(crate) roots: Vec<RepoRootState>,
 }
 
 impl RepoState {
     pub(crate) fn new(identity: flotilla_protocol::RepoIdentity, root: RepoRootState) -> Self {
-        Self { identity, roots: vec![root] }
+        Self { identity, repository_key: None, roots: vec![root] }
     }
     pub(crate) fn preferred_root(&self) -> &RepoRootState {
         self.roots.first().expect("repo state should have a root")
@@ -50,7 +49,9 @@ impl RepoState {
         &self.preferred_root().model.labels
     }
     pub(crate) fn provider_names(&self) -> HashMap<String, Vec<String>> {
-        provider_names_from_registry(&self.preferred_root().model.registry)
+        self.preferred_root()
+            .model
+            .provider_names()
             .into_iter()
             .map(|(category, entries)| (category, entries.into_iter().map(|entry| entry.display_name).collect()))
             .collect()

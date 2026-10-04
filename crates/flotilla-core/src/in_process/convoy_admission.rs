@@ -54,7 +54,7 @@ pub(super) struct ConvoyCreateAdmission<'a> {
 #[derive(bon::Builder)]
 pub(super) struct ConvoyAdmission {
     backend: ResourceBackend,
-    repository_keys_by_path: Arc<RwLock<HashMap<PathBuf, RepositoryKey>>>,
+    observed_backend: ResourceBackend,
     config: Arc<ConfigStore>,
     discovery: Arc<DiscoveryRuntime>,
     environment_manager: Arc<EnvironmentManager>,
@@ -1502,7 +1502,13 @@ impl ConvoyAdmission {
         let templates = CrewBriefTemplateResolver::with_config_dir(self.config.base_path().as_path());
         let repositories = self.backend.clone().using::<Repository>(namespace);
         let checkouts = self.backend.clone().using::<ResourceCheckout>(namespace);
-        let tracked_roots = self.repository_keys_by_path.read().await.clone();
+        let local_checkouts = crate::repository_addressing::local_checkouts(
+            &self.backend,
+            &self.observed_backend,
+            namespace,
+            self.environment_manager.local_host_id().as_str(),
+        )
+        .await?;
         for requirement in &workflow.vessels {
             let repository_refs = requirement
                 .repository_refs
@@ -1511,8 +1517,11 @@ impl ConvoyAdmission {
             let mut fork_stance = false;
             let mut roots = Vec::new();
             for repository_ref in &repository_refs {
-                let mut source_roots =
-                    tracked_roots.iter().filter(|(_, key)| *key == repository_ref).map(|(path, _)| path.clone()).collect::<Vec<_>>();
+                let mut source_roots = local_checkouts
+                    .iter()
+                    .filter(|checkout| checkout.spec.repo_ref() == repository_ref)
+                    .filter_map(|checkout| super::checkout_path(checkout).map(PathBuf::from))
+                    .collect::<Vec<_>>();
                 source_roots.sort();
                 roots.extend(source_roots);
                 if let Ok(repository) = repositories.get(&repository_ref.to_string()).await {
@@ -2490,9 +2499,10 @@ pub(super) async fn repository_provider_bag(
             )
         })
         .fold(EnvironmentBag::new(), |bag, assertion| bag.with(assertion.clone()));
-    let Some(remote) = repository.live_remote() else {
+    let Some(identity) = repository.forge() else {
         return Ok(host_bag);
     };
+    let remote = format!("{}/{}", identity.service_url.trim_end_matches('/'), identity.repository);
     let forge = match repository.identity() {
         RepositoryIdentity::Forge { forge_ref, .. } => Some(
             resource_backend
@@ -2503,9 +2513,9 @@ pub(super) async fn repository_provider_bag(
                 .object
                 .spec,
         ),
-        _ => forge_for_remote(resource_backend, namespace, remote).await?,
+        _ => forge_for_remote(resource_backend, namespace, &remote).await?,
     };
-    let remote_assertion = remote_assertion(remote, "origin").ok_or_else(|| format!("invalid repository remote {remote}"))?;
+    let remote_assertion = remote_assertion(&remote, "origin").ok_or_else(|| format!("invalid repository remote {remote}"))?;
     let mut bag = host_bag.with(remote_assertion);
     if let Some(forge) = &forge {
         bag = bag.with(EnvironmentAssertion::origin_forge(forge.clone()));

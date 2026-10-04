@@ -737,7 +737,7 @@ pub async fn discover_providers(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn discover_providers_with_host_scoped(
+pub(crate) async fn discover_checkout_with_host_scoped(
     host_bag: &EnvironmentBag,
     repo_root: &ExecutionEnvironmentPath,
     repo_detectors: &[Box<dyn RepoDetector>],
@@ -798,14 +798,18 @@ async fn discover_providers_inner(
         registry.vcs.insert(desc.implementation.clone(), desc, provider);
     })
     .await;
-    probe_all(&factories.change_requests, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.change_requests.insert(desc.implementation.clone(), desc, provider);
-    })
-    .await;
-    probe_all(&factories.issue_trackers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
-        registry.issue_trackers.insert(desc.implementation.clone(), desc, provider);
-    })
-    .await;
+    // The daemon's checkout discovery delegates host capabilities and never
+    // constructs forge-tier providers; those are demand-selected from resources.
+    if host_scoped.is_none() {
+        probe_all(&factories.change_requests, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
+            registry.change_requests.insert(desc.implementation.clone(), desc, provider);
+        })
+        .await;
+        probe_all(&factories.issue_trackers, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
+            registry.issue_trackers.insert(desc.implementation.clone(), desc, provider);
+        })
+        .await;
+    }
     if host_scoped.is_none() {
         probe_all(&factories.cloud_agents, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
             registry.cloud_agents.insert(desc.implementation.clone(), desc, provider);
@@ -855,18 +859,20 @@ async fn discover_providers_inner(
         }
     }
 
-    apply_backend_pref(
-        &mut registry.change_requests,
-        ProviderCategory::ChangeRequest,
-        config.resolve_change_request_backend(repo_root).as_deref(),
-        &mut unmet,
-    );
-    apply_backend_pref(
-        &mut registry.issue_trackers,
-        ProviderCategory::IssueProvider,
-        flotilla_config.issue_tracker.preference.backend.as_deref(),
-        &mut unmet,
-    );
+    if host_scoped.is_none() {
+        apply_backend_pref(
+            &mut registry.change_requests,
+            ProviderCategory::ChangeRequest,
+            flotilla_config.change_request.preference.backend.as_deref(),
+            &mut unmet,
+        );
+        apply_backend_pref(
+            &mut registry.issue_trackers,
+            ProviderCategory::IssueProvider,
+            flotilla_config.issue_tracker.preference.backend.as_deref(),
+            &mut unmet,
+        );
+    }
     apply_backend_pref(
         &mut registry.cloud_agents,
         ProviderCategory::CloudAgent,
@@ -1028,7 +1034,7 @@ mod orchestrator_tests {
     }
 
     #[tokio::test]
-    async fn discover_providers_repo_slug_from_remote() {
+    async fn checkout_discovery_does_not_infer_forge_identity_from_remotes() {
         let dir = tempdir().expect("tempdir");
         let repo_root = dir.path();
         std::fs::create_dir_all(repo_root.join(".git")).expect("create .git");
@@ -1055,9 +1061,9 @@ mod orchestrator_tests {
 
         let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
 
-        // RemoteHostDetector should have parsed the git remote URL into a
-        // RemoteHost assertion, yielding a repo_slug.
-        assert_eq!(result.repo_slug, Some("testowner/testrepo".into()), "repo_slug should be derived from remote host assertion");
+        // #1770: checkout discovery cannot assign repository identity by probing
+        // remotes. Forge assertions must come from Repository intent.
+        assert_eq!(result.repo_slug, None);
     }
 
     #[tokio::test]

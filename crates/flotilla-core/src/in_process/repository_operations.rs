@@ -8,10 +8,9 @@ use crate::{
     },
 };
 
-/// Match forge discovery's event identity, including installation paths. Local
-/// refresh uses its actual checkout when present; checkout-less resources use
-/// their durable key as a display identity, never as a filesystem path.
-pub(super) fn repository_event_identity(spec: &RepositorySpec, path: Option<&Path>) -> RepoIdentity {
+/// Forge identity or Repository key identifies a row independently of any
+/// execution location, including repositories that have no forge.
+pub(super) fn repository_event_identity(spec: &RepositorySpec, _path: Option<&Path>) -> RepoIdentity {
     if let Some(forge) = spec.forge() {
         let authority = forge
             .service_url
@@ -22,7 +21,7 @@ pub(super) fn repository_event_identity(spec: &RepositorySpec, path: Option<&Pat
             .to_string();
         RepoIdentity { authority, path: forge.repository.clone() }
     } else {
-        path.map(fallback_repo_identity).unwrap_or_else(|| RepoIdentity { authority: "repository".into(), path: spec.key().to_string() })
+        RepoIdentity { authority: "repository".into(), path: spec.key().to_string() }
     }
 }
 
@@ -255,25 +254,30 @@ impl InProcessDaemon {
             .collect::<Vec<_>>();
         let mut checkout_bag = self.environment_manager.local_environment_bag();
         let mut checkout_unmet = Vec::new();
-        let mut checkout_registry = ProviderRegistry::new();
         if let Some(path) = &path {
             let root = ExecutionEnvironmentPath::new(path);
             for detector in &self.discovery.repo_detectors {
                 checkout_bag = checkout_bag.extend(detector.detect(&root, lease.runner.as_ref(), self.discovery.env.as_ref()).await);
             }
-            let vcs = self.local_vcs_for_checkout(path).await;
-            probe(
-                &self.discovery.factories.vcs,
-                &checkout_bag,
-                &self.config,
-                &lease.runner,
-                &root,
-                &mut checkout_registry.vcs,
-                &mut checkout_unmet,
-            )
-            .await;
-            for (category, name) in checkout_registry.provider_infos() {
-                providers.push(ProviderInfo { category, name, healthy: vcs.is_ok(), disabled_reason: vcs.as_ref().err().cloned() });
+            match self.checkout_provider(&self.local_environment_id, path).await {
+                Ok(checkout) => providers.push(ProviderInfo {
+                    category: checkout.descriptor.category.slug().into(),
+                    name: checkout.descriptor.display_name.clone(),
+                    healthy: true,
+                    disabled_reason: None,
+                }),
+                Err(error) => {
+                    for factory in &self.discovery.factories.vcs {
+                        let descriptor = factory.descriptor();
+                        providers.push(ProviderInfo {
+                            category: descriptor.category.slug().into(),
+                            name: descriptor.display_name.clone(),
+                            healthy: false,
+                            disabled_reason: Some(error.clone()),
+                        });
+                        checkout_unmet.push((descriptor.implementation, UnmetRequirement::NoVcsCheckout));
+                    }
+                }
             }
         }
         let mut repo_discovery = lease

@@ -499,7 +499,13 @@ impl EnvironmentManager {
 
         let config = ConfigStore::with_base(config_base.as_path().join(format!("env-discovery/{env_id}")));
         let env_repo_root = ExecutionEnvironmentPath::new("/workspace");
-        let provider_registry = FactoryRegistry::default_all().probe_all(&bag, &config, &env_repo_root, env_runner).await;
+        // Environment lifetimes own host capabilities. Checkout VCS and forge
+        // capabilities are discovered by their resource-scoped consumers.
+        let mut factories = FactoryRegistry::default_all();
+        factories.vcs.clear();
+        factories.change_requests.clear();
+        factories.issue_trackers.clear();
+        let provider_registry = factories.probe_all(&bag, &config, &env_repo_root, env_runner).await;
 
         Ok((bag, provider_registry))
     }

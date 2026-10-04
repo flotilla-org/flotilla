@@ -3765,12 +3765,25 @@ fn generated_router_exited_crew_resume(tc: hegel::TestCase) {
 
 // #1769: identity resolution is a local read through the request router and works
 // for a declared Repository with no checkout or observation-root membership.
-async fn repository_identity_operations_scenario(alias: bool) {
+async fn repository_identity_operations_scenario(alias: bool, observed: bool) {
     use flotilla_resources::{Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, Repository, RepositorySpec};
 
-    let topology = spawn_in_memory_request_topology_stateful(empty_daemon_named("leader").await, empty_daemon_named("follower").await)
-        .await
-        .expect("in-memory router");
+    let path = Path::new("/checkouts/router-main");
+    let leader = if observed {
+        use flotilla_core::providers::discovery::test_support::{FakePresentationManagerFactory, FakeVcsFactory, FakeVcsState};
+        let tmp = tempfile::tempdir().expect("config");
+        let mut discovery = fake_discovery(false);
+        discovery.factories.vcs = vec![Box::new(FakeVcsFactory::new(
+            FakeVcsState::builder(path).branch("main", true).checkout("main").is_main(true).path(path).build().build(),
+        ))];
+        discovery.factories.presentation_managers = vec![Box::new(FakePresentationManagerFactory(Arc::new(
+            flotilla_core::providers::discovery::test_support::FakePresentationManager::new(),
+        )))];
+        InProcessDaemon::new(Vec::new(), test_config_store_with_floor(tmp.keep(), None), discovery, HostName::new("leader")).await
+    } else {
+        empty_daemon_named("leader").await
+    };
+    let topology = spawn_in_memory_request_topology_stateful(leader, empty_daemon_named("follower").await).await.expect("in-memory router");
     let backend = topology.leader.resource_backend();
     let spec = RepositorySpec::remote("https://github.com/acme/widgets").expect("repository");
     let key = spec.key();
@@ -3839,6 +3852,54 @@ async fn repository_identity_operations_scenario(alias: bool) {
             assert!(matches!(result, CommandValue::Error { message } if message.contains("no change request provider")));
         }
     }
+    if observed {
+        // #1770: generic checkout admission/execution uses observed resources
+        // and discovered VCS capabilities, without a presentation root.
+        topology
+            .leader
+            .observed_resource_backend()
+            .using::<Checkout>("flotilla")
+            .create(
+                &InputMeta::builder().name("router-main".into()).build(),
+                &CheckoutSpec::Observed(
+                    flotilla_resources::ObservedCheckoutSpec::builder()
+                        .r#ref("main".into())
+                        .path(path.to_string_lossy().into_owned())
+                        .repo_ref(key.clone())
+                        .host_ref(topology.leader.local_host_id().expect("host").to_string())
+                        .is_main(true)
+                        .build(),
+                ),
+            )
+            .await
+            .expect("observe checkout");
+        let mut events = topology.client.subscribe();
+        let id = topology
+            .client
+            .execute(
+                Command::builder()
+                    .action(CommandAction::Checkout {
+                        repo: selector,
+                        target: flotilla_protocol::CheckoutTarget::FreshBranch("router-branch".into()),
+                        issue_ids: vec![],
+                    })
+                    .build(),
+            )
+            .await
+            .expect("admit checkout command");
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let DaemonEvent::CommandFinished { command_id, result, .. } = events.recv().await.expect("event") {
+                    if command_id == id {
+                        break result;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("checkout command finishes");
+        assert!(matches!(result, CommandValue::CheckoutCreated { .. }), "{result:?}");
+    }
     assert!(topology.leader.tracked_repo_paths().await.is_empty());
     assert!(topology.follower.tracked_repo_paths().await.is_empty());
 }
@@ -3847,8 +3908,8 @@ async fn repository_identity_operations_scenario(alias: bool) {
 // without observation-root membership; aliases and slugs have identical behavior.
 #[tokio::test]
 async fn repository_identity_resolution_is_a_local_resource_read() {
-    for alias in [false, true] {
-        repository_identity_operations_scenario(alias).await;
+    for (alias, observed) in [(false, false), (true, false), (false, true), (true, true)] {
+        repository_identity_operations_scenario(alias, observed).await;
     }
 }
 
@@ -3856,11 +3917,12 @@ async fn repository_identity_resolution_is_a_local_resource_read() {
 fn generated_router_repository_identity_operations(tc: hegel::TestCase) {
     // Both public selector forms, with provider queries and refresh/admission.
     let alias = tc.draw(gs::booleans());
+    let observed = tc.draw(gs::booleans());
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime")
-        .block_on(repository_identity_operations_scenario(alias));
+        .block_on(repository_identity_operations_scenario(alias, observed));
 }
 
 // #2498: the operator's request queries replicated stalls without a crew or repo target.

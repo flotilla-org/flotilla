@@ -142,15 +142,13 @@ fn repository_provider_overrides_merge_with_global_defaults() {
         .expect("repository spec")
         .with_vcs(RepositoryVcsSpec { git: RepositoryGitSpec { checkout_path: Some("/repo/{{ branch }}".into()) } })
         .with_change_request(RepositoryProviderPreference { backend: Some("forgejo".into()) });
-    store.set_repository_spec(&overridden, spec);
+    store.set_checkout_config(&overridden, spec.vcs().clone());
 
     let resolved = store.resolve_checkout_config(&overridden);
     assert_eq!(resolved.path, "/repo/{{ branch }}");
-    assert_eq!(store.resolve_change_request_backend(&overridden).as_deref(), Some("forgejo"));
 
     let fallback_checkout = store.resolve_checkout_config(&fallback);
     assert_eq!(fallback_checkout.path, "/global/{{ branch }}");
-    assert_eq!(store.resolve_change_request_backend(&fallback).as_deref(), Some("github"));
 }
 
 #[test]

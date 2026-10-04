@@ -87,7 +87,7 @@ struct CheckoutFlow<'a> {
     create_branch: bool,
     intent: CheckoutIntent,
     repo_root: &'a ExecutionEnvironmentPath,
-    registry: &'a ProviderRegistry,
+    vcs: &'a dyn crate::vcs::Vcs,
     providers_data: &'a ProviderData,
     local_host: &'a HostName,
     new_checkout_qualifier: PathQualifier,
@@ -112,7 +112,7 @@ impl<'a> CheckoutFlow<'a> {
     }
 
     async fn checkout_created_result(&self) -> Result<CommandValue, String> {
-        let checkout_service = CheckoutService::new(self.registry);
+        let checkout_service = CheckoutService::new(self.vcs);
 
         if let Some(path) = self.existing_checkout_path() {
             if matches!(self.intent, CheckoutIntent::FreshBranch) {
@@ -756,12 +756,13 @@ impl StepResolver for ExecutorStepResolver {
 
         match action {
             StepAction::CreateCheckout { branch, create_branch, intent, .. } => {
+                let vcs = self.vcs_resolver.vcs_for(context_environment_id.as_ref(), effective_repo_root.as_path()).await?;
                 let checkout_flow = CheckoutFlow {
                     branch: &branch,
                     create_branch,
                     intent,
                     repo_root: &effective_repo_root,
-                    registry: effective_registry.as_ref(),
+                    vcs: vcs.as_ref(),
                     providers_data: effective_providers_data.as_ref(),
                     local_host: &self.local_host,
                     new_checkout_qualifier: context_environment_id.as_ref().map_or_else(
@@ -781,7 +782,8 @@ impl StepResolver for ExecutorStepResolver {
                 Ok(StepOutcome::Completed)
             }
             StepAction::RemoveCheckout { branch, deleted_checkout_paths } => {
-                let checkout_service = CheckoutService::new(effective_registry.as_ref());
+                let vcs = self.vcs_resolver.vcs_for(context_environment_id.as_ref(), effective_repo_root.as_path()).await?;
+                let checkout_service = CheckoutService::new(vcs.as_ref());
                 let tm = self.terminal_manager();
                 checkout_service.remove_checkout(&self.repo.root, &branch, &deleted_checkout_paths, tm.as_ref()).await?;
                 Ok(StepOutcome::CompletedWith(CommandValue::CheckoutRemoved { branch }))

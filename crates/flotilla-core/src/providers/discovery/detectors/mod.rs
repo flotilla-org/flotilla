@@ -35,7 +35,7 @@ pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
 }
 
 pub fn default_repo_detectors() -> Vec<Box<dyn RepoDetector>> {
-    vec![Box::new(git::VcsRepoDetector), Box::new(git::RemoteHostDetector)]
+    vec![Box::new(git::VcsRepoDetector)]
 }
 
 #[cfg(test)]

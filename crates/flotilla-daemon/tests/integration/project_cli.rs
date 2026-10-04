@@ -90,6 +90,7 @@ struct MutableInspector {
 
 #[derive(Clone)]
 struct PerPathInspector {
+    host_ref: String,
     specs: BTreeMap<PathBuf, RepositorySpec>,
 }
 
@@ -100,7 +101,7 @@ impl RepositoryInspector for PerPathInspector {
             spec: self.specs.get(path).ok_or_else(|| format!("unexpected checkout path {}", path.display()))?.clone(),
             checkout: LocalCheckoutInspection {
                 path: path.to_path_buf(),
-                host_ref: if path.ends_with("mirror-root") { "host-mirror" } else { "host-github" }.to_string(),
+                host_ref: self.host_ref.clone(),
                 git_ref: "main".to_string(),
                 is_main: true,
             },
@@ -112,6 +113,7 @@ impl RepositoryInspector for PerPathInspector {
 
 #[derive(Clone)]
 struct DeclarationInspector {
+    host_ref: String,
     bootstrap: RepositorySpec,
     commit: Arc<RwLock<String>>,
 }
@@ -123,7 +125,7 @@ impl RepositoryInspector for DeclarationInspector {
             spec: self.bootstrap.clone(),
             checkout: LocalCheckoutInspection {
                 path: path.to_path_buf(),
-                host_ref: "host-01".to_string(),
+                host_ref: self.host_ref.clone(),
                 git_ref: "main".to_string(),
                 is_main: true,
             },
@@ -363,7 +365,13 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let bootstrap = RepositorySpec::remote("https://github.com/example/bootstrap").expect("bootstrap spec");
     let commit = Arc::new(RwLock::new("0123456789abcdef".to_string()));
-    daemon.set_repository_inspector(Arc::new(DeclarationInspector { bootstrap: bootstrap.clone(), commit })).await;
+    daemon
+        .set_repository_inspector(Arc::new(DeclarationInspector {
+            host_ref: daemon.local_host_id().expect("local host").to_string(),
+            bootstrap: bootstrap.clone(),
+            commit,
+        }))
+        .await;
     let mut rx = daemon.subscribe();
 
     std::fs::write(
@@ -422,6 +430,7 @@ async fn declaration_adoption_survives_whole_repository_project_reconciliation()
     let commit = Arc::new(RwLock::new("declaration-commit".to_string()));
     daemon
         .set_repository_inspector(Arc::new(DeclarationInspector {
+            host_ref: daemon.local_host_id().expect("local host").to_string(),
             bootstrap: RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("bootstrap spec"),
             commit,
         }))
@@ -485,6 +494,7 @@ async fn project_refresh_accepts_every_declared_lab_forge_url_for_an_observed_ch
     let observed = RepositorySpec::remote("https://manchego.lab.flotilla.work/robert/ghostty-ops.git").expect("observed repository");
     daemon
         .set_repository_inspector(Arc::new(DeclarationInspector {
+            host_ref: daemon.local_host_id().expect("local host").to_string(),
             bootstrap: observed,
             commit: Arc::new(RwLock::new("declaration-commit".to_string())),
         }))
@@ -526,6 +536,7 @@ async fn project_refresh_rebinds_alias_when_a_superseding_declaration_changes_it
     let commit = Arc::new(RwLock::new("commit-one".to_string()));
     daemon
         .set_repository_inspector(Arc::new(DeclarationInspector {
+            host_ref: daemon.local_host_id().expect("local host").to_string(),
             bootstrap: RepositorySpec::remote("https://github.com/example/bootstrap").expect("bootstrap spec"),
             commit: Arc::clone(&commit),
         }))
@@ -591,7 +602,13 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let (daemon, backend, _config, _runtime, tmp) = start_daemon().await;
     let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
     let commit = Arc::new(RwLock::new("ops-commit".to_string()));
-    daemon.set_repository_inspector(Arc::new(DeclarationInspector { bootstrap: ops_spec.clone(), commit })).await;
+    daemon
+        .set_repository_inspector(Arc::new(DeclarationInspector {
+            host_ref: daemon.local_host_id().expect("local host").to_string(),
+            bootstrap: ops_spec.clone(),
+            commit,
+        }))
+        .await;
     std::fs::write(
         tmp.path().join("project.yaml"),
         "name: demo\nmembers:\n  - alias: app\n    url: https://github.com/example/app\n    roles: [code]\n  - alias: docs\n    url: https://github.com/example/docs\n    roles: [code]\n  - alias: operations\n    url: https://github.com/example/project-ops\n    roles: [ops]\n",
@@ -819,6 +836,7 @@ async fn project_replica_does_not_materialize_operational_entries_on_refresh() {
     let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
     daemon
         .set_repository_inspector(Arc::new(DeclarationInspector {
+            host_ref: daemon.local_host_id().expect("local host").to_string(),
             bootstrap: ops_spec.clone(),
             commit: Arc::new(RwLock::new("replica-commit".to_string())),
         }))
@@ -927,6 +945,7 @@ async fn project_materialized_workflow_coexists_with_a_global_template_of_the_sa
     let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
     daemon
         .set_repository_inspector(Arc::new(DeclarationInspector {
+            host_ref: daemon.local_host_id().expect("local host").to_string(),
             bootstrap: ops_spec,
             commit: Arc::new(RwLock::new("ops-commit".to_string())),
         }))
@@ -963,6 +982,7 @@ async fn ops_entry_rejects_a_verification_command_targeting_a_non_code_member() 
     let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
     daemon
         .set_repository_inspector(Arc::new(DeclarationInspector {
+            host_ref: daemon.local_host_id().expect("local host").to_string(),
             bootstrap: ops_spec,
             commit: Arc::new(RwLock::new("ops-commit".to_string())),
         }))
@@ -1001,6 +1021,7 @@ async fn ops_entry_rejects_an_ensure_whose_workflow_has_an_exit() {
     let ops_spec = RepositorySpec::remote("https://github.com/example/project-ops").expect("ops spec");
     daemon
         .set_repository_inspector(Arc::new(DeclarationInspector {
+            host_ref: daemon.local_host_id().expect("local host").to_string(),
             bootstrap: ops_spec,
             commit: Arc::new(RwLock::new("ops-commit".to_string())),
         }))
@@ -1138,6 +1159,7 @@ async fn mirror_and_canonical_roots_preserve_the_existing_mirror_project() {
         .expect("old mirror project");
     daemon
         .set_repository_inspector(Arc::new(PerPathInspector {
+            host_ref: daemon.local_host_id().expect("local host").to_string(),
             specs: BTreeMap::from([
                 (mirror_root, RepositorySpec::remote(mirror_url).expect("mirror clone")),
                 (github_root, RepositorySpec::remote(canonical_url).expect("GitHub clone")),

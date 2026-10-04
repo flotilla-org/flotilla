@@ -45,6 +45,12 @@ pub struct TypedSet<D, T: ?Sized> {
     inner: IndexMap<String, (D, Arc<T>)>,
 }
 
+impl<D: Clone, T: ?Sized> Clone for TypedSet<D, T> {
+    fn clone(&self) -> Self {
+        Self { inner: self.inner.clone() }
+    }
+}
+
 pub type ProviderSet<T> = TypedSet<ProviderDescriptor, T>;
 impl<D, T: ?Sized> TypedSet<D, T> {
     pub fn new() -> Self {
@@ -140,6 +146,7 @@ impl<D, T: ?Sized> Default for TypedSet<D, T> {
     }
 }
 
+#[derive(Clone)]
 pub struct ProviderRegistry {
     pub agent_adapters: AgentAdapterRegistry,
     pub clone_provisioners: ProviderSet<dyn CloneProvisioner>,

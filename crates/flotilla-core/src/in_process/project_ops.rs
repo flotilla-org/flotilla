@@ -1,7 +1,7 @@
 //! Project registration, refresh, and operational entry materialization.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -18,7 +18,6 @@ use flotilla_resources::{
     RepositoryIdentity, RepositoryKey, RepositorySpec, ResourceBackend, ResourceError, ResourceObject, WorkflowTemplate,
     WorkflowTemplateSpec, WriterIdentity, MANAGED_BY_LABEL,
 };
-use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use super::{
@@ -160,16 +159,23 @@ fn project_target_syntax(target: &str) -> ProjectTargetSyntax {
     }
 }
 
-/// Read-only lookup of local checkout paths by repository identity.
-/// This is the separate `repository_keys_by_path` index; it never takes the
-/// `repos`, `repo_order`, or `path_identities` locks.
+/// Local execution paths come from Checkout facts, joined by Repository key.
 pub(super) struct RepositoryIndex<'a> {
-    pub(super) keys_by_path: &'a RwLock<HashMap<PathBuf, RepositoryKey>>,
+    pub(super) backend: &'a ResourceBackend,
+    pub(super) observed: &'a ResourceBackend,
+    pub(super) namespace: &'a std::sync::RwLock<String>,
+    pub(super) host: &'a str,
 }
 
 impl RepositoryIndex<'_> {
-    async fn paths_for(&self, key: &RepositoryKey) -> Vec<PathBuf> {
-        self.keys_by_path.read().await.iter().filter(|(_, candidate)| *candidate == key).map(|(path, _)| path.clone()).collect()
+    async fn paths_for(&self, key: &RepositoryKey) -> Result<Vec<PathBuf>, String> {
+        let namespace = self.namespace.read().expect("namespace lock poisoned").clone();
+        Ok(crate::repository_addressing::local_checkouts(self.backend, self.observed, &namespace, self.host)
+            .await?
+            .into_iter()
+            .filter(|checkout| checkout.spec.repo_ref() == key)
+            .filter_map(|checkout| super::checkout_path(&checkout).map(PathBuf::from))
+            .collect())
     }
 }
 
@@ -256,7 +262,7 @@ impl ProjectService<'_> {
                 });
             };
             let key = RepositoryKey(repository.metadata.name.clone());
-            let mut paths = self.repository_index.paths_for(&key).await;
+            let mut paths = self.repository_index.paths_for(&key).await?;
             paths.sort();
             match paths.as_slice() {
                 [] => return Err(format!("bootstrap repository `{target}` has no local checkout on this host")),
@@ -508,7 +514,7 @@ impl ProjectService<'_> {
             let path = if member.repo == bootstrap.repository.key() {
                 bootstrap.repository.checkout.path.clone()
             } else {
-                let mut paths = self.repository_index.paths_for(&member.repo).await;
+                let mut paths = self.repository_index.paths_for(&member.repo).await?;
                 paths.sort();
                 match paths.as_slice() {
                     [] => {
@@ -1047,17 +1053,50 @@ impl ProjectService<'_> {
             RepositoryInspection { spec: repository_spec.clone(), checkout, transport_url: None, replaces_prior_repository: false };
         let inspector = self.operations.repository_inspector().await?;
         let mut providers = ProviderData::default();
-        for checkout in inspector.inspect_checkouts(&inspection).await? {
-            providers.checkouts.insert(QualifiedPath::host(HostId::new(checkout.host_ref), checkout.path), flotilla_protocol::Checkout {
-                branch: checkout.git_ref,
-                is_main: checkout.is_main,
-                trunk_ahead_behind: None,
-                remote_ahead_behind: None,
-                working_tree: None,
-                last_commit: None,
-                host_name: None,
-                environment_id: None,
-            });
+        // Each main Checkout is an independent observation producer. Gather
+        // their inventories before reconciling the Repository/host scope so
+        // refreshing one clone cannot erase a sibling clone's identity facts.
+        let mut inspections = vec![inspection.clone()];
+        for known in crate::repository_addressing::local_checkouts(
+            self.resource_backend,
+            self.observed_resource_backend,
+            namespace,
+            &inspection.checkout.host_ref,
+        )
+        .await?
+        {
+            if let flotilla_resources::CheckoutSpec::Observed(known) = known.spec {
+                if known.repo_ref == *repository_key && known.is_main && Path::new(&known.path) != inspection.checkout.path {
+                    inspections.push(RepositoryInspection {
+                        spec: repository_spec.clone(),
+                        checkout: crate::repository_inspection::LocalCheckoutInspection {
+                            path: PathBuf::from(known.path),
+                            host_ref: known.host_ref,
+                            git_ref: known.r#ref,
+                            is_main: true,
+                        },
+                        transport_url: None,
+                        replaces_prior_repository: false,
+                    });
+                }
+            }
+        }
+        for inspection in inspections {
+            for checkout in inspector.inspect_checkouts(&inspection).await? {
+                providers.checkouts.insert(
+                    QualifiedPath::host(HostId::new(checkout.host_ref), checkout.path),
+                    flotilla_protocol::Checkout {
+                        branch: checkout.git_ref,
+                        is_main: checkout.is_main,
+                        trunk_ahead_behind: None,
+                        remote_ahead_behind: None,
+                        working_tree: None,
+                        last_commit: None,
+                        host_name: None,
+                        environment_id: None,
+                    },
+                );
+            }
         }
         crate::observed_resources::reconcile_checkouts(
             self.observed_resource_backend,
@@ -1268,13 +1307,12 @@ mod tests {
         let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let namespace = std::sync::RwLock::new("flotilla".to_string());
-        let repository_keys_by_path = RwLock::new(HashMap::new());
         let service = ProjectService {
             resource_backend: &backend,
             observed_resource_backend: &observed,
             clock: &clock,
             namespace: &namespace,
-            repository_index: RepositoryIndex { keys_by_path: &repository_keys_by_path },
+            repository_index: RepositoryIndex { backend: &backend, observed: &observed, namespace: &namespace, host: "local-host" },
             operations: &operations,
         };
 

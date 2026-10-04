@@ -736,9 +736,9 @@ impl ChangeRequestTracker for CountingChangeRequestTracker {
 async fn daemon_for_cwd() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
-    std::fs::create_dir_all(repo.join(".git")).expect("create .git dir");
+    init_git_repo(&repo);
     let config = test_config_store(temp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
+    let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::local()).await;
     (temp, repo, daemon)
 }
 
@@ -5447,8 +5447,10 @@ async fn daemon_for_duplicate_fake_repos() -> (tempfile::TempDir, PathBuf, PathB
     discovery.repo_detectors.push(Box::new(FixedRemoteHostDetector { owner: "owner", repo: "repo" }));
 
     let config = test_config_store(temp.path().join("config"));
-    let daemon = InProcessDaemon::new(vec![repo_a.clone(), repo_b.clone()], config, discovery, HostName::local()).await;
+    let daemon = InProcessDaemon::new(Vec::new(), config, discovery, HostName::local()).await;
     install_test_repository_inspector(&daemon, Arc::new(std::sync::RwLock::new("repo".to_string()))).await;
+    daemon.add_repo(&repo_a).await.expect("observe first checkout");
+    daemon.add_repo(&repo_b).await.expect("observe second checkout");
     (temp, repo_a, repo_b, daemon)
 }
 
@@ -5977,12 +5979,14 @@ async fn discovery_resolves_origin_forge_and_binds_both_forgejo_sources() {
         .await
         .expect("declare Forge");
 
+    daemon.add_repo(&repo).await.expect("observe declared forge repository");
     let result = daemon.discover_repo_for_environment_for_test(&repo, daemon.local_environment_id()).await.expect("discover providers");
     assert_eq!(result.host_repo_bag.find_origin_forge().expect("origin Forge").forge_id, "flotilla-lab");
     assert_eq!(result.host_repo_bag.repo_identity().expect("repo identity").authority, "forgejo.lab.flotilla.work");
-    assert!(result.registry.issue_trackers.get("forgejo").is_some(), "{:?}", result.unmet);
-    assert!(result.registry.change_requests.get("forgejo").is_some());
-    assert!(result.registry.change_requests.get("github").is_none());
+    // Forge providers are demand-selected from declared Repository intent;
+    // checkout discovery retains only checkout and host capabilities.
+    assert!(result.registry.issue_trackers.is_empty());
+    assert!(result.registry.change_requests.is_empty());
     daemon
         .issue_provider_for_source(&IssueSource { service: "https://forgejo.lab.flotilla.work".into(), scope: "lab/flotilla".into() })
         .await
@@ -6903,7 +6907,7 @@ async fn stop_observing_missing_checkout_refuses_without_started_event() {
         .execute(Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Path(repo.clone()) }).build())
         .await
         .expect_err("untracked repo removal should fail");
-    assert!(err.contains("no observed checkout at"));
+    assert!(err.contains("no Repository matches"));
 
     let started = tokio::time::timeout(std::time::Duration::from_millis(200), async {
         loop {
@@ -7176,7 +7180,7 @@ async fn add_repo_uses_manager_backed_local_environment_for_provider_discovery()
 }
 
 #[tokio::test]
-async fn selected_static_ssh_repo_discovery_uses_default_remote_host_detector_via_remote_runner() {
+async fn selected_static_ssh_checkout_discovery_does_not_infer_forge_from_remotes() {
     let temp = tempfile::tempdir().expect("create tempdir");
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
@@ -7358,10 +7362,8 @@ hostname = "buildbox.example"
         .await
         .expect("discover repo in remote direct environment");
 
-    assert_eq!(
-        result.host_repo_bag.repo_identity(),
-        Some(RepoIdentity { authority: "github.com".into(), path: "owner/remote-repo".into() })
-    );
+    // Checkout discovery has no Repository intent: remotes must not select a forge.
+    assert_eq!(result.host_repo_bag.repo_identity(), None);
 }
 
 #[tokio::test]
