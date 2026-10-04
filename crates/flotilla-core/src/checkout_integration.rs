@@ -109,29 +109,7 @@ pub fn change_request_subjects_from_claim(
     repositories: &[flotilla_resources::ConvoyRepositorySpec],
     forges: &[flotilla_resources::ForgeSpec],
 ) -> Vec<flotilla_protocol::Subject> {
-    let context = flotilla_protocol::ReferenceContext {
-        repositories: repositories
-            .iter()
-            .filter_map(|repository| {
-                let address = flotilla_resources::change_request_address_with_forges(&repository.url, "1", forges).ok()?;
-                let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, .. } = address else { return None };
-                let canonical = flotilla_resources::canonicalize_repo_url(&repository.url).ok()?;
-                let web_base = forges
-                    .iter()
-                    .find(|forge| forge.forge_id == service)
-                    .map(|forge| forge.https_url.clone())
-                    .or_else(|| canonical.strip_suffix(&format!("/{scope}")).map(str::to_string))?;
-                let forge_alias = (service != "github.com").then(|| service.clone());
-                Some(flotilla_protocol::RepositoryAlias {
-                    project: None,
-                    alias: scope.rsplit('/').next()?.to_string(),
-                    source: flotilla_protocol::provider_data::IssueSource { service, scope },
-                    web_base,
-                    forge_alias,
-                })
-            })
-            .collect(),
-    };
+    let context = flotilla_resources::convoy_reference_context(repositories, None, None, forges, |_| None);
     let mut found = Vec::new();
     for (start, _) in message.match_indices("https://").chain(message.match_indices("http://")) {
         let tail = &message[start..];

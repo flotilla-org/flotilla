@@ -3849,12 +3849,21 @@ impl InProcessDaemon {
         self.discover_convoy_branch_subjects_with_resolution(namespace, convoy_name, branch, None).await
     }
 
+    pub async fn refresh_convoy_branch(
+        &self,
+        repository_keys: &[RepositoryKey],
+        branch: &str,
+        binding: Option<&flotilla_resources::BoundChangeRequest>,
+    ) -> crate::convoy_branch_refresh::ConvoyBranchRefresh {
+        self.convoy_admission.refresh_convoy_branch(repository_keys, branch, binding).await
+    }
+
     pub async fn discover_convoy_branch_subjects_with_resolution(
         &self,
         namespace: &str,
         convoy_name: &str,
         branch: &str,
-        resolution: Option<&Result<Option<ConvoyChangeRequest>, String>>,
+        resolution: Option<&crate::convoy_branch_refresh::ConvoyBranchRefresh>,
     ) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(namespace);
         let convoy = match convoys.get(convoy_name).await {
@@ -3908,26 +3917,22 @@ impl InProcessDaemon {
             }) {
                 continue;
             }
-            match resolution {
-                Some(Ok(Some(request))) if request.repository_key == repository.repo_ref => {
-                    let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
-                    if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
-                        if should_discover(&subject) {
-                            subjects.push((subject, flotilla_protocol::Relationship::Produces));
+            if let Some((_, result)) =
+                resolution.and_then(|refresh| refresh.repositories.iter().find(|(key, _)| key == &repository.repo_ref))
+            {
+                match result {
+                    Ok(Some(request)) => {
+                        let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
+                        if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
+                            if should_discover(&subject) {
+                                subjects.push((subject, flotilla_protocol::Relationship::Produces));
+                            }
                         }
                     }
-                    continue;
+                    Ok(None) => {}
+                    Err(error) => errors.push(error.clone()),
                 }
-                // The batched lookup covered every repository. A miss or error is
-                // retried by the aggregator; repeating it per repository here
-                // would spend extra provider quota. A match in another repository
-                // falls through to this repository's individual lookup.
-                Some(Ok(None)) => continue,
-                Some(Err(error)) => {
-                    errors.push(error.clone());
-                    continue;
-                }
-                _ => {}
+                continue;
             }
             match self.resolve_convoy_change_request(std::slice::from_ref(&repository.repo_ref), branch, None).await {
                 Ok(Some(request)) => {
@@ -3993,34 +3998,17 @@ impl InProcessDaemon {
         } else {
             None
         };
-        let repositories = convoy
-            .spec
-            .repositories
-            .iter()
-            .filter_map(|repository| {
-                let address = change_request_address_with_forges(&repository.url, "1", &forges).ok()?;
-                let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, .. } = address else { return None };
-                let canonical = flotilla_resources::canonicalize_repo_url(&repository.url).ok()?;
-                let web_base = forges
-                    .iter()
-                    .find(|forge| forge.forge_id == service)
-                    .map(|forge| forge.https_url.clone())
-                    .or_else(|| canonical.strip_suffix(&format!("/{scope}")).map(str::to_string))?;
-                let alias = project
-                    .as_ref()
-                    .and_then(|project| project.spec.repositories.iter().find(|candidate| candidate.repo == repository.repo_ref))
-                    .and_then(|repository| repository.alias.clone())
-                    .unwrap_or_else(|| scope.rsplit('/').next().unwrap_or(&scope).to_string());
-                Some(flotilla_protocol::RepositoryAlias {
-                    project: convoy.spec.project_ref.clone(),
-                    alias,
-                    source: flotilla_protocol::IssueSource { service: service.clone(), scope },
-                    web_base,
-                    forge_alias: (service != "github.com").then_some(service),
-                })
-            })
-            .collect();
-        Ok(flotilla_protocol::ReferenceContext { repositories })
+        let repositories =
+            self.resource_backend.including_replicas::<Repository>(namespace).list().await.map_err(|error| error.to_string())?;
+        let repository_specs =
+            repositories.items.iter().map(|record| (record.object.spec.key(), &record.object.spec)).collect::<HashMap<_, _>>();
+        Ok(flotilla_resources::convoy_reference_context(
+            &convoy.spec.repositories,
+            convoy.spec.project_ref.as_deref(),
+            project.as_ref().map(|project| &project.spec),
+            &forges,
+            |key| repository_specs.get(key).copied(),
+        ))
     }
 
     pub async fn link_convoy_subject(

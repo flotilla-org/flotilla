@@ -298,70 +298,116 @@ impl ConvoyAdmission {
         branch: &str,
         change_request_id: Option<&str>,
     ) -> Result<Option<ConvoyChangeRequest>, String> {
-        if let Some(change_request) = self.resolve_observed_convoy_change_request(repository_keys, change_request_id).await? {
+        match change_request_id {
+            Some(id) => self.resolve_bound_convoy_change_request(repository_keys, id).await,
+            None => self.refresh_convoy_branch(repository_keys, branch, None).await.primary,
+        }
+    }
+
+    async fn resolve_bound_convoy_change_request(
+        &self,
+        repository_keys: &[RepositoryKey],
+        id: &str,
+    ) -> Result<Option<ConvoyChangeRequest>, String> {
+        if let Some(change_request) = self.resolve_observed_convoy_change_request(repository_keys, Some(id)).await? {
             return Ok(Some(change_request));
         }
-        if let Some(id) = change_request_id {
-            let namespace = self.provisioning_namespace().await;
-            let repositories = self.backend.including_replicas::<Repository>(&namespace);
-            let mut failures = Vec::new();
-            for repository_key in repository_keys {
-                let repository = match repositories.get(&repository_key.to_string()).await {
-                    Ok(repository) => repository,
-                    Err(error) => {
-                        failures.push(ObservationError::Forge(error.to_string()));
-                        continue;
-                    }
-                };
-                let Some(remote) = repository.object.spec.live_remote() else { continue };
-                let address = match change_request_address(remote, id) {
-                    Ok(address) => address,
-                    Err(error) => {
-                        failures.push(ObservationError::Forge(error));
-                        continue;
-                    }
-                };
-                let Some(subject) = ChangeRequestRef::from_address(&namespace, &address) else { continue };
-                match self.change_request_observation_source.observe(&subject).await {
-                    Ok(observation) => {
-                        let status = match observation.state.value {
-                            Some(ObservedChangeRequestState::Open) => flotilla_protocol::ChangeRequestStatus::Open,
-                            Some(ObservedChangeRequestState::Draft) => flotilla_protocol::ChangeRequestStatus::Draft,
-                            Some(ObservedChangeRequestState::Merged) => flotilla_protocol::ChangeRequestStatus::Merged,
-                            Some(ObservedChangeRequestState::Closed) => flotilla_protocol::ChangeRequestStatus::Closed,
-                            None => continue,
-                        };
-                        return Ok(Some(ConvoyChangeRequest { id: id.to_string(), status, repository_key: repository_key.clone() }));
-                    }
-                    Err(error) => failures.push(error),
-                }
-            }
-            // Preserve classification until the final admission diagnostic, including
-            // classified limits with no retry deadline. Display wording is not policy.
-            if let Some(error) = failures.iter().find(|error| matches!(error, ObservationError::RateLimited { .. })) {
-                return Err(error.to_string());
-            }
-            return failures.into_iter().next().map_or(Ok(None), |error| Err(error.to_string()));
-        }
-
-        let (live_candidates, setup_failures) = self.repository_change_request_candidates(repository_keys).await;
-
-        let mut failures = setup_failures.into_iter().map(ObservationError::Forge).collect::<Vec<_>>();
-        for (repository, _, provider) in live_candidates {
-            match self.branch_lookup_observer.find(&repository.to_string(), &provider, branch).await {
-                Ok(Some((id, request))) => {
-                    return Ok(Some(ConvoyChangeRequest { id, status: request.status, repository_key: repository }));
-                }
-                Ok(None) => {}
+        let namespace = self.provisioning_namespace().await;
+        let repositories = self.backend.including_replicas::<Repository>(&namespace);
+        let mut failures = Vec::new();
+        for repository_key in repository_keys {
+            let repository = match repositories.get(&repository_key.to_string()).await {
+                Ok(repository) => repository,
                 Err(error) => {
-                    failures.push(error);
+                    failures.push(ObservationError::Forge(error.to_string()));
+                    continue;
                 }
+            };
+            let Some(remote) = repository.object.spec.live_remote() else { continue };
+            let address = match change_request_address(remote, id) {
+                Ok(address) => address,
+                Err(error) => {
+                    failures.push(ObservationError::Forge(error));
+                    continue;
+                }
+            };
+            let Some(subject) = ChangeRequestRef::from_address(&namespace, &address) else { continue };
+            match self.change_request_observation_source.observe(&subject).await {
+                Ok(observation) => {
+                    let status = match observation.state.value {
+                        Some(ObservedChangeRequestState::Open) => flotilla_protocol::ChangeRequestStatus::Open,
+                        Some(ObservedChangeRequestState::Draft) => flotilla_protocol::ChangeRequestStatus::Draft,
+                        Some(ObservedChangeRequestState::Merged) => flotilla_protocol::ChangeRequestStatus::Merged,
+                        Some(ObservedChangeRequestState::Closed) => flotilla_protocol::ChangeRequestStatus::Closed,
+                        None => continue,
+                    };
+                    return Ok(Some(ConvoyChangeRequest { id: id.to_string(), status, repository_key: repository_key.clone() }));
+                }
+                Err(error) => failures.push(error),
             }
         }
+        // Preserve classification until the final admission diagnostic, including
+        // classified limits with no retry deadline. Display wording is not policy.
         if let Some(error) = failures.iter().find(|error| matches!(error, ObservationError::RateLimited { .. })) {
             return Err(error.to_string());
         }
         failures.into_iter().next().map_or(Ok(None), |error| Err(error.to_string()))
+    }
+
+    pub(super) async fn refresh_convoy_branch(
+        &self,
+        repository_keys: &[RepositoryKey],
+        branch: &str,
+        binding: Option<&flotilla_resources::BoundChangeRequest>,
+    ) -> crate::convoy_branch_refresh::ConvoyBranchRefresh {
+        let bound = match binding {
+            Some(binding) => {
+                Some(self.resolve_bound_convoy_change_request(std::slice::from_ref(&binding.repository_ref), &binding.id).await)
+            }
+            None => None,
+        };
+        let mut results = Vec::new();
+        let mut failures = Vec::new();
+        let mut primary = None;
+        let mut seen = BTreeSet::new();
+        for key in repository_keys {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let result = if binding.is_some_and(|binding| binding.repository_ref == *key) {
+                // The admitted ID remains authoritative for this repository;
+                // reuse its lookup for discovery just as for the primary row.
+                bound.as_ref().expect("binding has a lookup").clone().map_err(ObservationError::Forge)
+            } else {
+                let (candidates, setup_failures) = self.repository_change_request_candidates(std::slice::from_ref(key)).await;
+                if let Some((repository, _, provider)) = candidates.into_iter().next() {
+                    self.branch_lookup_observer.find(&repository.to_string(), &provider, branch).await.map(|found| {
+                        found.map(|(id, request)| ConvoyChangeRequest { id, status: request.status, repository_key: repository })
+                    })
+                } else {
+                    // Setup reports repository-read, forge-identity, or provider-discovery
+                    // failures. The generic text defends against an empty diagnostic set.
+                    Err(ObservationError::Forge(setup_failures.into_iter().next().unwrap_or_else(|| "no repository provider".into())))
+                }
+            };
+            match &result {
+                Ok(Some(request)) if primary.is_none() => primary = Some(request.clone()),
+                Err(error) => failures.push(error.clone()),
+                _ => {}
+            }
+            results.push((key.clone(), result.map_err(|error| error.to_string())));
+        }
+        // An admitted ID remains authoritative even on absence or failure;
+        // matches in other repositories still contribute discovery results.
+        let primary = if let Some(bound) = bound {
+            bound
+        } else if primary.is_some() {
+            Ok(primary)
+        } else {
+            let error = failures.iter().find(|error| matches!(error, ObservationError::RateLimited { .. })).or_else(|| failures.first());
+            error.map_or(Ok(None), |error| Err(error.to_string()))
+        };
+        crate::convoy_branch_refresh::ConvoyBranchRefresh { primary, repositories: results }
     }
 
     pub(super) async fn resolve_observed_convoy_change_request(

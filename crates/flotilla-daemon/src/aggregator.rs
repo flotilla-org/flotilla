@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use flotilla_core::event_sink::BroadcastEventSink;
 use flotilla_core::{
     aggregator_projection::AggregatorProjectionState,
+    convoy_branch_refresh::ConvoyBranchRefresh,
     event_sink::EventSink,
     in_process::InProcessDaemon,
     ops_entry::{ENSURED_FROM_ANNOTATION, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION},
@@ -27,13 +28,13 @@ use flotilla_protocol::{
     RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{
-    api_version, change_request_address, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout,
-    CheckoutSpec, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Demand,
-    DemandAddressee, DemandState, Environment, Presentation, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard,
-    RegardExpiryPolicy, ReplicaReadResolver, Repository, RepositoryIdentity as ResourceRepositoryIdentity, Resource, ResourceError,
-    ResourceList, ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState,
-    TerminalSession, TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent, WatchStart, WatchStream,
-    WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec, Convoy,
+    ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Demand, DemandAddressee,
+    DemandState, Environment, Presentation, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard, RegardExpiryPolicy,
+    ReplicaReadResolver, Repository, RepositoryIdentity as ResourceRepositoryIdentity, Resource, ResourceError, ResourceList,
+    ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState, TerminalSession,
+    TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase,
+    WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::{
@@ -148,19 +149,19 @@ pub(crate) trait AttachCapabilityResolver: Send + Sync {
 
 #[async_trait]
 pub(crate) trait ConvoyChangeRequestResolver: Send + Sync {
-    async fn resolve_change_request(
+    async fn refresh_branch(
         &self,
         repositories: &[RepositoryKey],
         branch: &str,
-        change_request_id: Option<&str>,
-    ) -> Result<Option<ConvoyChangeRequest>, String>;
+        binding: Option<&flotilla_resources::BoundChangeRequest>,
+    ) -> ConvoyBranchRefresh;
 
     async fn discover_branch_subjects(
         &self,
         _namespace: &str,
         _convoy: &str,
         _branch: &str,
-        _resolution: Result<Option<ConvoyChangeRequest>, String>,
+        _resolution: ConvoyBranchRefresh,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -168,13 +169,13 @@ pub(crate) trait ConvoyChangeRequestResolver: Send + Sync {
 
 #[async_trait]
 impl ConvoyChangeRequestResolver for InProcessDaemon {
-    async fn resolve_change_request(
+    async fn refresh_branch(
         &self,
         repositories: &[RepositoryKey],
         branch: &str,
-        change_request_id: Option<&str>,
-    ) -> Result<Option<ConvoyChangeRequest>, String> {
-        self.resolve_convoy_change_request(repositories, branch, change_request_id).await
+        binding: Option<&flotilla_resources::BoundChangeRequest>,
+    ) -> ConvoyBranchRefresh {
+        self.refresh_convoy_branch(repositories, branch, binding).await
     }
 
     async fn discover_branch_subjects(
@@ -182,7 +183,7 @@ impl ConvoyChangeRequestResolver for InProcessDaemon {
         namespace: &str,
         convoy: &str,
         branch: &str,
-        resolution: Result<Option<ConvoyChangeRequest>, String>,
+        resolution: ConvoyBranchRefresh,
     ) -> Result<(), String> {
         self.discover_convoy_branch_subjects_with_resolution(namespace, convoy, branch, Some(&resolution)).await
     }
@@ -259,7 +260,12 @@ struct ChangeRequestResolution {
     reference: ResourceRef,
     generation: uuid::Uuid,
     branch: String,
-    result: Result<Option<ConvoyChangeRequest>, String>,
+    result: ConvoyBranchRefresh,
+}
+
+struct ChangeRequestRefreshGroup {
+    binding: Option<flotilla_resources::BoundChangeRequest>,
+    targets: Vec<(ResourceRef, uuid::Uuid)>,
 }
 
 struct ChangeRequestRefreshQueue {
@@ -1147,11 +1153,9 @@ impl Aggregator {
             self.convoy_change_requests.remove(&reference);
             return;
         };
-        let (repositories, change_request_id) = match &convoy.spec.change_request {
-            Some(change_request) => (vec![change_request.repository_ref.clone()], Some(change_request.id.clone())),
-            None => (convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>(), None),
-        };
-        if repositories.is_empty() {
+        let repositories = convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>();
+        let binding = convoy.spec.change_request.clone();
+        if repositories.is_empty() && binding.is_none() {
             self.convoy_change_requests.remove(&reference);
             return;
         }
@@ -1164,7 +1168,7 @@ impl Aggregator {
         let task_reference = reference.clone();
         let task = tokio::spawn(async move {
             tokio::time::sleep_until(refresh_at).await;
-            let result = resolver.resolve_change_request(&repositories, &branch, change_request_id.as_deref()).await;
+            let result = resolver.refresh_branch(&repositories, &branch, binding.as_ref()).await;
             let _ = refresh_tx.send(ChangeRequestResolution { reference: task_reference, generation, branch, result });
         });
         self.change_request_refresh_tasks.insert(reference, task);
@@ -1178,7 +1182,7 @@ impl Aggregator {
         self.change_request_refresh_tasks.remove(&reference);
         let discovery_resolution = result.clone();
         let mut failed = false;
-        match result {
+        match result.primary {
             Ok(Some(change_request)) => {
                 self.convoy_change_requests.insert(reference.clone(), change_request);
                 self.change_request_refresh_failures.remove(&reference);
@@ -1244,7 +1248,7 @@ impl Aggregator {
     fn schedule_change_request_refresh_pass(&mut self, convoys: impl IntoIterator<Item = (ResourceRef, ResourceObject<Convoy>)>) {
         // Repository order is resolver precedence, so only identical ordered
         // repository lists may safely share one lookup.
-        let mut lookups = HashMap::<(Vec<RepositoryKey>, String, Option<String>), Vec<(ResourceRef, uuid::Uuid)>>::new();
+        let mut lookups = HashMap::<(Vec<RepositoryKey>, String, Option<(RepositoryKey, String)>), ChangeRequestRefreshGroup>::new();
         for (reference, convoy) in convoys {
             if !self.is_home_convoy(&reference) {
                 continue;
@@ -1261,21 +1265,23 @@ impl Aggregator {
                 self.convoy_change_requests.remove(&reference);
                 continue;
             };
-            let (repositories, change_request_id) = match &convoy.spec.change_request {
-                Some(change_request) => (vec![change_request.repository_ref.clone()], Some(change_request.id.clone())),
-                None => (convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>(), None),
-            };
-            if repositories.is_empty() {
+            let repositories = convoy.spec.repositories.iter().map(|repository| repository.repo_ref.clone()).collect::<Vec<_>>();
+            let binding = convoy.spec.change_request.as_ref().map(|binding| (binding.repository_ref.clone(), binding.id.clone()));
+            if repositories.is_empty() && binding.is_none() {
                 self.convoy_change_requests.remove(&reference);
                 continue;
             }
-            lookups.entry((repositories, branch, change_request_id)).or_default().push((reference, generation));
+            lookups
+                .entry((repositories, branch, binding))
+                .or_insert_with(|| ChangeRequestRefreshGroup { binding: convoy.spec.change_request.clone(), targets: Vec::new() })
+                .targets
+                .push((reference, generation));
         }
 
         let Some(resolver) = self.change_request_resolver.clone() else {
             return;
         };
-        for ((repositories, branch, change_request_id), targets) in lookups {
+        for ((repositories, branch, _), ChangeRequestRefreshGroup { binding, targets }) in lookups {
             let now = Instant::now();
             let refresh_at = targets.iter().map(|(reference, _)| self.next_change_request_refresh(reference, now)).max().unwrap_or(now);
             for (reference, _) in &targets {
@@ -1285,7 +1291,7 @@ impl Aggregator {
             let lookup_branch = branch.clone();
             let lookup = async move {
                 tokio::time::sleep_until(refresh_at).await;
-                resolver.resolve_change_request(&repositories, &lookup_branch, change_request_id.as_deref()).await
+                resolver.refresh_branch(&repositories, &lookup_branch, binding.as_ref()).await
             }
             .boxed()
             .shared();
@@ -2189,38 +2195,15 @@ impl Aggregator {
         let name = if convoy.spec.role.is_empty() { &convoy.metadata.name } else { &convoy.spec.role };
         let status = convoy.status.as_ref();
         let subject_conflicts = subject_relationship_conflicts(convoy);
-        let reference_context = flotilla_protocol::ReferenceContext {
-            repositories: convoy
-                .spec
-                .repositories
-                .iter()
-                .filter_map(|repository| {
-                    let (service, scope) = match self.repositories.get(&repository.repo_ref).map(|object| object.spec.identity()) {
-                        Some(ResourceRepositoryIdentity::Forge { forge_ref, owner, repo_name }) => {
-                            (forge_ref.clone(), format!("{owner}/{repo_name}"))
-                        }
-                        _ => {
-                            let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, .. } =
-                                change_request_address(&repository.url, "1").ok()?
-                            else {
-                                return None;
-                            };
-                            (service, scope)
-                        }
-                    };
-                    let canonical = flotilla_resources::canonicalize_repo_url(&repository.url).ok()?;
-                    let web_base = canonical.strip_suffix(&format!("/{scope}"))?.to_string();
-                    let forge_alias = (service != "github.com").then(|| service.clone());
-                    Some(flotilla_protocol::RepositoryAlias {
-                        project: convoy.spec.project_ref.clone(),
-                        alias: scope.rsplit('/').next()?.to_string(),
-                        source: flotilla_protocol::IssueSource { service, scope },
-                        web_base,
-                        forge_alias,
-                    })
-                })
-                .collect(),
-        };
+        let project =
+            convoy.spec.project_ref.as_ref().and_then(|name| self.projects.get(&(convoy.metadata.namespace.clone(), name.clone())));
+        let reference_context = flotilla_resources::convoy_reference_context(
+            &convoy.spec.repositories,
+            convoy.spec.project_ref.as_deref(),
+            project.map(|project| &project.spec),
+            &[],
+            |key| self.repositories.get(key).map(|record| &record.spec),
+        );
         let mut subjects = convoy_subject_rows(convoy, &reference_context);
         for entry in &mut subjects {
             entry.repository_key = self.convoy_subject_repository_key(convoy, &entry.subject);
@@ -2359,17 +2342,14 @@ impl Aggregator {
         subject: &flotilla_protocol::Subject,
     ) -> Option<RepositoryKey> {
         convoy.spec.repositories.iter().find_map(|repository| {
-            let matches = match self.repositories.get(&repository.repo_ref).map(|record| record.spec.identity()) {
-                Some(ResourceRepositoryIdentity::Forge { forge_ref, owner, repo_name }) => {
-                    forge_ref == &subject.source.service && format!("{owner}/{repo_name}") == subject.source.scope
-                }
-                _ => match change_request_address(&repository.url, "1").ok()? {
-                    flotilla_protocol::LeafAddress::ChangeRequest { service, scope, .. } => {
-                        service == subject.source.service && scope == subject.source.scope
-                    }
-                    _ => false,
-                },
-            };
+            let context = flotilla_resources::convoy_reference_context(
+                std::slice::from_ref(repository),
+                convoy.spec.project_ref.as_deref(),
+                None,
+                &[],
+                |key| self.repositories.get(key).map(|record| &record.spec),
+            );
+            let matches = context.repositories.iter().any(|alias| alias.source == subject.source);
             matches.then(|| repository.repo_ref.clone())
         })
     }
@@ -4037,45 +4017,50 @@ mod tests {
 
     #[async_trait]
     impl ConvoyChangeRequestResolver for BlockingChangeRequestResolver {
-        async fn resolve_change_request(
+        async fn refresh_branch(
             &self,
             _repositories: &[RepositoryKey],
             _branch: &str,
-            _change_request_id: Option<&str>,
-        ) -> Result<Option<flotilla_protocol::ConvoyChangeRequest>, String> {
+            _binding: Option<&BoundChangeRequest>,
+        ) -> ConvoyBranchRefresh {
             std::future::pending().await
         }
     }
 
     #[async_trait]
     impl ConvoyChangeRequestResolver for ScriptedChangeRequestResolver {
-        async fn resolve_change_request(
+        async fn refresh_branch(
             &self,
             repositories: &[RepositoryKey],
             branch: &str,
-            _change_request_id: Option<&str>,
-        ) -> Result<Option<flotilla_protocol::ConvoyChangeRequest>, String> {
+            _binding: Option<&BoundChangeRequest>,
+        ) -> ConvoyBranchRefresh {
             assert_eq!(repositories, [RepositoryKey("repo_flotilla".into())]);
             self.branches.lock().await.push(branch.to_string());
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.results.lock().await.pop_front().unwrap_or(Ok(None))
+            let primary = self.results.lock().await.pop_front().unwrap_or(Ok(None));
+            ConvoyBranchRefresh { repositories: vec![(repositories[0].clone(), primary.clone())], primary }
         }
     }
 
     #[async_trait]
     impl ConvoyChangeRequestResolver for RecordingBoundChangeRequestResolver {
-        async fn resolve_change_request(
+        async fn refresh_branch(
             &self,
             repositories: &[RepositoryKey],
             branch: &str,
-            change_request_id: Option<&str>,
-        ) -> Result<Option<flotilla_protocol::ConvoyChangeRequest>, String> {
-            self.calls.lock().await.push((repositories.to_vec(), branch.to_string(), change_request_id.map(str::to_string)));
-            Ok(Some(flotilla_protocol::ConvoyChangeRequest {
-                id: change_request_id.expect("bound lookup should carry an id").to_string(),
-                status: flotilla_protocol::ChangeRequestStatus::Open,
-                repository_key: repositories[0].clone(),
-            }))
+            binding: Option<&BoundChangeRequest>,
+        ) -> ConvoyBranchRefresh {
+            let binding = binding.expect("bound lookup should carry a binding");
+            self.calls.lock().await.push((repositories.to_vec(), branch.to_string(), Some(binding.id.clone())));
+            ConvoyBranchRefresh {
+                primary: Ok(Some(ConvoyChangeRequest {
+                    id: binding.id.clone(),
+                    status: flotilla_protocol::ChangeRequestStatus::Open,
+                    repository_key: binding.repository_ref.clone(),
+                })),
+                repositories: Vec::new(),
+            }
         }
     }
 
@@ -4827,11 +4812,14 @@ mod tests {
                 reference: reference.clone(),
                 generation: stale_generation,
                 branch: "feat/convoy".to_string(),
-                result: Ok(Some(ConvoyChangeRequest {
-                    id: "stale".to_string(),
-                    status: flotilla_protocol::ChangeRequestStatus::Open,
-                    repository_key: RepositoryKey("repo_flotilla".into()),
-                })),
+                result: ConvoyBranchRefresh {
+                    primary: Ok(Some(ConvoyChangeRequest {
+                        id: "stale".to_string(),
+                        status: flotilla_protocol::ChangeRequestStatus::Open,
+                        repository_key: RepositoryKey("repo_flotilla".into()),
+                    })),
+                    repositories: Vec::new(),
+                },
             })
             .await;
         assert!(!aggregator.convoy_change_requests.contains_key(&reference));
