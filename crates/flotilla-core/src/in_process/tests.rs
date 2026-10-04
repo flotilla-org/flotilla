@@ -421,6 +421,7 @@ fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
 
     // Generate repeated idle passes and both queue positions (head/following).
     // Each case runs every lifecycle state against both real storage backends.
+    // The convoy turn stays a single message; its position in the terminal queue varies.
     let passes = tc.draw(gs::integers::<usize>().min_value(2).max_value(4));
     let following = tc.draw(gs::booleans());
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
@@ -553,6 +554,7 @@ async fn assert_supervisor_turn_passes_are_idle(
 ) {
     let sessions = backend.clone().using::<ResourceTerminalSession>(namespace);
     let convoys = backend.clone().using::<ResourceConvoy>(namespace);
+    // This namespace has no concurrent writers, so list-to-subscribe cannot miss a write.
     let before_sessions = serde_json::to_value(sessions.list().await.expect("terminal baseline")).expect("serialize terminal baseline");
     let before_convoys = serde_json::to_value(convoys.list().await.expect("convoy baseline")).expect("serialize convoy baseline");
     let mut session_watch = sessions.watch(flotilla_resources::WatchStart::Now).await.expect("terminal watch");
