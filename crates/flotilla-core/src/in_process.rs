@@ -7819,6 +7819,23 @@ impl InProcessDaemon {
         let agent_exited = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
             session.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped)
         });
+        let attention = session
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .and_then(|session| session.object.status.as_ref())
+            .and_then(|status| status.attention.as_ref());
+        tracing::info!(
+            convoy = %name, source = ?sender, %vessel, %role,
+            attention_state = ?attention.map(|attention| attention.state),
+            attention_source = ?attention.map(|attention| attention.source),
+            attention_as_of = ?attention.map(|attention| attention.as_of),
+            hook_precedence_seconds = flotilla_resources::TerminalAttention::FRESH_FOR.num_seconds(),
+            reason = if crew_phase == flotilla_resources::CrewWorkPhase::Working && !at_turn_boundary && !agent_exited {
+                "queue_until_turn_boundary"
+            } else { "release_at_turn_boundary_or_completed_work" },
+            "crew turn delivery decision"
+        );
         if crew_phase == flotilla_resources::CrewWorkPhase::Working && !at_turn_boundary && !agent_exited {
             let displaced = status.pending_brief().map(|brief| brief.content.clone());
             apply_resource_status_patch(
@@ -8244,6 +8261,23 @@ impl InProcessDaemon {
                                 })
                         })
                     });
+                    let attention = visible
+                        .items
+                        .iter()
+                        .filter_map(|session| session.object.status.as_ref())
+                        .filter_map(|status| status.attention.as_ref())
+                        .max_by_key(|attention| attention.as_of);
+                    tracing::info!(
+                        convoy = %convoy.metadata.name, source = ?pending.sender,
+                        vessel = %pending.vessel, role = %pending.role,
+                        attention_state = ?attention.map(|attention| attention.state),
+                        attention_source = ?attention.map(|attention| attention.source),
+                        attention_as_of = ?attention.map(|attention| attention.as_of),
+                        queued_at = %pending.queued_at,
+                        hook_precedence_seconds = flotilla_resources::TerminalAttention::FRESH_FOR.num_seconds(),
+                        reason = if boundary { "release_fresh_idle_after_queue" } else { "skip_without_fresh_idle_after_queue" },
+                        "pending crew turn delivery decision"
+                    );
                     if boundary {
                         if let Err(error) = self
                             .convoy_resume_with_sender_locked(

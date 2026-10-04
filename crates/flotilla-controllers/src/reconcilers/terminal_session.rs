@@ -388,30 +388,43 @@ where
                     } else {
                         TerminalDeliveryReadiness::TurnBoundary
                     };
-                    return Ok(
-                        match self
-                            .runtime
-                            .deliver_message(session_id, &obj.spec, &message.text, readiness)
-                            .await
-                            .map_err(ResourceError::other)?
-                        {
-                            // Waiting for a turn boundary must not suppress the
-                            // observation that releases other queued deliveries.
-                            TerminalDeliveryOutcome::Pending => match self.runtime.observe_attention(session_id, &obj.spec).await {
-                                Ok(Some(observation)) => TerminalPrepared::Attention(observation),
-                                Ok(None) => TerminalPrepared::MessageDeliveryPending,
-                                Err(error) => {
-                                    tracing::warn!(%session_id, %error, "attention observation failed during pending delivery");
-                                    TerminalPrepared::MessageDeliveryPending
-                                }
-                            },
-                            TerminalDeliveryOutcome::Confirmed => TerminalPrepared::MessageDelivered(message.id.clone()),
-                            TerminalDeliveryOutcome::Unconfirmed(failure) => TerminalPrepared::MessageDeliveryUnconfirmed {
-                                message_id: message.id.clone(),
-                                message: failure.message().to_string(),
-                            },
+                    let outcome = self
+                        .runtime
+                        .deliver_message(session_id, &obj.spec, &message.text, readiness)
+                        .await
+                        .map_err(ResourceError::other)?;
+                    let attention = obj.status.as_ref().and_then(|status| status.attention.as_ref());
+                    tracing::info!(
+                        convoy = ?obj.metadata.labels.get(CONVOY_LABEL), source = ?message.sender,
+                        message_id = %message.id, %session_id, ?readiness, ?outcome,
+                        attention_state = ?attention.map(|attention| attention.state),
+                        attention_source = ?attention.map(|attention| attention.source),
+                        attention_as_of = ?attention.map(|attention| attention.as_of),
+                        hook_precedence_seconds = TerminalAttention::FRESH_FOR.num_seconds(),
+                        reason = match outcome {
+                            TerminalDeliveryOutcome::Pending => "wait_for_boundary_or_submission_evidence",
+                            TerminalDeliveryOutcome::Confirmed => "submission_confirmed",
+                            TerminalDeliveryOutcome::Unconfirmed(_) => "delivery_unconfirmed",
                         },
+                        "terminal crew turn delivery decision"
                     );
+                    return Ok(match outcome {
+                        // Waiting for a turn boundary must not suppress the
+                        // observation that releases other queued deliveries.
+                        TerminalDeliveryOutcome::Pending => match self.runtime.observe_attention(session_id, &obj.spec).await {
+                            Ok(Some(observation)) => TerminalPrepared::Attention(observation),
+                            Ok(None) => TerminalPrepared::MessageDeliveryPending,
+                            Err(error) => {
+                                tracing::warn!(%session_id, %error, "attention observation failed during pending delivery");
+                                TerminalPrepared::MessageDeliveryPending
+                            }
+                        },
+                        TerminalDeliveryOutcome::Confirmed => TerminalPrepared::MessageDelivered(message.id.clone()),
+                        TerminalDeliveryOutcome::Unconfirmed(failure) => TerminalPrepared::MessageDeliveryUnconfirmed {
+                            message_id: message.id.clone(),
+                            message: failure.message().to_string(),
+                        },
+                    });
                 }
             }
             match self.runtime.cleat_endpoint(session_id, &obj.spec).await {
@@ -588,6 +601,16 @@ where
                     let attention_changed = attention.as_ref().is_some_and(|attention| {
                         current.and_then(|status| status.attention.as_ref()).is_none_or(|previous| previous.should_replace_with(attention))
                     });
+                    tracing::debug!(
+                        convoy = ?obj.metadata.labels.get(CONVOY_LABEL),
+                        attention_state = ?attention.as_ref().map(|attention| attention.state),
+                        attention_source = ?attention.as_ref().map(|attention| attention.source),
+                        previous_state = ?current.and_then(|status| status.attention.as_ref()).map(|attention| attention.state),
+                        previous_source = ?current.and_then(|status| status.attention.as_ref()).map(|attention| attention.source),
+                        hook_precedence_seconds = TerminalAttention::FRESH_FOR.num_seconds(),
+                        reason = if attention_changed { "accept_observation" } else { "skip_precedence_or_debounce" },
+                        "terminal attention decision"
+                    );
                     let output_changed = observation
                         .output_digest
                         .as_ref()
