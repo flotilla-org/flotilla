@@ -1,0 +1,156 @@
+rounds:
+- interactions:
+  - channel: command
+    cmd: sh
+    args:
+    - '-c'
+    - |
+      set -eu
+      GITHUB_TOKEN_FILE=$1
+      shift
+      export GITHUB_TOKEN_FILE
+      if [ -z "${GITHUB_TOKEN_FILE:-}" ] || [ ! -s "$GITHUB_TOKEN_FILE" ]; then
+        echo 'github-crew-pr credential missing or empty (GITHUB_TOKEN_FILE)' >&2
+        exit 1
+      fi
+      GH_TOKEN=$(cat "$GITHUB_TOKEN_FILE")
+      if [ -z "$GH_TOKEN" ]; then
+        echo 'github-crew-pr credential missing or empty (GITHUB_TOKEN_FILE)' >&2
+        exit 1
+      fi
+      GH_HOST={service}
+      export GH_TOKEN GH_HOST
+      unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN
+      exec gh api "$@"
+    - github-ledger-list
+    - '{GITHUB_TOKEN_FILE}'
+    - repos/{scope}/issues/2600/comments?per_page=100
+    - '--paginate'
+    - '--slurp'
+    cwd: /
+    stdout: '[[]]'
+    exit_code: 0
+  - channel: command
+    cmd: sh
+    args:
+    - '-c'
+    - |
+      set -eu
+      GITHUB_TOKEN_FILE=$1
+      shift
+      export GITHUB_TOKEN_FILE
+      if [ -z "${GITHUB_TOKEN_FILE:-}" ] || [ ! -s "$GITHUB_TOKEN_FILE" ]; then
+        echo 'github-crew-pr credential missing or empty (GITHUB_TOKEN_FILE)' >&2
+        exit 1
+      fi
+      GH_TOKEN=$(cat "$GITHUB_TOKEN_FILE")
+      if [ -z "$GH_TOKEN" ]; then
+        echo 'github-crew-pr credential missing or empty (GITHUB_TOKEN_FILE)' >&2
+        exit 1
+      fi
+      GH_HOST={service}
+      export GH_TOKEN GH_HOST
+      unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN
+      exec gh api "$@"
+    - github-ledger-write
+    - '{GITHUB_TOKEN_FILE}'
+    - '--method'
+    - POST
+    - repos/{scope}/issues/2600/comments
+    - '--input'
+    - '-'
+    cwd: /
+    stdout: '{"url":"https://api.{service}/repos/{scope}/issues/comments/5982552062","html_url":"https://{service}/{scope}/issues/2600#issuecomment-5982552062","issue_url":"https://api.{service}/repos/{scope}/issues/2600","id":5982552062,"node_id":"IC_kwDORel_088AAAABZJZ__g","user":{"login":"flotilla-crew[bot]","id":309902803,"node_id":"BOT_kgDOEni90w","avatar_url":"https://avatars.githubusercontent.com/u/269690888?v=4","gravatar_id":"","url":"https://api.{service}/users/flotilla-crew%5Bbot%5D","html_url":"https://{service}/apps/flotilla-crew","followers_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/followers","following_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/following{/other_user}","gists_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/gists{/gist_id}","starred_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/starred{/owner}{/repo}","subscriptions_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/subscriptions","organizations_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/orgs","repos_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/repos","events_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/events{/privacy}","received_events_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/received_events","type":"Bot","user_view_type":"public","site_admin":false},"created_at":"2026-10-04T17:25:35Z","updated_at":"2026-10-04T17:25:35Z","author_association":"CONTRIBUTOR","body":"## Decision ledger\n\nReplay recording for #2600: initial revision.\n<!-- flotilla-decision-ledger:artifact-370847cf0157c9a01967a736153b99749390723387e28cfbce218862966eafef:93df37fcd27c5f2f53633e2e581ceb6be89526497c9e897908dca791e2e932f7 -->","reactions":{"url":"https://api.{service}/repos/{scope}/issues/comments/5982552062/reactions","total_count":0,"+1":0,"-1":0,"laugh":0,"hooray":0,"confused":0,"heart":0,"rocket":0,"eyes":0},"performed_via_github_app":{"id":4409549,"slug":"flotilla-crew","node_id":"A_kwHOEBMoCM4AQ0jN","owner":{"login":"flotilla-org","id":269690888,"node_id":"O_kgDOEBMoCA","avatar_url":"https://avatars.githubusercontent.com/u/269690888?v=4","gravatar_id":"","url":"https://api.{service}/users/flotilla-org","html_url":"https://{service}/flotilla-org","followers_url":"https://api.{service}/users/flotilla-org/followers","following_url":"https://api.{service}/users/flotilla-org/following{/other_user}","gists_url":"https://api.{service}/users/flotilla-org/gists{/gist_id}","starred_url":"https://api.{service}/users/flotilla-org/starred{/owner}{/repo}","subscriptions_url":"https://api.{service}/users/flotilla-org/subscriptions","organizations_url":"https://api.{service}/users/flotilla-org/orgs","repos_url":"https://api.{service}/users/flotilla-org/repos","events_url":"https://api.{service}/users/flotilla-org/events{/privacy}","received_events_url":"https://api.{service}/users/flotilla-org/received_events","type":"Organization","user_view_type":"public","site_admin":false},"name":"flotilla-crew","description":"","external_url":"http://flotilla.work/","html_url":"https://{service}/apps/flotilla-crew","created_at":"2026-07-27T20:28:00Z","updated_at":"2026-09-27T13:20:43Z","permissions":{"actions":"write","checks":"read","contents":"write","issues":"write","metadata":"read","pull_requests":"write","workflows":"write"},"events":[]},"minimized":null,"pin":null}'
+    exit_code: 0
+  - channel: command
+    cmd: sh
+    args:
+    - '-c'
+    - |
+      set -eu
+      GITHUB_TOKEN_FILE=$1
+      shift
+      export GITHUB_TOKEN_FILE
+      if [ -z "${GITHUB_TOKEN_FILE:-}" ] || [ ! -s "$GITHUB_TOKEN_FILE" ]; then
+        echo 'github-crew-pr credential missing or empty (GITHUB_TOKEN_FILE)' >&2
+        exit 1
+      fi
+      GH_TOKEN=$(cat "$GITHUB_TOKEN_FILE")
+      if [ -z "$GH_TOKEN" ]; then
+        echo 'github-crew-pr credential missing or empty (GITHUB_TOKEN_FILE)' >&2
+        exit 1
+      fi
+      GH_HOST={service}
+      export GH_TOKEN GH_HOST
+      unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN
+      exec gh api "$@"
+    - github-ledger-list
+    - '{GITHUB_TOKEN_FILE}'
+    - repos/{scope}/issues/2600/comments?per_page=100
+    - '--paginate'
+    - '--slurp'
+    cwd: /
+    stdout: '[[{"url":"https://api.{service}/repos/{scope}/issues/comments/5982552062","html_url":"https://{service}/{scope}/issues/2600#issuecomment-5982552062","issue_url":"https://api.{service}/repos/{scope}/issues/2600","id":5982552062,"node_id":"IC_kwDORel_088AAAABZJZ__g","user":{"login":"flotilla-crew[bot]","id":309902803,"node_id":"BOT_kgDOEni90w","avatar_url":"https://avatars.githubusercontent.com/u/269690888?v=4","gravatar_id":"","url":"https://api.{service}/users/flotilla-crew%5Bbot%5D","html_url":"https://{service}/apps/flotilla-crew","followers_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/followers","following_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/following{/other_user}","gists_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/gists{/gist_id}","starred_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/starred{/owner}{/repo}","subscriptions_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/subscriptions","organizations_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/orgs","repos_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/repos","events_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/events{/privacy}","received_events_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/received_events","type":"Bot","user_view_type":"public","site_admin":false},"created_at":"2026-10-04T17:25:35Z","updated_at":"2026-10-04T17:25:35Z","body":"## Decision ledger\n\nReplay recording for #2600: initial revision.\n<!-- flotilla-decision-ledger:artifact-370847cf0157c9a01967a736153b99749390723387e28cfbce218862966eafef:93df37fcd27c5f2f53633e2e581ceb6be89526497c9e897908dca791e2e932f7 -->","author_association":"CONTRIBUTOR","pin":null,"reactions":{"url":"https://api.{service}/repos/{scope}/issues/comments/5982552062/reactions","total_count":0,"+1":0,"-1":0,"laugh":0,"hooray":0,"confused":0,"heart":0,"rocket":0,"eyes":0},"performed_via_github_app":{"id":4409549,"client_id":"Iv23liI6rGrCxMJO6wOb","slug":"flotilla-crew","node_id":"A_kwHOEBMoCM4AQ0jN","owner":{"login":"flotilla-org","id":269690888,"node_id":"O_kgDOEBMoCA","avatar_url":"https://avatars.githubusercontent.com/u/269690888?v=4","gravatar_id":"","url":"https://api.{service}/users/flotilla-org","html_url":"https://{service}/flotilla-org","followers_url":"https://api.{service}/users/flotilla-org/followers","following_url":"https://api.{service}/users/flotilla-org/following{/other_user}","gists_url":"https://api.{service}/users/flotilla-org/gists{/gist_id}","starred_url":"https://api.{service}/users/flotilla-org/starred{/owner}{/repo}","subscriptions_url":"https://api.{service}/users/flotilla-org/subscriptions","organizations_url":"https://api.{service}/users/flotilla-org/orgs","repos_url":"https://api.{service}/users/flotilla-org/repos","events_url":"https://api.{service}/users/flotilla-org/events{/privacy}","received_events_url":"https://api.{service}/users/flotilla-org/received_events","type":"Organization","user_view_type":"public","site_admin":false},"name":"flotilla-crew","description":"","external_url":"http://flotilla.work/","html_url":"https://{service}/apps/flotilla-crew","created_at":"2026-07-27T20:28:00Z","updated_at":"2026-09-27T13:20:43Z","permissions":{"actions":"write","checks":"read","contents":"write","issues":"write","metadata":"read","pull_requests":"write","workflows":"write"},"events":[]},"minimized":null}]]'
+    exit_code: 0
+  - channel: command
+    cmd: sh
+    args:
+    - '-c'
+    - |
+      set -eu
+      GITHUB_TOKEN_FILE=$1
+      shift
+      export GITHUB_TOKEN_FILE
+      if [ -z "${GITHUB_TOKEN_FILE:-}" ] || [ ! -s "$GITHUB_TOKEN_FILE" ]; then
+        echo 'github-crew-pr credential missing or empty (GITHUB_TOKEN_FILE)' >&2
+        exit 1
+      fi
+      GH_TOKEN=$(cat "$GITHUB_TOKEN_FILE")
+      if [ -z "$GH_TOKEN" ]; then
+        echo 'github-crew-pr credential missing or empty (GITHUB_TOKEN_FILE)' >&2
+        exit 1
+      fi
+      GH_HOST={service}
+      export GH_TOKEN GH_HOST
+      unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN
+      exec gh api "$@"
+    - github-ledger-write
+    - '{GITHUB_TOKEN_FILE}'
+    - '--method'
+    - PATCH
+    - repos/{scope}/issues/comments/5982552062
+    - '--input'
+    - '-'
+    cwd: /
+    stdout: '{"url":"https://api.{service}/repos/{scope}/issues/comments/5982552062","html_url":"https://{service}/{scope}/issues/2600#issuecomment-5982552062","issue_url":"https://api.{service}/repos/{scope}/issues/2600","id":5982552062,"node_id":"IC_kwDORel_088AAAABZJZ__g","user":{"login":"flotilla-crew[bot]","id":309902803,"node_id":"BOT_kgDOEni90w","avatar_url":"https://avatars.githubusercontent.com/u/269690888?v=4","gravatar_id":"","url":"https://api.{service}/users/flotilla-crew%5Bbot%5D","html_url":"https://{service}/apps/flotilla-crew","followers_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/followers","following_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/following{/other_user}","gists_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/gists{/gist_id}","starred_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/starred{/owner}{/repo}","subscriptions_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/subscriptions","organizations_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/orgs","repos_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/repos","events_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/events{/privacy}","received_events_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/received_events","type":"Bot","user_view_type":"public","site_admin":false},"created_at":"2026-10-04T17:25:35Z","updated_at":"2026-10-04T17:25:36Z","body":"## Decision ledger\n\nReplay recording for #2600: updated revision.\n<!-- flotilla-decision-ledger:artifact-370847cf0157c9a01967a736153b99749390723387e28cfbce218862966eafef:dd5431efa5c3a5cae8abde726c58220c6e259d4d9df11074dc08b78d72b13c9e -->","author_association":"CONTRIBUTOR","pin":null,"reactions":{"url":"https://api.{service}/repos/{scope}/issues/comments/5982552062/reactions","total_count":0,"+1":0,"-1":0,"laugh":0,"hooray":0,"confused":0,"heart":0,"rocket":0,"eyes":0},"performed_via_github_app":{"id":4409549,"client_id":"Iv23liI6rGrCxMJO6wOb","slug":"flotilla-crew","node_id":"A_kwHOEBMoCM4AQ0jN","owner":{"login":"flotilla-org","id":269690888,"node_id":"O_kgDOEBMoCA","avatar_url":"https://avatars.githubusercontent.com/u/269690888?v=4","gravatar_id":"","url":"https://api.{service}/users/flotilla-org","html_url":"https://{service}/flotilla-org","followers_url":"https://api.{service}/users/flotilla-org/followers","following_url":"https://api.{service}/users/flotilla-org/following{/other_user}","gists_url":"https://api.{service}/users/flotilla-org/gists{/gist_id}","starred_url":"https://api.{service}/users/flotilla-org/starred{/owner}{/repo}","subscriptions_url":"https://api.{service}/users/flotilla-org/subscriptions","organizations_url":"https://api.{service}/users/flotilla-org/orgs","repos_url":"https://api.{service}/users/flotilla-org/repos","events_url":"https://api.{service}/users/flotilla-org/events{/privacy}","received_events_url":"https://api.{service}/users/flotilla-org/received_events","type":"Organization","user_view_type":"public","site_admin":false},"name":"flotilla-crew","description":"","external_url":"http://flotilla.work/","html_url":"https://{service}/apps/flotilla-crew","created_at":"2026-07-27T20:28:00Z","updated_at":"2026-09-27T13:20:43Z","permissions":{"actions":"write","checks":"read","contents":"write","issues":"write","metadata":"read","pull_requests":"write","workflows":"write"},"events":[]},"minimized":null}'
+    exit_code: 0
+  - channel: command
+    cmd: sh
+    args:
+    - '-c'
+    - |
+      set -eu
+      GITHUB_TOKEN_FILE=$1
+      shift
+      export GITHUB_TOKEN_FILE
+      if [ -z "${GITHUB_TOKEN_FILE:-}" ] || [ ! -s "$GITHUB_TOKEN_FILE" ]; then
+        echo 'github-crew-pr credential missing or empty (GITHUB_TOKEN_FILE)' >&2
+        exit 1
+      fi
+      GH_TOKEN=$(cat "$GITHUB_TOKEN_FILE")
+      if [ -z "$GH_TOKEN" ]; then
+        echo 'github-crew-pr credential missing or empty (GITHUB_TOKEN_FILE)' >&2
+        exit 1
+      fi
+      GH_HOST={service}
+      export GH_TOKEN GH_HOST
+      unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN
+      exec gh api "$@"
+    - github-ledger-list
+    - '{GITHUB_TOKEN_FILE}'
+    - repos/{scope}/issues/2600/comments?per_page=100
+    - '--paginate'
+    - '--slurp'
+    cwd: /
+    stdout: '[[{"url":"https://api.{service}/repos/{scope}/issues/comments/5982552062","html_url":"https://{service}/{scope}/issues/2600#issuecomment-5982552062","issue_url":"https://api.{service}/repos/{scope}/issues/2600","id":5982552062,"node_id":"IC_kwDORel_088AAAABZJZ__g","user":{"login":"flotilla-crew[bot]","id":309902803,"node_id":"BOT_kgDOEni90w","avatar_url":"https://avatars.githubusercontent.com/u/269690888?v=4","gravatar_id":"","url":"https://api.{service}/users/flotilla-crew%5Bbot%5D","html_url":"https://{service}/apps/flotilla-crew","followers_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/followers","following_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/following{/other_user}","gists_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/gists{/gist_id}","starred_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/starred{/owner}{/repo}","subscriptions_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/subscriptions","organizations_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/orgs","repos_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/repos","events_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/events{/privacy}","received_events_url":"https://api.{service}/users/flotilla-crew%5Bbot%5D/received_events","type":"Bot","user_view_type":"public","site_admin":false},"created_at":"2026-10-04T17:25:35Z","updated_at":"2026-10-04T17:25:36Z","body":"## Decision ledger\n\nReplay recording for #2600: updated revision.\n<!-- flotilla-decision-ledger:artifact-370847cf0157c9a01967a736153b99749390723387e28cfbce218862966eafef:dd5431efa5c3a5cae8abde726c58220c6e259d4d9df11074dc08b78d72b13c9e -->","author_association":"CONTRIBUTOR","pin":null,"reactions":{"url":"https://api.{service}/repos/{scope}/issues/comments/5982552062/reactions","total_count":0,"+1":0,"-1":0,"laugh":0,"hooray":0,"confused":0,"heart":0,"rocket":0,"eyes":0},"performed_via_github_app":{"id":4409549,"client_id":"Iv23liI6rGrCxMJO6wOb","slug":"flotilla-crew","node_id":"A_kwHOEBMoCM4AQ0jN","owner":{"login":"flotilla-org","id":269690888,"node_id":"O_kgDOEBMoCA","avatar_url":"https://avatars.githubusercontent.com/u/269690888?v=4","gravatar_id":"","url":"https://api.{service}/users/flotilla-org","html_url":"https://{service}/flotilla-org","followers_url":"https://api.{service}/users/flotilla-org/followers","following_url":"https://api.{service}/users/flotilla-org/following{/other_user}","gists_url":"https://api.{service}/users/flotilla-org/gists{/gist_id}","starred_url":"https://api.{service}/users/flotilla-org/starred{/owner}{/repo}","subscriptions_url":"https://api.{service}/users/flotilla-org/subscriptions","organizations_url":"https://api.{service}/users/flotilla-org/orgs","repos_url":"https://api.{service}/users/flotilla-org/repos","events_url":"https://api.{service}/users/flotilla-org/events{/privacy}","received_events_url":"https://api.{service}/users/flotilla-org/received_events","type":"Organization","user_view_type":"public","site_admin":false},"name":"flotilla-crew","description":"","external_url":"http://flotilla.work/","html_url":"https://{service}/apps/flotilla-crew","created_at":"2026-07-27T20:28:00Z","updated_at":"2026-09-27T13:20:43Z","permissions":{"actions":"write","checks":"read","contents":"write","issues":"write","metadata":"read","pull_requests":"write","workflows":"write"},"events":[]},"minimized":null}]]'
+    exit_code: 0
