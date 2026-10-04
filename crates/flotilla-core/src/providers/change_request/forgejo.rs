@@ -694,6 +694,168 @@ mod tests {
         session.finish();
     }
 
+    // HTTP boundary: an observer reuses only proven absence, then checks again
+    // at the freshness boundary so a newly created fork-head PR can be found.
+    #[tokio::test(start_paused = true)]
+    async fn observer_repeated_absent_scans_are_bounded_and_expire() {
+        let other = serde_json::json!([{"number": 1, "title": "Other", "head": {"ref": "other"}, "state": "open"}]);
+        let found = serde_json::json!([{"number": 7, "title": "Fork PR", "head": {"ref": "feature/wanted", "repo": {"full_name": "fork/repo"}}, "state": "closed", "merged": true}]);
+        let http = Arc::new(MockHttp {
+            responses: Mutex::new(VecDeque::from([
+                json_response(&other),
+                json_response(&other),
+                json_response(&serde_json::json!([])),
+                json_response(&found),
+                json_response(&found),
+            ])),
+            urls: Mutex::new(Vec::new()),
+        });
+        let provider: Arc<dyn ChangeRequestTracker> = Arc::new(provider(http.clone()));
+        let observer = crate::branch_lookup_observer::BranchLookupObserver::default();
+        for _ in 0..4 {
+            assert!(observer.find("team/repo", &provider, "feature/wanted").await.expect("proven absence").is_none());
+            assert_eq!(http.urls.lock().expect("urls").len(), 3, "repeat scans reuse the complete scan");
+        }
+        tokio::time::advance(tokio::time::Duration::from_secs(299)).await;
+        assert!(observer.find("team/repo", &provider, "feature/wanted").await.expect("fresh absence").is_none());
+        assert_eq!(http.urls.lock().expect("urls").len(), 3);
+        tokio::time::advance(tokio::time::Duration::from_secs(1)).await;
+        for expected_calls in [4, 5] {
+            let (id, request) = observer.find("team/repo", &provider, "feature/wanted").await.expect("fresh lookup").expect("fork head");
+            assert_eq!(id, "7");
+            assert_eq!(request.status, ChangeRequestStatus::Merged);
+            assert_eq!(http.urls.lock().expect("urls").len(), expected_calls, "positive observations are read fresh");
+        }
+    }
+
+    // #2585: absence observations are isolated by repository and exact branch.
+    // Generate repeated/interleaved keys, including empty, slash, percent and
+    // Unicode names. The network boundary returns complete empty listings.
+    #[hegel::test]
+    fn observer_absence_keys_do_not_leak(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(20));
+        let keys = (0..steps)
+            .map(|_| {
+                (tc.draw(gs::integers::<usize>().min_value(0).max_value(1)), tc.draw(gs::integers::<usize>().min_value(0).max_value(4)))
+            })
+            .collect::<Vec<_>>();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let http = Arc::new(MockHttp {
+                responses: Mutex::new((0..steps).map(|_| json_response(&serde_json::json!([]))).collect()),
+                urls: Mutex::new(Vec::new()),
+            });
+            let provider: Arc<dyn ChangeRequestTracker> = Arc::new(provider(http.clone()));
+            let observer = crate::branch_lookup_observer::BranchLookupObserver::default();
+            let mut seen = std::collections::HashSet::new();
+            for (repository, branch) in keys {
+                let repo = ["team/repo", "team/other"][repository];
+                let name = ["", "feature/wanted", "feature%2Fwanted", "wanted", "修正"][branch];
+                assert!(observer.find(repo, &provider, name).await.expect("absence").is_none());
+                seen.insert((repository, branch));
+                assert_eq!(http.urls.lock().expect("urls").len(), seen.len(), "each distinct key scans once");
+            }
+        });
+    }
+
+    // #2585: bounded observer memory evicts the earliest-expiring observation,
+    // causing a fresh scan instead of making eviction look like a permanent miss.
+    #[tokio::test(start_paused = true)]
+    async fn observer_absence_capacity_evicts_oldest() {
+        let http = Arc::new(MockHttp {
+            responses: Mutex::new((0..1027).map(|_| json_response(&serde_json::json!([]))).collect()),
+            urls: Mutex::new(Vec::new()),
+        });
+        let provider: Arc<dyn ChangeRequestTracker> = Arc::new(provider(http.clone()));
+        let observer = crate::branch_lookup_observer::BranchLookupObserver::default();
+        for index in 0..1024 {
+            assert!(observer.find("team/repo", &provider, &format!("branch-{index}")).await.expect("absence").is_none());
+            tokio::time::advance(tokio::time::Duration::from_millis(1)).await;
+        }
+        assert!(observer.find("team/repo", &provider, "branch-0").await.expect("at capacity").is_none());
+        assert_eq!(http.urls.lock().expect("urls").len(), 1024);
+        // Replacing the provider for an existing key must not evict another key.
+        let replacement: Arc<dyn ChangeRequestTracker> = Arc::new(self::provider(http.clone()));
+        assert!(observer.find("team/repo", &replacement, "branch-1023").await.expect("replace existing key").is_none());
+        assert!(observer.find("team/repo", &provider, "branch-0").await.expect("unrelated key survives").is_none());
+        assert_eq!(http.urls.lock().expect("urls").len(), 1025);
+        assert!(observer.find("team/repo", &provider, "branch-1024").await.expect("overflow").is_none());
+        assert!(observer.find("team/repo", &provider, "branch-0").await.expect("evicted branch").is_none());
+        assert_eq!(http.urls.lock().expect("urls").len(), 1027);
+    }
+
+    // HTTP boundary: a bounded failure is never absence, and replacement
+    // providers (changed forge/credentials) do not inherit a previous absence.
+    #[tokio::test]
+    async fn observer_does_not_cache_failures_or_cross_provider_identity() {
+        let other = serde_json::json!([{"number": 1, "title": "Other", "head": {"ref": "other"}, "state": "open"}]);
+        let http = Arc::new(MockHttp {
+            responses: Mutex::new(
+                (0..100).map(|_| json_response(&other)).chain([error_response(403), json_response(&serde_json::json!([]))]).collect(),
+            ),
+            urls: Mutex::new(Vec::new()),
+        });
+        let first: Arc<dyn ChangeRequestTracker> = Arc::new(provider(http.clone()));
+        let observer = crate::branch_lookup_observer::BranchLookupObserver::default();
+        assert!(observer
+            .find("team/repo", &first, "wanted")
+            .await
+            .expect_err("budget is not absence")
+            .to_string()
+            .contains("exceeded 100 pages"));
+        assert!(observer.find("team/repo", &first, "wanted").await.expect_err("HTTP failure is not absence").to_string().contains("403"));
+        assert!(observer.find("team/repo", &first, "wanted").await.expect("retry complete scan").is_none());
+        assert_eq!(http.urls.lock().expect("urls").len(), 102);
+        let replacement_http = Arc::new(MockHttp {
+            responses: Mutex::new(VecDeque::from([json_response(&serde_json::json!([]))])),
+            urls: Mutex::new(Vec::new()),
+        });
+        let replacement: Arc<dyn ChangeRequestTracker> = Arc::new(provider(replacement_http.clone()));
+        assert!(observer.find("team/repo", &replacement, "wanted").await.expect("new provider").is_none());
+        assert_eq!(replacement_http.urls.lock().expect("urls").len(), 1);
+    }
+
+    // Live-recorded evidence: lab head filtering supports an exact branch name,
+    // but cannot reproduce lookup by a deleted head's synthetic head.ref.
+    #[tokio::test]
+    async fn record_replay_lab_head_filter_capability() {
+        let auth = auth();
+        let mut masks = Masks::new();
+        masks.add(&auth.token, "<LAB_FORGEJO_TOKEN>");
+        let fixture = crate::providers::testing::fixture_path("change_request", "forgejo_head_filter_capability.yaml");
+        let session = replay::test_session(&fixture, masks);
+        let provider = ForgejoChangeRequestProvider::new(
+            replay::test_http_client(&session),
+            Arc::new(MockRunner::new(vec![])),
+            ForgejoIssueProviderConfig::new("https://forgejo.lab.flotilla.work".into(), None, auth),
+            "robert/ghostty-ops".into(),
+        );
+        for (head, expected) in
+            [("drop-retired-stance", 1), ("robert:drop-retired-stance", 0), ("refs/pull/1/head", 0), ("flotilla-2585-definitely-absent", 0)]
+        {
+            let result = provider
+                .execute(
+                    reqwest::Method::GET,
+                    "pulls",
+                    &[("state", "all".into()), ("limit", "50".into()), ("page", "1".into()), ("head", head.into())],
+                    None,
+                )
+                .await
+                .expect("head query");
+            assert_eq!(result.as_array().expect("pull list").len(), expected);
+        }
+        let (_, request) =
+            provider.find_change_request_by_branch("refs/pull/1/head").await.expect("unfiltered lookup").expect("deleted head PR");
+        assert_eq!(request.branch, "refs/pull/1/head");
+        let provider: Arc<dyn ChangeRequestTracker> = Arc::new(provider);
+        let observer = crate::branch_lookup_observer::BranchLookupObserver::default();
+        for _ in 0..3 {
+            assert!(observer.find("robert/ghostty-ops", &provider, "flotilla-2585-definitely-absent").await.expect("absence").is_none());
+        }
+        session.finish();
+    }
+
     #[test]
     fn parses_forgejo_states_and_branch() {
         let config = ForgejoIssueProviderConfig::new("https://forgejo.example.test".into(), None, auth());
