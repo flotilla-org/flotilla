@@ -283,7 +283,26 @@ impl ChangeRequestTracker for ForgejoChangeRequestProvider {
     }
 
     async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, ObservationError> {
-        Ok(self.list("all", 100).await?.iter().filter_map(|value| self.parse(value)).find(|(_, request)| request.branch == branch))
+        // Search to an empty page instead of treating the first 100 requests
+        // (or a short page from a server-side limit) as proof of absence.
+        for page in 1..=100 {
+            let value = self
+                .execute(
+                    reqwest::Method::GET,
+                    "pulls",
+                    &[("state", "all".into()), ("limit", "50".into()), ("page", page.to_string())],
+                    None,
+                )
+                .await?;
+            let items = value.as_array().ok_or("Forgejo pull request list response was not an array")?;
+            if let Some(request) = items.iter().filter_map(|value| self.parse(value)).find(|(_, request)| request.branch == branch) {
+                return Ok(Some(request));
+            }
+            if items.is_empty() {
+                return Ok(None);
+            }
+        }
+        Err(format!("Forgejo pull request lookup for branch {branch} exceeded 100 pages").into())
     }
 
     async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
@@ -693,6 +712,45 @@ mod tests {
         merged["state"] = "closed".into();
         merged["merged"] = true.into();
         assert_eq!(provider.parse(&merged).expect("parse merged request").1.status, ChangeRequestStatus::Merged);
+    }
+
+    // HTTP boundary: fixtures exercise late matches, short pages, proven absence
+    // and budget exhaustion without contacting a Forgejo deployment.
+    #[tokio::test]
+    async fn branch_lookup_searches_beyond_the_old_window_and_proves_absence() {
+        for found in [false, true] {
+            let first = serde_json::Value::Array(
+                (1..=50)
+                    .map(|number| serde_json::json!({"number": number, "title": "Other", "head": {"ref": "other"}, "state": "open"}))
+                    .collect(),
+            );
+            let last = if found {
+                serde_json::json!([{"number": 101, "title": "Wanted", "head": {"ref": "wanted"}, "state": "closed", "merged": true}])
+            } else {
+                serde_json::json!([])
+            };
+            let http = Arc::new(MockHttp {
+                responses: Mutex::new(VecDeque::from([json_response(&first), json_response(&first), json_response(&last)])),
+                urls: Mutex::new(Vec::new()),
+            });
+            let result = provider(http.clone()).find_change_request_by_branch("wanted").await.expect("lookup");
+            assert_eq!(result.is_some(), found);
+            assert_eq!(http.urls.lock().expect("urls").len(), 3);
+            if let Some((id, request)) = result {
+                assert_eq!(id, "101");
+                assert_eq!(request.status, ChangeRequestStatus::Merged);
+            }
+        }
+        let item = serde_json::json!([{"number": 1, "title": "Other", "head": {"ref": "other"}, "state": "open"}]);
+        let http =
+            Arc::new(MockHttp { responses: Mutex::new((0..100).map(|_| json_response(&item)).collect()), urls: Mutex::new(Vec::new()) });
+        assert!(provider(http.clone())
+            .find_change_request_by_branch("wanted")
+            .await
+            .expect_err("cannot prove absence")
+            .to_string()
+            .contains("exceeded 100 pages"));
+        assert_eq!(http.urls.lock().expect("urls").len(), 100);
     }
 
     #[tokio::test]

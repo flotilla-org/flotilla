@@ -22,7 +22,6 @@ fn execution_root() -> &'static Path {
     Path::new("/")
 }
 
-const MAX_BRANCH_LOOKUP_PAGES: usize = 10;
 const MAX_HISTORY_PAGE_QUERIES: usize = 8;
 const MAX_HISTORY_PAGE_NODES: usize = 800;
 const HISTORY_PAGE_SIZE: usize = 100;
@@ -361,25 +360,19 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
     }
 
     async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, ObservationError> {
-        for page in 1..=MAX_BRANCH_LOOKUP_PAGES {
-            let endpoint = if page == 1 {
-                format!("repos/{}/pulls?state=all&per_page=100", self.repo_slug)
-            } else {
-                format!("repos/{}/pulls?state=all&per_page=100&page={page}", self.repo_slug)
-            };
-            let response =
-                self.api.get_classified_with_headers(&endpoint, execution_root(), &gh_api_channel_label("GET", &endpoint)).await?;
-            let items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
-            if let Some(pull_request) =
-                items.iter().filter_map(Self::parse_pull_request).find(|pull_request| pull_request.head_ref_name == branch)
-            {
-                return Ok(Some(self.gh_pr_to_change_request(&pull_request)));
-            }
-            if !response.has_next_page {
-                return Ok(None);
-            }
-        }
-        Err(format!("GitHub pull request lookup for branch {branch} exceeded {MAX_BRANCH_LOOKUP_PAGES} pages").into())
+        // Bare branches deliberately use the repository owner. Fork heads must
+        // be supplied as fork_owner:branch: inferring an unspecified fork owner
+        // would require the unfiltered history scan this lookup avoids.
+        let head = if branch.contains(':') {
+            branch.to_string()
+        } else {
+            let owner = self.repo_slug.split('/').next().ok_or("repository slug has no owner")?;
+            format!("{owner}:{branch}")
+        };
+        let endpoint = format!("repos/{}/pulls?head={}&state=all&per_page=100", self.repo_slug, urlencoding::encode(&head));
+        let response = self.api.get_classified_with_headers(&endpoint, execution_root(), &gh_api_channel_label("GET", &endpoint)).await?;
+        let items: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
+        Ok(items.iter().filter_map(Self::parse_pull_request).next().map(|request| self.gh_pr_to_change_request(&request)))
     }
 
     async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
@@ -452,60 +445,98 @@ mod tests {
         format!("HTTP/2 200 OK\r\n{link}\r\n{items}")
     }
 
+    // GitHub's server-side head filter proves both presence and absence in one
+    // call; explicit fork owners and URL metacharacters must survive encoding.
     #[tokio::test]
-    async fn branch_lookup_finds_merged_request_on_later_page_and_stops() {
-        let runner = Arc::new(MockRunner::new(vec![
-            Ok(branch_lookup_page(
-                serde_json::json!([{
-                    "number": 9, "title": "Other", "head": {"ref": "other"}, "state": "closed", "merged_at": null
-                }]),
-                true,
-            )),
-            Ok(branch_lookup_page(
-                serde_json::json!([{
-                    "number": 7, "title": "Wanted", "head": {"ref": "feature/wanted"},
-                    "state": "closed", "merged_at": "2026-09-01T00:00:00Z"
-                }]),
-                true,
-            )),
-        ]));
-        let provider =
-            GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
-
-        let found = provider.find_change_request_by_branch("feature/wanted").await.expect("lookup").expect("later-page request");
-        assert_eq!(found.0, "7");
-        assert_eq!(found.1.status, ChangeRequestStatus::Merged);
-        let calls = runner.calls();
-        assert_eq!(calls.len(), 2);
-        assert!(calls[0].1.iter().any(|arg| arg == "repos/team/one/pulls?state=all&per_page=100"));
-        assert!(calls[1].1.iter().any(|arg| arg.contains("per_page=100&page=2")));
+    async fn branch_lookup_filters_head_in_one_classified_request() {
+        for (branch, encoded_head) in [("feature/wanted", "team%3Afeature%2Fwanted"), ("fork:feature/a+b", "fork%3Afeature%2Fa%2Bb")] {
+            for found in [false, true] {
+                // Subprocess boundary: gh emits an HTTP response with headers.
+                let items = if found {
+                    serde_json::json!([{
+                        "number": 7, "title": "Wanted", "head": {"ref": branch.split_once(':').map_or(branch, |(_, name)| name)},
+                        "state": "closed", "merged_at": "2026-09-01T00:00:00Z"
+                    }])
+                } else {
+                    serde_json::json!([])
+                };
+                let runner = Arc::new(MockRunner::new(vec![Ok(branch_lookup_page(items, false))]));
+                let provider = GitHubChangeRequest::new(
+                    "github".into(),
+                    "team/one".into(),
+                    Arc::new(GhApiClient::new(runner.clone())),
+                    runner.clone(),
+                );
+                let result = provider.find_change_request_by_branch(branch).await.expect("lookup");
+                assert_eq!(result.is_some(), found);
+                if let Some((id, request)) = result {
+                    assert_eq!(id, "7");
+                    assert_eq!(request.branch, branch.split_once(':').map_or(branch, |(_, name)| name));
+                    assert_eq!(request.status, ChangeRequestStatus::Merged);
+                }
+                let calls = runner.calls();
+                assert_eq!(calls.len(), 1);
+                let expected = format!("repos/team/one/pulls?head={encoded_head}&state=all&per_page=100");
+                assert!(calls[0].1.contains(&expected));
+            }
+        }
     }
 
+    // Glue: the branch lookup must retain the shared REST rate-limit classifier.
     #[tokio::test]
-    async fn branch_lookup_stops_when_github_has_no_next_page() {
-        let runner = Arc::new(MockRunner::new(vec![Ok(branch_lookup_page(
-            serde_json::json!([{
-                "number": 9, "title": "Other", "head": {"ref": "other"}, "state": "open"
-            }]),
-            false,
-        ))]));
-        let provider =
-            GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
-
-        assert!(provider.find_change_request_by_branch("feature/wanted").await.expect("lookup").is_none());
-        assert_eq!(runner.calls().len(), 1);
+    async fn branch_lookup_preserves_classified_rate_limit() {
+        // Subprocess boundary: gh exits unsuccessfully while retaining headers
+        // on stdout, which the generic MockRunner cannot express.
+        struct FailedGhRunner;
+        #[async_trait]
+        impl CommandRunner for FailedGhRunner {
+            async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+                true
+            }
+            async fn run(
+                &self,
+                _cmd: &str,
+                _args: &[&str],
+                _cwd: &Path,
+                _label: &crate::providers::ChannelLabel,
+            ) -> Result<String, String> {
+                Err("gh: HTTP 403".into())
+            }
+            async fn run_output(
+                &self,
+                _cmd: &str,
+                _args: &[&str],
+                _cwd: &Path,
+                _label: &crate::providers::ChannelLabel,
+            ) -> Result<crate::providers::CommandOutput, String> {
+                Ok(crate::providers::CommandOutput {
+                    stdout: "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1893456000\r\n\r\n{\"message\":\"API rate limit exceeded\"}".into(),
+                    stderr: "gh: HTTP 403".into(),
+                    success: false,
+                })
+            }
+        }
+        let runner = Arc::new(FailedGhRunner);
+        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        let error = provider.find_change_request_by_branch("feature/wanted").await.expect_err("classified rate limit");
+        assert!(matches!(error, ObservationError::RateLimited { .. }));
+        assert!(error.retry_at().is_some());
     }
 
+    // This real API recording covers a merged PR and a nonexistent head using
+    // the exact filtered endpoint exercised in production.
     #[tokio::test]
-    async fn branch_lookup_reports_when_page_budget_cannot_prove_absence() {
-        let page = branch_lookup_page(serde_json::json!([]), true);
-        let runner = Arc::new(MockRunner::new(vec![Ok(page); MAX_BRANCH_LOOKUP_PAGES]));
-        let provider =
-            GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
-
-        let error = provider.find_change_request_by_branch("feature/wanted").await.expect_err("lookup cannot prove absence");
-        assert!(error.to_string().contains("exceeded 10 pages"), "{error}");
-        assert_eq!(runner.calls().len(), MAX_BRANCH_LOOKUP_PAGES);
+    async fn replayed_real_github_head_lookup_found_and_absent() {
+        let fixture = crate::providers::testing::fixture_path("change_request", "github_head_lookup.yaml");
+        let session = replay::test_session(&fixture, replay::Masks::new());
+        let runner = replay::test_runner(&session);
+        let api = replay::test_gh_api(&session);
+        let provider = GitHubChangeRequest::new("github".into(), "flotilla-org/flotilla".into(), api, runner);
+        let (id, request) = provider.find_change_request_by_branch("fix/observer-budget").await.expect("lookup").expect("merged PR");
+        assert_eq!(id, "2506");
+        assert_eq!(request.status, ChangeRequestStatus::Merged);
+        assert!(provider.find_change_request_by_branch("flotilla-head-lookup-2583-absent").await.expect("absence").is_none());
+        session.finish();
     }
 
     #[tokio::test]
