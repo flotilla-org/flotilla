@@ -510,9 +510,13 @@ mod tests {
     use flotilla_resources::{ForgeKind, ForgeSpec, RepositoryIdentity, RepositorySpec};
 
     use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
-    use crate::providers::{
-        discovery::test_support::{test_vcs_resolver, DiscoveryMockRunner},
-        ChannelLabel, CommandOutput, CommandRunner,
+    use crate::{
+        path_context::ExecutionEnvironmentPath,
+        providers::{
+            discovery::test_support::{test_vcs_resolver, DiscoveryMockRunner},
+            ChannelLabel, CommandOutput, CommandRunner,
+        },
+        vcs::EnumeratedCheckout,
     };
 
     // Process boundary: count and reject every Git command except worktree enumeration.
@@ -616,8 +620,6 @@ mod tests {
     // and propagates command errors. No concurrent state or reconciliation is changed here.
     #[tokio::test]
     async fn lightweight_enumeration_handles_empty_bare_detached_and_errors() {
-        use crate::{path_context::ExecutionEnvironmentPath, vcs::EnumeratedCheckout};
-
         let (_temp, root) = git_repo();
         for (result, expected) in [
             (Ok(String::new()), Ok(vec![])),
