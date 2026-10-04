@@ -6,6 +6,10 @@ Investigated 2026-10-03 against cleat revision
 Ghostty, Linux x86_64. Source acquisition used the injected authenticated `gh`
 wrapper and a scratch clone outside the vessel checkout.
 
+## Current proof status
+
+The cleat-specific proof is pending [cleat#302](https://github.com/flotilla-org/cleat/issues/302), which adds connect-only `--socket` attach and packets without metadata checks or daemon spawning. [Flotilla#2562](https://github.com/flotilla-org/flotilla/issues/2562) will run it in a dedicated CI job using cleat’s own client. The bespoke protocol-11 Python client and cleat fixture have been removed from Tender tests at operator review. The historical observations below explain the client limitation; they are not the maintained proof gate. Normal CI now runs the adapter contracts directly over a local Unix socket and a generic Rust ordinary-service interruption/half-close/recovery scenario. Exactly one opt-in loopback-sshd Forward smoke test remains.
+
 ## Client-path result
 
 | Client path | Result | Constraint |
@@ -19,8 +23,8 @@ wrapper and a scratch clone outside the vessel checkout.
 The CLI's hidden `--runtime-root` selects a runtime directory; it does not expose
 a connect-only arbitrary endpoint. `connect_packets` checks the session directory,
 then `connect_subscription` calls `ensure_daemon_started`. Consequently the CLI
-can create a daemon when given an absent layout. The connect-only proof helper
-avoids that path entirely. Sources: [CLI options and command dispatch](https://github.com/flotilla-org/cleat/blob/fd66a7121149e85eb8fbc57a99a388b0c91dae6c/crates/cleat/src/cli.rs),
+can create a daemon when given an absent layout. The historical connect-only proof helper
+avoided that path entirely. Sources: [CLI options and command dispatch](https://github.com/flotilla-org/cleat/blob/fd66a7121149e85eb8fbc57a99a388b0c91dae6c/crates/cleat/src/cli.rs),
 [SessionService packet connection](https://github.com/flotilla-org/cleat/blob/fd66a7121149e85eb8fbc57a99a388b0c91dae6c/crates/cleat/src/server.rs),
 [provider connect_packet_stream](https://github.com/flotilla-org/cleat/blob/fd66a7121149e85eb8fbc57a99a388b0c91dae6c/crates/cleat/src/provider_daemon.rs).
 
@@ -50,42 +54,23 @@ assertions about echoed strings should use capture or a real renderer. Sources:
 [render and input structures](https://github.com/flotilla-org/cleat/blob/fd66a7121149e85eb8fbc57a99a388b0c91dae6c/crates/cleat/src/provider.rs),
 [packet ACK handling](https://github.com/flotilla-org/cleat/blob/fd66a7121149e85eb8fbc57a99a388b0c91dae6c/crates/cleat/src/session.rs).
 
-## Reproducible isolated local setup
+## Historical isolated setup
 
-Use a short private directory directly beneath the default `/tmp` (no TMPDIR
-override). These commands start a separate cleat daemon, not Flotilla:
-
-```sh
-proof_root=$(mktemp -d /tmp/tender-cleat.XXXXXX)
-/usr/local/bin/cleat --runtime-root "$proof_root" --server tender \
-  launch tender-proof --cmd cat --no-record --json
-# Fresh layout uses physical generation tender@1:
-endpoint="$proof_root/tender@1/socket"
-python3 crates/tender/tests/common/cleat.py "$endpoint" tender-proof 'proof-input
-'
-/usr/local/bin/cleat --runtime-root "$proof_root" --server tender capture tender-proof
-/usr/local/bin/cleat --runtime-root "$proof_root" --server tender kill tender-proof
-# Stop only the daemon created by this fixture, using tender@1/daemon.pid.
-```
-
-Runtime sockets are `<root>/<physical-daemon>/socket`, with
-`daemon.pid` alongside; generation aliases select a physical daemon. Source:
+The investigation launched a separate cleat daemon in a private default `/tmp`
+directory using `cleat --runtime-root <root> --server tender launch tender-proof
+--cmd cat --no-record --json`. Runtime sockets are
+`<root>/<physical-daemon>/socket`, with `daemon.pid` alongside; generation aliases
+select a physical daemon. Source:
 [RuntimeLayout](https://github.com/flotilla-org/cleat/blob/fd66a7121149e85eb8fbc57a99a388b0c91dae6c/crates/cleat/src/runtime.rs).
 
-The checked-in Python helper owns only its connection. It does not discover,
-launch, reconnect, replay input, or touch session metadata. It is deliberately
-pinned to protocol 11 and implements the postcard fields needed for this proof,
-including render-generation ACKs. Initial local verification returned directory
-127 bytes, initial render 54,118 bytes, updated render 6,861 bytes, and capture
-confirmed the submitted input reached the `cat` PTY. The CLI packet probe also
-returned an initial full render. The fixture session and daemon were stopped.
+A temporary independent protocol-11 client returned directory and render frames,
+and capture confirmed input reached the `cat` PTY. That helper has been removed:
+maintaining a second cleat protocol implementation is unnecessary for Tender’s
+ordinary-service contract. Reproduce the cleat proof with cleat’s own connect-only
+client after cleat#302 lands, as tracked by #2562. The fixture session and daemon
+used in the investigation were stopped.
 
-For the real SSH proof, substitute Tender's locally exposed socket for
-`$endpoint`; keep the remote fixture cleat session alive when killing SSH, then
-create a fresh client after route recovery. This note establishes the client
-path only; the SSH adapter integration test records interruption and recovery.
-
-## Real SSH adapter proof
+## Historical real SSH adapter experiment
 
 The slice-2 integration test `cleat_survives_ssh_loss_and_fresh_client_recovers`
 passed on 2026-10-03 with an unprivileged OpenSSH 9.6p1 fixture listening only on
@@ -113,24 +98,24 @@ walkthroughs remain in-memory contracts for slice 3. The shared backpressure
 payload is 16 MB, exceeding native SSH channel windows and kernel socket buffers
 without assuming the in-memory adapter's smaller capacity.
 
-With `sshd` installed, run from the repository root with default TMPDIR:
+## Maintained Tender coverage
+
+Normal `cargo test -p tender --locked` runs all ten applicable slice-1 scenarios
+against both MemoryTender and SshTender directly connected to Server over a
+private local Unix socket. The intermediary scenario remains an in-memory
+contract for slice 3; the direct adapter explicitly tests refusal of `via`.
+Ordinary carriage uses a generic Rust request/response endpoint, directional EOF,
+route interruption, service survival and fresh-client recovery without replay.
+
+With OpenSSH client/server installed, run the single ignored Forward smoke test:
 
 ```sh
-cargo test -p tender --locked
 cargo test -p tender --locked -- --ignored
 ```
 
-The ignored checks require `ssh`, `ssh-keygen`, a local `sshd`, Python 3, and the
-pinned protocol-11 cleat build. `TENDER_TEST_SSHD` selects a nonstandard sshd
-binary. In this vessel sshd and libwrap were extracted from Ubuntu packages
-under `/tmp`; the test run supplied that library directory alongside cleat's
-`/usr/local/lib/flotilla` in `LD_LIBRARY_PATH`. The fixture generates private SSH
-keys and known_hosts, disables password authentication, listens only on
-127.0.0.1, and tears down its own processes. It needs no production credentials
-or host configuration.
-
-Review follow-up also proved a remote publisher's held registration is lost on
-SSH interruption: the host reserves its identity as Unavailable. After replacing
-the route, explicit reclaim returns the same identity at generation N+1, stale
-lease teardown is rejected, and the fresh channel contains no replayed bytes.
-This adds an eleventh real-SSH check.
+It exercises authenticated publication, raw bytes, SSH interruption, reserved
+identity, explicit generation reclaim and fresh opens without replay.
+`TENDER_TEST_SSHD` selects a nonstandard sshd binary. The fixture uses ephemeral
+keys, pinned known_hosts, private directories, loopback only, and cleans its own
+processes. No cleat or Python dependency is needed by Tender tests. The dedicated
+cleat proof remains pending on cleat#302 and #2562.

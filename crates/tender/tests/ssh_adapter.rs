@@ -3,7 +3,7 @@
 #[path = "common/ssh.rs"]
 mod ssh_fixture;
 
-use std::{collections::BTreeSet, os::unix::fs::PermissionsExt, path::Path, process::Command, time::Duration};
+use std::{collections::BTreeSet, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
 use tender::{
     memory::MemoryTender,
@@ -11,163 +11,133 @@ use tender::{
     Availability, Error, Grant, Namespace, PublishRequest, Session, Tender,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
     time::timeout,
 };
 
-struct CleatFixture {
-    root: tempfile::TempDir,
-}
-
-impl CleatFixture {
-    fn start() -> Self {
-        let root = tempfile::Builder::new()
-            .prefix("tcleat-")
-            .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir()
-            .expect("cleat fixture directory");
-        let fixture = Self { root };
-        let output = fixture
-            .command()
-            .args(["launch", "tender-proof", "--tag", "purpose=probe", "--cmd", "cat", "--no-record", "--json"])
-            .output()
-            .expect("launch cleat");
-        assert!(output.status.success(), "cleat launch: {}", String::from_utf8_lossy(&output.stderr));
-        fixture
-    }
-
-    fn command(&self) -> Command {
-        let mut command = Command::new("cleat");
-        command.arg("--runtime-root").arg(self.root.path()).args(["--server", "tender"]);
-        command
-    }
-
-    fn socket(&self) -> std::path::PathBuf {
-        self.root.path().join("tender@1/socket")
-    }
-
-    fn capture(&self) -> String {
-        let output = self.command().args(["capture", "tender-proof"]).output().expect("capture");
-        assert!(output.status.success(), "remote cleat remains usable");
-        String::from_utf8(output.stdout).expect("screen UTF8")
-    }
-}
-
-impl Drop for CleatFixture {
-    fn drop(&mut self) {
-        let _ = self.command().args(["kill", "tender-proof"]).output();
-        if let Ok(pid) = std::fs::read_to_string(self.root.path().join("tender@1/daemon.pid")) {
-            let _ = Command::new("kill").arg(pid.trim()).status();
-        }
-    }
-}
-
 fn request(audience: tender::Fingerprint) -> PublishRequest {
-    PublishRequest { namespace: Namespace("services".into()), name: "cleat".into(), audience: BTreeSet::from([audience]), reclaim: None }
+    PublishRequest { namespace: Namespace("services".into()), name: "ordinary".into(), audience: BTreeSet::from([audience]), reclaim: None }
 }
 
-fn probe(socket: &Path, input: Option<&str>) -> std::process::Output {
-    let mut command = Command::new("python3");
-    command.arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/common/cleat.py")).arg(socket).arg("tender-proof");
-    if let Some(input) = input {
-        command.arg(input);
-    }
-    let output = command.output().expect("packet client");
-    assert!(output.status.success(), "packet protocol through exposure: {}", String::from_utf8_lossy(&output.stderr));
-    output
-}
-
-// #2555: directory + session through a real SSH exposure; killing SSH closes
-// the application connection, retains the service, and permits fresh clients.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires cleat protocol 11, python3 and local sshd"]
-async fn cleat_survives_ssh_loss_and_fresh_client_recovers() {
-    let sshd = ssh_fixture::Sshd::start().await;
-    let cleat = CleatFixture::start();
+// Tender owns the route, while an ordinary Rust service independently owns its
+// listener and requests. Each response follows directional request EOF.
+#[tokio::test]
+async fn ordinary_service_survives_route_loss_and_fresh_client_recovers() {
+    let root = tempfile::Builder::new().permissions(std::fs::Permissions::from_mode(0o700)).tempdir().expect("directory");
+    let service_path = root.path().join("ordinary");
+    let listener = UnixListener::bind(&service_path).expect("ordinary listener");
+    let (requests, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let (progress, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let service = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.expect("service accept");
+            let requests = requests.clone();
+            let progress = progress.clone();
+            tokio::spawn(async move {
+                let mut input = Vec::new();
+                let mut buffer = [0; 1024];
+                loop {
+                    let n = stream.read(&mut buffer).await.expect("service read");
+                    if n == 0 {
+                        break;
+                    }
+                    input.extend_from_slice(&buffer[..n]);
+                    progress.send(input.clone()).expect("progress observer");
+                }
+                requests.send(input.clone()).expect("observer");
+                let _ = stream.write_all(&input).await;
+            });
+        }
+    });
     let host = Identity::generate();
-    let publisher = Identity::generate();
-    let consumer = Identity::generate();
+    let caller = Identity::generate();
     let policy = MemoryTender::new(host.fingerprint());
-    policy.allow_browse(consumer.fingerprint());
-    policy.allow_connect(consumer.fingerprint());
+    policy.allow_browse(caller.fingerprint());
+    policy.allow_connect(caller.fingerprint());
     policy.grant(Grant {
-        grantee: publisher.fingerprint(),
+        grantee: caller.fingerprint(),
         namespace: Namespace("services".into()),
-        audience_ceiling: BTreeSet::from([consumer.fingerprint()]),
+        audience_ceiling: BTreeSet::from([caller.fingerprint()]),
         expires_at: 100,
     });
-    let publisher_session = Session { caller: publisher.fingerprint(), pinned_host: host.fingerprint(), via: None };
-    let consumer_session = Session { caller: consumer.fingerprint(), pinned_host: host.fingerprint(), via: None };
-    let endpoint = sshd.directory.path().join("tender");
-    let server = Server::bind(endpoint.clone(), host.clone(), policy).expect("Tender listener");
-    let lease =
-        server.publish_endpoint(&publisher_session, request(consumer.fingerprint()), cleat.socket()).await.expect("publish existing cleat");
-    let mut forward = Forward::start(&sshd.destination, &endpoint, &sshd.options).await.expect("SSH forward");
-    let adapter = SshTender::new(forward.socket().to_owned(), host.fingerprint(), vec![consumer.clone()]).expect("adapter");
-    assert_eq!(adapter.browse(&consumer_session).await.expect("browse")[0].availability, Availability::Available);
-    let mut watch = adapter.watch(&consumer_session).await.expect("watch route");
-    assert_eq!(watch.recv().await.expect("initial snapshot")[0].availability, Availability::Available);
-    let exposure = adapter.expose_local(&consumer_session, lease.id).await.expect("exposure");
-    let socket = Path::new(&exposure.local_name);
-    let output = probe(socket, Some("once-before\n"));
-    println!("cleat first client: {}", String::from_utf8_lossy(&output.stdout));
-    let before = cleat.capture();
-    assert!(before.contains("once-before"), "packet input reached existing cleat session");
-
-    // Hold an ordinary packet client open through the SSH interruption.
-    let source = r#"
-import sys
-sys.path.insert(0, sys.argv[1])
-from cleat import Client
-client = Client(sys.argv[2]); client.open('tender-proof'); client.render()
-print('ready', flush=True)
-try:
-    while True: client.read()
-except (EOFError, ConnectionResetError):
-    print('closed', flush=True)
-finally: client.close()
-"#;
-    let mut client = tokio::process::Command::new("python3")
-        .args(["-u", "-c", source, concat!(env!("CARGO_MANIFEST_DIR"), "/tests/common"), &exposure.local_name])
-        .stdout(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("held packet client");
-    let mut lines = BufReader::new(client.stdout.take().expect("stdout")).lines();
+    let session = Session { caller: caller.fingerprint(), pinned_host: host.fingerprint(), via: None };
+    let endpoint = root.path().join("server");
+    let server = Server::bind(endpoint.clone(), host.clone(), policy.clone()).expect("server");
+    let lease = server.publish_endpoint(&session, request(caller.fingerprint()), service_path.clone()).await.expect("ordinary endpoint");
+    let adapter = SshTender::new(endpoint.clone(), host.fingerprint(), vec![caller]).expect("adapter");
+    let exposure = adapter.expose_local(&session, lease.id).await.expect("exposure");
+    let mut watch = adapter.watch(&session).await.expect("watch");
+    assert_eq!(watch.recv().await.expect("initial")[0].availability, Availability::Available);
+    let mut first = UnixStream::connect(&exposure.local_name).await.expect("ordinary client");
+    first.write_all(b"before").await.expect("request");
+    first.shutdown().await.expect("half close");
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(2), first.read_to_end(&mut response)).await.expect("response deadline").expect("response");
+    assert_eq!(response, b"before");
+    assert_eq!(observed.recv().await.expect("first request"), b"before");
+    async fn input_received(received: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>, expected: &[u8]) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let input = received.recv().await.expect("service input");
+                assert!(expected.starts_with(&input), "ordered bytes without replay");
+                if input.len() == expected.len() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("service input deadline");
+    }
+    input_received(&mut received, b"before").await;
+    let mut held = adapter.connect(&session, lease.id).await.expect("held client");
+    held.write_all(b"interrupted").await.expect("held request");
+    input_received(&mut received, b"interrupted").await;
+    // Dropping the transport server terminates its channels, not the service.
+    drop(server);
+    let mut byte = [0];
+    let closed = timeout(Duration::from_secs(2), held.read(&mut byte)).await.expect("closed route");
+    assert!(matches!(closed, Ok(0)) || matches!(closed, Err(ref error) if error.kind() == std::io::ErrorKind::ConnectionReset));
     assert_eq!(
-        timeout(Duration::from_secs(5), lines.next_line()).await.expect("client ready deadline").expect("read").as_deref(),
-        Some("ready")
-    );
-    forward.stop().await.expect("interrupt SSH only");
-    assert_eq!(
-        timeout(Duration::from_secs(5), lines.next_line()).await.expect("client close deadline").expect("read").as_deref(),
-        Some("closed")
-    );
-    assert!(client.wait().await.expect("client exit").success());
-    assert_eq!(cleat.capture(), before, "SSH loss does not stop cleat or replay input");
-    assert_eq!(
-        timeout(Duration::from_secs(2), watch.recv()).await.expect("unavailable watch deadline").expect("watch snapshot")[0].availability,
+        timeout(Duration::from_secs(2), watch.recv()).await.expect("unavailable deadline").expect("snapshot")[0].availability,
         Availability::Unavailable
     );
-    assert_eq!(adapter.browse(&consumer_session).await.expect("remembered unavailable")[0].availability, Availability::Unavailable);
-    assert!(matches!(adapter.connect(&consumer_session, lease.id).await, Err(Error::Unavailable)));
-    let mut dead = UnixStream::connect(socket).await.expect("stable exposure stays bound");
-    let mut byte = [0];
-    assert_eq!(timeout(Duration::from_secs(2), dead.read(&mut byte)).await.expect("prompt unavailable closure").expect("close"), 0);
-
-    let restored = Forward::start(&sshd.destination, &endpoint, &sshd.options).await.expect("restored SSH");
-    adapter.replace_route(restored.socket().to_owned());
-    assert_eq!(adapter.browse(&consumer_session).await.expect("live route")[0].availability, Availability::Available);
-    assert_eq!(
-        timeout(Duration::from_secs(2), watch.recv()).await.expect("recovered watch deadline").expect("watch snapshot")[0].availability,
-        Availability::Available
-    );
-    probe(socket, None); // Fresh directory and session render, with no input.
-    assert_eq!(cleat.capture(), before, "fresh stream receives no replayed input");
-    let output = probe(socket, Some("fresh-after\n"));
-    println!("cleat recovered client: {}", String::from_utf8_lossy(&output.stdout));
-    assert!(cleat.capture().contains("fresh-after"));
+    assert_eq!(adapter.browse(&session).await.expect("cached browse")[0].availability, Availability::Unavailable);
+    assert!(!service.is_finished(), "route loss leaves service running");
+    // A direct ordinary client still receives a response while Tender is down.
+    let mut direct = UnixStream::connect(&service_path).await.expect("service survives");
+    direct.write_all(b"direct").await.expect("direct request");
+    direct.shutdown().await.expect("direct EOF");
+    let mut direct_response = Vec::new();
+    timeout(Duration::from_secs(2), direct.read_to_end(&mut direct_response))
+        .await
+        .expect("direct response deadline")
+        .expect("direct response");
+    assert_eq!(direct_response, b"direct");
+    let restored = Server::bind(endpoint, host, policy).expect("restored server");
+    assert_eq!(adapter.browse(&session).await.expect("restored browse")[0].availability, Availability::Unavailable);
+    let mut publish = request(session.caller.clone());
+    publish.reclaim = Some(lease.id);
+    let renewed = restored.publish_endpoint(&session, publish, service_path).await.expect("reclaim endpoint");
+    assert_eq!(renewed.generation, lease.generation + 1);
+    assert_eq!(adapter.browse(&session).await.expect("available")[0].availability, Availability::Available);
+    // Drain only requests from the interrupted/direct clients before reopening.
+    timeout(Duration::from_secs(2), async {
+        let mut prior = vec![observed.recv().await.expect("interrupted request"), observed.recv().await.expect("direct request")];
+        prior.sort();
+        assert_eq!(prior, vec![b"direct".to_vec(), b"interrupted".to_vec()]);
+    })
+    .await
+    .expect("prior requests");
+    let mut fresh = UnixStream::connect(&exposure.local_name).await.expect("fresh exposed client");
+    fresh.write_all(b"after").await.expect("fresh request");
+    fresh.shutdown().await.expect("fresh EOF");
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(2), fresh.read_to_end(&mut response)).await.expect("fresh response deadline").expect("fresh response");
+    assert_eq!(response, b"after", "fresh stream contains only fresh bytes");
+    assert_eq!(observed.recv().await.expect("fresh request observed"), b"after", "no prior input replayed");
+    assert!(observed.try_recv().is_err(), "no extra replay request");
+    service.abort();
 }
 
 // SSH transport success cannot authorize a substituted Tender instance.
@@ -394,7 +364,7 @@ fn server_refuses_a_shared_parent_directory() {
 // automatically reclaiming would leave the caller's Lease silently stale.
 #[tokio::test]
 #[ignore = "requires a local sshd"]
-async fn ssh_publisher_reclaims_reserved_identity_after_route_replacement() {
+async fn forward_carries_contract_and_reclaims_after_route_replacement() {
     let sshd = ssh_fixture::Sshd::start().await;
     let host = Identity::generate();
     let caller = Identity::generate();
@@ -419,6 +389,14 @@ async fn ssh_publisher_reclaims_reserved_identity_after_route_replacement() {
     let mut before = [0; 6];
     service.read_exact(&mut before).await.expect("service input");
     assert_eq!(&before, b"before");
+    client.shutdown().await.expect("request half-close");
+    let mut byte = [0];
+    assert_eq!(service.read(&mut byte).await.expect("request EOF"), 0);
+    service.write_all(b"response").await.expect("response after half-close");
+    service.shutdown().await.expect("response EOF");
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.expect("response");
+    assert_eq!(response, b"response");
     forward.stop().await.expect("outage");
     assert!(timeout(Duration::from_secs(2), first.incoming.recv()).await.expect("publisher receiver closes").is_none());
     timeout(Duration::from_secs(2), async {

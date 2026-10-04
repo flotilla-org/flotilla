@@ -56,5 +56,5 @@ not withdraw a healthy host-side publication.
 Container outward publication and authenticated Tender intermediary relays are
 slice 3; an asserted `Session::via` is refused by this direct adapter. Windows
 local adapters and Flotilla resource consumption are later slices. See the
-[cleat proof and client-path findings](../../docs/research/tender-ssh-cleat-client-paths.md)
+[cleat client-path research and pending proof](../../docs/research/tender-ssh-cleat-client-paths.md)
 for real-SSH checks and the installed CLI's connect-only limitations.
