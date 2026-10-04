@@ -170,7 +170,12 @@ under the same message lock as resume, withdrawal, and completion. Delivery
 preserves sender attribution, stages credentials, and retains the pending brief
 on staging failure. Codex screen classification distinguishes an idle composer
 from a stable Working display or permission prompt; unknown screens remain
-unobservable. Selection rows in Codex menus are not composers. Losing observation
+unobservable. Selection rows in Codex menus are not composers. Submitted prompt
+history above the bottom composer does not make that composer unobservable,
+including when a principal attach changes terminal geometry. Adapter-classified
+prompt evidence governs both observation and terminal FIFO readiness, even when
+pixel activity is active or unavailable. Review-round wakes, supervisor resumes,
+and operator messages share that FIFO and its delivery receipts. Losing observation
 does not declare a new turn: the durable turn start survives stale or Unobservable
 evidence, and fresh activity restores ability. Fresh hook evidence still takes
 precedence for up to two minutes.

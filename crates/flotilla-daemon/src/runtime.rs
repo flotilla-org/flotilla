@@ -20,7 +20,7 @@ use flotilla_controllers::reconcilers::{
     TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
 };
 use flotilla_core::{
-    agent_adapter::{AgentLaunchRequest, CapabilityTable},
+    agent_adapter::{AgentAdapter, AgentLaunchRequest, CapabilityTable},
     agent_process::ExitReceiptObserver,
     aggregator_projection::AggregatorProjectionState,
     checkout_integration::{
@@ -56,12 +56,12 @@ use flotilla_resources::{
     FulfilmentRealisation, Host, HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
     HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch, InputDefinition, InputMeta, ManifestRoot, ModelProbeState,
     PlacementPolicy, PlacementPolicySpec, Platform, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository,
-    RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalOccupancy,
-    TerminalSession, TerminalSessionPhase, TerminalSessionSource, Vessel, VesselRequirement, VesselStatusPatch, WorkflowTemplate,
-    WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
-    CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
-    CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
-    PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, TRANSPORT_CAPABILITY,
+    RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalAttentionSource,
+    TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, Vessel, VesselRequirement,
+    VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
+    CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV,
+    CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
+    OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, TRANSPORT_CAPABILITY,
 };
 use futures::{
     stream::{BoxStream, SelectAll},
@@ -5541,18 +5541,59 @@ const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(200);
 const DELIVERY_CONFIRMATION_GRACE: Duration = Duration::from_secs(2);
 const DELIVERY_READY_POLLS: usize = 150;
 
-async fn wait_for_delivery_ready(pool: &dyn TerminalPool, session_id: &str, readiness: TerminalDeliveryReadiness) -> Result<bool, String> {
+// Screen classification is the same evidence for observation, turn release, and
+// submission. Pixel redraws and principal attachment status do not define turns.
+async fn observe_terminal_screen(
+    pool: &dyn TerminalPool,
+    adapter: Option<&dyn AgentAdapter>,
+    session_id: &str,
+    now: chrono::DateTime<Utc>,
+) -> Result<Option<TerminalObservation>, String> {
+    let Some(session) = pool.list_sessions().await?.into_iter().find(|session| session.session_name == session_id) else {
+        return Ok(None);
+    };
+    let occupancy = match session.status {
+        TerminalStatus::Running => TerminalOccupancy::Occupied,
+        TerminalStatus::Disconnected | TerminalStatus::Exited(_) => TerminalOccupancy::Vacant,
+    };
+    let mut output_digest = None;
+    let mut state = None;
+    if let Some(adapter) = adapter {
+        match pool.capture_screen(session_id).await {
+            Ok(Some(screen)) => {
+                output_digest = adapter.screen_output_digest(&screen);
+                state = adapter.classify_screen_attention(&screen);
+            }
+            Ok(None) => {}
+            Err(error) => tracing::debug!(%session_id, %error, "could not capture terminal screen for attention observation"),
+        }
+    }
+    let state = state.or_else(|| {
+        session.screen_activity.map(|activity| match activity {
+            ScreenActivity::Active => TerminalAttentionState::Working,
+            ScreenActivity::Stable => TerminalAttentionState::Idle,
+        })
+    });
+    Ok(Some(TerminalObservation {
+        output_digest,
+        attention: state.map(|state| flotilla_resources::TerminalAttention { state, as_of: now, source: TerminalAttentionSource::Screen }),
+        occupancy,
+    }))
+}
+
+async fn wait_for_delivery_ready(
+    pool: &dyn TerminalPool,
+    adapter: Option<&dyn AgentAdapter>,
+    session_id: &str,
+    readiness: TerminalDeliveryReadiness,
+) -> Result<bool, String> {
     let mut polls = 0;
     loop {
-        let session = pool
-            .list_sessions()
+        let observation = observe_terminal_screen(pool, adapter, session_id, Utc::now())
             .await?
-            .into_iter()
-            .find(|session| session.session_name == session_id)
             .ok_or_else(|| format!("terminal session {session_id} disappeared before message delivery"))?;
-        // Pools without screen activity cannot provide readiness evidence; retain
-        // their historical best-effort delivery behavior instead of blocking forever.
-        if session.screen_activity != Some(ScreenActivity::Active) {
+        // Pools without any attention evidence retain best-effort delivery.
+        if observation.attention.is_none_or(|attention| attention.state == TerminalAttentionState::Idle) {
             return Ok(true);
         }
         polls += 1;
@@ -5563,21 +5604,24 @@ async fn wait_for_delivery_ready(pool: &dyn TerminalPool, session_id: &str, read
     }
 }
 
-async fn session_busy_after_delivery_grace(pool: &dyn TerminalPool, session_id: &str) -> Result<bool, String> {
+async fn session_busy_after_delivery_grace(
+    pool: &dyn TerminalPool,
+    adapter: Option<&dyn AgentAdapter>,
+    session_id: &str,
+) -> Result<bool, String> {
     tokio::time::sleep(DELIVERY_CONFIRMATION_GRACE).await;
-    let session = pool
-        .list_sessions()
+    let observation = observe_terminal_screen(pool, adapter, session_id, Utc::now())
         .await?
-        .into_iter()
-        .find(|session| session.session_name == session_id)
         .ok_or_else(|| format!("terminal session {session_id} disappeared after message delivery"))?;
-    // An unavailable activity signal cannot disprove submission, so preserve
-    // best-effort confirmation for pools without a VT activity observer.
-    Ok(session.screen_activity != Some(ScreenActivity::Stable))
+    // Missing evidence preserves best-effort confirmation for legacy pools.
+    Ok(observation
+        .attention
+        .is_none_or(|attention| matches!(attention.state, TerminalAttentionState::Working | TerminalAttentionState::NeedsInput)))
 }
 
 async fn deliver_and_confirm(
     pool: &dyn TerminalPool,
+    adapter: Option<&dyn AgentAdapter>,
     session_id: &str,
     message: &str,
     readiness: TerminalDeliveryReadiness,
@@ -5586,7 +5630,7 @@ async fn deliver_and_confirm(
     // PTY input sent during agent startup can be consumed before the TUI has
     // enabled its composer input modes. A newly launched agent reports active,
     // so wait for its first idle observation before sending delivery bytes.
-    if !wait_for_delivery_ready(pool, session_id, readiness).await? {
+    if !wait_for_delivery_ready(pool, adapter, session_id, readiness).await? {
         warn!(%session_id, "agent session did not become idle before message delivery deadline");
         return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
     }
@@ -5595,12 +5639,12 @@ async fn deliver_and_confirm(
     } else {
         pool.deliver(session_id, message).await?;
     }
-    if session_busy_after_delivery_grace(pool, session_id).await? {
+    if session_busy_after_delivery_grace(pool, adapter, session_id).await? {
         return Ok(TerminalDeliveryOutcome::Confirmed);
     }
     warn!(%session_id, "agent session remained idle after message delivery; retrying submission once");
     pool.retry_delivery(session_id, message).await?;
-    if session_busy_after_delivery_grace(pool, session_id).await? {
+    if session_busy_after_delivery_grace(pool, adapter, session_id).await? {
         Ok(TerminalDeliveryOutcome::Confirmed)
     } else {
         warn!(%session_id, "agent session remained idle after message delivery retry");
@@ -5877,58 +5921,20 @@ impl TerminalRuntime for TerminalControllerRuntime {
         spec: &flotilla_resources::TerminalSessionSpec,
     ) -> Result<Option<TerminalObservation>, String> {
         let pool = self.pool_for_spec(spec)?;
-        let Some(session) = pool.list_sessions().await?.into_iter().find(|session| session.session_name == session_id) else {
-            return Ok(None);
-        };
-        let occupancy = match session.status {
-            TerminalStatus::Running => TerminalOccupancy::Occupied,
-            TerminalStatus::Disconnected | TerminalStatus::Exited(_) => TerminalOccupancy::Vacant,
-        };
-        let Some(activity) = session.screen_activity else {
-            return Ok(Some(TerminalObservation { output_digest: None, attention: None, occupancy }));
-        };
-        if let TerminalSessionSource::Agent { selector, .. } = &spec.source {
+        let adapter = if let TerminalSessionSource::Agent { selector, .. } = &spec.source {
             let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
             let registry = self.registry_for_env(&spec.env_ref)?;
-            let adapter = registry
-                .agent_adapters
-                .get(&requirement.adapter)
-                .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
-            match pool.capture_screen(session_id).await {
-                Ok(Some(screen)) => {
-                    let output_digest = adapter.screen_output_digest(&screen);
-                    let state = if activity == ScreenActivity::Active {
-                        flotilla_resources::TerminalAttentionState::Working
-                    } else {
-                        adapter.classify_screen_attention(&screen).unwrap_or(flotilla_resources::TerminalAttentionState::Idle)
-                    };
-                    return Ok(Some(TerminalObservation {
-                        output_digest,
-                        attention: Some(flotilla_resources::TerminalAttention {
-                            state,
-                            as_of: Utc::now(),
-                            source: flotilla_resources::TerminalAttentionSource::Screen,
-                        }),
-                        occupancy,
-                    }));
-                }
-                Ok(_) => {}
-                Err(error) => tracing::debug!(%session_id, %error, "could not capture terminal screen for attention observation"),
-            }
-        }
-        let state = match activity {
-            ScreenActivity::Active => flotilla_resources::TerminalAttentionState::Working,
-            ScreenActivity::Stable => flotilla_resources::TerminalAttentionState::Idle,
+            Some(
+                registry
+                    .agent_adapters
+                    .get(&requirement.adapter)
+                    .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?
+                    .clone(),
+            )
+        } else {
+            None
         };
-        Ok(Some(TerminalObservation {
-            output_digest: None,
-            attention: Some(flotilla_resources::TerminalAttention {
-                state,
-                as_of: Utc::now(),
-                source: flotilla_resources::TerminalAttentionSource::Screen,
-            }),
-            occupancy,
-        }))
+        observe_terminal_screen(&*pool, adapter.as_deref(), session_id, Utc::now()).await
     }
 
     async fn observe_failure(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<Option<String>, String> {
@@ -5977,10 +5983,17 @@ impl TerminalRuntime for TerminalControllerRuntime {
         message: &str,
         readiness: TerminalDeliveryReadiness,
     ) -> Result<TerminalDeliveryOutcome, String> {
-        let TerminalSessionSource::Agent { .. } = &spec.source else {
+        let TerminalSessionSource::Agent { selector, .. } = &spec.source else {
             return Err("crew message delivery requires an agent terminal".to_string());
         };
         let pool = self.pool_for_spec(spec)?;
+        let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
+        let registry = self.registry_for_env(&spec.env_ref)?;
+        let adapter = registry
+            .agent_adapters
+            .get(&requirement.adapter)
+            .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?
+            .clone();
         let clear_before_delivery = match lookup_terminal_delivery(&self.state.terminal_deliveries, session_id, message) {
             TerminalDeliveryLookup::InFlight => return Ok(TerminalDeliveryOutcome::Pending),
             TerminalDeliveryLookup::Taken(delivery) if delivery.message == message => {
@@ -5995,10 +6008,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
         };
         let session_id_owned = session_id.to_string();
         let message_owned = message.to_string();
-        let task =
-            tokio::spawn(
-                async move { deliver_and_confirm(&*pool, &session_id_owned, &message_owned, readiness, clear_before_delivery).await },
-            );
+        let task = tokio::spawn(async move {
+            deliver_and_confirm(&*pool, Some(&*adapter), &session_id_owned, &message_owned, readiness, clear_before_delivery).await
+        });
         self.state
             .terminal_deliveries
             .lock()
@@ -13125,11 +13137,239 @@ dependency = { path = "../dependency" }
         }
     }
 
+    // This fake stands in for the external PTY and harness: submission starts
+    // a working turn, and the scenario explicitly ends it at the composer.
+    struct HooklessComposerPool {
+        inner: FakeTerminalPool,
+        submitted_screen: &'static str,
+    }
+
+    #[async_trait]
+    impl TerminalPool for HooklessComposerPool {
+        async fn list_sessions(&self) -> Result<Vec<ProviderTerminalSession>, String> {
+            self.inner.list_sessions().await
+        }
+
+        async fn capture_screen(&self, id: &str) -> Result<Option<String>, String> {
+            self.inner.capture_screen(id).await
+        }
+
+        async fn deliver(&self, id: &str, text: &str) -> Result<(), String> {
+            self.inner.deliver(id, text).await?;
+            self.inner.set_captured_screen(id, self.submitted_screen).await;
+            Ok(())
+        }
+
+        async fn ensure_session(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ExecutionEnvironmentPath,
+            _: &TerminalEnvVars,
+            _: &[TerminalSessionTag],
+        ) -> Result<(), String> {
+            unreachable!("scenario starts with a running crew")
+        }
+
+        fn attach_args(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ExecutionEnvironmentPath,
+            _: &TerminalEnvVars,
+        ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn kill_session(&self, _: &str) -> Result<(), String> {
+            unreachable!("scenario never tears down its crew")
+        }
+    }
+
+    // A permission prompt after submission proves the turn was accepted;
+    // retrying would interrupt that new turn and duplicate its text.
+    #[tokio::test(start_paused = true)]
+    async fn hookless_submission_needing_permission_is_confirmed_without_retry() {
+        let pool = HooklessComposerPool {
+            inner: FakeTerminalPool::new(),
+            submitted_screen: "Would you like to run the following command?\n› 1. Yes\n  2. No",
+        };
+        pool.inner
+            .add_sessions(vec![ProviderTerminalSession::builder()
+                .session_name("agent".into())
+                .status(TerminalStatus::Running)
+                .command("codex".into())
+                .screen_activity(ScreenActivity::Stable)
+                .build()])
+            .await;
+        pool.inner.set_captured_screen("agent", "› Ask Codex to do anything").await;
+        let adapters = AgentAdapterRegistry::discover(
+            &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
+            Arc::new(DiscoveryMockRunner::builder().build()),
+        );
+        let outcome = deliver_and_confirm(
+            &pool,
+            adapters.get("codex").map(|a| &**a),
+            "agent",
+            "review wake",
+            TerminalDeliveryReadiness::TurnBoundary,
+            false,
+        )
+        .await
+        .expect("submit");
+        assert_eq!(outcome, TerminalDeliveryOutcome::Confirmed);
+        assert_eq!(pool.inner.delivered.lock().await.len(), 1);
+    }
+
+    // #2599: all senders share prompt readiness, FIFO order, and exact receipts.
+    // Explicit-clock in-memory scenarios cover both cleat attachment states,
+    // stable/active/missing pixel metadata, and history exposed by attach resize.
+    #[tokio::test(start_paused = true)]
+    async fn hookless_composer_delivers_review_and_supervisor_turns_with_or_without_principal() {
+        use flotilla_resources::{CrewMessageDelivery, CrewMessageSender, TerminalCrewMessage};
+        const ID: &str = "hookless-crew";
+        const COMPOSER: &str = "› Earlier submitted brief\nWorked for 10m 43s\n› Ask Codex to do anything\ngpt-6.1-sol · /workspace";
+        for attached in [false, true] {
+            for activity in [Some(ScreenActivity::Stable), Some(ScreenActivity::Active), None] {
+                let temp = TempDir::new().expect("tempdir");
+                fs::write(temp.path().join("daemon.toml"), "machine_id = \"hookless-test\"\n").expect("daemon config");
+                let config = Arc::new(ConfigStore::with_base(temp.path()));
+                let (daemon, _) = crew_daemon(config.clone()).await;
+                let backend = daemon.resource_backend();
+                let pool = Arc::new(HooklessComposerPool {
+                    inner: FakeTerminalPool::new(),
+                    submitted_screen: "• Working (1s • esc to interrupt)\n› Ask Codex to do anything",
+                });
+                pool.inner
+                    .add_sessions(vec![ProviderTerminalSession::builder()
+                        .session_name(ID.into())
+                        .status(if attached { TerminalStatus::Running } else { TerminalStatus::Disconnected })
+                        .command("codex".into())
+                        .working_directory(ExecutionEnvironmentPath::new("/workspace"))
+                        .maybe_screen_activity(activity)
+                        .build()])
+                    .await;
+                let mut registry = probe_local_provider_registry(&daemon, &config).await.expect("registry");
+                Arc::get_mut(&mut registry).expect("exclusive test registry").terminal_pools.insert(
+                    "hookless",
+                    ProviderDescriptor::named(ProviderCategory::TerminalPool, "hookless"),
+                    pool.clone(),
+                );
+                let profile = build_local_profile(&daemon, &registry).expect("profile");
+                ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("environment");
+                backend
+                    .using::<Convoy>(NAMESPACE)
+                    .create(&empty_meta("hookless"), &ConvoySpec::builder().workflow_ref("test".into()).role("hookless".into()).build())
+                    .await
+                    .expect("convoy");
+                create_credential_test_session(&backend, ID, "hookless", "hookless-work", &profile.host_direct_environment_name()).await;
+                let sessions = backend.using::<TerminalSession>(NAMESPACE);
+                let mut session = sessions.get(ID).await.expect("session");
+                let mut spec = session.spec.clone();
+                spec.pool = "hookless".into();
+                let TerminalSessionSource::Agent { message, .. } = &mut spec.source else { unreachable!() };
+                let make_message = |id: &str, sender| TerminalCrewMessage {
+                    id: id.into(),
+                    text: id.into(),
+                    sender,
+                    delivery: CrewMessageDelivery::Queued,
+                    acknowledged: Default::default(),
+                    following: Vec::new(),
+                };
+                let review = make_message("review-round-3", CrewMessageSender::FlotillaTurn { source: "review".into() });
+                *message = Some(review.clone());
+                let head = message.as_mut().expect("head");
+                head.append(review); // Duplicate wakes must not create a second turn.
+                head.append(make_message("supervisor-resume", CrewMessageSender::Governor { name: "porthole".into() }));
+                head.append(make_message("operator-brief", CrewMessageSender::OperatorResume { principal: None }));
+                session = sessions.update(&empty_meta(ID), &session.metadata.resource_version, &spec).await.expect("queue turns");
+                let mut status = session.status.clone().expect("status");
+                status.session_id = Some(ID.into());
+                status.delivered_message_id = Some("initial-brief".into());
+                session = sessions.update_status(ID, &session.metadata.resource_version, &status).await.expect("running status");
+                let runtime = Arc::new(TerminalControllerRuntime {
+                    state: Arc::new(ControllerRuntimeState::new(
+                        daemon,
+                        config,
+                        registry,
+                        None,
+                        profile.host_id.clone(),
+                        None,
+                        profile.host_direct_environment_name(),
+                    )),
+                });
+                let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend.clone(), NAMESPACE);
+                let epoch = chrono::DateTime::parse_from_rfc3339("2026-10-04T15:45:11Z").expect("epoch").with_timezone(&Utc);
+                let started = tokio::time::Instant::now();
+                for (index, expected) in ["review-round-3", "supervisor-resume", "operator-brief"].into_iter().enumerate() {
+                    for screen in [
+                        "• Working (10m • esc to interrupt)\n› Ask Codex to do anything",
+                        "Would you like to run the following command?\n› 1. Yes\n  2. No",
+                        "Unknown screen",
+                    ] {
+                        pool.inner.set_captured_screen(ID, screen).await;
+                        let busy = reconciler.prepare(&session).await.expect("non-boundary preparation");
+                        let outcome = reconciler.reconcile(&session, &busy, epoch);
+                        assert_eq!(outcome.requeue_after, Some(Duration::from_millis(200)));
+                        let patch = outcome.patch.expect("pending delivery retains screen observation");
+                        assert!(matches!(&patch, TerminalSessionStatusPatch::Observe { .. }));
+                        let mut status = session.status.clone().expect("status");
+                        patch.apply(&mut status);
+                        session =
+                            sessions.update_status(ID, &session.metadata.resource_version, &status).await.expect("observe while pending");
+                        tokio::time::advance(Duration::from_millis(200)).await;
+                        tokio::task::yield_now().await;
+                        assert_eq!(pool.inner.delivered.lock().await.len(), index, "non-boundary must not consume the FIFO");
+                    }
+                    pool.inner.set_captured_screen(ID, COMPOSER).await;
+                    let now = epoch + chrono::Duration::from_std(started.elapsed()).expect("elapsed");
+                    let observation =
+                        observe_terminal_screen(&*pool, runtime.state.local_registry.agent_adapters.get("codex").map(|a| &**a), ID, now)
+                            .await
+                            .expect("observe")
+                            .expect("session");
+                    assert_eq!(observation.attention.as_ref().expect("attention").state, TerminalAttentionState::Idle);
+                    assert_eq!(observation.attention.expect("attention").as_of, now);
+                    for _ in 0..20 {
+                        tokio::time::advance(Duration::from_millis(200)).await;
+                        tokio::task::yield_now().await;
+                        let prepared = reconciler.prepare(&session).await.expect("prepare delivery");
+                        if let Some(patch) = reconciler.reconcile(&session, &prepared, now).patch {
+                            let delivered =
+                                matches!(&patch, TerminalSessionStatusPatch::MarkMessageDelivered { message_id } if message_id == expected);
+                            assert!(delivered || matches!(&patch, TerminalSessionStatusPatch::Observe { .. }));
+                            let mut status = session.status.clone().expect("status");
+                            patch.apply(&mut status);
+                            session = sessions.update_status(ID, &session.metadata.resource_version, &status).await.expect("receipt");
+                            if delivered {
+                                break;
+                            }
+                        }
+                    }
+                    assert_eq!(session.status.as_ref().expect("status").delivered_message_id.as_deref(), Some(expected));
+                    assert_eq!(pool.inner.delivered.lock().await.len(), index + 1);
+                }
+                pool.inner.set_captured_screen(ID, COMPOSER).await;
+                let prepared = reconciler.prepare(&session).await.expect("duplicate reconcile");
+                assert!(!matches!(
+                    reconciler.reconcile(&session, &prepared, epoch).patch,
+                    Some(TerminalSessionStatusPatch::MarkMessageDelivered { .. })
+                ));
+                let delivered = pool.inner.delivered.lock().await;
+                assert_eq!(delivered.iter().map(|(_, text, _)| text.as_str()).collect::<Vec<_>>(), [
+                    "review-round-3",
+                    "supervisor-resume",
+                    "operator-brief"
+                ]);
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn delivery_waits_for_the_agent_tui_to_become_idle_before_submitting() {
         let pool = DeliveryProbePool::new(vec![ScreenActivity::Active, ScreenActivity::Stable, ScreenActivity::Active]);
 
-        let outcome = deliver_and_confirm(&pool, "agent", "first line\n\nsecond line", TerminalDeliveryReadiness::Startup, false)
+        let outcome = deliver_and_confirm(&pool, None, "agent", "first line\n\nsecond line", TerminalDeliveryReadiness::Startup, false)
             .await
             .expect("delivery outcome");
 
@@ -13142,7 +13382,7 @@ dependency = { path = "../dependency" }
     async fn delivery_confirmation_retries_once_then_flags_a_session_that_stays_idle() {
         let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
 
-        let outcome = deliver_and_confirm(&pool, "agent", "stuck handoff", TerminalDeliveryReadiness::Startup, false)
+        let outcome = deliver_and_confirm(&pool, None, "agent", "stuck handoff", TerminalDeliveryReadiness::Startup, false)
             .await
             .expect("delivery outcome");
 
@@ -13155,7 +13395,7 @@ dependency = { path = "../dependency" }
     async fn delivery_flags_a_session_that_never_becomes_idle_without_sending_bytes() {
         let pool = DeliveryProbePool::new(vec![ScreenActivity::Active]);
 
-        let outcome = deliver_and_confirm(&pool, "agent", "unsafe handoff", TerminalDeliveryReadiness::Startup, false)
+        let outcome = deliver_and_confirm(&pool, None, "agent", "unsafe handoff", TerminalDeliveryReadiness::Startup, false)
             .await
             .expect("delivery outcome");
 
@@ -13171,7 +13411,7 @@ dependency = { path = "../dependency" }
         activities.extend([ScreenActivity::Stable, ScreenActivity::Active]);
         let pool = DeliveryProbePool::new(activities);
 
-        let outcome = deliver_and_confirm(&pool, "agent", "handoff after this turn", TerminalDeliveryReadiness::TurnBoundary, false)
+        let outcome = deliver_and_confirm(&pool, None, "agent", "handoff after this turn", TerminalDeliveryReadiness::TurnBoundary, false)
             .await
             .expect("delivery outcome");
 
@@ -13184,7 +13424,7 @@ dependency = { path = "../dependency" }
     async fn replacement_delivery_clears_the_composer_before_submitting() {
         let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable, ScreenActivity::Active]);
 
-        let outcome = deliver_and_confirm(&pool, "agent", "replacement handoff", TerminalDeliveryReadiness::TurnBoundary, true)
+        let outcome = deliver_and_confirm(&pool, None, "agent", "replacement handoff", TerminalDeliveryReadiness::TurnBoundary, true)
             .await
             .expect("delivery outcome");
 

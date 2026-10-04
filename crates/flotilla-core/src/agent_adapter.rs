@@ -831,9 +831,11 @@ fn codex_composer_visible(screen: &str) -> bool {
     if lines.iter().any(|line| line.starts_with("Select ") || line.starts_with("Choose ")) {
         return false;
     }
-    let mut rows = lines.iter().enumerate().filter_map(|(index, line)| line.strip_prefix('›').map(|text| (index, text.trim())));
+    // Submitted prompts remain visible above the composer. An attach can
+    // resize the VT and expose more of that history; inspect the last row.
+    let mut rows = lines.iter().enumerate().rev().filter_map(|(index, line)| line.strip_prefix('›').map(|text| (index, text.trim())));
     let Some((index, text)) = rows.next() else { return false };
-    if rows.next().is_some() || text.starts_with(|character: char| character.is_ascii_digit()) {
+    if text.starts_with(|character: char| character.is_ascii_digit()) {
         return false;
     }
     let footer = lines[index + 1..].iter().any(|line| line.contains(" · /") || line.contains(" · ~"));
@@ -2149,6 +2151,21 @@ mod tests {
         let screen = "• Working (57s • esc to interrupt)\n\n› Run /review on my current changes\n\ngpt-5.6-sol high · /workspace";
 
         assert_eq!(codex.classify_screen_attention(screen), Some(TerminalAttentionState::Working));
+    }
+
+    // #2599: previous submitted prompts remain on screen, especially after a
+    // principal attach resizes the terminal. Only the bottom composer is live.
+    #[hegel::test]
+    fn codex_idle_composer_survives_visible_prompt_history(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Generate empty through eight submitted prompts, including a numeric
+        // submitted prompt. Only the final live composer determines readiness.
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+        let mut screen = (0..count).map(|n| format!("› {n} submitted prompt\nresponse\n")).collect::<String>();
+        screen.push_str("Worked for 10m 43s\n\n› Ask Codex to do anything\n\ngpt-6.1-sol · /workspace");
+        assert_eq!(codex.classify_screen_attention(&screen), Some(TerminalAttentionState::Idle));
     }
 
     // #2560: elapsed-time spinner redraws are not output progress, but actual
