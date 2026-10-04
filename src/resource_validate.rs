@@ -167,7 +167,7 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
                     // rather than blocking the fix for it. An absent endpoint never means
                     // an empty inventory either.
                     if !absent {
-                        eprintln!("{namespace}: running daemon refused its ops inventory ({body}); inspecting this host's checkouts with the candidate");
+                        eprintln!("{namespace}: running daemon refused its ops inventory ({status}: {body}); inspecting this host's checkouts with the candidate");
                     }
                     async {
                         if local_inventory.is_none() {
@@ -1028,6 +1028,9 @@ mod tests {
 
     #[tokio::test]
     async fn on_host_candidate_reinspects_after_a_daemon_inventory_refusal() {
+        use std::collections::BTreeSet;
+
+        use flotilla_resources::{InMemoryBackend, ProjectRepositoryRole, ProjectRepositorySpec, RepositoryKey, ResourceBackend};
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
             net::UnixListener,
@@ -1035,7 +1038,7 @@ mod tests {
         // A previous-generation daemon refuses its inventory under rules the
         // candidate fixes (#2579): on the daemon's own host the candidate's
         // inspection decides; validating a peer without local roots fails closed.
-        let backend = flotilla_resources::ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let project = backend
             .using::<Project>("flotilla")
             .create(
@@ -1043,10 +1046,10 @@ mod tests {
                 &ProjectSpec::builder()
                     .display_name("Demo".to_string())
                     .default_workflow_ref("default".to_string())
-                    .repositories(vec![flotilla_resources::ProjectRepositorySpec {
-                        repo: flotilla_resources::RepositoryKey("ops-elsewhere".into()),
+                    .repositories(vec![ProjectRepositorySpec {
+                        repo: RepositoryKey("ops-elsewhere".into()),
                         alias: None,
-                        roles: std::collections::BTreeSet::from([flotilla_resources::ProjectRepositoryRole::Ops]),
+                        roles: BTreeSet::from([ProjectRepositoryRole::Ops]),
                         subpath: None,
                         default_branch: None,
                     }])
