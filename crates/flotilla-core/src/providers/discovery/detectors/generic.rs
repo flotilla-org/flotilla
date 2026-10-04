@@ -145,48 +145,14 @@ pub fn parse_first_dotted_version(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        future::Future,
-        io::{self, Write},
-        sync::{Arc, Mutex},
-    };
-
-    use tracing::instrument::WithSubscriber;
-
     use super::*;
     use crate::{
         path_context::ExecutionEnvironmentPath,
-        providers::discovery::test_support::{DiscoveryMockRunner, TestEnvVars},
+        providers::{
+            discovery::test_support::{DiscoveryMockRunner, TestEnvVars},
+            testing::capture_logs,
+        },
     };
-
-    #[derive(Clone)]
-    struct LogWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for LogWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().expect("log capture lock should be healthy").write(buf)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    async fn capture_warn_logs<F: Future>(future: F) -> (F::Output, String) {
-        let log_output = Arc::new(Mutex::new(Vec::new()));
-        let writer = LogWriter(Arc::clone(&log_output));
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_target(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
-
-        let output = future.with_subscriber(subscriber).await;
-        let logs = String::from_utf8(log_output.lock().expect("log capture lock should be healthy").clone()).expect("logs should be utf-8");
-        (output, logs)
-    }
 
     #[test]
     fn parse_first_dotted_version_handles_supported_outputs() {
@@ -242,7 +208,7 @@ mod tests {
             .on_run("codex", &["--version"], Ok("codex-cli 0.5.0\n".into()))
             .on_run("sh", &["-c", "command -v \"$1\"", "flotilla-binary-discovery", "codex"], Err("sh is unavailable".into()))
             .build();
-        let (assertions, logs) = capture_warn_logs(detector.detect(&runner, &TestEnvVars::default())).await;
+        let (assertions, logs) = capture_logs(tracing::Level::WARN, detector.detect(&runner, &TestEnvVars::default())).await;
 
         assert!(assertions.is_empty());
         assert!(logs.contains("codex"), "warning should name the rejected binary: {logs}");
@@ -256,7 +222,7 @@ mod tests {
             .on_run("codex", &["--version"], Ok("codex-cli 0.5.0\n".into()))
             .on_run("sh", &["-c", "command -v \"$1\"", "flotilla-binary-discovery", "codex"], Ok("bin/codex\n".into()))
             .build();
-        let (assertions, logs) = capture_warn_logs(detector.detect(&runner, &TestEnvVars::default())).await;
+        let (assertions, logs) = capture_logs(tracing::Level::WARN, detector.detect(&runner, &TestEnvVars::default())).await;
 
         assert!(assertions.is_empty());
         assert!(logs.contains("codex"), "warning should name the rejected binary: {logs}");
@@ -267,7 +233,7 @@ mod tests {
     async fn resolved_path_detector_keeps_missing_binary_quiet() {
         let detector = CommandDetector::new("codex", &["--version"], parse_first_dotted_version).with_resolved_path();
         let runner = DiscoveryMockRunner::builder().on_run("codex", &["--version"], Err("command not found".into())).build();
-        let (assertions, logs) = capture_warn_logs(detector.detect(&runner, &TestEnvVars::default())).await;
+        let (assertions, logs) = capture_logs(tracing::Level::WARN, detector.detect(&runner, &TestEnvVars::default())).await;
 
         assert!(assertions.is_empty());
         assert!(logs.is_empty(), "ordinary missing-binary detection should remain quiet: {logs}");

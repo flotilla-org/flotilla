@@ -438,6 +438,7 @@ mod tests {
         github_api::{GhApiClient, GithubRetrySource},
         replay,
         testing::MockRunner,
+        CommandOutput,
     };
 
     fn branch_lookup_page(items: serde_json::Value, has_next: bool) -> String {
@@ -485,42 +486,19 @@ mod tests {
     // Glue: the branch lookup must retain the shared REST rate-limit classifier.
     #[tokio::test]
     async fn branch_lookup_preserves_classified_rate_limit() {
-        // Subprocess boundary: gh exits unsuccessfully while retaining headers
-        // on stdout, which the generic MockRunner cannot express.
-        struct FailedGhRunner;
-        #[async_trait]
-        impl CommandRunner for FailedGhRunner {
-            async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
-                true
-            }
-            async fn run(
-                &self,
-                _cmd: &str,
-                _args: &[&str],
-                _cwd: &Path,
-                _label: &crate::providers::ChannelLabel,
-            ) -> Result<String, String> {
-                Err("gh: HTTP 403".into())
-            }
-            async fn run_output(
-                &self,
-                _cmd: &str,
-                _args: &[&str],
-                _cwd: &Path,
-                _label: &crate::providers::ChannelLabel,
-            ) -> Result<crate::providers::CommandOutput, String> {
-                Ok(crate::providers::CommandOutput {
-                    stdout: "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1893456000\r\n\r\n{\"message\":\"API rate limit exceeded\"}".into(),
-                    stderr: "gh: HTTP 403".into(),
-                    success: false,
-                })
-            }
-        }
-        let runner = Arc::new(FailedGhRunner);
-        let provider = GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner);
+        // Subprocess boundary: gh retains HTTP headers on stdout after failure.
+        let runner = Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput {
+            stdout: "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1893456000\r\n\r\n{\"message\":\"API rate limit exceeded\"}".into(),
+            stderr: "gh: HTTP 403".into(),
+            success: false,
+        })]));
+        let provider =
+            GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());
         let error = provider.find_change_request_by_branch("feature/wanted").await.expect_err("classified rate limit");
         assert!(matches!(error, ObservationError::RateLimited { .. }));
         assert!(error.retry_at().is_some());
+        assert_eq!(runner.remaining(), 0);
+        assert_eq!(runner.calls().len(), 1);
     }
 
     // This real API recording covers a merged PR and a nonexistent head using
