@@ -1182,6 +1182,13 @@ mod tests {
         assert!(content.contains("**Alternative:**"));
         assert!(content.contains("**If asking were free:**"));
         assert!(content.contains("flotilla artifact put --kind decision-ledger <path>"));
+        // #2596: settlement projects the ledger only after a clean final shepherd snapshot.
+        let settlement = content.split("\n## Decision ledger\n").nth(1).expect("ledger section");
+        let clean = settlement.find("Only after the final shepherd snapshot is clean").expect("clean snapshot gate");
+        let put = settlement.find("flotilla artifact put --kind decision-ledger <path>").expect("artifact put");
+        let complete = settlement.find("Then run `flotilla crew complete ...`").expect("completion");
+        assert!(clean < put && put < complete);
+        assert!(settlement.contains("checks settled green, every review item answered, and no conflict"));
         assert!(content.contains("A completion without this artifact is refused"));
         assert!(content.contains("Background delegates and sub-agents must never run those verbs"));
         assert!(content.contains("Crews never enact failure"));
