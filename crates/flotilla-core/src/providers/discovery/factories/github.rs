@@ -202,9 +202,11 @@ fn resolve_forgejo_auth(env: &EnvironmentBag, config: &ConfigStore, forgejo: &Fo
     {
         return Err("no explicit daemon credential configured for Forgejo Forge".into());
     }
+    // Credential sources are host paths that may start with `~/`, as in
+    // project-map manifests; expand them like a configured token_path.
     let path = env
         .find_auth_path(FORGEJO_AUTH_PROVIDER)
-        .map(|path| path.as_path().to_path_buf())
+        .map(|path| config_path(&config_parent(config), &path.as_path().to_string_lossy()))
         .map_or_else(|| resolve_forgejo_token_path(config, forgejo), Ok)?;
     let token =
         std::fs::read_to_string(&path).map_err(|error| format!("forgejo token file {}: {error}", path.display()))?.trim().to_string();
@@ -214,9 +216,12 @@ fn resolve_forgejo_auth(env: &EnvironmentBag, config: &ConfigStore, forgejo: &Fo
     Ok(ForgejoAuth { token, token_path: path })
 }
 
+fn config_parent(config: &ConfigStore) -> PathBuf {
+    config.base_path().as_path().parent().map(PathBuf::from).unwrap_or_else(|| config.base_path().as_path().to_path_buf())
+}
+
 fn resolve_forgejo_token_path(config: &ConfigStore, forgejo: &ForgejoIssueTrackerConfig) -> Result<PathBuf, String> {
-    let config_parent =
-        config.base_path().as_path().parent().map(PathBuf::from).unwrap_or_else(|| config.base_path().as_path().to_path_buf());
+    let config_parent = config_parent(config);
     if let Some(path) = &forgejo.token_path {
         return Ok(config_path(&config_parent, path));
     }
@@ -530,6 +535,23 @@ mod tests {
         let auth = resolve_forgejo_auth(&bag, &config, &ForgejoIssueTrackerConfig::default()).expect("discovered auth");
         assert_eq!(auth.token_path, selected);
         assert_eq!(auth.token, "selected");
+    }
+
+    #[test]
+    fn forgejo_auth_expands_a_home_relative_credential_source() {
+        // Manifest credential sources are `~/.config/flotilla/credentials/...`;
+        // the daemon must read them relative to its config, not as a literal `~`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let credentials = dir.path().join("flotilla").join("credentials");
+        std::fs::create_dir_all(&credentials).expect("credentials dir");
+        std::fs::write(credentials.join("lab-forgejo-daemon.token"), "daemon\n").expect("daemon token");
+        let config = ConfigStore::with_base(dir.path().join("flotilla"));
+        let bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::auth_file("forgejo", "~/.config/flotilla/credentials/lab-forgejo-daemon.token"));
+
+        let auth = resolve_forgejo_auth(&bag, &config, &ForgejoIssueTrackerConfig::default()).expect("expanded daemon credential");
+        assert_eq!(auth.token_path, credentials.join("lab-forgejo-daemon.token"));
+        assert_eq!(auth.token, "daemon");
     }
 
     #[tokio::test]
