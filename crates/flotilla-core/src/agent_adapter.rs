@@ -1193,6 +1193,11 @@ mod tests {
         let complete = settlement.find("Then run `flotilla crew complete ...`").expect("completion");
         assert!(clean < put && put < complete);
         assert!(settlement.contains("checks settled green, every review item answered, and no conflict"));
+        assert!(settlement.contains("You may draft the ledger file while working"));
+        assert!(settlement.contains("The projected ledger comment is settlement evidence, not an unanswered review finding"));
+        assert!(settlement.contains("take a new clean final snapshot before resubmitting the ledger"));
+        assert_eq!(content.matches("follows the settlement order in `## Decision ledger`").count(), 1);
+        assert!(content.contains("Follow the settlement order in `## Decision ledger`, then complete your assignment"));
         assert!(content.contains("A completion without this artifact is refused"));
         assert!(content.contains("Background delegates and sub-agents must never run those verbs"));
         assert!(content.contains("Crews never enact failure"));
