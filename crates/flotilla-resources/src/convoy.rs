@@ -115,7 +115,9 @@ pub fn convoy_reference_context<'a>(
                 .iter()
                 .find(|forge| forge.forge_id == service)
                 .map(|forge| forge.https_url.trim_end_matches('/').to_string())
-                .or_else(|| resolved.and_then(crate::RepositorySpec::forge).map(|forge| forge.service_url.clone()))
+                .or_else(|| {
+                    resolved.and_then(crate::RepositorySpec::forge).map(|forge| forge.service_url.trim_end_matches('/').to_string())
+                })
                 .or_else(|| canonical.strip_suffix(&format!("/{scope}")).map(str::to_string))?;
             let alias = project
                 .and_then(|project| project.repositories.iter().find(|member| member.repo == repository.repo_ref))
@@ -2364,6 +2366,25 @@ mod subject_tests {
         let configured =
             convoy_reference_context(std::slice::from_ref(&snapshot), None, None, std::slice::from_ref(&forge), |_| Some(&resolved));
         let from_repository = convoy_reference_context(std::slice::from_ref(&snapshot), None, None, &[], |_| Some(&resolved));
+        // Stored records may predate constructor normalization. Both sources
+        // must still yield the same normalized public root for those records.
+        let simple_forge = crate::ForgeSpec { https_url: "https://forge.example/".into(), ..forge.clone() };
+        let simple = crate::RepositorySpec::remote("https://forge.example/team/repo")
+            .expect("repository")
+            .on_forge(&simple_forge)
+            .expect("forge repository");
+        let mut stored = serde_json::to_value(&simple).expect("serialized repository");
+        stored["forge"]["service_url"] = serde_json::json!("https://forge.example/");
+        let legacy = serde_json::from_value::<crate::RepositorySpec>(stored).expect("legacy repository");
+        let mut simple_snapshot = snapshot.clone();
+        simple_snapshot.url = "git@transport.example:team/repo.git".into();
+        let simple_configured =
+            convoy_reference_context(std::slice::from_ref(&simple_snapshot), None, None, std::slice::from_ref(&simple_forge), |_| {
+                Some(&simple)
+            });
+        let from_legacy = convoy_reference_context(std::slice::from_ref(&simple_snapshot), None, None, &[], |_| Some(&legacy));
+        assert_eq!(simple_configured.repositories, from_legacy.repositories);
+        assert_eq!(from_legacy.repositories[0].web_base, "https://forge.example");
         assert_eq!(configured.repositories.len(), 1);
         assert_eq!(configured.repositories, from_repository.repositories);
         assert_eq!(configured.repositories[0].web_base, "https://forge.example/install");

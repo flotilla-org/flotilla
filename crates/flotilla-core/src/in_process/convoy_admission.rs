@@ -384,6 +384,8 @@ impl ConvoyAdmission {
                         found.map(|(id, request)| ConvoyChangeRequest { id, status: request.status, repository_key: repository })
                     })
                 } else {
+                    // Setup reports repository-read, forge-identity, or provider-discovery
+                    // failures. The generic text defends against an empty diagnostic set.
                     Err(ObservationError::Forge(setup_failures.into_iter().next().unwrap_or_else(|| "no repository provider".into())))
                 }
             };
@@ -394,6 +396,8 @@ impl ConvoyAdmission {
             }
             results.push((key.clone(), result.map_err(|error| error.to_string())));
         }
+        // An admitted ID remains authoritative even on absence or failure;
+        // matches in other repositories still contribute discovery results.
         let primary = if let Some(bound) = bound {
             bound
         } else if primary.is_some() {
