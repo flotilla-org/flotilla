@@ -1,11 +1,20 @@
 name: Tender SSH cleat proof
 
+# Real-SSH proof is expensive (cleat build + sshd); run it only when Tender,
+# its CI rig, or this workflow changes, plus on demand.
 on:
   pull_request:
     branches: [main]
-  merge_group:
+    paths:
+      - "crates/tender/**"
+      - "ci/tender/**"
+      - ".github/workflows/tender-ssh-cleat.yml"
   push:
     branches: [main]
+    paths:
+      - "crates/tender/**"
+      - "ci/tender/**"
+      - ".github/workflows/tender-ssh-cleat.yml"
   workflow_dispatch:
 
 permissions:
