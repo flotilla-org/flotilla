@@ -20,3 +20,12 @@ libc = "0.2"
 
 [dev-dependencies]
 hegeltest = "=0.48.1"
+
+[features]
+# Dedicated provisioned Linux CI job; normal contracts need neither cleat nor sshd.
+ssh-cleat-proof = []
+
+[[test]]
+name = "ssh_cleat"
+path = "tests/ssh_cleat.rs"
+required-features = ["ssh-cleat-proof"]
