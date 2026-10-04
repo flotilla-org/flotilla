@@ -733,9 +733,20 @@ impl ChangeRequestTracker for CountingChangeRequestTracker {
     }
 }
 
+// #2570: exercise cosmetic filesystem aliases on Linux as well as macOS.
+// The TempDir owns both the physical directory and its symlink for cleanup.
+fn symlinked_fixture() -> (tempfile::TempDir, PathBuf) {
+    let temp = tempfile::tempdir().expect("symlink fixture");
+    let physical = temp.path().join("physical");
+    std::fs::create_dir(&physical).expect("physical directory");
+    let alias = temp.path().join("alias");
+    std::os::unix::fs::symlink(&physical, &alias).expect("directory symlink");
+    (temp, alias)
+}
+
 async fn daemon_for_cwd() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
-    let temp = tempfile::tempdir().expect("create tempdir");
-    let repo = temp.path().join("repo");
+    let (temp, fixture) = symlinked_fixture();
+    let repo = fixture.join("repo");
     init_git_repo(&repo);
     let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, git_process_discovery(false), HostName::local()).await;
@@ -744,7 +755,7 @@ async fn daemon_for_cwd() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) 
 
 async fn daemon_for_plain_dir() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let repo = temp.path().join("repo");
+    let repo = std::fs::canonicalize(temp.path()).expect("physical fixture").join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
     let config = test_config_store(temp.path().join("config"));
     let daemon = InProcessDaemon::new(vec![repo.clone()], config, fake_discovery(false), HostName::local()).await;
@@ -5372,7 +5383,7 @@ fn init_git_repo_with_local_bare_remote(path: &Path, remote_path: &Path) -> Repo
 
 async fn daemon_for_fake_repo() -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>, RepoIdentity) {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let repo = temp.path().join("repo");
+    let repo = std::fs::canonicalize(temp.path()).expect("physical fixture").join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
 
     let state =
@@ -5434,8 +5445,8 @@ async fn strict_refresh_surfaces_repository_inspection_failures() {
 
 async fn daemon_for_duplicate_fake_repos() -> (tempfile::TempDir, PathBuf, PathBuf, Arc<InProcessDaemon>) {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let repo_a = temp.path().join("repo-a");
-    let repo_b = temp.path().join("repo-b");
+    let repo_a = std::fs::canonicalize(temp.path()).expect("physical fixture").join("repo-a");
+    let repo_b = std::fs::canonicalize(temp.path()).expect("physical fixture").join("repo-b");
     std::fs::create_dir_all(&repo_a).expect("create repo-a dir");
     std::fs::create_dir_all(&repo_b).expect("create repo-b dir");
 
@@ -5965,8 +5976,8 @@ fn lab_forge_spec() -> flotilla_resources::ForgeSpec {
 async fn discovery_resolves_origin_forge_and_binds_both_forgejo_sources() {
     use flotilla_resources::Forge;
 
-    let temp = tempfile::tempdir().expect("tempdir");
-    let repo = temp.path().join("repo");
+    let (temp, fixture) = symlinked_fixture();
+    let repo = fixture.join("repo");
     init_git_repo_with_remote(&repo, "git@forgejo.lab.flotilla.work:lab/flotilla.git");
     std::fs::write(temp.path().join("lab-forgejo-coder-token"), "test-token\n").expect("write test token");
     let daemon =
@@ -6682,7 +6693,7 @@ async fn fetch_checkout_status_accepts_identity_context_repo() {
 #[tokio::test]
 async fn add_and_remove_repo_updates_state_and_emits_events() {
     let temp = tempfile::tempdir().unwrap();
-    let repo = temp.path().join("new-repo");
+    let repo = std::fs::canonicalize(temp.path()).expect("physical fixture").join("new-repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
     init_git_repo(&repo);
 
@@ -6928,8 +6939,8 @@ async fn stop_observing_missing_checkout_refuses_without_started_event() {
 #[tokio::test]
 async fn refresh_all_command_refreshes_every_tracked_repo() {
     let temp = tempfile::tempdir().unwrap();
-    let repo_a = temp.path().join("repo-a");
-    let repo_b = temp.path().join("repo-b");
+    let repo_a = std::fs::canonicalize(temp.path()).expect("physical fixture").join("repo-a");
+    let repo_b = std::fs::canonicalize(temp.path()).expect("physical fixture").join("repo-b");
     std::fs::create_dir_all(&repo_a).unwrap();
     std::fs::create_dir_all(&repo_b).unwrap();
 
@@ -6966,6 +6977,61 @@ async fn refresh_all_command_refreshes_every_tracked_repo() {
     .expect("timeout waiting for refresh all CommandFinished");
 
     assert!(matches!(finished, CommandValue::Refreshed { repos, .. } if repos.len() == 2));
+}
+
+// #2570: an observation root remains removable through its filesystem alias
+// even when inspection failed and no checkout facts were published.
+#[tokio::test]
+async fn symlinked_untrack_removes_unavailable_observation_root() {
+    let (temp, alias) = symlinked_fixture();
+    let physical = std::fs::canonicalize(&alias).expect("physical root");
+    let config = test_config_store(temp.path().join("config"));
+    config.add_observation_root(&ExecutionEnvironmentPath::new(&physical)).expect("observation root");
+    let daemon = InProcessDaemon::new(vec![], Arc::clone(&config), fake_discovery(false), HostName::local()).await;
+    daemon
+        .execute(Command::builder().action(CommandAction::UntrackRepo { repo: RepoSelector::Path(alias) }).build())
+        .await
+        .expect("alias resolves unavailable root");
+    assert!(config.load_observation_roots().expect("roots").is_empty());
+}
+
+// #2570: removing an observed checkout through its alias retires both the
+// physical presentation root and previously persisted alias spelling.
+#[tokio::test]
+async fn symlinked_remove_repo_retires_tracked_and_persisted_roots() {
+    let (temp, alias) = symlinked_fixture();
+    let repo = alias.join("repo");
+    init_git_repo(&repo);
+    let config = test_config_store(temp.path().join("config"));
+    config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("alias observation root");
+    let daemon = InProcessDaemon::new(vec![repo.clone()], Arc::clone(&config), git_process_discovery(false), HostName::local()).await;
+    daemon.remove_repo(&repo).await.expect("remove alias checkout");
+    assert!(daemon.tracked_repo_paths().await.is_empty());
+    assert!(config.load_observation_roots().expect("roots").is_empty());
+}
+
+// #2570: a symlinked checkout selector resolves through both command routing
+// and executor lookup. Git refuses main-worktree deletion after resolution.
+#[tokio::test]
+async fn symlinked_checkout_selector_reaches_main_worktree_refusal() {
+    let (_temp, repo, daemon) = daemon_for_cwd().await;
+    let mut events = daemon.subscribe();
+    let id = daemon
+        .execute(Command::builder().action(CommandAction::RemoveCheckout { checkout: CheckoutSelector::Path(repo) }).build())
+        .await
+        .expect("symlinked checkout resolves");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let DaemonEvent::CommandFinished { command_id, result, .. } = events.recv().await.expect("event") {
+                if command_id == id {
+                    break result;
+                }
+            }
+        }
+    })
+    .await
+    .expect("checkout removal result");
+    assert!(matches!(result, CommandValue::Error { message } if message.contains("main working tree")));
 }
 
 #[tokio::test]
@@ -7125,7 +7191,7 @@ async fn get_repo_providers_returns_structured_unmet_requirements_and_discovery(
 #[tokio::test]
 async fn add_repo_uses_manager_backed_local_environment_for_repo_identity() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    let repo = temp.path().join("repo");
+    let repo = std::fs::canonicalize(temp.path()).expect("physical fixture").join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
     let config = test_config_store(temp.path().join("config"));
     let daemon =
@@ -8386,7 +8452,7 @@ fn repository_operations_without_tracked_roots(tc: hegel::TestCase) {
             )
             .await
             .expect("declare alias");
-        let path = temp.path().join("checkout");
+        let path = std::fs::canonicalize(temp.path()).expect("physical fixture").join("checkout");
         if checkout {
             daemon
                 .observed_resource_backend()
@@ -8545,8 +8611,8 @@ async fn repository_forge_refusals_without_tracked_roots() {
 // consumers run after startup, while observing a root does not mint a Project.
 #[tokio::test]
 async fn startup_observation_publishes_repository_context_without_project_minting() {
-    let temp = tempfile::tempdir().expect("checkout fixture");
-    let path = temp.path().join("repo");
+    let (temp, fixture) = symlinked_fixture();
+    let path = fixture.join("repo");
     init_git_repo_with_remote(&path, "https://github.com/owner/startup");
     let daemon = InProcessDaemon::new(
         vec![path.clone()],
@@ -8573,7 +8639,8 @@ async fn startup_observation_publishes_repository_context_without_project_mintin
         }
     }
     assert!(matched, "refresh publishes the repo-info event identity");
-    assert_eq!(response.path, Some(path));
+    // Local facts and startup presentation use the same physical path.
+    assert_eq!(response.path, Some(std::fs::canonicalize(path).expect("physical checkout")));
     assert!(daemon.resource_backend().using::<Project>("flotilla").list().await.expect("Projects").items.is_empty());
 }
 

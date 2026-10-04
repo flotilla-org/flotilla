@@ -2,7 +2,12 @@ pub use flotilla_protocol::CheckoutIntent;
 use flotilla_protocol::{provider_data::Checkout, qualified_path::QualifiedPath, CheckoutSelector, HostName};
 use tracing::warn;
 
-use crate::{path_context::ExecutionEnvironmentPath, provider_data::ProviderData, terminal_manager::TerminalManager, vcs::Vcs};
+use crate::{
+    path_context::{canonical_or_original, ExecutionEnvironmentPath},
+    provider_data::ProviderData,
+    terminal_manager::TerminalManager,
+    vcs::Vcs,
+};
 
 pub(super) struct CheckoutService<'a> {
     vcs: &'a dyn Vcs,
@@ -103,7 +108,16 @@ pub(super) fn resolve_checkout_branch(
         CheckoutSelector::Path(path) => providers_data
             .checkouts
             .iter()
-            .find(|(host_path, checkout)| checkout_matches_scope(host_path, checkout, local_host, scope) && host_path.path == *path)
+            .find(|(host_path, checkout)| {
+                if !checkout_matches_scope(host_path, checkout, local_host, scope) {
+                    return false;
+                }
+                if checkout_matches_scope(host_path, checkout, local_host, &CheckoutResolutionScope::Local) {
+                    canonical_or_original(&host_path.path) == canonical_or_original(path)
+                } else {
+                    host_path.path == *path
+                }
+            })
             .map(|(_, checkout)| checkout.branch.clone())
             .ok_or_else(|| format!("checkout not found: {}", path.display())),
         CheckoutSelector::Query(query) => {

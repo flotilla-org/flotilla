@@ -8,6 +8,8 @@ use std::{
 use flotilla_protocol::{RepoIdentity, RepoSelector};
 use flotilla_resources::{Checkout, CheckoutPhase, CheckoutSpec, Environment, Project, Repository, RepositoryKey, ResourceBackend};
 
+use crate::path_context::canonical_or_original;
+
 pub(crate) async fn resolve_repository(
     backend: &ResourceBackend,
     observed: &ResourceBackend,
@@ -55,6 +57,7 @@ pub(crate) async fn resolve_repository(
             }
         }
         RepoSelector::Path(cwd) => {
+            let cwd = canonical_or_original(cwd);
             let checkouts = local_checkouts(backend, observed, namespace, local_host).await?;
             // Nested known checkouts scope to the deepest containing checkout.
             let mut deepest = 0;
@@ -153,6 +156,16 @@ pub(crate) async fn local_checkouts(
                             .is_some_and(|path| Path::new(path).is_absolute())
                 }
             }
+        })
+        .map(|mut checkout| {
+            // Only local facts may be resolved against this host's filesystem.
+            if let CheckoutSpec::Observed(spec) = &mut checkout.spec {
+                spec.path = canonical_or_original(Path::new(&spec.path)).to_string_lossy().into_owned();
+            }
+            if let Some(path) = checkout.status.as_mut().and_then(|status| status.path.as_mut()) {
+                *path = canonical_or_original(Path::new(path)).to_string_lossy().into_owned();
+            }
+            checkout
         })
         .collect())
 }
@@ -268,6 +281,38 @@ mod tests {
             );
             assert_eq!(
                 resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path("/work/widgets-other".into())).await,
+                Ok(None)
+            );
+        });
+    }
+
+    // #2570: local checkout facts and selectors agree through directory symlinks,
+    // including an absent suffix. Generate both stored spellings and suffix depths.
+    #[hegel::test]
+    fn symlinked_cwd_resolves_physical_checkout(tc: hegel::TestCase) {
+        let stored_alias = tc.draw(gs::booleans());
+        let depth = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+        let temp = tempfile::tempdir().expect("fixture");
+        let physical = temp.path().join("physical");
+        std::fs::create_dir(&physical).expect("physical directory");
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&physical, &alias).expect("symlink");
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let durable = backend();
+            let observed = backend();
+            let key = repository(&durable, "widgets", "acme/widgets").await;
+            let stored = if stored_alias { &alias } else { &physical };
+            checkout().backend(&observed).name("checkout").path(stored.to_str().expect("path")).key(key.clone()).call().await;
+            let mut cwd = alias.clone();
+            for _ in 0..depth {
+                cwd.push("missing");
+            }
+            assert_eq!(resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path(cwd)).await, Ok(Some(key.clone())));
+            assert_eq!(resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path(physical)).await, Ok(Some(key)));
+            // Component boundaries still prevent sibling-prefix matches.
+            assert_eq!(
+                resolve_repository(&durable, &observed, "test", "local", &RepoSelector::Path(temp.path().join("physical-other"))).await,
                 Ok(None)
             );
         });

@@ -9,7 +9,7 @@ use flotilla_protocol::NodeId;
 use flotilla_resources::RepositoryVcsSpec;
 use serde::{Deserialize, Serialize};
 
-use crate::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
+use crate::path_context::{canonical_or_original, DaemonHostPath, ExecutionEnvironmentPath};
 
 /// Per-category provider preference.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -664,11 +664,12 @@ impl ConfigStore {
 
     pub fn remove_observation_root(&self, path: &ExecutionEnvironmentPath) -> Result<(), String> {
         let _guard = self.observation_roots.lock().expect("observation roots mutex poisoned");
+        let physical = canonical_or_original(path.as_path());
         let paths = self
             .load_observation_roots()?
             .into_iter()
             .map(ExecutionEnvironmentPath::into_path_buf)
-            .filter(|candidate| candidate != path.as_path())
+            .filter(|candidate| canonical_or_original(candidate) != physical)
             .collect();
         self.save_observation_roots(paths)
     }
