@@ -10,7 +10,8 @@ pub struct ClockReading {
 }
 
 pub trait Clock: Send + Sync {
-    fn read(&self) -> ClockReading;
+    /// Failure refuses new work; hosts must reopen after restoring the clock.
+    fn read(&self) -> io::Result<ClockReading>;
 }
 
 /// Process-monotonic clock. Restart changes epoch, conservatively expiring old
@@ -30,8 +31,8 @@ impl Default for ProcessClock {
     }
 }
 impl Clock for ProcessClock {
-    fn read(&self) -> ClockReading {
-        ClockReading { epoch: self.epoch.clone(), tick: self.start.elapsed().as_millis().try_into().unwrap_or(u64::MAX) }
+    fn read(&self) -> io::Result<ClockReading> {
+        Ok(ClockReading { epoch: self.epoch.clone(), tick: self.start.elapsed().as_millis().try_into().unwrap_or(u64::MAX) })
     }
 }
 
@@ -111,6 +112,9 @@ impl Store for FileStore {
         temporary.write_all(bytes)?;
         temporary.as_file().sync_all()?;
         temporary.persist(&self.path).map_err(|error| error.error)?;
+        // Rename is already visible here. If directory sync fails, durability is
+        // uncertain even though the new record may survive; the authority treats
+        // that uncertainty as a failed save and conservatively refuses work.
         std::fs::File::open(parent)?.sync_all()
     }
 }
@@ -129,13 +133,23 @@ impl BootClock {
 }
 #[cfg(target_os = "linux")]
 impl Clock for BootClock {
-    fn read(&self) -> ClockReading {
+    fn read(&self) -> io::Result<ClockReading> {
         let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         // SAFETY: time is a valid writable timespec; CLOCK_BOOTTIME is supported
         // by Linux. A clock failure must never extend a grant's lifetime.
         let result = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) };
-        assert_eq!(result, 0, "hosting monotonic clock unavailable");
-        let tick = (time.tv_sec as u64).saturating_mul(1000).saturating_add(time.tv_nsec as u64 / 1_000_000);
-        ClockReading { epoch: self.epoch.clone(), tick }
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let seconds = u64::try_from(time.tv_sec).map_err(|_| io::Error::other("negative hosting clock"))?;
+        let nanos = u64::try_from(time.tv_nsec).map_err(|_| io::Error::other("negative hosting clock nanoseconds"))?;
+        if nanos >= 1_000_000_000 {
+            return Err(io::Error::other("invalid hosting clock nanoseconds"));
+        }
+        let tick = seconds
+            .checked_mul(1000)
+            .and_then(|millis| millis.checked_add(nanos / 1_000_000))
+            .ok_or_else(|| io::Error::other("hosting clock overflow"))?;
+        Ok(ClockReading { epoch: self.epoch.clone(), tick })
     }
 }

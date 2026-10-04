@@ -68,7 +68,9 @@ for real-SSH checks and the installed CLI's connect-only limitations.
 Inject `runtime::Clock` into `MemoryTender::hosted` or `Server::open`. Ticks are
 milliseconds within the clock's opaque epoch; a grant is invalid at
 `expires_at <= current_tick`. Sample the injected clock to issue a deadline,
-using checked addition for the desired lifetime. Every publish, connect and
+using checked addition for the desired lifetime. `Clock::read` is fallible;
+a clock error refuses work and closes streams without poisoning the authority
+lock. Restore the clock and reopen the host to resume. Every publish, connect and
 exposure open samples the clock under the authority lock, without publisher or
 operator activity. Browse/watch and the server's maintenance loop also observe
 expiry. Mere expiry retires the identity and refuses new work while established

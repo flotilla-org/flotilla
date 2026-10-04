@@ -15,18 +15,21 @@ use tokio::{
     time::timeout,
 };
 
-struct ManualClock(Mutex<ClockReading>);
+struct ManualClock(Mutex<ClockReading>, std::sync::atomic::AtomicBool);
 impl ManualClock {
     fn new() -> Self {
-        Self(Mutex::new(ClockReading { epoch: "boot-one".into(), tick: 0 }))
+        Self(Mutex::new(ClockReading { epoch: "boot-one".into(), tick: 0 }), std::sync::atomic::AtomicBool::new(false))
     }
     fn set(&self, tick: u64) {
         self.0.lock().unwrap().tick = tick;
     }
 }
 impl Clock for ManualClock {
-    fn read(&self) -> ClockReading {
-        self.0.lock().unwrap().clone()
+    fn read(&self) -> io::Result<ClockReading> {
+        if self.1.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::other("clock unavailable"));
+        }
+        Ok(self.0.lock().unwrap().clone())
     }
 }
 
@@ -435,3 +438,28 @@ fn corrupt_identity_counters_and_versions_are_refused() {
         assert_eq!(store.load().unwrap().unwrap(), bytes);
     }
 }
+
+// A failed injected clock cannot poison the authority lock or leave streams
+// alive. Restoring the clock alone does not clear the fail-closed latch.
+async fn clock_failure(rig: Rig) {
+    rig.authorize(100);
+    let mut published = rig.client.publish(&rig.session, rig.request(None)).await.unwrap();
+    let mut stream = rig.client.connect(&rig.session, published.lease.id).await.unwrap();
+    let _service = timeout(Duration::from_secs(2), published.incoming.recv()).await.unwrap().unwrap();
+    rig.clock.1.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(rig.client.publish(&rig.session, rig.request(None)).await, Err(Error::Storage)));
+    assert!(matches!(rig.client.connect(&rig.session, published.lease.id).await, Err(Error::Storage)));
+    let mut byte = [0];
+    let closed = timeout(Duration::from_secs(2), stream.read(&mut byte)).await.unwrap();
+    assert!(matches!(closed, Ok(0)) || closed.is_err());
+    rig.clock.1.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(rig.authority.allow_browse(rig.session.caller.clone()), Err(Error::Storage));
+    assert_eq!(rig.client.browse(&rig.session).await, Err(Error::Storage));
+}
+contract!(memory_clock_failure, clock_failure, false, false);
+#[cfg(unix)]
+contract!(socket_clock_failure, clock_failure, true, false);
+#[cfg(unix)]
+contract!(file_clock_failure, clock_failure, false, true);
+#[cfg(unix)]
+contract!(socket_file_clock_failure, clock_failure, true, true);

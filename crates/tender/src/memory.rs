@@ -76,7 +76,7 @@ impl MemoryTender {
     /// expire prior grants rather than extending their lifetime. Saves fail closed.
     pub fn hosted(host: Fingerprint, clock: Arc<dyn Clock>, store: Arc<dyn Store>) -> std_io::Result<Self> {
         let authority = Self::new(host.clone());
-        let reading = clock.read();
+        let reading = clock.read()?;
         {
             let mut state = authority.inner.lock().expect("state lock");
             if let Some(bytes) = store.load()? {
@@ -143,7 +143,15 @@ impl MemoryTender {
             return Err(Error::Storage);
         }
         if let Some(runtime) = &state.runtime {
-            let reading = runtime.clock.read();
+            let reading = match runtime.clock.read() {
+                Ok(reading) => reading,
+                Err(error) => {
+                    tracing::warn!(%error, "Tender hosting clock failed; refusing work");
+                    state.fail();
+                    state.send_snapshots();
+                    return Err(Error::Storage);
+                }
+            };
             let invalid = reading.epoch != runtime.epoch || reading.tick < state.now;
             if invalid {
                 for grant in state.grants.values_mut() {
@@ -313,6 +321,13 @@ struct StoredRecord {
 }
 
 impl State {
+    fn fail(&mut self) {
+        self.failed = true;
+        for record in self.records.values_mut() {
+            retire(record, true);
+        }
+    }
+
     fn expire(&mut self) {
         for record in self.records.values_mut() {
             if record.expires_at <= self.now {
@@ -352,11 +367,9 @@ impl State {
                 .collect(),
         };
         let result = serde_json::to_vec(&stored).map_err(std_io::Error::other).and_then(|bytes| runtime.store.save(&bytes));
-        if result.is_err() {
-            self.failed = true;
-            for record in self.records.values_mut() {
-                retire(record, true);
-            }
+        if let Err(error) = result {
+            tracing::warn!(%error, "Tender policy save failed; refusing work");
+            self.fail();
             return Err(Error::Storage);
         }
         Ok(())
@@ -382,6 +395,11 @@ impl State {
 
     fn notify(&mut self) -> Result<(), Error> {
         let saved = self.persist();
+        self.send_snapshots();
+        saved
+    }
+
+    fn send_snapshots(&mut self) {
         let snapshots: Vec<_> = self.watchers.iter().map(|(caller, _)| self.visible(caller)).collect();
         self.watchers = self
             .watchers
@@ -389,7 +407,6 @@ impl State {
             .zip(snapshots)
             .filter_map(|((caller, sender), snapshot)| sender.send(snapshot).ok().map(|()| (caller, sender)))
             .collect();
-        saved
     }
 
     fn record_for_connect(&mut self, session: &Session, id: PublicationId) -> Result<&mut Record, Error> {
@@ -494,6 +511,9 @@ impl Tender for MemoryTender {
                     record.publication.availability = Availability::Unavailable;
                     record.sender = None;
                     abort_streams(record);
+                    // No caller awaits this receiver-closure notification.
+                    // notify logs/latches save failure, aborts streams and updates
+                    // watchers, so ignoring the return cannot keep serving work.
                     let _ = state.notify();
                 }
             }
