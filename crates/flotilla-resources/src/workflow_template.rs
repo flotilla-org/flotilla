@@ -595,9 +595,19 @@ pub fn interactive_single_workflow_spec() -> WorkflowTemplateSpec {
 }
 
 pub fn implement_review_workflow_spec() -> WorkflowTemplateSpec {
+    let mut turn_delivery = standard_review_turn_delivery("work", "coder");
+    let mut reviewer_turns = standard_review_turn_delivery("work", "reviewer");
+    for (source, brief) in [
+        ("checks-settled", "Inspect checks and reviews at the bound head. Send failures or new findings to the coder, re-review fixes, and sign off when the implementation is sound, checks pass, and review items are handled."),
+        ("actionable-review", "Inspect actionable review feedback at the bound head, send findings to the coder, and re-review fixes before signing off."),
+    ] {
+        let mut rule = reviewer_turns.shift_remove(source).expect("stock review rule");
+        rule.brief = brief.to_string();
+        turn_delivery.insert(format!("reviewer-{source}"), rule);
+    }
     WorkflowTemplateSpec::builder()
         .exit(ExitDeclaration::standard_table())
-        .turn_delivery(standard_review_turn_delivery("work", "coder"))
+        .turn_delivery(turn_delivery)
         .vessels(vec![VesselRequirement::builder()
             .name("work".to_string())
             .crew(vec![
