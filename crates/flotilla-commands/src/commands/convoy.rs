@@ -19,6 +19,9 @@ pub struct ConvoyNoun {
     pub verb: ConvoyVerb,
 }
 
+// Variants with arguments take an `Args` struct so clap builds each in its
+// own call; inline fields share one frame that overflowed Windows' 1 MiB
+// main thread in unoptimised builds (flotilla-org/flotilla#2588).
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum ConvoyVerb {
     /// List convoys and their crew across the fleet
@@ -28,130 +31,154 @@ pub enum ConvoyVerb {
     /// Manage the work aboard a convoy's vessels
     Work(ConvoyWorkNoun),
     /// Delete a convoy and tear down its managed resources
-    Delete {
-        /// Convoy role or role@project address
-        name: String,
-        /// Skip integration safety checks
-        #[arg(long, default_value_t = false)]
-        force: bool,
-    },
+    Delete(ConvoyDeleteArgs),
     /// Link an issue or change request to a convoy
-    Link {
-        name: String,
-        reference: String,
-        #[arg(long = "as", value_parser = parse_relationship)]
-        relationship: flotilla_protocol::Relationship,
-    },
+    Link(ConvoyLinkArgs),
     /// Unlink a discovered subject and suppress automatic rediscovery
-    Unlink { name: String, reference: String },
+    Unlink(ConvoyUnlinkArgs),
     /// Abandon a convoy, archive best-effort, and tear it down
-    Abandon {
-        /// Convoy role or role@project address
-        name: String,
-        /// Human-readable reason for accepting loss of uncommitted work
-        #[arg(long)]
-        reason: String,
-    },
+    Abandon(ConvoyAbandonArgs),
     /// Send a follow-up brief to convoy crew
-    Resume {
-        /// Convoy role or role@project address
-        name: String,
-        /// Follow-up brief delivered to the existing crew session
-        #[arg(long, required_unless_present = "withdraw", conflicts_with = "withdraw")]
-        prompt: Option<String>,
-        /// Withdraw the brief waiting for the next turn boundary
-        #[arg(long, conflicts_with_all = ["prompt", "vessel", "role"])]
-        withdraw: bool,
-        /// Vessel name; inferred when exactly one active or completed crew member matches
-        #[arg(long)]
-        vessel: Option<String>,
-        /// Crew role; inferred when exactly one active or completed crew member matches
-        #[arg(long)]
-        role: Option<String>,
-    },
+    Resume(ConvoyResumeArgs),
     /// Start a convoy through Project-scoped admission completion
-    Start {
-        /// Project whose definitions and repository set admission snapshots
-        #[arg(long)]
-        project: String,
-        /// Existing pull request number to adopt
-        #[arg(
-            long = "pr",
-            conflicts_with_all = ["branch", "issue", "issue_service", "issue_scope"],
-            value_parser = parse_pr_number
-        )]
-        change_request: Option<String>,
-        /// Opaque external issue ID
-        #[arg(long)]
-        issue: Option<String>,
-        /// Portable issue service identity; requires --issue and --issue-scope
-        #[arg(long)]
-        issue_service: Option<String>,
-        /// Portable issue scope identity; requires --issue and --issue-service
-        #[arg(long)]
-        issue_scope: Option<String>,
-        /// Human-facing convoy role within the project
-        #[arg(long)]
-        name: Option<String>,
-        /// Complete git branch name
-        #[arg(long)]
-        branch: Option<String>,
-        /// Workflow template; defaults from the Project
-        #[arg(long)]
-        workflow: Option<String>,
-        /// Workflow input value (repeatable): --input key=value
-        #[arg(long = "input", value_parser = parse_input_kv)]
-        inputs: Vec<(String, String)>,
-        /// Human free-text appended to the crew Brief
-        #[arg(long)]
-        instruction: Option<String>,
-        /// Pin a fulfilment kind for vessel provisioning
-        #[arg(long = "fulfilment")]
-        placement_policy: Option<String>,
-        /// Add a capability need (repeatable)
-        #[arg(long = "need")]
-        needs: Vec<String>,
-        /// Reason for a pin above the least privileged alternatives
-        #[arg(long = "escalation-reason")]
-        escalation_reason: Option<String>,
-        /// Agent harness override (repeatable): --agent [capability=]adapter[:model].
-        /// Bare form applies to the `code` capability, e.g. --agent claude-code:opus
-        #[arg(long = "agent", value_parser = parse_agent_override)]
-        agent_overrides: Vec<AgentOverride>,
-        /// Explicit skill import or -name removal (repeatable)
-        #[arg(long = "skill", allow_hyphen_values = true)]
-        skills: Vec<String>,
-        /// Create the convoy without attaching the caller to its first crew session
-        #[arg(long, conflicts_with = "attach")]
-        no_attach: bool,
-        /// Attach to the convoy's first crew session even when a presentation surface is connected
-        #[arg(long, conflicts_with = "no_attach")]
-        attach: bool,
-    },
+    Start(ConvoyStartArgs),
     /// Create a convoy from a workflow template
-    Create {
-        /// Workflow template to instantiate
-        #[arg(long)]
-        template: String,
-        /// Input value (repeatable): --input key=value
-        #[arg(long = "input", value_parser = parse_input_kv)]
-        inputs: Vec<(String, String)>,
-        /// Repository URL the workflow operates on
-        #[arg(long = "repo")]
-        repository_url: Option<String>,
-        /// Git ref (branch/tag/commit) within the repository
-        #[arg(long = "ref")]
-        r#ref: Option<String>,
-        /// Project this convoy belongs to (metadata grouping)
-        #[arg(long = "project")]
-        project_ref: Option<String>,
-        /// Pin a fulfilment kind for vessel provisioning
-        #[arg(long = "fulfilment")]
-        placement_policy: Option<String>,
-        /// Existing local checkout/worktree to adopt as the convoy vessel
-        #[arg(long = "adopt-checkout")]
-        adopted_checkout: Option<PathBuf>,
-    },
+    Create(ConvoyCreateArgs),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ConvoyDeleteArgs {
+    /// Convoy role or role@project address
+    pub name: String,
+    /// Skip integration safety checks
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ConvoyLinkArgs {
+    pub name: String,
+    pub reference: String,
+    #[arg(long = "as", value_parser = parse_relationship)]
+    pub relationship: flotilla_protocol::Relationship,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ConvoyUnlinkArgs {
+    pub name: String,
+    pub reference: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ConvoyAbandonArgs {
+    /// Convoy role or role@project address
+    pub name: String,
+    /// Human-readable reason for accepting loss of uncommitted work
+    #[arg(long)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ConvoyResumeArgs {
+    /// Convoy role or role@project address
+    pub name: String,
+    /// Follow-up brief delivered to the existing crew session
+    #[arg(long, required_unless_present = "withdraw", conflicts_with = "withdraw")]
+    pub prompt: Option<String>,
+    /// Withdraw the brief waiting for the next turn boundary
+    #[arg(long, conflicts_with_all = ["prompt", "vessel", "role"])]
+    pub withdraw: bool,
+    /// Vessel name; inferred when exactly one active or completed crew member matches
+    #[arg(long)]
+    pub vessel: Option<String>,
+    /// Crew role; inferred when exactly one active or completed crew member matches
+    #[arg(long)]
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ConvoyStartArgs {
+    /// Project whose definitions and repository set admission snapshots
+    #[arg(long)]
+    pub project: String,
+    /// Existing pull request number to adopt
+    #[arg(
+        long = "pr",
+        conflicts_with_all = ["branch", "issue", "issue_service", "issue_scope"],
+        value_parser = parse_pr_number
+    )]
+    pub change_request: Option<String>,
+    /// Opaque external issue ID
+    #[arg(long)]
+    pub issue: Option<String>,
+    /// Portable issue service identity; requires --issue and --issue-scope
+    #[arg(long)]
+    pub issue_service: Option<String>,
+    /// Portable issue scope identity; requires --issue and --issue-service
+    #[arg(long)]
+    pub issue_scope: Option<String>,
+    /// Human-facing convoy role within the project
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Complete git branch name
+    #[arg(long)]
+    pub branch: Option<String>,
+    /// Workflow template; defaults from the Project
+    #[arg(long)]
+    pub workflow: Option<String>,
+    /// Workflow input value (repeatable): --input key=value
+    #[arg(long = "input", value_parser = parse_input_kv)]
+    pub inputs: Vec<(String, String)>,
+    /// Human free-text appended to the crew Brief
+    #[arg(long)]
+    pub instruction: Option<String>,
+    /// Pin a fulfilment kind for vessel provisioning
+    #[arg(long = "fulfilment")]
+    pub placement_policy: Option<String>,
+    /// Add a capability need (repeatable)
+    #[arg(long = "need")]
+    pub needs: Vec<String>,
+    /// Reason for a pin above the least privileged alternatives
+    #[arg(long = "escalation-reason")]
+    pub escalation_reason: Option<String>,
+    /// Agent harness override (repeatable): --agent [capability=]adapter[:model].
+    /// Bare form applies to the `code` capability, e.g. --agent claude-code:opus
+    #[arg(long = "agent", value_parser = parse_agent_override)]
+    pub agent_overrides: Vec<AgentOverride>,
+    /// Explicit skill import or -name removal (repeatable)
+    #[arg(long = "skill", allow_hyphen_values = true)]
+    pub skills: Vec<String>,
+    /// Create the convoy without attaching the caller to its first crew session
+    #[arg(long, conflicts_with = "attach")]
+    pub no_attach: bool,
+    /// Attach to the convoy's first crew session even when a presentation surface is connected
+    #[arg(long, conflicts_with = "no_attach")]
+    pub attach: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ConvoyCreateArgs {
+    /// Workflow template to instantiate
+    #[arg(long)]
+    pub template: String,
+    /// Input value (repeatable): --input key=value
+    #[arg(long = "input", value_parser = parse_input_kv)]
+    pub inputs: Vec<(String, String)>,
+    /// Repository URL the workflow operates on
+    #[arg(long = "repo")]
+    pub repository_url: Option<String>,
+    /// Git ref (branch/tag/commit) within the repository
+    #[arg(long = "ref")]
+    pub r#ref: Option<String>,
+    /// Project this convoy belongs to (metadata grouping)
+    #[arg(long = "project")]
+    pub project_ref: Option<String>,
+    /// Pin a fulfilment kind for vessel provisioning
+    #[arg(long = "fulfilment")]
+    pub placement_policy: Option<String>,
+    /// Existing local checkout/worktree to adopt as the convoy vessel
+    #[arg(long = "adopt-checkout")]
+    pub adopted_checkout: Option<PathBuf>,
 }
 
 fn parse_input_kv(raw: &str) -> Result<(String, String), String> {
@@ -249,7 +276,7 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 }),
             },
-            ConvoyVerb::Delete { name, force } => {
+            ConvoyVerb::Delete(ConvoyDeleteArgs { name, force }) => {
                 if self.subject.is_some() {
                     return Err("convoy delete takes its name after `delete`".to_string());
                 }
@@ -264,7 +291,7 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 })
             }
-            ConvoyVerb::Link { name, reference, relationship } => Ok(Resolved::NeedsContext {
+            ConvoyVerb::Link(ConvoyLinkArgs { name, reference, relationship }) => Ok(Resolved::NeedsContext {
                 command: Command {
                     node_id: None,
                     provisioning_target: None,
@@ -274,7 +301,7 @@ impl ConvoyNoun {
                 repo: RepoContext::None,
                 host: HostResolution::Local,
             }),
-            ConvoyVerb::Unlink { name, reference } => Ok(Resolved::NeedsContext {
+            ConvoyVerb::Unlink(ConvoyUnlinkArgs { name, reference }) => Ok(Resolved::NeedsContext {
                 command: Command {
                     node_id: None,
                     provisioning_target: None,
@@ -284,7 +311,7 @@ impl ConvoyNoun {
                 repo: RepoContext::None,
                 host: HostResolution::Local,
             }),
-            ConvoyVerb::Abandon { name, reason } => {
+            ConvoyVerb::Abandon(ConvoyAbandonArgs { name, reason }) => {
                 if self.subject.is_some() {
                     return Err("convoy abandon takes its name after `abandon`".to_string());
                 }
@@ -302,7 +329,7 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 })
             }
-            ConvoyVerb::Resume { name, prompt, withdraw, vessel, role } => {
+            ConvoyVerb::Resume(ConvoyResumeArgs { name, prompt, withdraw, vessel, role }) => {
                 if self.subject.is_some() {
                     return Err("convoy resume takes its name after `resume`".to_string());
                 }
@@ -320,7 +347,7 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 })
             }
-            ConvoyVerb::Start {
+            ConvoyVerb::Start(ConvoyStartArgs {
                 project,
                 change_request,
                 issue,
@@ -338,7 +365,7 @@ impl ConvoyNoun {
                 skills,
                 no_attach,
                 attach,
-            } => {
+            }) => {
                 if self.subject.is_some() {
                     return Err("convoy start does not take a positional convoy name; use --name".to_string());
                 }
@@ -398,7 +425,15 @@ impl ConvoyNoun {
                     host: HostResolution::Local,
                 })
             }
-            ConvoyVerb::Create { template, inputs, repository_url, r#ref, project_ref, placement_policy, adopted_checkout } => {
+            ConvoyVerb::Create(ConvoyCreateArgs {
+                template,
+                inputs,
+                repository_url,
+                r#ref,
+                project_ref,
+                placement_policy,
+                adopted_checkout,
+            }) => {
                 let name = self.subject.ok_or_else(|| "convoy role is required before `create`".to_string())?;
                 if let Some(project_ref) = project_ref.as_ref().filter(|_| repository_url.is_none() && adopted_checkout.is_none()) {
                     return Ok(Resolved::NeedsContext {
@@ -477,22 +512,22 @@ impl std::fmt::Display for ConvoyNoun {
                     }
                 }
             }
-            ConvoyVerb::Delete { name, force } => {
+            ConvoyVerb::Delete(ConvoyDeleteArgs { name, force }) => {
                 write!(f, " delete {}", quote_value(name))?;
                 if *force {
                     write!(f, " --force")?;
                 }
             }
-            ConvoyVerb::Link { name, reference, relationship } => {
+            ConvoyVerb::Link(ConvoyLinkArgs { name, reference, relationship }) => {
                 write!(f, " link {} {} --as {}", quote_value(name), quote_value(reference), relationship.as_str())?;
             }
-            ConvoyVerb::Unlink { name, reference } => {
+            ConvoyVerb::Unlink(ConvoyUnlinkArgs { name, reference }) => {
                 write!(f, " unlink {} {}", quote_value(name), quote_value(reference))?;
             }
-            ConvoyVerb::Abandon { name, reason } => {
+            ConvoyVerb::Abandon(ConvoyAbandonArgs { name, reason }) => {
                 write!(f, " abandon {} --reason {}", quote_value(name), quote_value(reason))?;
             }
-            ConvoyVerb::Resume { name, prompt, withdraw, vessel, role } => {
+            ConvoyVerb::Resume(ConvoyResumeArgs { name, prompt, withdraw, vessel, role }) => {
                 write!(f, " resume {}", quote_value(name))?;
                 if let Some(prompt) = prompt {
                     write!(f, " --prompt {}", quote_value(prompt))?;
@@ -507,7 +542,7 @@ impl std::fmt::Display for ConvoyNoun {
                     write!(f, " --role {}", quote_value(role))?;
                 }
             }
-            ConvoyVerb::Start {
+            ConvoyVerb::Start(ConvoyStartArgs {
                 project,
                 change_request,
                 issue,
@@ -525,7 +560,7 @@ impl std::fmt::Display for ConvoyNoun {
                 skills,
                 no_attach,
                 attach,
-            } => {
+            }) => {
                 write!(f, " start --project {}", quote_value(project))?;
                 if let Some(change_request) = change_request {
                     write!(f, " --pr {}", quote_value(change_request))?;
@@ -577,7 +612,15 @@ impl std::fmt::Display for ConvoyNoun {
                     write!(f, " --attach")?;
                 }
             }
-            ConvoyVerb::Create { template, inputs, repository_url, r#ref, project_ref, placement_policy, adopted_checkout } => {
+            ConvoyVerb::Create(ConvoyCreateArgs {
+                template,
+                inputs,
+                repository_url,
+                r#ref,
+                project_ref,
+                placement_policy,
+                adopted_checkout,
+            }) => {
                 write!(f, " create --template {}", quote_value(template))?;
                 for (k, v) in inputs {
                     write!(f, " --input {}", quote_value(&format!("{k}={v}")))?;

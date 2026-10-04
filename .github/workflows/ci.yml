@@ -162,6 +162,18 @@ jobs:
           shared-key: "windows-client"
       - run: cargo --config 'profile.dev.package."*".debug=0' clippy -p flotilla-client -p flotilla-manifest -p flotilla-transport --locked -- -D warnings
       - run: cargo --config 'profile.dev.package."*".debug=0' build --bin flotilla --locked
+      - name: Run the client on Windows' default 1 MiB main-thread stack
+        # Building is not enough: unoptimised clap frames once overflowed the
+        # main thread before `main` did anything (#2588). Without a daemon
+        # endpoint, `status` must fail cleanly rather than spawn one; the grep
+        # matches the refusal in flotilla-client's Windows `connect_unix_message_session`.
+        shell: bash
+        run: |
+          target/debug/flotilla.exe --version
+          if target/debug/flotilla.exe status 2> status.err; then
+            echo "flotilla status unexpectedly succeeded without a daemon"; exit 1
+          fi
+          grep -q "no local daemon will be spawned" status.err || { cat status.err; exit 1; }
       - run: "cargo --config 'profile.dev.package.\"*\".debug=0' test -p flotilla-client --locked --lib windows_tests::"
       - name: Test Wheelhouse named-pipe HTTP contract
         run: "cargo --config 'profile.dev.package.\"*\".debug=0' test -p flotilla-manifest --locked --lib sink::tests::"
