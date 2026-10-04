@@ -764,7 +764,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn observer_absence_capacity_evicts_oldest() {
         let http = Arc::new(MockHttp {
-            responses: Mutex::new((0..1026).map(|_| json_response(&serde_json::json!([]))).collect()),
+            responses: Mutex::new((0..1027).map(|_| json_response(&serde_json::json!([]))).collect()),
             urls: Mutex::new(Vec::new()),
         });
         let provider: Arc<dyn ChangeRequestTracker> = Arc::new(provider(http.clone()));
@@ -775,9 +775,14 @@ mod tests {
         }
         assert!(observer.find("team/repo", &provider, "branch-0").await.expect("at capacity").is_none());
         assert_eq!(http.urls.lock().expect("urls").len(), 1024);
+        // Replacing the provider for an existing key must not evict another key.
+        let replacement: Arc<dyn ChangeRequestTracker> = Arc::new(self::provider(http.clone()));
+        assert!(observer.find("team/repo", &replacement, "branch-1023").await.expect("replace existing key").is_none());
+        assert!(observer.find("team/repo", &provider, "branch-0").await.expect("unrelated key survives").is_none());
+        assert_eq!(http.urls.lock().expect("urls").len(), 1025);
         assert!(observer.find("team/repo", &provider, "branch-1024").await.expect("overflow").is_none());
         assert!(observer.find("team/repo", &provider, "branch-0").await.expect("evicted branch").is_none());
-        assert_eq!(http.urls.lock().expect("urls").len(), 1026);
+        assert_eq!(http.urls.lock().expect("urls").len(), 1027);
     }
 
     // HTTP boundary: a bounded failure is never absence, and replacement

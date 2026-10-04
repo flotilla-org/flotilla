@@ -49,7 +49,7 @@ impl BranchLookupObserver {
         let result = provider.find_change_request_by_branch(branch).await;
         if matches!(result, Ok(None)) {
             let mut absences = self.absences.lock().expect("branch absence observations");
-            if absences.len() >= MAX_ABSENCES {
+            if absences.len() >= MAX_ABSENCES && !absences.contains_key(&key) {
                 if let Some(oldest) = absences.iter().min_by_key(|(_, absence)| absence.expires).map(|(key, _)| key.clone()) {
                     absences.remove(&oldest);
                 }
