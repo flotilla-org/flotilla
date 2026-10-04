@@ -360,6 +360,22 @@ spec:
                           properties:
                             expectation:
                               type: string
+                            causes:
+                              type: array
+                              items:
+                                type: object
+                                required: [kind, service, scope, number]
+                                properties:
+                                  kind:
+                                    type: string
+                                    enum: [conflicting_change_request, missing_change_request_observation]
+                                  service:
+                                    type: string
+                                  scope:
+                                    type: string
+                                  number:
+                                    type: integer
+                                    minimum: 0
                             consecutive_count:
                               type: integer
                               minimum: 1

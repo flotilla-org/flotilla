@@ -6742,6 +6742,7 @@ impl InProcessDaemon {
                     })
                 });
             let mut observation_errors = Vec::new();
+            let mut refusal_causes = Vec::new();
             let mut observation_waits = Vec::new();
             if requires_change_request {
                 let mut subjects = BTreeSet::new();
@@ -6758,6 +6759,11 @@ impl InProcessDaemon {
                             observation_waits.push((retry_at, format!("PR {} observation: {error}", subject.number)));
                         } else {
                             observation_errors.push(format!("could not observe PR {}: {error}", subject.number));
+                            refusal_causes.push(flotilla_resources::CrewCompletionRefusalCause::MissingChangeRequestObservation {
+                                service: subject.service.clone(),
+                                scope: subject.scope.clone(),
+                                number: subject.number,
+                            });
                         }
                     }
                 }
@@ -6809,6 +6815,15 @@ impl InProcessDaemon {
                 return Ok(flotilla_protocol::CommandValue::CrewCompletionWaiting { reason, retry_at });
             }
             if !unmet.is_empty() || !observation_errors.is_empty() {
+                for expectation in &unmet {
+                    if let flotilla_resources::UnmetSettlementExpectation::CompletionConditionUnsatisfied { causes, .. } = expectation {
+                        for cause in causes {
+                            if !refusal_causes.contains(cause) {
+                                refusal_causes.push(cause.clone());
+                            }
+                        }
+                    }
+                }
                 let mut reasons = unmet
                     .into_iter()
                     .map(explain_unmet_expectation)
@@ -6820,6 +6835,7 @@ impl InProcessDaemon {
                     vessel: context.vessel.clone(),
                     role: context.caller_role.clone(),
                     expectation: expectation.clone(),
+                    causes: refusal_causes,
                     message: message.clone(),
                 })
                 .await

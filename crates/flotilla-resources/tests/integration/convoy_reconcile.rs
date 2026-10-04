@@ -110,6 +110,13 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr() {
     let missing = evaluate("coder", &change_requests, &artifacts);
     assert!(missing.iter().any(|expectation| matches!(expectation, UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, .. } if subject.starts_with("artifact/"))));
     assert!(missing.iter().any(|expectation| matches!(expectation, UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, .. } if subject.starts_with("cr/"))));
+    // #2211: a bound PR with no observation carries its typed identity, not a prose hint.
+    assert!(missing.iter().any(|expectation| matches!(expectation,
+        UnmetSettlementExpectation::CompletionConditionUnsatisfied { causes, .. }
+            if causes == &vec![flotilla_resources::CrewCompletionRefusalCause::MissingChangeRequestObservation {
+                service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 42,
+            }]
+    )));
     artifacts.insert(ledger("coder").0, ledger("coder").1);
     let mut unbound = convoy.clone();
     unbound.spec.change_request = None;
@@ -164,6 +171,16 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr() {
     ));
     change_requests.insert(record_name.clone(), record(ObservedChangeRequestState::Open, ObservedChecks::Pass));
     assert!(evaluate("coder", &change_requests, &artifacts).is_empty());
+    // #2211: a ready-condition refusal names the conflicting PR in structured data.
+    let mut conflicting = record(ObservedChangeRequestState::Open, ObservedChecks::Pass);
+    conflicting.status.as_mut().expect("status").mergeable = Observation::known(ObservedMergeability::Conflicting, now);
+    change_requests.insert(record_name.clone(), conflicting);
+    assert!(evaluate("coder", &change_requests, &artifacts).iter().any(|expectation| matches!(expectation,
+        UnmetSettlementExpectation::CompletionConditionUnsatisfied { causes, .. }
+            if causes == &vec![flotilla_resources::CrewCompletionRefusalCause::ConflictingChangeRequest {
+                service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 42,
+            }]
+    )));
     change_requests.insert(record_name.clone(), record(ObservedChangeRequestState::Merged, ObservedChecks::Pending));
     assert!(evaluate("coder", &change_requests, &artifacts).is_empty());
 }

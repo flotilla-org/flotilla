@@ -3156,6 +3156,16 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         assert!(first.contains("history access denied"), "{first}");
         let calls = runner.calls.lock().expect("calls").len();
         assert_eq!(calls, 3, "one shared batch and two history outcomes");
+        // #2211: a hard observation failure retains its subject even if other PRs have evidence.
+        let status = convoys.get("refused-claim").await.expect("convoy").status.expect("status");
+        assert!(status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal").causes.contains(
+            &flotilla_resources::CrewCompletionRefusalCause::MissingChangeRequestObservation {
+                service: "github.com".into(),
+                scope: "flotilla-org/flotilla".into(),
+                number: 2200,
+            }
+        ));
+
         let second = claim().await.expect_err("cached hard error must still refuse");
         assert!(second.contains("history access denied"), "{second}");
         assert_eq!(runner.calls.lock().expect("calls").len(), calls, "cooldown prevents forge calls");
@@ -3219,6 +3229,14 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         refused_status.subjects.iter().any(|entry| entry.subject.id == "2200"),
         "the rejected completion still discovered a PR in the convoy's repository"
     );
+    // #2211: claim admission persists the cause and exact PR identity before nudging.
+    assert_eq!(refused_status.crew_work["work"]["coder"].completion_refusal.as_ref().expect("refusal").causes, vec![
+        flotilla_resources::CrewCompletionRefusalCause::ConflictingChangeRequest {
+            service: "github.com".into(),
+            scope: "flotilla-org/flotilla".into(),
+            number: 2200,
+        }
+    ]);
     assert_ne!(refused_status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Done);
     let observed = backend
         .using::<ResourceChangeRequest>("flotilla")

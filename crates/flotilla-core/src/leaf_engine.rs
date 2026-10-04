@@ -158,6 +158,25 @@ fn is_conflict_probe(leaf: &Leaf) -> bool {
     leaf.field_path == ".mergeable" && leaf.operator == LeafOperator::Equal && leaf.literal == "conflicting"
 }
 
+fn refusal_nudge_brief(refusal: &flotilla_resources::CrewCompletionRefusal) -> String {
+    let conflict = refusal.causes.iter().find_map(|cause| match cause {
+        flotilla_resources::CrewCompletionRefusalCause::ConflictingChangeRequest { number, .. } => Some(*number),
+        _ => None,
+    });
+    let missing = refusal.causes.iter().find_map(|cause| match cause {
+        flotilla_resources::CrewCompletionRefusalCause::MissingChangeRequestObservation { number, .. } => Some(*number),
+        _ => None,
+    });
+    let remedy = if let Some(number) = conflict {
+        format!("PR #{number} is conflicting: rebase onto the current base branch, rerun the gates, push, then `flotilla crew complete`.")
+    } else if let Some(number) = missing {
+        format!("PR #{number} has no observation yet: check the PR URL and forge access, then run `flotilla crew complete` again.")
+    } else {
+        "Resolve the unmet expectation, then run `flotilla crew complete` again.".to_string()
+    };
+    format!("Your settlement claim was refused: {}. {remedy}", refusal.expectation)
+}
+
 fn refusal_limit(status: &ConvoyStatus, vessel: &str, role: &str) -> u32 {
     nudge_policy(status, vessel, role).and_then(|policy| policy.max_refusals).unwrap_or(DEFAULT_REFUSAL_LIMIT).max(1)
 }
@@ -1586,31 +1605,8 @@ impl ReconcilerWake {
                             condition.rung = StallRung::Nudge;
                             if due {
                                 let leaf = row.leaves.first().ok_or_else(|| "actor row has no leaf".to_string())?;
-                                let brief = if let Some(refusal) = refusal {
-                                    // These text matches are temporary until typed refusal causes land in #2211.
-                                    let conflict = observations.iter().find_map(|source| {
-                                        ((refusal.expectation.contains(&format!(
-                                            "cr/{}/{}/{}",
-                                            source.object.spec.service, source.object.spec.scope, source.object.spec.number
-                                        )) || refusal.expectation.contains(&source.object.metadata.name))
-                                            && source.object.status.as_ref().is_some_and(|status| {
-                                                status.mergeable.value == Some(flotilla_resources::ObservedMergeability::Conflicting)
-                                            }))
-                                        .then_some(source.object.spec.number)
-                                    });
-                                    let remedy = if let Some(number) = conflict {
-                                        format!("PR #{number} is conflicting: rebase onto the current base branch, rerun the gates, push, then `flotilla crew complete`.")
-                                    } else if refusal.expectation.contains("no federated observation")
-                                        || refusal.expectation.contains("could not observe PR")
-                                    {
-                                        "The PR has no observation yet: check the PR URL and forge access, then run `flotilla crew complete` again.".to_string()
-                                    } else {
-                                        "Resolve the unmet expectation, then run `flotilla crew complete` again.".to_string()
-                                    };
-                                    format!("Your settlement claim was refused: {}. {remedy}", refusal.expectation)
-                                } else {
-                                    actor_obligation(leaf)?
-                                };
+                                let brief =
+                                    if let Some(refusal) = refusal { refusal_nudge_brief(refusal) } else { actor_obligation(leaf)? };
                                 let request = TurnDeliveryRequest::builder()
                                     .namespace(namespace.to_string())
                                     .convoy(convoy.metadata.name.clone())
@@ -2536,6 +2532,7 @@ fn evaluate_row(
 
 #[cfg(test)]
 mod tests {
+
     use std::{
         collections::BTreeMap,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -2557,6 +2554,43 @@ mod tests {
         event_sink::broadcast_test_sink,
         providers::github_api::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource},
     };
+
+    // #2211: typed causes and PR identity select remedies regardless of explanation wording.
+    #[hegel::test]
+    fn refusal_remedies_ignore_explanation_wording(tc: hegel::TestCase) {
+        use flotilla_resources::{CrewCompletionRefusal, CrewCompletionRefusalCause};
+        use hegel::generators as gs;
+
+        // Cover both remedies, empty/legacy cause lists, duplicates, combined causes,
+        // misleading old matcher phrases, and PR numbers across the u64 boundaries.
+        let number = tc.draw(gs::integers::<u64>());
+        let variant = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+        let conflict =
+            CrewCompletionRefusalCause::ConflictingChangeRequest { service: "github.com".into(), scope: "owner/repo".into(), number };
+        let missing = CrewCompletionRefusalCause::MissingChangeRequestObservation {
+            service: "forge.example".into(),
+            scope: "other/repo".into(),
+            number,
+        };
+        let causes = match variant {
+            0 => vec![],
+            1 => vec![conflict.clone()],
+            2 => vec![missing.clone()],
+            3 => vec![missing, conflict.clone()],
+            _ => vec![conflict.clone(), conflict],
+        };
+        let expected = match variant {
+            0 => "Resolve the unmet expectation".to_string(),
+            2 => format!("PR #{number} has no observation yet"),
+            _ => format!("PR #{number} is conflicting"),
+        };
+        for text in ["", "different human explanation", "no federated observation; could not observe PR 42; cr/github.com/owner/repo/42"] {
+            let refusal = CrewCompletionRefusal::builder().expectation(text.into()).causes(causes.clone()).consecutive_count(1).build();
+            let brief = super::refusal_nudge_brief(&refusal);
+            assert!(brief.contains(&expected), "{brief}");
+            assert!(brief.contains("flotilla crew complete"));
+        }
+    }
 
     #[test]
     fn reconciler_row_identity_ignores_regenerated_freshness_instant() {
@@ -3031,6 +3065,54 @@ mod tests {
             .await
             .expect("crew session");
         (backend, wake, delivery)
+    }
+
+    // #2211: both typed remedies survive durable status restoration and reach an
+    // idle crew even when the explanation omits all former matcher phrases.
+    #[tokio::test]
+    async fn stored_refusal_nudges_use_typed_causes_after_restore() {
+        use flotilla_resources::{CrewCompletionRefusal, CrewCompletionRefusalCause};
+        for (cause, remedy) in [
+            (
+                CrewCompletionRefusalCause::ConflictingChangeRequest {
+                    service: "github.com".into(),
+                    scope: "owner/repo".into(),
+                    number: 42,
+                },
+                "PR #42 is conflicting",
+            ),
+            (
+                CrewCompletionRefusalCause::MissingChangeRequestObservation {
+                    service: "forge.example".into(),
+                    scope: "other/repo".into(),
+                    number: 73,
+                },
+                "PR #73 has no observation yet",
+            ),
+        ] {
+            let (backend, wake, delivery) = idle_nudge_scenario().await;
+            let convoys = backend.using::<Convoy>("flotilla");
+            let convoy = convoys.get("stalled-work").await.expect("convoy");
+            let mut status = convoy.status.expect("status");
+            status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("coder").completion_refusal = Some(
+                CrewCompletionRefusal::builder()
+                    .expectation("Presentation wording changed".into())
+                    .causes(vec![cause])
+                    .consecutive_count(1)
+                    .build(),
+            );
+            let stored = serde_json::to_vec(&status).expect("store status");
+            let restored = serde_json::from_slice(&stored).expect("restore status");
+            convoys.update_status("stalled-work", &convoy.metadata.resource_version, &restored).await.expect("persist refusal");
+            let start = Utc::now();
+            for second in [0, 60, 120, 180] {
+                observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+            }
+            let requests = delivery.requests.lock().expect("deliveries");
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].brief.contains(remedy), "{}", requests[0].brief);
+            assert!(requests[0].brief.contains("Presentation wording changed"));
+        }
     }
 
     async fn observe_actor(backend: &ResourceBackend, wake: &ReconcilerWake, state: TerminalAttentionState, now: DateTime<Utc>) {
