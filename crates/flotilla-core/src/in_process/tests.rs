@@ -1777,7 +1777,11 @@ impl crate::providers::discovery::Factory for ForgeAwareTestChangeRequestFactory
 #[tokio::test]
 async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credential() {
     let temp = tempfile::tempdir().expect("tempdir");
-    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"forgejo-cr-test\"\n").expect("daemon config");
+    std::fs::write(
+        temp.path().join("daemon.toml"),
+        "machine_id = \"forgejo-cr-test\"\n[credentials.forgejo]\nlab = \"lab-forgejo-daemon\"\n",
+    )
+    .expect("daemon config");
     let token_path = temp.path().join("forgejo-token");
     std::fs::write(&token_path, "test-token").expect("token file");
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -1806,7 +1810,7 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
     backend
         .definitions::<CredentialSpec>("flotilla")
         .create(
-            &test_meta("lab-forgejo-crew-pr"),
+            &test_meta("lab-forgejo-daemon"),
             &CredentialSpecSpec::builder()
                 .consumer(CredentialConsumer::Forgejo { forge_ref: "lab".to_string(), username: "crew".to_string() })
                 .source(CredentialSource::File { path: token_path.to_string_lossy().into_owned() })

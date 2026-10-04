@@ -688,12 +688,29 @@ impl DiscoveryRuntime {
 // Discovery result and orchestrator functions
 // ---------------------------------------------------------------------------
 
+/// Authentication slot shared by Forgejo discovery and its provider factories.
+pub(crate) const FORGEJO_AUTH_PROVIDER: &str = "forgejo";
+
 pub struct DiscoveryResult {
     pub registry: ProviderRegistry,
     pub host_repo_bag: EnvironmentBag,
     pub repo_bag: EnvironmentBag,
     pub repo_slug: Option<String>,
     pub unmet: Vec<(String, UnmetRequirement)>,
+}
+
+impl DiscoveryResult {
+    /// Report failed repository discovery while retaining independently safe
+    /// capabilities supplied by the caller, such as the checkout's VCS.
+    pub(crate) fn degraded(registry: ProviderRegistry, repo_slug: Option<String>, error: String) -> Self {
+        Self {
+            registry,
+            host_repo_bag: EnvironmentBag::new(),
+            repo_bag: EnvironmentBag::new(),
+            repo_slug,
+            unmet: vec![("repository discovery".into(), UnmetRequirement::MissingConfig(error))],
+        }
+    }
 }
 
 pub async fn run_host_detectors(detectors: &[Box<dyn HostDetector>], runner: &dyn CommandRunner, env: &dyn EnvVars) -> EnvironmentBag {

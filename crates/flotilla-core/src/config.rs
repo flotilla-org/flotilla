@@ -532,9 +532,13 @@ impl Default for AdmissionConfig {
     }
 }
 
-/// Host-local credential health settings.
+/// Host-local credential settings: health warning windows and explicit daemon identities.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CredentialHealthConfig {
+    /// Explicit host-daemon identities, keyed by Forge ID. Grant-delivered
+    /// credentials are never selected implicitly for repository observation.
+    #[serde(default)]
+    pub forgejo: BTreeMap<String, String>,
     /// Days before expiry at which held credential material surfaces as
     /// near-expiry in `flotilla host list` and TUI attention.
     #[serde(default = "default_credential_warning_window_days")]
@@ -543,7 +547,7 @@ pub struct CredentialHealthConfig {
 
 impl Default for CredentialHealthConfig {
     fn default() -> Self {
-        Self { warning_window_days: default_credential_warning_window_days() }
+        Self { forgejo: BTreeMap::new(), warning_window_days: default_credential_warning_window_days() }
     }
 }
 

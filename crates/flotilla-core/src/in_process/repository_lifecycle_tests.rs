@@ -358,14 +358,20 @@ async fn checkout_provider_watch_follows_namespace_changes() {
 // becomes the live transport, without a checkout or presentation row.
 #[tokio::test]
 async fn project_issue_binding_uses_source_forge_instead_of_mirror_transport() {
-    use flotilla_resources::{Forge, ForgeKind, ForgeSpec};
+    use flotilla_resources::{
+        CredentialConsumer, CredentialLifecycle, CredentialSource, CredentialSpec, CredentialSpecSpec, Forge, ForgeKind, ForgeSpec,
+    };
 
     use crate::providers::discovery::factories::github::ForgejoIssueProviderFactory;
 
     let temp = tempfile::tempdir().expect("config");
     let config_dir = temp.path().join("config");
     std::fs::create_dir(&config_dir).expect("config dir");
-    std::fs::write(config_dir.join("daemon.toml"), "machine_id = \"source-forge\"\n").expect("config");
+    std::fs::write(
+        config_dir.join("daemon.toml"),
+        "machine_id = \"source-forge\"\n[credentials.forgejo]\nsource-forge = \"source-daemon\"\n",
+    )
+    .expect("config");
     std::fs::write(temp.path().join("lab-forgejo-source-token"), "test-token\n").expect("credential");
     let mut discovery = fake_discovery(false);
     discovery.factories.issue_trackers = vec![Box::new(ForgejoIssueProviderFactory)];
@@ -383,6 +389,19 @@ async fn project_issue_binding_uses_source_forge_instead_of_mirror_transport() {
         .create(&InputMeta::builder().name("source-forge".into()).build(), &forge)
         .await
         .expect("Forge");
+    daemon
+        .resource_backend
+        .definitions::<CredentialSpec>("flotilla")
+        .create(
+            &InputMeta::builder().name("source-daemon".into()).build(),
+            &CredentialSpecSpec::builder()
+                .consumer(CredentialConsumer::Forgejo { forge_ref: "source-forge".into(), username: "daemon".into() })
+                .source(CredentialSource::File { path: temp.path().join("lab-forgejo-source-token").to_string_lossy().into_owned() })
+                .lifecycle(CredentialLifecycle::Static)
+                .build(),
+        )
+        .await
+        .expect("daemon credential");
     let spec = RepositorySpec::remote("https://forge.example/acme/issues")
         .expect("canonical source")
         .update_remotes("https://github.com/acme/issues")

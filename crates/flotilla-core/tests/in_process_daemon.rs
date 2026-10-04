@@ -5995,6 +5995,24 @@ async fn discovery_resolves_origin_forge_and_binds_both_forgejo_sources() {
         .await
         .expect("declare Forge");
 
+    daemon
+        .resource_backend()
+        .definitions::<CredentialSpec>("flotilla")
+        .create(
+            &InputMeta::builder().name("lab-daemon".into()).build(),
+            &CredentialSpecSpec::builder()
+                .consumer(CredentialConsumer::Forgejo { forge_ref: "flotilla-lab".into(), username: "daemon".into() })
+                .source(CredentialSource::File { path: temp.path().join("lab-forgejo-coder-token").to_string_lossy().into_owned() })
+                .lifecycle(CredentialLifecycle::Static)
+                .build(),
+        )
+        .await
+        .expect("declare daemon credential");
+    std::fs::write(
+        temp.path().join("config/daemon.toml"),
+        "machine_id = \"test-machine\"\n[credentials.forgejo]\nflotilla-lab = \"lab-daemon\"\n",
+    )
+    .expect("write daemon credential mapping");
     daemon.add_repo(&repo).await.expect("observe declared forge repository");
     let result = daemon.discover_repo_for_environment_for_test(&repo, daemon.local_environment_id()).await.expect("discover providers");
     assert_eq!(result.host_repo_bag.find_origin_forge().expect("origin Forge").forge_id, "flotilla-lab");
@@ -8684,4 +8702,202 @@ async fn checkoutless_refresh_honors_failure_policy() {
     let selector = RepoSelector::Repository(key);
     assert_eq!(daemon.refresh(&selector).await.expect("best effort"), None);
     assert!(daemon.refresh_strict(&selector).await.is_err(), "strict refresh reports the missing Forge");
+}
+
+// Process boundary: deterministic Git inspection for startup, without subprocesses.
+struct StartupForgeRunner;
+
+#[async_trait]
+impl CommandRunner for StartupForgeRunner {
+    async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        if cmd == "pwd" || (cmd == "git" && args == ["rev-parse", "--show-toplevel"]) {
+            return Ok(cwd.to_string_lossy().into_owned());
+        }
+        if cmd == "git" {
+            return match args {
+                ["--version"] => Ok("git version 2.45.0".into()),
+                ["rev-parse", "--is-inside-work-tree"] => Ok("true".into()),
+                ["rev-parse", "--abbrev-ref", "HEAD"] => Ok("main".into()),
+                ["remote"] => Ok("origin".into()),
+                ["config", "--get-all", "remote.origin.url"] | ["remote", "get-url", "origin"] => Ok(format!(
+                    "https://{}/lab/{}",
+                    if cwd.file_name().expect("checkout path has a repository name") == "healthy" {
+                        "github.com"
+                    } else {
+                        "forgejo.lab.flotilla.work"
+                    },
+                    cwd.file_name().expect("checkout path has a repository name").to_string_lossy()
+                )),
+                ["worktree", "list", "--porcelain"] => Ok(format!("worktree {}\nHEAD abcdef\nbranch refs/heads/main\n", cwd.display())),
+                _ => Err(format!("unsupported Git probe: {args:?}")),
+            };
+        }
+        Err(format!("unsupported command: {cmd}"))
+    }
+    async fn run_output(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: &Path,
+        label: &ChannelLabel,
+    ) -> Result<flotilla_core::providers::CommandOutput, String> {
+        match self.run(cmd, args, cwd, label).await {
+            Ok(stdout) => Ok(flotilla_core::providers::CommandOutput { stdout, stderr: String::new(), success: true }),
+            Err(stderr) => Ok(flotilla_core::providers::CommandOutput { stdout: String::new(), stderr, success: false }),
+        }
+    }
+    async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+        false
+    }
+}
+
+// Startup scenarios use real in-memory resources and an injected subprocess boundary.
+async fn startup_forgejo_case(
+    work_credentials: usize,
+    daemon_credential: Option<&str>,
+) -> (tempfile::TempDir, PathBuf, Arc<InProcessDaemon>) {
+    use flotilla_resources::{Forge, InMemoryBackend};
+    let temp = tempfile::tempdir().expect("create startup fixture directory");
+    let repo = temp.path().join("repo");
+    let healthy = temp.path().join("healthy");
+    std::fs::create_dir_all(&repo).expect("create Forgejo checkout directory");
+    std::fs::create_dir_all(&healthy).expect("create healthy checkout directory");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    backend
+        .definitions::<Forge>("flotilla")
+        .create(&InputMeta::builder().name("flotilla-lab".into()).build(), &lab_forge_spec())
+        .await
+        .expect("declare startup Forge");
+    for name in (0..work_credentials).map(|n| format!("work-{n}")).chain(std::iter::once("daemon".into())) {
+        backend
+            .definitions::<CredentialSpec>("flotilla")
+            .create(
+                &InputMeta::builder().name(name.clone()).build(),
+                &CredentialSpecSpec::builder()
+                    .consumer(CredentialConsumer::Forgejo {
+                        forge_ref: if name == "work-0" { "other-forge".into() } else { "flotilla-lab".into() },
+                        username: name.clone(),
+                    })
+                    .source(CredentialSource::File { path: format!("/tokens/{name}") })
+                    .lifecycle(CredentialLifecycle::Static)
+                    .build(),
+            )
+            .await
+            .expect("declare startup credential");
+    }
+    let spec = RepositorySpec::remote("https://forgejo.lab.flotilla.work/lab/repo")
+        .expect("parse startup repository remote")
+        .on_forge(&lab_forge_spec())
+        .expect("resolve startup repository Forge");
+    backend
+        .using::<Repository>("flotilla")
+        .create(&InputMeta::builder().name(spec.key().to_string()).build(), &spec)
+        .await
+        .expect("declare startup Repository");
+    let config = test_config_store(temp.path().join("config"));
+    if let Some(name) = daemon_credential {
+        std::fs::create_dir_all(temp.path().join("config")).expect("create daemon config directory");
+        std::fs::write(
+            temp.path().join("config/daemon.toml"),
+            format!("machine_id = \"test-machine\"\n[credentials.forgejo]\nflotilla-lab = \"{name}\"\n"),
+        )
+        .expect("write explicit daemon credential mapping");
+    }
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        vec![repo.clone(), healthy],
+        config,
+        fake_discovery_with_runner(false, Arc::new(StartupForgeRunner)),
+        HostName::local(),
+        backend,
+    )
+    .await;
+    (temp, repo, daemon)
+}
+
+// #2571: zero, one, or multiple work identities never serve daemon discovery.
+// Counts span the old selection boundary; an undeclared daemon identity also
+// remains ineligible. Startup observes both repositories and both checkouts.
+#[tokio::test]
+async fn startup_forgejo_ignores_work_credentials() {
+    for count in [0, 1, 3] {
+        let (temp, repo, daemon) = startup_forgejo_case(count, None).await;
+        std::fs::write(temp.path().join("lab-forgejo-coder-token"), "ambient-work-token").expect("write ambient work token");
+        assert_eq!(daemon.tracked_repo_paths().await.len(), 2);
+        let result = daemon
+            .discover_repo_for_environment_for_test(&repo, daemon.local_environment_id())
+            .await
+            .expect("discover unauthenticated checkout providers");
+        assert!(result.host_repo_bag.find_auth_path("forgejo").is_none());
+        let error = daemon
+            .issue_provider_for_source(&IssueSource { service: "https://forgejo.lab.flotilla.work".into(), scope: "lab/repo".into() })
+            .await
+            .err()
+            .expect("no implicit work identity");
+        assert_eq!(error, "no issue provider available for https://forgejo.lab.flotilla.work lab/repo");
+        assert_eq!(
+            daemon
+                .observed_resource_backend()
+                .using::<ResourceCheckout>("flotilla")
+                .list()
+                .await
+                .expect("list observed checkouts")
+                .items
+                .len(),
+            2
+        );
+    }
+}
+
+// #2571: the named daemon identity wins independently of other work credentials.
+#[tokio::test]
+async fn startup_forgejo_selects_explicit_daemon_credential() {
+    let (temp, repo, daemon) = startup_forgejo_case(3, Some("daemon")).await;
+    let result = daemon
+        .discover_repo_for_environment_for_test(&repo, daemon.local_environment_id())
+        .await
+        .expect("discover explicit daemon credential");
+    assert_eq!(
+        result.host_repo_bag.find_auth_path("forgejo").expect("resolve explicit Forgejo auth path").as_path(),
+        Path::new("/tokens/daemon")
+    );
+    // Credential intent changes are read on the next discovery request; keeping
+    // an earlier parsed daemon config would silently preserve the old identity.
+    std::fs::write(
+        temp.path().join("config/daemon.toml"),
+        "machine_id = \"test-machine\"\n[credentials.forgejo]\nflotilla-lab = \"missing\"\n",
+    )
+    .expect("change daemon credential mapping");
+    let error = daemon
+        .discover_repo_for_environment_for_test(&repo, daemon.local_environment_id())
+        .await
+        .err()
+        .expect("refuse changed invalid credential");
+    assert!(error.contains("daemon Forgejo credential missing"), "{error}");
+}
+
+// #2571: a bad declaration degrades only the affected root. The status API
+// reports its diagnosis while both repositories and checkout facts survive.
+#[tokio::test]
+async fn startup_forgejo_discovery_error_preserves_other_repositories() {
+    for name in ["missing", "work-0"] {
+        let (_temp, repo, daemon) = startup_forgejo_case(3, Some(name)).await;
+        let status = daemon.get_status().await.expect("read startup provider status");
+        assert_eq!(status.repos.len(), 2);
+        let failed = status.repos.iter().find(|root| root.path == repo).expect("retain failed repository in status");
+        assert!(failed.unmet_requirements.iter().any(|requirement| requirement.value.as_ref().is_some_and(|value| value.contains(name))));
+        let healthy = status.repos.iter().find(|root| root.path != repo).expect("retain healthy repository in status");
+        assert!(!healthy.unmet_requirements.iter().any(|requirement| requirement.factory == "repository discovery"));
+        assert_eq!(
+            daemon
+                .observed_resource_backend()
+                .using::<ResourceCheckout>("flotilla")
+                .list()
+                .await
+                .expect("list retained checkout facts")
+                .items
+                .len(),
+            2
+        );
+        assert!(daemon.discover_repo_for_environment_for_test(&repo, daemon.local_environment_id()).await.is_err());
+    }
 }
