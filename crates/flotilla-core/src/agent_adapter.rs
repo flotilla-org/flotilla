@@ -709,9 +709,9 @@ impl AgentAdapter for CliAgentAdapter {
             AdapterFlavor::ClaudeCode { .. } => None,
             AdapterFlavor::Codex { .. } => Some(if codex_screen_needs_input(screen) {
                 TerminalAttentionState::NeedsInput
-            } else if screen.contains("esc to interrupt") {
+            } else if screen.lines().any(codex_working_line) {
                 TerminalAttentionState::Working
-            } else if screen.lines().any(|line| line.trim_start().starts_with('›')) {
+            } else if codex_composer_visible(screen) {
                 TerminalAttentionState::Idle
             } else {
                 TerminalAttentionState::Unobservable
@@ -724,7 +724,7 @@ impl AgentAdapter for CliAgentAdapter {
         match self.flavor {
             AdapterFlavor::ClaudeCode { .. } => None,
             AdapterFlavor::Codex { .. } => {
-                let output = screen.lines().filter(|line| !line.contains("esc to interrupt")).collect::<Vec<_>>().join("\n");
+                let output = screen.lines().filter(|line| !codex_working_line(line)).collect::<Vec<_>>().join("\n");
                 Some(format!("{:x}", Sha256::digest(output.as_bytes())))
             }
         }
@@ -820,6 +820,25 @@ impl CliAgentAdapter {
         self.runner.write_file(&cwd.as_path().join(&brief.path), &brief.content).await?;
         Ok(())
     }
+}
+
+fn codex_working_line(line: &str) -> bool {
+    line.trim_start().trim_start_matches('•').trim_start().starts_with("Working (") && line.contains("esc to interrupt")
+}
+
+fn codex_composer_visible(screen: &str) -> bool {
+    let lines = screen.lines().map(str::trim).collect::<Vec<_>>();
+    if lines.iter().any(|line| line.starts_with("Select ") || line.starts_with("Choose ")) {
+        return false;
+    }
+    let mut rows = lines.iter().enumerate().filter_map(|(index, line)| line.strip_prefix('›').map(|text| (index, text.trim())));
+    let Some((index, text)) = rows.next() else { return false };
+    if rows.next().is_some() || text.starts_with(|character: char| character.is_ascii_digit()) {
+        return false;
+    }
+    let footer = lines[index + 1..].iter().any(|line| line.contains(" · /") || line.contains(" · ~"));
+    // Known empty-composer hints also work on cropped captures without the footer.
+    footer || text.starts_with("Ask Codex") || text.starts_with("Run /review")
 }
 
 fn codex_screen_needs_input(screen: &str) -> bool {
@@ -2144,6 +2163,21 @@ mod tests {
         let redraw = format!("tool output\n• Working ({age}s • esc to interrupt)\n› Ask Codex");
         assert_eq!(codex.screen_output_digest(first), codex.screen_output_digest(&redraw));
         assert_ne!(codex.screen_output_digest(first), codex.screen_output_digest(&format!("new tool output\n{redraw}")));
+    }
+
+    // A Codex selection row is not the composer; tool output mentioning the
+    // interrupt shortcut must not override a real idle composer.
+    #[test]
+    fn codex_selection_rows_are_not_turn_boundaries() {
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+        for screen in ["Select a model\n› gpt-6.1-sol (current)\n  gpt-6-astra", "Select reasoning effort\n› 1. High\n  2. Low"] {
+            assert_eq!(codex.classify_screen_attention(screen), Some(TerminalAttentionState::Unobservable));
+        }
+        assert_eq!(
+            codex.classify_screen_attention("tool output: esc to interrupt\n\n› Ask Codex to do something\n\ngpt-6.1-sol · /workspace"),
+            Some(TerminalAttentionState::Idle)
+        );
     }
 
     // #2560: interrupt returns to the composer without emitting a notify hook.

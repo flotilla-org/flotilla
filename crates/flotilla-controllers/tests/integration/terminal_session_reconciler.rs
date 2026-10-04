@@ -1614,7 +1614,9 @@ async fn meaningful_output_progress_survives_coalesced_attention() {
     let status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
     sessions.update_status("output-crew", &created.metadata.resource_version, &status).await.expect("running session");
     let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
-    for (digest, second, expected, changed) in [("first", 0, 0, true), ("first", 30, 0, false), ("second", 60, 60, true)] {
+    for (digest, second, expected, changed) in
+        [("first", 0, 0, true), ("second", 10, 0, false), ("second", 29, 0, false), ("second", 30, 30, true), ("second", 60, 30, false)]
+    {
         let session = sessions.get("output-crew").await.expect("session");
         let observation = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
             output_digest: Some(digest.into()),

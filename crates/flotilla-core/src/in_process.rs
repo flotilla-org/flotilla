@@ -7782,6 +7782,8 @@ impl InProcessDaemon {
             .await
             .map_err(|err| err.to_string())
             .map(|list| list.items.into_iter().next());
+        // Explicit resume accepts fresh idle evidence. Observation-driven pending
+        // release additionally checks that the observation postdates queued_at.
         let at_turn_boundary = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
             session.object.status.as_ref().is_some_and(|status| {
                 status.phase == ResourceTerminalSessionPhase::Running

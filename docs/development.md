@@ -159,8 +159,9 @@ tool activity, harness hook, meaningful screen output, or delivered-message resp
 redraws of the Working spinner line do not refresh that bound: a Codex spinner can continue animating
 while its turn is hung. An exceeded bound goes directly to the supervision
 ladder, carrying the turn start, tool/hook/output timestamps, and latest screen
-observation. Automatic interruption is deferred to the supervisor and recorded
-in the evidence. Fresh tool, hook, or output activity restores the actor's ability.
+observation. Output digest changes are persisted at most once every thirty
+seconds; screen capture and hashing also run during active output. Automatic
+interruption is deferred to the supervisor and recorded in the evidence. Fresh tool, hook, or output activity restores the actor's ability.
 
 A queued operator brief is released by a fresh idle observation newer than the
 brief, including a Codex composer after interruption without a notify hook.
@@ -169,7 +170,10 @@ under the same message lock as resume, withdrawal, and completion. Delivery
 preserves sender attribution, stages credentials, and retains the pending brief
 on staging failure. Codex screen classification distinguishes an idle composer
 from a stable Working display or permission prompt; unknown screens remain
-unobservable. Fresh hook evidence still takes precedence for up to two minutes.
+unobservable. Selection rows in Codex menus are not composers. Losing observation
+does not declare a new turn: the durable turn start survives stale or Unobservable
+evidence, and fresh activity restores ability. Fresh hook evidence still takes
+precedence for up to two minutes.
 
 Schema authors: WorkflowTemplate manifests in the external project-map/ops
 repositories may specify `stall_nudges`; their existing field names and defaults

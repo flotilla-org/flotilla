@@ -86,18 +86,39 @@ fn turn_inactivity_reason(
     now: DateTime<Utc>,
 ) -> Option<String> {
     let since = obligation.working_since?;
-    let hook =
-        status.attention.as_ref().filter(|attention| attention.source == TerminalAttentionSource::Hook).map(|attention| attention.as_of);
+    let hook = status
+        .attention
+        .as_ref()
+        .filter(|attention| attention.source == TerminalAttentionSource::Hook && attention.state != TerminalAttentionState::Unobservable)
+        .map(|attention| attention.as_of);
     let last_activity =
-        [Some(since), status.last_tool_activity_at, status.last_output_activity_at, obligation.last_hook_at, hook, obligation.reply_after]
+        [status.last_tool_activity_at, status.last_output_activity_at, obligation.last_hook_at, hook, obligation.reply_after]
             .into_iter()
             .flatten()
-            .max()
-            .expect("turn start present");
-    (now.signed_duration_since(last_activity) >= TURN_INACTIVITY_BOUND).then(|| format!(
-        "turn inactivity bound exceeded: turn began {since}, last tool {:?}, last hook {:?}, last output {:?}, last screen observation {:?}; no tool, hook, or output activity for {} seconds; automatic interrupt deferred to supervisor",
-        status.last_tool_activity_at, obligation.last_hook_at.or(hook), status.last_output_activity_at, status.attention.as_ref(), now.signed_duration_since(last_activity).num_seconds()
+            .fold(since, std::cmp::max);
+    let quiet = now.signed_duration_since(last_activity);
+    (quiet >= TURN_INACTIVITY_BOUND).then(|| format!(
+        "turn inactivity bound exceeded: turn began {since}, last tool {:?}, last hook {:?}, last output {:?}, latest attention {:?}; no tool, hook, or output activity for {} seconds; automatic interrupt deferred to supervisor",
+        status.last_tool_activity_at, obligation.last_hook_at.or(hook), status.last_output_activity_at, status.attention.as_ref(), quiet.num_seconds()
     ))
+}
+
+fn actor_is_working(
+    status: &flotilla_resources::TerminalSessionStatus,
+    obligations: &[NudgeObligation],
+    vessel: &str,
+    role: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    let working = status
+        .attention
+        .as_ref()
+        .is_some_and(|attention| attention.state == TerminalAttentionState::Working && !attention.is_stale_at(now));
+    let silent = obligations.iter().any(|obligation| {
+        matches!(&obligation.maker, LeafMaker::Actor { vessel: actor_vessel, role: actor_role } if actor_vessel == vessel && actor_role == role)
+            && turn_inactivity_reason(status, obligation, now).is_some()
+    });
+    working && !silent
 }
 
 struct UnavailableTurnDeliveryActuator;
@@ -1036,16 +1057,11 @@ impl ReconcilerWake {
                 status.stalled.as_ref().filter(|stalled| stalled.supervisor.is_some() && stalled.source != StallEvidenceSource::Crew)
             {
                 if let Some((vessel, role)) = stalled_source_actor(stalled) {
-                    let source_working =
-                        selected_sessions.values().any(|session| {
-                            session.metadata.labels.get(VESSEL_LABEL).is_some_and(|name| name == vessel)
-                                && session.metadata.labels.get(ROLE_LABEL).is_some_and(|name| name == role)
-                                && session.status.as_ref().and_then(|status| status.attention.as_ref()).is_some_and(|attention| {
-                                    attention.state == TerminalAttentionState::Working && !attention.is_stale_at(now)
-                                        && obligations.iter().filter(|obligation| matches!(&obligation.maker, LeafMaker::Actor { vessel: actor_vessel, role: actor_role } if actor_vessel == vessel && actor_role == role))
-                                            .all(|obligation| session.status.as_ref().and_then(|status| turn_inactivity_reason(status, obligation, now)).is_none())
-                                })
-                        });
+                    let source_working = selected_sessions.values().any(|session| {
+                        session.metadata.labels.get(VESSEL_LABEL).is_some_and(|name| name == vessel)
+                            && session.metadata.labels.get(ROLE_LABEL).is_some_and(|name| name == role)
+                            && session.status.as_ref().is_some_and(|status| actor_is_working(status, &obligations, vessel, role, now))
+                    });
                     if source_working {
                         for obligation in &mut obligations {
                             if matches!(&obligation.maker, LeafMaker::Actor { vessel: actor_vessel, role: actor_role } if actor_vessel == vessel && actor_role == role)
@@ -1216,7 +1232,8 @@ impl ReconcilerWake {
                                 }
                             }
                             obligation.last_attention_at = Some(attention.as_of);
-                            if attention.source == TerminalAttentionSource::Hook {
+                            if attention.source == TerminalAttentionSource::Hook && attention.state != TerminalAttentionState::Unobservable
+                            {
                                 obligation.last_hook_at = Some(attention.as_of);
                                 if attention.state == TerminalAttentionState::Idle
                                     && obligation.reply_after.is_some_and(|at| attention.as_of > at)
@@ -2687,6 +2704,31 @@ mod tests {
         observe_claude_hook(&backend, &wake, "pre-tool-use", start + chrono::Duration::seconds(902)).await;
         let recovered = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy").status.expect("status");
         assert!(recovered.stalled.is_none(), "tool activity recovers the maker: {:?}", recovered.stalled);
+    }
+
+    // Losing observation is not a new turn boundary: stale/Unobservable
+    // evidence must not reset a hung turn's bound or masquerade as a real hook.
+    #[tokio::test]
+    async fn silent_turn_survives_stale_and_unobservable_evidence() {
+        for source in [TerminalAttentionSource::Screen, TerminalAttentionSource::Hook] {
+            let (backend, wake, _) = idle_nudge_scenario().await;
+            let start = Utc::now();
+            observe_actor_source(&backend, &wake, TerminalAttentionState::Working, source, start).await;
+            let convoy = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy");
+            wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), start + chrono::Duration::seconds(120))
+                .await
+                .expect("stale observation");
+            observe_actor_source(&backend, &wake, TerminalAttentionState::Unobservable, source, start + chrono::Duration::seconds(121))
+                .await;
+            observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(900)).await;
+            let status = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy").status.expect("status");
+            assert!(status.stalled.expect("silent turn still stalls").evidence.contains("turn inactivity bound"));
+            observe_claude_hook(&backend, &wake, "pre-tool-use", start + chrono::Duration::seconds(901)).await;
+            assert!(
+                backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("convoy").status.expect("status").stalled.is_none(),
+                "new turn activity restores ability"
+            );
+        }
     }
 
     // #2211: typed causes and PR identity select remedies regardless of explanation wording.
