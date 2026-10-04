@@ -6,8 +6,9 @@
 //!
 //! A transport adapter authenticates the caller and the pinned host before
 //! constructing a [`Session`]. Serde derives support adapter control records;
-//! these wire shapes are not a stored-resource schema (ADR 0047). Each connection gets a separate ordered byte
-//! stream. Control and diagnostics never enter that stream.
+//! the hosting runtime has its own versioned policy document, independent of
+//! application resource schemas (ADR 0047). Each connection gets a separate
+//! ordered byte stream. Control and diagnostics never enter that stream.
 
 use std::{collections::BTreeSet, fmt, time::Duration};
 
@@ -19,6 +20,7 @@ use tokio::{
 };
 
 pub mod memory;
+pub mod runtime;
 #[cfg(unix)]
 pub mod ssh;
 
@@ -57,7 +59,7 @@ pub struct Grant {
     pub grantee: Fingerprint,
     pub namespace: Namespace,
     pub audience_ceiling: BTreeSet<Fingerprint>,
-    /// Adapter-defined monotonic tick; the grant is invalid at this tick.
+    /// Hosting clock milliseconds; the grant is invalid at this tick.
     pub expires_at: u64,
 }
 
@@ -119,6 +121,7 @@ pub enum Error {
     LivePublisher,
     StaleGeneration,
     Deadline,
+    Storage,
 }
 
 impl fmt::Display for Error {

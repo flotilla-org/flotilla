@@ -8,7 +8,7 @@
 use std::{
     collections::BTreeMap,
     io,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
     time::Duration,
@@ -29,8 +29,9 @@ use tokio::{
 };
 
 use crate::{
-    memory::MemoryTender, ByteStream, Error, Exposure, Fingerprint, Lease, Publication, PublicationId, PublishRequest, Published, Session,
-    Tender, Watch,
+    memory::MemoryTender,
+    runtime::{Clock, FileStore},
+    ByteStream, Error, Exposure, Fingerprint, Lease, Publication, PublicationId, PublishRequest, Published, Session, Tender, Watch,
 };
 
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -191,6 +192,32 @@ pub struct Server {
 }
 
 impl Server {
+    /// Host a durable Tender authority. The private state directory owns both
+    /// the independently persisted instance key and versioned policy store.
+    pub fn open(path: PathBuf, directory: &Path, clock: Arc<dyn Clock>) -> io::Result<Self> {
+        let identity = Identity::load_or_create(&directory.join("identity"))?;
+        let store = Arc::new(FileStore::new(directory.join("authority.json"))?);
+        let policy = MemoryTender::hosted(identity.fingerprint(), clock, store)?;
+        // The exclusive policy-store lock is held before stale socket recovery.
+        // A live listener or any non-socket path is never removed.
+        let parent = path.parent().ok_or_else(|| io::Error::other("listener needs a private parent directory"))?;
+        if std::fs::metadata(parent)?.permissions().mode() & 0o077 != 0 {
+            return Err(io::Error::other("Tender listener parent directory must be user-only"));
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_socket() => match std::os::unix::net::UnixStream::connect(&path) {
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => std::fs::remove_file(&path)?,
+                _ => return Err(io::Error::other("Tender control socket is already in use")),
+            },
+            Ok(_) => return Err(io::Error::other("Tender control path is not a socket")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        Self::bind(path, identity, policy)
+    }
+
+    /// Bind an explicitly supplied authority, primarily for adapter rigs. This
+    /// does not upgrade a manual-clock policy; use [`Self::open`] for deployment.
     pub fn bind(path: PathBuf, identity: Identity, policy: MemoryTender) -> io::Result<Self> {
         if identity.fingerprint() != policy.host() {
             return Err(io::Error::other("policy host does not match instance key"));
@@ -264,7 +291,7 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
-        self.policy.restart();
+        let _ = self.policy.restart();
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -875,13 +902,15 @@ mod tests {
         let publisher = Identity::generate();
         let policy = MemoryTender::new(host.fingerprint());
         let caller = publisher.fingerprint();
-        policy.allow_browse(caller.clone());
-        policy.grant(crate::Grant {
-            grantee: caller.clone(),
-            namespace: crate::Namespace("n".into()),
-            audience_ceiling: std::collections::BTreeSet::from([caller.clone()]),
-            expires_at: 100,
-        });
+        policy.allow_browse(caller.clone()).expect("host policy");
+        policy
+            .grant(crate::Grant {
+                grantee: caller.clone(),
+                namespace: crate::Namespace("n".into()),
+                audience_ceiling: std::collections::BTreeSet::from([caller.clone()]),
+                expires_at: 100,
+            })
+            .expect("host policy");
         let session = Session { caller: caller.clone(), pinned_host: host.fingerprint(), via: None };
         let published = policy
             .publish(&session, PublishRequest {

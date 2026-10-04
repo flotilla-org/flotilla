@@ -53,14 +53,16 @@ async fn ordinary_service_survives_route_loss_and_fresh_client_recovers() {
     let host = Identity::generate();
     let caller = Identity::generate();
     let policy = MemoryTender::new(host.fingerprint());
-    policy.allow_browse(caller.fingerprint());
-    policy.allow_connect(caller.fingerprint());
-    policy.grant(Grant {
-        grantee: caller.fingerprint(),
-        namespace: Namespace("services".into()),
-        audience_ceiling: BTreeSet::from([caller.fingerprint()]),
-        expires_at: 100,
-    });
+    policy.allow_browse(caller.fingerprint()).expect("host policy");
+    policy.allow_connect(caller.fingerprint()).expect("host policy");
+    policy
+        .grant(Grant {
+            grantee: caller.fingerprint(),
+            namespace: Namespace("services".into()),
+            audience_ceiling: BTreeSet::from([caller.fingerprint()]),
+            expires_at: 100,
+        })
+        .expect("host policy");
     let session = Session { caller: caller.fingerprint(), pinned_host: host.fingerprint(), via: None };
     let endpoint = root.path().join("server");
     let server = Server::bind(endpoint.clone(), host.clone(), policy.clone()).expect("server");
@@ -166,13 +168,15 @@ async fn exposure_failure_is_eof_without_protocol_bytes() {
     let caller = Identity::generate();
     let policy = MemoryTender::new(host.fingerprint());
     let session = Session { caller: caller.fingerprint(), pinned_host: host.fingerprint(), via: None };
-    policy.allow_connect(caller.fingerprint());
-    policy.grant(Grant {
-        grantee: caller.fingerprint(),
-        namespace: Namespace("services".into()),
-        audience_ceiling: BTreeSet::from([caller.fingerprint()]),
-        expires_at: 100,
-    });
+    policy.allow_connect(caller.fingerprint()).expect("host policy");
+    policy
+        .grant(Grant {
+            grantee: caller.fingerprint(),
+            namespace: Namespace("services".into()),
+            audience_ceiling: BTreeSet::from([caller.fingerprint()]),
+            expires_at: 100,
+        })
+        .expect("host policy");
     let endpoint = root.path().join("server");
     let _server = Server::bind(endpoint.clone(), host.clone(), policy.clone()).expect("server");
     let adapter = SshTender::new(endpoint, host.fingerprint(), vec![caller.clone()]).expect("adapter");
@@ -212,13 +216,15 @@ async fn endpoint_half_close_preserves_response() {
     let host = Identity::generate();
     let caller = Identity::generate();
     let policy = MemoryTender::new(host.fingerprint());
-    policy.allow_connect(caller.fingerprint());
-    policy.grant(Grant {
-        grantee: caller.fingerprint(),
-        namespace: Namespace("services".into()),
-        audience_ceiling: BTreeSet::from([caller.fingerprint()]),
-        expires_at: 100,
-    });
+    policy.allow_connect(caller.fingerprint()).expect("host policy");
+    policy
+        .grant(Grant {
+            grantee: caller.fingerprint(),
+            namespace: Namespace("services".into()),
+            audience_ceiling: BTreeSet::from([caller.fingerprint()]),
+            expires_at: 100,
+        })
+        .expect("host policy");
     let session = Session { caller: caller.fingerprint(), pinned_host: host.fingerprint(), via: None };
     let endpoint = root.path().join("server");
     let server = Server::bind(endpoint.clone(), host.clone(), policy).expect("server");
@@ -256,14 +262,16 @@ async fn missing_service_marks_publication_unavailable() {
     let host = Identity::generate();
     let caller = Identity::generate();
     let policy = MemoryTender::new(host.fingerprint());
-    policy.allow_connect(caller.fingerprint());
-    policy.allow_browse(caller.fingerprint());
-    policy.grant(Grant {
-        grantee: caller.fingerprint(),
-        namespace: Namespace("services".into()),
-        audience_ceiling: BTreeSet::from([caller.fingerprint()]),
-        expires_at: 100,
-    });
+    policy.allow_connect(caller.fingerprint()).expect("host policy");
+    policy.allow_browse(caller.fingerprint()).expect("host policy");
+    policy
+        .grant(Grant {
+            grantee: caller.fingerprint(),
+            namespace: Namespace("services".into()),
+            audience_ceiling: BTreeSet::from([caller.fingerprint()]),
+            expires_at: 100,
+        })
+        .expect("host policy");
     let session = Session { caller: caller.fingerprint(), pinned_host: host.fingerprint(), via: None };
     let endpoint = root.path().join("server");
     let server = Server::bind(endpoint.clone(), host.clone(), policy).expect("server");
@@ -293,21 +301,21 @@ async fn reexpose_after_audience_permission_returns() {
     let host = Identity::generate();
     let caller = Identity::generate();
     let policy = MemoryTender::new(host.fingerprint());
-    policy.allow_connect(caller.fingerprint());
+    policy.allow_connect(caller.fingerprint()).expect("host policy");
     let grant = Grant {
         grantee: caller.fingerprint(),
         namespace: Namespace("services".into()),
         audience_ceiling: BTreeSet::from([caller.fingerprint()]),
         expires_at: 100,
     };
-    policy.grant(grant.clone());
+    policy.grant(grant.clone()).expect("host policy");
     let session = Session { caller: caller.fingerprint(), pinned_host: host.fingerprint(), via: None };
     let endpoint = root.path().join("server");
     let _server = Server::bind(endpoint.clone(), host.clone(), policy.clone()).expect("server");
     let published = policy.publish(&session, request(caller.fingerprint())).await.expect("publish");
     let adapter = SshTender::new(endpoint, host.fingerprint(), vec![caller]).expect("adapter");
     let first = adapter.expose_local(&session, published.lease.id).await.expect("exposure");
-    policy.grant(Grant { audience_ceiling: BTreeSet::new(), ..grant.clone() });
+    policy.grant(Grant { audience_ceiling: BTreeSet::new(), ..grant.clone() }).expect("host policy");
     timeout(Duration::from_secs(3), async {
         while Path::new(&first.local_name).exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -315,7 +323,7 @@ async fn reexpose_after_audience_permission_returns() {
     })
     .await
     .expect("denial removes listener");
-    policy.grant(grant);
+    policy.grant(grant).expect("host policy");
     let restored = adapter.expose_local(&session, published.lease.id).await.expect("explicit re-exposure");
     assert_eq!(restored, first);
     assert!(UnixStream::connect(&restored.local_name).await.is_ok(), "re-exposure has a live listener");
@@ -369,14 +377,16 @@ async fn forward_carries_contract_and_reclaims_after_route_replacement() {
     let host = Identity::generate();
     let caller = Identity::generate();
     let policy = MemoryTender::new(host.fingerprint());
-    policy.allow_browse(caller.fingerprint());
-    policy.allow_connect(caller.fingerprint());
-    policy.grant(Grant {
-        grantee: caller.fingerprint(),
-        namespace: Namespace("services".into()),
-        audience_ceiling: BTreeSet::from([caller.fingerprint()]),
-        expires_at: 100,
-    });
+    policy.allow_browse(caller.fingerprint()).expect("host policy");
+    policy.allow_connect(caller.fingerprint()).expect("host policy");
+    policy
+        .grant(Grant {
+            grantee: caller.fingerprint(),
+            namespace: Namespace("services".into()),
+            audience_ceiling: BTreeSet::from([caller.fingerprint()]),
+            expires_at: 100,
+        })
+        .expect("host policy");
     let session = Session { caller: caller.fingerprint(), pinned_host: host.fingerprint(), via: None };
     let endpoint = sshd.directory.path().join("server");
     let _server = Server::bind(endpoint.clone(), host.clone(), policy.clone()).expect("server");
