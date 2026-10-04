@@ -10,4 +10,5 @@ bon = { workspace = true }
 clap = { version = "4", features = ["derive", "string"] }
 
 [dev-dependencies]
+hegeltest = "=0.48.1"
 tempfile = "3"

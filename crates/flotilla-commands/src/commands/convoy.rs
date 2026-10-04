@@ -1141,6 +1141,7 @@ mod tests {
         assert!(err.contains("adopted checkout path /tmp/flotilla-missing-checkout cannot be resolved"), "{err}");
     }
 
+    // Display quoting must preserve whitespace-bearing values when re-parsed.
     #[test]
     fn round_trip_create() {
         assert_round_trip::<ConvoyNoun>(&[
@@ -1150,7 +1151,7 @@ mod tests {
             "--template",
             "scratch",
             "--input",
-            "topic=demo",
+            "topic=my work",
             "--repo",
             "https://example.com/repo.git",
             "--ref",
@@ -1158,7 +1159,7 @@ mod tests {
             "--fulfilment",
             "host-direct-local",
             "--adopt-checkout",
-            "/tmp/repo",
+            "/tmp/my repo",
         ]);
     }
 

@@ -90,97 +90,7 @@ pub enum PaletteParseResult<'a> {
     Resolved(Resolved),
 }
 
-/// A token with its byte offset in the original input.
-pub struct Token {
-    pub value: String,
-    /// Byte offset of the token's start in the original input (including any leading quote).
-    pub offset: usize,
-}
-
-/// Tokenize palette input. Like shell splitting with quote support, but without
-/// treating `#` as a comment character (users type `cr #42 open`, not shell scripts).
-///
-/// Returns tokens with their byte offsets in the original input, enabling
-/// prefix slicing for Tab completion.
-/// Quote a palette token if it contains whitespace, quotes, or backslashes.
-/// Inverse of the tokenizer: round-trips arbitrary identifier strings (including
-/// those with spaces) through the palette grammar without breaking subsequent
-/// parses or completions.
-pub fn quote_palette_token(s: &str) -> String {
-    let needs_quoting = s.is_empty() || s.chars().any(|c| c.is_whitespace() || c == '"' || c == '\'' || c == '\\');
-    if !needs_quoting {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        if c == '"' || c == '\\' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('"');
-    out
-}
-
-pub fn tokenize_palette_input(input: &str) -> Result<Vec<Token>, String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut token_start: Option<usize> = None;
-    let mut byte_offset = 0;
-    let mut chars = input.chars().peekable();
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\'' if !in_double_quote => {
-                if token_start.is_none() {
-                    token_start = Some(byte_offset);
-                }
-                in_single_quote = !in_single_quote;
-            }
-            '"' if !in_single_quote => {
-                if token_start.is_none() {
-                    token_start = Some(byte_offset);
-                }
-                in_double_quote = !in_double_quote;
-            }
-            '\\' if !in_single_quote => {
-                if token_start.is_none() {
-                    token_start = Some(byte_offset);
-                }
-                byte_offset += ch.len_utf8();
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                    byte_offset += next.len_utf8();
-                }
-                continue;
-            }
-            ' ' | '\t' if !in_single_quote && !in_double_quote => {
-                if !current.is_empty() {
-                    tokens.push(Token { value: std::mem::take(&mut current), offset: token_start.unwrap_or(byte_offset) });
-                    token_start = None;
-                }
-            }
-            _ => {
-                if token_start.is_none() {
-                    token_start = Some(byte_offset);
-                }
-                current.push(ch);
-            }
-        }
-        byte_offset += ch.len_utf8();
-    }
-
-    if in_single_quote || in_double_quote {
-        return Err("unclosed quote".to_string());
-    }
-    if !current.is_empty() {
-        tokens.push(Token { value: current, offset: token_start.unwrap_or(byte_offset) });
-    }
-    Ok(tokens)
-}
+pub use flotilla_commands::{quote_value as quote_palette_token, tokenize_command as tokenize_palette_input, CommandToken as Token};
 
 /// Parse palette input text. Tries palette-local commands first, then noun-verb commands.
 pub fn parse_palette_input(input: &str) -> Result<PaletteParseResult<'_>, String> {
@@ -788,6 +698,15 @@ mod tests {
         ));
     }
 
+    // Empty quoted arguments retain their arity: convoy list accepts no
+    // subject, and unfinished noun/verb commands remain undispatchable.
+    #[test]
+    fn empty_quoted_arguments_preserve_palette_arity() {
+        for input in ["\"\"", "convoy \"\"", "convoy \"\" list", "convoy \"\" work"] {
+            assert_eq!(palette_input_state(input), PaletteInputState::Incomplete, "{input}");
+        }
+    }
+
     #[test]
     fn parse_palette_input_unknown_errors() {
         assert!(parse_palette_input("bogus command").is_err());
@@ -1244,9 +1163,7 @@ mod tests {
     #[test]
     fn quote_palette_token_round_trips_through_tokenizer() {
         // Round-trip property: quote(s) tokenizes back to a single token equal to s.
-        // Empty strings are not a valid resource name and are not exercised here —
-        // the tokenizer drops empty-quoted tokens, which is fine for that case.
-        for s in ["fix-bug-123", "implement", "fix my bug", "name with \"quote\"", "it's", "back\\slash"] {
+        for s in ["", "fix-bug-123", "implement", "fix my bug", "name with \"quote\"", "it's", "back\\slash"] {
             let quoted = quote_palette_token(s);
             let tokens = tokenize_palette_input(&quoted).expect("tokenize");
             assert_eq!(tokens.len(), 1, "quoted {quoted:?} should tokenize to one token");

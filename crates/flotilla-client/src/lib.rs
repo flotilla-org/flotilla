@@ -1176,6 +1176,143 @@ mod spawn_lock_tests {
 
     use super::*;
 
+    fn spawn_socket_paths() -> (flotilla_test_support::TestSocketDir, PathBuf, PathBuf, PathBuf) {
+        let dir = flotilla_test_support::TestSocketDir::new();
+        let config = dir.path().to_path_buf();
+        let state = config.join("state");
+        fs::create_dir_all(config.join("run")).expect("socket parent");
+        fs::create_dir_all(&state).expect("state directory");
+        let socket = flotilla_core::path_policy::daemon_socket_path(&config);
+        (dir, socket, config, state)
+    }
+
+    // Stand in for the daemon process boundary, retaining real Unix transport
+    // and the stateful protocol handshake. No flotillad process is launched.
+    fn start_listener(socket: &Path, clients: usize) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(socket).expect("bind test daemon");
+        tokio::spawn(async move {
+            let mut sessions = Vec::new();
+            for _ in 0..clients {
+                let (stream, _) = listener.accept().await.expect("accept client");
+                let session = flotilla_transport::message::unix_message_session(stream);
+                assert!(matches!(session.read().await.expect("client hello"), Some(Message::Hello { .. })));
+                session
+                    .write(Message::Hello {
+                        protocol_version: PROTOCOL_VERSION,
+                        node_id: NodeId::new("daemon"),
+                        display_name: flotilla_protocol::hello_display_name("daemon", BUILD_ID, PROTOCOL_FINGERPRINT),
+                        session_id: uuid::Uuid::nil(),
+                        connection_role: Some(ConnectionRole::Client),
+                        surface: None,
+                    })
+                    .await
+                    .expect("daemon hello");
+                sessions.push(session);
+            }
+            // Retain connections until the test aborts this listener task.
+            let _sessions = sessions;
+            std::future::pending::<()>().await;
+        })
+    }
+
+    // Two clients that both probe an absent socket must spawn exactly once,
+    // then both complete the stateful handshake with that daemon (#152).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_clients_spawn_once_and_both_connect() {
+        let (_dir, socket, config, state) = spawn_socket_paths();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let supervisor: Arc<DaemonSupervisor> = Arc::new(move |_: &Path, _: &Path, _: &Path| {
+            barrier.wait(); // Both initial probes finished before either acquires the lock.
+            Ok(DaemonStartupOwner::Client)
+        });
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let listener = Arc::new(std::sync::Mutex::new(None));
+        let counted_spawns = Arc::clone(&spawns);
+        let listener_handle = Arc::clone(&listener);
+        let spawner: Arc<DaemonSpawner> = Arc::new(move |socket: &Path, _: &Path, _: &Path| {
+            counted_spawns.fetch_add(1, Ordering::SeqCst);
+            *listener_handle.lock().expect("listener handle") = Some(start_listener(socket, 2));
+            Ok(())
+        });
+        let launch = || {
+            let (socket, config, state) = (socket.clone(), config.clone(), state.clone());
+            let (supervisor, spawner) = (Arc::clone(&supervisor), Arc::clone(&spawner));
+            tokio::spawn(async move {
+                connect_or_spawn_with_optional_surface_using(&socket, &config, &state, None, &*supervisor, &*spawner).await
+            })
+        };
+        let (first, second) = (launch(), launch());
+        let (first, second) =
+            tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(first, second) }).await.expect("race completes");
+        let (first, second) = (first.expect("first task"), second.expect("second task"));
+        assert!(first.is_ok(), "first client: {:?}", first.err());
+        assert!(second.is_ok(), "second client: {:?}", second.err());
+        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        listener.lock().expect("listener handle").take().expect("spawned listener").abort();
+    }
+
+    // A losing client must remain pending while the winner holds the lock,
+    // then connect to the winner's listener without invoking its spawner.
+    #[tokio::test]
+    async fn losing_client_waits_then_connects_without_spawning() {
+        let (_dir, socket, config, state) = spawn_socket_paths();
+        let lock =
+            SpawnLockGuard::new(acquire_spawn_lock(&PathBuf::from(format!("{}.lock", socket.display()))).expect("lock").expect("winner"));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let supervisor = |_: &Path, _: &Path, _: &Path| Ok(DaemonStartupOwner::Client);
+        let counted_spawns = Arc::clone(&spawns);
+        let spawner = move |_: &Path, _: &Path, _: &Path| {
+            counted_spawns.fetch_add(1, Ordering::SeqCst);
+            Err("loser must not spawn".into())
+        };
+        let client = connect_or_spawn_with_optional_surface_using(&socket, &config, &state, None, &supervisor, &spawner);
+        tokio::pin!(client);
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut client).await.is_err(), "loser must wait for the lock");
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        let listener = start_listener(&socket, 1);
+        drop(lock);
+        let result = tokio::time::timeout(Duration::from_secs(10), &mut client).await.expect("loser completes");
+        assert!(result.is_ok(), "loser: {:?}", result.err());
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+        listener.abort();
+    }
+
+    // Lock-open errors must surface before the injected spawner is called.
+    #[tokio::test]
+    async fn unopenable_spawn_lock_never_spawns() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, socket, config, state) = spawn_socket_paths();
+        let parent = socket.parent().expect("socket parent");
+        struct PermissionsGuard<'a> {
+            path: &'a Path,
+            original: fs::Permissions,
+        }
+        impl Drop for PermissionsGuard<'_> {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(self.path, self.original.clone());
+            }
+        }
+        // Restore before TestSocketDir cleans up, including during unwinding.
+        let _permissions = PermissionsGuard { path: parent, original: fs::metadata(parent).expect("parent metadata").permissions() };
+        // Root bypasses directory permissions; a directory at the lock path
+        // supplies the same lock-open failure on privileged test runners.
+        if unsafe { libc::geteuid() } == 0 {
+            fs::create_dir(format!("{}.lock", socket.display())).expect("unopenable lock");
+        }
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o555)).expect("read-only parent");
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let supervisor = |_: &Path, _: &Path, _: &Path| Ok(DaemonStartupOwner::Client);
+        let counted_spawns = Arc::clone(&spawns);
+        let spawner = move |_: &Path, _: &Path, _: &Path| {
+            counted_spawns.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let result = connect_or_spawn_with_optional_surface_using(&socket, &config, &state, None, &supervisor, &spawner).await;
+        let Err(error) = result else { panic!("lock open must fail") };
+        assert!(error.contains("spawn lock failed"), "unexpected error: {error}");
+        assert_eq!(spawns.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn spawn_lock_guard_keeps_stable_lock_file_on_drop() {
         let dir = tempfile::tempdir().expect("tempdir");

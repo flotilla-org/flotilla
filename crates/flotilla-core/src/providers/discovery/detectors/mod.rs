@@ -17,6 +17,7 @@ pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
         Box::new(codex::CodexAuthDetector),
         Box::new(CommandDetector::new("codex", &["--version"], parse_first_dotted_version).with_resolved_path()),
         Box::new(EnvVarDetector::new("HOME")),
+        Box::new(EnvVarDetector::new("SHELL")),
         Box::new(EnvVarDetector::new("CODEX_HOME")),
         Box::new(EnvVarDetector::new("ANTHROPIC_API_KEY")),
         Box::new(EnvVarDetector::new("CURSOR_API_KEY")),
