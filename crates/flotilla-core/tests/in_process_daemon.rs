@@ -7011,6 +7011,10 @@ async fn symlinked_remove_repo_retires_tracked_and_persisted_roots() {
     config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("alias observation root");
     let physical = std::fs::canonicalize(&repo).expect("physical checkout");
     config.add_observation_root(&ExecutionEnvironmentPath::new(&physical)).expect("physical observation root");
+    assert_eq!(config.load_observation_roots().expect("deduplicated roots").len(), 1);
+    // Seed a previous-generation file that already contains both spellings.
+    let legacy_roots = toml::to_string(&BTreeMap::from([("paths", vec![repo.clone(), physical.clone()])])).expect("legacy roots");
+    std::fs::write(config.base_path().as_path().join("observation-roots.toml"), legacy_roots).expect("persist legacy aliases");
     let daemon =
         InProcessDaemon::new(vec![repo.clone(), physical], Arc::clone(&config), git_process_discovery(false), HostName::local()).await;
     // Legacy persisted spellings produce one physical root, and removal retires both.

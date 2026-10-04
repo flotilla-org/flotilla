@@ -658,6 +658,11 @@ impl ConfigStore {
     pub fn add_observation_root(&self, path: &ExecutionEnvironmentPath) -> Result<(), String> {
         let _guard = self.observation_roots.lock().expect("observation roots mutex poisoned");
         let mut paths = self.load_observation_roots()?.into_iter().map(ExecutionEnvironmentPath::into_path_buf).collect::<Vec<_>>();
+        let physical = canonical_or_original(path.as_path());
+        // Keep the first configured spelling while avoiding equivalent roots.
+        if paths.iter().any(|root| canonical_or_original(root) == physical) {
+            return Ok(());
+        }
         paths.push(path.as_path().to_path_buf());
         self.save_observation_roots(paths)
     }

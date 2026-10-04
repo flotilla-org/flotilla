@@ -5,6 +5,7 @@ use std::{
 
 use flotilla_protocol::NodeId;
 use flotilla_resources::{RepositoryGitSpec, RepositoryProviderPreference, RepositorySpec, RepositoryVcsSpec};
+use hegel::generators as gs;
 use tempfile::tempdir;
 
 use super::*;
@@ -34,6 +35,34 @@ fn observation_roots_roundtrip_and_reject_configuration() {
     std::fs::write(dir.path().join("observation-roots.toml"), format!("paths = [\"{}\"]\nper_path = {{}}\n", repo.display()))
         .expect("write invalid roots");
     assert!(store.load_observation_roots().expect_err("per-path config must be rejected").contains("unknown field"));
+}
+
+// #2570: adding equivalent filesystem roots is idempotent and preserves the
+// first configured spelling, including a suffix that does not exist yet.
+// Generate insertion order, zero to three missing components, and repeated adds.
+#[hegel::test]
+fn observation_root_alias_add_is_idempotent(tc: hegel::TestCase) {
+    let alias_first = tc.draw(gs::booleans());
+    let depth = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+    let repeats = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+    let dir = tempdir().expect("config fixture");
+    let physical = make_dir(dir.path(), "physical");
+    let mut physical = std::fs::canonicalize(physical).expect("physical root");
+    let mut alias = dir.path().join("alias");
+    std::os::unix::fs::symlink(&physical, &alias).expect("alias root");
+    for _ in 0..depth {
+        physical.push("missing");
+        alias.push("missing");
+    }
+    let (first, second) = if alias_first { (alias, physical) } else { (physical, alias) };
+    let store = ConfigStore::with_base(dir.path().join("config"));
+    store.add_observation_root(&ee(&first)).expect("first root");
+    for _ in 0..repeats {
+        for path in [&second, &first] {
+            store.add_observation_root(&ee(path)).expect("equivalent root");
+            assert_eq!(store.load_observation_roots().expect("roots"), vec![ee(&first)]);
+        }
+    }
 }
 
 #[test]
