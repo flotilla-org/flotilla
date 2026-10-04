@@ -33,7 +33,7 @@ use crate::{
         CommandRunner,
     },
     step::{StepAction, StepExecutionContext, StepOutcome, StepResolver},
-    vcs::Vcs,
+    vcs::{EnumeratedCheckout, Vcs},
 };
 
 fn desc(name: &str) -> ProviderDescriptor {
@@ -95,6 +95,15 @@ impl MockCheckoutManager {
 impl Vcs for MockCheckoutManager {
     async fn validate_target(&self, _branch: &str, _intent: CheckoutIntent) -> Result<(), String> {
         self.validate_result.lock().await.take().expect("validate_target called more than expected")
+    }
+
+    async fn enumerate_checkouts(&self) -> Result<Vec<EnumeratedCheckout>, String> {
+        self.list_checkouts().await.map(|checkouts| {
+            checkouts
+                .into_iter()
+                .map(|(path, checkout)| EnumeratedCheckout { path, git_ref: checkout.branch, is_main: checkout.is_main })
+                .collect()
+        })
     }
 
     async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {

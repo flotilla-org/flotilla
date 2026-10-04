@@ -35,7 +35,7 @@ use crate::{
         vcs::{git_worktree::GitWorktreeStrategy, VcsInspection},
         ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
     },
-    vcs::{CheckoutVcsResolver, FlotillaVcs, GitCheckoutStrategy, Vcs},
+    vcs::{CheckoutVcsResolver, EnumeratedCheckout, FlotillaVcs, GitCheckoutStrategy, Vcs},
 };
 
 struct TestVcsResolver(Arc<dyn CommandRunner>);
@@ -781,6 +781,15 @@ impl FakeCheckoutManager {
 impl Vcs for FakeCheckoutManager {
     async fn validate_target(&self, _branch: &str, _intent: flotilla_protocol::CheckoutIntent) -> Result<(), String> {
         Ok(())
+    }
+
+    async fn enumerate_checkouts(&self) -> Result<Vec<EnumeratedCheckout>, String> {
+        self.list_checkouts().await.map(|checkouts| {
+            checkouts
+                .into_iter()
+                .map(|(path, checkout)| EnumeratedCheckout { path, git_ref: checkout.branch, is_main: checkout.is_main })
+                .collect()
+        })
     }
 
     async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {

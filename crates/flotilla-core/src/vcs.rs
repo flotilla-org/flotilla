@@ -557,10 +557,21 @@ pub enum CheckoutSharing {
     Independent,
 }
 
+/// Checkout identity facts for observation, without status or commit enrichment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumeratedCheckout {
+    pub path: ExecutionEnvironmentPath,
+    /// Branch name, or the existing synthetic detached-HEAD label.
+    pub git_ref: String,
+    pub is_main: bool,
+}
+
 /// A VCS backend bound to one checkout path in its execution environment.
 #[async_trait]
 pub trait VcsBackend: Send + Sync {
     async fn validate_target(&self, branch: &str, intent: CheckoutIntent) -> Result<(), String>;
+    /// List checkout identity facts without per-checkout enrichment.
+    async fn enumerate_checkouts(&self) -> Result<Vec<EnumeratedCheckout>, String>;
     async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String>;
     async fn create_checkout(&self, branch: &str, create_branch: bool) -> Result<(ExecutionEnvironmentPath, Checkout), String>;
     async fn remove_checkout(&self, branch: &str) -> Result<(), String>;
@@ -615,6 +626,8 @@ pub trait Vcs: Send + Sync {
         Err("operational entry inspection is unavailable".into())
     }
     async fn validate_target(&self, branch: &str, intent: CheckoutIntent) -> Result<(), String>;
+    /// List checkout identity facts without per-checkout enrichment.
+    async fn enumerate_checkouts(&self) -> Result<Vec<EnumeratedCheckout>, String>;
     async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String>;
     async fn create_checkout(&self, branch: &str, create_branch: bool) -> Result<(ExecutionEnvironmentPath, Checkout), String>;
     async fn remove_checkout(&self, branch: &str) -> Result<(), String>;
@@ -812,6 +825,10 @@ impl Vcs for FlotillaVcs {
     }
     async fn validate_target(&self, branch: &str, intent: CheckoutIntent) -> Result<(), String> {
         self.cli().validate_target(branch, intent).await
+    }
+
+    async fn enumerate_checkouts(&self) -> Result<Vec<EnumeratedCheckout>, String> {
+        self.cli().enumerate_checkouts().await
     }
 
     async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
@@ -1301,6 +1318,18 @@ impl VcsBackend for GitCliBackend<'_> {
                 strategy.validate_target(&ExecutionEnvironmentPath::new(self.checkout), branch, intent).await
             }
         }
+    }
+
+    async fn enumerate_checkouts(&self) -> Result<Vec<EnumeratedCheckout>, String> {
+        if let Some(GitCheckoutStrategy::ReferenceClone(strategy)) = self.strategy {
+            return strategy.enumerate_checkouts().await;
+        }
+        let output = self.run(&["worktree", "list", "--porcelain"]).await?;
+        Ok(GitWorktreeStrategy::parse_porcelain(&output)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (path, git_ref))| EnumeratedCheckout { path: ExecutionEnvironmentPath::new(path), git_ref, is_main: index == 0 })
+            .collect())
     }
 
     async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {

@@ -467,13 +467,13 @@ impl RepositoryInspector for GitRepositoryInspector {
     }
 
     async fn inspect_checkouts(&self, inspection: &RepositoryInspection) -> Result<Vec<LocalCheckoutInspection>, String> {
-        self.provider(&inspection.checkout.path).await?.list_checkouts().await.map(|checkouts| {
+        self.provider(&inspection.checkout.path).await?.enumerate_checkouts().await.map(|checkouts| {
             checkouts
                 .into_iter()
-                .map(|(path, checkout)| LocalCheckoutInspection {
-                    path: path.into_path_buf(),
+                .map(|checkout| LocalCheckoutInspection {
+                    path: checkout.path.into_path_buf(),
                     host_ref: self.host_ref.clone(),
-                    git_ref: checkout.branch,
+                    git_ref: checkout.git_ref,
                     is_main: checkout.is_main,
                 })
                 .collect()
@@ -498,15 +498,45 @@ fn ssh_remote_host(remote: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, sync::Arc};
+    use std::{
+        collections::BTreeSet,
+        path::Path,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
     use flotilla_resources::{ForgeKind, ForgeSpec, RepositoryIdentity, RepositorySpec};
 
     use super::{GitRepositoryInspector, LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector};
     use crate::providers::{
         discovery::test_support::{test_vcs_resolver, DiscoveryMockRunner},
-        CommandRunner,
+        ChannelLabel, CommandOutput, CommandRunner,
     };
+
+    // Process boundary: count and reject every Git command except worktree enumeration.
+    struct ObservationRunner {
+        result: Result<String, String>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl CommandRunner for ObservationRunner {
+        async fn run(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+            assert_eq!((cmd, args), ("git", ["worktree", "list", "--porcelain"].as_slice()), "observation must not enrich worktrees");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.result.clone()
+        }
+
+        async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
+            panic!("observation must only enumerate worktrees")
+        }
+
+        async fn exists(&self, _: &str, _: &[&str]) -> bool {
+            panic!("observation must not probe tools")
+        }
+    }
 
     fn test_inspector(runner: Arc<dyn CommandRunner>, host_ref: &str) -> GitRepositoryInspector {
         GitRepositoryInspector::new(Arc::clone(&runner), test_vcs_resolver(runner), host_ref)
@@ -548,6 +578,7 @@ mod tests {
         assert!(matches!(inspector.verify_continuity(&root, &previous).await, RepositoryContinuity::Unproven { .. }));
     }
 
+    // Glue: observation maps identity facts and host ownership in one call, without enrichment.
     #[tokio::test]
     async fn git_inspection_enumerates_main_and_linked_worktree_checkouts() {
         let (_temp, root) = git_repo();
@@ -558,11 +589,8 @@ mod tests {
             root.display(),
             feature.display()
         );
-        let runner = DiscoveryMockRunner::builder()
-            .on_run("git", &["worktree", "list", "--porcelain"], Ok(porcelain))
-            .on_run("git", &["symbolic-ref", "refs/remotes/origin/HEAD", "--short"], Ok("origin/main\n".to_string()))
-            .build();
-        let inspector = test_inspector(Arc::new(runner), "host-01");
+        let runner = Arc::new(ObservationRunner { result: Ok(porcelain), calls: AtomicUsize::new(0) });
+        let inspector = test_inspector(runner.clone(), "host-01");
         let inspection = RepositoryInspection {
             spec: RepositorySpec::remote("https://github.com/org/repo").expect("repository spec"),
             checkout: LocalCheckoutInspection {
@@ -577,10 +605,38 @@ mod tests {
 
         let checkouts = inspector.inspect_checkouts(&inspection).await.expect("checkout inspection");
 
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
         assert_eq!(checkouts, vec![
             LocalCheckoutInspection { path: root, host_ref: "host-01".to_string(), git_ref: "main".to_string(), is_main: true },
             LocalCheckoutInspection { path: feature, host_ref: "host-01".to_string(), git_ref: "feature".to_string(), is_main: false },
         ]);
+    }
+
+    // Enumeration preserves the enriched parser's empty/bare filtering and detached labels,
+    // and propagates command errors. No concurrent state or reconciliation is changed here.
+    #[tokio::test]
+    async fn lightweight_enumeration_handles_empty_bare_detached_and_errors() {
+        use crate::{path_context::ExecutionEnvironmentPath, vcs::EnumeratedCheckout};
+
+        let (_temp, root) = git_repo();
+        for (result, expected) in [
+            (Ok(String::new()), Ok(vec![])),
+            (Ok("worktree /bare\nbare\n\n".into()), Ok(vec![])),
+            (
+                Ok("worktree /bare\nbare\n\nworktree /detached\nHEAD abcdef0123456789\ndetached\n\n".into()),
+                Ok(vec![EnumeratedCheckout {
+                    path: ExecutionEnvironmentPath::new("/detached"),
+                    git_ref: "(detached: abcdef0)".into(),
+                    is_main: true,
+                }]),
+            ),
+            (Err("worktree list failed".into()), Err("worktree list failed".into())),
+        ] {
+            let runner = Arc::new(ObservationRunner { result, calls: AtomicUsize::new(0) });
+            let vcs = test_vcs_resolver(runner.clone()).vcs_for(None, &root).await.expect("resolve VCS");
+            assert_eq!(vcs.enumerate_checkouts().await, expected);
+            assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]

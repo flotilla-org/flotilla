@@ -8,7 +8,7 @@ use tracing::info;
 use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{types::Checkout, ChannelLabel, CommandRunner},
-    vcs::{CheckoutMaterialisation, GitCliBackend, VcsBackend},
+    vcs::{CheckoutMaterialisation, EnumeratedCheckout, GitCliBackend, VcsBackend},
 };
 
 /// A `CheckoutManager` for sandbox/container environments that uses
@@ -162,10 +162,7 @@ impl ReferenceCloneStrategy {
             .await
     }
 
-    pub(crate) async fn list_checkouts(
-        &self,
-        _repo_root: &ExecutionEnvironmentPath,
-    ) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+    pub(crate) async fn enumerate_checkouts(&self) -> Result<Vec<EnumeratedCheckout>, String> {
         // List directories under /workspace/
         let output = self
             .runner
@@ -202,21 +199,33 @@ impl ReferenceCloneStrategy {
                 .map(|s| s.trim().to_string())
                 .unwrap_or_else(|_| entry.to_string());
 
-            let checkout = Checkout {
-                branch,
-                is_main: false,
-                trunk_ahead_behind: None,
-                remote_ahead_behind: None,
-                working_tree: None,
-                last_commit: None,
-                host_name: None,
-                environment_id: None,
-            };
-
-            checkouts.push((ExecutionEnvironmentPath::new(dir), checkout));
+            checkouts.push(EnumeratedCheckout { path: ExecutionEnvironmentPath::new(dir), git_ref: branch, is_main: false });
         }
 
         Ok(checkouts)
+    }
+
+    pub(crate) async fn list_checkouts(
+        &self,
+        _repo_root: &ExecutionEnvironmentPath,
+    ) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String> {
+        self.enumerate_checkouts().await.map(|checkouts| {
+            checkouts
+                .into_iter()
+                .map(|checkout| {
+                    (checkout.path, Checkout {
+                        branch: checkout.git_ref,
+                        is_main: checkout.is_main,
+                        trunk_ahead_behind: None,
+                        remote_ahead_behind: None,
+                        working_tree: None,
+                        last_commit: None,
+                        host_name: None,
+                        environment_id: None,
+                    })
+                })
+                .collect()
+        })
     }
 
     pub(crate) async fn create_checkout(
@@ -577,28 +586,47 @@ mod tests {
         assert_eq!(calls[0].1, vec!["-rf", "/workspace/my-feature"]);
     }
 
+    // Glue: both APIs retain independent clone membership and branch labels without enrichment.
     #[tokio::test]
     async fn list_checkouts_finds_git_repos() {
-        let runner = Arc::new(RecordingRunner::new(vec![
-            // ls -1 /workspace/
-            Ok("feat-a\nfeat-b\nnot-a-repo\n".into()),
-            // git -C /workspace/feat-a rev-parse --is-inside-work-tree
-            Ok("true\n".into()),
-            // git -C /workspace/feat-a rev-parse --abbrev-ref HEAD
-            Ok("feat/a\n".into()),
-            // git -C /workspace/feat-b rev-parse --is-inside-work-tree
-            Ok("true\n".into()),
-            // git -C /workspace/feat-b rev-parse --abbrev-ref HEAD
-            Ok("feat/b\n".into()),
-            // git -C /workspace/not-a-repo rev-parse --is-inside-work-tree
-            Err("fatal: not a git repository".into()),
-        ]));
+        for lightweight in [false, true] {
+            let runner = Arc::new(RecordingRunner::new(vec![
+                // ls -1 /workspace/
+                Ok("feat-a\nfeat-b\nnot-a-repo\n".into()),
+                // git -C /workspace/feat-a rev-parse --is-inside-work-tree
+                Ok("true\n".into()),
+                // git -C /workspace/feat-a rev-parse --abbrev-ref HEAD
+                Ok("feat/a\n".into()),
+                // git -C /workspace/feat-b rev-parse --is-inside-work-tree
+                Ok("true\n".into()),
+                // git -C /workspace/feat-b rev-parse --abbrev-ref HEAD
+                Ok("feat/b\n".into()),
+                // git -C /workspace/not-a-repo rev-parse --is-inside-work-tree
+                Err("fatal: not a git repository".into()),
+            ]));
 
-        let mgr = ReferenceCloneStrategy::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
-        let checkouts = mgr.list_checkouts(&ExecutionEnvironmentPath::new("/ref/repo")).await.expect("list should succeed");
-
-        assert_eq!(checkouts.len(), 2);
-        assert_eq!(checkouts[0].1.branch, "feat/a");
-        assert_eq!(checkouts[1].1.branch, "feat/b");
+            use crate::vcs::{FlotillaVcs, GitCheckoutStrategy, Vcs};
+            let mgr = ReferenceCloneStrategy::new(runner.clone(), ExecutionEnvironmentPath::new("/ref/repo"));
+            let vcs = FlotillaVcs::new(
+                ExecutionEnvironmentPath::new("/workspace/feat-a"),
+                runner.clone(),
+                GitCheckoutStrategy::ReferenceClone(mgr),
+            );
+            let checkouts = if lightweight {
+                vcs.enumerate_checkouts().await.expect("enumerate clones")
+            } else {
+                vcs.list_checkouts()
+                    .await
+                    .expect("list clones")
+                    .into_iter()
+                    .map(|(path, checkout)| EnumeratedCheckout { path, git_ref: checkout.branch, is_main: checkout.is_main })
+                    .collect()
+            };
+            assert_eq!(checkouts, vec![
+                EnumeratedCheckout { path: ExecutionEnvironmentPath::new("/workspace/feat-a"), git_ref: "feat/a".into(), is_main: false },
+                EnumeratedCheckout { path: ExecutionEnvironmentPath::new("/workspace/feat-b"), git_ref: "feat/b".into(), is_main: false },
+            ]);
+            assert_eq!(runner.calls().len(), 6, "listing, root probes, and branch queries only");
+        }
     }
 }

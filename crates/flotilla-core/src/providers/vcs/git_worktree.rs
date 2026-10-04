@@ -63,7 +63,7 @@ impl GitWorktreeStrategy {
 
     /// Parse `git worktree list --porcelain` output into (path, branch) tuples.
     /// Entries without a branch (detached HEAD, bare) use a synthetic label.
-    fn parse_porcelain(output: &str) -> Vec<(PathBuf, String)> {
+    pub(crate) fn parse_porcelain(output: &str) -> Vec<(PathBuf, String)> {
         let mut results = Vec::new();
         let mut path: Option<PathBuf> = None;
         let mut branch: Option<String> = None;

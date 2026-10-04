@@ -2139,7 +2139,18 @@ impl InProcessDaemon {
                         .map_err(|error| error.to_string())?;
                         let mut providers = ProviderData::default();
                         if let Some(vcs) = registry.vcs.preferred() {
-                            for (checkout_path, checkout) in vcs.list_checkouts().await? {
+                            for checkout in vcs.enumerate_checkouts().await? {
+                                let checkout_path = checkout.path;
+                                let checkout = flotilla_protocol::Checkout {
+                                    branch: checkout.git_ref,
+                                    is_main: checkout.is_main,
+                                    trunk_ahead_behind: None,
+                                    remote_ahead_behind: None,
+                                    working_tree: None,
+                                    last_commit: None,
+                                    host_name: None,
+                                    environment_id: None,
+                                };
                                 providers
                                     .checkouts
                                     .insert(QualifiedPath::host(local_host_id.clone(), checkout_path.into_path_buf()), checkout);
