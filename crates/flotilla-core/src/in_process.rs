@@ -1377,6 +1377,25 @@ async fn crew_brief_repo_roots(
     roots
 }
 
+/// Legacy convoys may have no role; retain their resource identity instead of
+/// rendering an empty address or a bare project suffix.
+pub(crate) fn convoy_message_address(convoy: &ResourceObject<ResourceConvoy>) -> String {
+    if convoy.spec.role.is_empty() {
+        convoy.metadata.name.clone()
+    } else {
+        convoy_address(&convoy.spec.role, convoy.spec.project_ref.as_deref())
+    }
+}
+
+async fn convoy_sender_address(backend: &ResourceBackend, namespace: &str, name: &str) -> String {
+    backend
+        .including_replicas::<ResourceConvoy>(namespace)
+        .get(name)
+        .await
+        .map(|source| convoy_message_address(&source.object))
+        .unwrap_or_else(|_| name.to_string())
+}
+
 fn safe_header_value(value: &str) -> String {
     value
         .chars()
@@ -7043,10 +7062,13 @@ impl InProcessDaemon {
             flotilla_protocol::CrewSupervisionAction::Resume => {
                 let sender = if actor_crew_id.is_some() {
                     let supervisor = stalled.supervisor.as_ref().expect("checked supervisor above");
+                    // Attribution must not prevent authorized guidance when the convoy
+                    // is temporarily absent from the replica view.
+                    let address = convoy_sender_address(&self.resource_backend, namespace, &supervisor.convoy).await;
                     if stalled.rung == flotilla_resources::StallRung::Governor {
-                        CrewMessageSender::Governor { name: supervisor.convoy.clone() }
+                        CrewMessageSender::Governor { name: address }
                     } else if stalled.rung == flotilla_resources::StallRung::Bosun {
-                        CrewMessageSender::Bosun { name: format!("{}@{}", supervisor.role, supervisor.vessel) }
+                        CrewMessageSender::Bosun { name: format!("{}@{} in {address}", supervisor.role, supervisor.vessel) }
                     } else {
                         return Err("crew supervisor has no governor or Bosun rung".to_string());
                     }
@@ -7478,7 +7500,9 @@ impl InProcessDaemon {
             return Err(format!("crew target `{target}` has failed work and cannot receive a handoff"));
         }
 
-        let sender = CrewMessageSender::Handoff { from: format!("{}@{}", context.caller_role, context.vessel) };
+        let sender = CrewMessageSender::Handoff {
+            from: format!("{}@{} in {}", context.caller_role, context.vessel, convoy_message_address(&convoy)),
+        };
         let sessions = self.resource_backend.clone().using::<ResourceTerminalSession>(&context.namespace);
         let identity = TerminalSessionIdentity::builder()
             .vessel_ref(context.vessel_ref.clone())

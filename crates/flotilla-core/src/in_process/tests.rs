@@ -32,6 +32,36 @@ use crate::{
     repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector},
 };
 
+// #2592: attribution uses role/project addresses, preserves legacy resource names,
+// and remains available when a supervisor convoy is absent from the replica view.
+// Formatting glue: these rows exhaust empty/nonempty role and absent/present project.
+#[tokio::test]
+async fn convoy_sender_addresses_preserve_legacy_and_missing_convoy_identity() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    for (name, role, project, expected) in [
+        ("legacy", "", None, "legacy"),
+        ("legacy-project", "", Some("project"), "legacy-project"),
+        ("named", "graphql-budget", None, "graphql-budget"),
+        ("named-project", "graphql-budget", Some("project"), "graphql-budget@project"),
+    ] {
+        let convoy = convoys
+            .create(
+                &test_meta(name),
+                &ConvoySpec::builder()
+                    .workflow_ref("workflow".to_string())
+                    .role(role.to_string())
+                    .maybe_project_ref(project.map(str::to_string))
+                    .build(),
+            )
+            .await
+            .expect("convoy");
+        assert_eq!(convoy_message_address(&convoy), expected);
+        assert_eq!(convoy_sender_address(&backend, "flotilla", name).await, expected);
+    }
+    assert_eq!(convoy_sender_address(&backend, "flotilla", "missing-governor").await, "missing-governor");
+}
+
 #[tokio::test]
 async fn repository_watch_evicts_deleted_providers_and_relist_preserves_live_providers() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -696,7 +726,7 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
         .role("governor".to_string())
         .brief("Supervise the stalled crew".to_string())
         .subject_revision("stall-1".to_string())
-        .sender(CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() })
+        .sender(CrewMessageSender::FlotillaEscalation { from: "coder@work in graphql-budget@flotilla".to_string() })
         .build();
     daemon.deliver_standing_turn(&request).await.expect("remote governor turn accepted");
     let queued = convoys.get("governor-convoy").await.expect("governor convoy after turn");
@@ -713,7 +743,11 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
     placement_daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("placement consumes turn");
     let delivered = sessions.get("governor-terminal").await.expect("governor terminal after turn");
     let TerminalSessionSource::Agent { message: Some(message), .. } = delivered.spec.source else { panic!("governor turn queued") };
-    assert_eq!(message.text, "[flotilla · escalated from coder@work · supervise the stalled crew]\n\nSupervise the stalled crew");
+    // #2592: remote turn delivery preserves the source convoy in the rendered header.
+    assert_eq!(
+        message.text,
+        "[flotilla · escalated from coder@work in graphql-budget@flotilla · supervise the stalled crew]\n\nSupervise the stalled crew"
+    );
     let delivered = sessions.get("governor-terminal").await.expect("governor terminal for acknowledgment");
     let mut delivered_status = delivered.status.expect("running terminal status");
     delivered_status.delivered_message_id = Some(message.id);
@@ -961,7 +995,10 @@ async fn resume_staging_fixture_with_clock(
     .await;
     let convoys = backend.clone().using::<ResourceConvoy>("flotilla");
     let convoy = convoys
-        .create(&test_meta("resume-staging"), &ConvoySpec::builder().workflow_ref("implement-review".to_string()).build())
+        .create(
+            &test_meta("resume-staging"),
+            &ConvoySpec::builder().workflow_ref("implement-review".to_string()).role("resume-staging".to_string()).build(),
+        )
         .await
         .expect("convoy");
     convoys
@@ -1196,6 +1233,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     let source = convoys.get("resume-staging").await.expect("source convoy");
     let mut spec = source.spec.clone();
     spec.project_ref = Some("project".to_string());
+    spec.role = "graphql-budget".to_string();
     let source =
         convoys.update(&input_meta_from_resource(&source), &source.metadata.resource_version, &spec).await.expect("project source");
     let mut status = source.status.expect("source status");
@@ -1304,9 +1342,19 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     {
         let requests = supervision.requests.lock().expect("supervision requests");
         let escalation = requests.iter().find(|request| request.vessel == "watch").expect("governor escalation");
-        assert_eq!(escalation.sender, CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() });
+        // #2592: the supervisor must identify the convoy and act on the exact stalled crew.
+        assert_eq!(escalation.sender, CrewMessageSender::FlotillaEscalation { from: "coder@work in graphql-budget@project".to_string() });
         let framed = frame_crew_message(&escalation.sender, &escalation.brief);
-        assert!(framed.starts_with("[flotilla · escalated from coder@work · supervise the stalled crew]"));
+        assert!(framed.starts_with("[flotilla · escalated from coder@work in graphql-budget@project · supervise the stalled crew]"));
+        assert!(framed.contains("convoy graphql-budget@project (resource ref: resume-staging)"), "{framed}");
+        assert!(framed.contains("Reason: access. Evidence:"), "{framed}");
+        assert!(framed.contains("repository permission missing"), "{framed}");
+        for action in ["resume", "convert-to-failed", "escalate"] {
+            assert!(
+                framed.contains(&format!("flotilla crew supervise --convoy 'resume-staging' --vessel 'work' --role 'coder' {action}")),
+                "{framed}"
+            );
+        }
         assert!(framed.contains("Proposed disposition: reduce-scope."), "{framed}");
     }
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1378,8 +1426,8 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     let TerminalSessionSource::Agent { message: Some(guidance), .. } = source_session.spec.source else {
         panic!("governor guidance should be queued")
     };
-    assert_eq!(guidance.sender, CrewMessageSender::Governor { name: "governor".to_string() });
-    assert!(guidance.text.starts_with("[governor governor · guidance for your stalled work · reply by running `crew complete`]"));
+    assert_eq!(guidance.sender, CrewMessageSender::Governor { name: "governor@project".to_string() });
+    assert!(guidance.text.starts_with("[governor governor@project · guidance for your stalled work · reply by running `crew complete`]"));
     let governor_session = sessions.get("governor-session").await.expect("governor session");
     sessions
         .update_status("governor-session", &governor_session.metadata.resource_version, &ResourceTerminalSessionStatus {
@@ -1779,7 +1827,7 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
             assert!(message.is_none());
             assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 0);
         } else {
-            assert_eq!(message.expect("nudge").text, "[flotilla · nudge · reply by running `crew complete` or `crew stall`]\n\nYou owe a settlement claim for work/coder: finish, put the decision-ledger artifact, then run `flotilla crew complete`, or `crew stall --reason <infra|scope|decision|access|other> --message …` if blocked.");
+            assert_eq!(message.expect("nudge").text, "[flotilla · nudge · reply by running `crew complete` or `crew stall`]\n\nFor coder@work in resume-staging (resource ref: resume-staging):\nYou owe a settlement claim for work/coder: finish, put the decision-ledger artifact, then run `flotilla crew complete`, or `crew stall --reason <infra|scope|decision|access|other> --message …` if blocked.");
             assert_eq!(probe.staged.load(std::sync::atomic::Ordering::SeqCst), 1);
             for (offset, desired_rung) in [(1, StallRung::Nudge), (2, StallRung::Operator)] {
                 let session = sessions.get("resume-staging-session").await.expect("session");

@@ -695,6 +695,18 @@ pub enum StallReason {
     Other,
 }
 
+impl std::fmt::Display for StallReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Infra => "infra",
+            Self::Scope => "scope",
+            Self::Decision => "decision",
+            Self::Access => "access",
+            Self::Other => "other",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StallProposedDisposition {
@@ -1399,6 +1411,32 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    // Formatting glue: every declared stall reason displays its wire/CLI label.
+    #[test]
+    fn stall_reason_display_matches_serialized_label() {
+        for reason in [
+            super::StallReason::Infra,
+            super::StallReason::Scope,
+            super::StallReason::Decision,
+            super::StallReason::Access,
+            super::StallReason::Other,
+        ] {
+            assert_eq!(serde_json::to_value(reason).expect("serialize reason"), serde_json::Value::String(reason.to_string()));
+        }
+    }
+
+    // Formatting glue: every proposed disposition displays its serialized label.
+    #[test]
+    fn stall_proposed_disposition_display_matches_serialized_label() {
+        for disposition in [StallProposedDisposition::Resume, StallProposedDisposition::ReduceScope, StallProposedDisposition::Fail] {
+            assert_eq!(
+                serde_json::to_value(disposition).expect("serialize disposition"),
+                serde_json::Value::String(disposition.to_string())
+            );
+        }
+    }
+
     use crate::{
         arg::Arg,
         query::{

@@ -2,6 +2,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    fmt::Write,
     future::Future,
     marker::PhantomData,
     pin::Pin,
@@ -11,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{DaemonEvent, Leaf, LeafAddress, LeafFire, LeafOperator, NodeId, WaitSubscriptionRequest};
+use flotilla_protocol::{arg::shell_quote, DaemonEvent, Leaf, LeafAddress, LeafFire, LeafOperator, NodeId, WaitSubscriptionRequest};
 use flotilla_resources::{
     actor_obligation, admit_leaf,
     controller::{SecondaryWatch, WorkQueueSender},
@@ -20,11 +21,10 @@ use flotilla_resources::{
     ControllerRetry, Convoy, ConvoyAttention, ConvoyEnsure, ConvoyLeafSubject, ConvoyPhase, ConvoyStatus, CrewCompletionRefusal,
     CrewCompletionRefusalCause, Forge, HoldAct, InstantiatedExit, Issue, IssueLeafSubject, LeafMaker, NudgeObligation, Project,
     ReadResourceObject, ReadWatchEvent, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RetryCeiling,
-    StallEvidenceSource, StallNudge, StallProposedDisposition, StallRung, StallSupervisor, StalledCondition, StatusPatch,
-    SupervisionTarget, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, ThreeValue, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Usage,
-    UsageLeafSubject, Vessel, VesselLeafSubject, WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL,
-    VESSEL_LABEL,
+    StallEvidenceSource, StallNudge, StallRung, StallSupervisor, StalledCondition, StatusPatch, SupervisionTarget, TerminalAttention,
+    TerminalAttentionSource, TerminalAttentionState, TerminalSession, TerminalSessionPhase, TerminalSessionSource, ThreeValue,
+    TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRule, TurnDeliveryRung, Usage, UsageLeafSubject, Vessel, VesselLeafSubject,
+    WatchEvent, WatchStart, WorkLeafSubject, WorkPhase, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::StreamExt;
 use tokio::{
@@ -35,6 +35,7 @@ use tokio::{
 use crate::{
     change_request_observer::{ChangeRequestRef, ChangeRequestRefresher},
     event_sink::EventSink,
+    in_process::convoy_message_address,
     issue_observer::{IssueObservationSource, IssueRef, IssueRefreshCadence, IssueRefresher},
     providers::change_request::ObservationError,
 };
@@ -186,6 +187,39 @@ fn stalled_source_actor(condition: &StalledCondition) -> Option<(&str, &str)> {
     let LeafAddress::Work { work, .. } = &leaf.address else { return None };
     let role = leaf.field_path.strip_prefix(".crew.")?.strip_suffix(".phase")?;
     Some((work, role))
+}
+
+/// Shared by supervisor delivery and the operator backstop, so both identify
+/// the same crew and provide commands targeting the exact convoy record and crew.
+fn stall_supervision_brief(convoy: &ResourceObject<Convoy>, condition: &StalledCondition) -> String {
+    let address = convoy_message_address(convoy);
+    let actor =
+        stalled_source_actor(condition).map(|(vessel, role)| format!("{role}@{vessel}")).unwrap_or_else(|| "unidentified crew".to_string());
+    let reason = condition.reason.map_or_else(|| "inferred stall".to_string(), |reason| reason.to_string());
+    let proposal = condition.proposed_disposition.map_or(String::new(), |disposition| format!(" Proposed disposition: {disposition}."));
+    let mut brief = format!(
+        "Supervise stalled crew {actor} in convoy {address} (resource ref: {}). Reason: {reason}. Evidence: {}.{proposal}",
+        convoy.metadata.name, condition.evidence,
+    );
+    if let Some((vessel, role)) = stalled_source_actor(condition) {
+        brief.push_str(" Resume it with guidance, convert it to failed, or escalate it.");
+        for action in ["resume", "convert-to-failed", "escalate"] {
+            write!(
+                brief,
+                "\n`flotilla crew supervise --convoy {} --vessel {} --role {} {action} --message 'guidance'`",
+                shell_quote(&convoy.metadata.name),
+                shell_quote(vessel),
+                shell_quote(role),
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    brief
+}
+
+// Keep each warning one event line while retaining copyable command text.
+fn stall_supervision_log_brief(convoy: &ResourceObject<Convoy>, condition: &StalledCondition) -> String {
+    stall_supervision_brief(convoy, condition).replace('\n', " ")
 }
 
 const DEFAULT_REFUSAL_LIMIT: u32 = 2;
@@ -1661,8 +1695,13 @@ impl ReconcilerWake {
                             condition.rung = StallRung::Nudge;
                             if due {
                                 let leaf = row.leaves.first().ok_or_else(|| "actor row has no leaf".to_string())?;
-                                let brief =
+                                let obligation =
                                     if let Some(refusal) = refusal { refusal_nudge_brief(refusal) } else { actor_obligation(leaf)? };
+                                let brief = format!(
+                                    "For {role}@{vessel} in {} (resource ref: {}):\n{obligation}",
+                                    convoy_message_address(convoy),
+                                    convoy.metadata.name
+                                );
                                 let request = TurnDeliveryRequest::builder()
                                     .namespace(namespace.to_string())
                                     .convoy(convoy.metadata.name.clone())
@@ -1690,6 +1729,7 @@ impl ReconcilerWake {
                                             target = %role,
                                             %vessel,
                                             reason = %error,
+                                            brief = %stall_supervision_log_brief(convoy, &condition),
                                             "stall nudge fell back to operator"
                                         );
                                         condition.rung = StallRung::Operator;
@@ -1830,21 +1870,7 @@ impl ReconcilerWake {
                                     unavailable_target = Some(target);
                                     continue;
                                 }
-                                let proposal = condition.proposed_disposition.map_or(String::new(), |disposition| {
-                                    let label = match disposition {
-                                        StallProposedDisposition::Resume => "resume",
-                                        StallProposedDisposition::ReduceScope => "reduce-scope",
-                                        StallProposedDisposition::Fail => "fail",
-                                    };
-                                    format!(" Proposed disposition: {label}.")
-                                });
-                                let brief = format!(
-                                    "Supervise stalled crew {} in convoy {}. Reason: {}.{} Resume it with guidance, fail it, or escalate it.",
-                                    condition.leaves.first().map(|leaf| leaf.field_path.as_str()).unwrap_or_default(),
-                                    convoy.metadata.name,
-                                    condition.evidence,
-                                    proposal,
-                                );
+                                let brief = stall_supervision_brief(convoy, &condition);
                                 let delivery = TurnDeliveryRequest::builder()
                                     .namespace(namespace.to_string())
                                     .convoy(target_convoy.clone())
@@ -1855,8 +1881,8 @@ impl ReconcilerWake {
                                     .subject_revision(condition.began_at.timestamp_micros().to_string())
                                     .sender(flotilla_resources::CrewMessageSender::FlotillaEscalation {
                                         from: stalled_source_actor(&condition)
-                                            .map(|(vessel, role)| format!("{role}@{vessel}"))
-                                            .unwrap_or_else(|| convoy.metadata.name.clone()),
+                                            .map(|(vessel, role)| format!("{role}@{vessel} in {}", convoy_message_address(convoy)))
+                                            .unwrap_or_else(|| convoy_message_address(convoy)),
                                     })
                                     .build();
                                 if let Err(error) = self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&delivery).await {
@@ -1866,6 +1892,7 @@ impl ReconcilerWake {
                                         %target_vessel,
                                         %target_role,
                                         reason = %error,
+                                        brief = %stall_supervision_log_brief(convoy, &condition),
                                         "stall escalation fell back to operator"
                                     );
                                     condition.evidence.push_str(&format!("; supervisor delivery failed: {error}"));
@@ -1899,6 +1926,7 @@ impl ReconcilerWake {
                                 convoy = %convoy.metadata.name,
                                 ?target,
                                 reason = "no live supervisor found",
+                                brief = %stall_supervision_log_brief(convoy, &condition),
                                 "stall escalation fell back to operator"
                             );
                             if unavailable_target.is_some() {
@@ -3113,7 +3141,11 @@ mod tests {
         let source = convoys
             .create(
                 &InputMeta::builder().name("stalled-work".into()).build(),
-                &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("wheelhouse".into()).build(),
+                &ConvoySpec::builder()
+                    .workflow_ref("workflow".into())
+                    .role("graphql-budget".into())
+                    .project_ref("wheelhouse".into())
+                    .build(),
             )
             .await
             .expect("create work convoy");
@@ -3412,6 +3444,10 @@ mod tests {
         assert!(delivery.requests.lock().expect("deliveries").is_empty());
         observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(180)).await;
         assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1);
+        // #2592: even mechanical nudges identify the crew and convoy they concern.
+        assert!(delivery.requests.lock().expect("deliveries")[0]
+            .brief
+            .contains("coder@work in graphql-budget@wheelhouse (resource ref: stalled-work)"));
         // A brief working flicker cannot replenish the unmet claim's budget.
         observe_actor(&backend, &wake, TerminalAttentionState::Working, start + chrono::Duration::seconds(181)).await;
         for second in [182, 240, 300, 359] {
@@ -3989,6 +4025,9 @@ mod tests {
                 assert!(warning.contains("convoy=stalled-work"), "{warning}");
                 assert!(warning.contains("target="), "{warning}");
                 assert!(warning.contains("reason="), "{warning}");
+                // #2592: operator fallback logs contain the source address and exact actionable crew.
+                assert!(warning.contains("coder@work in convoy graphql-budget@wheelhouse (resource ref: stalled-work)"), "{warning}");
+                assert!(warning.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"), "{warning}");
                 assert!(
                     warning.contains(if matches!(unavailable, GovernorUnavailable::DeliveryError) {
                         "supervisor reconnecting"
@@ -4119,6 +4158,44 @@ mod tests {
         assert!(delivery.requests.lock().expect("deliveries").is_empty());
     }
 
+    // Supervision commands must preserve identifiers containing shell metacharacters.
+    // Formatting glue: spaces and an apostrophe exercise the shared shell quoting helper.
+    #[tokio::test]
+    async fn stall_supervision_commands_quote_role_and_vessel_identifiers() {
+        let (backend, wake, _) = project_supervision_case(&[]).await;
+        let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
+        wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source)])).await.expect("judge");
+        let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
+        let mut condition = source.status.as_ref().expect("status").stalled.clone().expect("stall");
+        let leaf = condition.leaves.first_mut().expect("actor leaf");
+        let LeafAddress::Work { work, .. } = &mut leaf.address else { panic!("work leaf") };
+        *work = "work space".to_string();
+        leaf.field_path = ".crew.coder's role.phase".to_string();
+        let brief = stall_supervision_brief(&source, &condition);
+        for action in ["resume", "convert-to-failed", "escalate"] {
+            assert!(
+                brief.contains(&format!(r"--convoy 'stalled-work' --vessel 'work space' --role 'coder'\''s role' {action}")),
+                "{brief}"
+            );
+        }
+    }
+
+    // #2592: a non-actor stall retains convoy identity and evidence, without
+    // fabricating role/vessel supervision commands for an unknown actor.
+    #[tokio::test]
+    async fn unattributed_stall_brief_preserves_identity_without_inventing_commands() {
+        let (backend, wake, _) = project_supervision_case(&[]).await;
+        let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
+        wake.judge_stalls("flotilla", &HashMap::from([("stalled-work".into(), source)])).await.expect("judge");
+        let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
+        let mut condition = source.status.as_ref().expect("status").stalled.clone().expect("stall");
+        condition.leaves.clear();
+        let brief = stall_supervision_brief(&source, &condition);
+        assert!(brief.contains("unidentified crew in convoy graphql-budget@wheelhouse (resource ref: stalled-work)"), "{brief}");
+        assert!(brief.contains("Reason: inferred stall. Evidence: needs decision"), "{brief}");
+        assert!(!brief.contains("flotilla crew supervise"), "{brief}");
+    }
+
     #[tokio::test]
     async fn stalled_work_without_live_governor_names_reason_at_operator_rung() {
         let (backend, wake, delivery) = project_supervision_case(&[("governor-one", 1, ConvoyPhase::Abandoned)]).await;
@@ -4135,6 +4212,11 @@ mod tests {
             .expect("stalled");
         assert_eq!(stalled.rung, StallRung::Operator);
         assert!(!stalled.supervision_exhausted);
+        // #2592: the operator backstop uses the same actionable description as a supervisor turn.
+        let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("source");
+        let brief = stall_supervision_brief(&source, &stalled);
+        assert!(brief.contains("coder@work in convoy graphql-budget@wheelhouse (resource ref: stalled-work)"), "{brief}");
+        assert!(brief.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"), "{brief}");
         assert!(stalled.evidence.contains("no live governor for project wheelhouse"), "{}", stalled.evidence);
         assert!(delivery.requests.lock().expect("deliveries").is_empty());
     }
