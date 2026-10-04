@@ -5885,32 +5885,35 @@ impl TerminalRuntime for TerminalControllerRuntime {
             TerminalStatus::Disconnected | TerminalStatus::Exited(_) => TerminalOccupancy::Vacant,
         };
         let Some(activity) = session.screen_activity else {
-            return Ok(Some(TerminalObservation { attention: None, occupancy }));
+            return Ok(Some(TerminalObservation { output_digest: None, attention: None, occupancy }));
         };
-        if activity == ScreenActivity::Stable {
-            if let TerminalSessionSource::Agent { selector, .. } = &spec.source {
-                let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
-                let registry = self.registry_for_env(&spec.env_ref)?;
-                let adapter = registry
-                    .agent_adapters
-                    .get(&requirement.adapter)
-                    .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
-                match pool.capture_screen(session_id).await {
-                    Ok(Some(screen))
-                        if adapter.classify_screen_attention(&screen) == Some(flotilla_resources::TerminalAttentionState::NeedsInput) =>
-                    {
-                        return Ok(Some(TerminalObservation {
-                            attention: Some(flotilla_resources::TerminalAttention {
-                                state: flotilla_resources::TerminalAttentionState::NeedsInput,
-                                as_of: Utc::now(),
-                                source: flotilla_resources::TerminalAttentionSource::Screen,
-                            }),
-                            occupancy,
-                        }));
-                    }
-                    Ok(_) => {}
-                    Err(error) => tracing::debug!(%session_id, %error, "could not capture terminal screen for attention observation"),
+        if let TerminalSessionSource::Agent { selector, .. } = &spec.source {
+            let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
+            let registry = self.registry_for_env(&spec.env_ref)?;
+            let adapter = registry
+                .agent_adapters
+                .get(&requirement.adapter)
+                .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
+            match pool.capture_screen(session_id).await {
+                Ok(Some(screen)) => {
+                    let output_digest = adapter.screen_output_digest(&screen);
+                    let state = if activity == ScreenActivity::Active {
+                        flotilla_resources::TerminalAttentionState::Working
+                    } else {
+                        adapter.classify_screen_attention(&screen).unwrap_or(flotilla_resources::TerminalAttentionState::Idle)
+                    };
+                    return Ok(Some(TerminalObservation {
+                        output_digest,
+                        attention: Some(flotilla_resources::TerminalAttention {
+                            state,
+                            as_of: Utc::now(),
+                            source: flotilla_resources::TerminalAttentionSource::Screen,
+                        }),
+                        occupancy,
+                    }));
                 }
+                Ok(_) => {}
+                Err(error) => tracing::debug!(%session_id, %error, "could not capture terminal screen for attention observation"),
             }
         }
         let state = match activity {
@@ -5918,6 +5921,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             ScreenActivity::Stable => flotilla_resources::TerminalAttentionState::Idle,
         };
         Ok(Some(TerminalObservation {
+            output_digest: None,
             attention: Some(flotilla_resources::TerminalAttention {
                 state,
                 as_of: Utc::now(),
@@ -15101,6 +15105,18 @@ dependency = { path = "../dependency" }
         let observation =
             runtime.observe_attention(session_name, &spec).await.expect("observe normal composer").expect("attention observation");
         assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Idle);
+
+        // #2560: stable pixels alone do not end a Codex turn. An interrupt
+        // returning to the composer is a boundary even without a notify hook.
+        pool.set_captured_screen(session_name, "• Working (2h 12m • esc to interrupt)\n\n› Ask Codex to do something").await;
+        let observation = runtime.observe_attention(session_name, &spec).await.expect("observe quiet working turn").expect("observation");
+        assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Working);
+        pool.set_captured_screen(session_name, "■ Conversation interrupted\n\n› Ask Codex to do something").await;
+        let observation = runtime.observe_attention(session_name, &spec).await.expect("observe interrupted prompt").expect("observation");
+        assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Idle);
+        pool.set_captured_screen(session_name, "Loading unknown screen").await;
+        let observation = runtime.observe_attention(session_name, &spec).await.expect("observe unknown screen").expect("observation");
+        assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Unobservable);
 
         pool.set_captured_screen(
             session_name,

@@ -27,6 +27,7 @@ pub struct TerminalRuntimeState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalObservation {
+    pub output_digest: Option<String>,
     pub attention: Option<TerminalAttention>,
     pub occupancy: TerminalOccupancy,
 }
@@ -578,8 +579,19 @@ where
                     let attention_changed = attention.as_ref().is_some_and(|attention| {
                         current.and_then(|status| status.attention.as_ref()).is_none_or(|previous| previous.should_replace_with(attention))
                     });
-                    (occupancy_changed || attention_changed)
-                        .then_some(TerminalSessionStatusPatch::Observe { attention, occupancy: observation.occupancy })
+                    let output_changed = observation
+                        .output_digest
+                        .as_ref()
+                        .is_some_and(|digest| current.and_then(|status| status.last_output_digest.as_ref()) != Some(digest))
+                        && current
+                            .and_then(|status| status.last_output_activity_at)
+                            .is_none_or(|at| now.signed_duration_since(at) >= chrono::Duration::seconds(30));
+                    (occupancy_changed || attention_changed || output_changed).then_some(TerminalSessionStatusPatch::Observe {
+                        attention,
+                        occupancy: observation.occupancy,
+                        output_digest: observation.output_digest.clone().filter(|_| output_changed),
+                        observed_at: now,
+                    })
                 }
                 TerminalPrepared::AttentionStale => Some(TerminalSessionStatusPatch::ObserveAttention {
                     attention: TerminalAttention {

@@ -1594,6 +1594,45 @@ async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
     assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), 1);
 }
 
+// #2560: output progress is persisted even when attention is coalesced;
+// repeating the same output is a no-op and cannot keep a hung turn alive.
+#[tokio::test]
+async fn meaningful_output_progress_survives_coalesced_attention() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(&meta("output-crew"), &TerminalSessionSpec {
+            env_ref: "env-a".into(),
+            role: "coder".into(),
+            source: flotilla_resources::TerminalSessionSource::Tool { command: "test".into() },
+            cwd: "/workspace".into(),
+            pool: "cleat".into(),
+        })
+        .await
+        .expect("session");
+    let start = Utc::now();
+    let status = TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() };
+    sessions.update_status("output-crew", &created.metadata.resource_version, &status).await.expect("running session");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
+    for (digest, second, expected, changed) in
+        [("first", 0, 0, true), ("second", 10, 0, false), ("second", 29, 0, false), ("second", 30, 30, true), ("second", 60, 30, false)]
+    {
+        let session = sessions.get("output-crew").await.expect("session");
+        let observation = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+            output_digest: Some(digest.into()),
+            attention: None,
+            occupancy: TerminalOccupancy::Vacant,
+        });
+        let result = reconciler.reconcile(&session, &observation, start + chrono::Duration::seconds(second));
+        assert_eq!(result.patch.is_some(), changed);
+        if let Some(patch) = result.patch {
+            flotilla_resources::apply_status_patch(&sessions, "output-crew", &patch).await.expect("persist output progress");
+        }
+        let status = sessions.get("output-crew").await.expect("session").status.expect("status");
+        assert_eq!(status.last_output_activity_at, Some(start + chrono::Duration::seconds(expected)));
+    }
+}
+
 #[tokio::test]
 async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_still_true() {
     let backend = ResourceBackend::InMemory(Default::default());
@@ -1626,6 +1665,7 @@ async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_s
     let attached = reconciler.reconcile(
         &session,
         &flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+            output_digest: None,
             attention: Some(attention.clone()),
             occupancy: TerminalOccupancy::Occupied,
         }),
@@ -1636,6 +1676,7 @@ async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_s
     let detached = reconciler.reconcile(
         &session,
         &flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+            output_digest: None,
             attention: Some(attention),
             occupancy: TerminalOccupancy::Vacant,
         }),
@@ -1757,6 +1798,7 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
 
     async fn observe_attention(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {
         Ok(Some(TerminalObservation {
+            output_digest: None,
             attention: Some(TerminalAttention {
                 state: TerminalAttentionState::Working,
                 as_of: Utc::now(),

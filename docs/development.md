@@ -133,7 +133,7 @@ stall_nudges:
 ```
 
 The historical `max_per_episode` field now bounds the unmet actor obligation,
-identified by its maker and leaves. Working attention clears the visible stall
+identified by its maker and leaves. Able Working attention clears the visible stall
 but preserves durable accounting in convoy status. A changed observed checkout
 HEAD or pushed revision, a settlement claim (including a refused claim), or a
 crew stall declaration resets the corresponding budget. Unknown or unchanged
@@ -152,6 +152,28 @@ clock and budget. Actual tool activity cancels idleness; if idle resumes after
 real work, it must satisfy grace again. Remaining continuously idle permits
 further nudges at the backed-off times, up to the obligation budget. Pending briefs remain
 protected by the existing delivery ordering.
+
+Working evidence also has a fifteen-minute inactivity bound. The leaf engine
+persists when it first observes the turn, and compares the clock with the newest
+tool activity, harness hook, meaningful screen output, or delivered-message response window. Screen
+redraws of the Working spinner line do not refresh that bound: a Codex spinner can continue animating
+while its turn is hung. An exceeded bound goes directly to the supervision
+ladder, carrying the turn start, tool/hook/output timestamps, and latest screen
+observation. Output digest changes are persisted at most once every thirty
+seconds; screen capture and hashing also run during active output. Automatic
+interruption is deferred to the supervisor and recorded in the evidence. Fresh tool, hook, or output activity restores the actor's ability.
+
+A queued operator brief is released by a fresh idle observation newer than the
+brief, including a Codex composer after interruption without a notify hook.
+The existing convoy/session watch reconciler handles this on the authority host
+under the same message lock as resume, withdrawal, and completion. Delivery
+preserves sender attribution, stages credentials, and retains the pending brief
+on staging failure. Codex screen classification distinguishes an idle composer
+from a stable Working display or permission prompt; unknown screens remain
+unobservable. Selection rows in Codex menus are not composers. Losing observation
+does not declare a new turn: the durable turn start survives stale or Unobservable
+evidence, and fresh activity restores ability. Fresh hook evidence still takes
+precedence for up to two minutes.
 
 Schema authors: WorkflowTemplate manifests in the external project-map/ops
 repositories may specify `stall_nudges`; their existing field names and defaults
