@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     agent_adapter::{CrewAssignment, CrewBriefTemplateResolver},
-    providers::discovery::detectors::git::remote_assertion,
+    providers::discovery::{detectors::git::remote_assertion, FORGEJO_AUTH_PROVIDER},
 };
 
 /// Routing uses replicated observations as hints; only admission may refuse on
@@ -2515,7 +2515,7 @@ pub(super) async fn repository_provider_bag(
         .filter(|assertion| {
             !matches!(
                 assertion,
-                EnvironmentAssertion::AuthFileExists { provider, .. } if provider == "forgejo"
+                EnvironmentAssertion::AuthFileExists { provider, .. } if provider == FORGEJO_AUTH_PROVIDER
             ) && !matches!(
                 assertion,
                 EnvironmentAssertion::RemoteHost { .. }
@@ -2545,6 +2545,8 @@ pub(super) async fn repository_provider_bag(
     if let Some(forge) = &forge {
         bag = bag.with(EnvironmentAssertion::origin_forge(forge.clone()));
         if forge.kind == ForgeKind::Forgejo {
+            // Read current intent on each request: provider leases compare the
+            // resolved bag so a changed identity cannot reuse a stale credential.
             if let Some(name) = config.load_daemon_config()?.credentials.forgejo.get(&forge.forge_id) {
                 let credential = resource_backend
                     .definitions::<CredentialSpec>(namespace)
@@ -2553,7 +2555,7 @@ pub(super) async fn repository_provider_bag(
                     .map_err(|error| format!("daemon Forgejo credential {name}: {error}"))?;
                 match (&credential.spec.consumer, &credential.spec.source) {
                     (CredentialConsumer::Forgejo { forge_ref, .. }, CredentialSource::File { path }) if forge_ref == &forge.forge_id => {
-                        bag = bag.with(EnvironmentAssertion::auth_file("forgejo", path));
+                        bag = bag.with(EnvironmentAssertion::auth_file(FORGEJO_AUTH_PROVIDER, path));
                     }
                     _ => {
                         return Err(format!("daemon Forgejo credential {name} must use a file source and target Forge {}", forge.forge_id))

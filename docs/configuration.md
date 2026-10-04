@@ -227,6 +227,9 @@ Declare each host daemon's Forgejo credential explicitly in that host's
 flotilla-lab = "lab-forgejo-daemon"
 ```
 
+The mapping is read whenever a repository provider bag is resolved, so new
+discovery requests see the selected identity without restarting the daemon.
+
 The named credential must have a `forgejo` consumer targeting that Forge and a
 file source readable in the discovery environment. Its token file uses the
 existing Forgejo provider format. Crew and governor credentials delivered by

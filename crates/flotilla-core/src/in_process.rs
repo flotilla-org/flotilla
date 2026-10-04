@@ -120,8 +120,7 @@ use crate::{
         ai_utility::{AiUtility, ConvoyNames},
         change_request::{BoundObservations, ChangeRequestTracker, ObservationError},
         discovery::{
-            discover_checkout_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion,
-            EnvironmentBag, UnmetRequirement,
+            discover_checkout_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag,
         },
         issue_tracker::IssueProvider,
         registry::ProviderRegistry,
@@ -2079,13 +2078,11 @@ impl InProcessDaemon {
                 if let Ok(vcs) = &initial_vcs {
                     registry.vcs.insert(vcs.descriptor.backend.clone(), vcs.descriptor.clone(), Arc::clone(&vcs.vcs));
                 }
-                DiscoveryResult {
+                DiscoveryResult::degraded(
                     registry,
-                    host_repo_bag: EnvironmentBag::new(),
-                    repo_bag: EnvironmentBag::new(),
-                    repo_slug: startup_inspection.as_ref().ok().map(|inspection| inspection.spec.catalog_slug()),
-                    unmet: vec![("repository discovery".into(), UnmetRequirement::MissingConfig(error))],
-                }
+                    startup_inspection.as_ref().ok().map(|inspection| inspection.spec.catalog_slug()),
+                    error,
+                )
             });
             if !unmet.is_empty() {
                 debug!(count = unmet.len(), ?unmet, "providers not activated: missing requirements");
