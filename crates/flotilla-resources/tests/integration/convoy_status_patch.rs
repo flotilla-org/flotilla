@@ -219,6 +219,46 @@ fn placement_decision_is_written_once_without_overwriting_concurrent_status() {
     assert_eq!(status.observed_workflow_ref.as_deref(), Some("scratch"));
 }
 
+// Discovery completes only for accepted produced change requests. The generator
+// spans every source, relationship, both subject kinds and operator unlink overrides.
+#[hegel::test]
+fn discovery_completion_respects_subject_kind_relationship_and_unlinks(tc: hegel::TestCase) {
+    use flotilla_protocol::{provider_data::IssueSource, Relationship, Subject, SubjectKind};
+    use flotilla_resources::SubjectDiscoverySource;
+    let source =
+        [SubjectDiscoverySource::Branch, SubjectDiscoverySource::Claim, SubjectDiscoverySource::Relay, SubjectDiscoverySource::Operator]
+            [tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3))];
+    let relationship =
+        [Relationship::Produces, Relationship::Adopts, Relationship::WorksOn, Relationship::Supersedes, Relationship::References]
+            [tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(4))];
+    let kind = if tc.draw(hegel::generators::booleans()) { SubjectKind::ChangeRequest } else { SubjectKind::Issue };
+    let unlinked = tc.draw(hegel::generators::booleans());
+    let subject = Subject { kind, source: IssueSource { service: "github.com".into(), scope: "team/repo".into() }, id: "42".into() };
+    let mut status = ConvoyStatus { branch_subject_scan_error: Some("scan failed".into()), ..Default::default() };
+    if unlinked {
+        status.unlink_subject(&subject);
+    }
+    let completes = kind == SubjectKind::ChangeRequest
+        && relationship == Relationship::Produces
+        && (!unlinked || source == SubjectDiscoverySource::Operator);
+    for at in [ts(10), ts(20)] {
+        ConvoyStatusPatch::DiscoverSubjects { subjects: vec![(subject.clone(), relationship)], source, at }.apply(&mut status);
+        assert_eq!(status.branch_subject_scan_at, completes.then_some(at));
+        assert_eq!(status.branch_subject_scan_error.is_none(), completes);
+    }
+    // Every generated sequence ends with an accepted produced PR so completion
+    // is exercised even when the random prefix contains only unrelated evidence.
+    let subject = Subject { kind: SubjectKind::ChangeRequest, ..subject };
+    ConvoyStatusPatch::DiscoverSubjects {
+        subjects: vec![(subject, Relationship::Produces)],
+        source: SubjectDiscoverySource::Operator,
+        at: ts(30),
+    }
+    .apply(&mut status);
+    assert_eq!(status.branch_subject_scan_at, Some(ts(30)));
+    assert!(status.branch_subject_scan_error.is_none());
+}
+
 #[test]
 fn successful_branch_scan_clears_a_stale_lookup_error() {
     let mut status = ConvoyStatus::default();

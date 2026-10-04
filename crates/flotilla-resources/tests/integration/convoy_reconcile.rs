@@ -1355,9 +1355,122 @@ fn landing_waits_for_a_branch_scan_before_treating_an_empty_subject_set_as_no_pr
         flotilla_resources::SubjectDiscoverySource::Branch,
         timestamp(40),
     );
-    assert!(matches!(evaluate(&scanned).unmet.as_slice(), [UnmetSettlementExpectation::SubjectDiscoveryPending { .. }]));
-    scanned.status.as_mut().expect("status").branch_subject_scan_at = Some(timestamp(40));
+    assert_eq!(scanned.status.as_ref().expect("status").branch_subject_scan_at, Some(timestamp(40)));
+    assert!(scanned.status.as_ref().expect("status").branch_subject_scan_error.is_none());
     assert!(!evaluate(&scanned).unmet.iter().any(|unmet| matches!(unmet, UnmetSettlementExpectation::SubjectDiscoveryPending { .. })));
+}
+
+// Every accepted produced PR discovery completes the scan lifecycle, including
+// repeated discoveries from all sources. Read persisted status through the backend.
+#[tokio::test]
+async fn produced_subject_discovery_completes_branch_scan_from_every_source() {
+    use flotilla_protocol::{provider_data::IssueSource, Relationship, Subject, SubjectKind};
+    use flotilla_resources::SubjectDiscoverySource;
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let convoys = backend.using::<Convoy>("flotilla");
+    let mut current = convoys.create(&convoy_meta("discovery"), &valid_convoy_spec()).await.expect("create");
+    let subject = Subject {
+        kind: SubjectKind::ChangeRequest,
+        source: IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+        id: "42".into(),
+    };
+    for source in
+        [SubjectDiscoverySource::Branch, SubjectDiscoverySource::Claim, SubjectDiscoverySource::Relay, SubjectDiscoverySource::Operator]
+    {
+        let mut status = current.status.unwrap_or_default();
+        status.branch_subject_scan_at = None;
+        status.branch_subject_scan_error = Some("lookup exceeded 10 pages".into());
+        ConvoyStatusPatch::DiscoverSubjects { subjects: vec![(subject.clone(), Relationship::Produces)], source, at: timestamp(30) }
+            .apply(&mut status);
+        current = convoys.update_status("discovery", &current.metadata.resource_version, &status).await.expect("persist discovery");
+        let stored = convoys.get("discovery").await.expect("get").status.expect("status");
+        assert_eq!(stored.branch_subject_scan_at, Some(timestamp(30)));
+        assert!(stored.branch_subject_scan_error.is_none());
+        assert_eq!(stored.subjects.len(), 1, "rediscovery remains idempotent");
+    }
+}
+
+// A historical scan error is diagnostic once a produced PR is known; without
+// subjects, discovery still gates Landing. Exercise both through the real reconciler.
+#[tokio::test]
+async fn stale_branch_scan_error_only_holds_landing_without_subjects() {
+    for known_subject in [false, true] {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let convoys = backend.clone().using::<Convoy>("flotilla");
+        let requests = backend.clone().using::<ChangeRequest>("flotilla");
+        let mut spec = task_provisioning_convoy_spec();
+        spec.repositories[0].url = "https://github.com/flotilla-org/flotilla".into();
+        let mut status = bootstrapped_convoy_status();
+        status.phase = ConvoyPhase::Landing;
+        status.work.get_mut("implement").expect("work").placement = Some(flotilla_resources::PlacementStatus {
+            fields: BTreeMap::from([(
+                "checkout_refs".into(),
+                serde_json::json!(BTreeMap::from([(spec.repositories[0].repo_ref.clone(), "checkout-a")])),
+            )]),
+        });
+        status.workflow_snapshot.as_mut().expect("snapshot").exit = Some(flotilla_resources::ExitDeclaration::standard_table());
+        status.branch_subject_scan_at = None;
+        status.branch_subject_scan_error = Some("lookup exceeded 10 pages".into());
+        if known_subject {
+            status.discover_subject(
+                flotilla_protocol::Subject {
+                    kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                    source: flotilla_protocol::provider_data::IssueSource {
+                        service: "github.com".into(),
+                        scope: "flotilla-org/flotilla".into(),
+                    },
+                    id: "42".into(),
+                },
+                flotilla_protocol::Relationship::Produces,
+                flotilla_resources::SubjectDiscoverySource::Operator,
+                timestamp(30),
+            );
+            // Simulate stored pre-fix state rather than relying on discovery's lifecycle.
+            status.branch_subject_scan_at = None;
+            status.branch_subject_scan_error = Some("lookup exceeded 10 pages".into());
+        }
+        for work in status.work.values_mut() {
+            work.phase = WorkPhase::Complete;
+        }
+        for crew in status.crew_work.values_mut() {
+            for member in crew.values_mut() {
+                member.phase = CrewWorkPhase::Done;
+            }
+        }
+        let created = convoys.create(&convoy_meta("stale-scan"), &spec).await.expect("create");
+        convoys.update_status("stale-scan", &created.metadata.resource_version, &status).await.expect("status");
+        let name = change_request_record_name("github.com", "flotilla-org/flotilla", 42);
+        let record = requests
+            .create(
+                &InputMeta::builder().name(name.clone()).build(),
+                &ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("flotilla-org/flotilla".into())
+                    .number(42)
+                    .observing_authority("host-a".into())
+                    .build(),
+            )
+            .await
+            .expect("PR");
+        requests
+            .update_status(&name, &record.metadata.resource_version, &merged_change_request_status(timestamp(40)))
+            .await
+            .expect("merged");
+        let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))
+            .with_change_requests(backend.including_replicas::<ChangeRequest>("flotilla"), Duration::from_secs(180))
+            .with_clock(Arc::new(FixedClock(timestamp(40))));
+        let current = convoys.get("stale-scan").await.expect("convoy");
+        let deps = reconciler.prepare(&current).await.expect("deps");
+        let outcome = reconciler.reconcile(&current, &deps, timestamp(40));
+        if known_subject {
+            let patch = outcome.patch.expect("known merged PR settles despite historical scan error");
+            let mut status = current.status.expect("status");
+            patch.apply(&mut status);
+            assert_eq!(status.phase, ConvoyPhase::Landed);
+        } else {
+            assert!(outcome.patch.is_none(), "no subjects must still wait for discovery");
+        }
+    }
 }
 
 #[tokio::test]

@@ -535,8 +535,9 @@ fn evaluate_landing_settlement_with_disposition(
                     .as_ref()
                     .and_then(|snapshot| snapshot.exit.as_ref())
                     .is_some_and(|exit| matches!(exit, ExitDeclaration::Table(_)))
-                && (status.branch_subject_scan_error.is_some()
-                    || expected_change_request_leaves(convoy, checkouts).is_ok_and(|leaves| leaves.is_empty()))
+                // A known subject lets the exit table decide settlement. Old
+                // scan failures remain diagnostic, including stored pre-fix state.
+                && expected_change_request_leaves(convoy, checkouts).is_ok_and(|leaves| leaves.is_empty())
         });
     if discovery_pending {
         return LandingSettlement {
