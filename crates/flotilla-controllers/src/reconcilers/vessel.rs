@@ -1401,7 +1401,9 @@ fn checkout_placement_scope(convoy: &ResourceObject<Convoy>, host_ref: Option<&s
     Some(digest[..12].to_string())
 }
 
-fn checkout_path_component(branch: &str) -> String {
+/// The filesystem component used for both branch refs and convoy names.
+/// Provisioning and cleanup must share this normalization rule.
+pub fn checkout_path_component(branch: &str) -> String {
     let normalized = branch
         .chars()
         .map(|character| if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') { character } else { '-' })

@@ -22,5 +22,5 @@ pub use terminal_session::{
     TerminalDeliveryFailure, TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime,
     TerminalRuntimeState, TerminalSessionReconciler,
 };
-pub use vessel::{VesselPrepared, VesselReconciler};
+pub use vessel::{checkout_path_component, VesselPrepared, VesselReconciler};
 pub use vessel_placement::{VesselPlacementProjector, VesselPlacementSync};
