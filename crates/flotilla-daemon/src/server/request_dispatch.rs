@@ -92,6 +92,9 @@ async fn project_decision_ledger(
     Ok(urls)
 }
 
+/// Projects a machine-owned comment: revisions replace the whole body, including
+/// manual edits. Identity is carried by the generated marker on the final line.
+/// Listing and writing are not atomic; concurrent first projections can race.
 #[allow(clippy::too_many_arguments)]
 async fn project_ledger_comment(
     convoy_name: &str,
@@ -110,6 +113,9 @@ async fn project_ledger_comment(
     let name = flotilla_resources::artifact_record_name(convoy_name, producer, "decision-ledger", convoy_name);
     let marker = format!("<!-- flotilla-decision-ledger:{name}:{} -->", digest.as_str());
     let endpoint = format!("repos/{scope}/issues/{number}/comments");
+    // Match DefaultLabeler::label_for in flotilla-core/src/providers/mod.rs:
+    // it derives command labels from the program and first argument.
+    let channel = ChannelLabel::Command("sh -c".to_string());
     let credential_path = if service == "github.com" { "GITHUB_TOKEN_FILE" } else { "FORGEJO_TOKEN_FILE" };
     let token_file =
         delivery_env.get(credential_path).ok_or_else(|| format!("{credential_path} is absent from the credential delivery record"))?;
@@ -126,7 +132,7 @@ async fn project_ledger_comment(
                 "sh",
                 &["-c", GITHUB_LEDGER_API, "github-ledger-list", token_file, &format!("{endpoint}?per_page=100"), "--paginate", "--slurp"],
                 cwd,
-                &ChannelLabel::Default,
+                &channel,
             )
             .await
             .map_err(|error| format!("GitHub ledger comment lookup failed: {error}"))?;
@@ -167,7 +173,7 @@ curl --fail-with-body --silent --show-error \
                         &page,
                     ],
                     cwd,
-                    &ChannelLabel::Default,
+                    &channel,
                 )
                 .await?;
             let batch =
@@ -183,27 +189,49 @@ curl --fail-with-body --silent --show-error \
         }
         comments
     };
-    if let Some(url) = existing
+    // Keep the digest in the marker for retry idempotence, but select by the
+    // stable artifact name. Numeric comment IDs order creation on both forges.
+    let prefix = format!("<!-- flotilla-decision-ledger:{name}:");
+    let selected = existing
         .iter()
-        .find(|comment| comment.get("body").and_then(serde_json::Value::as_str).is_some_and(|body| body.trim_end().ends_with(&marker)))
-        .and_then(|comment| comment.get("html_url"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|url| url.starts_with("https://"))
-    {
-        return Ok(url.to_string());
-    }
+        .filter(|comment| {
+            comment.get("body").and_then(serde_json::Value::as_str).is_some_and(|body| {
+                body.trim_end()
+                    .rsplit_once('\n')
+                    .map_or(body.trim_end(), |(_, last)| last)
+                    .strip_prefix(&prefix)
+                    .is_some_and(|suffix| suffix.ends_with(" -->"))
+            })
+        })
+        .max_by_key(|comment| comment.get("id").and_then(serde_json::Value::as_u64));
+    let (method, endpoint) = if let Some(comment) = selected {
+        if comment["body"].as_str().is_some_and(|body| body.trim_end().ends_with(&marker)) {
+            // Refuse malformed URLs rather than POSTing a duplicate of an
+            // unchanged ledger whose existing comment was already found.
+            return comment
+                .get("html_url")
+                .and_then(serde_json::Value::as_str)
+                .filter(|url| url.starts_with("https://"))
+                .map(str::to_string)
+                .ok_or_else(|| "existing ledger comment has no HTTPS URL".to_string());
+        }
+        let id = comment.get("id").and_then(serde_json::Value::as_u64).ok_or("existing ledger comment has no numeric ID")?;
+        ("PATCH", format!("repos/{scope}/issues/comments/{id}"))
+    } else {
+        ("POST", endpoint)
+    };
     let input = serde_json::to_vec(&serde_json::json!({ "body": format!("{text}\n{marker}") })).map_err(|error| error.to_string())?;
     let response = if service == "github.com" {
         runner
             .run_with_input(
                 "sh",
-                &["-c", GITHUB_LEDGER_API, "github-ledger-post", token_file, "--method", "POST", &endpoint, "--input", "-"],
+                &["-c", GITHUB_LEDGER_API, "github-ledger-write", token_file, "--method", method, &endpoint, "--input", "-"],
                 cwd,
-                &ChannelLabel::Default,
+                &channel,
                 &input,
             )
             .await
-            .map_err(|error| format!("GitHub ledger comment post failed: {error}"))?
+            .map_err(|error| format!("GitHub ledger comment write failed: {error}"))?
     } else {
         // The scoped Forgejo credential is staged in the crew environment.
         // The daemon supplies the JSON body on stdin and never reads the token.
@@ -215,11 +243,10 @@ shift 2
 : "${FORGEJO_TOKEN_FILE:?missing Forgejo token file}"
 test -s "$FORGEJO_TOKEN_FILE"
 token=$(cat "$FORGEJO_TOKEN_FILE")
-curl --fail-with-body --silent --show-error -X POST \
+curl --fail-with-body --silent --show-error -X "$1" \
   -H "Authorization: token $token" -H "Content-Type: application/json" \
-  --data-binary @- "${FORGEJO_API_URL%/}/repos/$1/issues/$2/comments"
+  --data-binary @- "${FORGEJO_API_URL%/}/$2"
 "#;
-        let number = number.to_string();
         runner
             .run_with_input(
                 "sh",
@@ -229,11 +256,11 @@ curl --fail-with-body --silent --show-error -X POST \
                     "project-ledger",
                     token_file,
                     forgejo_api_url.ok_or("Forgejo API URL is unavailable")?,
-                    scope,
-                    &number,
+                    method,
+                    &endpoint,
                 ],
                 cwd,
-                &ChannelLabel::Default,
+                &channel,
                 &input,
             )
             .await?
@@ -1068,6 +1095,164 @@ mod ledger_projection_tests {
         }
     }
 
+    // Real forge process calls are recorded with repository-scoped credentials.
+    // Recording targets a disposable comment on a configured issue or PR.
+    #[tokio::test]
+    async fn ledger_revision_forge_replay() {
+        use flotilla_core::providers::replay::{self, Masks};
+
+        let recording = std::env::var("REPLAY").is_ok_and(|mode| mode != "replay");
+        let service = "github.com".to_string();
+        let scope = "flotilla-org/flotilla".to_string();
+        let number = 2600;
+        let env = BTreeMap::from([(
+            "GITHUB_TOKEN_FILE".into(),
+            if recording { std::env::var("GITHUB_TOKEN_FILE").expect("injected GitHub credential") } else { "/staged/github/token".into() },
+        )]);
+        let mut masks = Masks::new();
+        for (key, value) in &env {
+            masks.add(value, format!("{{{key}}}"));
+        }
+        masks.add(&service, "{service}");
+        masks.add(&scope, "{scope}");
+        let path = format!("{}/tests/fixtures/ledger_revision_github.yaml", env!("CARGO_MANIFEST_DIR"));
+        let session = replay::test_session(&path, masks);
+        let runner = replay::test_runner(&session);
+        let address = LeafAddress::ChangeRequest { service, scope, number };
+        let first = b"## Decision ledger\n\nReplay recording for #2600: initial revision.";
+        let revised = b"## Decision ledger\n\nReplay recording for #2600: updated revision.";
+        let url = project_ledger_comment("replay-2600", "coder", first, &address, runner.as_ref(), Path::new("/"), &env)
+            .await
+            .expect("first projection");
+        let updated = project_ledger_comment("replay-2600", "coder", revised, &address, runner.as_ref(), Path::new("/"), &env)
+            .await
+            .expect("PATCH revision");
+        assert_eq!(updated, url);
+        let retry = project_ledger_comment("replay-2600", "coder", revised, &address, runner.as_ref(), Path::new("/"), &env)
+            .await
+            .expect("unchanged retry");
+        assert_eq!(retry, url);
+        session.finish();
+    }
+
+    // The runner replaces the forge process boundary; comments are real in-memory state.
+    #[derive(Default)]
+    struct CommentRunner {
+        comments: Mutex<Vec<serde_json::Value>>,
+        writes: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl CommandRunner for CommentRunner {
+        async fn run(&self, _cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            let comments = self.comments.lock().expect("comments lock");
+            // GitHub lists use --slurp; the final Forgejo shell argument is
+            // the page number. This boundary stand-in leaves later pages empty.
+            if args.contains(&"--slurp") {
+                Ok(serde_json::json!([*comments]).to_string())
+            } else if args.last() == Some(&"1") {
+                Ok(serde_json::json!(*comments).to_string())
+            } else {
+                Ok("[]".into())
+            }
+        }
+
+        async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
+            Err("unexpected run_output".into())
+        }
+
+        async fn run_with_input(
+            &self,
+            _cmd: &str,
+            args: &[&str],
+            _cwd: &Path,
+            _label: &ChannelLabel,
+            input: &[u8],
+        ) -> Result<String, String> {
+            let method = args.iter().find(|arg| matches!(**arg, "POST" | "PATCH")).expect("write method");
+            let endpoint = args.iter().find(|arg| arg.starts_with("repos/")).expect("write endpoint");
+            self.writes.lock().expect("writes lock").push(((*method).into(), (*endpoint).into()));
+            let mut comments = self.comments.lock().expect("comments lock");
+            let body = serde_json::from_slice::<serde_json::Value>(input).expect("JSON")["body"].clone();
+            let id = if *method == "PATCH" {
+                endpoint.rsplit('/').next().expect("comment id").parse::<u64>().expect("numeric id")
+            } else {
+                1 + comments.iter().filter_map(|comment| comment["id"].as_u64()).max().unwrap_or(0)
+            };
+            let comment = serde_json::json!({"id": id, "body": body, "html_url": format!("https://forge.example/comment/{id}")});
+            if *method == "PATCH" {
+                *comments.iter_mut().find(|comment| comment["id"] == id).expect("existing comment") = comment.clone();
+            } else {
+                comments.push(comment.clone());
+            }
+            Ok(comment.to_string())
+        }
+
+        async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
+            false
+        }
+    }
+
+    // #2600: each artifact posts once, retries unchanged content without writing,
+    // and updates the newest legacy duplicate in place when its content changes.
+    #[tokio::test]
+    async fn ledger_revisions_update_newest_comment_on_both_forges() {
+        for service in ["github.com", "forgejo.example"] {
+            let runner = CommentRunner::default();
+            let env = if service == "github.com" { github_delivery_env() } else { forgejo_delivery_env() };
+            let address = LeafAddress::ChangeRequest { service: service.into(), scope: "acme/repo".into(), number: 42 };
+            let first = b"## Decision ledger\nfirst";
+            let revised = b"## Decision ledger\nrevised";
+            let url =
+                project_ledger_comment("demo", "coder", first, &address, &runner, Path::new("/"), &env).await.expect("first projection");
+            assert_eq!(runner.writes.lock().expect("writes lock").as_slice(), [(
+                "POST".into(),
+                "repos/acme/repo/issues/42/comments".into()
+            )]);
+            assert_eq!(project_ledger_comment("demo", "coder", first, &address, &runner, Path::new("/"), &env).await.expect("retry"), url);
+            assert_eq!(runner.writes.lock().expect("writes lock").len(), 1);
+            project_ledger_comment("demo", "coder", revised, &address, &runner, Path::new("/"), &env).await.expect("revision");
+            assert_eq!(runner.comments.lock().expect("comments lock").len(), 1);
+            assert_eq!(runner.writes.lock().expect("writes lock")[1], ("PATCH".into(), "repos/acme/repo/issues/comments/1".into()));
+            let older = runner.comments.lock().expect("comments lock")[0].clone();
+            let mut newer = older.clone();
+            newer["id"] = serde_json::json!(9);
+            newer["html_url"] = serde_json::json!("https://forge.example/comment/9");
+            // Deliberately unsorted: listing order must not decide which duplicate wins.
+            *runner.comments.lock().expect("comments lock") = vec![newer, older.clone()];
+            project_ledger_comment("demo", "coder", first, &address, &runner, Path::new("/"), &env).await.expect("legacy duplicates");
+            let comments = runner.comments.lock().expect("comments lock");
+            assert_eq!(comments.len(), 2);
+            assert_eq!(comments[1], older);
+            assert!(comments[0]["body"].as_str().expect("body").starts_with("## Decision ledger\nfirst"));
+            assert_eq!(runner.writes.lock().expect("writes lock")[2], ("PATCH".into(), "repos/acme/repo/issues/comments/9".into()));
+        }
+    }
+
+    // A same-digest match with no HTTPS URL must fail without creating a duplicate.
+    #[tokio::test]
+    async fn ledger_retry_refuses_missing_or_insecure_url_without_writing() {
+        for service in ["github.com", "forgejo.example"] {
+            for url in [serde_json::Value::Null, serde_json::json!("http://forge.example/comment/1")] {
+                let body = b"## Decision ledger\nfirst";
+                let name = flotilla_resources::artifact_record_name("demo", "coder", "decision-ledger", "demo");
+                let runner = CommentRunner::default();
+                runner.comments.lock().expect("comments lock").push(serde_json::json!({
+                    "id": 1, "html_url": url,
+                    "body": format!("ledger\n<!-- flotilla-decision-ledger:{name}:{} -->", BlobDigest::of(body).as_str())
+                }));
+                let address = LeafAddress::ChangeRequest { service: service.into(), scope: "acme/repo".into(), number: 42 };
+                let env = if service == "github.com" { github_delivery_env() } else { forgejo_delivery_env() };
+                let error = project_ledger_comment("demo", "coder", body, &address, &runner, Path::new("/"), &env)
+                    .await
+                    .expect_err("existing comment URL is unusable");
+                assert!(error.contains("no HTTPS URL"), "{error}");
+                assert!(runner.writes.lock().expect("writes lock").is_empty());
+                assert_eq!(runner.comments.lock().expect("comments lock").len(), 1);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn ledger_projection_sends_file_content_on_stdin() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
@@ -1304,3 +1489,6 @@ mod ledger_projection_tests {
         }
     }
 }
+
+#[cfg(all(test, not(feature = "skip-no-sandbox-tests")))]
+mod ledger_forgejo_contract;

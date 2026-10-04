@@ -47,7 +47,7 @@ http = "1"
 libc = "0.2"
 
 [dev-dependencies]
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 bytes = "1"
 flotilla-core = { path = "../flotilla-core", features = ["test-support", "replay"] }
 flotilla-daemon = { path = ".", features = ["test-support"] }
