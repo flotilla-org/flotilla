@@ -5671,6 +5671,13 @@ fn terminal_liveness_for_source(source: &TerminalSessionSource, liveness: Termin
 
 #[async_trait]
 impl TerminalRuntime for TerminalControllerRuntime {
+    async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
+        let backend = self.state.daemon.resource_backend();
+        let records = backend.including_replicas::<Checkout>(&convoy.metadata.namespace).list().await.map_err(|error| error.to_string())?;
+        let checkouts = flotilla_resources::select_convoy_children(convoy, &records.items).into_values().collect::<Vec<_>>();
+        self.state.daemon.verify_convoy_teardown_gate_for_checkouts(convoy, &checkouts, false).await
+    }
+
     async fn brief_ready(&self, spec: &flotilla_resources::TerminalSessionSpec) -> Result<bool, String> {
         let TerminalSessionSource::Agent { brief, .. } = &spec.source else { return Ok(true) };
         let Some(digest) = &brief.artifact_digest else { return Ok(true) };
@@ -13495,6 +13502,95 @@ mod tests {
             )
             .expect("crew environment bag");
         (daemon, pool)
+    }
+
+    // A Landed convoy and its running orphan predate daemon startup. The
+    // convoy is a replica here: startup must reap the local session through
+    // the real reclaim gate, without any convoy or session change event.
+    #[tokio::test(start_paused = true)]
+    async fn daemon_startup_reaps_retained_landed_convoy_orphan() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"orphan-startup-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let backend = ResourceBackend::InMemory(Default::default());
+        let (initial, _) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
+        let registry = probe_local_provider_registry(&initial, &config).await.expect("registry");
+        let profile = build_local_profile(&initial, &registry).expect("profile");
+        let coordinator = ResourceBackend::InMemory(Default::default());
+        let convoys = coordinator.using::<Convoy>(NAMESPACE);
+        let created =
+            convoys.create(&empty_meta("old-landed"), &ConvoySpec::builder().workflow_ref("wf".to_string()).build()).await.expect("convoy");
+        convoys
+            .update_status("old-landed", &created.metadata.resource_version, &landed_status_with_placed_checkout("collected-checkout"))
+            .await
+            .expect("landed");
+        backend
+            .replica_writer::<Convoy>(flotilla_protocol::NodeId::new("coordinator"), NAMESPACE)
+            .replace(&convoys.list().await.expect("convoys"), Utc::now())
+            .await
+            .expect("replicate convoy");
+        let sessions = backend.using::<TerminalSession>(NAMESPACE);
+        let created = sessions
+            .create(
+                &InputMeta::builder()
+                    .name("old-orphan".to_string())
+                    .labels(BTreeMap::from([(CONVOY_LABEL.to_string(), "old-landed".to_string())]))
+                    .annotations(BTreeMap::from([(
+                        flotilla_resources::ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(),
+                        "coordinator".to_string(),
+                    )]))
+                    .finalizers(vec!["flotilla.work/terminal-teardown".to_string()])
+                    .build()
+                    .with_lifecycle_authority(LifecycleAuthority::Managed),
+                &TerminalSessionSpec {
+                    env_ref: profile.host_direct_environment_name(),
+                    role: "coder".to_string(),
+                    source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                    cwd: "/workspace".to_string(),
+                    pool: profile.host_direct_pool.clone(),
+                },
+            )
+            .await
+            .expect("session");
+        sessions
+            .update_status("old-orphan", &created.metadata.resource_version, &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                session_id: Some("old-process".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("running orphan");
+        drop(initial);
+        let (restarted, pool) = crew_daemon_with_backend(Arc::clone(&config), backend.clone()).await;
+        pool.add_sessions(vec![ProviderTerminalSession::builder()
+            .session_name("old-process".to_string())
+            .status(TerminalStatus::Running)
+            .command("cargo test".to_string())
+            .working_directory(ExecutionEnvironmentPath::new("/workspace"))
+            .build()])
+            .await;
+        let runtime = DaemonRuntime::start_with_options(Arc::clone(&restarted), config, None, RuntimeOptions {
+            controller_resync_interval: Duration::from_secs(3600),
+            ..RuntimeOptions::default()
+        })
+        .await
+        .expect("daemon startup");
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+            if matches!(sessions.get("old-orphan").await, Err(ResourceError::NotFound { .. })) {
+                break;
+            }
+        }
+        runtime.shutdown();
+        assert!(matches!(sessions.get("old-orphan").await, Err(ResourceError::NotFound { .. })), "startup must reap the old orphan");
+        assert!(pool.list_sessions().await.expect("pool").is_empty(), "terminal finalizer must kill the old process");
+        assert_eq!(*pool.killed.lock().await, vec!["old-process"]);
+        assert!(
+            backend.using::<Environment>(NAMESPACE).get(&profile.host_direct_environment_name()).await.is_ok(),
+            "the gate, rather than a missing environment shortcut, must authorize cleanup"
+        );
+        assert!(backend.using::<Convoy>(NAMESPACE).list().await.expect("local convoys").items.is_empty());
+        assert_eq!(convoys.get("old-landed").await.expect("retained convoy").status.expect("status").phase, ConvoyPhase::Landed);
     }
 
     #[tokio::test(start_paused = true)]
