@@ -17,7 +17,8 @@ use crate::{
         discovery::{run_host_detectors, run_provisioned_host_detectors, DiscoveryRuntime, EnvironmentBag, FactoryRegistry, HostDetector},
         environment::{
             contained_daemon_socket_path, CreateOpts, EnvironmentHandle, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess,
-            EnvironmentToolAssetKind, EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode, CONTAINED_DAEMON_REQUIRED_ENV,
+            EnvironmentToolAssetKind, EnvironmentVariableUpdate, PreparedEnvironmentAuth, ProvisionedMount, ProvisionedMountMode,
+            CONTAINED_DAEMON_REQUIRED_ENV,
         },
         registry::ProviderRegistry,
         CommandRunner,
@@ -361,7 +362,7 @@ impl EnvironmentManager {
                     "the contained host-daemon requirement",
                 ))],
             image_pull_policy: Default::default(),
-            docker_config_dir: None,
+            prepared_auth: PreparedEnvironmentAuth::NoRegistryCredential,
             cpu_limit: None,
         };
         let handle = env_provider.create(env_id.clone(), &image, opts).await?;

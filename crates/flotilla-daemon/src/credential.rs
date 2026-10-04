@@ -9,8 +9,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use flotilla_core::providers::{
     discovery::{EnvVars, EnvironmentBag},
+    environment::PreparedEnvironmentAuth,
     ChannelLabel, CommandRunner, HttpClient, ReqwestHttpClient,
 };
+use flotilla_protocol::DaemonHostPath;
 use flotilla_resources::{
     capped_github_app_permissions, Clock, CredentialConsumer, CredentialExpiry, CredentialLifecycle, CredentialSource, CredentialSpec,
     CredentialSpecSpec, Forge, ForgeKind, Project, Repository, RepositoryIdentity, RepositoryKey, ResourceBackend, ResourceError,
@@ -1011,7 +1013,7 @@ impl CredentialStore {
         environment_ref: &str,
         credential_refs: &BTreeSet<String>,
         image: &str,
-    ) -> Result<Option<PathBuf>, String> {
+    ) -> Result<PreparedEnvironmentAuth, String> {
         let mut matching = Vec::new();
         for name in credential_refs {
             let spec = self.spec(name).await?;
@@ -1023,7 +1025,7 @@ impl CredentialStore {
             }
         }
         let Some((name, spec)) = matching.pop() else {
-            return Ok(None);
+            return Ok(PreparedEnvironmentAuth::NoRegistryCredential);
         };
         if !matching.is_empty() {
             return Err(bounded_adapter_error(&name, "docker-registry", "multiple granted credentials match the image registry"));
@@ -1081,7 +1083,7 @@ impl CredentialStore {
             return Err(bounded_adapter_error(&name, "docker-registry", &detail));
         }
         self.registry_configs.lock().await.insert(environment_ref.to_string(), config_dir.clone());
-        Ok(Some(config_dir))
+        Ok(PreparedEnvironmentAuth::RegistryConfig { directory: DaemonHostPath::new(config_dir) })
     }
 
     pub(crate) async fn prepare_skill_source(
@@ -5235,12 +5237,17 @@ interactions:
             tokio::spawn(async move { store.sweep_orphaned_registry_configs(&BTreeSet::new(), &BTreeSet::new()).await })
         };
         gate.1.add_permits(1);
-        let config_dir = preparing.await.expect("preparation task").expect("prepare registry credential").expect("matching credential");
+        let PreparedEnvironmentAuth::RegistryConfig { directory } =
+            preparing.await.expect("preparation task").expect("prepare registry credential")
+        else {
+            panic!("matching credential");
+        };
+        let config_dir = directory.as_path();
         sweeping.await.expect("sweep task").expect("sweep with stale empty owner snapshots");
 
         assert!(config_dir.is_dir(), "credential config must remain available to docker run");
         assert_eq!(
-            std::fs::metadata(&config_dir).expect("credential config metadata").permissions().mode() & 0o777,
+            std::fs::metadata(config_dir).expect("credential config metadata").permissions().mode() & 0o777,
             0o700,
             "credential config directory must not be readable by other host users"
         );

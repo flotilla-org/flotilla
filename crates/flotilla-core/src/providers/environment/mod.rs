@@ -31,9 +31,23 @@ pub struct CreateOpts {
     /// sockets through their own transport.
     pub tools: Vec<EnvironmentTool>,
     pub image_pull_policy: ImagePullPolicy,
-    pub docker_config_dir: Option<DaemonHostPath>,
+    pub prepared_auth: PreparedEnvironmentAuth,
     /// CPU quota for this vessel. None leaves the provider's default.
     pub cpu_limit: Option<usize>,
+}
+
+/// Auth admitted by credential preflight for this environment's image pull.
+/// Runtime-only: the credential store owns the artifact and its cleanup. Providers
+/// must use a supplied artifact rather than substituting ambient credentials.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PreparedEnvironmentAuth {
+    /// No granted credential matches the image registry.
+    #[default]
+    NoRegistryCredential,
+    /// A private registry auth configuration directory containing `config.json`
+    /// in the container-registry auth format. Providers interpret this artifact;
+    /// only the Docker adapter lowers its directory to Docker CLI configuration.
+    RegistryConfig { directory: DaemonHostPath },
 }
 
 /// A host-side tool that an environment provider must make invokable inside a

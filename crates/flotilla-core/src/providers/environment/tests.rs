@@ -294,7 +294,7 @@ async fn create_returns_handle() {
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -349,7 +349,7 @@ async fn create_runs_container_as_the_host_user() {
         working_directory: None,
         provisioned_mounts: Vec::new(),
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -378,7 +378,7 @@ async fn create_removes_container_when_image_digest_cannot_be_resolved() {
         working_directory: None,
         provisioned_mounts: Vec::new(),
         image_pull_policy: ImagePullPolicy::Always,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -410,7 +410,7 @@ async fn create_translates_image_pull_policy_to_docker_run() {
             working_directory: None,
             provisioned_mounts: Vec::new(),
             image_pull_policy: policy,
-            docker_config_dir: None,
+            prepared_auth: Default::default(),
             cpu_limit: Some(8),
         };
 
@@ -426,6 +426,7 @@ async fn create_translates_image_pull_policy_to_docker_run() {
 }
 
 #[tokio::test]
+// Glue: Docker must lower the admitted registry artifact to its CLI configuration.
 async fn create_uses_the_credential_scoped_docker_config_for_pull_on_run() {
     use flotilla_protocol::ImageId;
 
@@ -438,7 +439,7 @@ async fn create_uses_the_credential_scoped_docker_config_for_pull_on_run() {
         working_directory: None,
         provisioned_mounts: Vec::new(),
         image_pull_policy: ImagePullPolicy::Always,
-        docker_config_dir: Some(DaemonHostPath::new("/run/flotilla/registry-auth")),
+        prepared_auth: super::PreparedEnvironmentAuth::RegistryConfig { directory: DaemonHostPath::new("/run/flotilla/registry-auth") },
         cpu_limit: None,
     };
 
@@ -465,7 +466,7 @@ async fn create_reports_infrastructure_and_requested_mount_metadata() {
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new(reference_repo.as_path().to_path_buf(), "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -505,7 +506,7 @@ async fn create_rejects_a_mount_targeting_the_reserved_daemon_socket_directory()
             ProvisionedMountMode::Rw,
         )],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -539,7 +540,7 @@ async fn create_rejects_a_mount_targeting_a_reserved_tool_file() {
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new("/host/replacement-flotilla", "/usr/local/bin/flotilla", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -583,7 +584,7 @@ async fn create_delivers_tool_assets_and_applies_tool_environment() {
         provisioned_mounts: Vec::new(),
         tools: vec![tool],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -608,7 +609,7 @@ fn path_prepending_opts(image_pull_policy: ImagePullPolicy) -> CreateOpts {
         provisioned_mounts: Vec::new(),
         tools: vec![path_prepending_tool()],
         image_pull_policy,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     }
 }
@@ -790,7 +791,7 @@ async fn create_mounts_the_flotilla_binary_directory_so_atomic_replacements_stay
         provisioned_mounts: Vec::new(),
         tools: vec![tool],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -823,7 +824,7 @@ async fn create_uses_requested_mount_modes_in_docker_arguments() {
             ProvisionedMount::new("/host/clone/.git/hooks", "/host/clone/.git/hooks", ProvisionedMountMode::Ro),
         ],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -860,7 +861,7 @@ async fn protected_git_mount_rejects_a_comma_in_its_path() {
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new("/host/a,b/.git/config", "/host/a,b/.git/config", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
     let error = provider.create(EnvironmentId::new("comma"), &ImageId::new("ubuntu:22.04"), opts).await.err().expect("unsafe mount syntax");
@@ -892,7 +893,7 @@ async fn list_preserves_provisioned_mount_metadata() {
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -943,7 +944,7 @@ async fn list_fails_on_malformed_reference_repo_mount_metadata() {
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -970,7 +971,7 @@ async fn list_rejects_missing_reference_repo_mount_metadata() {
         working_directory: None,
         provisioned_mounts: vec![ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro)],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -993,7 +994,7 @@ async fn provisioned_handle_returns_its_initialized_runner() {
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -1020,7 +1021,7 @@ async fn status_returns_running() {
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -1053,7 +1054,7 @@ async fn env_vars_parses_output() {
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
@@ -1088,7 +1089,7 @@ async fn destroy_calls_docker_rm() {
         working_directory: None,
         provisioned_mounts: vec![],
         image_pull_policy: ImagePullPolicy::IfNotPresent,
-        docker_config_dir: None,
+        prepared_auth: Default::default(),
         cpu_limit: None,
     };
 
