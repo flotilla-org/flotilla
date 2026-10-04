@@ -113,7 +113,8 @@ async fn project_ledger_comment(
     let name = flotilla_resources::artifact_record_name(convoy_name, producer, "decision-ledger", convoy_name);
     let marker = format!("<!-- flotilla-decision-ledger:{name}:{} -->", digest.as_str());
     let endpoint = format!("repos/{scope}/issues/{number}/comments");
-    // Match the shell command channel assigned by record/replay.
+    // Match DefaultLabeler::label_for in flotilla-core/src/providers/mod.rs:
+    // it derives command labels from the program and first argument.
     let channel = ChannelLabel::Command("sh -c".to_string());
     let credential_path = if service == "github.com" { "GITHUB_TOKEN_FILE" } else { "FORGEJO_TOKEN_FILE" };
     let token_file =
@@ -1145,6 +1146,8 @@ mod ledger_projection_tests {
     impl CommandRunner for CommentRunner {
         async fn run(&self, _cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
             let comments = self.comments.lock().expect("comments lock");
+            // GitHub lists use --slurp; the final Forgejo shell argument is
+            // the page number. This boundary stand-in leaves later pages empty.
             if args.contains(&"--slurp") {
                 Ok(serde_json::json!([*comments]).to_string())
             } else if args.last() == Some(&"1") {
