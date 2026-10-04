@@ -1556,7 +1556,8 @@ mod tests {
                 .system(SystemInfo::default())
                 .build();
             let registry = crate::host_registry::HostRegistry::new(node, summary);
-            let environments = EnvironmentManager::from_local_state(environment_id, host_id, Arc::clone(&runner), EnvironmentBag::new());
+            let environments =
+                EnvironmentManager::from_local_state(environment_id, host_id, Arc::clone(&runner), EnvironmentBag::new(), Arc::new(vec![]));
             let refresher = ChangeRequestRefresher::new(
                 "fleet".to_string(),
                 backend.clone(),

@@ -241,7 +241,11 @@ async fn project_issue_binding_keeps_conditional_lease_after_checkout_removal() 
         Ok("HTTP/2 304 Not Modified\r\nETag: \"issue-window\"\r\nX-RateLimit-Remaining: 4800\r\n\r\n".into()),
     ]) });
     let mut discovery = fake_discovery_with_runner(false, runner.clone());
-    discovery.host_detectors.push(Box::new(CommandDetector::new("gh", &["--version"], parse_first_dotted_version)));
+    Arc::get_mut(&mut discovery.host_detectors).expect("unshared detectors").push(Box::new(CommandDetector::new(
+        "gh",
+        &["--version"],
+        parse_first_dotted_version,
+    )));
     discovery.factories.issue_trackers = vec![Box::new(GitHubIssueProviderFactory)];
     let daemon = InProcessDaemon::new(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), discovery, HostName::new("test")).await;
     let spec = RepositorySpec::remote("https://github.com/acme/issues").expect("repository");

@@ -14,10 +14,7 @@ use crate::{
     config::ConfigStore,
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
     providers::{
-        discovery::{
-            detectors::default_host_detectors, run_host_detectors, run_provisioned_host_detectors, DiscoveryRuntime, EnvironmentBag,
-            FactoryRegistry,
-        },
+        discovery::{run_host_detectors, run_provisioned_host_detectors, DiscoveryRuntime, EnvironmentBag, FactoryRegistry, HostDetector},
         environment::{
             contained_daemon_socket_path, CreateOpts, EnvironmentHandle, EnvironmentTool, EnvironmentToolAsset, EnvironmentToolAssetAccess,
             EnvironmentToolAssetKind, EnvironmentVariableUpdate, ProvisionedMount, ProvisionedMountMode, CONTAINED_DAEMON_REQUIRED_ENV,
@@ -63,6 +60,7 @@ pub struct EnvironmentManager {
     local_environment_id: EnvironmentId,
     local_host_id: HostId,
     managed: Mutex<HashMap<EnvironmentId, ManagedEnvironmentKind>>,
+    host_detectors: Arc<Vec<Box<dyn HostDetector>>>,
 }
 
 pub struct CreateProvisionedEnvironmentRequest<'a> {
@@ -79,14 +77,23 @@ pub struct CreateProvisionedEnvironmentRequest<'a> {
 impl EnvironmentManager {
     pub async fn new_local(discovery: &DiscoveryRuntime, local_environment_id: EnvironmentId, local_host_id: HostId) -> Self {
         let env_bag = run_host_detectors(&discovery.host_detectors, &*discovery.runner, &*discovery.env).await;
-        Self::from_local_state(local_environment_id, local_host_id, Arc::clone(&discovery.runner), env_bag)
+        Self::from_local_state(
+            local_environment_id,
+            local_host_id,
+            Arc::clone(&discovery.runner),
+            env_bag,
+            Arc::clone(&discovery.host_detectors),
+        )
     }
 
+    /// Register an already-detected local environment and retain its detector
+    /// configuration for subsequent provisioned-environment discovery.
     pub fn from_local_state(
         local_environment_id: EnvironmentId,
         local_host_id: HostId,
         local_runner: Arc<dyn CommandRunner>,
         env_bag: EnvironmentBag,
+        host_detectors: Arc<Vec<Box<dyn HostDetector>>>,
     ) -> Self {
         let mut managed = HashMap::new();
         let display_name = Self::display_name_for_bag(&env_bag);
@@ -102,7 +109,7 @@ impl EnvironmentManager {
             }),
         );
 
-        Self { local_environment_id, local_host_id, managed: Mutex::new(managed) }
+        Self { local_environment_id, local_host_id, managed: Mutex::new(managed), host_detectors }
     }
 
     pub fn local_environment_id(&self) -> &EnvironmentId {
@@ -495,7 +502,7 @@ impl EnvironmentManager {
         let env_runner = handle.runner();
 
         let raw_env_vars = handle.env_vars().await?;
-        let bag = run_provisioned_host_detectors(&default_host_detectors(), &*env_runner, &raw_env_vars).await;
+        let bag = run_provisioned_host_detectors(&self.host_detectors, &*env_runner, &raw_env_vars).await;
 
         let config = ConfigStore::with_base(config_base.as_path().join(format!("env-discovery/{env_id}")));
         let env_repo_root = ExecutionEnvironmentPath::new("/workspace");
@@ -805,6 +812,7 @@ mod tests {
             HostId::new("local-host-id"),
             Arc::new(DiscoveryMockRunner::builder().build()),
             local_bag,
+            Arc::new(vec![]),
         );
 
         let ssh_environment_id = EnvironmentId::new("ssh-env");
@@ -1062,10 +1070,85 @@ mod tests {
         assert!(manager.environment_registry(&env_id).is_some());
     }
 
+    // #1131: configured detectors must run inside both newly created and
+    // adopted environments, even after the runtime has been dropped.
+    // Glue: the same custom command detector exercises both probe callers.
+    #[tokio::test]
+    async fn provisioned_discovery_retains_configured_detectors() {
+        use crate::providers::discovery::detectors::generic::{parse_first_dotted_version, CommandDetector};
+
+        let mut discovery = fake_discovery(false);
+        discovery.host_detectors =
+            Arc::new(vec![Box::new(CommandDetector::new("custom-tool", &["--version"], parse_first_dotted_version))]);
+        discovery.runner =
+            Arc::new(DiscoveryMockRunner::builder().on_run("custom-tool", &["--version"], Ok("custom 1.0.0".into())).build());
+        let manager = EnvironmentManager::new_local(&discovery, test_local_environment_id(), test_local_host_id()).await;
+        assert!(manager.local_environment_bag().assertions().contains(&EnvironmentAssertion::versioned_binary(
+            "custom-tool",
+            "custom-tool",
+            "1.0.0"
+        )));
+        drop(discovery);
+
+        let env_id = EnvironmentId::new("custom-provisioned");
+        // The fake runner stands in for the provisioned subprocess boundary.
+        let handle: EnvironmentHandle = Arc::new(MockProvisionedEnvironment {
+            id: env_id.clone(),
+            image: ImageId::new("mock:image"),
+            runner: Arc::new(
+                DiscoveryMockRunner::builder()
+                    .on_run("custom-tool", &["--version"], Ok("custom 2.0.0".into()))
+                    .on_run("custom-tool", &["--version"], Ok("custom 2.0.0".into()))
+                    .on_run("codex", &["--version"], Ok("codex-cli 1.2.3".into()))
+                    .build(),
+            ),
+            env_vars: HashMap::new(),
+            provisioned_mounts: vec![],
+            destroyed: Arc::new(AtomicBool::new(false)),
+            destroy_error: None,
+        });
+        let mut registry = ProviderRegistry::new();
+        registry.environment_providers.insert(
+            "mock",
+            crate::providers::discovery::ProviderDescriptor::named(
+                crate::providers::discovery::ProviderCategory::EnvironmentProvider,
+                "mock",
+            ),
+            Arc::new(MockEnvironmentProvider { create_result: tokio::sync::Mutex::new(Some(Ok(handle))) }),
+        );
+        manager
+            .create_provisioned_environment(CreateProvisionedEnvironmentRequest {
+                env_id: env_id.clone(),
+                provider: "mock",
+                registry: &registry,
+                image: ImageId::new("mock:image"),
+                tokens: vec![],
+                config_base: &DaemonHostPath::new("/tmp/test-config"),
+                daemon_socket_path: &DaemonHostPath::new("/tmp/flotilla.sock"),
+                reference_repo: None,
+            })
+            .await
+            .expect("create environment");
+        let bag = manager.environment_bag(&env_id).unwrap();
+        assert!(bag.assertions().contains(&EnvironmentAssertion::versioned_binary("custom-tool", "custom-tool", "2.0.0")));
+        assert!(bag.find_binary("codex").is_none(), "unconfigured defaults must not run");
+        // Clear discovery so ensure cannot return the already-populated registry.
+        let state = manager.remove_provisioned_environment(&env_id).unwrap();
+        manager.register_provisioned_environment(env_id.clone(), state.handle, EnvironmentBag::new(), None).unwrap();
+        manager
+            .ensure_provisioned_environment_providers(&env_id, &DaemonHostPath::new("/tmp/test-config"))
+            .await
+            .expect("discover adopted environment");
+        let bag = manager.environment_bag(&env_id).unwrap();
+        assert!(bag.assertions().contains(&EnvironmentAssertion::versioned_binary("custom-tool", "custom-tool", "2.0.0")));
+        assert!(bag.find_binary("codex").is_none(), "unconfigured defaults must not run");
+    }
+
     #[tokio::test]
     async fn ensure_provisioned_environment_providers_updates_bag_and_registry() {
         let env_id = EnvironmentId::new("env-discover-1");
-        let discovery = fake_discovery(false);
+        let mut discovery = fake_discovery(false);
+        discovery.host_detectors = Arc::new(crate::providers::discovery::detectors::default_host_detectors());
         let manager = EnvironmentManager::new_local(&discovery, test_local_environment_id(), test_local_host_id()).await;
         let handle: EnvironmentHandle = Arc::new(MockProvisionedEnvironment {
             id: env_id.clone(),
@@ -1222,7 +1305,8 @@ mod tests {
         let runner = Arc::new(DiscoveryMockRunner::builder().build()) as Arc<dyn CommandRunner>;
         let bag = EnvironmentBag::new().with(EnvironmentAssertion::env_var("SEEDED", "true"));
 
-        let manager = EnvironmentManager::from_local_state(env_id.clone(), test_local_host_id(), Arc::clone(&runner), bag.clone());
+        let manager =
+            EnvironmentManager::from_local_state(env_id.clone(), test_local_host_id(), Arc::clone(&runner), bag.clone(), Arc::new(vec![]));
 
         assert!(Arc::ptr_eq(&manager.environment_runner(&env_id).expect("runner"), &runner));
         assert_eq!(manager.environment_bag(&env_id).expect("bag").find_env_var("SEEDED"), Some("true"));

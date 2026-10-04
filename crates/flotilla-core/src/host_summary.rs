@@ -212,6 +212,7 @@ mod tests {
             HostId::new("test-local-host-id"),
             Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
             EnvironmentBag::new().with(EnvironmentAssertion::versioned_binary("git", "/usr/bin/git", "2.40.0")),
+            Arc::new(vec![]),
         );
         let env = TestEnvVars;
 
@@ -239,6 +240,7 @@ mod tests {
             HostId::new("test-local-host-id"),
             Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
             EnvironmentBag::new(),
+            Arc::new(vec![]),
         );
         let env = TestEnvVars;
         let handle: EnvironmentHandle = Arc::new(TestProvisionedEnvironment {
@@ -287,6 +289,7 @@ mod tests {
             HostId::new("test-local-host-id"),
             Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
             EnvironmentBag::new(),
+            Arc::new(vec![]),
         );
         let env = TestEnvVars;
         let direct_env_id = EnvironmentId::new("direct-env");
