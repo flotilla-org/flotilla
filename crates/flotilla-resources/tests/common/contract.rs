@@ -49,6 +49,33 @@ pub async fn assert_terminal_session_label_lookup_with_backend(backend: Resource
             .await
             .expect("update session status");
     }
+    // #588: both spellings select previous-generation and newly written sessions
+    // through the same storage contract (in-memory and SQLite).
+    let mut legacy_meta = TerminalSessionIdentity::builder()
+        .vessel_ref("legacy-work".to_string())
+        .convoy("legacy".to_string())
+        .vessel("work".to_string())
+        .role("coder".to_string())
+        .vessel_index(0)
+        .crew_index(0)
+        .build()
+        .input_meta();
+    for key in [flotilla_resources::VESSEL_REF_LABEL, flotilla_resources::VESSEL_ORDINAL_LABEL, flotilla_resources::CREW_ORDINAL_LABEL] {
+        let value = legacy_meta.labels.remove(key).expect("canonical identity label");
+        legacy_meta.labels.insert(key.replace('-', "_"), value);
+    }
+    sessions.create(&legacy_meta, &spec).await.expect("store prior-generation labels");
+    for (key, value, expected_count) in [
+        (flotilla_resources::VESSEL_REF_LABEL, "legacy-work", 1),
+        (flotilla_resources::VESSEL_ORDINAL_LABEL, "000", 5),
+        (flotilla_resources::CREW_ORDINAL_LABEL, "000", 5),
+    ] {
+        for spelling in [key.to_string(), key.replace('-', "_")] {
+            let selected =
+                sessions.list_matching_labels(&BTreeMap::from([(spelling, value.to_string())])).await.expect("dual-read selector");
+            assert_eq!(selected.items.len(), expected_count);
+        }
+    }
     let selector = BTreeMap::from([
         (CONVOY_LABEL.to_string(), "target".to_string()),
         (VESSEL_LABEL.to_string(), "work".to_string()),

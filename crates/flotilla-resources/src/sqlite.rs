@@ -1505,11 +1505,7 @@ impl SqliteBackend {
         }
 
         let listed = self.list_typed::<T>(namespace).await?;
-        let items = listed
-            .items
-            .into_iter()
-            .filter(|object| required.iter().all(|(key, expected)| object.metadata.labels.get(key) == Some(expected)))
-            .collect();
+        let items = listed.items.into_iter().filter(|object| crate::labels_match(&object.metadata.labels, required)).collect();
         Ok(ResourceList { items, resource_version: listed.resource_version, generation: None })
     }
 

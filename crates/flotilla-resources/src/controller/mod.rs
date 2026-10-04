@@ -255,7 +255,7 @@ impl<W: Resource, P: Resource> LabelMappedWatch<W, P> {
         sender: &WorkQueueSender,
         object: &ResourceObject<W>,
     ) -> Result<(), ResourceError> {
-        if let Some(primary) = object.metadata.labels.get(label_key) {
+        if let Some(primary) = crate::label_value(&object.metadata.labels, label_key) {
             sender
                 .send(primary.clone())
                 .await
@@ -457,7 +457,7 @@ impl<W: Resource, P: Resource> LabelJoinWatch<W, P> {
         watched: &ResourceObject<W>,
         primaries: &TypedResolver<P>,
     ) -> Result<(), ResourceError> {
-        let Some(value) = watched.metadata.labels.get(label_key) else {
+        let Some(value) = crate::label_value(&watched.metadata.labels, label_key) else {
             return Ok(());
         };
         let selector = BTreeMap::from([(label_key.to_string(), value.clone())]);

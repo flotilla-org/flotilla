@@ -111,6 +111,11 @@ impl HttpBackend {
         namespace: &str,
         required: &BTreeMap<String, String>,
     ) -> Result<ReadResourceList<T>, ResourceError> {
+        if crate::labels::selector_needs_legacy_read(required) {
+            let mut listed = self.list_including_replicas_typed::<T>(namespace).await?;
+            listed.items.retain(|item| crate::labels_match(&item.object.metadata.labels, required));
+            return Ok(listed);
+        }
         let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
         let label_selector = required.iter().map(|(key, value)| format!("{key}={value}")).collect::<Vec<_>>().join(",");
         let response = self
@@ -247,6 +252,11 @@ impl HttpBackend {
             return self.list_typed::<T>(namespace).await;
         }
 
+        if crate::labels::selector_needs_legacy_read(required) {
+            let mut listed = self.list_typed::<T>(namespace).await?;
+            listed.items.retain(|item| crate::labels_match(&item.metadata.labels, required));
+            return Ok(listed);
+        }
         let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
         let label_selector = required.iter().map(|(key, value)| format!("{key}={value}")).collect::<Vec<_>>().join(",");
         let response = self

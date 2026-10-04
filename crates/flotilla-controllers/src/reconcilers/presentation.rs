@@ -643,8 +643,10 @@ fn has_any_observed_state(status: Option<&PresentationStatus>) -> bool {
 
 fn session_sort_key(session: &ResourceObject<TerminalSession>) -> (&str, &str, &str) {
     (
-        session.metadata.labels.get(flotilla_resources::VESSEL_ORDINAL_LABEL).map(String::as_str).unwrap_or(""),
-        session.metadata.labels.get(flotilla_resources::CREW_ORDINAL_LABEL).map(String::as_str).unwrap_or(""),
+        flotilla_resources::label_value(&session.metadata.labels, flotilla_resources::VESSEL_ORDINAL_LABEL)
+            .map(String::as_str)
+            .unwrap_or(""),
+        flotilla_resources::label_value(&session.metadata.labels, flotilla_resources::CREW_ORDINAL_LABEL).map(String::as_str).unwrap_or(""),
         session.metadata.name.as_str(),
     )
 }

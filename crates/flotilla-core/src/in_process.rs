@@ -6488,7 +6488,8 @@ impl InProcessDaemon {
             .ok_or_else(|| "crew context requires FLOTILLA_CREW_ID or --convoy, --vessel-ref, and --role".to_string())?;
         let caller = session_list.iter().find(|session| {
             session.spec.role == role
-                && (session.metadata.labels.get(VESSEL_REF_LABEL).map(String::as_str) == Some(vessel_ref.as_str())
+                && (flotilla_resources::label_value(&session.metadata.labels, VESSEL_REF_LABEL).map(String::as_str)
+                    == Some(vessel_ref.as_str())
                     || matches!(
                         &session.spec.source,
                         TerminalSessionSource::Agent { context, .. } if context.vessel_ref == vessel_ref && context.convoy == convoy
