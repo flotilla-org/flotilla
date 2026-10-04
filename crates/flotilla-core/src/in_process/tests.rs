@@ -2665,6 +2665,7 @@ enum RestAdmissionSelection {
 // GitHub subprocess boundary: retain failed stdout headers as the real CLI does.
 struct AdmissionRestRunner {
     responses: BTreeMap<String, CommandOutput>,
+    calls: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -2681,6 +2682,7 @@ impl CommandRunner for AdmissionRestRunner {
         _label: &crate::providers::ChannelLabel,
     ) -> Result<CommandOutput, String> {
         assert_eq!(cmd, "gh");
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let endpoint = args.iter().find(|arg| arg.starts_with("repos/")).expect("REST endpoint");
         let scope = endpoint.strip_prefix("repos/").expect("repository path").split("/pulls").next().expect("scope");
         let response = self.responses.get(scope).expect("configured repository");
@@ -2736,6 +2738,7 @@ fn rest_admission_response(reply: RestAdmissionReply, lookup: RestAdmissionLooku
 }
 
 struct RestAdmissionFixture {
+    calls: Arc<AtomicUsize>,
     daemon: Arc<InProcessDaemon>,
     keys: Vec<RepositoryKey>,
     _config: tempfile::TempDir,
@@ -2751,7 +2754,8 @@ async fn rest_admission_fixture(outcomes: [RestAdmissionReply; 2], lookup: RestA
         .enumerate()
         .map(|(index, reply)| (format!("team/repo{index}"), rest_admission_response(reply, lookup)))
         .collect();
-    let runner = Arc::new(AdmissionRestRunner { responses });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runner = Arc::new(AdmissionRestRunner { responses, calls: Arc::clone(&calls) });
     let daemon = InProcessDaemon::new_with_resource_backend(
         Vec::new(),
         Arc::new(ConfigStore::with_base(config.path())),
@@ -2779,7 +2783,23 @@ async fn rest_admission_fixture(outcomes: [RestAdmissionReply; 2], lookup: RestA
         });
         keys.push(key);
     }
-    RestAdmissionFixture { daemon, keys, _config: config }
+    RestAdmissionFixture { calls, daemon, keys, _config: config }
+}
+
+// #2585: the real convoy resolver shares proven branch absence across callers
+// while preserving ordered repository selection and refreshing after five minutes.
+#[tokio::test(start_paused = true)]
+async fn convoy_resolver_reuses_absence_observations() {
+    let fixture = rest_admission_fixture([RestAdmissionReply::Absent; 2], RestAdmissionLookup::Branch).await;
+    for _ in 0..3 {
+        assert!(fixture.daemon.resolve_convoy_change_request(&fixture.keys, "feature/wanted", None).await.expect("absence").is_none());
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    }
+    assert!(fixture.daemon.resolve_convoy_change_request(&fixture.keys, "feature/other", None).await.expect("another branch").is_none());
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 4);
+    tokio::time::advance(Duration::from_secs(300)).await;
+    assert!(fixture.daemon.resolve_convoy_change_request(&fixture.keys, "feature/wanted", None).await.expect("expired absence").is_none());
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 6);
 }
 
 // #2541: both REST lookup paths choose classified limits over ordinary text,

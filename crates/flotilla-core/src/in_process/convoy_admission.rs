@@ -3,6 +3,7 @@
 use super::*;
 use crate::{
     agent_adapter::{CrewAssignment, CrewBriefTemplateResolver},
+    branch_lookup_observer::BranchLookupObserver,
     providers::discovery::{detectors::git::remote_assertion, FORGEJO_AUTH_PROVIDER},
 };
 
@@ -62,6 +63,8 @@ pub(super) struct ConvoyAdmission {
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
     pub(super) repository_change_requests: Arc<RwLock<HashMap<RepositoryKey, RepositoryChangeRequestProvider>>>,
     change_request_port: Arc<dyn ChangeRequestQueryPort>,
+    #[builder(default)]
+    branch_lookup_observer: BranchLookupObserver,
     issue_port: Arc<dyn IssueQueryPort>,
     change_request_observation_source: Arc<ProviderChangeRequestObservationSource>,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
@@ -344,7 +347,7 @@ impl ConvoyAdmission {
 
         let mut failures = setup_failures.into_iter().map(ObservationError::Forge).collect::<Vec<_>>();
         for (repository, _, provider) in live_candidates {
-            match provider.find_change_request_by_branch(branch).await {
+            match self.branch_lookup_observer.find(&repository.to_string(), &provider, branch).await {
                 Ok(Some((id, request))) => {
                     return Ok(Some(ConvoyChangeRequest { id, status: request.status, repository_key: repository }));
                 }
