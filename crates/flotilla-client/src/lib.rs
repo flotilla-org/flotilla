@@ -1209,8 +1209,9 @@ mod spawn_lock_tests {
                     .expect("daemon hello");
                 sessions.push(session);
             }
+            // Retain connections until the test aborts this listener task.
+            let _sessions = sessions;
             std::future::pending::<()>().await;
-            drop(sessions);
         })
     }
 

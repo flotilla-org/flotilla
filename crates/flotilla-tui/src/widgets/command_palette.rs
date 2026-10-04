@@ -491,6 +491,23 @@ mod tests {
         theme::Theme,
     };
 
+    // Filling a trailing empty quoted token replaces it, preserving the
+    // preceding command (including Unicode byte offsets). After a space, the
+    // same completion appends instead and preserves the empty argument.
+    #[test]
+    fn completion_preserves_prefix_around_empty_quoted_token() {
+        let completion = PaletteCompletion { value: "work".into(), description: String::new(), key_hint: None };
+        for (input, expected) in [
+            ("convoy \"\"", "convoy work "),
+            ("convoy \"café work\" work \"\"", "convoy \"café work\" work work "),
+            ("convoy \"\" ", "convoy \"\" work "),
+        ] {
+            let mut widget = CommandPaletteWidget::with_state(Input::from(input), 0, 0);
+            widget.fill_completion(&completion);
+            assert_eq!(widget.input_value(), expected);
+        }
+    }
+
     #[test]
     fn typed_cli_query_cannot_bypass_palette_dispatch_gate() {
         let harness = TestWidgetHarness::new();

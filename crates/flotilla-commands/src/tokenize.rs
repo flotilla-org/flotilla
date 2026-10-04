@@ -45,9 +45,8 @@ pub fn tokenize_command(input: &str) -> Result<Vec<CommandToken>, String> {
                 continue;
             }
             ' ' | '\t' if !in_single_quote && !in_double_quote => {
-                if token_start.is_some() {
-                    tokens.push(CommandToken { value: std::mem::take(&mut current), offset: token_start.unwrap_or(byte_offset) });
-                    token_start = None;
+                if let Some(offset) = token_start.take() {
+                    tokens.push(CommandToken { value: std::mem::take(&mut current), offset });
                 }
             }
             _ => {
@@ -63,8 +62,8 @@ pub fn tokenize_command(input: &str) -> Result<Vec<CommandToken>, String> {
     if in_single_quote || in_double_quote {
         return Err("unclosed quote".to_string());
     }
-    if token_start.is_some() {
-        tokens.push(CommandToken { value: current, offset: token_start.unwrap_or(byte_offset) });
+    if let Some(offset) = token_start {
+        tokens.push(CommandToken { value: current, offset });
     }
     Ok(tokens)
 }
