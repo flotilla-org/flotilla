@@ -34,7 +34,7 @@ pub fn fingerprint_protocol_source(source_root: &Path) -> Result<String, String>
 
     let mut hasher = Sha256::new();
     for (relative, path) in files {
-        let contents = fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let contents = checkout_independent(fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?);
         hasher.update((relative.len() as u64).to_be_bytes());
         hasher.update(relative.as_bytes());
         hasher.update((contents.len() as u64).to_be_bytes());
@@ -46,4 +46,19 @@ pub fn fingerprint_protocol_source(source_root: &Path) -> Result<String, String>
         write!(fingerprint, "{byte:02x}").expect("writing to a String cannot fail");
     }
     Ok(fingerprint)
+}
+
+/// Hash CRLF as LF so a Windows checkout (`core.autocrlf`) fingerprints the
+/// same protocol as a Unix one. Lone CR and other bytes are preserved.
+fn checkout_independent(contents: Vec<u8>) -> Vec<u8> {
+    if !contents.windows(2).any(|pair| pair == b"\r\n") {
+        return contents;
+    }
+    let mut normalized = Vec::with_capacity(contents.len());
+    for (index, byte) in contents.iter().enumerate() {
+        if *byte != b'\r' || contents.get(index + 1) != Some(&b'\n') {
+            normalized.push(*byte);
+        }
+    }
+    normalized
 }

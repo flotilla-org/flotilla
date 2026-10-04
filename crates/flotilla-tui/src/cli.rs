@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
-    path::Path,
     time::Duration,
 };
 
@@ -16,7 +15,7 @@ use flotilla_protocol::{
     TopologyResponse,
 };
 
-use crate::socket::SocketDaemon;
+use crate::socket::{DaemonEndpoint, SocketDaemon};
 
 fn format_status_response_human(status: &StatusResponse) -> String {
     if status.repos.is_empty() {
@@ -1404,8 +1403,8 @@ fn event_stream_seq(event: &DaemonEvent) -> Option<(StreamKey, u64)> {
     }
 }
 
-pub async fn run_status(socket_path: &Path, format: OutputFormat) -> Result<(), String> {
-    let daemon = SocketDaemon::connect(socket_path).await.map_err(|e| format!("cannot connect to daemon: {e}"))?;
+pub async fn run_status(endpoint: &DaemonEndpoint, format: OutputFormat) -> Result<(), String> {
+    let daemon = SocketDaemon::connect_endpoint(endpoint).await.map_err(|e| format!("cannot connect to daemon: {e}"))?;
     let status = daemon.get_status().await?;
     let output = match format {
         OutputFormat::Human => format_status_response_human(&status),
@@ -1500,10 +1499,10 @@ fn print_bootstrap_events(events: &[DaemonEvent], replay_seqs: &mut HashMap<Stre
     }
 }
 
-pub async fn run_watch(socket_path: &Path, format: OutputFormat) -> Result<(), String> {
+pub async fn run_watch(endpoint: &DaemonEndpoint, format: OutputFormat) -> Result<(), String> {
     loop {
         let daemon = flotilla_client::reconnect::connect_with_retry(
-            || SocketDaemon::connect(socket_path),
+            || SocketDaemon::connect_endpoint(endpoint),
             |notice| match notice {
                 flotilla_client::reconnect::ReconnectNotice::Attempt { attempt } => {
                     eprintln!("connecting to daemon (attempt {attempt})...");

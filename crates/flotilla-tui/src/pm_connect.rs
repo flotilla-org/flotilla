@@ -21,7 +21,10 @@ use std::{
 };
 
 pub use flotilla_client::reconnect::is_incompatible_daemon_error;
-use flotilla_client::reconnect::{is_permanent_daemon_error, ReconnectBackoff};
+use flotilla_client::{
+    reconnect::{is_permanent_daemon_error, ReconnectBackoff},
+    DaemonEndpoint, SshEndpoint,
+};
 use flotilla_core::{
     config::{ssh_destination, ConfigStore},
     daemon::DaemonHandle,
@@ -535,6 +538,7 @@ async fn run_connector_subscribed(
 /// daemon, reconnecting on failure. Catalog facts fade by TTL while the
 /// daemon is away and re-assert on return.
 pub async fn run(
+    remote: Option<SshEndpoint>,
     socket_path: &Path,
     config_dir: &Path,
     state_dir: &Path,
@@ -568,7 +572,10 @@ pub async fn run(
     run_reconnecting(
         || async {
             let surface = flotilla_protocol::SurfaceDeclaration::ambient_for_namespace("flotilla");
-            if require_host_daemon {
+            if let Some(remote) = &remote {
+                // A remote daemon is never spawned or replaced from this host.
+                crate::socket::SocketDaemon::connect_endpoint_with_surface(&DaemonEndpoint::Ssh(remote.clone()), surface).await
+            } else if require_host_daemon {
                 crate::socket::connect_required_host_daemon_with_surface(socket_path, surface).await
             } else {
                 crate::socket::connect_or_spawn_with_surface(socket_path, config_dir, state_dir, surface).await

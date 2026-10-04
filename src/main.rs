@@ -22,7 +22,11 @@ use flotilla_protocol::{
     commands::CommandValue, output::OutputFormat, AgentHookEvent, AttachableId, Command, CommandAction, EnvironmentId, HostName,
     ProjectListResponse, RepoIdentity, RepoInfo, RepoSelector, ViewAddress,
 };
-use flotilla_tui::{app, event_log, theme};
+use flotilla_tui::{
+    app, event_log,
+    socket::{DaemonEndpoint, SshEndpoint},
+    theme,
+};
 use tracing::info;
 
 mod resource_validate;
@@ -50,6 +54,12 @@ struct Cli {
     /// Socket path (default: ${config_dir}/run/flotilla.sock)
     #[arg(long)]
     socket: Option<PathBuf>,
+
+    /// Use a daemon on another host: ssh://[user@]host[:port][/path/to/flotilla]
+    /// (default: $FLOTILLA_DAEMON). Never spawns a local daemon; hooks and
+    /// daemon lifecycle commands still act on this host.
+    #[arg(long, conflicts_with = "socket")]
+    daemon: Option<String>,
 
     /// Theme name (catppuccin-mocha, classic)
     #[arg(long)]
@@ -145,6 +155,9 @@ enum SubCommand {
     #[command(flatten)]
     Domain(DomainCommand),
 
+    /// Bridge stdio to this host's daemon socket (hidden; run over SSH by `--daemon ssh://...`)
+    #[command(hide = true)]
+    DaemonBridge,
     /// Generate completions (hidden, called by shell scripts)
     #[command(hide = true)]
     Complete(CompleteArgs),
@@ -728,6 +741,30 @@ impl Cli {
             .unwrap_or_else(|| policy.config_dir.into_path_buf());
         socket_path_from(self.socket.as_deref(), &config_dir, std::env::var_os("FLOTILLA_DAEMON_SOCKET").as_deref())
     }
+
+    /// The remote daemon selected by `--daemon` or `FLOTILLA_DAEMON`, if any.
+    fn remote_daemon(&self) -> Result<Option<SshEndpoint>, String> {
+        remote_daemon_from(self.daemon.as_deref(), std::env::var("FLOTILLA_DAEMON").ok().as_deref())
+    }
+
+    /// The daemon socket-only commands talk to: a remote endpoint, else this host's socket.
+    fn daemon_endpoint(&self) -> Result<DaemonEndpoint, String> {
+        Ok(self.remote_daemon()?.map(DaemonEndpoint::Ssh).unwrap_or_else(|| DaemonEndpoint::Local(self.socket_path())))
+    }
+
+    /// Refuse a remote endpoint for commands that manage this host's daemon.
+    fn require_local_daemon(&self, command: &str) -> Result<()> {
+        match self.remote_daemon().map_err(|error| color_eyre::eyre::eyre!(error))? {
+            Some(remote) => Err(color_eyre::eyre::eyre!(
+                "`{command}` manages this host's daemon and cannot target {remote}; drop --daemon or unset FLOTILLA_DAEMON"
+            )),
+            None => Ok(()),
+        }
+    }
+}
+
+fn remote_daemon_from(flag: Option<&str>, environment: Option<&str>) -> Result<Option<SshEndpoint>, String> {
+    flag.or(environment.filter(|value| !value.is_empty())).map(SshEndpoint::parse).transpose()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -794,6 +831,7 @@ fn host_daemon_socket_required(contained_marker: Option<&std::ffi::OsStr>) -> bo
 }
 
 async fn connect_cli_socket(
+    remote: Option<&SshEndpoint>,
     socket_path: &Path,
     config_dir: &Path,
     state_dir: &Path,
@@ -801,7 +839,10 @@ async fn connect_cli_socket(
 ) -> Result<Arc<flotilla_tui::socket::SocketDaemon>, String> {
     let surface =
         cli_surface_from(std::env::var("FLOTILLA_CREW_ROLE").ok().as_deref(), std::env::var("FLOTILLA_NAMESPACE").ok().as_deref());
-    if require_host_daemon {
+    if let Some(remote) = remote {
+        // A remote daemon is never spawned or replaced from this host.
+        flotilla_tui::socket::SocketDaemon::connect_endpoint_with_surface(&DaemonEndpoint::Ssh(remote.clone()), surface).await
+    } else if require_host_daemon {
         flotilla_tui::socket::connect_required_host_daemon_with_surface(socket_path, surface).await
     } else {
         flotilla_tui::socket::connect_or_spawn_with_surface(socket_path, config_dir, state_dir, surface).await
@@ -900,6 +941,7 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
         }
         Some(SubCommand::Domain(command)) => dispatch(command.resolve()?, &cli, format).await,
 
+        Some(SubCommand::DaemonBridge) => run_daemon_bridge(&cli).await,
         Some(SubCommand::Complete(CompleteArgs { line, cursor_pos })) => {
             run_complete(&line, cursor_pos);
             Ok(())
@@ -1040,13 +1082,21 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
     let daemon_log_path =
         resolved_state_dir.as_path().join(flotilla_core::log_file::DAEMON_LOG_DIRECTORY).join(flotilla_core::log_file::DAEMON_LOG_FILE);
     let daemon_panic_log_path = resolved_config_dir.join("daemon-panic.log");
+    let remote = cli.remote_daemon().map_err(|error| color_eyre::eyre::eyre!(error))?;
+    let initial_remote = remote.clone();
     let initial_socket_path = socket_path.clone();
     let initial_config_dir = resolved_config_dir.clone();
     let initial_state_dir = resolved_state_dir.clone();
     let daemon_task = tokio::spawn(async move {
-        connect_cli_socket(&initial_socket_path, &initial_config_dir, initial_state_dir.as_path(), require_host_daemon)
-            .await
-            .map(|d| d as Arc<dyn DaemonHandle>)
+        connect_cli_socket(
+            initial_remote.as_ref(),
+            &initial_socket_path,
+            &initial_config_dir,
+            initial_state_dir.as_path(),
+            require_host_daemon,
+        )
+        .await
+        .map(|d| d as Arc<dyn DaemonHandle>)
     });
 
     show_startup_splash(scoped_view.as_ref(), || flotilla_tui::splash::show_splash(&mut terminal)).await?;
@@ -1115,7 +1165,7 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
 
         terminal = ratatui::init();
         let connected = match flotilla_tui::socket::reconnect::connect_with_retry(
-            || connect_cli_socket(&socket_path, &resolved_config_dir, resolved_state_dir.as_path(), require_host_daemon),
+            || connect_cli_socket(remote.as_ref(), &socket_path, &resolved_config_dir, resolved_state_dir.as_path(), require_host_daemon),
             |notice| {
                 let (attempt, detail) = match notice {
                     flotilla_tui::socket::reconnect::ReconnectNotice::Attempt { attempt } => (attempt, None),
@@ -1171,7 +1221,22 @@ fn restore_tui_handoff(app: &mut app::App) {
     }
 }
 
+/// The remote half of `--daemon ssh://...`: copy stdio to this host's daemon
+/// socket. It never spawns a daemon; a missing one is reported to the client.
+async fn run_daemon_bridge(cli: &Cli) -> Result<()> {
+    cli.require_local_daemon("daemon-bridge")?;
+    #[cfg(unix)]
+    {
+        flotilla_tui::socket::bridge::bridge_stdio(&cli.socket_path()).await.map_err(|error| color_eyre::eyre::eyre!(error))
+    }
+    #[cfg(not(unix))]
+    {
+        Err(color_eyre::eyre::eyre!("daemon-bridge serves a local Unix daemon socket, which this platform does not host"))
+    }
+}
+
 async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
+    cli.require_local_daemon("daemon")?;
     let daemon_binary = resolve_flotillad_binary()?;
     let CliPaths { config_dir, state_dir, socket_path } = cli.daemon_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
     flotilla_core::path_policy::ensure_daemon_socket_belongs_to_config(&socket_path, &config_dir)
@@ -1193,6 +1258,7 @@ async fn run_daemon(cli: &Cli, timeout_secs: u64) -> Result<()> {
 }
 
 async fn run_daemon_stop(cli: &Cli) -> Result<()> {
+    cli.require_local_daemon("daemon stop")?;
     let socket_path = cli.socket_path();
     if !socket_path.exists() {
         println!("Daemon is not running.");
@@ -1218,6 +1284,7 @@ async fn wait_for_socket_removal(socket_path: &Path) -> Result<()> {
 }
 
 async fn run_daemon_dev_mode(cli: &Cli, command: DevModeSubCommand) -> Result<()> {
+    cli.require_local_daemon("daemon dev-mode")?;
     match command {
         DevModeSubCommand::Enable => {
             // Disable first. Even if graceful shutdown fails, the supervisor cannot
@@ -1312,7 +1379,8 @@ fn reset_sigpipe() {}
 
 async fn run_status(cli: &Cli, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
-    flotilla_tui::cli::run_status(&cli.socket_path(), format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+    let endpoint = cli.daemon_endpoint().map_err(|e| color_eyre::eyre::eyre!(e))?;
+    flotilla_tui::cli::run_status(&endpoint, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
 async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<()> {
@@ -1326,7 +1394,9 @@ async fn run_pm_command(cli: &Cli, command: PmSubCommand) -> Result<()> {
                 .flotilla_bin(flotilla_bin)
                 .build();
             let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
+            let remote = cli.remote_daemon().map_err(|error| color_eyre::eyre::eyre!(error))?;
             flotilla_tui::pm_connect::run(
+                remote,
                 &socket_path,
                 &config_dir,
                 &state_dir,
@@ -1355,7 +1425,8 @@ fn resolve_pm_flotilla_bin(override_bin: Option<String>, current_exe: impl FnOnc
 
 async fn run_watch(cli: &Cli, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
-    flotilla_tui::cli::run_watch(&cli.socket_path(), format).await.map_err(|e| color_eyre::eyre::eyre!(e))
+    let endpoint = cli.daemon_endpoint().map_err(|e| color_eyre::eyre::eyre!(e))?;
+    flotilla_tui::cli::run_watch(&endpoint, format).await.map_err(|e| color_eyre::eyre::eyre!(e))
 }
 
 async fn run_wait(
@@ -1368,7 +1439,9 @@ async fn run_wait(
 ) -> Result<()> {
     reset_sigpipe();
     let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
+    let remote = cli.remote_daemon().map_err(|error| color_eyre::eyre::eyre!(error))?;
     let daemon = connect_cli_socket(
+        remote.as_ref(),
         &socket_path,
         &config_dir,
         &state_dir,
@@ -1407,7 +1480,9 @@ async fn run_wait(
 
 async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
     let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
+    let remote = cli.remote_daemon().map_err(|error| color_eyre::eyre::eyre!(error))?;
     let daemon = connect_cli_socket(
+        remote.as_ref(),
         &socket_path,
         &config_dir,
         &state_dir,
@@ -1420,7 +1495,9 @@ async fn connect_daemon(cli: &Cli) -> Result<Arc<dyn DaemonHandle>> {
 
 async fn run_artifact_command(cli: &Cli, command: ArtifactSubCommand, format: OutputFormat) -> Result<()> {
     let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
+    let remote = cli.remote_daemon().map_err(|error| color_eyre::eyre::eyre!(error))?;
     let daemon = connect_cli_socket(
+        remote.as_ref(),
         &socket_path,
         &config_dir,
         &state_dir,
@@ -2922,7 +2999,7 @@ mod tests {
 
     use std::path::{Path, PathBuf};
 
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use flotilla_protocol::{
         output::OutputFormat, qualified_path::HostId, EnvironmentId, HostListEntry, HostName, NodeId, NodeInfo, PeerConnectionState,
         ProjectListEntry, ProjectListRepository, ProjectListResponse, ProvisioningTarget, RepoIdentity, RepoInfo, RepoLabels,
@@ -2932,13 +3009,43 @@ mod tests {
     use super::{
         attach_mode, cli_surface_from, client_dirs_from, confirm_command, daemon_paths_from, default_project_landing,
         format_human_resource_value, host_daemon_socket_required, incompatible_daemon_reexec_failure, install_codex_hook,
-        provisioning_target_for_environment, replace_host_ids, resolve_pm_flotilla_bin, select_host_target, select_startup_repo_roots,
-        should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, topology_output_format,
-        uninstall_codex_hook, ArtifactSubCommand, AttachArgs, Cli, CliPaths, CommandValue, DaemonArgs, DaemonSubCommand, DevModeSubCommand,
-        DomainCommand, EventsArgs, LogsArgs, LsArgs, PmSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs,
-        ResourceListArgs, ResourceManifestResolutionArgs, ResourceReconcileNowArgs, ResourceStatusPatchArgs, ResourceSubCommand,
-        ResourceWatchArgs, SubCommand, TopologyArgs, WaitArgs,
+        provisioning_target_for_environment, remote_daemon_from, replace_host_ids, resolve_pm_flotilla_bin, select_host_target,
+        select_startup_repo_roots, should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from,
+        topology_output_format, uninstall_codex_hook, ArtifactSubCommand, AttachArgs, Cli, CliPaths, CommandValue, DaemonArgs,
+        DaemonSubCommand, DevModeSubCommand, DomainCommand, EventsArgs, LogsArgs, LsArgs, PmSubCommand, ResourceApplyArgs,
+        ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs, ResourceReconcileNowArgs,
+        ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand, TopologyArgs, WaitArgs,
     };
+
+    // `--daemon` wins over FLOTILLA_DAEMON; an empty variable selects this host.
+    #[test]
+    fn remote_daemon_prefers_flag_and_ignores_empty_environment() {
+        let flag = remote_daemon_from(Some("ssh://udder"), Some("ssh://kiwi")).expect("valid").expect("remote");
+        assert_eq!(flag.to_string(), "ssh://udder");
+        let environment = remote_daemon_from(None, Some("ssh://kiwi")).expect("valid").expect("remote");
+        assert_eq!(environment.to_string(), "ssh://kiwi");
+        assert_eq!(remote_daemon_from(None, Some("")).expect("valid"), None);
+        assert_eq!(remote_daemon_from(None, None).expect("valid"), None);
+        assert!(remote_daemon_from(Some("udder"), None).is_err(), "a bare host is not an endpoint");
+    }
+
+    #[test]
+    fn daemon_endpoint_conflicts_with_socket_and_bridge_is_hidden() {
+        assert!(Cli::try_parse_from(["flotilla", "--daemon", "ssh://udder", "--socket", "/tmp/x.sock", "status"]).is_err());
+        let bridge = Cli::try_parse_from(["flotilla", "--socket", "/tmp/x.sock", "daemon-bridge"]).expect("bridge parses");
+        assert!(matches!(bridge.command, Some(SubCommand::DaemonBridge)));
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("daemon-bridge"), "daemon-bridge is internal: {help}");
+    }
+
+    // Lifecycle commands manage this host's daemon; a remote endpoint is refused,
+    // never silently ignored.
+    #[test]
+    fn local_daemon_commands_refuse_a_remote_endpoint() {
+        let cli = Cli::try_parse_from(["flotilla", "--daemon", "ssh://udder", "daemon", "stop"]).expect("parse");
+        let error = cli.require_local_daemon("daemon stop").expect_err("remote endpoint refused").to_string();
+        assert!(error.contains("this host's daemon") && error.contains("ssh://udder"), "{error}");
+    }
 
     /// Windows gives the main thread 1 MiB of stack. Unoptimised clap-derive
     /// builders need frames that grow with the command tree, and the nested
