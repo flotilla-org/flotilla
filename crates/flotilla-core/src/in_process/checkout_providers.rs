@@ -44,7 +44,19 @@ pub(super) struct CheckoutLifetimeKey {
 
 pub(super) type CheckoutVcsCache = HashMap<CheckoutLifetimeKey, Arc<OnceCell<Arc<CheckoutProvider>>>>;
 
-impl InProcessDaemon {
+#[derive(bon::Builder)]
+pub(super) struct CheckoutProviders {
+    resource_backend: ResourceBackend,
+    observed_resource_backend: ResourceBackend,
+    config: Arc<ConfigStore>,
+    discovery: Arc<super::DiscoveryRuntime>,
+    environment_manager: Arc<crate::environment_manager::EnvironmentManager>,
+    local_environment_id: EnvironmentId,
+    provisioning_namespace: Arc<std::sync::RwLock<String>>,
+    checkout_vcs: tokio::sync::Mutex<CheckoutVcsCache>,
+}
+
+impl CheckoutProviders {
     /// Observed Checkouts own cached providers. Before observation, inspection
     /// uses a transient discovered provider that is never retained by the daemon.
     pub(super) async fn checkout_provider(&self, env_id: &EnvironmentId, path: &Path) -> Result<Arc<CheckoutProvider>, String> {
@@ -150,7 +162,10 @@ impl InProcessDaemon {
                     _ => None,
                 })
             }
-            spec => spec.env_ref().and_then(|reference| self.resolve_environment_ref(reference)).map(|environment| environment.id),
+            spec => spec
+                .env_ref()
+                .and_then(|reference| self.environment_manager.resolve_environment_ref(reference))
+                .map(|environment| environment.id),
         }
     }
 
@@ -181,7 +196,11 @@ impl InProcessDaemon {
             .collect())
     }
 
-    fn checkout_lifetime_key(&self, namespace: &str, checkout: &ResourceObject<ResourceCheckout>) -> Option<CheckoutLifetimeKey> {
+    pub(super) fn checkout_lifetime_key(
+        &self,
+        namespace: &str,
+        checkout: &ResourceObject<ResourceCheckout>,
+    ) -> Option<CheckoutLifetimeKey> {
         if checkout.metadata.deletion_timestamp.is_some()
             || checkout.status.as_ref().is_some_and(|status| status.phase != CheckoutPhase::Ready)
         {
@@ -212,6 +231,28 @@ impl InProcessDaemon {
     /// Resolve capabilities through discovery once for each observed Checkout.
     pub async fn vcs_for_checkout(&self, env_id: &EnvironmentId, checkout: &Path) -> Result<Arc<dyn Vcs>, String> {
         self.checkout_provider(env_id, checkout).await.map(|provider| Arc::clone(&provider.vcs))
+    }
+
+    async fn provisioning_namespace(&self) -> String {
+        self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone()
+    }
+}
+
+impl InProcessDaemon {
+    pub(super) async fn checkout_provider(&self, env_id: &EnvironmentId, path: &Path) -> Result<Arc<CheckoutProvider>, String> {
+        self.checkout_providers.checkout_provider(env_id, path).await
+    }
+
+    fn checkout_lifetime_key(&self, namespace: &str, checkout: &ResourceObject<ResourceCheckout>) -> Option<CheckoutLifetimeKey> {
+        self.checkout_providers.checkout_lifetime_key(namespace, checkout)
+    }
+
+    pub(super) async fn retire_checkout_providers(&self) -> Result<(), String> {
+        self.checkout_providers.retire_checkout_providers().await
+    }
+
+    pub async fn vcs_for_checkout(&self, env_id: &EnvironmentId, checkout: &Path) -> Result<Arc<dyn Vcs>, String> {
+        self.checkout_providers.vcs_for_checkout(env_id, checkout).await
     }
 
     pub(super) async fn execution_registry(
