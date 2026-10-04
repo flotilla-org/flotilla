@@ -1000,7 +1000,7 @@ impl flotilla_core::repository_inspection::RepositoryInspector for ConflictCheck
                 if cleanup_checkout_rows(&daemon).await.iter().any(|row| row.authority == LifecycleAuthority::Adopted) {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -1037,7 +1037,7 @@ async fn admission_conflict_removes_adopted_projection_and_aggregator_row() {
 }
 
 async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
-    use flotilla_protocol::{Command, CommandAction, CommandValue};
+    use flotilla_protocol::{CommandAction, CommandValue};
     use flotilla_resources::{CrewSource, CrewSpec, WorkflowTemplate, WorkflowTemplateSpec};
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let config = test_config(tmp.path().join("config"));
@@ -1122,7 +1122,7 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
                 if cleanup_checkout_rows(&daemon).await.iter().any(|row| row.authority == LifecycleAuthority::Adopted) {
                     break;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -1134,9 +1134,45 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
             replica_origin: None,
         }
     };
+    let result = cleanup_command_result(&daemon, action.clone()).await;
+    if admission_conflict {
+        assert!(matches!(result, CommandValue::Error { ref message } if message.contains("already exists")), "{result:?}");
+    } else {
+        assert!(matches!(result, CommandValue::ResourceDeleted(_)), "{result:?}");
+    }
+    assert!(backend.using::<Checkout>("flotilla").list().await.expect("durable checkouts").items.is_empty());
+    let remaining = observed.list().await.expect("observed checkouts").items;
+    assert!(matches!(remaining.as_slice(), [checkout] if checkout.metadata.name == "unrelated"), "{remaining:?}");
+    if !admission_conflict {
+        // A cleanup failure can leave an orphan after the durable delete. A
+        // repeated command must accept the tombstone and retry projection cleanup.
+        observed
+            .create(&InputMeta::builder().name("adopted".to_string()).build().with_lifecycle_authority(LifecycleAuthority::Adopted), &spec)
+            .await
+            .expect("orphan left by interrupted cleanup");
+        let repeated = cleanup_command_result(&daemon, action).await;
+        assert!(matches!(repeated, CommandValue::ResourceAlreadyDeleted(_)), "{repeated:?}");
+        let remaining = observed.list().await.expect("observed checkouts after retry").items;
+        assert!(matches!(remaining.as_slice(), [checkout] if checkout.metadata.name == "unrelated"), "{remaining:?}");
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = cleanup_checkout_rows(&daemon).await;
+            if rows.len() == 1 && rows[0].authority == LifecycleAuthority::Observed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("only unrelated Aggregator row remains without periodic reconciliation");
+}
+
+async fn cleanup_command_result(daemon: &InProcessDaemon, action: flotilla_protocol::CommandAction) -> flotilla_protocol::CommandValue {
+    use flotilla_protocol::Command;
     let mut events = daemon.subscribe();
     let id = daemon.execute(Command::builder().action(action).build()).await.expect("command");
-    let result = tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let DaemonEvent::CommandFinished { command_id, result, .. } = events.recv().await.expect("event") {
                 if command_id == id {
@@ -1146,24 +1182,5 @@ async fn assert_adopted_checkout_cleanup(admission_conflict: bool) {
         }
     })
     .await
-    .expect("command completes");
-    if admission_conflict {
-        assert!(matches!(result, CommandValue::Error { ref message } if message.contains("already exists")), "{result:?}");
-    } else {
-        assert!(matches!(result, CommandValue::ResourceDeleted(_)), "{result:?}");
-    }
-    assert!(backend.using::<Checkout>("flotilla").list().await.expect("durable checkouts").items.is_empty());
-    let remaining = observed.list().await.expect("observed checkouts").items;
-    assert!(matches!(remaining.as_slice(), [checkout] if checkout.metadata.name == "unrelated"), "{remaining:?}");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let rows = cleanup_checkout_rows(&daemon).await;
-            if rows.len() == 1 && rows[0].authority == LifecycleAuthority::Observed {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("only unrelated Aggregator row remains without periodic reconciliation");
+    .expect("command completes")
 }
