@@ -11,7 +11,7 @@ where
 {
     let parsed = T::try_parse_from(args).expect("initial parse");
     let displayed = parsed.to_string();
-    let tokens: Vec<&str> = displayed.split_whitespace().collect();
+    let tokens: Vec<String> = crate::tokenize_command(&displayed).expect("tokenize display").into_iter().map(|t| t.value).collect();
     let reparsed = T::try_parse_from(&tokens).expect("re-parse from display");
     assert_eq!(parsed, reparsed, "round-trip failed for: {displayed}");
 }

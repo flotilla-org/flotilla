@@ -9,8 +9,11 @@ use crate::{
     providers::{run, run_output, CommandRunner},
 };
 
+#[derive(bon::Builder)]
 pub struct ShpoolTerminalPool {
     runner: Arc<dyn CommandRunner>,
+    #[builder(default = "/bin/sh".into())]
+    shell: String,
     socket_path: DaemonHostPath,
     config_path: DaemonHostPath,
     /// Terminal env defaults (TERM, COLORTERM) from discovery, injected into
@@ -28,12 +31,23 @@ pub struct ShpoolTerminalPool {
 const FLOTILLA_SHPOOL_CONFIG: &str = include_str!("shpool_config.toml");
 
 impl ShpoolTerminalPool {
-    pub async fn create(runner: Arc<dyn CommandRunner>, socket_path: DaemonHostPath, terminal_env_defaults: TerminalEnvVars) -> Self {
+    pub async fn create(
+        runner: Arc<dyn CommandRunner>,
+        socket_path: DaemonHostPath,
+        terminal_env_defaults: TerminalEnvVars,
+        shell: Option<String>,
+    ) -> Self {
         let config_path = DaemonHostPath::new(socket_path.as_path().parent().unwrap_or(Path::new(".")).join("config.toml"));
         if let Err(e) = runner.ensure_file(config_path.as_path(), FLOTILLA_SHPOOL_CONFIG).await {
             tracing::warn!(err = %e, "failed to write shpool config");
         }
-        Self { runner, socket_path, config_path, terminal_env_defaults }
+        Self::builder()
+            .runner(runner)
+            .socket_path(socket_path)
+            .config_path(config_path)
+            .terminal_env_defaults(terminal_env_defaults)
+            .maybe_shell(shell)
+            .build()
     }
 
     #[cfg(test)]
@@ -48,7 +62,12 @@ impl ShpoolTerminalPool {
         terminal_env_defaults: TerminalEnvVars,
     ) -> Self {
         let config_path = DaemonHostPath::new(socket_path.as_path().parent().unwrap_or(Path::new(".")).join("config.toml"));
-        Self { runner, socket_path, config_path, terminal_env_defaults }
+        Self::builder()
+            .runner(runner)
+            .socket_path(socket_path)
+            .config_path(config_path)
+            .terminal_env_defaults(terminal_env_defaults)
+            .build()
     }
 
     /// Check whether a session with the given name exists in the shpool daemon.
@@ -167,7 +186,7 @@ impl TerminalPool for ShpoolTerminalPool {
             return Ok(());
         }
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let shell = &self.shell;
 
         // Build --cmd value. shpool uses shell-words for tokenization (no
         // variable expansion), so all values must be literal. Quote values
@@ -186,7 +205,7 @@ impl TerminalPool for ShpoolTerminalPool {
                 cmd_parts.push(format!("{k}={}", flotilla_protocol::arg::shell_quote(v)));
             }
         }
-        cmd_parts.push(flotilla_protocol::arg::shell_quote(&shell));
+        cmd_parts.push(flotilla_protocol::arg::shell_quote(shell));
         if !command.is_empty() {
             cmd_parts.push("-lic".to_string());
             cmd_parts.push(flotilla_protocol::arg::shell_quote(command));

@@ -97,9 +97,10 @@ mod tests {
         assert!(err.contains("read"));
     }
 
+    // Display quoting must preserve whitespace-bearing values when re-parsed.
     #[test]
     fn round_trip_apply() {
-        assert_round_trip::<WorkflowTemplateNoun>(&["workflow-template", "scratch", "apply", "--file", "/tmp/x.yaml"]);
+        assert_round_trip::<WorkflowTemplateNoun>(&["workflow-template", "my workflow", "apply", "--file", "/tmp/my workflow.yaml"]);
     }
 
     #[test]

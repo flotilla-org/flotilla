@@ -1199,6 +1199,7 @@ dependencies = [
  "bon",
  "clap",
  "flotilla-protocol",
+ "hegeltest",
  "tempfile",
 ]
 
