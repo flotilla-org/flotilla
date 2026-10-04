@@ -360,8 +360,9 @@ impl super::ChangeRequestTracker for GitHubChangeRequest {
     }
 
     async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, ObservationError> {
-        // Unqualified heads belong to the repository owner; explicit owner:branch
-        // heads support forks without scanning unrelated repository history.
+        // Bare branches deliberately use the repository owner. Fork heads must
+        // be supplied as fork_owner:branch: inferring an unspecified fork owner
+        // would require the unfiltered history scan this lookup avoids.
         let head = if branch.contains(':') {
             branch.to_string()
         } else {
@@ -453,7 +454,7 @@ mod tests {
                 // Subprocess boundary: gh emits an HTTP response with headers.
                 let items = if found {
                     serde_json::json!([{
-                        "number": 7, "title": "Wanted", "head": {"ref": "feature/wanted"},
+                        "number": 7, "title": "Wanted", "head": {"ref": branch.split_once(':').map_or(branch, |(_, name)| name)},
                         "state": "closed", "merged_at": "2026-09-01T00:00:00Z"
                     }])
                 } else {
@@ -470,6 +471,7 @@ mod tests {
                 assert_eq!(result.is_some(), found);
                 if let Some((id, request)) = result {
                     assert_eq!(id, "7");
+                    assert_eq!(request.branch, branch.split_once(':').map_or(branch, |(_, name)| name));
                     assert_eq!(request.status, ChangeRequestStatus::Merged);
                 }
                 let calls = runner.calls();
