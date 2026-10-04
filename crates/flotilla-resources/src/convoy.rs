@@ -83,6 +83,56 @@ impl ConvoySpec {
     }
 }
 
+/// Build subject parsing and presentation context from the convoy's admitted
+/// repository snapshot. Resolved Repository identity wins over URL inference;
+/// project aliases and Forge web roots are shared by every consumer.
+pub fn convoy_reference_context<'a>(
+    repositories: &[ConvoyRepositorySpec],
+    project_ref: Option<&str>,
+    project: Option<&crate::ProjectSpec>,
+    forges: &[crate::ForgeSpec],
+    repository_spec: impl Fn(&RepositoryKey) -> Option<&'a crate::RepositorySpec>,
+) -> flotilla_protocol::ReferenceContext {
+    let repositories = repositories
+        .iter()
+        .filter_map(|repository| {
+            let resolved = repository_spec(&repository.repo_ref);
+            let (service, scope) = match resolved.map(crate::RepositorySpec::identity) {
+                Some(crate::RepositoryIdentity::Forge { forge_ref, owner, repo_name }) => {
+                    (forge_ref.clone(), format!("{owner}/{repo_name}"))
+                }
+                _ => {
+                    let LeafAddress::ChangeRequest { service, scope, .. } =
+                        change_request_address_with_forges(&repository.url, "1", forges).ok()?
+                    else {
+                        return None;
+                    };
+                    (service, scope)
+                }
+            };
+            let canonical = crate::canonicalize_repo_url(&repository.url).ok()?;
+            let web_base = forges
+                .iter()
+                .find(|forge| forge.forge_id == service)
+                .map(|forge| forge.https_url.trim_end_matches('/').to_string())
+                .or_else(|| resolved.and_then(crate::RepositorySpec::forge).map(|forge| forge.service_url.clone()))
+                .or_else(|| canonical.strip_suffix(&format!("/{scope}")).map(str::to_string))?;
+            let alias = project
+                .and_then(|project| project.repositories.iter().find(|member| member.repo == repository.repo_ref))
+                .and_then(|member| member.alias.clone())
+                .unwrap_or_else(|| scope.rsplit('/').next().unwrap_or(&scope).to_string());
+            Some(flotilla_protocol::RepositoryAlias {
+                project: project_ref.map(str::to_string),
+                alias,
+                source: flotilla_protocol::IssueSource { service: service.clone(), scope },
+                web_base,
+                forge_alias: (service != "github.com").then_some(service),
+            })
+        })
+        .collect();
+    flotilla_protocol::ReferenceContext { repositories }
+}
+
 /// The presentation and settlement consumers read the same persisted links.
 pub fn convoy_subject_rows(
     convoy: &ResourceObject<Convoy>,
@@ -2285,6 +2335,75 @@ pub mod external_patches {
 mod subject_tests {
     use super::*;
     use crate::{CrewMessageDelivery, CrewMessageSender, TerminalCrewMessage};
+
+    // #2202: every caller builds the same source, alias, and URL context
+    // whether it has a resolved Repository or only the admitted URL and Forge.
+    #[hegel::test]
+    fn convoy_reference_context_agrees_across_inputs(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Span GitHub and a named Forgejo installation, HTTPS/SSH aliases,
+        // project aliases/default names, empty lists, duplicates and invalid URLs.
+        let custom_forge = tc.draw(gs::booleans());
+        let ssh = tc.draw(gs::booleans());
+        let project_alias = tc.draw(gs::booleans());
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(2));
+        let invalid = tc.draw(gs::booleans());
+        let forge = crate::ForgeSpec {
+            forge_id: if custom_forge { "lab" } else { "github.com" }.into(),
+            kind: if custom_forge { crate::ForgeKind::Forgejo } else { crate::ForgeKind::Github },
+            hosts: BTreeSet::from(["git-alias.example".into()]),
+            https_url: if custom_forge { "https://forge.example/install" } else { "https://github.com" }.into(),
+            git_ssh_host: "git-alias.example".into(),
+        };
+        let url = if ssh { "git@git-alias.example:team/repo.git".to_string() } else { format!("{}/team/repo", forge.https_url) };
+        // For an installation prefix, the SSH path includes that prefix too.
+        let url = if ssh && custom_forge { "git@git-alias.example:install/team/repo.git".into() } else { url };
+        let resolved = crate::RepositorySpec::remote(format!("{}/team/repo", forge.https_url))
+            .expect("repository")
+            .on_forge(&forge)
+            .expect("forge repository");
+        let snapshot = ConvoyRepositorySpec {
+            repo_ref: resolved.key(),
+            url,
+            source_ref: "main".into(),
+            target_ref: "main".into(),
+            workspace_slug: "repo".into(),
+            subpaths: Vec::new(),
+        };
+        let project = crate::ProjectSpec::builder()
+            .display_name("Project".into())
+            .default_workflow_ref("workflow".into())
+            .repositories(vec![crate::ProjectRepositorySpec::builder()
+                .repo(resolved.key())
+                .maybe_alias(project_alias.then(|| "code".into()))
+                .build()])
+            .build();
+        let mut snapshots = vec![snapshot; count];
+        if invalid {
+            snapshots.push(ConvoyRepositorySpec {
+                repo_ref: RepositoryKey("invalid".into()),
+                url: "invalid".into(),
+                source_ref: "main".into(),
+                target_ref: "main".into(),
+                workspace_slug: "invalid".into(),
+                subpaths: Vec::new(),
+            });
+        }
+        let inferred = convoy_reference_context(&snapshots, Some("project"), Some(&project), std::slice::from_ref(&forge), |_| None);
+        let from_records =
+            convoy_reference_context(&snapshots, Some("project"), Some(&project), &[], |key| (*key == resolved.key()).then_some(&resolved));
+        assert_eq!(inferred.repositories, from_records.repositories);
+        assert_eq!(inferred.repositories.len(), count);
+        for alias in &inferred.repositories {
+            assert_eq!(alias.alias, if project_alias { "code" } else { "repo" });
+            assert_eq!(alias.source.service, forge.forge_id);
+            assert_eq!(alias.source.scope, "team/repo");
+            assert_eq!(alias.web_base, forge.https_url);
+            let url = format!("{}/team/repo/{}/7", forge.https_url, if custom_forge { "pulls" } else { "pull" });
+            let subject = inferred.parse(&url).expect("parse forge PR");
+            assert_eq!(subject.url(&inferred), Some(url));
+        }
+    }
 
     #[test]
     fn settlement_uses_every_active_change_request_subject() {

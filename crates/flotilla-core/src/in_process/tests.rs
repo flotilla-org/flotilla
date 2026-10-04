@@ -2456,6 +2456,14 @@ async fn bound_change_request_resolution_uses_durable_observation_for_a_mirror_c
     assert_eq!(resolved.id, "1696");
     assert_eq!(resolved.repository_key, repository_key);
     assert_eq!(resolved.status, flotilla_protocol::ChangeRequestStatus::Open);
+
+    // #2202: a bound ID remains authoritative for both the row and discovery;
+    // duplicate repository keys reuse the durable observation without a scan.
+    let binding = BoundChangeRequest { id: "1696".into(), repository_ref: repository_key.clone(), title: "Existing PR".into() };
+    let refresh =
+        daemon.refresh_convoy_branch(&[repository_key.clone(), repository_key.clone()], "fix/convoy-pr-linkage", Some(&binding)).await;
+    assert_eq!(refresh.primary.expect("primary"), Some(resolved.clone()));
+    assert_eq!(refresh.repositories, vec![(repository_key, Ok(Some(resolved)))]);
 }
 
 struct BatchedObservationRunner {
@@ -9027,4 +9035,78 @@ async fn distinct_cooldowns_block_all_observation_reads() {
     let subject = ChangeRequestRef { namespace: "flotilla".into(), service: "github.com".into(), scope: "team/repo".into(), number: 1 };
     let expired = source.observe_for_completion(&subject).await.expect_err("no repository after cache expires");
     assert!(matches!(expired, ObservationError::Forge(_)), "cache expires at controlling deadline");
+}
+
+// #2202: row publication and subject discovery reuse every branch lookup,
+// including misses/errors. Each repository is queried once per refresh, even
+// when a duplicate key is supplied; successes persist despite another failure.
+#[hegel::test]
+fn convoy_branch_refresh_reuses_repository_results(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    // All pairs of found, absent, ordinary failure, and classified limit,
+    // plus empty input and duplicate keys. Async interleavings are covered by
+    // the aggregator's generation/cancellation tests; this seam is sequential.
+    let replies = [RestAdmissionReply::Success, RestAdmissionReply::Absent, RestAdmissionReply::Ordinary, RestAdmissionReply::Limited];
+    let outcomes = [
+        replies[tc.draw(gs::integers::<usize>().min_value(0).max_value(3))],
+        replies[tc.draw(gs::integers::<usize>().min_value(0).max_value(3))],
+    ];
+    let empty = tc.draw(gs::booleans());
+    let duplicate = tc.draw(gs::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        for (outcomes, empty, duplicate) in [
+            (outcomes, empty, duplicate),
+            ([RestAdmissionReply::Success, RestAdmissionReply::Success], false, true),
+            ([RestAdmissionReply::Absent, RestAdmissionReply::Success], false, false),
+            ([RestAdmissionReply::Limited, RestAdmissionReply::Success], false, false),
+        ] {
+            let fixture = rest_admission_fixture(outcomes, RestAdmissionLookup::Branch).await;
+            let snapshots = fixture
+                .keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| ConvoyRepositorySpec {
+                    repo_ref: key.clone(),
+                    url: format!("https://github.com/team/repo{index}"),
+                    source_ref: "main".into(),
+                    target_ref: "main".into(),
+                    workspace_slug: format!("repo{index}"),
+                    subpaths: Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            let spec = ConvoySpec::builder()
+                .workflow_ref("workflow".into())
+                .repositories(if empty { Vec::new() } else { snapshots })
+                .r#ref("feature/wanted".into())
+                .build();
+            let convoys = fixture.daemon.resource_backend().using::<ResourceConvoy>("flotilla");
+            convoys.create(&test_meta("refresh-reuse"), &spec).await.expect("convoy");
+            let mut keys = if empty { Vec::new() } else { fixture.keys.clone() };
+            if !empty && duplicate {
+                keys.push(keys[0].clone());
+            }
+            let refresh = fixture.daemon.refresh_convoy_branch(&keys, "feature/wanted", None).await;
+            let discovery = fixture
+                .daemon
+                .discover_convoy_branch_subjects_with_resolution("flotilla", "refresh-reuse", "feature/wanted", Some(&refresh))
+                .await;
+            let expected_count = if empty { 0 } else { 2 };
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), expected_count);
+            assert_eq!(refresh.repositories.len(), expected_count);
+            let expected_found = if empty { 0 } else { outcomes.iter().filter(|reply| **reply == RestAdmissionReply::Success).count() };
+            let convoy = convoys.get("refresh-reuse").await.expect("convoy");
+            let status = convoy.status.unwrap_or_default();
+            assert_eq!(status.subjects.len(), expected_found);
+            let failed = !empty && outcomes.iter().any(|reply| matches!(reply, RestAdmissionReply::Ordinary | RestAdmissionReply::Limited));
+            assert_eq!(discovery.is_err(), failed);
+            assert_eq!(status.branch_subject_scan_error.is_some(), failed);
+            if expected_found > 0 {
+                let expected_index = outcomes.iter().position(|reply| *reply == RestAdmissionReply::Success).expect("match");
+                assert_eq!(refresh.primary.expect("primary success").expect("match").repository_key, fixture.keys[expected_index]);
+            } else {
+                assert_eq!(refresh.primary.is_err(), failed);
+            }
+        }
+    });
 }

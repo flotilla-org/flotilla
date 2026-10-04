@@ -851,31 +851,20 @@ impl ReadProjections<'_> {
             .into_iter()
             .map(|forge| forge.spec)
             .collect::<Vec<_>>();
-        let reference_context = flotilla_protocol::ReferenceContext {
-            repositories: convoy
-                .spec
-                .repositories
-                .iter()
-                .filter_map(|repository| {
-                    let address = flotilla_resources::change_request_address_with_forges(&repository.url, "1", &forges).ok()?;
-                    let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, .. } = address else { return None };
-                    let canonical = flotilla_resources::canonicalize_repo_url(&repository.url).ok()?;
-                    let web_base = forges
-                        .iter()
-                        .find(|forge| forge.forge_id == service)
-                        .map(|forge| forge.https_url.clone())
-                        .or_else(|| canonical.strip_suffix(&format!("/{scope}")).map(str::to_string))?;
-                    let forge_alias = (service != "github.com").then(|| service.clone());
-                    Some(flotilla_protocol::RepositoryAlias {
-                        project: convoy.spec.project_ref.clone(),
-                        alias: scope.rsplit('/').next()?.to_string(),
-                        source: flotilla_protocol::IssueSource { service, scope },
-                        web_base,
-                        forge_alias,
-                    })
-                })
-                .collect(),
+        let project = match &convoy.spec.project_ref {
+            Some(name) => self.backend.including_replicas::<Project>(namespace).get(name).await.ok().map(|record| record.object),
+            None => None,
         };
+        let repositories = self.backend.including_replicas::<Repository>(namespace).list().await.map_err(|error| error.to_string())?;
+        let repository_specs =
+            repositories.items.iter().map(|record| (record.object.spec.key(), &record.object.spec)).collect::<HashMap<_, _>>();
+        let reference_context = flotilla_resources::convoy_reference_context(
+            &convoy.spec.repositories,
+            convoy.spec.project_ref.as_deref(),
+            project.as_ref().map(|project| &project.spec),
+            &forges,
+            |key| repository_specs.get(key).copied(),
+        );
         let subjects = convoy_subject_rows(&convoy, &reference_context);
         let change_request_stale_after = self.leaf_subscriptions.change_request_stale_after();
 
