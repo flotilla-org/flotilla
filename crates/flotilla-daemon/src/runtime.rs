@@ -5520,8 +5520,12 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
     }
 }
 
-// Only prune the convoy subtree, never its repository root. rmdir is atomic
-// with respect to emptiness, so a concurrent creator cannot lose its files.
+// Managed checkout provisioning names the parent after the Convoy resource:
+// <repository root>/<convoy name>/<branch>[/<repository>]. Removal receives only
+// the target path, so this uses that convention rather than an owner lookup.
+// A legacy path with another convoy-prefixed ancestor may match it too; only
+// empty directories up to that ancestor can be pruned, never its parent.
+// rmdir is atomic with respect to emptiness, so concurrent files cannot be lost.
 async fn cleanup_convoy_checkout_parents(runner: &dyn CommandRunner, target: &Path) {
     let Some(convoy_dir) = target
         .ancestors()
@@ -5555,6 +5559,8 @@ async fn cleanup_convoy_checkout_parents(runner: &dyn CommandRunner, target: &Pa
 async fn sweep_host_empty_convoy_directories(backend: &ResourceBackend, host: &str) -> Result<(), String> {
     // Repository roots are shared across namespaces. Include replicated convoys,
     // and fail closed on any listing error before touching the filesystem.
+    // VesselReconciler reads its existing Convoy before creating Checkouts;
+    // checkout provisioning therefore starts after the owner is in this store.
     let mut live = BTreeSet::new();
     for namespace in backend.stored_namespaces::<Convoy>().await.map_err(|error| error.to_string())? {
         live.extend(
@@ -5584,6 +5590,8 @@ async fn sweep_host_empty_convoy_directories(backend: &ResourceBackend, host: &s
     Ok(())
 }
 
+// These roots belong to this daemon's host-direct environments, so local fs
+// access is appropriate. Teardown instead uses the checkout environment runner.
 async fn sweep_empty_convoy_directories(root: &Path, live: &BTreeSet<String>) -> Result<(), String> {
     let mut entries = match tokio::fs::read_dir(root).await {
         Ok(entries) => entries,
@@ -5595,10 +5603,11 @@ async fn sweep_empty_convoy_directories(root: &Path, live: &BTreeSet<String>) ->
         if !name.starts_with("convoy-") || live.contains(&name) || !entry.file_type().await.map_err(|error| error.to_string())?.is_dir() {
             continue;
         }
-        // Never recurse: nonempty leftovers and symlinks are preserved.
+        // Never recurse: nonempty leftovers (even empty child directories) and
+        // symlinks are preserved, as required by the never-nonempty contract.
         if let Err(error) = tokio::fs::remove_dir(entry.path()).await {
             if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(convoy_ref = %name, %error, "keeping stale convoy directory");
+                debug!(convoy_ref = %name, %error, "keeping stale convoy directory");
             }
         }
     }
@@ -10066,6 +10075,45 @@ dependency = { path = "../dependency" }
         assert!(remote.join("convoy-gone").exists());
     }
 
+    // #2610: failed resource discovery must leave every candidate untouched.
+    // Corrupt the real SQLite store's sequence table to make a typed listing
+    // fail after namespace discovery, both for Convoys and for Environments.
+    #[tokio::test]
+    async fn empty_convoy_sweep_fails_closed_on_listing_errors() {
+        for has_convoy_namespace in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let root = temp.path().join("repos");
+            let candidate = root.join("convoy-orphan");
+            fs::create_dir_all(&candidate).expect("empty stale convoy directory");
+            let database = temp.path().join("resources.sqlite");
+            let backend = ResourceBackend::Sqlite(SqliteBackend::open(&database).expect("resource store"));
+            backend
+                .using::<Environment>(NAMESPACE)
+                .create(&empty_meta("host-direct"), &EnvironmentSpec {
+                    host_direct: Some(HostDirectEnvironmentSpec {
+                        host_ref: "local".into(),
+                        repo_default_dir: root.to_str().expect("root path").into(),
+                    }),
+                    docker: None,
+                })
+                .await
+                .expect("host environment");
+            if has_convoy_namespace {
+                backend
+                    .using::<Convoy>(NAMESPACE)
+                    .create(&empty_meta("convoy-live"), &ConvoySpec::builder().workflow_ref("test".into()).build())
+                    .await
+                    .expect("live convoy");
+            }
+            let connection = rusqlite::Connection::open(&database).expect("fault injection connection");
+            connection.execute("DROP TABLE resource_sequences", []).expect("inject listing failure");
+            drop(connection);
+            let error = sweep_host_empty_convoy_directories(&backend, "local").await.expect_err("failed listing must stop sweep");
+            assert!(error.contains("resource_sequences"), "{error}");
+            assert!(candidate.exists(), "listing failure must preserve empty candidates");
+        }
+    }
+
     // #2610: periodic sweeping preserves live, nonempty, unrelated and symlink entries; repeating is harmless.
     #[tokio::test]
     async fn empty_convoy_sweep_contract() {
@@ -10491,7 +10539,7 @@ dependency = { path = "../dependency" }
             CheckoutRemovalOutcome::ArchivedAndRemoved { .. }
         ));
         assert!(!target.exists());
-        assert!(!target.parent().unwrap().exists(), "landed archived checkout must remove its empty convoy parent");
+        assert!(!target.parent().expect("checkout parent").exists(), "landed archived checkout must remove its empty convoy parent");
         let archive_parent = temp.path().join(".flotilla-archives");
         assert!(fs::read_dir(archive_parent)
             .expect("archive directory")
