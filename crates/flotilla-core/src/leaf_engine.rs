@@ -239,8 +239,8 @@ fn is_conflict_probe(leaf: &Leaf) -> bool {
 
 fn is_active_change_request_probe(leaf: &Leaf) -> bool {
     is_conflict_probe(leaf)
-        || matches!(leaf.address, LeafAddress::ChangeRequest { .. })
-            && matches!(leaf.field_path.as_str(), ".checks" | ".review.actionable-at-head")
+        || (matches!(leaf.address, LeafAddress::ChangeRequest { .. })
+            && matches!(leaf.field_path.as_str(), ".checks" | ".review.actionable-at-head"))
 }
 
 fn refusal_nudge_brief(refusal: &CrewCompletionRefusal) -> String {
@@ -740,6 +740,7 @@ impl LeafSubscriptionTable {
         let claim = status.crew_work.get(&rule.to.vessel).and_then(|crew| crew.get(&rule.to.role));
         let claim_at = claim.and_then(|claim| claim.finished_at);
         let active_probe = status.phase == ConvoyPhase::Active && claim_at.is_none() && is_active_change_request_probe(leaf);
+        let active_conflict = active_probe && is_conflict_probe(leaf);
         let (subject_revision, evidence_at, brief) = match &leaf.address {
             LeafAddress::ChangeRequest { service, scope, number } => {
                 let record_name = flotilla_resources::change_request_record_name(service, scope, *number);
@@ -762,8 +763,8 @@ impl LeafSubscriptionTable {
                     ".mergeable" => cr.mergeable.observed_at,
                     _ => return Err(format!("turn-delivery leaf path `{}` has no firing evidence timestamp", leaf.field_path)),
                 };
-                let brief = if active_probe && is_conflict_probe(leaf) {
-                    format!("PR #{number} is conflicting. Rebase onto the current base branch, rerun the gates, push, then file a settlement claim.")
+                let brief = if active_conflict {
+                    format!("{}\n\nPR #{number} is conflicting. Rebase onto the current base branch, rerun the gates, push, then file a settlement claim.", rule.brief.trim())
                 } else if active_probe {
                     format!(
                         "{}\n\n## Turn firing context\n\n- Condition source: `{source}`\n- Head SHA: `{head_sha}`\n- Checks: {:?}\n- Review actionable at head: {:?}\n- Durable convoy record: `{namespace}/{convoy_name}`\n- Target crew: `{}/{}`\n",
@@ -901,10 +902,12 @@ impl LeafSubscriptionTable {
         {
             return Ok(());
         }
+        // Active checks/review turns require evidence newer than this work's start;
+        // an already-green adopted PR waits for a fresh observation.
         let judged_at = claim_at
             .or_else(|| active_probe.then(|| status.started_at.unwrap_or(convoy.metadata.creation_timestamp)))
             .ok_or_else(|| format!("turn-delivery target {}/{} has no settlement claim", rule.to.vessel, rule.to.role))?;
-        if evidence_at <= judged_at && !(active_probe && is_conflict_probe(leaf)) {
+        if !active_conflict && evidence_at <= judged_at {
             return Ok(());
         }
 
@@ -5018,6 +5021,9 @@ mod tests {
             })
             .expect("active checks-settled subscription");
         let LeafWatcher::TurnDelivery { source, rule, .. } = &row.watcher else { unreachable!() };
+        // Subscribe before writing observations so a delivery racing the status
+        // read remains buffered, with no polling or missed notification.
+        let mut convoy_watch = convoys.watch(WatchStart::Now).await.expect("delivery watch");
         for (index, pass) in outcomes.iter().enumerate() {
             for checks in [None, Some(ObservedChecks::Pending), Some(if *pass { ObservedChecks::Pass } else { ObservedChecks::Fail })] {
                 let observed = flotilla_resources::ChangeRequestStatus {
@@ -5063,7 +5069,7 @@ mod tests {
                                 if current.turn_deliveries.get(source).is_some_and(|state| state.episodes.len() == index + 1) {
                                     break;
                                 }
-                                tokio::task::yield_now().await;
+                                convoy_watch.next().await.expect("delivery watch open").expect("delivery event");
                             }
                         })
                         .await
@@ -5085,6 +5091,25 @@ mod tests {
             assert!(requests[0].brief.contains("Head SHA: `head-0`"));
             assert!(requests[0].brief.contains("Inspect checks and reviews"));
         }
+        // Active conflict turns honor the workflow's declared instructions,
+        // just as active checks and review turns do.
+        for task in table.inner.tasks.lock().await.drain().map(|(_, task)| task) {
+            task.abort();
+        }
+        let conflict = table.rows().await.into_iter().find(|row| is_conflict_probe(&row.leaves[0])).expect("active conflict subscription");
+        let LeafWatcher::TurnDelivery { source, rule, .. } = &conflict.watcher else { unreachable!() };
+        loop {
+            let current = records.get(&name).await.expect("record");
+            let mut observed = current.status.expect("observation");
+            observed.mergeable = Observation::known(flotilla_resources::ObservedMergeability::Conflicting, Utc::now());
+            match records.update_status(&name, &current.metadata.resource_version, &observed).await {
+                Ok(_) => break,
+                Err(ResourceError::Conflict { .. }) => continue,
+                Err(error) => panic!("observe conflict: {error}"),
+            }
+        }
+        table.deliver_turn(conflict.id, "checks-wake", source, rule, &conflict.leaves[0]).await.expect("active conflict turn");
+        assert!(actuator.requests.lock().expect("requests").last().expect("conflict request").brief.starts_with(rule.brief.trim()));
         for row in table.rows().await {
             table.finish(row.id).await;
         }
