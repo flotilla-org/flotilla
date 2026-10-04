@@ -738,6 +738,10 @@ impl ConvoyStatus {
         if source == SubjectDiscoverySource::Operator {
             self.unlinked_subjects.retain(|unlinked| unlinked != &subject);
         }
+        if subject.kind == flotilla_protocol::SubjectKind::ChangeRequest && relationship == Relationship::Produces {
+            self.branch_subject_scan_at = Some(at);
+            self.branch_subject_scan_error = None;
+        }
         if let Some(existing) = self.subjects.iter_mut().find(|entry| entry.subject == subject && entry.relationship == relationship) {
             if let Some(evidence) = existing.sources.iter_mut().find(|evidence| evidence.source == source) {
                 evidence.at = at;
@@ -805,12 +809,13 @@ pub struct ConvoyStatus {
     pub phase: ConvoyPhase,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subjects: Vec<DiscoveredSubject>,
-    /// The latest successful search of every admitted repository for this
-    /// convoy's branch. The default can be removed one fleet roll after this
-    /// field first ships, per ADR 0047.
+    /// Discovery completed by a successful search of every admitted repository
+    /// or by recording a produced change request from any source. The default
+    /// can be removed one fleet roll after this field first ships, per ADR 0047.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_subject_scan_at: Option<DateTime<Utc>>,
-    /// Latest branch discovery failure. The default is a one-roll decoder.
+    /// Latest branch discovery failure; diagnostic once a subject is known.
+    /// The default is a one-roll decoder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_subject_scan_error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
