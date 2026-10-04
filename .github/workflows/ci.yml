@@ -160,7 +160,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "windows-client"
-      - run: cargo --config 'profile.dev.package."*".debug=0' clippy -p flotilla-client -p flotilla-manifest -p flotilla-transport --locked
+      - run: cargo --config 'profile.dev.package."*".debug=0' clippy -p flotilla-client -p flotilla-manifest -p flotilla-transport --locked -- -D warnings
       - run: cargo --config 'profile.dev.package."*".debug=0' build --bin flotilla --locked
       - run: "cargo --config 'profile.dev.package.\"*\".debug=0' test -p flotilla-client --locked --lib windows_tests::"
       - name: Test Wheelhouse named-pipe HTTP contract
