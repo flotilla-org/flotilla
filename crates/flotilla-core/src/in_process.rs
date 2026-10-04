@@ -7833,7 +7833,9 @@ impl InProcessDaemon {
             hook_precedence_seconds = flotilla_resources::TerminalAttention::FRESH_FOR.num_seconds(),
             reason = if crew_phase == flotilla_resources::CrewWorkPhase::Working && !at_turn_boundary && !agent_exited {
                 "queue_until_turn_boundary"
-            } else { "release_at_turn_boundary_or_completed_work" },
+            } else if agent_exited { "release_after_agent_exit" }
+            else if at_turn_boundary { "release_at_turn_boundary" }
+            else { "release_completed_work" },
             "crew turn delivery decision"
         );
         if crew_phase == flotilla_resources::CrewWorkPhase::Working && !at_turn_boundary && !agent_exited {
@@ -8267,17 +8269,31 @@ impl InProcessDaemon {
                         .filter_map(|session| session.object.status.as_ref())
                         .filter_map(|status| status.attention.as_ref())
                         .max_by_key(|attention| attention.as_of);
-                    tracing::info!(
-                        convoy = %convoy.metadata.name, source = ?pending.sender,
-                        vessel = %pending.vessel, role = %pending.role,
-                        attention_state = ?attention.map(|attention| attention.state),
-                        attention_source = ?attention.map(|attention| attention.source),
-                        attention_as_of = ?attention.map(|attention| attention.as_of),
-                        queued_at = %pending.queued_at,
-                        hook_precedence_seconds = flotilla_resources::TerminalAttention::FRESH_FOR.num_seconds(),
-                        reason = if boundary { "release_fresh_idle_after_queue" } else { "skip_without_fresh_idle_after_queue" },
-                        "pending crew turn delivery decision"
-                    );
+                    if boundary {
+                        tracing::info!(
+                            convoy = %convoy.metadata.name, source = ?pending.sender,
+                            vessel = %pending.vessel, role = %pending.role,
+                            attention_state = ?attention.map(|attention| attention.state),
+                            attention_source = ?attention.map(|attention| attention.source),
+                            attention_as_of = ?attention.map(|attention| attention.as_of),
+                            queued_at = %pending.queued_at,
+                            hook_precedence_seconds = flotilla_resources::TerminalAttention::FRESH_FOR.num_seconds(),
+                            reason = if boundary { "release_fresh_idle_after_queue" } else { "skip_without_fresh_idle_after_queue" },
+                            "pending crew turn delivery decision"
+                        );
+                    } else {
+                        tracing::debug!(
+                            convoy = %convoy.metadata.name, source = ?pending.sender,
+                            vessel = %pending.vessel, role = %pending.role,
+                            attention_state = ?attention.map(|attention| attention.state),
+                            attention_source = ?attention.map(|attention| attention.source),
+                            attention_as_of = ?attention.map(|attention| attention.as_of),
+                            queued_at = %pending.queued_at,
+                            hook_precedence_seconds = flotilla_resources::TerminalAttention::FRESH_FOR.num_seconds(),
+                            reason = if boundary { "release_fresh_idle_after_queue" } else { "skip_without_fresh_idle_after_queue" },
+                            "pending crew turn delivery decision"
+                        );
+                    }
                     if boundary {
                         if let Err(error) = self
                             .convoy_resume_with_sender_locked(

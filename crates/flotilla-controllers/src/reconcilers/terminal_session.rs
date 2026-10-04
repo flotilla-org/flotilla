@@ -394,20 +394,37 @@ where
                         .await
                         .map_err(ResourceError::other)?;
                     let attention = obj.status.as_ref().and_then(|status| status.attention.as_ref());
-                    tracing::info!(
-                        convoy = ?obj.metadata.labels.get(CONVOY_LABEL), source = ?message.sender,
-                        message_id = %message.id, %session_id, ?readiness, ?outcome,
-                        attention_state = ?attention.map(|attention| attention.state),
-                        attention_source = ?attention.map(|attention| attention.source),
-                        attention_as_of = ?attention.map(|attention| attention.as_of),
-                        hook_precedence_seconds = TerminalAttention::FRESH_FOR.num_seconds(),
-                        reason = match outcome {
-                            TerminalDeliveryOutcome::Pending => "wait_for_boundary_or_submission_evidence",
-                            TerminalDeliveryOutcome::Confirmed => "submission_confirmed",
-                            TerminalDeliveryOutcome::Unconfirmed(_) => "delivery_unconfirmed",
-                        },
-                        "terminal crew turn delivery decision"
-                    );
+                    if outcome == TerminalDeliveryOutcome::Pending {
+                        tracing::debug!(
+                            convoy = ?obj.metadata.labels.get(CONVOY_LABEL), source = ?message.sender,
+                            message_id = %message.id, %session_id, ?readiness, ?outcome,
+                            attention_state = ?attention.map(|attention| attention.state),
+                            attention_source = ?attention.map(|attention| attention.source),
+                            attention_as_of = ?attention.map(|attention| attention.as_of),
+                            hook_precedence_seconds = TerminalAttention::FRESH_FOR.num_seconds(),
+                            reason = match outcome {
+                                TerminalDeliveryOutcome::Pending => "wait_for_boundary_or_submission_evidence",
+                                TerminalDeliveryOutcome::Confirmed => "submission_confirmed",
+                                TerminalDeliveryOutcome::Unconfirmed(_) => "delivery_unconfirmed",
+                            },
+                            "terminal crew turn delivery decision"
+                        );
+                    } else {
+                        tracing::info!(
+                            convoy = ?obj.metadata.labels.get(CONVOY_LABEL), source = ?message.sender,
+                            message_id = %message.id, %session_id, ?readiness, ?outcome,
+                            attention_state = ?attention.map(|attention| attention.state),
+                            attention_source = ?attention.map(|attention| attention.source),
+                            attention_as_of = ?attention.map(|attention| attention.as_of),
+                            hook_precedence_seconds = TerminalAttention::FRESH_FOR.num_seconds(),
+                            reason = match outcome {
+                                TerminalDeliveryOutcome::Pending => "wait_for_boundary_or_submission_evidence",
+                                TerminalDeliveryOutcome::Confirmed => "submission_confirmed",
+                                TerminalDeliveryOutcome::Unconfirmed(_) => "delivery_unconfirmed",
+                            },
+                            "terminal crew turn delivery decision"
+                        );
+                    }
                     return Ok(match outcome {
                         // Waiting for a turn boundary must not suppress the
                         // observation that releases other queued deliveries.

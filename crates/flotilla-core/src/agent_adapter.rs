@@ -885,7 +885,7 @@ async fn seed_codex_workspace_trust(
         && document.get("notify").and_then(Item::as_array).is_none_or(|array| {
             array.iter().map(|entry| entry.as_str()).ne(crate::agents::CODEX_NOTIFY_COMMAND.iter().map(|entry| Some(*entry)))
         });
-    tracing::info!(contained, config_path = %config.path.display(), notify_repaired = needs_notify,
+    tracing::info!(contained, config_path = %config.path.display(), notify_repair_needed = needs_notify,
         reason = if contained { "contained_notify_configuration" } else { "host_direct_invocation_override" },
         "Codex turn hook configuration");
     if needs_notify {
@@ -2166,7 +2166,10 @@ mod tests {
         let mut screen = (0..count).map(|n| format!("› {n} submitted prompt\nresponse\n")).collect::<String>();
         // Background terminals are independent of the foreground Codex turn.
         let background_count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
-        screen.push_str(&format!("Worked for 10m 43s • 3:56 PM\n\n› Ask Codex to do anything\n\n  {background_count} background terminal running · /ps\n\ngpt-6.1-sol · /workspace"));
+        screen.push_str(&format!(
+            "Worked for 10m 43s • 3:56 PM\n\n› Ask Codex to do anything\n\n  \
+             {background_count} background terminal running · /ps\n\ngpt-6.1-sol · /workspace"
+        ));
         assert_eq!(codex.classify_screen_attention(&screen), Some(TerminalAttentionState::Idle));
     }
 

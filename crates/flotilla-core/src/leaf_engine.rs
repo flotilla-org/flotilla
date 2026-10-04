@@ -4089,6 +4089,41 @@ mod tests {
                 );
             }
         }
+        // A live governor does not turn an explicit/consumed operator policy
+        // into a lookup failure. Both operator routes must explain that choice.
+        for (policy, expected_reason) in
+            [(Vec::new(), "supervision_policy_exhausted"), (vec![SupervisionTarget::Operator], "operator_rung_selected")]
+        {
+            let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = LogWriter(logs.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+            tracing::subscriber::with_default(subscriber, || {
+                runtime.block_on(async {
+                    let (backend, wake, delivery) = project_supervision_case(&[("governor", 1, ConvoyPhase::Active)]).await;
+                    let convoys = backend.using::<Convoy>("flotilla");
+                    let source = convoys.get("stalled-work").await.expect("source");
+                    let now = source.metadata.creation_timestamp + chrono::Duration::seconds(120);
+                    let mut status = source.status.expect("status");
+                    status.workflow_snapshot.as_mut().expect("snapshot").supervision = Some(policy);
+                    let source =
+                        convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("operator policy");
+                    wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), source)]), now).await.expect("judge policy");
+                    assert!(delivery.requests.lock().expect("deliveries").is_empty(), "policy must not contact the live governor");
+                });
+            });
+            let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8 logs");
+            assert_eq!(text.lines().count(), 1, "one operator decision: {text}");
+            assert!(text.contains(expected_reason), "{text}");
+            assert!(text.contains("target=Operator"), "{text}");
+            assert!(text.contains("supervision_start=0"), "{text}");
+            assert!(!text.contains("supervisor_lookup_failed"), "{text}");
+        }
     }
 
     // Draw failure modes and sequences of reconciles/restarts. Check fallback after
