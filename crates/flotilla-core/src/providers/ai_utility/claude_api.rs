@@ -133,4 +133,48 @@ mod tests {
 
         assert!(matches!(result, Err(message) if message.contains("timed out after 15s")));
     }
+    // Anthropic's documented Messages contract requires key/version headers and
+    // model, max_tokens and messages: https://platform.claude.com/docs/en/api/messages/create
+    // Glue: one request exercises this endpoint's single serialization path.
+    #[tokio::test]
+    #[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "requires loopback listener")]
+    async fn messages_request_satisfies_http_contract() {
+        use axum::{body::Bytes, routing::post, Router};
+        use http::{HeaderMap, StatusCode};
+        use serde_json::{json, Value};
+
+        use crate::providers::http_contract::StandIn;
+        async fn receive(headers: HeaderMap, body: Bytes) -> (StatusCode, String) {
+            let valid_headers = headers.get("x-api-key").is_some_and(|v| v == "test-key")
+                && headers.get("anthropic-version").is_some_and(|v| v == "2023-06-01")
+                && headers.get("content-type").is_some_and(|v| v == "application/json");
+            let Ok(body) = serde_json::from_slice::<Value>(&body) else {
+                return (StatusCode::BAD_REQUEST, "malformed JSON request".into());
+            };
+            let valid_body = body["model"].as_str().is_some_and(|v| !v.is_empty())
+                && body["max_tokens"].as_u64().is_some_and(|v| v > 0)
+                && body["messages"].as_array().is_some_and(|messages| {
+                    !messages.is_empty() && messages.iter().all(|m| m["role"] == "user" && m["content"].is_string())
+                });
+            if valid_headers && valid_body {
+                (StatusCode::OK, json!({"content":[{"type":"text","text":"contract-branch"}]}).to_string())
+            } else {
+                (StatusCode::BAD_REQUEST, "invalid Messages request".into())
+            }
+        }
+        let server = StandIn::start("https://api.anthropic.com", Router::new().route("/v1/messages", post(receive))).await;
+        let utility = ClaudeApiAiUtility::new("test-key".into(), server.http.clone());
+        assert_eq!(utility.generate_branch_name("HTTP contract").await.expect("accepted request"), "contract-branch");
+        // Malformed JSON must receive a service refusal, not panic the handler.
+        let response = crate::tls::client()
+            .post(server.url.join("/v1/messages").expect("stand-in URL"))
+            .header("x-api-key", "test-key")
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .body("{")
+            .send()
+            .await
+            .expect("malformed request response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }

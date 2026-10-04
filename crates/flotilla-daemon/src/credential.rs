@@ -5289,3 +5289,7 @@ interactions:
         assert!(!legacy.exists(), "legacy orphan must be removed once no environment can own it");
     }
 }
+
+#[cfg(test)]
+#[path = "credential/http_contract.rs"]
+mod http_contract;

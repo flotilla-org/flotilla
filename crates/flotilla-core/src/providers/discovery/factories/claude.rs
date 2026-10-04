@@ -114,6 +114,12 @@ impl Factory for ClaudeCliAiUtilityFactory {
 
 #[cfg(test)]
 mod tests {
+    // HTTP audit (#1512): the consumer cloud-session endpoints use the unpublished
+    // ccr-byoc beta contract and keychain OAuth credentials, not the documented
+    // Anthropic Messages API. No enforcing stand-in can claim published rules,
+    // and live recording would capture user OAuth material. Legacy claude_*.yaml
+    // files are not referenced by active tests and are not claimed as coverage.
+    // Neither service-contract option applies here; this remains a coverage gap.
     use std::sync::Arc;
 
     use super::{ClaudeApiAiUtilityFactory, ClaudeCliAiUtilityFactory, ClaudeCodingAgentFactory};

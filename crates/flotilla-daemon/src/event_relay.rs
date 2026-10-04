@@ -334,6 +334,12 @@ pub(crate) fn spawn(daemon: Arc<InProcessDaemon>, config: RelayConfig, state_dir
 
 #[cfg(test)]
 mod tests {
+    // HTTP audit (#1512): relay long-poll GET/ack POST and WebSocket upgrade
+    // implement Flotilla's own ConsumerFrame/StreamFrame protocol, not an external
+    // service with separately documented header requirements. The in-memory relay
+    // scenarios below cover that protocol; there is no live replay fixture or
+    // external-service stand-in for this owned boundary. HTTP transport coverage
+    // remains separate from these lifecycle scenarios.
     use std::{collections::HashSet, sync::Mutex};
 
     use flotilla_relay_protocol::{Delivery, Hint, SubjectKind};

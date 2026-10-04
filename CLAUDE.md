@@ -67,6 +67,8 @@ subscribers. Keep tests that require process-wide state (such as a global alloca
 
 ## Testing Philosophy
 
+- Outbound HTTP code must be tested against an in-process stand-in that enforces the remote service's documented request requirements, or against a recorded replay fixture. Mock-only coverage that accepts arbitrary requests is insufficient. Document justified exceptions beside the affected tests; the [HTTP audit](docs/http-request-contract-audit.md) indexes coverage and exceptions. Use test identities and signing keys for credential contracts; never record live token mints.
+
 - Prefer behavior tests that run through injected collaborators over tests that depend on real filesystem state, subprocess orchestration, sockets, or live multi-host setup.
 - When a subsystem has multiple storage or transport implementations, specify the behavior once and run the same contract tests against each implementation.
 - Use in-memory implementations for most logical scenario tests when they make setup clearer and failures easier to reason about.
