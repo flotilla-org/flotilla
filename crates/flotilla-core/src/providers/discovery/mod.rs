@@ -516,6 +516,8 @@ pub struct DiscoveryRuntime {
     pub env: Arc<dyn EnvVars>,
     pub(crate) available_space_probe: Arc<dyn AvailableSpaceProbe>,
     /// Configure before discovery; managers retain this shared detector set.
+    /// Append with `Arc::get_mut` only while uniquely owned. Once shared, replace
+    /// the collection to configure a new runtime; existing managers keep their set.
     pub host_detectors: Arc<Vec<Box<dyn HostDetector>>>,
     pub repo_detectors: Vec<Box<dyn RepoDetector>>,
     pub factories: FactoryRegistry,

@@ -88,6 +88,8 @@ impl EnvironmentManager {
 
     /// Register an already-detected local environment and retain its detector
     /// configuration for subsequent provisioned-environment discovery.
+    /// An empty collection disables detector probes for provisioned environments;
+    /// their complete environment variables still populate the discovery bag.
     pub fn from_local_state(
         local_environment_id: EnvironmentId,
         local_host_id: HostId,
@@ -1092,6 +1094,8 @@ mod tests {
 
         let env_id = EnvironmentId::new("custom-provisioned");
         // The fake runner stands in for the provisioned subprocess boundary.
+        // Responses are consumed: custom-tool needs one response for creation
+        // and another for the later ensure probe. Keep both registrations.
         let handle: EnvironmentHandle = Arc::new(MockProvisionedEnvironment {
             id: env_id.clone(),
             image: ImageId::new("mock:image"),
