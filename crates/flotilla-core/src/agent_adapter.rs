@@ -536,11 +536,8 @@ pub fn minimum_harness_version(adapter: &str) -> Option<&'static str> {
 #[async_trait]
 pub trait AgentAdapter: Send + Sync {
     fn id(&self) -> &'static str;
-    fn minimum_harness_version(&self) -> Option<&'static str> {
-        minimum_harness_version(self.id())
-    }
-    /// A positive process exit can prove a launch error even if its terminal
-    /// has vanished. Screen capture enriches the diagnosis but is optional.
+    /// Classify a positive process exit using captured diagnostics. An exit
+    /// code alone need not distinguish launch failure from interruption.
     fn classify_exit_failure(&self, _exit_code: i32, _screen: &str) -> Option<String> {
         None
     }
@@ -747,8 +744,10 @@ impl AgentAdapter for CliAgentAdapter {
         if !matches!(self.flavor, AdapterFlavor::Codex { .. }) || exit_code != 2 {
             return None;
         }
-        let diagnostic = screen.lines().map(str::trim).find(|line| line.starts_with("error:"));
-        Some(format!("Codex launch usage error (exit 2): {}", diagnostic.unwrap_or("harness rejected the invocation")))
+        // Exit 2 without a diagnostic may be a later agent interruption.
+        // Require evidence before making the session irrecoverably Failed.
+        let diagnostic = screen.lines().map(str::trim).find(|line| line.starts_with("error:"))?;
+        Some(format!("Codex launch usage error (exit 2): {diagnostic}"))
     }
 
     fn classify_screen_failure(&self, screen: &str) -> Option<&'static str> {
@@ -1181,17 +1180,17 @@ mod tests {
     }
 
     // Issue #2694: every Codex launch needs the declared --no-daemon floor.
-    // Exit 2 is a usage failure; empty capture still fails visibly. Other
+    // Exit 2 needs a diagnostic; empty capture remains resumable. Other
     // exit codes and a live screen containing quoted errors do not prove it.
     #[hegel::test]
     fn codex_launch_contract_classifies_only_usage_exits(tc: hegel::TestCase) {
         let registry = discovered_registry();
         let codex = registry.get("codex").expect("codex");
-        assert_eq!(codex.minimum_harness_version(), Some("0.160.0"));
+        assert_eq!(super::minimum_harness_version(codex.id()), Some("0.160.0"));
         let code = tc.draw(hegel::generators::integers::<i32>().min_value(0).max_value(255));
         let screen = if tc.draw(hegel::generators::booleans()) { "error: unexpected argument '--no-daemon' found" } else { "" };
         let failure = codex.classify_exit_failure(code, screen);
-        assert_eq!(failure.is_some(), code == 2);
+        assert_eq!(failure.is_some(), code == 2 && !screen.is_empty());
         if let Some(message) = failure {
             assert!(message.contains("exit 2"));
             assert!(screen.is_empty() || message.contains(screen));

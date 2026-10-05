@@ -6165,6 +6165,9 @@ impl TerminalRuntime for TerminalControllerRuntime {
         spec: &flotilla_resources::TerminalSessionSpec,
         exit_code: i32,
     ) -> Result<Option<String>, String> {
+        if exit_code == 0 {
+            return Ok(None);
+        }
         let TerminalSessionSource::Agent { selector, .. } = &spec.source else { return Ok(None) };
         let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
         let registry = self.registry_for_env(&spec.env_ref)?;
@@ -6172,11 +6175,8 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .agent_adapters
             .get(&requirement.adapter)
             .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
-        // Exit classification must survive a disappeared terminal or failed
-        // capture. First ask whether this code alone proves a launch failure.
-        if adapter.classify_exit_failure(exit_code, "").is_none() {
-            return Ok(None);
-        }
+        // A receipt proves an exit, but only captured evidence distinguishes
+        // a launch failure from an interruption. Missing capture stays resumable.
         let screen = match self.pool_for_spec(spec) {
             Ok(pool) => pool.capture_screen(session_id).await.ok().flatten().unwrap_or_default(),
             Err(_) => String::new(),

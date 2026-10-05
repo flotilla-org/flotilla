@@ -734,15 +734,15 @@ where
                 }),
                 _ => None,
             },
-            TerminalSessionPhase::Lost if matches!(prepared, TerminalPrepared::Failed(_)) => {
-                let TerminalPrepared::Failed(message) = prepared else { unreachable!() };
-                Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })
-            }
-            TerminalSessionPhase::Lost if matches!(prepared, TerminalPrepared::Revived) => Some(TerminalSessionStatusPatch::MarkRevived),
-            TerminalSessionPhase::Lost if matches!(prepared, TerminalPrepared::RecoverLost) => {
-                Some(TerminalSessionStatusPatch::MarkStarting)
-            }
-            TerminalSessionPhase::Lost | TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed => None,
+            TerminalSessionPhase::Lost => match prepared {
+                TerminalPrepared::Failed(message) => {
+                    Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })
+                }
+                TerminalPrepared::Revived => Some(TerminalSessionStatusPatch::MarkRevived),
+                TerminalPrepared::RecoverLost => Some(TerminalSessionStatusPatch::MarkStarting),
+                _ => None,
+            },
+            TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed => None,
         }
         .or_else(|| {
             obj.status
