@@ -256,16 +256,30 @@ def test_02_transport_death_re_resolves_forwarded_socket(topology):
             and peer_entry()["link"] == "Connected"
         )
 
-    wait_for(
+    def wait_for_recovery(predicate, description, interval):
+        try:
+            wait_for(
+                predicate,
+                description,
+                timeout=max(0, deadline - time.monotonic()),
+                interval=interval,
+            )
+        except TimeoutError as error:
+            raise AssertionError(
+                f"transport and replication should reconverge within {recovery_timeout} seconds: "
+                f"{description}\n{daemon_log('node-a')[len(initial_log):]}"
+            ) from error
+
+    wait_for_recovery(
         transport_reconnected,
         "SSH transport reconnects with a new forwarded socket",
-        timeout=max(0, deadline - time.monotonic()),
         interval=0.25,
     )
     assert docker_exec(
         "node-b", "cat ~/.config/flotilla/flotillad.pid"
     ).stdout.strip() == remote_pid
-    # Each repetition must observe a new write, never a pre-outage replica.
+    # Each successful kill/reconnect advances the generation, so repetitions
+    # get distinct markers and must observe a new write, never an old replica.
     marker_name = f"transport-recovery-{initial_generation}"
     document = "\n".join([
         "apiVersion: flotilla.work/v1",
@@ -297,10 +311,9 @@ def test_02_transport_death_re_resolves_forwarded_socket(topology):
             for item in listed_objects(listed)
         )
 
-    wait_for(
+    wait_for_recovery(
         template_replicated,
         "replicators re-resolve the replacement forwarded socket",
-        timeout=max(0, deadline - time.monotonic()),
         interval=0.5,
     )
     assert time.monotonic() <= deadline, (
