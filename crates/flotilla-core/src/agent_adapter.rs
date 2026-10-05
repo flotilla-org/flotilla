@@ -1222,6 +1222,7 @@ mod tests {
         assert!(content.contains("**Choice:**"));
         assert!(content.contains("**Alternative:**"));
         assert!(content.contains("**If asking were free:**"));
+        assert!(content.contains("Optionally append a `### Friction` section after all numbered decisions"));
         assert!(content.contains("flotilla artifact put --kind decision-ledger <path>"));
         // #2596: settlement projects the ledger only after a clean final shepherd snapshot.
         let settlement = content.split("\n## Decision ledger\n").nth(1).expect("ledger section");
@@ -1241,6 +1242,7 @@ mod tests {
         assert!(content.contains("--propose <resume|reduce-scope|fail>"));
         assert!(!content.contains("crew fail"));
         assert!(content.contains("## Assignment\n\nFix the flux capacitor."));
+        assert!(content.contains("Write the pull request body with the `pr` skill, inside the repository's pull request template, keeping the line that closes the issue."));
         assert!(content.contains("Every item in every review is in scope"));
         assert!(content.contains("Reply to each finding with a fix and commit, concrete reasoning, or a filed follow-up issue number"));
         assert!(content.contains("While checks are pending, report the PR URL and current state, then yield at the turn boundary."));
@@ -1286,6 +1288,7 @@ mod tests {
         assert!(!content.contains("flotilla crew complete"));
         assert!(!content.contains("flotilla crew fail"));
         assert!(!content.contains("flotilla crew stall"));
+        assert!(content.contains("Write the pull request body with the `pr` skill, inside the repository's pull request template, keeping the line that closes the issue."));
         assert!(content.contains("Open a pull request that closes the issue"));
         assert!(content.contains("ADR carry:"));
         assert!(content.contains("yield at the turn boundary"));

@@ -33,6 +33,10 @@ pub(crate) fn validate_decision_ledger(body: &[u8]) -> Result<(), String> {
     }
     let mut entries = 0;
     while let Some(line) = lines.next() {
+        // Friction is optional trailing prose; complete decisions remain mandatory.
+        if line == "### Friction" {
+            break;
+        }
         entries += 1;
         let prefix = format!("{entries}. **Brief silence:** ");
         if !line.starts_with(&prefix) || line[prefix.len()..].trim().is_empty() {
@@ -372,6 +376,27 @@ mod tests {
         assert_eq!(read_decision_ledger(file.path()).expect("daemon reads body"), valid);
         std::fs::write(file.path(), b"/tmp/ledger.md").expect("write path text");
         assert!(read_decision_ledger(file.path()).is_err());
+    }
+
+    // #2666: trailing friction is optional and cannot replace or repair required decisions.
+    #[test]
+    fn decision_ledger_accepts_optional_trailing_friction() {
+        let decision =
+            "1. **Brief silence:** Naming\n- **Choice:** report.md\n- **Alternative:** output.md\n- **If asking were free:** Which name?\n";
+        let second = decision.replacen("1.", "2.", 1);
+        let multiple = format!("## Decision ledger\n{decision}{second}\n### Friction\nSlow check.");
+        assert!(validate_decision_ledger(multiple.as_bytes()).is_ok());
+        for friction in ["", "\n### Friction\n", "\n### Friction\nMissing command.\n\n- Slow check; retried.\n"] {
+            let body = format!("## Decision ledger\n\n{decision}{friction}");
+            assert!(validate_decision_ledger(body.as_bytes()).is_ok());
+        }
+        for invalid in [
+            "## Decision ledger\n### Friction\nMissing command.",
+            "## Decision ledger\n1. **Brief silence:** Naming\n### Friction\nMissing command.",
+            "## Decision ledger\n1. **Brief silence:** Naming\n- **Choice:** report.md\n- **Alternative:** output.md\n- **If asking were free:** \n### Friction\nMissing command.",
+        ] {
+            assert!(validate_decision_ledger(invalid.as_bytes()).is_err());
+        }
     }
 
     fn input(subject: &str, summary: BTreeMap<String, serde_json::Value>, body: &[u8]) -> ArtifactPutInput {
