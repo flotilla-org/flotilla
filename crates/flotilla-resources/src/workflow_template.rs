@@ -542,6 +542,16 @@ impl Selector {
     }
 }
 
+/// Compatibility for Project and dispatch references authored before the builtin
+/// consolidation. Added 2026-10-05; remove one fleet roll after those references
+/// have been rewritten to `single-agent` (ADR 0047).
+pub fn current_builtin_workflow_name(name: &str) -> &str {
+    match name {
+        "single-agent-contained" | "single-agent-trusted" => "single-agent",
+        _ => name,
+    }
+}
+
 pub fn single_agent_workflow_spec() -> WorkflowTemplateSpec {
     WorkflowTemplateSpec::builder()
         .exit(ExitDeclaration::standard_table())
@@ -641,6 +651,17 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
                 .brief("Inspect checks and reviews at the bound head. Fix failures caused by this PR and continue shepherding; complete when checks pass, review findings are handled, and the PR is mergeable.".to_string())
                 .hold(HoldAct::ChangeRequestComment {
                     body: "Flotilla paused automatic turn delivery after repeated checks-settled episodes; human attention is required.".to_string(),
+                })
+                .build(),
+        ),
+        (
+            "merged-unclaimed".to_string(),
+            TurnDeliveryRule::builder()
+                .on("$cr.state == merged".parse().expect("valid stock merged leaf"))
+                .to(target())
+                .brief("The PR merged. Submit your decision ledger and run `flotilla crew complete` with the PR URL to finish your settlement claim.".to_string())
+                .hold(HoldAct::ChangeRequestComment {
+                    body: "Flotilla could not deliver the merged PR settlement reminder; human attention is required.".to_string(),
                 })
                 .build(),
         ),
@@ -851,7 +872,7 @@ fn validate_turn_delivery(
 ) {
     for (source, rule) in &spec.turn_delivery {
         let admitted = (rule.on.subject == SubjectVariable::ChangeRequest
-            && matches!(rule.on.field_path.as_str(), ".checks" | ".review.actionable-at-head" | ".mergeable")
+            && matches!(rule.on.field_path.as_str(), ".state" | ".checks" | ".review.actionable-at-head" | ".mergeable")
             || rule.on.subject == SubjectVariable::Issue
                 && (matches!(rule.on.field_path.as_str(), ".state" | ".updated-at") || rule.on.field_path.starts_with(".labels."))
             || matches!(rule.on.subject, SubjectVariable::Artifact { .. })
@@ -1183,6 +1204,28 @@ mod tests {
 
     fn agent(capability: &str) -> CrewSource {
         CrewSource::Agent { selector: Selector::for_capability(capability.to_string()), prompt: None, brief_template: None }
+    }
+
+    // ADR 0047/#2701: frozen snapshots lacking the newer stock rules decode
+    // without acquiring new admission rules or changing their persisted meaning.
+    #[test]
+    fn previous_stock_workflow_snapshots_decode_unchanged() {
+        let workflow = super::single_agent_workflow_spec();
+        let mut snapshot = crate::WorkflowSnapshot {
+            exit: workflow.exit,
+            turn_delivery: workflow.turn_delivery,
+            vessels: workflow.vessels,
+            stall_nudges: workflow.stall_nudges,
+            supervision: workflow.supervision,
+        };
+        snapshot.turn_delivery.shift_remove("checks-settled");
+        snapshot.turn_delivery.shift_remove("merged-unclaimed");
+        let stored = serde_json::to_value(&snapshot).expect("previous generation snapshot");
+        assert_eq!(serde_json::from_value::<crate::WorkflowSnapshot>(stored).expect("decode previous snapshot"), snapshot);
+        snapshot.turn_delivery.clear();
+        let mut stored = serde_json::to_value(&snapshot).expect("snapshot without rules");
+        stored.as_object_mut().expect("snapshot object").remove("turn_delivery");
+        assert_eq!(serde_json::from_value::<crate::WorkflowSnapshot>(stored).expect("decode snapshot without rules"), snapshot);
     }
 
     #[test]

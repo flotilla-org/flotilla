@@ -252,9 +252,9 @@ macro_rules! for_each_registered_resource {
 }
 pub use fulfilment_kind::{effective_grants, version_at_least, CapabilityNeed};
 pub use workflow_template::{
-    implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_shepherd_workflow_spec, single_agent_workflow_spec,
-    validate, AllocationDecision, ArtifactSubjectBinding, ClaimExit, CompletionCondition, CrewCompletionExpectation, CrewSource, CrewSpec,
-    ExitDeclaration, HoldAct, InputDefinition, InterpolationField, InterpolationLocation, LeafTemplate, LegacyCompletionExpectation,
-    RoleHandoff, Selector, StallNudgePolicy, Stance, SubjectVariable, SupervisionTarget, TurnDeliveryRule, TurnDeliveryTarget,
-    ValidationError, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
+    current_builtin_workflow_name, implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_shepherd_workflow_spec,
+    single_agent_workflow_spec, validate, AllocationDecision, ArtifactSubjectBinding, ClaimExit, CompletionCondition,
+    CrewCompletionExpectation, CrewSource, CrewSpec, ExitDeclaration, HoldAct, InputDefinition, InterpolationField, InterpolationLocation,
+    LeafTemplate, LegacyCompletionExpectation, RoleHandoff, Selector, StallNudgePolicy, Stance, SubjectVariable, SupervisionTarget,
+    TurnDeliveryRule, TurnDeliveryTarget, ValidationError, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };

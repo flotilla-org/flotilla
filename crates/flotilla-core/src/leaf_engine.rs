@@ -284,10 +284,18 @@ fn is_conflict_probe(leaf: &Leaf) -> bool {
     leaf.field_path == ".mergeable" && leaf.operator == LeafOperator::Equal && leaf.literal == "conflicting"
 }
 
-/// Workflow-declared checks and review rules run during active crew work too,
+fn is_merged_settlement_probe(leaf: &Leaf) -> bool {
+    matches!(leaf.address, LeafAddress::ChangeRequest { .. })
+        && leaf.field_path == ".state"
+        && leaf.operator == LeafOperator::Equal
+        && leaf.literal == "merged"
+}
+
+/// Workflow-declared checks, review and merged settlement rules run during active crew work too,
 /// including custom rules; conflict probes retain their active delivery behavior.
 fn is_active_change_request_probe(status: &ConvoyStatus, rule: &TurnDeliveryRule, leaf: &Leaf) -> bool {
     let active_field = is_conflict_probe(leaf)
+        || is_merged_settlement_probe(leaf)
         || (matches!(leaf.address, LeafAddress::ChangeRequest { .. })
             && matches!(leaf.field_path.as_str(), ".checks" | ".review.actionable-at-head"));
     status.phase == ConvoyPhase::Active
@@ -870,7 +878,7 @@ impl LeafSubscriptionTable {
         let active_probe = is_active_change_request_probe(status, rule, leaf);
         // A cached row can fire after its target stalls or settles, before the
         // reconciler removes it. Judge eligibility against the current status.
-        if status.phase == ConvoyPhase::Active && !active_probe {
+        if (status.phase == ConvoyPhase::Active || is_merged_settlement_probe(leaf)) && !active_probe {
             return Ok(());
         }
         let active_conflict = active_probe && is_conflict_probe(leaf);
@@ -886,11 +894,22 @@ impl LeafSubscriptionTable {
                     .map_err(|error| error.to_string())?;
                 let cr =
                     record.object.status.as_ref().ok_or_else(|| format!("change-request observation `{record_name}` has no status"))?;
-                let head_sha = cr.head_sha.value.clone().ok_or_else(|| "change-request head SHA is unknown".to_string())?;
+                let merged_settlement = is_merged_settlement_probe(leaf);
+                // Once the world is terminal, active CI/review probes cannot add
+                // competing reminders beside the explicit settlement delivery.
+                if active_probe && !merged_settlement && cr.state.value == Some(flotilla_resources::ObservedChangeRequestState::Merged) {
+                    return Ok(());
+                }
+                let head_sha = if merged_settlement {
+                    cr.head_sha.value.clone().unwrap_or_else(|| "unknown".into())
+                } else {
+                    cr.head_sha.value.clone().ok_or_else(|| "change-request head SHA is unknown".to_string())?
+                };
                 if claim_at.is_some_and(|claim_at| cr.head_sha.observed_at <= claim_at) {
                     return Ok(());
                 }
                 let evidence_at = match leaf.field_path.as_str() {
+                    ".state" => cr.state.observed_at,
                     ".checks" => cr.checks.observed_at,
                     ".review.actionable-at-head" => cr.review.actionable_at_head.observed_at,
                     ".mergeable" => cr.mergeable.observed_at,
@@ -934,7 +953,10 @@ impl LeafSubscriptionTable {
                         })
                         .unwrap_or_default()
                 };
-                (head_sha, evidence_at, brief)
+                // Merge is one terminal episode for the subject, independent of
+                // later head observations (including a previously unknown head).
+                let revision = if merged_settlement { format!("{}@merged", leaf.address) } else { head_sha };
+                (revision, evidence_at, brief)
             }
             LeafAddress::Issue { service, scope, number } => {
                 let record_name = flotilla_resources::issue_record_name(service, scope, *number);
@@ -2680,6 +2702,10 @@ impl ReconcilerWake {
             }
             let status = convoy.status.as_ref().expect("parked convoy has status");
             for delivery in instantiate_turn_delivery(convoy, &checkouts, &observed_change_requests, &forges)? {
+                // A merged PR cannot reopen a crew that already claimed settlement.
+                if is_merged_settlement_probe(&delivery.leaf) {
+                    continue;
+                }
                 let Some(claim_at) = status
                     .crew_work
                     .get(&delivery.rule.to.vessel)
@@ -5851,6 +5877,213 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].1.len(), 1);
         assert_eq!(diagnostics[0].1[0].value, "Landed");
+    }
+
+    // #2701: a merged PR wakes an unclaimed crew exactly once, including after
+    // subscription reconstruction. A claimed or terminal crew is never reopened.
+    async fn merged_unclaimed_scenario(repeats: usize, unknown_head: bool) {
+        use flotilla_protocol::Relationship;
+        use flotilla_resources::{Observation, ObservedChangeRequestState, SubjectDiscoverySource};
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let wake = supervision_wake(&backend);
+        let table = &wake.subscriptions;
+        let actuator = Arc::new(RecordingTurnDelivery::default());
+        table.set_turn_delivery_actuator(actuator.clone()).await;
+        let role = "coder";
+        let workflow = flotilla_resources::single_agent_workflow_spec();
+        let convoys = backend.using::<Convoy>("flotilla");
+        let created = convoys
+            .create(
+                &InputMeta::builder().name("checks-wake".into()).build(),
+                &ConvoySpec::builder().workflow_ref("single-agent".into()).build(),
+            )
+            .await
+            .expect("convoy");
+        let base = Utc::now() - chrono::Duration::seconds(2);
+        let mut status = ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            started_at: Some(base),
+            workflow_snapshot: Some(WorkflowSnapshot {
+                stall_nudges: workflow.stall_nudges,
+                supervision: workflow.supervision,
+                exit: workflow.exit,
+                turn_delivery: workflow.turn_delivery,
+                vessels: workflow.vessels,
+            }),
+            work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
+            crew_work: BTreeMap::from([(
+                "work".into(),
+                BTreeMap::from([(role.into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+            )]),
+            ..Default::default()
+        };
+        status.discover_subject(
+            flotilla_protocol::Subject {
+                kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "flotilla-org/flotilla".into() },
+                id: "2596".into(),
+            },
+            Relationship::Produces,
+            SubjectDiscoverySource::Claim,
+            base,
+        );
+        convoys.update_status("checks-wake", &created.metadata.resource_version, &status).await.expect("active crew");
+        let records = backend.using::<ChangeRequest>("flotilla");
+        let name = flotilla_resources::change_request_record_name("github.com", "flotilla-org/flotilla", 2596);
+        records
+            .create(
+                &InputMeta::builder().name(name.clone()).build(),
+                &flotilla_resources::ChangeRequestSpec::builder()
+                    .service("github.com".into())
+                    .scope("flotilla-org/flotilla".into())
+                    .number(2596)
+                    .observing_authority("authority".into())
+                    .build(),
+            )
+            .await
+            .expect("PR record");
+        // Pending, stalled and terminal crews do not owe an active settlement turn.
+        for phase in [CrewWorkPhase::Pending, CrewWorkPhase::Stalled, CrewWorkPhase::Done, CrewWorkPhase::Failed, CrewWorkPhase::HandedBack]
+        {
+            let current = convoys.get("checks-wake").await.expect("convoy");
+            let mut status = current.status.expect("status");
+            status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").phase = phase;
+            let updated = convoys.update_status("checks-wake", &current.metadata.resource_version, &status).await.expect("inactive crew");
+            wake.sync_rows("flotilla", &HashMap::from([("checks-wake".into(), updated)])).await.expect("inactive subscriptions");
+            assert!(
+                !table
+                    .rows()
+                    .await
+                    .iter()
+                    .any(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { source, .. } if source == "merged-unclaimed")),
+                "{phase:?}"
+            );
+        }
+        let current = convoys.get("checks-wake").await.expect("convoy");
+        let mut status = current.status.expect("status");
+        status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew").phase = CrewWorkPhase::Interrupted;
+        convoys.update_status("checks-wake", &current.metadata.resource_version, &status).await.expect("yielded crew");
+        let observed = flotilla_resources::ChangeRequestStatus {
+            state: Observation::known(ObservedChangeRequestState::Merged, Utc::now()),
+            head_sha: if unknown_head { Observation::unknown(Utc::now()) } else { Observation::known("merged-head".into(), Utc::now()) },
+            title: Default::default(),
+            author: Default::default(),
+            review_decision: Default::default(),
+            review_requested_from_owner: Default::default(),
+            checks: Observation::known(ObservedChecks::Pass, Utc::now()),
+            mergeable: Default::default(),
+            review: flotilla_resources::ChangeRequestReviewObservation { actionable_at_head: Default::default() },
+        };
+        let record = records.get(&name).await.expect("record");
+        let record = records.update_status(&name, &record.metadata.resource_version, &observed).await.expect("merged observation");
+        for _ in 0..repeats {
+            let objects = HashMap::from([("checks-wake".into(), convoys.get("checks-wake").await.expect("convoy"))]);
+            wake.sync_rows("flotilla", &objects).await.expect("subscriptions");
+            for task in table.inner.tasks.lock().await.drain().map(|(_, task)| task) {
+                task.abort();
+            }
+            let rows = table.rows().await;
+            let row = table
+                .rows()
+                .await
+                .into_iter()
+                .find(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { source, .. } if source == "merged-unclaimed"))
+                .expect("merged subscription");
+            let empty = HashMap::new();
+            let fire = evaluate_row(
+                &row,
+                &LeafSubjects {
+                    convoys: &objects,
+                    vessels: &empty,
+                    change_requests: &HashMap::from([(name.clone(), record.clone())]),
+                    usages: &HashMap::new(),
+                    issues: &HashMap::new(),
+                    artifacts: &HashMap::new(),
+                },
+                LeafObservationStaleness { change_request: Duration::from_secs(60), issue: Duration::from_secs(60) },
+            )
+            .expect("evaluate merged")
+            .expect("merged fires");
+            table.fire(row.id, fire).await;
+            // Exercise competing CI and review firings from the same merged record.
+            for competing in
+                rows.iter().filter(|candidate| candidate.id != row.id && matches!(candidate.watcher, LeafWatcher::TurnDelivery { .. }))
+            {
+                if let Some(fire) = evaluate_row(
+                    competing,
+                    &LeafSubjects {
+                        convoys: &objects,
+                        vessels: &empty,
+                        change_requests: &HashMap::from([(name.clone(), record.clone())]),
+                        usages: &HashMap::new(),
+                        issues: &HashMap::new(),
+                        artifacts: &HashMap::new(),
+                    },
+                    LeafObservationStaleness { change_request: Duration::from_secs(60), issue: Duration::from_secs(60) },
+                )
+                .expect("competing evaluation")
+                {
+                    table.fire(competing.id, fire).await;
+                }
+            }
+            let LeafWatcher::TurnDelivery { source, rule, .. } = &row.watcher else { unreachable!() };
+            table.deliver_turn(row.id, "checks-wake", source, rule, &row.leaves[0]).await.expect("duplicate delivery");
+            assert_eq!(actuator.requests.lock().expect("requests").len(), 1);
+            let current = convoys.get("checks-wake").await.expect("convoy");
+            assert_eq!(current.status.expect("status").turn_deliveries["merged-unclaimed"].episodes.len(), 1);
+        }
+        assert!(actuator.requests.lock().expect("requests")[0].brief.contains("PR merged"));
+        assert!(actuator.requests.lock().expect("requests")[0].brief.contains("decision ledger"));
+        let current = convoys.get("checks-wake").await.expect("convoy");
+        let mut status = current.status.expect("status");
+        let crew = status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("crew");
+        crew.phase = CrewWorkPhase::Done;
+        crew.finished_at = Some(base);
+        let stale_row = table
+            .rows()
+            .await
+            .into_iter()
+            .find(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { source, .. } if source == "merged-unclaimed"))
+            .expect("cached merge row");
+        let LeafWatcher::TurnDelivery { source, rule, .. } = &stale_row.watcher else { unreachable!() };
+        // A cached firing must recheck both active and parked settlement claims.
+        for phase in [ConvoyPhase::Active, ConvoyPhase::Landing, ConvoyPhase::Anchored] {
+            let current = convoys.get("checks-wake").await.expect("convoy");
+            status.phase = phase;
+            // Clear the episode to prove eligibility, rather than deduplication,
+            // prevents reopening a claimed crew.
+            status.turn_deliveries.clear();
+            convoys.update_status("checks-wake", &current.metadata.resource_version, &status).await.expect("claim");
+            table.deliver_turn(stale_row.id, "checks-wake", source, rule, &stale_row.leaves[0]).await.expect("cached firing after claim");
+            assert_eq!(actuator.requests.lock().expect("requests").len(), 1);
+        }
+        let updated = convoys.get("checks-wake").await.expect("claimed convoy");
+        wake.sync_rows("flotilla", &HashMap::from([("checks-wake".into(), updated)])).await.expect("settled subscriptions");
+        assert!(!table
+            .rows()
+            .await
+            .iter()
+            .any(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { source, .. } if source == "merged-unclaimed")));
+    }
+
+    #[tokio::test]
+    async fn merged_unclaimed_crew_delivers_once() {
+        for unknown_head in [false, true] {
+            merged_unclaimed_scenario(2, unknown_head).await;
+        }
+    }
+
+    // Repeated observations and subscription reconstruction must retain exactly
+    // one terminal delivery, whether the PR head is known or unknown.
+    #[hegel::test]
+    fn generated_merged_unclaimed_delivery_is_idempotent(tc: hegel::TestCase) {
+        let repeats = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(5));
+        let unknown_head = tc.draw(hegel::generators::booleans());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(merged_unclaimed_scenario(repeats, unknown_head));
     }
 
     // #2596: an active crew with a produced PR yields while checks are pending;

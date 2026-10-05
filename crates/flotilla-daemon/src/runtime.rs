@@ -2541,7 +2541,21 @@ fn mark_builtin_managed(mut meta: InputMeta) -> InputMeta {
 /// manifest loop in https://github.com/flotilla-org/flotilla/issues/1192.
 async fn reconcile_builtin_workflow_templates(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
     let templates = backend.clone().definitions::<WorkflowTemplate>(namespace);
-    for (name, spec) in builtin_workflow_templates() {
+    let builtins = builtin_workflow_templates();
+    // Ownership follows the current code-owned set. Tombstone retired definitions
+    // through the merged resolver so replicas cannot resurrect stale builtins.
+    for existing in templates.list().await.map_err(|err| format!("list builtin workflow templates: {err}"))? {
+        if existing.metadata.labels.get(MANAGED_BY_LABEL).is_some_and(|value| value == BUILTIN_MANAGED_BY_VALUE)
+            && !builtins.iter().any(|(name, _)| *name == existing.metadata.name)
+        {
+            templates
+                .delete(&existing.metadata.name)
+                .await
+                .map_err(|err| format!("retire builtin workflow template {}: {err}", existing.metadata.name))?;
+            warn!(template = %existing.metadata.name, "retired orphaned builtin workflow template");
+        }
+    }
+    for (name, spec) in builtins {
         match templates.get(name).await {
             Ok(existing) => {
                 let spec_diverged = existing.spec != spec;
@@ -12476,6 +12490,28 @@ mod tests {
 
         assert_eq!(error.to_string(), "image `contained-image` declares agent adapter `codex`, but interior discovery did not find it");
         assert!(destroyed.load(Ordering::SeqCst), "rejected environment should be destroyed");
+    }
+
+    // #2701: reconciliation removes every orphan still claiming builtin ownership,
+    // preserves user-owned templates, and is idempotent across startup sweeps.
+    #[tokio::test]
+    async fn retired_builtin_records_are_removed_without_deleting_user_templates() {
+        let backend = ResourceBackend::InMemory(Default::default());
+        let templates = backend.definitions::<WorkflowTemplate>(NAMESPACE);
+        for name in ["single-agent-contained", "single-agent-trusted", "unknown-retired"] {
+            let mut stale = flotilla_resources::single_agent_workflow_spec();
+            stale.turn_delivery.shift_remove("checks-settled");
+            templates.create(&mark_builtin_managed(empty_meta(name)), &stale).await.expect("orphan");
+        }
+        templates.create(&empty_meta("user-workflow"), &flotilla_resources::single_agent_workflow_spec()).await.expect("user template");
+        for _ in 0..2 {
+            reconcile_builtin_workflow_templates(&backend, NAMESPACE).await.expect("reconcile");
+            for name in ["single-agent-contained", "single-agent-trusted", "unknown-retired"] {
+                assert!(matches!(templates.get(name).await, Err(ResourceError::NotFound { .. })), "orphan {name}");
+            }
+            assert!(templates.get("user-workflow").await.is_ok());
+            assert!(templates.get("single-agent").await.expect("current builtin").spec.turn_delivery.contains_key("checks-settled"));
+        }
     }
 
     #[tokio::test]
