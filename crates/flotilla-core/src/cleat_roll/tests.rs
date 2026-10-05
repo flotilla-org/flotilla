@@ -1,7 +1,3 @@
-use std::sync::Mutex;
-
-use async_trait::async_trait;
-
 use super::*;
 use crate::providers::{
     discovery::{EnvironmentAssertion, EnvironmentBag},
@@ -48,7 +44,12 @@ async fn recorded_drain_outcomes_preserve_reports_and_continue() {
     {
         let output = recorded(name);
         let expected_stdout = output.stdout.clone();
-        let runner = Arc::new(MockRunner::with_outputs(vec![Ok(output), Ok(recorded("unchanged"))]));
+        let mut outputs = vec![Ok(output)];
+        if name == "nonzero" {
+            outputs.push(Err("discovery unavailable".into()));
+        }
+        outputs.push(Ok(recorded("unchanged")));
+        let runner = Arc::new(MockRunner::with_outputs(outputs));
         let targets = [target(runner.clone(), "default", false), target(runner.clone(), "named", false)];
         let report = drain("host".into(), "generation-2".into(), Path::new("/incoming/bin/cleat"), &targets, vec![]).await;
         assert_eq!(report.failed(), failed, "{name}: {report:?}");
@@ -157,54 +158,17 @@ fn default_runtime_roots_follow_injected_environment() {
     }
 }
 
-// Container daemons must start successors inside their execution environment,
-// using the incoming CLI rather than the older read-only mount. Delivery happens
-// once per environment/root even when it has several logical daemons.
+// #2671: contained toolchains stay pinned until restart. Even a registered
+// runner must receive no file copies, subprocesses or daemon mutations.
 #[tokio::test]
-async fn contained_successor_uses_delivered_incoming_cli_once() {
-    struct Runner {
-        inner: MockRunner,
-        copies: Mutex<Vec<(PathBuf, PathBuf)>>,
-    }
-    #[async_trait]
-    impl CommandRunner for Runner {
-        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
-            self.inner.run(cmd, args, cwd, label).await
-        }
-        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-            self.inner.run_output(cmd, args, cwd, label).await
-        }
-        async fn exists(&self, _: &str, _: &[&str]) -> bool {
-            false
-        }
-        async fn write_file_from(&self, source: &Path, destination: &Path) -> Result<(), String> {
-            self.copies.lock().expect("copies").push((source.into(), destination.into()));
-            Ok(())
-        }
-    }
-    let empty = || Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true });
-    let runner = Arc::new(Runner {
-        inner: MockRunner::with_outputs(vec![empty(), empty(), Ok(recorded("success")), Ok(recorded("unchanged"))]),
-        copies: Mutex::new(vec![]),
-    });
-    let report = drain(
-        "host".into(),
-        "new-gen".into(),
-        Path::new("/incoming/bin/cleat"),
-        &[target(runner.clone(), "default", true), target(runner.clone(), "named", true)],
-        vec![],
-    )
-    .await;
-    assert!(!report.failed(), "{report:?}");
-    assert_eq!(*runner.copies.lock().expect("copies"), vec![
-        (PathBuf::from("/incoming/bin/cleat"), PathBuf::from("/state/crew cleat/.fleet-bin/new-gen/bin/cleat")),
-        (PathBuf::from("/incoming/lib/libghostty-vt.so.0"), PathBuf::from("/state/crew cleat/.fleet-bin/new-gen/lib/libghostty-vt.so.0")),
-    ]);
-    let calls = runner.inner.calls();
-    assert_eq!(calls[2].0, "env");
-    assert_eq!(calls[2].1[0], "LD_LIBRARY_PATH=/state/crew cleat/.fleet-bin/new-gen/lib");
-    assert_eq!(calls[2].1[1], "/state/crew cleat/.fleet-bin/new-gen/bin/cleat");
-    assert_eq!(calls[3].1[..2], calls[2].1[..2]);
+async fn contained_drain_is_expected_and_never_executes() {
+    let runner = Arc::new(MockRunner::with_outputs(vec![]));
+    let report =
+        drain("host".into(), "new-gen".into(), Path::new("/incoming/bin/cleat"), &[target(runner.clone(), "default", true)], vec![]).await;
+    assert!(!report.failed());
+    assert!(report.attempts.is_empty());
+    assert!(report.information[0].contains("refreshes on restart"));
+    assert!(runner.calls().is_empty());
 }
 
 // Host health compares the host-installed SHA with each current serving SHA;
@@ -212,14 +176,21 @@ async fn contained_successor_uses_delivered_incoming_cli_once() {
 #[tokio::test]
 async fn serving_sha_skew_is_visible_per_runtime() {
     for (installed, serving, expected) in
-        [(Some("new"), Some("new"), false), (Some("new"), Some("old"), true), (Some("new"), None, true), (None, Some("old"), true)]
+        [(Some("new"), Some("new"), false), (Some("new"), Some("old"), true), (Some("new"), None, false), (None, Some("old"), false)]
     {
-        let runner = Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput {
-            stdout: serde_json::json!({"daemon":{"git_sha":serving}}).to_string(),
-            stderr: String::new(),
-            success: true,
-        })]));
-        let messages = build_skew(installed, &[target(runner.clone(), "named", false)]).await;
+        // Subprocess boundary: aliases are absent, version metadata is injected,
+        // and daemon discovery reports an empty legacy runtime.
+        let runner = Arc::new(MockRunner::with_outputs(vec![
+            Err("no sidecar".into()),
+            Err("legacy".into()),
+            Ok(CommandOutput {
+                stdout: serde_json::json!({"daemon":{"git_sha":serving}}).to_string(),
+                stderr: String::new(),
+                success: true,
+            }),
+            Ok(CommandOutput { stdout: "[]".into(), stderr: String::new(), success: true }),
+        ]));
+        let messages = build_skew(installed, &[target(runner.clone(), "named", false)], None).await.actionable;
         assert_eq!(!messages.is_empty(), expected);
         if expected {
             assert!(messages[0].contains("crew-env /state/crew cleat/named"));
@@ -229,7 +200,7 @@ async fn serving_sha_skew_is_visible_per_runtime() {
                 serving.unwrap_or("unknown")
             )));
         }
-        assert_eq!(runner.calls()[0].1, vec!["--runtime-root", "/state/crew cleat", "--server", "named", "version", "--daemon", "--json"]);
+        assert_eq!(runner.calls()[2].1, vec!["--runtime-root", "/state/crew cleat", "--server", "named", "version", "--daemon", "--json"]);
     }
 }
 
@@ -242,7 +213,8 @@ async fn diagnostics_retain_failed_attempts_and_surface_storage_errors() {
     let mut report = drain("host".into(), "gen".into(), Path::new("/incoming/cleat"), &[target(runner, "default", false)], vec![]).await;
     persist(&mut report, directory.path()).await;
     let path = report.diagnostics_path.as_ref().expect("diagnostics path");
-    let stored: RollReport = serde_json::from_slice(&tokio::fs::read(path).await.expect("stored report")).expect("decode report");
+    let stored: RollReport =
+        serde_json::from_slice(&std::fs::read(path).expect("stored report immediately after persistence")).expect("decode report");
     assert!(stored.failed());
     assert_eq!(stored.attempts[0].stdout, report.attempts[0].stdout);
     assert_eq!(stored.attempts[0].report, report.attempts[0].report);
@@ -258,6 +230,155 @@ async fn diagnostics_retain_failed_attempts_and_surface_storage_errors() {
     assert!(report.diagnostics_path.is_none());
     assert!(report.errors[0].contains("write roll diagnostics"));
     assert_eq!(report.attempts[0].report, stored.attempts[0].report);
+}
+
+// Successful drain evidence compares installed with current, never old. A
+// host-level warning/failure remains actionable even when version is unknown.
+#[tokio::test]
+async fn recorded_drain_reports_keep_host_failures_actionable() {
+    for name in ["success", "unchanged", "warning", "nonzero"] {
+        let mut outputs = vec![Ok(recorded(name))];
+        if name == "nonzero" {
+            outputs.push(Err("discovery unavailable".into()));
+        }
+        let runner = Arc::new(MockRunner::with_outputs(outputs));
+        let target = target(runner, "default", false);
+        let report = drain("host".into(), "gen".into(), Path::new("/incoming/cleat"), std::slice::from_ref(&target), vec![]).await;
+        let assessment = assess_drain(&report);
+        assert_eq!(!assessment.actionable.is_empty(), matches!(name, "warning" | "nonzero"));
+        if let Some(drain) = &report.attempts[0].report {
+            let current = serde_json::json!({"daemon": drain.current["build"]});
+            assert!(assess_current(sha(&drain.installed), &target, &current).actionable.is_empty());
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RecordedGenerations {
+    drain: RecordedOutput,
+    installed: Value,
+    current: RecordedOutput,
+    listing: RecordedOutput,
+    empty: RecordedOutput,
+    stale: RecordedOutput,
+}
+
+fn generations() -> RecordedGenerations {
+    serde_json::from_str(include_str!("fixtures/generations.json")).expect("recorded generations")
+}
+
+fn output(record: RecordedOutput) -> CommandOutput {
+    CommandOutput { stdout: record.stdout.replace("{root}", "/state/crew cleat"), stderr: record.stderr, success: record.success }
+}
+
+// #2671: the real CLI's alias and listing recordings reproduce the r531 shape:
+// a new current generation alongside an alive, older draining generation. The
+// latter is informational, and unrelated roots must not contaminate health.
+#[tokio::test]
+async fn recorded_generations_report_draining_without_degrading() {
+    let records = generations();
+    let installed = sha(&records.installed).expect("installed").to_string();
+    // Subprocess boundary: exact drain/version/listing outputs from the CLI;
+    // only the alias read is supplied separately.
+    let runner = Arc::new(MockRunner::with_outputs(vec![
+        Ok(output(records.drain)),
+        Ok(CommandOutput { stdout: "default@27\n".into(), stderr: String::new(), success: true }),
+        Ok(output(records.current)),
+        Ok(output(records.listing)),
+    ]));
+    let target = target(runner.clone(), "default", false);
+    let report = drain("host".into(), "r531".into(), Path::new("/incoming/cleat"), std::slice::from_ref(&target), vec![]).await;
+    assert!(!report.failed());
+    let assessment = build_skew(Some(&installed), &[target], Some(&report)).await;
+    assert!(assessment.actionable.is_empty(), "{assessment:?}");
+    assert_eq!(assessment.information.len(), 1);
+    assert!(assessment.information[0].contains("draining 3 sessions on fd66a712"));
+    assert_eq!(runner.calls()[1].1, ["/state/crew cleat/default"]);
+    assert_eq!(runner.calls()[2].1[3], "default@27");
+    assert_eq!(runner.remaining(), 0);
+}
+
+// Generate every observation class (current/stale/absent/invalid), container
+// status and installed-known boundary. Old sessions and pinned vessels must
+// never change whether the host's current alias has actionable skew.
+#[hegel::test]
+fn recorded_current_observations_degrade_only_actionable_host_skew(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let class = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+    let contained = tc.draw(gs::booleans());
+    let installed_known = tc.draw(gs::booleans());
+    let records = generations();
+    let current = match class {
+        0 => parsed(Ok(output(records.current))).expect("current"),
+        1 => parsed(Ok(output(records.stale))).expect("stale"),
+        2 => parsed(Ok(output(records.empty))).unwrap_or(Value::Null),
+        _ => Value::Null,
+    };
+    let target = target(Arc::new(MockRunner::with_outputs(vec![])), "default", contained);
+    let installed = if installed_known { sha(&records.installed) } else { None };
+    let assessment = assess_current(installed, &target, &current);
+    assert_eq!(!assessment.actionable.is_empty(), class == 1 && installed_known && !contained);
+    let informational = contained || !installed_known || class >= 2;
+    assert_eq!(assessment.information.len(), usize::from(informational));
+    if contained {
+        assert!(assessment.information[0].contains("refreshes on restart"));
+    }
+    let condition = assessment.into_condition(chrono::Utc::now());
+    if class == 1 && installed_known && !contained {
+        assert_eq!(condition.expect("actionable condition").value, flotilla_resources::ConditionValue::False);
+    } else if informational {
+        assert_eq!(condition.expect("informational condition").value, flotilla_resources::ConditionValue::True);
+    } else {
+        assert!(condition.is_none());
+    }
+}
+
+// #2671: a failed connection with a confirmed empty daemon inventory is a
+// healthy no-op; unavailable discovery must still retain the host drain error.
+#[tokio::test]
+async fn absent_host_daemon_drain_does_not_warn() {
+    for listing in [Ok(CommandOutput { stdout: "[]".into(), stderr: String::new(), success: true }), Err("listing unavailable".into())] {
+        let absent = listing.is_ok();
+        let runner = Arc::new(MockRunner::with_outputs(vec![Ok(recorded("nonzero")), listing]));
+        let report =
+            drain("host".into(), "gen".into(), Path::new("/incoming/cleat"), &[target(runner.clone(), "default", false)], vec![]).await;
+        assert_eq!(report.failed(), !absent);
+        assert_eq!(assess_drain(&report).actionable.is_empty(), absent);
+        assert_eq!(runner.remaining(), 0);
+    }
+}
+
+// Unix aliases select the physical current generation. Legacy directory
+// sidecars are consulted only when the main path is not a symlink; stale
+// sidecars must never override a valid main alias.
+#[tokio::test]
+async fn current_alias_precedes_legacy_sidecar() {
+    for (main, sidecar, expected) in [
+        (Some("default@27"), None, "default@27"),
+        (None, Some("default@28"), "default@28"),
+        (None, None, "default"),
+        (Some("../default@26"), None, "default"),
+    ] {
+        // Subprocess boundary: readlink results, including legacy/missing paths.
+        let result = |value: Option<&str>| {
+            value.map_or_else(
+                || Err("not a symlink".into()),
+                |value| Ok(CommandOutput { stdout: format!("{value}\n"), stderr: String::new(), success: true }),
+            )
+        };
+        let mut outputs = vec![result(main)];
+        if main != Some("default@27") {
+            outputs.push(result(sidecar));
+        }
+        let runner = Arc::new(MockRunner::with_outputs(outputs));
+        let current = current_target(&target(runner.clone(), "default", false)).await;
+        assert_eq!(current.name, expected);
+        assert_eq!(runner.calls()[0].1, ["/state/crew cleat/default"]);
+        if main != Some("default@27") {
+            assert_eq!(runner.calls()[1].1, ["/state/crew cleat/.default.current"]);
+        }
+        assert_eq!(runner.remaining(), 0);
+    }
 }
 
 // Returning a diagnostics path promises a complete readable report immediately,
