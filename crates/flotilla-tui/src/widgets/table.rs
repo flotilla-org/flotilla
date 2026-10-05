@@ -566,12 +566,26 @@ mod tests {
     }
 
     fn snapshot_view() -> TableView {
+        use flotilla_protocol::result_set::{Readiness, ReadinessBlocker, ReadinessState};
         fn vessel(name: &str, phase: WorkPhase) -> VesselSummary {
-            VesselSummary::builder().name(name.to_string()).depends_on(Vec::new()).phase(phase).crew(Vec::new()).build()
+            let state = match phase {
+                WorkPhase::Pending | WorkPhase::Ready | WorkPhase::Launching => ReadinessState::Provisioning,
+                WorkPhase::Failed => ReadinessState::Failed,
+                _ => ReadinessState::Ready,
+            };
+            VesselSummary::builder()
+                .readiness(Readiness { state, blockers: Vec::new() })
+                .name(name.to_string())
+                .depends_on(Vec::new())
+                .phase(phase)
+                .crew(Vec::new())
+                .build()
         }
 
         fn convoy(name: &str, phase: ConvoyPhase, initializing: bool, vessels: Vec<VesselSummary>, message: Option<&str>) -> ConvoySummary {
+            let readiness = Readiness::aggregate(vessels.iter().map(|vessel| &vessel.readiness));
             ConvoySummary::builder()
+                .readiness(readiness)
                 .id(ConvoyId::new("dev", name))
                 .namespace("dev".to_string())
                 .resource_name(name.to_string())
@@ -585,6 +599,15 @@ mod tests {
                 .build()
         }
 
+        let mut blocked = vessel("govern", WorkPhase::Pending);
+        blocked.readiness = Readiness {
+            state: ReadinessState::Blocked,
+            blockers: vec![ReadinessBlocker {
+                resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Checkout", "dev", "ghostty-ops"),
+                phase: "Preparing".into(),
+                reason: "Forgejo authentication refused".into(),
+            }],
+        };
         let mut convoys = [
             convoy(
                 "tables",
@@ -614,6 +637,7 @@ mod tests {
                 vec![vessel("build", WorkPhase::Complete), vessel("ship", WorkPhase::Failed)],
                 Some("workspace launch failed"),
             ),
+            convoy("governor", ConvoyPhase::Active, false, vec![blocked], Some("Forgejo authentication refused")),
         ];
         for (index, id) in [(1, "815"), (2, "812")] {
             convoys[index].subjects.push(flotilla_protocol::result_set::ConvoySubjectRow {

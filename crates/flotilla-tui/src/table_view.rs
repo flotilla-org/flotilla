@@ -904,7 +904,7 @@ fn surface_label(name: &str, state: SurfaceState) -> String {
     }
 }
 
-static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 7] = [
+static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 8] = [
     ColumnSpec {
         id: "name",
         label: "CONVOY",
@@ -920,6 +920,20 @@ static CONVOY_COLUMNS: [ColumnSpec<ConvoySummary>; 7] = [
         extract: |row| CellValue::plain(&row.workflow_ref),
     },
     ColumnSpec { id: "phase", label: "PHASE", width: WidthHint::Fixed(12), alignment: Alignment::Left, extract: convoy_phase },
+    ColumnSpec {
+        id: "readiness",
+        label: "READINESS",
+        width: WidthHint::Fixed(12),
+        alignment: Alignment::Left,
+        extract: |row| {
+            if row.initializing && !row.phase.is_terminal() && row.readiness.state == flotilla_protocol::result_set::ReadinessState::Unknown
+            {
+                CellValue::toned("provisioning", CellTone::Warning)
+            } else {
+                readiness_cell(&row.readiness)
+            }
+        },
+    },
     ColumnSpec { id: "pr", label: "PR", width: WidthHint::Fixed(14), alignment: Alignment::Left, extract: convoy_change_request },
     ColumnSpec { id: "vessels", label: "VESSELS", width: WidthHint::Fixed(9), alignment: Alignment::Right, extract: convoy_progress },
     ColumnSpec {
@@ -944,7 +958,7 @@ static CONVOY_ACTIONS: [ActionSpec<ConvoySummary>; 3] = [
     ActionSpec { id: "open_in_pm", label: "Open in PM", key: 'o', resolve: open_convoy_in_pm },
 ];
 
-static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 6] = [
+static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 7] = [
     ColumnSpec {
         id: "depends_on",
         label: "↳",
@@ -967,6 +981,13 @@ static VESSEL_COLUMNS: [ColumnSpec<VesselProjection>; 6] = [
         extract: vessel_crew,
     },
     ColumnSpec { id: "phase", label: "PHASE", width: WidthHint::Fixed(10), alignment: Alignment::Left, extract: vessel_phase },
+    ColumnSpec {
+        id: "readiness",
+        label: "READINESS",
+        width: WidthHint::Fixed(12),
+        alignment: Alignment::Left,
+        extract: |row| readiness_cell(&row.vessel.readiness),
+    },
     ColumnSpec {
         id: "host",
         label: "HOST",
@@ -1111,9 +1132,6 @@ fn convoy_drill(row: &ConvoySummary) -> Option<ViewAddress> {
 }
 
 fn convoy_phase(row: &ConvoySummary) -> CellValue {
-    if row.initializing && !row.phase.is_terminal() {
-        return CellValue::toned("pending", CellTone::Warning);
-    }
     let tone = match row.phase {
         ConvoyPhase::Pending => CellTone::Muted,
         ConvoyPhase::Active => CellTone::Plain,
@@ -1129,6 +1147,24 @@ fn convoy_phase(row: &ConvoySummary) -> CellValue {
         _ => row.phase.label().to_string(),
     };
     CellValue::toned(label, tone)
+}
+
+fn readiness_cell(readiness: &flotilla_protocol::result_set::Readiness) -> CellValue {
+    use flotilla_protocol::result_set::ReadinessState;
+    let tone = match readiness.state {
+        ReadinessState::Ready => CellTone::Success,
+        ReadinessState::Unknown => CellTone::Muted,
+        ReadinessState::Provisioning | ReadinessState::Blocked => CellTone::Warning,
+        ReadinessState::Failed => CellTone::Error,
+    };
+    CellValue::toned(readiness.state.as_str(), tone)
+}
+
+fn readiness_details(readiness: &flotilla_protocol::result_set::Readiness) -> Vec<DetailField> {
+    vec![DetailField { label: "Readiness", value: readiness.state.as_str().into() }, DetailField {
+        label: "Readiness reasons",
+        value: readiness.explanation(),
+    }]
 }
 
 fn convoy_progress(row: &ConvoySummary) -> CellValue {
@@ -1181,6 +1217,7 @@ fn convoy_description(row: &ConvoySummary) -> Vec<DetailField> {
         DetailField { label: "Message", value: row.message.clone().unwrap_or_default() },
         DetailField { label: "Vessels", value: convoy_progress(row).text },
     ];
+    fields.extend(readiness_details(&row.readiness));
     if let Some(decision) = &row.placement_decision {
         fields
             .push(DetailField { label: "Placement", value: format!("{} on {}", decision.policy_name, decision.target_host.display_name) });
@@ -1368,6 +1405,7 @@ fn vessel_description(row: &VesselProjection) -> Vec<DetailField> {
         DetailField { label: "Image digest", value: row.vessel.image_digest.clone().unwrap_or_default() },
         DetailField { label: "Message", value: row.vessel.message.clone().unwrap_or_default() },
     ];
+    fields.extend(readiness_details(&row.vessel.readiness));
     if let Some(decision) = &row.vessel.placement_decision {
         fields
             .push(DetailField { label: "Placement", value: format!("{} on {}", decision.policy_name, decision.target_host.display_name) });
@@ -1469,6 +1507,7 @@ mod tests {
 
     fn vessel(name: &str, depends_on: &[&str], phase: WorkPhase) -> VesselSummary {
         VesselSummary {
+            readiness: Default::default(),
             placement_decision: None,
             name: name.into(),
             surface_state: Default::default(),
@@ -1490,6 +1529,7 @@ mod tests {
 
     fn convoy(vessels: Vec<VesselSummary>) -> ConvoySummary {
         ConvoySummary {
+            readiness: Default::default(),
             generation: 1,
             placement_decision: None,
             id: ConvoyId::new("dev", "tables"),
@@ -1526,6 +1566,78 @@ mod tests {
             .build()
     }
 
+    // #1961: surfaces preserve Active lifecycle while readiness explains why
+    // attachment is unavailable; a fresh projection clears recovered blockers.
+    #[test]
+    fn active_convoy_readiness_is_shared_with_vessel_details() {
+        use flotilla_protocol::result_set::{Readiness, ReadinessBlocker, ReadinessState};
+        let states = [ReadinessState::Provisioning, ReadinessState::Blocked, ReadinessState::Failed];
+        // Exhaustive finite map: all three warning/error readiness states.
+        for state in states {
+            let mut vessel = vessel("implement", &[], WorkPhase::Running);
+            vessel.readiness = Readiness {
+                state,
+                blockers: vec![ReadinessBlocker {
+                    resource: ResourceRef::new("flotilla.work/v1", "Checkout", "dev", "ops"),
+                    phase: "Preparing".into(),
+                    reason: "Forgejo authentication refused".into(),
+                }],
+            };
+            let mut row = convoy(vec![vessel]);
+            row.readiness = Readiness::aggregate(row.vessels.iter().map(|vessel| &vessel.readiness));
+            let view = project_convoys("convoys/dev", &[&row]).expect("table");
+            assert_eq!(view.rows[0].cells[2].text, "active");
+            assert_eq!(view.rows[0].cells[3].text, state.as_str());
+            assert!(view.rows[0]
+                .describe
+                .iter()
+                .any(|field| field.label == "Readiness reasons" && field.value.contains("Forgejo authentication refused")));
+            let vessels = project(&ViewAddress::Convoy { namespace: "dev".into(), name: row.resource_name.clone() }, &TableRows {
+                convoys: vec![&row],
+                ..Default::default()
+            })
+            .expect("vessels");
+            assert!(vessels.rows[0]
+                .describe
+                .iter()
+                .any(|field| field.label == "Readiness reasons" && field.value == row.readiness.explanation()));
+            row.readiness = Readiness { state: ReadinessState::Ready, blockers: Vec::new() };
+            row.vessels[0].readiness = row.readiness.clone();
+            let recovered = project_convoys("convoys/dev", &[&row]).expect("table");
+            assert_eq!(recovered.rows[0].cells[2].text, "active");
+            assert!(!recovered.rows[0].describe.iter().any(|field| field.value.contains("Forgejo authentication refused")));
+        }
+    }
+
+    // Admission capacity holds can precede any concrete vessel or snapshot.
+    // The adapter and shared table must preserve their reason beside Active.
+    #[test]
+    fn admission_capacity_hold_survives_initializing_adapter() {
+        use flotilla_protocol::result_set::{ConvoyPhase as WirePhase, ConvoyRow, ReadinessBlocker};
+        let mut row = ConvoyRow::builder()
+            .resource(ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "capacity"))
+            .name("governor")
+            .workflow_ref("governor")
+            .phase(WirePhase::Active)
+            .initializing(true)
+            .admission_blockers(vec![ReadinessBlocker {
+                resource: ResourceRef::new("flotilla.work/v1", "Convoy", "dev", "capacity"),
+                phase: "Admission".into(),
+                reason: "agent-slot capacity hold".into(),
+            }])
+            .build();
+        let summary = ConvoySummary::from(&row);
+        let view = project_convoys("convoys/dev", &[&summary]).expect("table");
+        assert_eq!(view.rows[0].cells[2].text, "active");
+        assert_eq!(view.rows[0].cells[3].text, "blocked");
+        assert!(view.rows[0].describe.iter().any(|field| field.value.contains("agent-slot capacity hold")));
+        row.admission_blockers.clear();
+        let summary = ConvoySummary::from(&row);
+        let view = project_convoys("convoys/dev", &[&summary]).expect("table");
+        assert_eq!(view.rows[0].cells[3].text, "provisioning");
+        assert!(!view.rows[0].describe.iter().any(|field| field.value.contains("agent-slot capacity hold")));
+    }
+
     #[test]
     fn convoy_human_surfaces_render_and_target_the_role_address() {
         let convoy = convoy(Vec::new());
@@ -1545,22 +1657,29 @@ mod tests {
         let view = project_convoys("convoys/dev", &[&row]).expect("project table");
 
         assert_eq!(view.columns.iter().map(|column| column.id).collect::<Vec<_>>(), vec![
-            "name", "workflow", "phase", "pr", "vessels", "scope", "message"
+            "name",
+            "workflow",
+            "phase",
+            "readiness",
+            "pr",
+            "vessels",
+            "scope",
+            "message"
         ]);
         assert_eq!(view.rows[0].cells[2], CellValue::toned("failed", CellTone::Error));
-        assert_eq!(view.rows[0].cells[6].text, "workspace launch failed: disk full");
+        assert_eq!(view.rows[0].cells[7].text, "workspace launch failed: disk full");
         assert_eq!(view.rows[0].drill, Some("convoy/dev/tables".parse().expect("valid address")));
     }
 
     #[test]
-    fn initializing_convoy_is_presented_as_pending_with_its_wait_reason() {
+    fn initializing_convoy_keeps_lifecycle_with_its_wait_reason() {
         let mut row = convoy(Vec::new());
         row.initializing = true;
         row.message = Some("waiting for an available codex credential".into());
         let view = project_convoys("convoys/dev", &[&row]).expect("project table");
 
-        assert_eq!(view.rows[0].cells[2], CellValue::toned("pending", CellTone::Warning));
-        assert_eq!(view.rows[0].cells[6].text, "waiting for an available codex credential");
+        assert_eq!(view.rows[0].cells[2], CellValue::toned("active", CellTone::Plain));
+        assert_eq!(view.rows[0].cells[7].text, "waiting for an available codex credential");
     }
 
     #[test]
