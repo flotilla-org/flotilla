@@ -39,6 +39,7 @@ struct RecordingCheckoutRuntime {
     removals: Mutex<Vec<CheckoutRemoval>>,
     removal_attempts: Mutex<Option<watch::Sender<usize>>>,
     inspections: Mutex<usize>,
+    protections: Mutex<Vec<(String, String, String, String)>>,
     failed_removal_target: Option<String>,
     transient_removal_failures: AtomicUsize,
     blocked_removal_target: Option<String>,
@@ -50,6 +51,12 @@ struct RecordingCheckoutRuntime {
 
 #[async_trait]
 impl CheckoutRuntime for RecordingCheckoutRuntime {
+    // Boundary fake: records the environment-scoped VCS registration request.
+    async fn protect_worktree_in(&self, env_ref: &str, clone_path: &str, target: &str, reason: &str) -> Result<(), String> {
+        self.protections.lock().expect("protections").push((env_ref.into(), clone_path.into(), target.into(), reason.into()));
+        Ok(())
+    }
+
     async fn checkout_path_exists_in(&self, _env_ref: &str, _path: &str) -> Result<Option<bool>, String> {
         Ok(self.path_exists)
     }
@@ -734,7 +741,7 @@ async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let created = checkouts
         .create(
-            &meta("checkout-a"),
+            &meta("checkout-a").with_lifecycle_authority(LifecycleAuthority::Managed),
             &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
                 repo_ref: RepositoryKey(repo_key(REPO_URL)),
                 env_ref: "host-direct-a".to_string(),
@@ -777,6 +784,14 @@ async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
     assert!(matches!(deps, CheckoutPrepared::None));
     assert!(outcome.patch.is_none(), "fresh integration status should not be patched");
     assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 0);
+    // Issue #2675: even a fresh Ready checkout is re-protected on every
+    // reconcile, using its owning environment rather than a vessel mount path.
+    assert_eq!(*runtime.protections.lock().expect("protections"), vec![(
+        "host-direct-a".into(),
+        "/checkouts/repo".into(),
+        "/checkouts/convoy-a/repo.feature-cleanup".into(),
+        "flotilla-managed: managed/checkout-a".into()
+    )]);
 }
 
 #[tokio::test]

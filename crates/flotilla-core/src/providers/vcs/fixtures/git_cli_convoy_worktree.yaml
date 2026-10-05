@@ -103,7 +103,7 @@ rounds:
     cwd: /
     stdout: |
       branch 'convoy/new' set up to track 'origin/main'.
-      HEAD is now at b2dbf53 initial
+      HEAD is now at 2d8ae29 initial
     exit_code: 0
   - channel: command
     cmd: git
@@ -115,7 +115,7 @@ rounds:
     - HEAD
     cwd: /
     stdout: |
-      b2dbf53c9b58fc0a1f13fb6baf5ddc2cc8b56ddf
+      2d8ae29ec54a16614cc66979d63cc9d4a79f9e59
     exit_code: 0
   - channel: command
     cmd: git
@@ -124,9 +124,34 @@ rounds:
     - '{root}/repo'
     - update-ref
     - refs/flotilla/bootstrap/convoy/new
-    - b2dbf53c9b58fc0a1f13fb6baf5ddc2cc8b56ddf
+    - '2d8ae29ec54a16614cc66979d63cc9d4a79f9e59'
     cwd: /
     stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
+    - repair
+    - '{root}/convoy-new'
+    cwd: /
+    stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
+    - lock
+    - '--reason'
+    - 'flotilla-managed: convoy/new'
+    - '{root}/convoy-new'
+    cwd: /
+    stdout: ''
+    stderr: ''
     exit_code: 0
   - channel: command
     cmd: git
@@ -200,6 +225,18 @@ rounds:
     - '-C'
     - '{root}/repo'
     - worktree
+    - unlock
+    - '{root}/convoy-new'
+    cwd: /
+    stdout: ''
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
     - remove
     - '--force'
     - '{root}/convoy-new'
@@ -227,7 +264,7 @@ rounds:
     - refs/heads/convoy/new
     cwd: /
     stdout: |
-      b2dbf53c9b58fc0a1f13fb6baf5ddc2cc8b56ddf
+      2d8ae29ec54a16614cc66979d63cc9d4a79f9e59
     stderr: ''
     exit_code: 0
   - channel: command
@@ -240,7 +277,7 @@ rounds:
     - refs/flotilla/bootstrap/convoy/new
     cwd: /
     stdout: |
-      b2dbf53c9b58fc0a1f13fb6baf5ddc2cc8b56ddf
+      2d8ae29ec54a16614cc66979d63cc9d4a79f9e59
     stderr: ''
     exit_code: 0
   - channel: command
@@ -254,7 +291,7 @@ rounds:
     cwd: /
     stdout: |+
       worktree {root}/repo
-      HEAD b2dbf53c9b58fc0a1f13fb6baf5ddc2cc8b56ddf
+      HEAD 2d8ae29ec54a16614cc66979d63cc9d4a79f9e59
       branch refs/heads/main
 
     exit_code: 0
@@ -269,7 +306,7 @@ rounds:
     - convoy/new
     cwd: /
     stdout: |
-      Deleted branch convoy/new (was b2dbf53).
+      Deleted branch convoy/new (was 2d8ae29).
     exit_code: 0
   - channel: command
     cmd: git

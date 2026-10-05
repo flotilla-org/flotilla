@@ -51,6 +51,10 @@ pub struct PreparedCheckout {
 
 #[async_trait]
 pub trait CheckoutRuntime: Send + Sync {
+    /// Restore registration protection through the checkout's owning environment.
+    async fn protect_worktree_in(&self, _env_ref: &str, _clone_path: &str, _target: &str, _reason: &str) -> Result<(), String> {
+        Ok(())
+    }
     async fn create_worktree(
         &self,
         clone_path: &str,
@@ -82,6 +86,7 @@ pub trait CheckoutRuntime: Send + Sync {
         branch: &str,
         base_ref: Option<&str>,
         target_path: &str,
+        _registration_reason: &str,
     ) -> Result<PreparedCheckout, String> {
         self.create_worktree(clone_path, branch, base_ref, target_path).await
     }
@@ -260,6 +265,14 @@ fn integration_is_fresh(status: &CheckoutStatus, now: DateTime<Utc>, max_age: Du
     now.signed_duration_since(oldest_observation).to_std().is_ok_and(|age| age < max_age)
 }
 
+fn checkout_registration_reason(checkout: &ResourceObject<Checkout>, convoy: Option<&ResourceObject<Convoy>>) -> String {
+    let owner = convoy
+        .map(|convoy| convoy.metadata.name.as_str())
+        .or_else(|| checkout.metadata.labels.get(CONVOY_LABEL).map(String::as_str))
+        .unwrap_or("managed");
+    format!("flotilla-managed: {owner}/{}", checkout.metadata.name)
+}
+
 fn convoy_needs_delete_evidence(convoy: Option<&ResourceObject<Convoy>>) -> bool {
     convoy.is_some_and(|convoy| convoy.status.as_ref().is_none_or(|status| status.phase != ConvoyPhase::Abandoned))
 }
@@ -296,6 +309,21 @@ where
                         }
                         Ok(Some(_)) | Ok(None) => {}
                         Err(error) => return Ok(CheckoutPrepared::Failed(error)),
+                    }
+                }
+            }
+            if lifecycle_authority == Some(LifecycleAuthority::Managed)
+                && obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Ready)
+            {
+                if let CheckoutSpec::Worktree(spec) = &obj.spec {
+                    let source = match self.clones.get(&spec.clone_ref).await {
+                        Ok(clone) => clone.spec.path,
+                        Err(ResourceError::NotFound { .. }) => spec.target_path.clone(),
+                        Err(error) => return Err(error),
+                    };
+                    let reason = checkout_registration_reason(obj, convoy.as_ref());
+                    if let Err(error) = self.runtime.protect_worktree_in(&spec.env_ref, &source, &spec.target_path, &reason).await {
+                        return Ok(CheckoutPrepared::Failed(error));
                     }
                 }
             }
@@ -356,7 +384,14 @@ where
                 Ok(
                     match self
                         .runtime
-                        .create_worktree_in(&spec.env_ref, &clone.spec.path, &spec.r#ref, spec.base_ref.as_deref(), &spec.target_path)
+                        .create_worktree_in(
+                            &spec.env_ref,
+                            &clone.spec.path,
+                            &spec.r#ref,
+                            spec.base_ref.as_deref(),
+                            &spec.target_path,
+                            &checkout_registration_reason(obj, convoy.as_ref()),
+                        )
                         .await
                     {
                         Ok(prepared) => CheckoutPrepared::Ready { prepared },

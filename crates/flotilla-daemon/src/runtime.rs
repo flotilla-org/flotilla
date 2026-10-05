@@ -41,7 +41,7 @@ use flotilla_core::{
         terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize},
         ChannelLabel, CommandRunner,
     },
-    vcs::REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT,
+    vcs::{CheckoutRegistration, REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT},
 };
 use flotilla_protocol::{
     CanonicalHostId, ConfiguredResourceLimits, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus,
@@ -5264,6 +5264,12 @@ fn removal_source_path(removal: &CheckoutRemoval) -> &str {
 
 #[async_trait]
 impl CheckoutRuntime for RoutingCheckoutRuntime {
+    async fn protect_worktree_in(&self, env_ref: &str, clone_path: &str, target: &str, reason: &str) -> Result<(), String> {
+        let runtime = self.runtime_for(env_ref, clone_path).await?;
+        let vcs = controller_vcs(&runtime.vcs, &runtime.runner, clone_path)?;
+        vcs.checkout_registration(target, CheckoutRegistration::Protect { reason }).await
+    }
+
     async fn checkout_path_exists_in(&self, env_ref: &str, path: &str) -> Result<Option<bool>, String> {
         if env_ref != self.state.host_direct_environment_name {
             return Ok(None);
@@ -5323,8 +5329,12 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         branch: &str,
         base_ref: Option<&str>,
         target_path: &str,
+        registration_reason: &str,
     ) -> Result<PreparedCheckout, String> {
-        self.runtime_for(env_ref, clone_path).await?.create_worktree(clone_path, branch, base_ref, target_path).await
+        let runtime = self.runtime_for(env_ref, clone_path).await?;
+        let vcs = controller_vcs(&runtime.vcs, &runtime.runner, clone_path)?;
+        let materialisation = vcs.materialise_checkout(branch, base_ref, target_path, registration_reason).await?;
+        Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 
     async fn create_fresh_clone_in(
@@ -5407,7 +5417,7 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         target_path: &str,
     ) -> Result<PreparedCheckout, String> {
         let vcs = controller_vcs(&self.vcs, &self.runner, _clone_path)?;
-        let materialisation = vcs.materialise_checkout(branch, base_ref, target_path).await?;
+        let materialisation = vcs.materialise_checkout(branch, base_ref, target_path, &format!("flotilla-managed: {target_path}")).await?;
         Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 
@@ -5468,6 +5478,13 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 Ok(CheckoutRemovalOutcome::Removed)
             }
             CheckoutRemoval::OrphanedWorktree { target_path } => {
+                // The Clone resource may be gone while the linked checkout and
+                // its shared registration remain. Release it before deleting
+                // the last path from which its VCS can still be discovered.
+                if runner.path_exists(&Path::new(target_path).join(".git")).await? {
+                    let vcs = controller_vcs(&self.vcs, &self.runner, target_path)?;
+                    vcs.checkout_registration(target_path, CheckoutRegistration::Release).await?;
+                }
                 remove_checkout_path(&*runner, utf8_path(target_path)?).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
             }
@@ -7808,6 +7825,7 @@ mod tests {
                 "feature/ssh-crew",
                 Some("main"),
                 worktree_path.to_str().expect("worktree path"),
+                "flotilla-managed: ssh-crew/work",
             )
             .await
             .expect("worktree over SSH runner");
@@ -10251,6 +10269,13 @@ mod tests {
             )
             .await
             .expect("stale worktree should create");
+        // This fixture represents a released registration eligible for pruning.
+        // Issue #2675 requires still-managed siblings to remain locked instead.
+        let released = ProcessCommand::new("git")
+            .args(["-C", clone.path().to_str().expect("clone path"), "worktree", "unlock", stale_target.to_str().expect("stale path")])
+            .status()
+            .expect("release stale fixture registration");
+        assert!(released.success());
         fs::remove_dir_all(&stale_target).expect("simulate checkout directory disappearing without git cleanup");
         let stale_worktrees = ProcessCommand::new("git")
             .args(["-C", clone.path().to_str().expect("utf-8 clone path"), "worktree", "list", "--porcelain"])
@@ -10949,6 +10974,30 @@ mod tests {
 
         assert_eq!(outcome, CheckoutRemovalOutcome::Removed);
         assert!(!Path::new(&staging_path).exists());
+    }
+
+    // Issue #2675: losing the Clone resource must not strand a locked
+    // registration when its remaining checkout is finalized.
+    #[tokio::test]
+    async fn orphaned_worktree_teardown_releases_registration_before_deleting_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = TestGitRepo::init(temp.path().join("source")).with_initial_commit();
+        let target = temp.path().join("orphan");
+        let runtime =
+            CheckoutControllerRuntime { vcs: None, runner: Arc::new(ProcessCommandRunner), change_requests: None, forges: Vec::new() };
+        runtime
+            .create_worktree(source.path().to_str().expect("source"), "convoy/work", Some("main"), target.to_str().expect("target"))
+            .await
+            .expect("create managed worktree");
+        let admin = source.path().join(".git/worktrees/orphan");
+        assert!(admin.join("locked").exists());
+        let outcome = runtime
+            .remove_checkout(&CheckoutRemoval::OrphanedWorktree { target_path: target.to_str().expect("target").into() })
+            .await
+            .expect("remove orphan");
+        assert_eq!(outcome, CheckoutRemovalOutcome::Removed);
+        assert!(!target.exists());
+        assert!(!admin.join("locked").exists(), "orphan teardown releases protection before deleting its path");
     }
 
     #[tokio::test]
