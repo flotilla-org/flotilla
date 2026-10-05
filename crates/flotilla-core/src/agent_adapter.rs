@@ -831,15 +831,33 @@ fn codex_composer_visible(screen: &str) -> bool {
         return false;
     }
     let trailing = &lines[index + 1..];
-    let footer = trailing.iter().position(|line| line.contains(" · /") || line.contains(" · ~"));
+    // Only the last nonblank row can delimit the composer; a draft can itself
+    // contain footer-like text before more draft rows or the actual footer.
+    let footer = trailing
+        .iter()
+        .rposition(|line| !line.is_empty())
+        .filter(|&index| trailing[index].contains(" · /") || trailing[index].contains(" · ~"));
     // Wrapped or multiline draft text is still part of the composer. A known
     // placeholder on its first row must not hide a typed continuation.
-    if trailing[..footer.unwrap_or(trailing.len())].iter().any(|line| !line.is_empty()) {
+    if trailing[..footer.unwrap_or(trailing.len())].iter().any(|line| !line.is_empty() && !codex_background_terminal_footer(line)) {
         return false;
     }
     // A footer identifies a live blank composer, but never makes draft text
     // idle. Exact known placeholders also work on captures cropped above it.
-    (text.is_empty() && footer.is_some()) || CODEX_COMPOSER_PLACEHOLDERS.contains(&text)
+    let idle = (text.is_empty() && footer.is_some()) || CODEX_COMPOSER_PLACEHOLDERS.contains(&text);
+    if !idle && !text.is_empty() {
+        tracing::debug!(codex_version = "rust-v0.160.0", "unrecognised Codex composer text; delivery remains blocked");
+    }
+    idle
+}
+
+fn codex_background_terminal_footer(line: &str) -> bool {
+    // rust-v0.160.0: bottom_pane/unified_exec_footer.rs. Background sessions
+    // render above the model footer and do not make the foreground turn busy.
+    let Some((count, status)) = line.split_once(' ') else { return false };
+    !count.is_empty()
+        && count.chars().all(|character| character.is_ascii_digit())
+        && (status.starts_with("background terminal running · /ps") || status.starts_with("background terminals running · /ps"))
 }
 
 fn codex_screen_needs_input(screen: &str) -> bool {
@@ -2227,9 +2245,10 @@ mod tests {
         let mut screen = (0..count).map(|n| format!("› {n} submitted prompt\nresponse\n")).collect::<String>();
         // Background terminals are independent of the foreground Codex turn.
         let background_count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
+        let plural = if background_count == 1 { "" } else { "s" };
         screen.push_str(&format!(
             "Worked for 10m 43s • 3:56 PM\n\n› Ask Codex to do anything\n\n  \
-             {background_count} background terminal running · /ps\n\ngpt-6.1-sol · /workspace"
+             {background_count} background terminal{plural} running · /ps\n\ngpt-6.1-sol · /workspace"
         ));
         assert_eq!(codex.classify_screen_attention(&screen), Some(TerminalAttentionState::Idle));
     }
@@ -2278,6 +2297,8 @@ mod tests {
             "unrecognised future placeholder",
             "Ask Codex to do anything\n  but wait for me",
             "\n  a draft with a blank first line",
+            "Ask Codex to do anything\n  foo · /bar\n  still typing",
+            "\n  foo · ~/bar\n  still typing",
         ];
         let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
         let suffix = "x".repeat(tc.draw(gs::integers::<usize>().min_value(1).max_value(128)));
