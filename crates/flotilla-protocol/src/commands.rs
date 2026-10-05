@@ -1936,6 +1936,7 @@ mod tests {
                 visible_environments: vec![],
             })),
             CommandValue::FleetList(Box::new(FleetListResponse {
+                fleet_project: None,
                 declaration_attention: Vec::new(),
                 rows: vec![FleetListRow::builder()
                     .convoy("convoy-a")

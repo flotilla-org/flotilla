@@ -58,6 +58,8 @@ pub struct SqliteBackend {
     pending_cleanups: Arc<Mutex<HashSet<CleanupKey>>>,
     event_retention: EventRetention,
     local_root: Option<NodeId>,
+    // Serialize cross-kind Project/FleetDesignation admission across clones.
+    pub(crate) hierarchy_admission: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +210,7 @@ impl SqliteBackend {
             pending_cleanups: Arc::new(Mutex::new(HashSet::new())),
             event_retention,
             local_root: None,
+            hierarchy_admission: Arc::default(),
         })
     }
 
@@ -224,6 +227,7 @@ impl SqliteBackend {
             pending_cleanups: Arc::new(Mutex::new(HashSet::new())),
             event_retention,
             local_root: None,
+            hierarchy_admission: Arc::default(),
         })
     }
 
@@ -2015,10 +2019,10 @@ impl SqliteBackend {
             let value = serde_json::from_str(&body).map_err(|err| ResourceError::decode(format!("decode namespace sibling: {err}")))?;
             let object = Self::decode_object::<T>(value)?;
             if object.metadata.deletion_timestamp.is_none() {
-                siblings.push(object.spec);
+                siblings.push(object);
             }
         }
-        T::validate_spec_with_siblings(spec, &siblings)
+        T::validate_spec_with_named_siblings(meta, spec, &siblings)
     }
 
     fn select_existing<T: Resource>(

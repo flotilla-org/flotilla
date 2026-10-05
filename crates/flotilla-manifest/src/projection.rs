@@ -390,16 +390,17 @@ pub fn project_catalog_without_warnings(input: &CatalogInput<'_>, mint: &dyn Rec
 fn project_repository_memberships(catalog: &mut Catalog, projects: &[ProjectRepositoriesRow]) {
     for project in projects {
         let project_entity = entity::project(&project.resource.namespace, &project.resource.name, "fleet");
-        catalog.assert_entity(
-            project_entity.clone(),
-            vec![
-                (SEGMENT_PROJECT, MetadataValue::text(project_entity.id.clone())),
-                (KEY_PROJECT_NAME, MetadataValue::text(&project.display_name)),
-                (KEY_DISPLAY_LABEL, MetadataValue::text(&project.display_name)),
-                (KEY_PROJECT_REPOSITORY_COUNT, MetadataValue::Integer(project.repositories.len() as i64)),
-            ],
-            None,
-        );
+        let mut facts = vec![
+            (SEGMENT_PROJECT, MetadataValue::text(project_entity.id.clone())),
+            (KEY_PROJECT_NAME, MetadataValue::text(&project.display_name)),
+            (KEY_DISPLAY_LABEL, MetadataValue::text(&project.display_name)),
+            (KEY_PROJECT_REPOSITORY_COUNT, MetadataValue::Integer(project.repositories.len() as i64)),
+        ];
+        if let Some(parent) = &project.parent {
+            facts
+                .push((crate::keys::KEY_PROJECT_PARENT, MetadataValue::text(entity::project(&parent.namespace, &parent.name, "fleet").id)));
+        }
+        catalog.assert_entity(project_entity.clone(), facts, None);
         for membership in &project.repositories {
             let relation = entity::project_repository(
                 &project.resource.namespace,

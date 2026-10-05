@@ -356,3 +356,6 @@ pub const KEY_CONVOY_ALTERNATIVES: &str = "flotilla.convoy.alternatives";
 
 /// Names of convoy-wide minimal alternative placement policies.
 pub const KEY_CONVOY_MINIMAL_ALTERNATIVES: &str = "flotilla.convoy.minimal_alternatives";
+
+/// Resolved Project parent entity, including the implicit fleet parent.
+pub const KEY_PROJECT_PARENT: &str = "parent";

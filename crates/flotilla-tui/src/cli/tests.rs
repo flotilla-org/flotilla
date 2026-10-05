@@ -48,6 +48,7 @@ fn fleet_list_displays_replication_failure_and_last_successful_sync() {
 
     let last_sync = Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 0).single().expect("timestamp");
     let response = FleetListResponse {
+        fleet_project: None,
         declaration_attention: Vec::new(),
         rows: vec![],
         replicas: vec![FleetReplicaStatus {
@@ -762,4 +763,35 @@ fn crew_list_renders_charter_error_alongside_state_and_alerts() {
     let json = serde_json::to_value(response).expect("JSON");
     assert_eq!(json["project_error"], "live Project `island` unavailable");
     assert!(json.get("project").is_none());
+}
+
+// #2718: human output identifies the fleet even when it has no crew sessions,
+// and project listings expose its designation and resolved parent.
+#[test]
+fn fleet_root_is_visible_in_project_and_fleet_lists() {
+    use flotilla_protocol::{FleetListResponse, ProjectListEntry, ProjectListResponse, ResourceRef, ViewAddress};
+    let response = FleetListResponse {
+        fleet_project: Some(ResourceRef::new("flotilla.work/v1", "Project", "flotilla", "project-map")),
+        rows: vec![],
+        replicas: vec![],
+        declaration_attention: vec![],
+    };
+    assert!(super::format_fleet_list_human(&response).contains("Fleet Project: flotilla/project-map"));
+    let entry = |name: &str| {
+        ProjectListEntry::builder()
+            .namespace("flotilla".into())
+            .name(name.into())
+            .display_name(name.into())
+            .address(ViewAddress::Project { namespace: "flotilla".into(), name: name.into() })
+            .repositories(vec![])
+            .default_workflow_ref("work".into())
+            .build()
+    };
+    let mut root = entry("project-map");
+    root.is_fleet = true;
+    let mut child = entry("product");
+    child.parent = Some("project-map".into());
+    let output = super::format_project_list_human(&ProjectListResponse { projects: vec![root, child] });
+    assert!(output.lines().any(|line| line.contains("flotilla/project-map") && line.contains("fleet")), "{output}");
+    assert!(output.lines().any(|line| line.contains("flotilla/product") && line.contains("project-map")), "{output}");
 }

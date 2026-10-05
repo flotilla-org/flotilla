@@ -53,3 +53,7 @@ baseline once, verify its replication, then replace each home's literal crew
 policy with the reference. Subsequent bumps need no per-host policy applies.
 Registry image construction and digest recording remain existing runner
 responsibilities. This does not introduce image recipe resolution or rebuilds.
+
+## Amendment
+
+[ADR 0053](0053-the-fleet-is-the-root-project.md) binds Definition charter authoring to a repository and branch head, with commit provenance and bounded delegation.

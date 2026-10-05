@@ -1309,6 +1309,7 @@ fn removed_declaration_retracts_the_role_but_keeps_its_attempts_standing() {
 
 fn membership_project(name: &str, members: &[(&str, Option<&str>, Option<&str>)]) -> ProjectRepositoriesRow {
     ProjectRepositoriesRow {
+        parent: None,
         resource: ResourceRef::new("flotilla.work/v1", "Project", "dev", name),
         display_name: format!("{name} display"),
         repositories: members
@@ -2763,4 +2764,34 @@ fn launch_limits_preserve_unoverridden_environment_fields(tc: hegel::TestCase) {
             assert_eq!(observed, applied.or(prior));
         }
     }
+}
+
+// #2718: Project parents are raw entity metadata, usable by tree and flat
+// surfaces. Removing a parent retracts the previous fact on catalog diff.
+#[test]
+fn project_parent_is_raw_catalog_metadata() {
+    let mut child = membership_project("child", &[]);
+    child.parent = Some(ResourceRef::new("flotilla.work/v1", "Project", "dev", "root"));
+    let projects = [membership_project("root", &[]), child];
+    let build = |projects: &[ProjectRepositoriesRow]| {
+        project_catalog(
+            &CatalogInput {
+                subjects: None,
+                awareness: None,
+                convoys: &[],
+                independents: &[],
+                standing_roles: &[],
+                project_repositories: projects,
+            },
+            &mint(),
+        )
+    };
+    let before = build(&projects);
+    let patches = before.reassert_patches();
+    let child_entity = entity::project("dev", "child", "fleet");
+    assert_eq!(text(find_entity(&patches, &child_entity), crate::keys::KEY_PROJECT_PARENT), entity::project("dev", "root", "fleet").id);
+    assert!(!find_entity(&patches, &entity::project("dev", "root", "fleet")).set.contains_key(crate::keys::KEY_PROJECT_PARENT));
+    let after = build(&[membership_project("root", &[]), membership_project("child", &[])]);
+    assert!(after.diff_patches(&before).iter().any(|patch| patch.target == MetadataTarget::Entity(child_entity.clone())
+        && patch.unset.contains(&crate::keys::KEY_PROJECT_PARENT.to_string())));
 }

@@ -94,21 +94,26 @@ impl<T: Resource> DefinitionResolver<T> {
 
     pub async fn apply_as(&self, writer: &WriterIdentity, meta: &InputMeta, spec: &T::Spec) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
+        let _hierarchy_admission = self.backend.hierarchy_admission(T::API_PATHS.kind).await;
         T::validate_spec(meta, spec)?;
+        if matches!(T::API_PATHS.kind, "Project" | "FleetDesignation") {
+            crate::project_hierarchy::validate_hierarchy_write(
+                &self.backend,
+                &self.namespace,
+                T::API_PATHS.kind,
+                &meta.name,
+                serde_json::to_value(spec).map_err(|error| ResourceError::decode(error.to_string()))?,
+            )
+            .await?;
+        }
         if T::VALIDATE_NAMESPACE_SPEC {
             // This pass includes merged replicas. Embedded stores repeat the local
             // check under their lock/transaction to serialize local admissions.
             // No-op reapplies intentionally refuse legacy overlaps until repaired.
             // list() excludes resolved tombstones; deletion conflicts stay visible
             // and must continue reserving ownership for namespace consumers.
-            let siblings = self
-                .list()
-                .await?
-                .into_iter()
-                .filter(|object| object.metadata.name != meta.name)
-                .map(|object| object.spec)
-                .collect::<Vec<_>>();
-            T::validate_spec_with_siblings(spec, &siblings)?;
+            let siblings = self.list().await?.into_iter().filter(|object| object.metadata.name != meta.name).collect::<Vec<_>>();
+            T::validate_spec_with_named_siblings(meta, spec, &siblings)?;
         }
         let local_root = self.backend.local_root()?;
         let sources = self.sources_for_name(&meta.name).await?;
@@ -212,6 +217,13 @@ impl<T: Resource> DefinitionResolver<T> {
 
     pub async fn delete(&self, name: &str) -> Result<(), ResourceError> {
         ensure_definitions::<T>()?;
+        let _hierarchy_admission = self.backend.hierarchy_admission(T::API_PATHS.kind).await;
+        if T::API_PATHS.kind == "Project" {
+            let hierarchy = crate::ProjectHierarchy::load(&self.backend, &self.namespace).await?;
+            if hierarchy.fleet() == Some(name) || !hierarchy.descendants(name)?.is_empty() {
+                return Err(ResourceError::invalid(format!("Project `{name}` is the fleet or has descendants; reparent before deleting")));
+            }
+        }
         let local_root = self.backend.local_root()?;
         let sources = self.sources_for_name(name).await?;
         if sources.is_empty() {
@@ -269,6 +281,7 @@ impl<T: Resource> DefinitionResolver<T> {
     /// Update definition metadata without replaying or re-authoring its spec.
     pub async fn update_metadata(&self, meta: &InputMeta) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
+        let _hierarchy_admission = self.backend.hierarchy_admission(T::API_PATHS.kind).await;
         let current = self.get(&meta.name).await?;
         let merge = current.metadata.merge.clone().unwrap_or_else(|| MergeMetadata {
             fields: BTreeMap::new(),

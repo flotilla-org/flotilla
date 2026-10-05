@@ -8,16 +8,50 @@ pub use flotilla_protocol::{IssueSource, ProjectRepositoryRole};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    resource::define_resource, status_patch::StatusPatch, CapabilityNeed, Platform, ReplicaReadResolver, ReplicationClass, Repository,
-    RepositoryKey,
+    status_patch::StatusPatch, ApiPaths, CapabilityNeed, InputMeta, Platform, ProjectHierarchy, ReplicaReadResolver, ReplicationClass,
+    Repository, RepositoryKey, Resource, ResourceError, ResourceObject,
 };
 
-define_resource!(Project, "projects", ProjectSpec, ProjectStatus, ProjectStatusPatch, replication = ReplicationClass::Definitions);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Project;
+
+impl Resource for Project {
+    type Spec = ProjectSpec;
+    type Status = ProjectStatus;
+    type StatusPatch = ProjectStatusPatch;
+    const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "projects", kind: "Project" };
+    const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Definitions;
+    const VALIDATE_NAMESPACE_SPEC: bool = true;
+
+    fn validate_spec_with_named_siblings(
+        meta: &InputMeta,
+        spec: &Self::Spec,
+        siblings: &[ResourceObject<Self>],
+    ) -> Result<(), ResourceError> {
+        let mut declared =
+            siblings.iter().map(|object| (object.metadata.name.clone(), object.spec.parent.clone())).collect::<BTreeMap<_, _>>();
+        declared.insert(meta.name.clone(), spec.parent.clone());
+        // The merged Definitions check establishes declaration existence. A
+        // parent can live only in a replica, absent from the local locked view.
+        // Here enforce cycles among locally present records atomically.
+        let names = declared.keys().cloned().collect::<BTreeSet<_>>();
+        for parent in declared.values_mut() {
+            if parent.as_ref().is_some_and(|name| !names.contains(name)) {
+                *parent = None;
+            }
+        }
+        ProjectHierarchy::new(declared, None).map(|_| ())
+    }
+}
 
 pub const DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS: u64 = 3600;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ProjectSpec {
+    /// Declared parent in this namespace; omission inherits the designated fleet.
+    // Previous-generation Projects omit parent (ADR 0047).
+    #[serde(default)]
+    pub parent: Option<String>,
     pub display_name: String,
     pub default_workflow_ref: String,
     /// Standing additions to each workflow role's capability needs.
@@ -540,6 +574,7 @@ mod tests {
     #[test]
     fn dispatch_policy_rejects_zero_staleness_threshold() {
         let spec = ProjectSpec {
+            parent: None,
             platform_matrix: Vec::new(),
             display_name: "Widgets".to_string(),
             default_workflow_ref: "implement".to_string(),
@@ -576,6 +611,7 @@ mod tests {
             default_branch: None,
         };
         let spec = ProjectSpec {
+            parent: None,
             platform_matrix: Vec::new(),
             display_name: "Widgets".to_string(),
             default_workflow_ref: "implement".to_string(),

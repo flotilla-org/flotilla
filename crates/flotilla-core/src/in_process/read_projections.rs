@@ -25,8 +25,8 @@ use flotilla_protocol::{
     ExplainedLeafFiring, ExplainedSettlement, ExplainedSubscription, ExplainedUnclaimedWork, ExplainedUnmetExpectation,
     FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse, FleetListRow, FleetReplicaStatus, FleetStaleness,
     FulfilmentHarness, FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListResponse, HostName, HostProvidersResponse,
-    HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry, ProjectListRepository, ProjectListResponse, Subject,
-    SubjectKind, ViewAddress,
+    HostStatusResponse, HostSummary, NodeId, PeerConnectionState, ProjectListEntry, ProjectListRepository, ProjectListResponse,
+    ResourceRef, Subject, SubjectKind, ViewAddress,
 };
 use flotilla_resources::{
     bound_change_request_record_name, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves,
@@ -541,6 +541,8 @@ impl ReadProjections<'_> {
         namespace: &str,
         now: DateTime<Utc>,
     ) -> Result<ProjectListResponse, String> {
+        let hierarchy = flotilla_resources::ProjectHierarchy::load(backend, namespace).await.map_err(|error| error.to_string())?;
+
         let projects = backend.clone().definitions::<Project>(namespace).list().await.map_err(|error| error.to_string())?;
         let repositories = backend.clone().using::<Repository>(namespace).list().await.map_err(|error| error.to_string())?;
         let repositories = repositories
@@ -580,6 +582,8 @@ impl ReadProjections<'_> {
                 .collect::<Vec<_>>();
             entries.push(
                 ProjectListEntry::builder()
+                    .is_fleet(hierarchy.fleet() == Some(project.metadata.name.as_str()))
+                    .maybe_parent(hierarchy.parent(&project.metadata.name).map_err(|error| error.to_string())?.map(str::to_string))
                     .maybe_declaration_refused(
                         project
                             .status
@@ -781,7 +785,9 @@ impl ReadProjections<'_> {
                 &right.resource.name,
             ))
         });
-        Ok(FleetListResponse { rows, replicas, declaration_attention })
+        let hierarchy = flotilla_resources::ProjectHierarchy::load(self.backend, namespace).await.map_err(|error| error.to_string())?;
+        let fleet_project = hierarchy.fleet().map(|name| ResourceRef::new("flotilla.work/v1", "Project", namespace, name));
+        Ok(FleetListResponse { fleet_project, rows, replicas, declaration_attention })
     }
 
     pub(super) async fn scoped_fleet_list(
@@ -2621,5 +2627,41 @@ mod tests {
             .expect("filtered queue")
             .entries
             .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod project_hierarchy_projection_tests {
+    use flotilla_resources::{FleetDesignation, FleetDesignationSpec, InMemoryBackend, InputMeta, Project, ProjectSpec, ResourceBackend};
+
+    use super::ReadProjections;
+
+    // #2718: project list marks the designated fleet and resolves omitted
+    // parent to it; the fleet's own parent remains absent.
+    #[tokio::test]
+    async fn project_list_marks_fleet_and_resolved_parent() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        for name in ["root", "product"] {
+            backend
+                .definitions::<Project>("flotilla")
+                .apply(
+                    &InputMeta::builder().name(name.into()).build(),
+                    &ProjectSpec::builder().display_name(name.into()).default_workflow_ref("work".into()).build(),
+                )
+                .await
+                .expect("project");
+        }
+        backend
+            .definitions::<FleetDesignation>("flotilla")
+            .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec { project: "root".into() })
+            .await
+            .expect("fleet");
+        let response = ReadProjections::list_projects(&backend, "flotilla", chrono::Utc::now()).await.expect("list");
+        let root = response.projects.iter().find(|project| project.name == "root").expect("root");
+        let product = response.projects.iter().find(|project| project.name == "product").expect("product");
+        assert!(root.is_fleet);
+        assert!(root.parent.is_none());
+        assert!(!product.is_fleet);
+        assert_eq!(product.parent.as_deref(), Some("root"));
     }
 }

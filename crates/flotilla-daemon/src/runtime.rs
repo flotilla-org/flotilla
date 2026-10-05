@@ -4507,6 +4507,7 @@ fn spawn_aggregator_task(
                             .durable_presentations(durable.using::<Presentation>(&namespace))
                             .durable_sessions(durable.including_replicas::<flotilla_resources::TerminalSession>(&namespace))
                             .durable_projects(durable.including_replicas::<Project>(&namespace))
+                            .durable_fleet_designation(durable.including_replicas::<flotilla_resources::FleetDesignation>(&namespace))
                             .durable_repositories(durable.including_replicas::<Repository>(&namespace))
                             .durable_regards(durable.using::<Regard>(&namespace))
                             .durable_vessels(durable.including_replicas::<flotilla_resources::Vessel>(&namespace))

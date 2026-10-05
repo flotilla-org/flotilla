@@ -343,7 +343,7 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Project", "Display Name", "Repositories", "Issue Source", "Workflow", "Conflict", "Address"]);
+    table.set_header(vec!["Project", "Fleet", "Parent", "Display Name", "Repositories", "Issue Source", "Workflow", "Conflict", "Address"]);
     for project in &response.projects {
         let repository_count = project.repositories.len();
         let repositories = if repository_count <= 3 {
@@ -364,6 +364,8 @@ fn format_project_list_human(response: &ProjectListResponse) -> String {
         let stale_marker = if project.declaration_stale { " (stale)" } else { "" };
         table.add_row(vec![
             Cell::new(format!("{}/{}", project.namespace, project.name)),
+            Cell::new(if project.is_fleet { "fleet" } else { "" }),
+            Cell::new(project.parent.as_deref().unwrap_or("-")),
             Cell::new(&project.display_name),
             Cell::new(repositories),
             Cell::new(issue_source),
@@ -683,6 +685,9 @@ fn format_fleet_staleness(staleness: &FleetStaleness) -> String {
 
 fn format_fleet_list_human(response: &FleetListResponse) -> String {
     let mut out = String::new();
+    if let Some(project) = &response.fleet_project {
+        out.push_str(&format!("Fleet Project: {}/{}\n", project.namespace, project.name));
+    }
     if response.rows.is_empty() {
         out.push_str("No crew sessions found.\n");
     } else {

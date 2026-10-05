@@ -39,6 +39,18 @@ pub enum ResourceBackend {
 }
 
 impl ResourceBackend {
+    pub(crate) async fn hierarchy_admission(&self, kind: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if !matches!(kind, "Project" | "FleetDesignation") {
+            return None;
+        }
+        let lock = match self {
+            Self::InMemory(backend) => &backend.hierarchy_admission,
+            Self::Sqlite(backend) => &backend.hierarchy_admission,
+            Self::Http(_) => return None,
+        };
+        Some(lock.clone().lock_owned().await)
+    }
+
     pub fn with_local_root(self, local_root: NodeId) -> Self {
         match self {
             Self::InMemory(backend) => Self::InMemory(backend.with_local_root(local_root)),

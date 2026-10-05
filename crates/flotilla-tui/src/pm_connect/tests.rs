@@ -476,6 +476,7 @@ fn standing_roles_publish_and_retract_role_entities() {
 fn project_membership_full_refresh_and_delta_retract_without_activity() {
     let mut state = ConnectorState::default();
     let project = ProjectRepositoriesRow {
+        parent: None,
         resource: ResourceRef::new("flotilla.work/v1", "Project", "dev", "alpha"),
         display_name: "Alpha".to_owned(),
         repositories: vec![flotilla_protocol::ProjectRepositoryMembership {
