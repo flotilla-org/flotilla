@@ -113,7 +113,7 @@ fn missing_turn_hook(session: &ResourceObject<TerminalSession>, obligations: &[N
     }
     let status = session.status.as_ref()?;
     let crew = status.crew.as_ref()?;
-    if status.phase != TerminalSessionPhase::Running || !matches!(crew.adapter.as_str(), "codex" | "claude-code") {
+    if status.phase != TerminalSessionPhase::Running || crate::agents::parser_for_harness(&crew.adapter).is_err() {
         return None;
     }
     let started = status.started_at?;
@@ -1160,8 +1160,10 @@ impl ReconcilerWake {
                     selected_sessions.values().filter_map(|session| missing_turn_hook(session, &obligations, now)).collect::<Vec<_>>();
                 missing_hooks.sort();
                 let reason = (!missing_hooks.is_empty()).then(|| missing_hooks.join("\n"));
-                let prior = status.attention.as_ref().filter(|attention| attention.source == "missing-turn-hook");
-                if status.attention.as_ref().is_none_or(|attention| attention.source == "missing-turn-hook")
+                let prior = status.attention.as_ref().filter(|attention| attention.source == ConvoyAttention::MISSING_TURN_HOOK_SOURCE);
+                // Skip no-op writes here; the patch repeats the source guard after
+                // an optimistic retry so concurrent settlement attention stays intact.
+                if status.attention.as_ref().is_none_or(|attention| attention.source == ConvoyAttention::MISSING_TURN_HOOK_SOURCE)
                     && prior.map(|attention| &attention.reason) != reason.as_ref()
                 {
                     flotilla_resources::apply_status_patch(

@@ -1185,6 +1185,10 @@ pub struct ConvoyAttention {
     pub raised_at: DateTime<Utc>,
 }
 
+impl ConvoyAttention {
+    pub const MISSING_TURN_HOOK_SOURCE: &'static str = "missing-turn-hook";
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ConvoyPhase {
     #[default]
@@ -1703,12 +1707,15 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::SetSettlementAttention { attention } => status.attention = attention.clone(),
             Self::ObserveTurnHookHealth { reason, observed_at } => {
-                if status.attention.as_ref().is_none_or(|attention| attention.source == "missing-turn-hook") {
+                if status.attention.as_ref().is_none_or(|attention| attention.source == ConvoyAttention::MISSING_TURN_HOOK_SOURCE) {
                     match reason {
                         Some(reason) => {
                             let raised_at = status.attention.as_ref().map_or(*observed_at, |attention| attention.raised_at);
-                            status.attention =
-                                Some(ConvoyAttention { source: "missing-turn-hook".into(), reason: reason.clone(), raised_at });
+                            status.attention = Some(ConvoyAttention {
+                                source: ConvoyAttention::MISSING_TURN_HOOK_SOURCE.into(),
+                                reason: reason.clone(),
+                                raised_at,
+                            });
                         }
                         None => status.attention = None,
                     }
