@@ -29,6 +29,7 @@ use flotilla_tui::{
 };
 use tracing::info;
 
+mod fleet_prune;
 mod resource_validate;
 
 /// Flotilla: TUI dashboard for managing development workspaces
@@ -710,6 +711,15 @@ enum FleetSubCommand {
     Check,
     /// Show hosts grouped by wire generation (never starts a daemon)
     Spread,
+    /// Prune local generations (caller must hold the fleet installer lock)
+    Prune {
+        #[arg(long)]
+        fleet_root: PathBuf,
+        #[arg(long, default_value = "3", allow_hyphen_values = true)]
+        keep_others: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run this generation's post-install cleat turnover after health confirmation
     PostInstall {
         #[arg(long)]
@@ -947,6 +957,14 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
             }
             print!("{}", flotilla_core::fleet_health::spread(result));
             Ok(())
+        }
+        Some(SubCommand::Fleet { command: Some(FleetSubCommand::Prune { fleet_root, keep_others, dry_run }) }) => {
+            if cli.daemon.is_some() {
+                return Err(color_eyre::eyre::eyre!("fleet prune operates on local generations; drop --daemon"));
+            }
+            fleet_prune::run(&fleet_root, &keep_others, dry_run, &ProcessCommandRunner)
+                .await
+                .map_err(|error| color_eyre::eyre::eyre!(error))
         }
         Some(SubCommand::Fleet { command: Some(FleetSubCommand::PostInstall { cleat_bin, generation, diagnostics_dir }) }) => {
             cli.require_local_daemon("fleet post-install")?;
@@ -4341,6 +4359,17 @@ mod tests {
     fn cli_parses_fleet_health_dashboard() {
         let cli = Cli::try_parse_from(["flotilla", "fleet"]).expect("fleet should parse");
         assert!(matches!(cli.command, Some(SubCommand::Fleet { command: None })));
+    }
+
+    // Glue: the standalone local pruning command accepts installer arguments,
+    // including a negative K so the pruning module emits its recovery error.
+    #[test]
+    fn cli_parses_generation_pruning() {
+        let cli = Cli::try_parse_from(["flotilla", "fleet", "prune", "--fleet-root", "/fleet", "--keep-others", "-1", "--dry-run"])
+            .expect("prune parses");
+        assert!(
+            matches!(cli.command, Some(SubCommand::Fleet { command: Some(super::FleetSubCommand::Prune { fleet_root, keep_others, dry_run: true }) }) if fleet_root == Path::new("/fleet") && keep_others == "-1")
+        );
     }
 
     #[test]

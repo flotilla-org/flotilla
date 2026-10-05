@@ -979,129 +979,19 @@ rollback() {
   restart_darwin_daemon_service
 }
 
-# Selection and deletion share the install lock. Process discovery fails closed:
-# an unreadable executable means we cannot prove any old release is unused.
+# Selection and deletion share the install lock. Always delegate to the active
+# (incoming after activation) generation, never a PATH launcher or previous CLI.
 prune_generations() {
   local dry_run="${1:-0}"
-  python3 - "$FLEET_ROOT" "${FLEET_INSTALL_KEEP_OTHERS:-3}" "$dry_run" "$PLATFORM" <<'PRUNE'
-import ctypes
-import json
-import os
-from pathlib import Path
-import re
-import shutil
-import stat
-import subprocess
-import sys
-
-root = Path(sys.argv[1]).resolve()
-keep_text, dry_run, platform = sys.argv[2:]
-if not re.fullmatch(r"[0-9]+", keep_text):
-    raise SystemExit("fleet-install: FLEET_INSTALL_KEEP_OTHERS must be a non-negative integer")
-keep = int(keep_text)
-releases = root / "releases"
-proc_pidpath = None
-path_buffer = None
-
-def protected_paths():
-    global proc_pidpath, path_buffer
-    protected = set()
-    for name in ("current", "previous"):
-        link = root / name
-        if link.is_symlink():
-            target = link.resolve()
-            if target.parent != releases or not target.is_dir():
-                recovery = "inspect and restore the link to an installed release"
-                if name == "previous":
-                    recovery += ", or remove the stale previous link"
-                raise RuntimeError(f"unsafe or missing {name} target: {link}; {recovery} before retrying")
-            protected.add(target)
-        elif link.exists():
-            raise RuntimeError(f"{name} is not a symlink")
-    # Fixture seam at the process boundary, never enabled in normal installs.
-    fixture = os.environ.get("FLEET_INSTALL_TEST_PROCESS_PATHS")
-    if os.environ.get("FLEET_INSTALL_TESTING") == "1" and fixture:
-        executables = json.loads(Path(fixture).read_text())
-    else:
-        result = subprocess.run(["pgrep", "-x", "flotillad"],
-                                capture_output=True, text=True)
-        if result.returncode not in (0, 1):
-            raise RuntimeError("cannot enumerate running flotillad processes")
-        if result.returncode == 0 and not result.stdout.strip():
-            raise RuntimeError("process discovery returned no executable PIDs")
-        executables = []
-        if platform.startswith("darwin") and result.stdout.strip() and proc_pidpath is None:
-            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-            proc_pidpath = libproc.proc_pidpath
-            proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
-            proc_pidpath.restype = ctypes.c_int
-            path_buffer = ctypes.create_string_buffer(4096)
-        for value in result.stdout.split():
-            pid = int(value)
-            try:
-                if platform.startswith("linux"):
-                    executable = os.readlink(f"/proc/{pid}/exe")
-                    executable = executable.removesuffix(" (deleted)")
-                else:
-                    # proc_pidpath reads the actual executable, not argv or the
-                    # current symlink, including launchd's pre-flip respawns.
-                    path_buffer.value = b""
-                    if proc_pidpath(pid, path_buffer, len(path_buffer)) <= 0:
-                        raise OSError(ctypes.get_errno(), "proc_pidpath failed")
-                    executable = os.fsdecode(path_buffer.value)
-                executables.append(executable)
-            except OSError:
-                # An exited process cannot hold a generation. Any process that
-                # still exists but cannot be inspected blocks all deletion.
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    continue
-                raise
-    for executable in executables:
-        path = Path(executable).resolve()
-        try:
-            relative = path.relative_to(releases)
-        except ValueError:
-            continue
-        if len(relative.parts) >= 2:
-            protected.add(releases / relative.parts[0])
-    return protected
-
-try:
-    protected = protected_paths()
-    if not releases.exists():
-        sys.exit(0)
-    # Generation IDs start with a UTC publication timestamp. Directory mtimes
-    # can change on validator sync or reinstall and are not publication order.
-    generations = sorted((p for p in releases.iterdir() if p.is_dir() and not p.is_symlink()
-                          and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", p.name)),
-                         key=lambda p: p.name, reverse=True)
-    # Longest-prefix ownership disambiguates dotted generation IDs: pruning
-    # A must not delete A.b.validator.bak when generation A.b is retained.
-    generation_names = sorted((p.name for p in generations), key=len, reverse=True)
-    # Running releases are protected in addition to the K recent others.
-    others = [p for p in generations if p not in protected]
-    retained = set(others[:keep]) | protected
-    for release in others[keep:]:
-        # Recheck immediately before deletion in case a daemon respawned since
-        # selection. Never mutate a protected release, including its modes.
-        if release in protected_paths() or release in retained:
-            continue
-        print(f"fleet-install: {'would prune' if dry_run == '1' else 'pruning'} {release.name}", flush=True)
-        if dry_run != "1":
-            for directory, _, _ in os.walk(release):
-                os.chmod(directory, stat.S_IMODE(os.stat(directory).st_mode) | stat.S_IWUSR)
-            shutil.rmtree(release)
-            # Host-staged validator copies/backups are generation-scoped
-            # siblings. Do not touch the host's shared validator or kept ones.
-            for sibling in releases.iterdir():
-                owner = next((name for name in generation_names if sibling.name.startswith(name + ".")), None)
-                if owner == release.name and (sibling.is_symlink() or not sibling.is_dir()):
-                    sibling.unlink()
-except (OSError, ValueError, RuntimeError) as error:
-    raise SystemExit(f"fleet-install: pruning failed: {error}")
-PRUNE
+  local -a options=()
+  if [[ ! -e "$RELEASES_DIR" && ! -L "$CURRENT_LINK" && ! -e "$CURRENT_LINK" && ! -L "$PREVIOUS_LINK" && ! -e "$PREVIOUS_LINK" ]]; then
+    return 0
+  fi
+  [[ -x "$CURRENT_LINK/bin/flotilla" ]] \
+    || die "unsafe or missing current target: $CURRENT_LINK; inspect and restore the link to an installed release with an executable CLI before retrying"
+  if [[ "$dry_run" == 1 ]]; then options+=(--dry-run); fi
+  "$CURRENT_LINK/bin/flotilla" fleet prune --fleet-root "$FLEET_ROOT" \
+    --keep-others "${FLEET_INSTALL_KEEP_OTHERS:-3}" "${options[@]}"
 }
 
 prune_after_confirmation() {
