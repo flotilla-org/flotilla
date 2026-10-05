@@ -1638,12 +1638,10 @@ impl VcsBackend for GitCliBackend<'_> {
         }
         let remote_exists = self.ref_exists(&remote_ref).await;
         if local_exists {
-            return Err(format!("checkout branch {branch} already exists locally; choose a fresh branch name"));
+            return Err(existing_checkout_branch_error(branch, None));
         }
         if remote_exists {
-            return Err(format!(
-                "checkout branch {branch} conflicts with remote-tracking ref {remote_ref} (possibly stale); choose a fresh branch name"
-            ));
+            return Err(existing_checkout_branch_error(branch, Some(&remote_ref)));
         }
         let provenance = if !local_exists && !remote_exists && base_ref.is_some() {
             CheckoutBranchProvenance::CreatedForConvoy
@@ -1897,6 +1895,13 @@ fn non_empty_output_or(fallback: &str, output: &str) -> String {
         fallback.to_string()
     } else {
         output.to_string()
+    }
+}
+
+pub(crate) fn existing_checkout_branch_error(branch: &str, tracking_ref: Option<&str>) -> String {
+    match tracking_ref {
+        Some(reference) => format!("checkout branch {branch} conflicts with remote-tracking ref {reference} (possibly stale); inspect with git branch -r and git fetch --prune, or choose a fresh branch name"),
+        None => format!("checkout branch {branch} already exists locally; choose a fresh branch name"),
     }
 }
 

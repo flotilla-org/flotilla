@@ -15,7 +15,7 @@ use flotilla_resources::{
     ResourceProvenance, SystemClock, TypedResolver, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, FORCE_TEARDOWN_ANNOTATION,
 };
 use tokio::{sync::Mutex, task::JoinHandle};
-use tracing::warn;
+use tracing::{debug, warn};
 
 const CHECKOUT_INTEGRATION_REFRESH_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 const CHECKOUT_PROVISIONING_REQUEUE_AFTER: Duration = Duration::from_secs(1);
@@ -253,6 +253,7 @@ pub enum CheckoutPrepared {
     Integration { status: Box<CheckoutIntegrationStatus> },
     RetryClone { clone_name: String, failed_at: DateTime<Utc> },
     Waiting,
+    ValidationUnavailable(String),
     Failed(String),
 }
 
@@ -369,6 +370,7 @@ where
                     && match other.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) {
                         CheckoutPhase::Ready | CheckoutPhase::Preparing | CheckoutPhase::Terminating => true,
                         // Pending siblings reserve in creation order; names break timestamp ties.
+                        // A refused loser remains terminally Failed even if the winner later fails.
                         CheckoutPhase::Pending => {
                             (other.metadata.creation_timestamp, &other.metadata.name)
                                 < (obj.metadata.creation_timestamp, &obj.metadata.name)
@@ -390,8 +392,12 @@ where
                 Ok(Some(conflict)) => return Ok(CheckoutPrepared::Failed(conflict)),
                 Ok(None) => {}
                 Err(error) => {
-                    warn!(checkout = %obj.metadata.name, %error, "checkout branch validation unavailable; retrying");
-                    return Ok(CheckoutPrepared::Waiting);
+                    if obj.status.as_ref().and_then(|status| status.message.as_deref()) == Some(error.as_str()) {
+                        debug!(checkout = %obj.metadata.name, %error, "checkout branch validation still unavailable; retrying");
+                    } else {
+                        warn!(checkout = %obj.metadata.name, %error, "checkout branch validation unavailable; retrying");
+                    }
+                    return Ok(CheckoutPrepared::ValidationUnavailable(error));
                 }
             }
         }
@@ -478,7 +484,14 @@ where
                 | CheckoutPrepared::Reappeared => None,
                 CheckoutPrepared::RetryClone { .. } => None,
                 CheckoutPrepared::Failed(message) => Some(CheckoutStatusPatch::MarkFailed { message: message.clone() }),
-                CheckoutPrepared::Waiting | CheckoutPrepared::None => None,
+                CheckoutPrepared::ValidationUnavailable(message) => (obj.status.as_ref().and_then(|status| status.message.as_ref())
+                    != Some(message))
+                .then(|| CheckoutStatusPatch::ObserveValidation { message: Some(message.clone()) }),
+                CheckoutPrepared::Waiting | CheckoutPrepared::None => obj
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.message.as_ref())
+                    .map(|_| CheckoutStatusPatch::ObserveValidation { message: None }),
             }
         } else if obj.status.as_ref().is_some_and(|status| status.phase == CheckoutPhase::Gone) {
             match prepared {
@@ -527,7 +540,8 @@ where
                 | CheckoutPrepared::Reappeared
                 | CheckoutPrepared::Ready { .. }
                 | CheckoutPrepared::RetryClone { .. }
-                | CheckoutPrepared::Waiting => None,
+                | CheckoutPrepared::Waiting
+                | CheckoutPrepared::ValidationUnavailable(_) => None,
             }
         } else {
             None

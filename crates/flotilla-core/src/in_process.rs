@@ -3408,14 +3408,10 @@ impl InProcessDaemon {
             .await
             .map_err(|error| error.to_string())?
             .object;
-        if repository
+        Ok(!repository
             .spec
             .forge()
-            .is_none_or(|forge| !forge.service_url.starts_with("https://") && !forge.service_url.starts_with("http://"))
-        {
-            return Ok(false);
-        }
-        Ok(true)
+            .is_none_or(|forge| !forge.service_url.starts_with("https://") && !forge.service_url.starts_with("http://")))
     }
 
     /// Creation requires a fresh forge lookup: a cached absence must not

@@ -8,7 +8,7 @@ use tracing::info;
 use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{types::Checkout, ChannelLabel, CommandRunner},
-    vcs::{CheckoutMaterialisation, EnumeratedCheckout, GitCliBackend, VcsBackend},
+    vcs::{existing_checkout_branch_error, CheckoutMaterialisation, EnumeratedCheckout, GitCliBackend, VcsBackend},
 };
 
 /// A `CheckoutManager` for sandbox/container environments that uses
@@ -108,12 +108,10 @@ impl ReferenceCloneStrategy {
             .await
             .is_ok();
         if local_exists {
-            return Err(format!("checkout branch {branch} already exists locally; choose a fresh branch name"));
+            return Err(existing_checkout_branch_error(branch, None));
         }
         if remote_exists {
-            return Err(format!(
-                "checkout branch {branch} conflicts with remote-tracking ref {remote_ref} (possibly stale); choose a fresh branch name"
-            ));
+            return Err(existing_checkout_branch_error(branch, Some(&remote_ref)));
         }
         if !GitCliBackend::new(std::path::Path::new("/"), &*self.runner).remote_heads(&remote_url, &local_ref).await?.trim().is_empty() {
             return Err(format!("checkout branch {branch} already exists on remote; choose a fresh branch name"));
