@@ -9183,6 +9183,15 @@ async fn prless_decision_ledger_claim_accepts_and_settles() {
         role: Some("coder".into()),
         ..Default::default()
     };
+    // Review #2681: a legacy Done status alone must not bypass the artifact expectation.
+    let current = convoys.get("ledger-claim").await.expect("convoy");
+    let mut status = current.status.expect("status");
+    status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("claim").phase = CrewWorkPhase::Done;
+    convoys.update_status("ledger-claim", &current.metadata.resource_version, &status).await.expect("legacy Done claim");
+    daemon
+        .crew_complete_with_disposition_internal(&context, None, None, None)
+        .await
+        .expect_err("Done without admission evidence must not bypass validation");
     for producer in ["reviewer", "coder"] {
         daemon
             .crew_complete_with_disposition_internal(&context, None, None, None)
@@ -9221,6 +9230,8 @@ async fn prless_decision_ledger_claim_accepts_and_settles() {
         .await
         .expect("explain accepted claim");
     let CommandValue::ConvoyExplanation(explanation) = explanation else { panic!("expected convoy explanation") };
+    let admitted = convoys.get("ledger-claim").await.expect("admitted convoy");
+    assert_eq!(admitted.status.as_ref().expect("status").crew_work["work"]["coder"].decision_ledger_digest.as_deref(), Some("ledger"));
     assert!(!explanation.decision_ledgers[0].missing);
     assert!(!explanation.decision_ledgers[0].projection_missing);
     assert!(explanation.settlement.satisfied, "artifact-backed issue convoy must explain as settled");

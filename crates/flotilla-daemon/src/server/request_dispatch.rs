@@ -1032,8 +1032,10 @@ mod ledger_projection_tests {
         let fails = tc.draw(gs::booleans());
         let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
         let length = tc.draw(gs::integers::<usize>().min_value(0).max_value(600));
+        // Unicode scalar values and JSON-escaped control characters exercise the byte budget.
+        let character = ["é", "\0", "🦀"][tc.draw(gs::integers::<usize>().min_value(0).max_value(2))];
         let urls = vec!["https://example.test/comment".to_string(); count];
-        let result = if fails { Err("é".repeat(length)) } else { Ok(urls) };
+        let result = if fails { Err(character.repeat(length)) } else { Ok(urls) };
         let summary = decision_ledger_projection_summary(result);
         assert_eq!(summary.contains_key("projection_error"), fails);
         assert_eq!(summary.contains_key("comment_url"), !fails && count > 0);

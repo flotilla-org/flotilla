@@ -975,7 +975,13 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             }
             if ledger.missing {
                 let detail = ledger.override_principal.as_ref().map_or_else(
-                    || "crew completed without a decision ledger".to_string(),
+                    || {
+                        if ledger.comment_url.is_some() {
+                            "PR comment exists, decision-ledger artifact not found".to_string()
+                        } else {
+                            "decision-ledger artifact not found".to_string()
+                        }
+                    },
                     |principal| format!("completed by {}/{} with --force", principal.namespace, principal.name),
                 );
                 let _ = writeln!(

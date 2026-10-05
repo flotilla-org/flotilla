@@ -1312,6 +1312,10 @@ pub struct CrewWorkState {
     /// this pointer is additional evidence and is absent for PR-less claims.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_ledger_ref: Option<String>,
+    /// Digest of the artifact body accepted with this claim, independent of PR projection.
+    /// Decode prior stored claims without it for one generation; remove the default after the next fleet roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_ledger_digest: Option<String>,
     /// Completion claims displaced by a brief delivered at the turn boundary.
     #[builder(default)]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1360,6 +1364,10 @@ pub struct SupersededCrewClaim {
     pub message: Option<String>,
     pub disposition: Option<String>,
     pub decision_ledger_ref: Option<String>,
+    /// Digest of the artifact body accepted with this claim, independent of PR projection.
+    /// Decode prior stored claims without it for one generation; remove the default after the next fleet roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_ledger_digest: Option<String>,
     pub completion_override: Option<CrewCompletionOverride>,
     pub completed_while_crew_active: bool,
 }
@@ -1519,6 +1527,7 @@ pub enum ConvoyStatusPatch {
         message: Option<String>,
         disposition: Option<String>,
         decision_ledger_ref: Option<String>,
+        decision_ledger_digest: Option<String>,
         completed_while_crew_active: bool,
         forced_by: Option<PrincipalRef>,
     },
@@ -1570,6 +1579,7 @@ pub enum ConvoyStatusPatch {
         completion_message: Option<String>,
         disposition: Option<String>,
         decision_ledger_ref: Option<String>,
+        decision_ledger_digest: Option<String>,
         completed_while_crew_active: bool,
         forced_by: Option<PrincipalRef>,
     },
@@ -1899,6 +1909,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 message,
                 disposition,
                 decision_ledger_ref,
+                decision_ledger_digest,
                 completed_while_crew_active,
                 forced_by,
             } => {
@@ -1920,10 +1931,13 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     if decision_ledger_ref.is_some() {
                         state.decision_ledger_ref = decision_ledger_ref.clone();
                     }
+                    if decision_ledger_digest.is_some() {
+                        state.decision_ledger_digest = decision_ledger_digest.clone();
+                    }
                 }
                 if let Some(principal) = forced_by {
                     if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
-                        if state.decision_ledger_ref.is_none() {
+                        if state.decision_ledger_ref.is_none() && state.decision_ledger_digest.is_none() {
                             state.completion_override =
                                 Some(CrewCompletionOverride { principal: principal.clone(), forced_at: *finished_at });
                         }
@@ -2027,6 +2041,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         target.phase = CrewWorkPhase::Working;
                         target.started_at.get_or_insert(*handed_off_at);
                         target.finished_at = None;
+                        target.decision_ledger_digest = None;
                         target.message = Some(message.clone());
                     }
                 }
@@ -2058,6 +2073,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.phase = CrewWorkPhase::Working;
                     state.started_at.get_or_insert(*resumed_at);
                     state.finished_at = None;
+                    state.decision_ledger_digest = None;
                     state.message = Some(prompt.clone());
                 }
                 status.stalled = None;
@@ -2078,6 +2094,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 completion_message,
                 disposition,
                 decision_ledger_ref,
+                decision_ledger_digest,
                 completed_while_crew_active,
                 forced_by,
             } => {
@@ -2092,8 +2109,10 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                         message: completion_message.clone(),
                         disposition: disposition.clone(),
                         decision_ledger_ref: decision_ledger_ref.clone(),
+                        decision_ledger_digest: decision_ledger_digest.clone(),
                         completion_override: forced_by
                             .as_ref()
+                            .filter(|_| decision_ledger_ref.is_none() && decision_ledger_digest.is_none())
                             .map(|principal| CrewCompletionOverride { principal: principal.clone(), forced_at: *delivered_at }),
                         completed_while_crew_active: *completed_while_crew_active,
                     });
@@ -2113,6 +2132,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     state.message = Some(content.clone());
                     state.disposition = None;
                     state.decision_ledger_ref = None;
+                    state.decision_ledger_digest = None;
                     state.completion_override = None;
                     state.completed_while_crew_active = false;
                 }
@@ -2132,6 +2152,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 if let Some(state) = status.crew_work.get_mut(vessel).and_then(|crew| crew.get_mut(role)) {
                     state.phase = CrewWorkPhase::Working;
                     state.finished_at = None;
+                    state.decision_ledger_digest = None;
                     state.message = Some(prompt.clone());
                 }
                 status.phase = ConvoyPhase::Active;
@@ -2302,7 +2323,7 @@ pub mod external_patches {
         disposition: Option<String>,
         decision_ledger_ref: Option<String>,
     ) -> ConvoyStatusPatch {
-        mark_crew_completed_with_context(vessel, role, finished_at, message, disposition, decision_ledger_ref, false, None)
+        mark_crew_completed_with_context(vessel, role, finished_at, message, disposition, decision_ledger_ref, None, false, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2313,6 +2334,7 @@ pub mod external_patches {
         message: Option<String>,
         disposition: Option<String>,
         decision_ledger_ref: Option<String>,
+        decision_ledger_digest: Option<String>,
         completed_while_crew_active: bool,
         forced_by: Option<PrincipalRef>,
     ) -> ConvoyStatusPatch {
@@ -2323,6 +2345,7 @@ pub mod external_patches {
             message,
             disposition,
             decision_ledger_ref,
+            decision_ledger_digest,
             completed_while_crew_active,
             forced_by,
         }
@@ -2381,6 +2404,7 @@ pub mod external_patches {
         completion_message: Option<String>,
         disposition: Option<String>,
         decision_ledger_ref: Option<String>,
+        decision_ledger_digest: Option<String>,
         completed_while_crew_active: bool,
         forced_by: Option<PrincipalRef>,
     ) -> ConvoyStatusPatch {
@@ -2392,6 +2416,7 @@ pub mod external_patches {
             completion_message,
             disposition,
             decision_ledger_ref,
+            decision_ledger_digest,
             completed_while_crew_active,
             forced_by,
         }

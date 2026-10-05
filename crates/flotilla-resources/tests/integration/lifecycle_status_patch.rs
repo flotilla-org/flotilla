@@ -24,6 +24,7 @@ fn force_does_not_relabel_a_ledger_backed_claim_as_overridden() {
         message: Some("duplicate completion".to_string()),
         disposition: None,
         decision_ledger_ref: None,
+        decision_ledger_digest: None,
         completed_while_crew_active: false,
         forced_by: Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".to_string(), name: "operator".to_string() }),
     }
@@ -283,6 +284,7 @@ fn crew_state(phase: CrewWorkPhase, started_at: Option<DateTime<Utc>>, finished_
         message: None,
         disposition: None,
         decision_ledger_ref: None,
+        decision_ledger_digest: None,
         superseded_claims: Vec::new(),
         completion_override: None,
         completed_while_crew_active: false,
@@ -641,6 +643,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     message: Some("still complete".to_string()),
                     disposition: None,
                     decision_ledger_ref: None,
+                    decision_ledger_digest: None,
                     completed_while_crew_active: false,
                     forced_by: None,
                 };
@@ -973,6 +976,7 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
                     completion_message: Some("first turn complete".to_string()),
                     disposition: Some("satisfied".to_string()),
                     decision_ledger_ref: None,
+                    decision_ledger_digest: None,
                     completed_while_crew_active: false,
                     forced_by: None,
                 };
@@ -1136,6 +1140,7 @@ fn settling_again_after_a_continuation_records_the_new_outcome_time() {
                     message: Some("addressed".to_string()),
                     disposition: None,
                     decision_ledger_ref: None,
+                    decision_ledger_digest: None,
                     completed_while_crew_active: false,
                     forced_by: None,
                 };
@@ -1186,4 +1191,91 @@ fn turn_delivery_episodes_stored_before_2135_decode_their_head_sha_as_subject_re
     let decoded: TurnDeliveryEpisode = serde_json::from_value(stored).expect("pre-#2135 episode decodes");
     assert_eq!(decoded, episode);
     assert!(serde_json::to_value(&decoded).expect("serialize").get("head_sha").is_none(), "the old name is never written back");
+}
+
+// Review #2681: admitted artifact identity survives duplicate completion and force,
+// is archived at a pending-brief boundary, and cannot leak into a new working turn.
+#[hegel::test]
+fn ledger_admission_digest_survives_duplicates_and_resets_for_new_turns(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    // All continuation writers: resume, hand-off target, pending brief, and subject turn.
+    let continuation = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+    let mut status = active_convoy_status();
+    let completion = ConvoyStatusPatch::MarkCrewCompleted {
+        vessel: "implement".into(),
+        role: "coder".into(),
+        finished_at: ts(30),
+        message: None,
+        disposition: None,
+        decision_ledger_ref: None,
+        decision_ledger_digest: Some("admitted".into()),
+        completed_while_crew_active: false,
+        forced_by: None,
+    };
+    completion.apply(&mut status);
+    let duplicate = ConvoyStatusPatch::MarkCrewCompleted {
+        vessel: "implement".into(),
+        role: "coder".into(),
+        finished_at: ts(31),
+        message: None,
+        disposition: None,
+        decision_ledger_ref: None,
+        decision_ledger_digest: None,
+        completed_while_crew_active: false,
+        forced_by: Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "operator".into() }),
+    };
+    duplicate.apply(&mut status);
+    assert_eq!(status.crew_work["implement"]["coder"].decision_ledger_digest.as_deref(), Some("admitted"));
+    assert!(status.crew_work["implement"]["coder"].completion_override.is_none());
+    let patch = match continuation {
+        0 => ConvoyStatusPatch::ResumeCrewWork {
+            vessel: "implement".into(),
+            role: "coder".into(),
+            resumed_at: ts(40),
+            prompt: "new turn".into(),
+            brief_id: None,
+        },
+        1 => ConvoyStatusPatch::HandoffCrewWork {
+            vessel: "implement".into(),
+            sender_role: "reviewer".into(),
+            target_role: "coder".into(),
+            handed_off_at: ts(40),
+            message: "new turn".into(),
+        },
+        2 => {
+            ConvoyStatusPatch::SetPendingBrief { pending_brief: pending_brief() }.apply(&mut status);
+            ConvoyStatusPatch::DeliverPendingBrief {
+                vessel: "implement".into(),
+                role: "coder".into(),
+                delivered_at: ts(40),
+                content: "address review".into(),
+                completion_message: None,
+                disposition: None,
+                decision_ledger_ref: None,
+                decision_ledger_digest: Some("admitted".into()),
+                completed_while_crew_active: false,
+                forced_by: Some(flotilla_protocol::PrincipalRef { namespace: "flotilla".into(), name: "operator".into() }),
+            }
+        }
+        _ => ConvoyStatusPatch::RecordTurnDelivery {
+            source: "review".into(),
+            episode: TurnDeliveryEpisode {
+                subject_revision: "new-head".into(),
+                evidence_at: ts(40),
+                judged_claim_at: ts(20),
+                outcome: TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::WarmSession, delivered_at: ts(40) },
+                sender: Default::default(),
+            },
+            vessel: "implement".into(),
+            role: "coder".into(),
+            prompt: "new turn".into(),
+        },
+    };
+    patch.apply(&mut status);
+    assert_eq!(status.crew_work["implement"]["coder"].phase, CrewWorkPhase::Working);
+    assert!(status.crew_work["implement"]["coder"].decision_ledger_digest.is_none());
+    if continuation == 2 {
+        assert!(status.crew_work["implement"]["coder"].superseded_claims[0].completion_override.is_none());
+        assert_eq!(status.crew_work["implement"]["coder"].superseded_claims[0].decision_ledger_digest.as_deref(), Some("admitted"));
+    }
 }

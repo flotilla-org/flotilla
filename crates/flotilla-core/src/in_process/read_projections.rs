@@ -1323,7 +1323,20 @@ fn explained_decision_ledgers(
                     let artifact = artifacts
                         .iter()
                         .filter(|source| source.object.metadata.name == name)
-                        .min_by_key(|source| !matches!(source.provenance, ResourceProvenance::Local));
+                        .min_by_key(|source| !matches!(source.provenance, ResourceProvenance::Local))
+                        .filter(|source| {
+                            let artifact = &source.object.spec;
+                            match claim.decision_ledger_digest.as_deref() {
+                                Some(digest) => artifact.digest == digest,
+                                // Legacy claims have no admitted digest. When a hand-back has dated
+                                // evidence, exclude bodies recorded after its claim; undated records
+                                // remain readable under the previous-generation compatibility contract.
+                                None => {
+                                    claim.phase != CrewWorkPhase::HandedBack
+                                        || artifact.recorded_at.zip(claim.finished_at).is_none_or(|(recorded, claimed)| recorded <= claimed)
+                                }
+                            }
+                        });
                     let comment_url = artifact
                         .and_then(|source| source.object.spec.summary.get("comment_url"))
                         .and_then(serde_json::Value::as_str)
@@ -2390,8 +2403,62 @@ mod tests {
         assert_eq!(ledger.projection_error.as_deref(), projection_failure.then_some("forge unavailable"));
     }
 
+    // Review #2681: HandedBack claims must not borrow a later turn's body; local evidence
+    // wins over a replica regardless of list order. Generate known/legacy claim identity,
+    // matching/different bodies, before/after recording times, and both source orderings.
+    #[hegel::test]
+    fn ledger_artifact_selection_respects_claim_identity_and_local_authority(tc: hegel::TestCase) {
+        let known_digest = tc.draw(gs::booleans());
+        let matching = tc.draw(gs::booleans());
+        let later = tc.draw(gs::booleans());
+        let replica_first = tc.draw(gs::booleans());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let at = Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).single().expect("timestamp");
+            let name = flotilla_resources::artifact_record_name("claimed", "coder", "decision-ledger", "claimed");
+            let mut spec = flotilla_resources::ArtifactSpec::builder()
+                .convoy("claimed".into())
+                .producer("coder".into())
+                .kind("decision-ledger".into())
+                .subject("claimed".into())
+                .digest(if matching { "admitted" } else { "later-body" }.into())
+                .size(1)
+                .media_type("text/markdown".into())
+                .expires_at(at + ChronoDuration::days(1))
+                .build();
+            spec.recorded_at = Some(at + ChronoDuration::seconds(if later { 1 } else { -1 }));
+            spec.summary.insert("comment_url".into(), serde_json::json!("https://example.test/local"));
+            let object = backend
+                .using::<flotilla_resources::Artifact>("flotilla")
+                .create(&InputMeta::builder().name(name).build(), &spec)
+                .await
+                .expect("artifact");
+            let local = ReadResourceObject { object: object.clone(), provenance: ResourceProvenance::Local };
+            let mut replica = ReadResourceObject {
+                object,
+                provenance: ResourceProvenance::Replica { origin_root: NodeId::new("other"), last_synced_at: at },
+            };
+            replica.object.spec.summary.insert("comment_url".into(), serde_json::json!("https://example.test/replica"));
+            let artifacts = if replica_first { vec![replica, local] } else { vec![local, replica] };
+            let mut claim = CrewWorkState::builder().phase(CrewWorkPhase::HandedBack).finished_at(at).build();
+            claim.decision_ledger_digest = known_digest.then(|| "admitted".into());
+            let status = ConvoyStatus {
+                crew_work: BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), claim)]))]),
+                ..Default::default()
+            };
+            let ledgers = explained_decision_ledgers("claimed", Some(&status), &artifacts, true);
+            let present = if known_digest { matching } else { !later };
+            assert_eq!(ledgers[0].missing, !present);
+            assert_eq!(ledgers[0].artifact_address.is_some(), present);
+            assert_eq!(ledgers[0].comment_url.as_deref(), present.then_some("https://example.test/local"));
+        });
+    }
+
+    // A legacy PR projection can outlive its retained artifact. Report the surviving
+    // comment independently; it cannot satisfy the artifact expectation.
     #[test]
-    fn completed_claims_without_a_decision_ledger_are_visible_in_explanations() {
+    fn comment_projection_without_artifact_remains_missing_in_explanations() {
         let claimed_at = chrono::Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).single().expect("timestamp");
         let status = ConvoyStatus {
             crew_work: BTreeMap::from([(

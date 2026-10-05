@@ -250,7 +250,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 vessel: "review".into(),
                 role: "reviewer".into(),
                 claimed_at: Some("2026-08-21T12:01:00Z".into()),
-                comment_url: None,
+                comment_url: Some("https://example.test/pull/1#orphaned".into()),
                 missing: true,
                 override_principal: None,
                 completed_while_crew_active: false,
@@ -284,7 +284,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     assert!(output.contains("Crew work needing a settlement claim:\n  - work/coder (turn idle)"));
     assert!(output
         .contains("work/coder claimed_at=2026-08-21T12:00:00Z artifact=artifact/ledger comment=https://example.test/pull/1#comment-2"));
-    assert!(output.contains("review/reviewer claimed_at=2026-08-21T12:01:00Z MISSING (crew completed without a decision ledger)"));
+    assert!(output.contains("review/reviewer claimed_at=2026-08-21T12:01:00Z MISSING (PR comment exists, decision-ledger artifact not found) comment=https://example.test/pull/1#orphaned"));
     assert!(output.contains(
         "research/researcher claimed_at=2026-08-21T12:02:00Z MISSING (completed by flotilla/operator with --force) — completed while crew active"
     ));
@@ -301,7 +301,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     let output = format_convoy_explanation_human(&artifact_only);
     assert!(output.contains("artifact=artifact/ledger comment=-"));
     assert!(output.contains("PR projection MISSING (forge unavailable)"));
-    assert!(!output.contains("crew completed without a decision ledger"));
+    assert!(!output.contains("decision-ledger artifact not found"));
 }
 
 #[test]
