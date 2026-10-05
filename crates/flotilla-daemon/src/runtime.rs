@@ -6202,6 +6202,38 @@ impl TerminalRuntime for TerminalControllerRuntime {
         observe_terminal_screen(&*pool, adapter.as_deref(), session_id, Utc::now()).await
     }
 
+    async fn agent_exit_failure(
+        &self,
+        session_id: &str,
+        spec: &flotilla_resources::TerminalSessionSpec,
+        exit_code: i32,
+    ) -> Result<Option<String>, String> {
+        if exit_code == 0 {
+            return Ok(None);
+        }
+        let TerminalSessionSource::Agent { selector, .. } = &spec.source else { return Ok(None) };
+        let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
+        let registry = self.registry_for_env(&spec.env_ref)?;
+        let adapter = registry
+            .agent_adapters
+            .get(&requirement.adapter)
+            .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
+        let screen = match self.pool_for_spec(spec) {
+            Ok(pool) => match pool.capture_screen(session_id).await {
+                Ok(screen) => screen.unwrap_or_default(),
+                Err(error) => {
+                    debug!(%error, %session_id, exit_code, "cannot capture exited agent diagnostic");
+                    String::new()
+                }
+            },
+            Err(error) => {
+                debug!(%error, %session_id, exit_code, "cannot resolve exited agent terminal pool");
+                String::new()
+            }
+        };
+        Ok(adapter.classify_exit_failure(exit_code, &screen))
+    }
+
     async fn observe_failure(&self, session_id: &str, spec: &flotilla_resources::TerminalSessionSpec) -> Result<Option<String>, String> {
         let TerminalSessionSource::Agent { selector, .. } = &spec.source else { return Ok(None) };
         let requirement = CapabilityTable::seeded().resolve_selector(selector)?;

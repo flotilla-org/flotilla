@@ -5,6 +5,9 @@ use flotilla_resources::{InnerCommandStatus, TerminalSessionPhase, TerminalSessi
 
 pub fn condition(status: &TerminalSessionStatus) -> Option<ExplainedTerminalCondition> {
     match status.phase {
+        TerminalSessionPhase::Failed => Some(ExplainedTerminalCondition::ProcessFailed {
+            message: status.message.clone().unwrap_or_else(|| "terminal launch failed".into()),
+        }),
         TerminalSessionPhase::Lost => Some(ExplainedTerminalCondition::SessionLost {
             message: status.message.clone().unwrap_or_else(|| "external session is absent".into()),
         }),

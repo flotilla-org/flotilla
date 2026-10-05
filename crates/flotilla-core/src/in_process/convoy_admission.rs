@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::{
-    agent_adapter::{CrewAssignment, CrewBriefTemplateResolver},
+    agent_adapter::{minimum_harness_version, CrewAssignment, CrewBriefTemplateResolver},
     branch_lookup_observer::BranchLookupObserver,
     providers::discovery::{detectors::git::remote_assertion, FORGEJO_AUTH_PROVIDER},
 };
@@ -738,6 +738,11 @@ impl ConvoyAdmission {
                         vessel_needs.extend(crew.needs.iter().cloned());
                         continue;
                     }
+                    let requirement = CapabilityTable::seeded().resolve_selector(selector)?;
+                    if let Some(minimum) = minimum_harness_version(&requirement.adapter) {
+                        crew.needs
+                            .insert(CapabilityNeed::Harness { adapter: requirement.adapter.clone(), minimum_version: minimum.to_string() });
+                    }
                     if let (Some(adapter), Some(model)) = (&selector.adapter, &selector.model) {
                         // Only an explicit rejection refuses. Model acceptance is often
                         // unobservable (credential-less probe containers, harnesses with
@@ -880,14 +885,29 @@ impl ConvoyAdmission {
         let mut candidates = Vec::new();
         let mut rejected = Vec::new();
         for mut kind in kinds {
-            let canonical_kind_host = match flotilla_resources::canonical_host_id(hosts.iter(), &kind.spec.host_ref) {
+            let canonical_kind_host = flotilla_resources::canonical_host_id(hosts.iter(), &kind.spec.host_ref);
+            let target_ref = canonical_kind_host
+                .as_ref()
+                .ok()
+                .and_then(Clone::clone)
+                .unwrap_or_else(|| CanonicalHostId::resolved(kind.spec.host_ref.clone()));
+            let host = hosts.iter().find(|host| host.metadata.name == target_ref.as_str());
+            let target_host = PlacementTargetHost {
+                reference: target_ref,
+                display_name: host
+                    .map(|host| host.spec.display_name.clone())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| kind.spec.host_ref.clone()),
+            };
+            let policy_name = kind.metadata.name.clone();
+            let refusal = |reason: String| PlacementRefusal { policy_name: policy_name.clone(), target_host: target_host.clone(), reason };
+            let canonical_kind_host = match canonical_kind_host {
                 Ok(host) => host,
                 Err(error) => {
-                    rejected.push(format!("{}: {error}", kind.metadata.name));
+                    rejected.push(refusal(error));
                     continue;
                 }
             };
-            let host = hosts.iter().find(|host| canonical_kind_host.as_ref().is_some_and(|id| host.metadata.name == id.as_str()));
             if let Some(canonical_kind_host) = &canonical_kind_host {
                 kind.spec.host_ref = canonical_kind_host.to_string();
             }
@@ -901,11 +921,10 @@ impl ConvoyAdmission {
                 })
                 .collect::<Vec<_>>();
             if !structurally_missing.is_empty() {
-                rejected.push(format!(
-                    "{}: uncovered {}",
-                    kind.metadata.name,
+                rejected.push(refusal(format!(
+                    "uncovered {}",
                     structurally_missing.iter().map(|need| format!("`{need}`")).collect::<Vec<_>>().join(", ")
-                ));
+                )));
                 continue;
             }
             if purpose == PlacementPurpose::Admission
@@ -914,16 +933,30 @@ impl ConvoyAdmission {
                     .iter()
                     .any(|need| matches!(need, CapabilityNeed::GuiSession | CapabilityNeed::Toolchain(_) | CapabilityNeed::Harness { .. }))
             {
-                rejected.push(format!("{}: facts not yet observed for kind {}", kind.metadata.name, kind.metadata.name));
+                rejected.push(refusal(format!("facts not yet observed for kind {}", kind.metadata.name)));
                 continue;
             }
             let missing = needs.iter().filter(|need| !need.covered_by(&kind.spec.grants, facts)).collect::<Vec<_>>();
             if purpose == PlacementPurpose::Admission && !missing.is_empty() {
-                rejected.push(format!(
-                    "{}: uncovered {}",
-                    kind.metadata.name,
-                    missing.iter().map(|need| format!("`{need}`")).collect::<Vec<_>>().join(", ")
-                ));
+                rejected.push(refusal(format!(
+                    "uncovered {}",
+                    missing
+                        .iter()
+                        .map(|need| {
+                            match need {
+                                CapabilityNeed::Harness { adapter, .. } => {
+                                    let observed = facts.and_then(|facts| facts.harnesses.get(adapter));
+                                    format!(
+                                        "`{need}` (observed {adapter} {})",
+                                        observed.map_or("unknown", |harness| harness.version.as_str())
+                                    )
+                                }
+                                _ => format!("`{need}`"),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
                 continue;
             }
             match self
@@ -952,15 +985,14 @@ impl ConvoyAdmission {
                     let policy_host = match policy_host_ref.map(|host_ref| flotilla_resources::canonical_host_id(hosts.iter(), host_ref)) {
                         Some(Ok(host)) => host,
                         Some(Err(error)) => {
-                            rejected.push(format!("{}: {error}", kind.metadata.name));
+                            rejected.push(refusal(error));
                             continue;
                         }
                         None => None,
                     };
                     let realization_matches = policy_host_ref.is_some() && policy_host == canonical_kind_host;
                     if !realization_matches {
-                        rejected
-                            .push(format!("{}: fulfilment kind and placement policy disagree on host or realisation", kind.metadata.name));
+                        rejected.push(refusal("fulfilment kind and placement policy disagree on host or realisation".into()));
                         continue;
                     }
                     let free_slots = facts.and_then(|facts| facts.free_vessel_slots);
@@ -980,13 +1012,13 @@ impl ConvoyAdmission {
                             host.and_then(|host| host.status.as_ref()),
                             self.clock.now(),
                         ) {
-                            rejected.push(format!("{}: {reason}", kind.metadata.name));
+                            rejected.push(refusal(reason));
                             continue;
                         }
                     }
                     candidates.push(KindCandidate { kind, placement, free_slots, host_ready, sleeping_until });
                 }
-                Err(error) => rejected.push(format!("{}: {error}", kind.metadata.name)),
+                Err(error) => rejected.push(refusal(error)),
             }
         }
         if candidates.is_empty() {
@@ -996,7 +1028,11 @@ impl ConvoyAdmission {
                 .flat_map(|vessel| vessel.crew.iter())
                 .flat_map(|crew| crew.needs.iter().map(move |need| format!("role {} need `{need}`", crew.role)))
                 .collect::<Vec<_>>();
-            return Err(format!("no fulfilment kind covers {}; candidates: {}", role_needs.join(", "), rejected.join("; ")));
+            return Err(format!(
+                "no fulfilment kind covers {}; candidates: {}",
+                role_needs.join(", "),
+                rejected.iter().map(|refusal| format!("{}: {}", refusal.policy_name, refusal.reason)).collect::<Vec<_>>().join("; ")
+            ));
         }
         let placement_tiebreak = self.fulfilment_decider.for_admission(needs, self.clock.now());
         // Hold scarce platform capacity only when unreserved capacity also covers the needs.
@@ -1020,10 +1056,12 @@ impl ConvoyAdmission {
             .collect::<BTreeSet<_>>();
         candidates.sort_by(|left, right| placement_tiebreak.compare(left, right));
         let index = match pin {
-            Some(pin) => candidates
-                .iter()
-                .position(|candidate| candidate.kind.metadata.name == pin)
-                .ok_or_else(|| format!("pinned fulfilment `{pin}` cannot cover vessel needs; candidates: {}", rejected.join("; ")))?,
+            Some(pin) => candidates.iter().position(|candidate| candidate.kind.metadata.name == pin).ok_or_else(|| {
+                format!(
+                    "pinned fulfilment `{pin}` cannot cover vessel needs; candidates: {}",
+                    rejected.iter().map(|refusal| format!("{}: {}", refusal.policy_name, refusal.reason)).collect::<Vec<_>>().join("; ")
+                )
+            })?,
             None => candidates.iter().position(|candidate| minimal.contains(&candidate.kind.metadata.name)).expect("nonempty minimal set"),
         };
         let chosen_kind = candidates[index].kind.metadata.name.clone();
@@ -1079,6 +1117,7 @@ impl ConvoyAdmission {
                     .to_string(),
             });
         }
+        selected.placement.refused_candidates.extend(rejected);
         selected.placement.allocation = Some(allocation);
         Ok((selected.placement, alternatives))
     }
@@ -3726,6 +3765,36 @@ mod tests {
             daemon.convoy_admission.compose_convoy_needs("flotilla", &project, &[], &intent, &mut workflow).await.expect("composed needs");
         assert_eq!(needs, BTreeSet::from([CapabilityNeed::Platform("linux".to_string()), CapabilityNeed::GuiSession]));
         assert_eq!(workflow.vessels[0].crew[0].needs, needs);
+    }
+    #[tokio::test]
+    async fn codex_adapter_floor_is_composed_without_a_model() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"codex-floor-test\"\n").expect("daemon config");
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(temp.path())),
+            fake_discovery(false),
+            HostName::new("test-host"),
+            ResourceBackend::InMemory(InMemoryBackend::default()),
+        )
+        .await;
+        let project = ProjectSpec::builder().display_name("Example".into()).default_workflow_ref("work".into()).build();
+        let mut workflow = WorkflowTemplateSpec::builder()
+            .vessels(vec![VesselRequirement::builder()
+                .name("work".into())
+                .crew(vec![CrewSpec::builder()
+                    .role("coder".into())
+                    .source(CrewSource::Agent {
+                        selector: flotilla_resources::Selector::for_capability("code"),
+                        prompt: None,
+                        brief_template: None,
+                    })
+                    .build()])
+                .build()])
+            .build();
+        let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("example".into()).build();
+        let needs = daemon.convoy_admission.compose_convoy_needs("flotilla", &project, &[], &intent, &mut workflow).await.expect("needs");
+        assert!(needs.contains(&CapabilityNeed::Harness { adapter: "codex".into(), minimum_version: "0.160.0".into() }));
     }
     #[test]
     fn placement_tiebreak_orders_live_minimal_candidates_by_availability_then_cost() {

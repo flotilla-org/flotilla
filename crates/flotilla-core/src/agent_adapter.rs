@@ -522,9 +522,22 @@ impl Default for CapabilityTable {
     }
 }
 
+/// Minimum CLI version required by the launch flags, available without local discovery.
+pub fn minimum_harness_version(adapter: &str) -> Option<&'static str> {
+    match adapter {
+        // --no-daemon is part of every managed Codex invocation.
+        "codex" => Some("0.160.0"),
+        _ => None,
+    }
+}
+
 #[async_trait]
 pub trait AgentAdapter: Send + Sync {
     fn id(&self) -> &'static str;
+    /// Return a fatal launch diagnostic; ambiguous exits remain resumable.
+    fn classify_exit_failure(&self, _exit_code: i32, _screen: &str) -> Option<String> {
+        None
+    }
     async fn prepare(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String>;
     /// Prepare an invocation with the environment selected for this particular
     /// crew process. Credential-backed paths are deliberately resolved here,
@@ -722,6 +735,15 @@ impl AgentAdapter for CliAgentAdapter {
                 Some(format!("{:x}", Sha256::digest(output.as_bytes())))
             }
         }
+    }
+
+    fn classify_exit_failure(&self, exit_code: i32, screen: &str) -> Option<String> {
+        if !matches!(self.flavor, AdapterFlavor::Codex { .. }) || exit_code != 2 {
+            return None;
+        }
+        // Capture is the current terminal screen and can include output from before the exit.
+        let diagnostic = screen.lines().map(str::trim).find(|line| line.starts_with("error:"))?;
+        Some(format!("Codex launch usage error (exit 2): {diagnostic}"))
     }
 
     fn classify_screen_failure(&self, screen: &str) -> Option<&'static str> {
@@ -1153,6 +1175,22 @@ mod tests {
             &env,
             Arc::new(MockRunner::new(vec![Ok("/workspace\n".into()), Ok(".git/info/exclude\n".into()), Ok(String::new())])),
         )
+    }
+
+    #[hegel::test]
+    fn codex_launch_contract_classifies_only_usage_exits(tc: hegel::TestCase) {
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex");
+        assert_eq!(super::minimum_harness_version(codex.id()), Some("0.160.0"));
+        let code = tc.draw(hegel::generators::integers::<i32>().min_value(0).max_value(255));
+        let screen = if tc.draw(hegel::generators::booleans()) { "error: unexpected argument '--no-daemon' found" } else { "" };
+        let failure = codex.classify_exit_failure(code, screen);
+        assert_eq!(failure.is_some(), code == 2 && !screen.is_empty());
+        if let Some(message) = failure {
+            assert!(message.contains("exit 2"));
+            assert!(screen.is_empty() || message.contains(screen));
+        }
+        assert!(registry.get("claude-code").expect("claude").classify_exit_failure(code, screen).is_none());
     }
 
     #[test]
@@ -2238,6 +2276,7 @@ mod tests {
             .expect("launch");
         assert_eq!(plan.command.matches("-c 'notify=[\"flotilla\",\"hook\",\"codex\",\"notify\"]'").count(), 1);
         assert!(plan.command.contains("--no-daemon"));
+        assert_eq!(super::minimum_harness_version("codex"), Some("0.160.0"));
     }
 
     #[tokio::test]

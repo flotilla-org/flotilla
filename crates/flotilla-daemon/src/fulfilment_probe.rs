@@ -291,6 +291,39 @@ mod tests {
 
     use super::*;
 
+    #[hegel::test]
+    fn probed_codex_versions_cover_only_compatible_launches(tc: hegel::TestCase) {
+        let minor = tc.draw(hegel::generators::integers::<u32>().min_value(150).max_value(170));
+        let valid = tc.draw(hegel::generators::booleans());
+        let version = if valid { format!("codex-cli 0.{minor}.0") } else { "codex-cli unknown".into() };
+        let runner = DiscoveryMockRunner::builder()
+            .on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new()))
+            .on_run("codex", &["--version"], Ok(version))
+            .build();
+        let kind = FulfilmentKindSpec::builder()
+            .host_ref("host".into())
+            .pool("cleat".into())
+            .realisation(FulfilmentRealisation::HostDirect)
+            .build();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let facts = runtime
+            .block_on(probe_kind(
+                &kind,
+                None,
+                true,
+                &runner,
+                &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
+                Path::new("/tmp/flotilla-probe-test"),
+                &mut ModelProbeState::default(),
+            ))
+            .expect("probe");
+        let need = flotilla_resources::CapabilityNeed::Harness {
+            adapter: "codex".into(),
+            minimum_version: flotilla_core::agent_adapter::minimum_harness_version("codex").expect("floor").into(),
+        };
+        assert_eq!(need.covered_by(&kind.grants, Some(&facts)), valid && minor >= 160);
+    }
+
     fn docker_kind() -> FulfilmentKindSpec {
         FulfilmentKindSpec::builder()
             .host_ref("feta".to_string())
