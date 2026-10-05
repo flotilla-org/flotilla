@@ -813,6 +813,11 @@ fn codex_working_line(line: &str) -> bool {
     line.trim_start().trim_start_matches('•').trim_start().starts_with("Working (") && line.contains("esc to interrupt")
 }
 
+// Codex rust-v0.160.0: codex-rs/tui/src/chatwidget.rs, PLACEHOLDER and
+// SIDE_PLACEHOLDER (selected by chatwidget/side.rs). The cleat capture path
+// supplies plain text, not cells or the dim attribute used for placeholders.
+const CODEX_COMPOSER_PLACEHOLDERS: &[&str] = &["Ask Codex to do anything", "Ask a follow-up question"];
+
 fn codex_composer_visible(screen: &str) -> bool {
     let lines = screen.lines().map(str::trim).collect::<Vec<_>>();
     if lines.iter().any(|line| line.starts_with("Select ") || line.starts_with("Choose ")) {
@@ -825,11 +830,16 @@ fn codex_composer_visible(screen: &str) -> bool {
     if text.starts_with(|character: char| character.is_ascii_digit()) {
         return false;
     }
-    // The footer ties arbitrary trailing prompt text to the live composer,
-    // rather than a transcript row that merely begins with the same marker.
-    let footer = lines[index + 1..].iter().any(|line| line.contains(" · /") || line.contains(" · ~"));
-    // Known empty-composer hints also work on cropped captures without the footer.
-    footer || text.starts_with("Ask Codex") || text.starts_with("Run /review")
+    let trailing = &lines[index + 1..];
+    let footer = trailing.iter().position(|line| line.contains(" · /") || line.contains(" · ~"));
+    // Wrapped or multiline draft text is still part of the composer. A known
+    // placeholder on its first row must not hide a typed continuation.
+    if trailing[..footer.unwrap_or(trailing.len())].iter().any(|line| !line.is_empty()) {
+        return false;
+    }
+    // A footer identifies a live blank composer, but never makes draft text
+    // idle. Exact known placeholders also work on captures cropped above it.
+    (text.is_empty() && footer.is_some()) || CODEX_COMPOSER_PLACEHOLDERS.contains(&text)
 }
 
 fn codex_screen_needs_input(screen: &str) -> bool {
@@ -2224,6 +2234,65 @@ mod tests {
         assert_eq!(codex.classify_screen_attention(&screen), Some(TerminalAttentionState::Idle));
     }
 
+    // #2648: every empty-composer placeholder shipped by rust-v0.160.0 must
+    // remain idle, including a cropped capture without the status footer.
+    #[test]
+    fn codex_pinned_placeholders_are_idle() {
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+        // Independent source oracle: chatwidget.rs PLACEHOLDER and SIDE_PLACEHOLDER.
+        for placeholder in ["Ask Codex to do anything", "Ask a follow-up question"] {
+            for footer in ["", "\n\ngpt-6.1-sol · /workspace", "\n\ngpt-6.1-sol · ~/workspace"] {
+                let screen = format!("› {placeholder}{footer}");
+                assert_eq!(codex.classify_screen_attention(&screen), Some(TerminalAttentionState::Idle), "{screen}");
+            }
+        }
+    }
+
+    // A genuinely blank composer is idle only when the footer identifies it;
+    // a cropped blank prompt row alone cannot prove a live composer exists.
+    #[test]
+    fn codex_blank_composer_requires_footer() {
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+        assert_eq!(codex.classify_screen_attention("›   \n\ngpt-6.1-sol · /workspace"), Some(TerminalAttentionState::Idle));
+        assert_eq!(codex.classify_screen_attention("›   "), Some(TerminalAttentionState::Unobservable));
+    }
+
+    // #2648: unknown composer text must block delivery, even with a footer or
+    // when it begins with words from a placeholder. History must not mask it.
+    #[hegel::test]
+    fn codex_drafts_are_not_idle(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Generate zero through eight duplicate history rows and extensions of
+        // 1..128 characters. Each run covers every named draft and footer shape.
+        let drafts = [
+            "please fix this",
+            "1 typed draft",
+            "Ask Codex",
+            "Ask Codex to do something",
+            "Ask Codex to do anything after checking with me",
+            "Ask a follow-up question about my draft",
+            "Run /review on my current changes",
+            "Run /review after I finish typing",
+            "unrecognised future placeholder",
+            "Ask Codex to do anything\n  but wait for me",
+            "\n  a draft with a blank first line",
+        ];
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
+        let suffix = "x".repeat(tc.draw(gs::integers::<usize>().min_value(1).max_value(128)));
+        let extended = format!("Ask Codex to do anything{suffix}");
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+        for draft in drafts.into_iter().chain(std::iter::once(extended.as_str())) {
+            for footer in ["", "\n\ngpt-6.1-sol · /workspace", "\n\ngpt-6.1-sol · ~/workspace"] {
+                let history = "› Ask Codex to do anything\nprevious response\n".repeat(count);
+                let screen = format!("{history}› {draft}{footer}");
+                assert_eq!(codex.classify_screen_attention(&screen), Some(TerminalAttentionState::Unobservable), "{screen}");
+            }
+        }
+    }
+
     // #2560: elapsed-time spinner redraws are not output progress, but actual
     // screen content changes are. Cover varied turn ages with explicit generation.
     #[hegel::test]
@@ -2248,7 +2317,7 @@ mod tests {
             assert_eq!(codex.classify_screen_attention(screen), Some(TerminalAttentionState::Unobservable));
         }
         assert_eq!(
-            codex.classify_screen_attention("tool output: esc to interrupt\n\n› Ask Codex to do something\n\ngpt-6.1-sol · /workspace"),
+            codex.classify_screen_attention("tool output: esc to interrupt\n\n› Ask Codex to do anything\n\ngpt-6.1-sol · /workspace"),
             Some(TerminalAttentionState::Idle)
         );
     }
@@ -2262,7 +2331,7 @@ mod tests {
             codex.classify_screen_attention(
                 "■ Conversation interrupted
 
-› Ask Codex to do something
+› Ask Codex to do anything
 
 gpt-6.1-sol · /workspace"
             ),
@@ -2272,7 +2341,7 @@ gpt-6.1-sol · /workspace"
             codex.classify_screen_attention(
                 "• Working (2h • esc to interrupt)
 
-› Ask Codex to do something"
+› Ask Codex to do anything"
             ),
             Some(TerminalAttentionState::Working)
         );
@@ -2288,7 +2357,7 @@ gpt-6.1-sol · /workspace"
             codex.classify_screen_failure("Your access token could not be refreshed. Please log out and sign in again."),
             Some("access token could not be refreshed")
         );
-        assert_eq!(codex.classify_screen_failure("› Ask Codex to do something"), None);
+        assert_eq!(codex.classify_screen_failure("› Ask Codex to do anything"), None);
     }
 
     // Real Git must ignore runtime files even with an unterminated existing

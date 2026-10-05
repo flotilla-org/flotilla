@@ -13425,17 +13425,31 @@ mod tests {
                         "• Working (10m • esc to interrupt)\n› Ask Codex to do anything",
                         "Would you like to run the following command?\n› 1. Yes\n  2. No",
                         "Unknown screen",
+                        // #2648: draft text must retain the queued turn until
+                        // the person clears it, with or without a footer.
+                        "› please wait for my draft\n\ngpt-6.1-sol · /workspace",
+                        "› Ask Codex to do anything after I finish typing",
+                        "› Ask Codex to do anything\n  but wait for my second line\n\ngpt-6.1-sol · /workspace",
                     ] {
                         pool.inner.set_captured_screen(ID, screen).await;
                         let busy = reconciler.prepare(&session).await.expect("non-boundary preparation");
                         let outcome = reconciler.reconcile(&session, &busy, epoch);
                         assert_eq!(outcome.requeue_after, Some(Duration::from_millis(200)));
-                        let patch = outcome.patch.expect("pending delivery retains screen observation");
-                        assert!(matches!(&patch, TerminalSessionStatusPatch::Observe { .. }));
-                        let mut status = session.status.clone().expect("status");
-                        patch.apply(&mut status);
-                        session =
-                            sessions.update_status(ID, &session.metadata.resource_version, &status).await.expect("observe while pending");
+                        // Repeated non-idle observations may be coalesced.
+                        if let Some(patch) = outcome.patch {
+                            assert!(matches!(&patch, TerminalSessionStatusPatch::Observe { .. }));
+                            let mut status = session.status.clone().expect("status");
+                            patch.apply(&mut status);
+                            session = sessions
+                                .update_status(ID, &session.metadata.resource_version, &status)
+                                .await
+                                .expect("observe while pending");
+                        }
+                        assert_ne!(
+                            session.status.as_ref().expect("status").attention.as_ref().expect("attention").state,
+                            TerminalAttentionState::Idle,
+                            "pending delivery retains non-idle attention"
+                        );
                         tokio::time::advance(Duration::from_millis(200)).await;
                         tokio::task::yield_now().await;
                         assert_eq!(pool.inner.delivered.lock().await.len(), index, "non-boundary must not consume the FIFO");
@@ -15549,17 +15563,17 @@ mod tests {
         let observation = runtime.observe_attention(session_name, &spec).await.expect("observe prompt").expect("attention observation");
         assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::NeedsInput);
 
-        pool.set_captured_screen(session_name, "› Ask Codex to do something\n\ngpt-5.6-sol high · /workspace").await;
+        pool.set_captured_screen(session_name, "› Ask Codex to do anything\n\ngpt-5.6-sol high · /workspace").await;
         let observation =
             runtime.observe_attention(session_name, &spec).await.expect("observe normal composer").expect("attention observation");
         assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Idle);
 
         // #2560: stable pixels alone do not end a Codex turn. An interrupt
         // returning to the composer is a boundary even without a notify hook.
-        pool.set_captured_screen(session_name, "• Working (2h 12m • esc to interrupt)\n\n› Ask Codex to do something").await;
+        pool.set_captured_screen(session_name, "• Working (2h 12m • esc to interrupt)\n\n› Ask Codex to do anything").await;
         let observation = runtime.observe_attention(session_name, &spec).await.expect("observe quiet working turn").expect("observation");
         assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Working);
-        pool.set_captured_screen(session_name, "■ Conversation interrupted\n\n› Ask Codex to do something").await;
+        pool.set_captured_screen(session_name, "■ Conversation interrupted\n\n› Ask Codex to do anything").await;
         let observation = runtime.observe_attention(session_name, &spec).await.expect("observe interrupted prompt").expect("observation");
         assert_eq!(observation.attention.expect("attention").state, TerminalAttentionState::Idle);
         pool.set_captured_screen(session_name, "Loading unknown screen").await;
