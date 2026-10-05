@@ -73,21 +73,23 @@ struct RetryBackoff {
     reset_after: Duration,
 }
 
-/// Production always replicates every kind; generated fixtures can select their
-/// authored kinds without adding production state or changing the wire protocol.
-#[derive(Clone, Copy, Default)]
-pub(super) struct ReplicationKindFilter {
+/// Test harnesses can select authored kinds and drive digest rounds explicitly.
+/// Production keeps full-fleet replication and periodic digest scheduling.
+#[derive(Clone, Default)]
+pub(super) struct ReplicationTestOptions {
     #[cfg(feature = "test-support")]
     kinds: Option<&'static [&'static str]>,
+    #[cfg(feature = "test-support")]
+    pub(super) digest_driver: Option<super::test_support::DigestDriver>,
 }
 
-impl ReplicationKindFilter {
+impl ReplicationTestOptions {
     #[cfg(feature = "test-support")]
     pub(super) fn new(kinds: Option<&'static [&'static str]>) -> Self {
-        Self { kinds }
+        Self { kinds, digest_driver: None }
     }
 
-    fn includes<T: Resource>(self) -> bool {
+    fn includes<T: Resource>(&self) -> bool {
         #[cfg(feature = "test-support")]
         if self.kinds.is_some_and(|kinds| !kinds.contains(&T::API_PATHS.kind)) {
             return false;
@@ -99,7 +101,7 @@ impl ReplicationKindFilter {
 #[derive(Default)]
 pub(super) struct PeerReplicatorSupervisors {
     generations: HashMap<NodeId, ActiveGeneration>,
-    kind_filter: ReplicationKindFilter,
+    test_options: ReplicationTestOptions,
 }
 
 impl Drop for PeerReplicatorSupervisors {
@@ -152,8 +154,8 @@ impl SocketPathSource {
 }
 
 impl PeerReplicatorSupervisors {
-    pub(super) fn new(kind_filter: ReplicationKindFilter) -> Self {
-        Self { generations: HashMap::new(), kind_filter }
+    pub(super) fn new(test_options: ReplicationTestOptions) -> Self {
+        Self { generations: HashMap::new(), test_options }
     }
 
     pub(super) async fn peer_connected(
@@ -186,7 +188,7 @@ impl PeerReplicatorSupervisors {
             &transport,
             &cancellation,
             ReplicationStore::Durable,
-            self.kind_filter
+            self.test_options.clone()
         );
         spawn_kind::<flotilla_resources::Checkout>(
             &daemon,
@@ -195,7 +197,7 @@ impl PeerReplicatorSupervisors {
             &transport,
             &cancellation,
             ReplicationStore::Observed,
-            self.kind_filter,
+            self.test_options.clone(),
         );
         spawn_kind::<flotilla_resources::TerminalSession>(
             &daemon,
@@ -204,7 +206,7 @@ impl PeerReplicatorSupervisors {
             &transport,
             &cancellation,
             ReplicationStore::Observed,
-            self.kind_filter,
+            self.test_options.clone(),
         )
     }
 
@@ -278,9 +280,9 @@ fn spawn_kind<T: Resource>(
     transport: &ReplicationTransport,
     cancellation: &CancellationToken,
     store: ReplicationStore,
-    kind_filter: ReplicationKindFilter,
+    test_options: ReplicationTestOptions,
 ) {
-    if !kind_filter.includes::<T>() {
+    if !test_options.includes::<T>() {
         return;
     }
     if T::REPLICATION_CLASS == ReplicationClass::None {
@@ -345,6 +347,8 @@ fn spawn_kind<T: Resource>(
     let daemon = Arc::clone(daemon);
     let peer = peer.clone();
     let transport = transport.clone();
+    #[cfg(feature = "test-support")]
+    let digest_control = test_options.digest_driver.map(|driver| driver.control(daemon.node_id(), &peer, &store.kind::<T>()));
     let cancellation = cancellation.clone();
     tokio::spawn(async move {
         match transport {
@@ -391,8 +395,9 @@ fn spawn_kind<T: Resource>(
                         let router = router.clone();
                         let daemon = Arc::clone(&run_daemon);
                         let peer = run_peer.clone();
+                        let digest_control = digest_control.clone();
                         async move {
-                            let result = replicate_kind_over_routed_watch::<T>(&router, &daemon, &peer, store).await;
+                            let result = replicate_kind_over_routed_watch::<T>(&router, &daemon, &peer, store, digest_control).await;
                             if let Err(error) = &result {
                                 daemon.report_resource_replication_failure(&peer, &store.health_kind::<T>(), error).await;
                             }
@@ -755,13 +760,14 @@ async fn replicate_kind_over_routed_watch<T: Resource>(
     daemon: &Arc<InProcessDaemon>,
     peer: &NodeId,
     store: ReplicationStore,
+    digest_control: Option<Arc<super::test_support::DigestControl>>,
 ) -> Result<(), String> {
     store.backend(daemon).including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
     let writer = store.backend(daemon).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let mut cursor = writer.cursor().await.map_err(|error| error.to_string())?;
     let mut repaired = false;
     loop {
-        match run_routed_watch::<T>(router, daemon, peer, store, cursor).await {
+        match run_routed_watch::<T>(router, daemon, peer, store, cursor, digest_control.clone()).await {
             Err(error)
                 if flotilla_resources::ResourceError::is_invalid_message(&error)
                     || error.contains("sequence gap")
@@ -788,7 +794,11 @@ async fn run_routed_watch<T: Resource>(
     peer: &NodeId,
     store: ReplicationStore,
     prefix: Option<flotilla_resources::ReplicaCursor>,
+    digest_control: Option<Arc<super::test_support::DigestControl>>,
 ) -> Result<(), String> {
+    if let Some(control) = &digest_control {
+        control.ready.send_replace(false);
+    }
     let mut events = daemon.subscribe();
     let command_id = router
         .dispatch_execute_for_principal(
@@ -815,23 +825,42 @@ async fn run_routed_watch<T: Resource>(
     let mut initial = Vec::<ResourceObject<T>>::new();
     let mut initializing = prefix.is_none();
 
+    let mut requests = match &digest_control {
+        Some(control) => Some(control.requests.lock().await),
+        None => None,
+    };
     let mut version = prefix.map(|prefix| prefix.resource_version);
     let mut digest_failures = DigestFailures::default();
     let mut digest_tick = tokio::time::interval_at(tokio::time::Instant::now() + DIGEST_INTERVAL, DIGEST_INTERVAL);
     digest_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        let completion;
         let received = tokio::select! {
-            event = events.recv() => event,
-            _ = digest_tick.tick(), if !initializing => {
-                let result=reconcile_digest::<T,_,_>(&writer,peer,|query| fetch_routed_digest::<T>(router,peer,store,query)).await;
-                digest_failures.report::<T>(peer,&result);
-                match result {
-                    Ok(true)=>{let _=router.dispatch_cancel(command_id).await;return Ok(());},
-                    Ok(false)=>{},
-                    Err(_)=>{},
+            event = events.recv() => { completion = None; Some(event) },
+            request = async {
+                match &mut requests {
+                    Some(requests) => requests.recv().await,
+                    None => std::future::pending().await,
                 }
-                continue;
+            }, if !initializing => { completion = request; None },
+            _ = digest_tick.tick(), if !initializing && digest_control.is_none() => { completion = None; None },
+        };
+        let Some(received) = received else {
+            let result = reconcile_digest::<T, _, _>(&writer, peer, |query| fetch_routed_digest::<T>(router, peer, store, query)).await;
+            digest_failures.report::<T>(peer, &result);
+            if matches!(result, Ok(true)) {
+                if let Some(control) = &digest_control {
+                    control.ready.send_replace(false);
+                }
+                let _ = router.dispatch_cancel(command_id).await;
             }
+            if let Some(completion) = completion {
+                let _ = completion.send(result.clone());
+            }
+            if matches!(result, Ok(true)) {
+                return Ok(());
+            }
+            continue;
         };
         match received {
             Ok(DaemonEvent::CommandStepUpdate {
@@ -863,8 +892,14 @@ async fn run_routed_watch<T: Resource>(
                         }
                     }
                 }
+                let bookmark = response.records.iter().any(|record| record.record_type == ResourceRecordType::Bookmark);
                 let was_initializing = initializing;
                 apply_response(&writer, &mut initial, &mut initializing, *response).await?;
+                if bookmark {
+                    if let Some(control) = &digest_control {
+                        control.ready.send_replace(true);
+                    }
+                }
                 if was_initializing && !initializing {
                     // The snapshot's final bookmark is the position preceding
                     // the first live event, so that first event is checked too.

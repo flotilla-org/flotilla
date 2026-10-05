@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     remote_commands::RemoteCommandRouter,
-    replicator::{PeerReplicatorSupervisors, ReplicationKindFilter},
+    replicator::{PeerReplicatorSupervisors, ReplicationTestOptions},
     shared::sync_peer_query_state,
     PeerConnectedNotice, PeerConnectionEvent, SshTransport,
 };
@@ -160,7 +160,7 @@ pub(super) struct PeerRuntime {
     inbound_peer_tx: mpsc::Sender<InboundPeerEnvelope>,
     remote_command_router: RemoteCommandRouter,
     resource_socket_dir: Option<PathBuf>,
-    replication_kind_filter: ReplicationKindFilter,
+    replication_test_options: ReplicationTestOptions,
 }
 
 impl PeerRuntime {
@@ -179,13 +179,19 @@ impl PeerRuntime {
             inbound_peer_tx,
             remote_command_router,
             resource_socket_dir,
-            replication_kind_filter: ReplicationKindFilter::default(),
+            replication_test_options: ReplicationTestOptions::default(),
         }
     }
 
     #[cfg(feature = "test-support")]
     pub(super) fn with_replication_kinds(mut self, kinds: Option<&'static [&'static str]>) -> Self {
-        self.replication_kind_filter = ReplicationKindFilter::new(kinds);
+        self.replication_test_options = ReplicationTestOptions::new(kinds);
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(super) fn with_digest_driver(mut self, driver: Option<super::test_support::DigestDriver>) -> Self {
+        self.replication_test_options.digest_driver = driver;
         self
     }
 
@@ -580,12 +586,12 @@ impl PeerRuntime {
             }
         });
 
-        let replication_kind_filter = self.replication_kind_filter;
+        let replication_test_options = self.replication_test_options;
         let outbound_daemon = Arc::clone(&self.daemon);
         let outbound_remote_command_router = self.remote_command_router.clone();
         let mut peer_connected_rx = peer_connected_rx;
         tasks.spawn(async move {
-            let mut peer_replicators = PeerReplicatorSupervisors::new(replication_kind_filter);
+            let mut peer_replicators = PeerReplicatorSupervisors::new(replication_test_options);
 
             while let Some(event) = peer_connected_rx.recv().await {
                 match event {
