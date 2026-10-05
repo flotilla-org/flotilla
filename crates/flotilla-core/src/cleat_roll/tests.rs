@@ -337,8 +337,25 @@ fn recorded_current_observations_degrade_only_actionable_host_skew(tc: hegel::Te
 // healthy no-op; unavailable discovery must still retain the host drain error.
 #[tokio::test]
 async fn absent_host_daemon_drain_does_not_warn() {
-    for listing in [Ok(CommandOutput { stdout: "[]".into(), stderr: String::new(), success: true }), Err("listing unavailable".into())] {
-        let absent = listing.is_ok();
+    for (listing, absent) in [
+        (Ok(CommandOutput { stdout: "[]".into(), stderr: String::new(), success: true }), true),
+        (
+            Ok(CommandOutput {
+                stdout: serde_json::json!([
+                    {"name":"other@26", "runtime_root":"/state/crew cleat", "alive":true},
+                    {"name":"default@26", "runtime_root":"/another/root", "alive":true},
+                    {"name":"default@25", "runtime_root":"/state/crew cleat", "alive":false}
+                ])
+                .to_string(),
+                stderr: String::new(),
+                success: true,
+            }),
+            true,
+        ),
+        (Ok(CommandOutput { stdout: "invalid".into(), stderr: String::new(), success: true }), false),
+        (Ok(CommandOutput { stdout: "{}".into(), stderr: String::new(), success: true }), false),
+        (Err("listing unavailable".into()), false),
+    ] {
         let runner = Arc::new(MockRunner::with_outputs(vec![Ok(recorded("nonzero")), listing]));
         let report =
             drain("host".into(), "gen".into(), Path::new("/incoming/cleat"), &[target(runner.clone(), "default", false)], vec![]).await;
@@ -391,7 +408,7 @@ async fn retained_report_is_immediately_readable() {
             .host("host".into())
             .generation(format!("generation-{index}"))
             .attempts(vec![])
-            .errors(vec!["diagnostic".repeat(1024)])
+            .errors(if index % 2 == 0 { vec![] } else { vec!["diagnostic".repeat(1024)] })
             .build();
         persist(&mut report, directory.path()).await;
         let path = report.diagnostics_path.as_ref().expect("retained report");
@@ -399,4 +416,62 @@ async fn retained_report_is_immediately_readable() {
         let stored: serde_json::Value = serde_json::from_slice(&bytes).expect("complete report JSON");
         assert_eq!(stored, serde_json::to_value(&report).expect("returned report"));
     }
+}
+
+// #2693: an absent current socket is informational when older generations
+// remain alive: report waiting for their sessions, whether serving or draining.
+// The subprocess double supplies discovery; unrelated roots/names and dead
+// generations must not turn an empty target into a waiting target.
+#[tokio::test]
+async fn absent_current_reports_waiting_for_live_generations() {
+    // Pin the CLI's two supported absent/unserved socket error strings. The
+    // current generation is default@27 (dead); @26 and @25 are older and live.
+    for (state, stderr) in [
+        ("serving", "connect daemon: No such file or directory (os error 2)\n"),
+        ("draining", "connect daemon: No such file or directory (os error 2)\n"),
+        ("serving", "connect daemon: Connection refused (os error 111)\n"),
+        ("draining", "connect daemon: Connection refused (os error 111)\n"),
+    ] {
+        let listing = serde_json::json!([
+            {"name":"default@27", "runtime_root":"/state/crew cleat", "alive":false},
+            {"name":"default@26", "runtime_root":"/state/crew cleat", "alive":true, "drain_state":state},
+            {"name":"default@25", "runtime_root":"/state/crew cleat", "alive":true, "drain_state":"draining"},
+            {"name":"default@24", "runtime_root":"/state/crew cleat", "alive":false},
+            {"name":"other@26", "runtime_root":"/state/crew cleat", "alive":true},
+            {"name":"default@26", "runtime_root":"/another/root", "alive":true}
+        ]);
+        let runner = Arc::new(MockRunner::with_outputs(vec![
+            Ok(CommandOutput { stdout: String::new(), stderr: stderr.into(), success: false }),
+            Ok(CommandOutput { stdout: listing.to_string(), stderr: String::new(), success: true }),
+        ]));
+        let report =
+            drain("host".into(), "gen".into(), Path::new("/incoming/cleat"), &[target(runner.clone(), "default", false)], vec![]).await;
+        assert!(!report.failed(), "{report:?}");
+        assert!(assess_drain(&report).actionable.is_empty());
+        assert_eq!(report.information.len(), 2);
+        for name in ["default@26", "default@25"] {
+            let message = report.information.iter().find(|message| message.contains(name)).expect("live generation waiting state");
+            assert!(message.contains("waiting for sessions to end"), "{message}");
+        }
+        assert!(!report.attempts[0].success, "retain the actual CLI exit status");
+        assert!(report.attempts[0].stderr.starts_with("connect daemon:"));
+        assert_eq!(runner.remaining(), 0);
+    }
+}
+
+// A permission failure is actionable even when older generations might be
+// alive: only an absent/unserved socket warrants the waiting classification.
+#[tokio::test]
+async fn inaccessible_current_socket_remains_actionable() {
+    // Subprocess boundary: the CLI cannot access its socket.
+    let runner = Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput {
+        stdout: String::new(),
+        stderr: "connect daemon: Permission denied (os error 13)".into(),
+        success: false,
+    })]));
+    let report =
+        drain("host".into(), "gen".into(), Path::new("/incoming/cleat"), &[target(runner.clone(), "default", false)], vec![]).await;
+    assert!(report.failed());
+    assert!(report.information.is_empty());
+    assert_eq!(runner.remaining(), 0);
 }

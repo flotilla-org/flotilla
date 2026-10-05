@@ -177,24 +177,44 @@ pub async fn drain(host: String, generation: String, incoming: &Path, targets: &
         if error.is_none() {
             error = parsed_report.as_ref().and_then(|report| report.warning.clone());
         }
-        // Discovery matches roots literally: alternate spellings can miss a live
-        // daemon and suppress this connection failure, not just draining information.
-        if !success && stderr.starts_with("connect daemon:") {
+        // Discovery matches registered roots literally. A missing current
+        // socket does not imply failure: older generations can retain sessions
+        // after a roll, even when nothing has started the current generation.
+        // Read-only discovery avoids rotating an already-draining generation.
+        if !success
+            && stderr.starts_with("connect daemon:")
+            && (stderr.contains("No such file or directory") || stderr.contains("Connection refused"))
+        {
             let listing = parsed(command(target, &target.binary, &["daemons", "--json"], Duration::from_secs(5)).await);
-            if listing.as_ref().and_then(Value::as_array).is_some_and(|daemons| {
-                !daemons.iter().any(|daemon| {
-                    daemon["alive"] == true
-                        && daemon["runtime_root"].as_str() == target.runtime_root.to_str()
-                        && daemon["name"].as_str().and_then(|name| logical_name(name).ok()) == Some(target.name.as_str())
-                })
-            }) {
+            if let Some(daemons) = listing.as_ref().and_then(Value::as_array) {
+                let live: Vec<_> = daemons
+                    .iter()
+                    .filter(|daemon| {
+                        daemon["alive"] == true
+                            && daemon["runtime_root"].as_str() == target.runtime_root.to_str()
+                            && daemon["name"].as_str().and_then(|name| logical_name(name).ok()) == Some(target.name.as_str())
+                    })
+                    .collect();
                 error = None;
-                report.information.push(format!(
-                    "{} {}/{}: no running host cleat daemon",
-                    target.label(),
-                    target.runtime_root.display(),
-                    target.name
-                ));
+                if live.is_empty() {
+                    report.information.push(format!(
+                        "{} {}/{}: no running host cleat daemon",
+                        target.label(),
+                        target.runtime_root.display(),
+                        target.name
+                    ));
+                } else {
+                    for daemon in live {
+                        report.information.push(format!(
+                            "{} {}/{}: current socket unavailable; waiting for sessions to end on {} ({})",
+                            target.label(),
+                            target.runtime_root.display(),
+                            target.name,
+                            daemon["name"].as_str().unwrap_or("unknown"),
+                            daemon["drain_state"].as_str().unwrap_or("unknown drain state")
+                        ));
+                    }
+                }
             }
         }
         report.attempts.push(
