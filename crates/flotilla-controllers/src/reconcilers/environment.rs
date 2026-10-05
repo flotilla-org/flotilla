@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use flotilla_protocol::CanonicalHostId;
+use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits};
 use flotilla_resources::{
     controller::{ReconcileOutcome, Reconciler},
     DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentStatusPatch, Host, ResourceBackend, ResourceError, ResourceObject,
@@ -19,6 +19,7 @@ pub trait DockerEnvironmentRuntime: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DockerProvisioning {
+    pub configured_limits: Option<ConfiguredResourceLimits>,
     pub container_id: String,
     pub image_ref: String,
     pub image_digest: String,
@@ -113,11 +114,15 @@ where
             return ReconcileOutcome::new(None);
         }
         let patch = match obj.status.as_ref().map(|status| status.phase).unwrap_or(EnvironmentPhase::Pending) {
-            EnvironmentPhase::Pending if obj.spec.host_direct.is_some() => {
-                Some(EnvironmentStatusPatch::MarkReady { docker_container_id: None, image_ref: None, image_digest: None })
-            }
+            EnvironmentPhase::Pending if obj.spec.host_direct.is_some() => Some(EnvironmentStatusPatch::MarkReady {
+                configured_limits: None,
+                docker_container_id: None,
+                image_ref: None,
+                image_digest: None,
+            }),
             EnvironmentPhase::Pending => match prepared {
                 EnvironmentPrepared::Ready(provisioning) => Some(EnvironmentStatusPatch::MarkReady {
+                    configured_limits: provisioning.configured_limits.clone(),
                     docker_container_id: Some(provisioning.container_id.clone()),
                     image_ref: Some(provisioning.image_ref.clone()),
                     image_digest: Some(provisioning.image_digest.clone()),

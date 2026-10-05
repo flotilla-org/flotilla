@@ -664,6 +664,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             kind: PatchKind::TerminalMarkRunning,
             exercise: || {
                 let mut status = TerminalSessionStatus {
+                    configured_limits: None,
                     last_tool_activity_at: None,
                     last_output_digest: None,
                     last_output_activity_at: None,
@@ -687,6 +688,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 };
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
                 let patch = TerminalSessionStatusPatch::MarkRunning {
+                    configured_limits: None,
                     session_id: "session-a".to_string(),
                     pid: Some(42),
                     started_at: ts(30),
@@ -781,6 +783,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     VesselStatus { phase: VesselPhase::Ready, started_at: Some(ts(10)), ready_at: Some(ts(20)), ..VesselStatus::default() };
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
                 let patch = VesselStatusPatch::MarkReady {
+                    configured_limits: None,
                     placement_decision: None,
                     environment_ref: Some("env-a".to_string()),
                     image_ref: Some("registry.example/crew:latest".to_string()),
@@ -1036,6 +1039,7 @@ fn new_attempt_transitions_replace_attempt_timestamps() {
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.stopped_at };
                 apply_and_replay(&mut status, &TerminalSessionStatusPatch::MarkStarting);
                 let patch = TerminalSessionStatusPatch::MarkRunning {
+                    configured_limits: None,
                     session_id: "session-b".to_string(),
                     pid: Some(43),
                     started_at: ts(30),

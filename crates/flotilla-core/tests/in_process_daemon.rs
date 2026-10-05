@@ -5702,6 +5702,7 @@ async fn daemon_restart_preserves_standing_convoy_and_terminal_session() {
         .await
         .expect("create terminal session");
     apply_status_patch(&terminals, "standing-cleat-session", &TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "cleat-standing".to_string(),
         pid: None,
         started_at: chrono::Utc::now(),

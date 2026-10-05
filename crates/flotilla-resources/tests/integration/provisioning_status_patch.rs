@@ -118,6 +118,7 @@ async fn heartbeat_patch_preserves_independent_status_after_another_writer_updat
 fn environment_status_patch_marks_ready_and_failed() {
     let mut status = EnvironmentStatus::default();
     EnvironmentStatusPatch::MarkReady {
+        configured_limits: None,
         docker_container_id: Some("container-123".to_string()),
         image_ref: Some("registry.example/crew:latest".to_string()),
         image_digest: Some("sha256:first".to_string()),
@@ -242,6 +243,7 @@ fn terminal_session_status_patch_marks_running_and_stopped() {
     let stopped_at = Utc.timestamp_opt(20, 0).single().expect("timestamp");
 
     TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "abc123".to_string(),
         pid: Some(12345),
         started_at,
@@ -251,6 +253,7 @@ fn terminal_session_status_patch_marks_running_and_stopped() {
     }
     .apply(&mut status);
     TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "abc123".to_string(),
         pid: Some(12345),
         started_at: Utc.timestamp_opt(11, 0).single().expect("timestamp"),
@@ -353,6 +356,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     assert_eq!(status.placement_decision.as_ref(), Some(&placement_decision), "placement decision is write-once");
 
     VesselStatusPatch::MarkReady {
+        configured_limits: None,
         placement_decision: None,
         environment_ref: Some("env-a".to_string()),
         image_ref: Some("registry.example/crew:latest".to_string()),
@@ -370,6 +374,7 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     assert_eq!(status.image_digest.as_deref(), Some("sha256:test-image"));
 
     VesselStatusPatch::MarkReady {
+        configured_limits: None,
         placement_decision: None,
         environment_ref: Some("env-a".to_string()),
         image_ref: Some("registry.example/crew:latest".to_string()),
@@ -504,4 +509,18 @@ fn heartbeat_description_has_one_availability_authority(tc: hegel::TestCase) {
     assert!(previous.description.is_none());
     assert_eq!(previous.capabilities, status.capabilities);
     assert_eq!(previous.daemon_rss_bytes, status.daemon_rss_bytes);
+}
+
+// ADR 0047: previous-generation statuses lack configured limits and must decode
+// as unknown. Exercise each stored owner without changing the golden corpus.
+#[test]
+fn previous_generation_statuses_decode_without_configured_limits() {
+    let environment: EnvironmentStatus =
+        serde_json::from_value(serde_json::json!({"phase": "Ready"})).expect("previous-generation status decodes");
+    let vessel: VesselStatus = serde_json::from_value(serde_json::json!({"phase": "Ready"})).expect("previous-generation status decodes");
+    let terminal: TerminalSessionStatus =
+        serde_json::from_value(serde_json::json!({"phase": "Running"})).expect("previous-generation status decodes");
+    assert_eq!(environment.configured_limits, None);
+    assert_eq!(vessel.configured_limits, None);
+    assert_eq!(terminal.configured_limits, None);
 }

@@ -947,6 +947,9 @@ fn crew_roles_remain_a_flat_fact() {
     let reference = convoy_ref("dev", "cutover");
     let mut coder = vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).call();
     coder.crew = vec![CrewMemberSummary {
+        session: None,
+        adapter: None,
+        model: None,
         role: "coder".to_owned(),
         command_preview: "codex".to_owned(),
         requested_stance: None,
@@ -2582,5 +2585,182 @@ fn catalog_readiness_multi_vessel_attachment_and_unknown_evidence() {
         let facts = find_entity(&patches, &entity::vessel("dev", "provisioning", name, "feta"));
         assert_eq!(facts.set[KEY_READINESS_ATTACH_AVAILABLE].value, MetadataValue::Bool(true));
         assert!(facts.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
+    }
+}
+
+// Contract #2650: the catalog preserves placement configuration as raw facts,
+// and unknown facts stay absent. Generate both stances, unknown/known models,
+// minimal/nonminimal allocations, empty/nonempty alternatives and quota bounds.
+#[hegel::test]
+fn placement_catalog_preserves_raw_facts(tc: hegel::TestCase) {
+    use flotilla_protocol::{
+        CanonicalHostId, ConfiguredResourceLimits, FulfilmentAllocation, FulfilmentAllocationCandidate, PlacementDecision,
+        PlacementTargetHost,
+    };
+
+    use crate::keys::*;
+    let contained = tc.draw(hegel::generators::booleans());
+    let known_model = tc.draw(hegel::generators::booleans());
+    let minimal = tc.draw(hegel::generators::booleans());
+    let jobs = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(64));
+    let alternatives = if tc.draw(hegel::generators::booleans()) { vec!["another-policy".to_owned()] } else { vec![] };
+    let viable = alternatives
+        .iter()
+        .map(|policy| {
+            flotilla_protocol::PlacementViableCandidate::builder()
+                .policy_name(policy.clone())
+                .target_host(
+                    PlacementTargetHost::builder().reference(CanonicalHostId::resolved("host-kiwi")).display_name("kiwi".into()).build(),
+                )
+                .reason("available but not chosen".to_string())
+                .build()
+        })
+        .collect::<Vec<_>>();
+    let reference = convoy_ref("dev", "placement");
+    let mut row = vessel().convoy(&reference).name("work").phase(WorkPhase::Running).call();
+    row.environment_ref = Some("env-work".into());
+    row.effective_stance = Some(if contained { "contained" } else { "host-direct" }.into());
+    let kind = if contained { "docker-crew-image-feta" } else { "host-direct-feta" };
+    row.placement_decision = Some(
+        PlacementDecision::builder()
+            .policy_name("policy-work".into())
+            .target_host(
+                PlacementTargetHost::builder().reference(CanonicalHostId::resolved("host-feta")).display_name("feta".into()).build(),
+            )
+            .minimal_alternatives(alternatives.clone())
+            .viable_not_selected(viable.clone())
+            .allocation(FulfilmentAllocation {
+                chosen_kind: kind.into(),
+                reservation_reason: None,
+                candidates: vec![FulfilmentAllocationCandidate {
+                    kind: kind.into(),
+                    host: "host-feta".into(),
+                    cost_class: "cheap".into(),
+                    host_ready: true,
+                    sleeping_until: None,
+                    free_vessel_slots: Some(1),
+                    reserved_for_platform: false,
+                    minimal,
+                    available: true,
+                }],
+            })
+            .build(),
+    );
+    row.configured_limits =
+        Some(ConfiguredResourceLimits { cpus: contained.then_some(jobs), build_jobs: Some(jobs), linker_threads: Some(jobs) });
+    row.image_ref = contained.then(|| "crew:latest".into());
+    row.image_digest = contained.then(|| "sha256:abcdef1234567890".into());
+    row.crew = vec![CrewMemberSummary {
+        role: "coder".into(),
+        command_preview: "codex".into(),
+        requested_stance: None,
+        effective_stance: None,
+        session: Some("feta/dev/session-work".into()),
+        adapter: Some("codex".into()),
+        model: known_model.then(|| "gpt-6.1-sol".into()),
+    }];
+    let convoy = ConvoyRow::builder()
+        .resource(reference)
+        .name("placement")
+        .workflow_ref("code")
+        .phase(ConvoyPhase::Active)
+        .placement_decision(row.placement_decision.clone().expect("recorded placement decision"))
+        .vessels(vec![row])
+        .build();
+    let patches = project_catalog(&catalog_input(&[convoy]), &mint()).reassert_patches();
+    let patch = find_entity(&patches, &entity::vessel("dev", "placement", "work", "feta"));
+    assert_eq!(text(patch, KEY_VESSEL_KIND), kind);
+    assert_eq!(text(patch, KEY_VESSEL_POLICY), "policy-work");
+    assert_eq!(text(patch, KEY_VESSEL_ENV), "env-work");
+    assert_eq!(text(patch, KEY_VESSEL_HOST_REF), "host-feta");
+    assert_eq!(text(patch, KEY_VESSEL_HOST_NAME), "feta");
+    assert_eq!(text(patch, KEY_VESSEL_STANCE), if contained { "contained" } else { "host-direct" });
+    assert_eq!(text(patch, KEY_VESSEL_COST_CLASS), "cheap");
+    assert_eq!(patch.set[KEY_VESSEL_MINIMAL].value, MetadataValue::Bool(minimal));
+    assert_eq!(patch.set[KEY_VESSEL_MINIMAL_ALTERNATIVES].value, MetadataValue::StringList(alternatives));
+    assert_eq!(
+        serde_json::from_str::<Vec<flotilla_protocol::PlacementViableCandidate>>(&text(patch, KEY_VESSEL_ALTERNATIVES))
+            .expect("structured placement alternatives"),
+        viable
+    );
+    let convoy_patch = find_entity(&patches, &entity::convoy("dev", "placement", "kiwi"));
+    for (convoy_key, vessel_key) in [
+        (KEY_CONVOY_POLICY, KEY_VESSEL_POLICY),
+        (KEY_CONVOY_KIND, KEY_VESSEL_KIND),
+        (KEY_CONVOY_HOST_REF, KEY_VESSEL_HOST_REF),
+        (KEY_CONVOY_HOST_NAME, KEY_VESSEL_HOST_NAME),
+        (KEY_CONVOY_COST_CLASS, KEY_VESSEL_COST_CLASS),
+        (KEY_CONVOY_MINIMAL, KEY_VESSEL_MINIMAL),
+        (KEY_CONVOY_ALTERNATIVES, KEY_VESSEL_ALTERNATIVES),
+        (KEY_CONVOY_MINIMAL_ALTERNATIVES, KEY_VESSEL_MINIMAL_ALTERNATIVES),
+    ] {
+        assert_eq!(convoy_patch.set[convoy_key].value, patch.set[vessel_key].value);
+    }
+
+    assert_eq!(patch.set[KEY_VESSEL_BUILD_JOBS].value, MetadataValue::Integer(jobs as i64));
+    assert_eq!(patch.set[KEY_VESSEL_LINKER_THREADS].value, MetadataValue::Integer(jobs as i64));
+    assert_eq!(patch.set.contains_key(KEY_VESSEL_CPUS), contained);
+    assert_eq!(patch.set.contains_key(KEY_VESSEL_IMAGE_REF), contained);
+    assert_eq!(patch.set.contains_key(KEY_VESSEL_IMAGE_DIGEST), contained);
+    if contained {
+        assert_eq!(text(patch, KEY_VESSEL_IMAGE_SHORT_DIGEST), "abcdef123456");
+    }
+    let crew = find_entity(&patches, &entity::session("feta/dev/session-work"));
+    assert_eq!(text(crew, KEY_CREW_ADAPTER), "codex");
+    assert_eq!(crew.set.contains_key(KEY_CREW_MODEL), known_model);
+    if known_model {
+        assert_eq!(text(crew, KEY_CREW_MODEL), "gpt-6.1-sol");
+    }
+}
+
+// Missing placement, launch and quota evidence must not invent defaults.
+#[test]
+fn placement_catalog_omits_unknown_facts() {
+    use crate::keys::*;
+    let reference = convoy_ref("dev", "unknown");
+    let row = vessel().convoy(&reference).name("work").phase(WorkPhase::Pending).call();
+    let convoy = ConvoyRow::builder()
+        .resource(reference)
+        .name("unknown")
+        .workflow_ref("code")
+        .phase(ConvoyPhase::Pending)
+        .vessels(vec![row])
+        .build();
+    let patches = project_catalog(&catalog_input(&[convoy]), &mint()).reassert_patches();
+    let patch = find_entity(&patches, &entity::vessel("dev", "unknown", "work", "feta"));
+    for key in [
+        KEY_VESSEL_KIND,
+        KEY_VESSEL_POLICY,
+        KEY_VESSEL_ENV,
+        KEY_VESSEL_STANCE,
+        KEY_VESSEL_IMAGE_REF,
+        KEY_VESSEL_CPUS,
+        KEY_VESSEL_BUILD_JOBS,
+        KEY_VESSEL_LINKER_THREADS,
+    ] {
+        assert!(!patch.set.contains_key(key), "unknown {key} must be absent");
+    }
+}
+
+// Known launch fields override environment fields; unknown launch fields must
+// preserve recorded configuration, especially a contained vessel's CPU quota.
+#[hegel::test]
+fn launch_limits_preserve_unoverridden_environment_fields(tc: hegel::TestCase) {
+    use flotilla_protocol::ConfiguredResourceLimits;
+    // Exhaust all 64 optional-field combinations for generated quota values,
+    // including zero and normal bounds; each run exercises quota preservation.
+    let values: Vec<usize> = (0..6).map(|_| tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(64))).collect();
+    for mask in 0..64 {
+        let field = |index: usize| (mask & (1 << index) != 0).then_some(values[index]);
+        let environment = ConfiguredResourceLimits { cpus: field(0), build_jobs: field(1), linker_threads: field(2) };
+        let launch = ConfiguredResourceLimits { cpus: field(3), build_jobs: field(4), linker_threads: field(5) };
+        let merged = environment.clone().with_overrides(launch.clone());
+        for (prior, applied, observed) in [
+            (environment.cpus, launch.cpus, merged.cpus),
+            (environment.build_jobs, launch.build_jobs, merged.build_jobs),
+            (environment.linker_threads, launch.linker_threads, merged.linker_threads),
+        ] {
+            assert_eq!(observed, applied.or(prior));
+        }
     }
 }

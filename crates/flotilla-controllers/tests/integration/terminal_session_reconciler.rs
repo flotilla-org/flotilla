@@ -40,7 +40,8 @@ async fn create_ready_environment(backend: &ResourceBackend, name: &str) {
         .await
         .expect("create environment");
     let mut status = EnvironmentStatus::default();
-    EnvironmentStatusPatch::MarkReady { docker_container_id: None, image_ref: None, image_digest: None }.apply(&mut status);
+    EnvironmentStatusPatch::MarkReady { configured_limits: None, docker_container_id: None, image_ref: None, image_digest: None }
+        .apply(&mut status);
     environments.update_status(name, &environment.metadata.resource_version, &status).await.expect("mark environment ready");
 }
 
@@ -130,6 +131,7 @@ async fn dead_generation_is_lost_then_recreated() {
         .expect("create session");
     let mut running = TerminalSessionStatus::default();
     TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "old-generation".into(),
         pid: None,
         started_at: Utc::now(),
@@ -218,6 +220,7 @@ async fn a_briefly_missing_live_session_recovers_without_a_second_launch() {
         .expect("create session");
     let mut status = TerminalSessionStatus::default();
     TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "session-a".into(),
         pid: None,
         started_at: Utc::now(),
@@ -261,7 +264,8 @@ async fn terminal_session_failure_uses_injected_now_for_stopped_at() {
     environments
         .update_status("env-a", &env.metadata.resource_version, &{
             let mut status = EnvironmentStatus::default();
-            EnvironmentStatusPatch::MarkReady { docker_container_id: None, image_ref: None, image_digest: None }.apply(&mut status);
+            EnvironmentStatusPatch::MarkReady { configured_limits: None, docker_container_id: None, image_ref: None, image_digest: None }
+                .apply(&mut status);
             status
         })
         .await
@@ -379,6 +383,7 @@ async fn terminal_finalizer_drains_after_its_environment_is_deleted() {
         .expect("create terminal session");
     let mut status = TerminalSessionStatus::default();
     TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "terminal-orphan".to_string(),
         pid: None,
         started_at: Utc::now(),
@@ -563,6 +568,7 @@ async fn failed_convoy_terminal_stops_without_probing_its_gone_environment_runti
         .expect("create terminal");
     let mut running = TerminalSessionStatus::default();
     TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "cleat-failed-convoy".to_string(),
         pid: None,
         started_at: Utc::now(),
@@ -672,6 +678,7 @@ async fn transient_runtime_probe_failure_holds_and_recovers_automatically() {
         .expect("terminal should be created");
     let mut running = TerminalSessionStatus::default();
     TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "cleat-demo-work-coder".to_string(),
         pid: None,
         started_at: Utc::now(),
@@ -791,6 +798,7 @@ async fn foreign_actuator_runtime_failure_is_skipped_and_convoy_stays_active() {
         .expect("terminal should be created");
     let mut running = TerminalSessionStatus::default();
     TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "cleat-demo-work-coder".to_string(),
         pid: None,
         started_at: Utc::now(),
@@ -858,7 +866,8 @@ impl WorldBuilder for GhostRecoveryWorldBuilder {
             .await
             .map_err(|error| error.to_string())?;
         let mut env_status = EnvironmentStatus::default();
-        EnvironmentStatusPatch::MarkReady { docker_container_id: None, image_ref: None, image_digest: None }.apply(&mut env_status);
+        EnvironmentStatusPatch::MarkReady { configured_limits: None, docker_container_id: None, image_ref: None, image_digest: None }
+            .apply(&mut env_status);
         environments
             .update_status("host-direct-feta", &env.metadata.resource_version, &env_status)
             .await
@@ -924,6 +933,7 @@ impl TerminalRuntime for GhostRecoveryRuntime {
     ) -> Result<TerminalRuntimeState, String> {
         self.ensure_calls.fetch_add(1, Ordering::SeqCst);
         Ok(TerminalRuntimeState {
+            configured_limits: None,
             session_id: name.to_string(),
             pid: None,
             started_at: Utc::now(),
@@ -1055,6 +1065,7 @@ async fn terminal_finalizer_kills_the_persisted_session_using_its_spec() {
     let created = sessions.create(&meta("terminal-convoy-work-coder"), &spec).await.expect("session create");
     let mut status = flotilla_resources::TerminalSessionStatus::default();
     flotilla_resources::TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "terminal-convoy-work-coder".to_string(),
         pid: None,
         started_at: Utc::now(),
@@ -1124,7 +1135,8 @@ async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
         .await
         .expect("environment");
     let mut env_status = EnvironmentStatus::default();
-    EnvironmentStatusPatch::MarkReady { docker_container_id: None, image_ref: None, image_digest: None }.apply(&mut env_status);
+    EnvironmentStatusPatch::MarkReady { configured_limits: None, docker_container_id: None, image_ref: None, image_digest: None }
+        .apply(&mut env_status);
     environments.update_status("env-a", &env.metadata.resource_version, &env_status).await.expect("ready environment");
     let input = InputMeta::builder()
         .name("term-a".to_string())
@@ -1179,6 +1191,7 @@ impl TerminalRuntime for BriefGateRuntime {
     ) -> Result<TerminalRuntimeState, String> {
         self.launches.fetch_add(1, Ordering::SeqCst);
         Ok(TerminalRuntimeState {
+            configured_limits: None,
             session_id: name.to_string(),
             pid: None,
             started_at: Utc::now(),
@@ -1260,6 +1273,7 @@ impl TerminalRuntime for TagRecordingRuntime {
     ) -> Result<TerminalRuntimeState, String> {
         *self.tags.lock().expect("tags mutex") = tags.to_vec();
         Ok(TerminalRuntimeState {
+            configured_limits: None,
             session_id: name.to_string(),
             pid: None,
             started_at: Utc::now(),
@@ -1306,6 +1320,7 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
         .expect("session");
     let mut status = flotilla_resources::TerminalSessionStatus::default();
     flotilla_resources::TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "cleat-session".into(),
         pid: None,
         started_at: Utc::now(),
@@ -1371,6 +1386,7 @@ async fn a_fresh_turn_launched_as_the_brief_is_not_delivered_again() {
         .expect("create fresh turn session");
     let reconciler = TerminalSessionReconciler::new(Arc::new(MissingTerminalRuntime), backend, "flotilla");
     let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Running(TerminalRuntimeState {
+        configured_limits: None,
         session_id: "cleat-session".into(),
         pid: None,
         started_at: Utc::now(),
@@ -1385,6 +1401,7 @@ async fn a_fresh_turn_launched_as_the_brief_is_not_delivered_again() {
 
     let runtime_with_older_delivery =
         flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Running(TerminalRuntimeState {
+            configured_limits: None,
             session_id: "cleat-session".into(),
             pid: None,
             started_at: Utc::now(),
@@ -1463,6 +1480,7 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
         .expect("session");
     let mut status = flotilla_resources::TerminalSessionStatus::default();
     flotilla_resources::TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "cleat-session".into(),
         pid: None,
         started_at: Utc::now(),
@@ -1571,6 +1589,7 @@ async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
         .expect("session");
     let mut status = TerminalSessionStatus::default();
     TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "cleat-session".into(),
         pid: None,
         started_at: Utc::now(),
@@ -1672,6 +1691,7 @@ async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_s
         .expect("session");
     let mut status = TerminalSessionStatus::default();
     TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "cleat-session".into(),
         pid: None,
         started_at: Utc::now(),
@@ -1739,6 +1759,7 @@ async fn terminal_finalizer_cleans_agent_artifacts() {
         .expect("session");
     let mut status = flotilla_resources::TerminalSessionStatus::default();
     flotilla_resources::TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "cleat-session".into(),
         pid: None,
         started_at: Utc::now(),
@@ -1874,6 +1895,7 @@ async fn stale_attention_decays_to_unobservable_without_losing_a_live_session() 
             .expect("session");
         let mut status = flotilla_resources::TerminalSessionStatus::default();
         flotilla_resources::TerminalSessionStatusPatch::MarkRunning {
+            configured_limits: None,
             session_id: "session-a".into(),
             pid: None,
             started_at: Utc::now(),
@@ -1959,6 +1981,7 @@ async fn fatal_runtime_observation_fails_a_running_terminal_naming_its_credentia
         .expect("session");
     let mut status = TerminalSessionStatus::default();
     TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "session-a".into(),
         pid: None,
         started_at: Utc::now(),

@@ -113,3 +113,24 @@ mod tests {
         assert_eq!(allocation.reservation_reason, None);
     }
 }
+
+/// Limits actually configured at provisioning or terminal launch; absence means
+/// unknown, rather than unlimited. These are configuration facts, not usage.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfiguredResourceLimits {
+    pub cpus: Option<usize>,
+    pub build_jobs: Option<usize>,
+    pub linker_threads: Option<usize>,
+}
+
+impl ConfiguredResourceLimits {
+    /// Apply known launch limits without erasing recorded environment limits
+    /// when a launch leaves a field unknown (notably a container's CPU quota).
+    pub fn with_overrides(self, overrides: Self) -> Self {
+        Self {
+            cpus: overrides.cpus.or(self.cpus),
+            build_jobs: overrides.build_jobs.or(self.build_jobs),
+            linker_threads: overrides.linker_threads.or(self.linker_threads),
+        }
+    }
+}

@@ -787,6 +787,7 @@ fn vessel_object_with_image_digest(
             adopted_checkout_refs: Default::default(),
         },
         status: Some(VesselStatus {
+            configured_limits: None,
             placement_decision: None,
             phase,
             message: message.map(str::to_string),

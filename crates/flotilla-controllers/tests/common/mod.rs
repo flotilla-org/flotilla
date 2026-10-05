@@ -221,6 +221,7 @@ pub async fn create_ready_host_direct_environment(
         .expect("environment create should succeed");
     environments
         .update_status(&name, &created.metadata.resource_version, &EnvironmentStatus {
+            configured_limits: None,
             phase: EnvironmentPhase::Ready,
             ready: true,
             docker_container_id: None,
@@ -249,6 +250,7 @@ pub async fn create_ready_docker_environment(
         .expect("docker env create should succeed");
     environments
         .update_status(name, &created.metadata.resource_version, &EnvironmentStatus {
+            configured_limits: None,
             phase: EnvironmentPhase::Ready,
             ready: true,
             docker_container_id: Some(format!("container-{name}")),
@@ -362,6 +364,7 @@ pub async fn create_stopped_terminal(
         .expect("terminal create should succeed");
     sessions
         .update_status(&fixture.name, &created.metadata.resource_version, &TerminalSessionStatus {
+            configured_limits: None,
             phase: TerminalSessionPhase::Stopped,
             session_id: Some(format!("session-{}", fixture.name)),
             cleat_endpoint: None,

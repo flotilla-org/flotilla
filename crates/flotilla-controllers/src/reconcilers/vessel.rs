@@ -14,7 +14,7 @@ use flotilla_core::{
     },
     in_process::BRIEF_ARTIFACTS_ANNOTATION,
 };
-use flotilla_protocol::{CanonicalHostId, PlacementDecision};
+use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, PlacementDecision};
 use flotilla_resources::{
     artifact_record_name, canonicalize_repo_url,
     controller::{
@@ -226,6 +226,7 @@ enum PlannedPatch {
         message: String,
     },
     Ready {
+        configured_limits: Option<ConfiguredResourceLimits>,
         placement_decision: Option<PlacementDecision>,
         environment_ref: String,
         image: Option<ImageStamp>,
@@ -1155,8 +1156,19 @@ impl Reconciler for VesselReconciler {
             }
         }
 
+        let mut configured_limits =
+            self.environments.get(&resolved_environment_ref).await?.status.and_then(|status| status.configured_limits);
+        for terminal_ref in &terminal_refs {
+            if let Some(limits) = self.terminal_sessions.get(terminal_ref).await?.status.and_then(|status| status.configured_limits) {
+                // Only host-direct launches record terminal limits today. Merge
+                // known fields so future launch caps cannot erase a container quota.
+                configured_limits = Some(configured_limits.take().unwrap_or_default().with_overrides(limits));
+                break;
+            }
+        }
         Ok(VesselPrepared {
             patch: PlannedPatch::Ready {
+                configured_limits,
                 placement_decision,
                 environment_ref: resolved_environment_ref,
                 image,
@@ -1204,6 +1216,7 @@ impl Reconciler for VesselReconciler {
                 }
             }
             PlannedPatch::Ready {
+                configured_limits,
                 placement_decision,
                 environment_ref,
                 image,
@@ -1212,6 +1225,7 @@ impl Reconciler for VesselReconciler {
                 requested_stance,
                 effective_stance,
             } => Some(VesselStatusPatch::MarkReady {
+                configured_limits: configured_limits.clone(),
                 placement_decision: placement_decision.clone(),
                 environment_ref: Some(environment_ref.clone()),
                 image_ref: image.as_ref().map(|image| image.image_ref.clone()),
