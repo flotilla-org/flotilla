@@ -177,6 +177,8 @@ pub async fn drain(host: String, generation: String, incoming: &Path, targets: &
         if error.is_none() {
             error = parsed_report.as_ref().and_then(|report| report.warning.clone());
         }
+        // Discovery matches roots literally: alternate spellings can miss a live
+        // daemon and suppress this connection failure, not just draining information.
         if !success && stderr.starts_with("connect daemon:") {
             let listing = parsed(command(target, &target.binary, &["daemons", "--json"], Duration::from_secs(5)).await);
             if listing.as_ref().and_then(Value::as_array).is_some_and(|daemons| {
