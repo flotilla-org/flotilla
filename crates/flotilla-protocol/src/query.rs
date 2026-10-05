@@ -352,6 +352,9 @@ pub struct FleetHostRow {
     pub link: PeerConnectionState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_generation: Option<String>,
+    /// Wire-generation fingerprint compared by the daemon handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

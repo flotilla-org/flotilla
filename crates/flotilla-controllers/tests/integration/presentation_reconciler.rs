@@ -877,6 +877,7 @@ async fn create_ready_host(backend: &ResourceBackend, name: &str) {
         heartbeat_at: Utc::now(),
         ready: true,
         daemon_generation: None,
+        protocol_fingerprint: None,
         daemon_version: None,
         daemon_started_at: None,
         disk_free_bytes: None,

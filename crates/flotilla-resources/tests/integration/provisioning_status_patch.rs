@@ -18,6 +18,7 @@ fn host_status_patch_updates_heartbeat_snapshot() {
         heartbeat_at: Utc::now(),
         ready: true,
         daemon_generation: None,
+        protocol_fingerprint: Some("wire-fingerprint".to_string()),
         daemon_version: None,
         daemon_started_at: None,
         disk_free_bytes: None,
@@ -34,6 +35,8 @@ fn host_status_patch_updates_heartbeat_snapshot() {
     assert!(status.ready);
     // Heartbeat telemetry is in bytes and persists on the host status.
     assert_eq!(status.daemon_rss_bytes, Some(123 * 1024 * 1024));
+    // Heartbeats persist wire identity separately from the daemon instance id.
+    assert_eq!(status.protocol_fingerprint.as_deref(), Some("wire-fingerprint"));
 
     HostStatusPatch::SleepInhibition {
         health: SleepInhibitionHealth::Failed { consecutive_failures: 3, message: "polkit denied".to_string() },
@@ -93,6 +96,7 @@ async fn heartbeat_patch_preserves_independent_status_after_another_writer_updat
         heartbeat_at: observed_at,
         ready: true,
         daemon_generation: None,
+        protocol_fingerprint: None,
         daemon_version: None,
         daemon_started_at: None,
         disk_free_bytes: None,
@@ -476,6 +480,7 @@ fn heartbeat_description_has_one_availability_authority(tc: hegel::TestCase) {
         heartbeat_at: Utc::now(),
         ready: true,
         daemon_generation: None,
+        protocol_fingerprint: None,
         daemon_version: None,
         daemon_started_at: None,
         disk_free_bytes: None,
