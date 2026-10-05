@@ -4248,6 +4248,51 @@ async fn convoy_explain_addresses_an_exact_terminal_pre_identity_record() {
     assert_eq!(explanation.phase, "Failed");
 }
 
+// #2684: explain exposes the pending episode's durable age and live blocker,
+// including when the terminal has disappeared. Glue: one projection call-through.
+#[tokio::test]
+async fn convoy_explain_surfaces_queued_turn_age_and_blocker() {
+    let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;
+    let namespace = "queued-explain";
+    let convoys = backend.using::<ResourceConvoy>(namespace);
+    let convoy = convoys.create(&test_meta("queued"), &ConvoySpec::builder().workflow_ref("review".into()).build()).await.unwrap();
+    let queued_at = daemon.clock.now() - chrono::Duration::seconds(601);
+    convoys
+        .update_status("queued", &convoy.metadata.resource_version, &ConvoyStatus {
+            phase: ConvoyPhase::Active,
+            turn_deliveries: BTreeMap::from([("review".into(), flotilla_resources::TurnDeliveryStatus {
+                episodes: vec![flotilla_resources::TurnDeliveryEpisode {
+                    subject_revision: "head".into(),
+                    evidence_at: queued_at,
+                    judged_claim_at: queued_at,
+                    outcome: flotilla_resources::TurnDeliveryOutcome::Queued {
+                        rung: flotilla_resources::TurnDeliveryRung::WarmSession,
+                        queued_at,
+                        vessel: "work".into(),
+                        role: "coder".into(),
+                        message_id: "turn".into(),
+                        blocking_reason: "old readiness".into(),
+                    },
+                    sender: Default::default(),
+                }],
+                ..Default::default()
+            })]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let explanation = daemon.explain_convoy_internal(Some(namespace), "queued").await.unwrap();
+    let turns = explanation.queued_turns;
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].source, "review");
+    assert_eq!(turns[0].subject_revision, "head");
+    assert_eq!(serde_json::to_value(&turns[0]).unwrap()["rung"], "warm-session");
+    assert_eq!(turns[0].queued_at, queued_at.to_rfc3339());
+    assert_eq!(turns[0].age_seconds, 601);
+    assert!(turns[0].overdue);
+    assert_eq!(turns[0].blocking_reason, "terminal session unavailable");
+}
+
 #[tokio::test]
 async fn convoy_explain_refuses_multiple_terminal_generations() {
     let (daemon, backend, _clock, _temp) = standing_ensure_fixture().await;

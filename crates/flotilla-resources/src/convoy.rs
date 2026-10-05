@@ -1198,8 +1198,33 @@ pub struct TurnDeliveryEpisode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum TurnDeliveryOutcome {
-    Delivered { rung: TurnDeliveryRung, delivered_at: DateTime<Utc> },
-    Refused { reason: String, refused_at: DateTime<Utc>, hold_executed: bool },
+    /// Accepted into the terminal FIFO; no agent turn has been confirmed yet.
+    Queued {
+        rung: TurnDeliveryRung,
+        queued_at: DateTime<Utc>,
+        vessel: String,
+        role: String,
+        message_id: String,
+        blocking_reason: String,
+    },
+    Delivered {
+        rung: TurnDeliveryRung,
+        delivered_at: DateTime<Utc>,
+    },
+    Refused {
+        reason: String,
+        refused_at: DateTime<Utc>,
+        hold_executed: bool,
+    },
+}
+
+/// One terminal receipt/readiness observation, applied with its convoy peers in one write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedTurnObservation {
+    pub source: String,
+    pub subject_revision: String,
+    pub confirmed: bool,
+    pub blocking_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -1209,7 +1234,13 @@ pub struct ConvoyAttention {
     pub raised_at: DateTime<Utc>,
 }
 
+impl TurnDeliveryOutcome {
+    /// Allow startup, readiness observation and replica propagation before asking a supervisor.
+    pub const QUEUED_BOUND: chrono::Duration = chrono::Duration::minutes(5);
+}
+
 impl ConvoyAttention {
+    pub const QUEUED_TURN_SOURCE: &'static str = "queued-turn-delivery";
     pub const MISSING_TURN_HOOK_SOURCE: &'static str = "missing-turn-hook";
 }
 
@@ -1590,6 +1621,10 @@ pub enum ConvoyStatusPatch {
         role: String,
         prompt: String,
     },
+    ObserveQueuedTurnDeliveries {
+        observations: Vec<QueuedTurnObservation>,
+        observed_at: DateTime<Utc>,
+    },
     FailTurnDelivery {
         source: String,
         failure: TurnDeliveryFailure,
@@ -1613,7 +1648,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
         // Terminal outcomes reject stale and duplicate patches. An explicit
         // abandon may override a terminal outcome only when its caller saw
         // that exact phase. Mutation audit records remain appendable, and
-        // SetStalled may clear stale attention.
+        // SetStalled and queued-turn observations may clear stale attention.
         if status.phase.is_terminal()
             && !matches!(
                 self,
@@ -1621,6 +1656,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     | Self::RecordLifecycleMutation { .. }
                     | Self::SetStalled { .. }
                     | Self::SetTeardownWait { .. }
+                    | Self::ObserveQueuedTurnDeliveries { .. }
             )
             && !matches!(self, Self::MarkConvoyAbandoned { expected_phase, .. } if *expected_phase == status.phase && status.phase != ConvoyPhase::Abandoned)
         {
@@ -2158,6 +2194,56 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.phase = ConvoyPhase::Active;
                 status.finished_at = None;
             }
+            Self::ObserveQueuedTurnDeliveries { observations, observed_at } => {
+                for QueuedTurnObservation { source, subject_revision, confirmed, blocking_reason } in observations {
+                    if let Some(episode) = status
+                        .turn_deliveries
+                        .get_mut(source)
+                        .and_then(|delivery| delivery.episodes.iter_mut().find(|episode| episode.subject_revision == *subject_revision))
+                    {
+                        if let TurnDeliveryOutcome::Queued { rung, blocking_reason: reason, .. } = &mut episode.outcome {
+                            if *confirmed {
+                                episode.outcome = TurnDeliveryOutcome::Delivered { rung: *rung, delivered_at: *observed_at };
+                            } else {
+                                *reason = blocking_reason.clone();
+                            }
+                        }
+                    }
+                }
+                // Re-evaluate all pending episodes after optimistic retry. One confirmation
+                // must not clear another queued turn's attention or unrelated operator attention.
+                // When unrelated attention occupies the slot, overdue turns remain visible
+                // in explain. This advisory is raised once that other attention clears.
+                if status.attention.as_ref().is_none_or(|attention| attention.source == ConvoyAttention::QUEUED_TURN_SOURCE) {
+                    let terminal = status.phase.is_terminal();
+                    let overdue = status
+                        .turn_deliveries
+                        .iter()
+                        .flat_map(|(source, delivery)| {
+                            delivery.episodes.iter().filter_map(move |episode| match &episode.outcome {
+                                TurnDeliveryOutcome::Queued { queued_at, blocking_reason, message_id, .. }
+                                    if !terminal && observed_at.signed_duration_since(*queued_at) > TurnDeliveryOutcome::QUEUED_BOUND =>
+                                {
+                                    Some(format!(
+                                        "{source}: {message_id} queued since {} without submission: {blocking_reason}",
+                                        queued_at.to_rfc3339()
+                                    ))
+                                }
+                                _ => None,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    status.attention = if overdue.is_empty() {
+                        None
+                    } else {
+                        Some(ConvoyAttention {
+                            source: ConvoyAttention::QUEUED_TURN_SOURCE.into(),
+                            reason: overdue.join("\n"),
+                            raised_at: status.attention.as_ref().map_or(*observed_at, |attention| attention.raised_at),
+                        })
+                    };
+                }
+            }
             Self::FailTurnDelivery { source, failure } => {
                 let delivery = status.turn_deliveries.entry(source.clone()).or_default();
                 let changed = delivery.failure.as_ref().is_none_or(|prior| prior.kind != failure.kind || prior.reason != failure.reason);
@@ -2441,6 +2527,110 @@ pub mod external_patches {
 mod subject_tests {
     use super::*;
     use crate::{CrewMessageDelivery, CrewMessageSender, TerminalCrewMessage};
+
+    // #2684: confirmation is monotonic, and clearing one queued episode must
+    // retain attention for another overdue episode and unrelated operator attention.
+    #[hegel::test]
+    fn queued_turn_observations_are_monotonic_and_preserve_attention(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let unrelated = tc.draw(gs::booleans());
+        let steps = tc.draw(gs::integers::<usize>().min_value(2).max_value(12));
+        let start = Utc::now();
+        let now = start + chrono::Duration::seconds(301);
+        let other = ConvoyAttention { source: "settlement".into(), reason: "keep this".into(), raised_at: start };
+        let mut status = ConvoyStatus::default();
+        for source in ["first", "second"] {
+            status.turn_deliveries.insert(source.into(), TurnDeliveryStatus {
+                episodes: vec![TurnDeliveryEpisode {
+                    subject_revision: "head".into(),
+                    evidence_at: start,
+                    judged_claim_at: start,
+                    outcome: TurnDeliveryOutcome::Queued {
+                        rung: TurnDeliveryRung::WarmSession,
+                        queued_at: start,
+                        vessel: "work".into(),
+                        role: "coder".into(),
+                        message_id: source.into(),
+                        blocking_reason: "Pending".into(),
+                    },
+                    sender: Default::default(),
+                }],
+                ..Default::default()
+            });
+        }
+        status.attention = unrelated.then_some(other.clone());
+        for age in [-1, 299, 300, 301] {
+            let mut observed = status.clone();
+            ConvoyStatusPatch::ObserveQueuedTurnDeliveries {
+                observations: vec![QueuedTurnObservation {
+                    source: "first".into(),
+                    subject_revision: "head".into(),
+                    confirmed: false,
+                    blocking_reason: "Pending".into(),
+                }],
+                observed_at: start + chrono::Duration::seconds(age),
+            }
+            .apply(&mut observed);
+            assert_eq!(observed.attention.is_some(), unrelated || age > 300);
+        }
+        let mut confirmed = [false; 2];
+        // Explicit operation sequence includes repeated pending observations after
+        // confirmation, both episode orders, and an absent revision (optimistic retries).
+        for _ in 0..steps {
+            let index = tc.draw(gs::integers::<usize>().min_value(0).max_value(1));
+            let receipt = tc.draw(gs::booleans());
+            let missing_revision = tc.draw(gs::booleans());
+            let source = ["first", "second"][index];
+            ConvoyStatusPatch::ObserveQueuedTurnDeliveries {
+                observations: vec![QueuedTurnObservation {
+                    source: source.into(),
+                    subject_revision: if missing_revision { "other" } else { "head" }.into(),
+                    confirmed: receipt,
+                    blocking_reason: "attention Unobservable".into(),
+                }],
+                observed_at: now,
+            }
+            .apply(&mut status);
+            confirmed[index] |= receipt && !missing_revision;
+            for (index, source) in ["first", "second"].iter().enumerate() {
+                assert_eq!(
+                    matches!(status.turn_deliveries[*source].episodes[0].outcome, TurnDeliveryOutcome::Delivered { .. }),
+                    confirmed[index]
+                );
+            }
+            if unrelated {
+                assert_eq!(status.attention, Some(other.clone()));
+            } else {
+                assert_eq!(status.attention.is_some(), !confirmed.iter().all(|confirmed| *confirmed));
+                if let Some(attention) = &status.attention {
+                    assert_eq!(attention.source, ConvoyAttention::QUEUED_TURN_SOURCE);
+                    assert_eq!(attention.raised_at, now);
+                }
+            }
+        }
+        // Terminal convoys must not retain queued-turn NeedsYou attention. Clearing
+        // the advisory must still preserve unrelated attention, for every terminal phase.
+        for phase in [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Cancelled, ConvoyPhase::Abandoned] {
+            let mut terminal = status.clone();
+            terminal.phase = phase;
+            terminal.turn_deliveries.get_mut("first").unwrap().episodes[0].outcome = TurnDeliveryOutcome::Queued {
+                rung: TurnDeliveryRung::WarmSession,
+                queued_at: start,
+                vessel: "work".into(),
+                role: "coder".into(),
+                message_id: "first".into(),
+                blocking_reason: "Pending".into(),
+            };
+            terminal.attention = Some(if unrelated {
+                other.clone()
+            } else {
+                ConvoyAttention { source: ConvoyAttention::QUEUED_TURN_SOURCE.into(), reason: "overdue".into(), raised_at: now }
+            });
+            ConvoyStatusPatch::ObserveQueuedTurnDeliveries { observations: Vec::new(), observed_at: now }.apply(&mut terminal);
+            assert_eq!(terminal.attention, unrelated.then_some(other.clone()));
+            assert_eq!(terminal.phase, phase);
+        }
+    }
 
     // #2634: hook health is advisory; a settlement attention raised between
     // reading health and applying its patch must survive both raise and clear.

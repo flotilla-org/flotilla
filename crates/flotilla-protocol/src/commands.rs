@@ -456,6 +456,8 @@ pub struct ConvoyExplanation {
     pub subscriptions: Vec<ExplainedSubscription>,
     pub crew_deliveries: Vec<ExplainedCrewDelivery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_turns: Vec<ExplainedQueuedTurn>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unclaimed_work: Vec<ExplainedUnclaimedWork>,
     pub decision_ledgers: Vec<ExplainedDecisionLedger>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -465,6 +467,20 @@ pub struct ConvoyExplanation {
     pub recent_events: Vec<ExplainedEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lifecycle_mutations: Vec<ExplainedLifecycleMutation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedQueuedTurn {
+    pub source: String,
+    pub subject_revision: String,
+    pub vessel: String,
+    pub role: String,
+    pub message_id: String,
+    pub rung: TurnDeliveryRung,
+    pub queued_at: String,
+    pub age_seconds: i64,
+    pub blocking_reason: String,
+    pub overdue: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -208,6 +208,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         change_requests: Vec::new(),
         subscriptions: Vec::new(),
         crew_deliveries: Vec::new(),
+        queued_turns: Vec::new(),
         unclaimed_work: vec![ExplainedUnclaimedWork { vessel: "work".into(), role: "coder".into(), evidence: "turn_idle".into() }],
         artifacts: vec![flotilla_protocol::ExplainedArtifact {
             kind: "explainer".into(),
@@ -338,6 +339,7 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
         change_requests: Vec::new(),
         subscriptions: Vec::new(),
         crew_deliveries: Vec::new(),
+        queued_turns: Vec::new(),
         unclaimed_work: Vec::new(),
         decision_ledgers: Vec::new(),
         artifacts: Vec::new(),
@@ -350,6 +352,26 @@ fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
     assert!(output.contains("Fulfilment: macos-scarce on comte"), "{output}");
     assert!(output.contains("Reserved platform capacity used: no unreserved capacity covers the needs"), "{output}");
     assert!(!output.contains("Escalation:"), "{output}");
+}
+
+// #2684: human explain must make queued/unsubmitted age and reason visible.
+// Glue: a single serialized explanation exercises the display contract.
+#[test]
+fn convoy_explain_formats_queued_turn_age_and_blocker() {
+    let explanation: ConvoyExplanation = serde_json::from_value(serde_json::json!({
+        "namespace": "flotilla", "convoy": "queued", "phase": "Active", "evidence_ttl_seconds": 30,
+        "change_request_stale_after_seconds": 30, "checkouts": [], "change_requests": [], "subscriptions": [],
+        "crew_deliveries": [], "decision_ledgers": [], "settlement": {"mode": "no_exit", "satisfied": false, "unmet": []},
+        "queued_turns": [{"source": "review", "subject_revision": "head", "vessel": "work", "role": "coder", "message_id": "turn",
+            "rung": "warm-session", "queued_at": "2026-10-05T13:42:35+00:00", "age_seconds": 301,
+            "blocking_reason": "attention Unobservable; waiting for turn readiness or submission evidence", "overdue": true}]
+    }))
+    .unwrap();
+    let output = format_convoy_explanation_human(&explanation);
+    assert!(output.contains("Queued turns (not submitted):"), "{output}");
+    assert!(output.contains("review work/coder revision=head"), "{output}");
+    assert!(output.contains("rung=warm-session"), "{output}");
+    assert!(output.contains("age=301s OVERDUE: attention Unobservable"), "{output}");
 }
 
 #[test]
