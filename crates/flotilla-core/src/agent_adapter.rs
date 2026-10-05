@@ -808,7 +808,11 @@ impl CliAgentAdapter {
                 let config = trust_config
                     .as_ref()
                     .ok_or_else(|| "cannot determine Codex config path because neither CODEX_HOME nor HOME was detected".to_string())?;
-                seed_codex_workspace_trust(&*self.runner, cwd.as_path(), config, *contained).await?;
+                let invocation_config = environment
+                    .iter()
+                    .find(|(name, _)| name == "CODEX_HOME")
+                    .map(|(_, home)| CodexTrustConfig { path: PathBuf::from(home).join("config.toml"), lock: Arc::clone(&config.lock) });
+                seed_codex_workspace_trust(&*self.runner, cwd.as_path(), invocation_config.as_ref().unwrap_or(config), *contained).await?;
             }
         }
         self.runner.write_file(&cwd.as_path().join(&brief.path), &brief.content).await?;
@@ -2151,6 +2155,42 @@ mod tests {
         assert!(parsed.get("notify").is_none(), "host-direct Codex should use an invocation-only notify override");
         assert_eq!(parsed["projects"]["/existing"]["trust_level"].as_str(), Some("trusted"));
         assert_eq!(parsed["projects"][&canonical_workspace]["trust_level"].as_str(), Some("trusted"));
+    }
+
+    #[tokio::test]
+    async fn codex_prepares_trust_in_each_invocation_home() {
+        // Issue #2672: preparation must trust the workspace in the same private
+        // home launch uses, without writing trust into another crew's config.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("codex");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let bag = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("CODEX_HOME", base.display().to_string()))
+            .with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "shared"))
+            .with(EnvironmentAssertion::binary("codex", "/tools/codex"));
+        let registry = AgentAdapterRegistry::discover(&bag, Arc::new(ProcessCommandRunner));
+        let adapter = registry.get("codex").expect("adapter");
+        let brief = flotilla_resources::TerminalBrief {
+            artifact_digest: None,
+            path: ".flotilla/briefs/coder.md".into(),
+            content: String::new(),
+            copies: Vec::new(),
+        };
+        let canonical = workspace.canonicalize().expect("canonical workspace").display().to_string();
+        for role in ["coder", "reviewer"] {
+            let home = base.join("crews").join(role);
+            adapter
+                .prepare_with_environment(&ExecutionEnvironmentPath::new(&workspace), &brief, &vec![(
+                    "CODEX_HOME".into(),
+                    home.display().to_string(),
+                )])
+                .await
+                .expect("prepare crew");
+            let config = std::fs::read_to_string(home.join("config.toml")).expect("private config").parse::<DocumentMut>().expect("config");
+            assert_eq!(config["projects"][&canonical]["trust_level"].as_str(), Some("trusted"));
+        }
+        assert!(!base.join("config.toml").exists(), "trust is prepared in each invocation home");
     }
 
     // #2634: every Codex launch carries the hook, regardless of confinement,

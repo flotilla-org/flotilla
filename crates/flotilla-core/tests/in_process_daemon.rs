@@ -2687,6 +2687,121 @@ async fn allocation_shares_equal_need_roles_and_explains_grouping() {
 }
 
 #[tokio::test]
+async fn implement_review_admission_shares_a_vessel_with_different_resolved_skills() {
+    // Issue #2672: different role skill selections alone must not split an
+    // implement-review vessel; admission retains each crew's resolved imports.
+    use flotilla_core::providers::discovery::test_support::TestEnvVars;
+    use flotilla_resources::{CrewDefaults, CrewDefaultsSpec, SkillCatalogEntry};
+    let bundle = tempfile::tempdir().expect("skill bundle");
+    let catalog = ["implement", "review"].map(|name| SkillCatalogEntry {
+        source: "source".into(),
+        repository: "owner/repo".into(),
+        revision: "1".repeat(40),
+        name: name.into(),
+        path: format!("skills/{name}"),
+    });
+    std::fs::write(bundle.path().join(".flotilla-skill-catalog.json"), serde_json::to_string(&catalog).expect("catalog"))
+        .expect("catalog file");
+    std::fs::write(bundle.path().join(".flotilla-sources.json"), serde_json::json!({"schema_version":5,"sources":[{"name":"source","repository":"https://github.com/owner/repo.git","revision":"1".repeat(40)}]}).to_string()).expect("manifest");
+    let mut discovery = fake_discovery(false);
+    discovery.env = Arc::new(TestEnvVars::new([("FLOTILLA_SKILLS_DIR", bundle.path().display().to_string())]));
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(discovery).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    backend
+        .definitions::<CrewDefaults>("flotilla")
+        .apply(&InputMeta::builder().name("fleet".into()).build(), &CrewDefaultsSpec {
+            skills: BTreeMap::from([("coder".into(), vec!["implement".into()]), ("reviewer".into(), vec!["review".into()])]),
+        })
+        .await
+        .expect("defaults");
+    let crew = |role: &str| {
+        flotilla_resources::CrewSpec::builder()
+            .role(role.into())
+            .source(flotilla_resources::CrewSource::Agent {
+                selector: flotilla_resources::Selector::for_capability("code"),
+                prompt: None,
+                brief_template: None,
+            })
+            .build()
+    };
+    backend
+        .definitions::<WorkflowTemplate>("flotilla")
+        .create(
+            &InputMeta::builder().name("implement-review-skills".into()).build(),
+            &flotilla_resources::WorkflowTemplateSpec::builder()
+                .vessels(vec![flotilla_resources::VesselRequirement::builder()
+                    .name("work".into())
+                    .crew(vec![crew("coder"), crew("reviewer")])
+                    .build()])
+                .build(),
+        )
+        .await
+        .expect("workflow");
+    let result =
+        start_capability_convoy(&daemon, "shared-skills", |intent| intent.workflow_ref = Some("implement-review-skills".into())).await;
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+    let admitted = admitted_convoy(&backend, "shared-skills").await;
+    let snapshot_name = admitted.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).expect("snapshot name");
+    let snapshot = backend.definitions::<WorkflowTemplate>("flotilla").get(snapshot_name).await.expect("snapshot");
+    assert_eq!(snapshot.spec.vessels.len(), 1, "skills alone cannot split vessels");
+    let crew = &snapshot.spec.vessels[0].crew;
+    assert_eq!(crew.len(), 2);
+    for (role, skill) in [("coder", "implement"), ("reviewer", "review")] {
+        assert_eq!(
+            crew.iter()
+                .find(|crew| crew.role == role)
+                .expect("crew")
+                .skills
+                .selected
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            [skill]
+        );
+    }
+    // Different grants remain an isolation criterion even with crew-local skills.
+    backend
+        .definitions::<CredentialSpec>("flotilla")
+        .create(&InputMeta::builder().name("coder-gh".into()).build(), &CredentialSpecSpec {
+            consumer: CredentialConsumer::Gh,
+            source: CredentialSource::Env { name: "TEST_CODER_TOKEN".into() },
+            lifecycle: CredentialLifecycle::Static,
+            placement: CredentialPlacementRequirements::default(),
+        })
+        .await
+        .expect("credential");
+    backend
+        .definitions::<CredentialGrant>("flotilla")
+        .create(
+            &InputMeta::builder().name("coder-only".into()).build(),
+            &CredentialGrantSpec::builder()
+                .selector(
+                    CredentialGrantSelector::builder()
+                        .projects(BTreeSet::from(["flotilla".into()]))
+                        .roles(BTreeSet::from(["coder".into()]))
+                        .build(),
+                )
+                .credentials(BTreeSet::from(["coder-gh".into()]))
+                .build(),
+        )
+        .await
+        .expect("grant");
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let host = hosts.get("host-test").await.expect("placement host");
+    let mut status = host.status.expect("host status");
+    status.capabilities.insert(HELD_CREDENTIALS_CAPABILITY.into(), serde_json::json!(["coder-gh"]));
+    hosts.update_status("host-test", &host.metadata.resource_version, &status).await.expect("held credential");
+    let result =
+        start_capability_convoy(&daemon, "split-grants", |intent| intent.workflow_ref = Some("implement-review-skills".into())).await;
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+    let admitted = admitted_convoy(&backend, "split-grants").await;
+    let snapshot_name = admitted.metadata.annotations.get(flotilla_resources::WORKFLOW_SNAPSHOT_ANNOTATION).expect("snapshot name");
+    let snapshot = backend.definitions::<WorkflowTemplate>("flotilla").get(snapshot_name).await.expect("snapshot");
+    assert_eq!(snapshot.spec.vessels.len(), 2, "different grants must split vessels");
+}
+
+#[tokio::test]
 async fn allocation_separates_linux_coder_from_gui_verifier() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
     let backend = daemon.resource_backend();

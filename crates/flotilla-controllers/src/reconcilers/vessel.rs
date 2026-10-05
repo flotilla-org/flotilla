@@ -523,9 +523,14 @@ impl Reconciler for VesselReconciler {
                                         {
                                             let mut env = env.clone();
                                             env.insert(
-                                                "FLOTILLA_RESOLVED_SKILLS".to_string(),
+                                                "FLOTILLA_CREW_SKILLS".to_string(),
                                                 serde_json::to_string(
-                                                    &requirement.crew.iter().flat_map(|crew| &crew.skills.selected).collect::<Vec<_>>(),
+                                                    &requirement
+                                                        .crew
+                                                        .iter()
+                                                        .filter(|crew| matches!(crew.source, CrewSource::Agent { .. }))
+                                                        .map(|crew| (&crew.role, &crew.skills.selected))
+                                                        .collect::<BTreeMap<_, _>>(),
                                                 )
                                                 .expect("serialize resolved skills"),
                                             );
@@ -947,9 +952,14 @@ impl Reconciler for VesselReconciler {
                                         {
                                             let mut env = env.clone();
                                             env.insert(
-                                                "FLOTILLA_RESOLVED_SKILLS".to_string(),
+                                                "FLOTILLA_CREW_SKILLS".to_string(),
                                                 serde_json::to_string(
-                                                    &requirement.crew.iter().flat_map(|crew| &crew.skills.selected).collect::<Vec<_>>(),
+                                                    &requirement
+                                                        .crew
+                                                        .iter()
+                                                        .filter(|crew| matches!(crew.source, CrewSource::Agent { .. }))
+                                                        .map(|crew| (&crew.role, &crew.skills.selected))
+                                                        .collect::<BTreeMap<_, _>>(),
                                                 )
                                                 .expect("serialize resolved skills"),
                                             );

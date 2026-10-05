@@ -41,8 +41,13 @@ No demand list belongs in generation assembly.
 
 The resolved entries and complete ordered decision trace are frozen in each
 CrewSpec in the workflow snapshot. Roles with different selections cannot share
-an agent home: the selection participates in vessel allocation compatibility.
-Provisioning stages only those entries and checks frontmatter names. `convoy
+an agent home. As amended by #2672 (2026-10-05), contained provisioning gives
+each role its own scratch home under the delivered harness home and stages only
+that role's entries. Launch selects the same home; refreshed authentication
+remains linked to the vessel's credential delivery. Skill selections do not
+participate in vessel allocation compatibility: grants, scopes, permissions,
+needs and repository refs remain the isolation criteria. Provisioning checks
+frontmatter names. `convoy
 explain` displays selected entries and additions, removals, and warnings.
 
 The pre-roll gate runs the same resolver against every CrewDefaults role and
