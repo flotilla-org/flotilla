@@ -341,14 +341,6 @@ fn delivery_retry_delay(failures: u32) -> Duration {
     Duration::from_secs(60 * (1_u64 << failures.saturating_sub(1).min(2)))
 }
 
-fn next_delivery_failure_count(obj: &ResourceObject<TerminalSession>, message_id: &str) -> u32 {
-    obj.status
-        .as_ref()
-        .and_then(|status| status.degraded.as_ref())
-        .filter(|condition| condition.message_id.as_deref() == Some(message_id))
-        .map_or(1, |condition| condition.consecutive_failures.saturating_add(1))
-}
-
 fn retirement_pending(obj: &ResourceObject<TerminalSession>) -> bool {
     obj.status.as_ref().is_some_and(|status| {
         status.phase != TerminalSessionPhase::Starting && status.crew.is_some() && !status.retired_launches.is_empty()
@@ -448,7 +440,7 @@ where
                                     && (condition.consecutive_failures >= DELIVERY_MAX_ATTEMPTS
                                         || Utc::now().signed_duration_since(condition.observed_at)
                                             < chrono::Duration::from_std(delivery_retry_delay(condition.consecutive_failures))
-                                                .expect("bounded delivery backoff"))))
+                                                .unwrap_or(chrono::Duration::MAX))))
                     }) {
                         return Ok(TerminalPrepared::None);
                     }
@@ -673,7 +665,7 @@ where
                     Some(TerminalSessionStatusPatch::MarkMessageDelivered { message_id: message_id.clone() })
                 }
                 TerminalPrepared::MessageDeliveryNotSubmitted { message_id, message } => {
-                    let failures = next_delivery_failure_count(obj, message_id);
+                    let failures = obj.status.as_ref().map_or(1, |status| status.next_delivery_failure_count(message_id));
                     let disposition = if failures >= DELIVERY_MAX_ATTEMPTS {
                         "retry budget exhausted; delivery held for explicit intervention"
                     } else {
@@ -801,7 +793,7 @@ where
             outcome.requeue_after = Some(LOST_RECHECK_AFTER);
         }
         if let TerminalPrepared::MessageDeliveryNotSubmitted { message_id, .. } = prepared {
-            let failures = next_delivery_failure_count(obj, message_id);
+            let failures = obj.status.as_ref().map_or(1, |status| status.next_delivery_failure_count(message_id));
             if failures < DELIVERY_MAX_ATTEMPTS {
                 outcome.requeue_after = Some(delivery_retry_delay(failures));
             }

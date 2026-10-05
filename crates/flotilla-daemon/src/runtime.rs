@@ -5747,6 +5747,7 @@ struct TerminalControllerRuntime {
 
 const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(200);
 const DELIVERY_CONFIRMATION_GRACE: Duration = Duration::from_secs(4);
+const DELIVERY_CONFIRMATION_STABLE_FOR: Duration = Duration::from_secs(1);
 const DELIVERY_READY_POLLS: usize = 150;
 
 // Screen classification is the same evidence for observation, turn release, and
@@ -5836,7 +5837,7 @@ async fn session_busy_after_delivery_grace(
         let now = tokio::time::Instant::now();
         if positive {
             let since = positive_since.get_or_insert(now);
-            if now.duration_since(*since) >= Duration::from_secs(1) {
+            if now.duration_since(*since) >= DELIVERY_CONFIRMATION_STABLE_FOR {
                 return Ok(true);
             }
         } else {
@@ -5857,6 +5858,11 @@ async fn deliver_and_confirm(
     readiness: TerminalDeliveryReadiness,
     clear_before_delivery: bool,
 ) -> Result<TerminalDeliveryOutcome, String> {
+    // This confirmation task is in-memory. A crash after PTY acceptance and
+    // before its durable receipt/hold can still cause a resend after restart;
+    // crash-atomic delivery needs a pre-write intent and harness acknowledgement.
+    // Readiness only observes the session and never writes input, so any error
+    // from wait_for_delivery_ready is known-unsent and safe for bounded retry.
     // PTY input sent during agent startup can be consumed before the TUI has
     // enabled its composer input modes. A newly launched agent reports active,
     // so wait for its first idle observation before sending delivery bytes.

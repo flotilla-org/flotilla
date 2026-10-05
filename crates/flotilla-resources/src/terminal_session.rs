@@ -364,6 +364,17 @@ pub struct TerminalSessionDegradedCondition {
     pub observed_at: DateTime<Utc>,
 }
 
+impl TerminalSessionStatus {
+    /// Count the next failed attempt for this message, retaining a saturated
+    /// ceiling. A different message starts a fresh delivery budget.
+    pub fn next_delivery_failure_count(&self, message_id: &str) -> u32 {
+        self.degraded
+            .as_ref()
+            .filter(|condition| condition.message_id.as_deref() == Some(message_id))
+            .map_or(1, |condition| condition.consecutive_failures.saturating_add(1))
+    }
+}
+
 impl TerminalSessionDegradedCondition {
     /// Delivery evidence is cleared only by an explicit delivery or lifecycle
     /// transition, never by an unrelated observation or provider recovery.
@@ -571,11 +582,7 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
             }
             Self::MarkDeliveryUnconfirmed { message_id, message, observed_at }
             | Self::MarkDeliveryNotSubmitted { message_id, message, observed_at } => {
-                let consecutive_failures = status
-                    .degraded
-                    .as_ref()
-                    .filter(|condition| condition.message_id.as_ref() == Some(message_id))
-                    .map_or(1, |condition| condition.consecutive_failures.saturating_add(1));
+                let consecutive_failures = status.next_delivery_failure_count(message_id);
                 status.message = Some(message.clone());
                 status.degraded = Some(TerminalSessionDegradedCondition {
                     reason: if matches!(self, Self::MarkDeliveryNotSubmitted { .. }) {
@@ -850,6 +857,28 @@ mod tests {
         assert_eq!(condition.reason, "DeliveryUnconfirmed");
         assert_eq!(condition.message, message);
         assert_eq!(condition.message_id.as_deref(), Some("handoff-1"));
+    }
+
+    // Delivery acknowledgement and attempt-ending lifecycle transitions release
+    // a hold. Reviving an existing process alone supplies no delivery evidence.
+    #[test]
+    fn delivery_holds_clear_when_the_attempt_is_retired_or_acknowledged() {
+        let now = Utc::now();
+        for patch in [
+            TerminalSessionStatusPatch::MarkMessageDelivered { message_id: "message".into() },
+            TerminalSessionStatusPatch::MarkStarting,
+            TerminalSessionStatusPatch::MarkStopped { stopped_at: now, inner_command_status: None, inner_exit_code: None, message: None },
+            TerminalSessionStatusPatch::MarkLost { reason: "lost".into(), lost_at: now },
+            TerminalSessionStatusPatch::MarkFailed { message: "failed".into(), stopped_at: Some(now) },
+        ] {
+            let mut status = TerminalSessionStatus::default();
+            TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { message_id: "message".into(), message: "hold".into(), observed_at: now }
+                .apply(&mut status);
+            TerminalSessionStatusPatch::MarkRevived.apply(&mut status);
+            assert!(status.degraded.is_some(), "revival alone must retain delivery evidence");
+            patch.apply(&mut status);
+            assert!(status.degraded.is_none(), "attempt retirement or acknowledgement must release the hold");
+        }
     }
 
     // #2705: hook/screen observations and provider recovery cannot erase a
