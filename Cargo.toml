@@ -77,6 +77,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 flotilla-daemon = { path = "crates/flotilla-daemon" }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tempfile = "3"
 flotilla-core = { path = "crates/flotilla-core", features = ["test-support"] }
 flotilla-test-support = { path = "crates/flotilla-test-support" }

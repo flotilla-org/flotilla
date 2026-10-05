@@ -242,7 +242,7 @@ impl SshTransport {
             .map_err(|_| format!("timed out resolving remote daemon socket path on {destination}"))?
             .map_err(|error| format!("failed to resolve remote daemon socket path on {destination}: {error}"))?;
 
-        if !output.success {
+        if !output.success() {
             return Err(format!(
                 "failed to resolve remote daemon socket path on {destination}: ssh exited unsuccessfully{}",
                 if output.stderr.trim().is_empty() { String::new() } else { format!(": {}", output.stderr.trim()) }
@@ -264,7 +264,7 @@ impl SshTransport {
             .map_err(|_| format!("timed out removing stale reverse peer socket at {path} on {destination}"))?
             .map_err(|e| format!("failed to run remote stale peer socket cleanup at {path} on {destination}: {e}"))?;
 
-        if output.success {
+        if output.success() {
             return Ok(());
         }
 
@@ -437,7 +437,7 @@ impl SshTransport {
         );
         let output = tokio::time::timeout(REMOTE_COMMAND_TIMEOUT, self.run_ssh_output(&destination, command)).await.ok()?.ok()?;
 
-        if output.success && output.stdout.lines().any(|line| line.trim() == REMOTE_DAEMON_NOT_LISTENING) {
+        if output.success() && output.stdout.lines().any(|line| line.trim() == REMOTE_DAEMON_NOT_LISTENING) {
             Some(format!(
                 "remote daemon not listening at derived path {} on {destination} (peer closed before sending hello)",
                 remote_socket.display()
@@ -741,7 +741,7 @@ mod tests {
     }
 
     fn successful_output(stdout: impl Into<String>) -> Result<CommandOutput, String> {
-        Ok(CommandOutput { stdout: stdout.into(), stderr: String::new(), success: true })
+        Ok(CommandOutput { stdout: stdout.into(), stderr: String::new(), exit_code: Some(0) })
     }
 
     #[test]
@@ -1047,7 +1047,7 @@ mod tests {
         let runner = Arc::new(FakeCommandRunner::new(
             vec![
                 successful_output(format!("{REMOTE_SOCKET_PATH_PREFIX}{}\n", daemon_socket.display())),
-                Ok(CommandOutput { stdout: String::new(), stderr: "cleanup-denied".into(), success: false }),
+                Ok(CommandOutput { stdout: String::new(), stderr: "cleanup-denied".into(), exit_code: Some(1) }),
             ],
             events.clone(),
         ));

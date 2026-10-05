@@ -328,8 +328,8 @@ mod tests {
 
         async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
             match self.run(cmd, args, cwd, label).await {
-                Ok(stdout) => Ok(CommandOutput { stdout, stderr: String::new(), success: true }),
-                Err(stderr) => Ok(CommandOutput { stdout: String::new(), stderr, success: false }),
+                Ok(stdout) => Ok(CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) }),
+                Err(stderr) => Ok(CommandOutput { stdout: String::new(), stderr, exit_code: Some(1) }),
             }
         }
 

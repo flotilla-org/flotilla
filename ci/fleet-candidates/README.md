@@ -83,6 +83,12 @@ link can instead be removed if that rollback target is no longer available.
 
 Operators can preview with `fleet-install --prune-dry-run` or apply with
 `fleet-install --prune`. These modes need no package credentials or network.
+The installer delegates to the active generation's `bin/flotilla fleet prune
+--fleet-root <root> --keep-others <K>` (with `--dry-run` for previews). This
+subcommand runs locally without connecting to or starting a daemon. Use the
+installer entry points so mutations hold the install lock; the binary
+subcommand expects its caller to hold that lock. A fleet with no releases
+needs no binary; an installed fleet must have an executable current CLI.
 Mutating pruning shares the install/rollback lock. Dry runs do not take that
 lock or change the fleet tree, so a concurrent install can make the preview
 stale; `--prune` always recomputes its selection under the lock. Removed releases

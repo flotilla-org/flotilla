@@ -354,7 +354,7 @@ mod tests {
         let inner = std::sync::Arc::new(RecordingRunner::with_run_output_result(Ok(CommandOutput {
             stdout: "out".into(),
             stderr: "err".into(),
-            success: false,
+            exit_code: Some(17),
         })));
         let runner = SshCommandRunner::new("alice@feta.local", true, inner.clone());
 
@@ -362,7 +362,8 @@ mod tests {
 
         assert_eq!(output.stdout, "out");
         assert_eq!(output.stderr, "err");
-        assert!(!output.success);
+        assert!(!output.success());
+        assert_eq!(output.exit_code, Some(17));
 
         let calls = inner.calls();
         let args = ssh_call_args(&calls);

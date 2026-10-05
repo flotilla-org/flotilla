@@ -440,7 +440,7 @@ async fn resolve_cleat_ghostty_library(
     let runner = runner.ok_or_else(|| "local command runner unavailable for cleat asset discovery".to_string())?;
     let binary = cleat_binary_path.as_path().to_string_lossy().into_owned();
     let output = runner.run_output("ldd", &[&binary], Path::new("/"), &ChannelLabel::Default).await?;
-    if !output.success {
+    if !output.success() {
         return Err(format!("inspect cleat runtime libraries: {}", output.stderr.trim()));
     }
     let path = output.stdout.lines().find_map(|line| {

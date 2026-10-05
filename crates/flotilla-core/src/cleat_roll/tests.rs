@@ -20,7 +20,7 @@ fn recorded(name: &str) -> CommandOutput {
         _ => panic!("unknown recording"),
     };
     let output: RecordedOutput = serde_json::from_str(json).expect("recorded output");
-    CommandOutput { stdout: output.stdout, stderr: output.stderr, success: output.success }
+    CommandOutput { stdout: output.stdout, stderr: output.stderr, exit_code: Some(if output.success { 0 } else { 1 }) }
 }
 
 fn target(runner: Arc<dyn CommandRunner>, name: &str, contained: bool) -> CleatTarget {
@@ -83,7 +83,7 @@ async fn recorded_drain_outcomes_preserve_reports_and_continue() {
 async fn invalid_and_unavailable_drain_evidence_fails_closed() {
     let runner = Arc::new(MockRunner::with_outputs(vec![
         Err("spawn refused".into()),
-        Ok(CommandOutput { stdout: "invalid JSON".into(), stderr: "warning text".into(), success: true }),
+        Ok(CommandOutput { stdout: "invalid JSON".into(), stderr: "warning text".into(), exit_code: Some(0) }),
     ]));
     let report = drain(
         "host".into(),
@@ -186,9 +186,9 @@ async fn serving_sha_skew_is_visible_per_runtime() {
             Ok(CommandOutput {
                 stdout: serde_json::json!({"daemon":{"git_sha":serving}}).to_string(),
                 stderr: String::new(),
-                success: true,
+                exit_code: Some(0),
             }),
-            Ok(CommandOutput { stdout: "[]".into(), stderr: String::new(), success: true }),
+            Ok(CommandOutput { stdout: "[]".into(), stderr: String::new(), exit_code: Some(0) }),
         ]));
         let messages = build_skew(installed, &[target(runner.clone(), "named", false)], None).await.actionable;
         assert_eq!(!messages.is_empty(), expected);
@@ -268,7 +268,11 @@ fn generations() -> RecordedGenerations {
 }
 
 fn output(record: RecordedOutput) -> CommandOutput {
-    CommandOutput { stdout: record.stdout.replace("{root}", "/state/crew cleat"), stderr: record.stderr, success: record.success }
+    CommandOutput {
+        stdout: record.stdout.replace("{root}", "/state/crew cleat"),
+        stderr: record.stderr,
+        exit_code: Some(if record.success { 0 } else { 1 }),
+    }
 }
 
 // #2671: the real CLI's alias and listing recordings reproduce the r531 shape:
@@ -282,7 +286,7 @@ async fn recorded_generations_report_draining_without_degrading() {
     // only the alias read is supplied separately.
     let runner = Arc::new(MockRunner::with_outputs(vec![
         Ok(output(records.drain)),
-        Ok(CommandOutput { stdout: "default@27\n".into(), stderr: String::new(), success: true }),
+        Ok(CommandOutput { stdout: "default@27\n".into(), stderr: String::new(), exit_code: Some(0) }),
         Ok(output(records.current)),
         Ok(output(records.listing)),
     ]));
@@ -338,7 +342,7 @@ fn recorded_current_observations_degrade_only_actionable_host_skew(tc: hegel::Te
 #[tokio::test]
 async fn absent_host_daemon_drain_does_not_warn() {
     for (listing, absent) in [
-        (Ok(CommandOutput { stdout: "[]".into(), stderr: String::new(), success: true }), true),
+        (Ok(CommandOutput { stdout: "[]".into(), stderr: String::new(), exit_code: Some(0) }), true),
         (
             Ok(CommandOutput {
                 stdout: serde_json::json!([
@@ -348,12 +352,12 @@ async fn absent_host_daemon_drain_does_not_warn() {
                 ])
                 .to_string(),
                 stderr: String::new(),
-                success: true,
+                exit_code: Some(0),
             }),
             true,
         ),
-        (Ok(CommandOutput { stdout: "invalid".into(), stderr: String::new(), success: true }), false),
-        (Ok(CommandOutput { stdout: "{}".into(), stderr: String::new(), success: true }), false),
+        (Ok(CommandOutput { stdout: "invalid".into(), stderr: String::new(), exit_code: Some(0) }), false),
+        (Ok(CommandOutput { stdout: "{}".into(), stderr: String::new(), exit_code: Some(0) }), false),
         (Err("listing unavailable".into()), false),
     ] {
         let runner = Arc::new(MockRunner::with_outputs(vec![Ok(recorded("nonzero")), listing]));
@@ -380,7 +384,7 @@ async fn current_alias_precedes_legacy_sidecar() {
         let result = |value: Option<&str>| {
             value.map_or_else(
                 || Err("not a symlink".into()),
-                |value| Ok(CommandOutput { stdout: format!("{value}\n"), stderr: String::new(), success: true }),
+                |value| Ok(CommandOutput { stdout: format!("{value}\n"), stderr: String::new(), exit_code: Some(0) }),
             )
         };
         let mut outputs = vec![result(main)];
@@ -441,8 +445,8 @@ async fn absent_current_reports_waiting_for_live_generations() {
             {"name":"default@26", "runtime_root":"/another/root", "alive":true}
         ]);
         let runner = Arc::new(MockRunner::with_outputs(vec![
-            Ok(CommandOutput { stdout: String::new(), stderr: stderr.into(), success: false }),
-            Ok(CommandOutput { stdout: listing.to_string(), stderr: String::new(), success: true }),
+            Ok(CommandOutput { stdout: String::new(), stderr: stderr.into(), exit_code: Some(1) }),
+            Ok(CommandOutput { stdout: listing.to_string(), stderr: String::new(), exit_code: Some(0) }),
         ]));
         let report =
             drain("host".into(), "gen".into(), Path::new("/incoming/cleat"), &[target(runner.clone(), "default", false)], vec![]).await;
@@ -467,7 +471,7 @@ async fn inaccessible_current_socket_remains_actionable() {
     let runner = Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput {
         stdout: String::new(),
         stderr: "connect daemon: Permission denied (os error 13)".into(),
-        success: false,
+        exit_code: Some(1),
     })]));
     let report =
         drain("host".into(), "gen".into(), Path::new("/incoming/cleat"), &[target(runner.clone(), "default", false)], vec![]).await;

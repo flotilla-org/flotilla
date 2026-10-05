@@ -23,7 +23,8 @@ fn yaml_round_trip() {
                 cwd: "{repo}".into(),
                 stdout: Some("clean\n".into()),
                 stderr: None,
-                exit_code: 0,
+                exit_code: Some(0),
+                error: None,
             },
             Interaction::GhApi {
                 label: None,
@@ -86,7 +87,8 @@ fn replay_session_serves_in_order() {
             cwd: "{repo}".into(),
             stdout: Some("ok\n".into()),
             stderr: None,
-            exit_code: 0,
+            exit_code: Some(0),
+            error: None,
         }],
     };
 
@@ -382,7 +384,8 @@ fn channel_label_from_interaction() {
         cwd: "/repo".into(),
         stdout: Some("ok\n".into()),
         stderr: None,
-        exit_code: 0,
+        exit_code: Some(0),
+        error: None,
     };
     // DefaultLabeler uses subcommand: "git status"
     assert_eq!(cmd.channel_label(), ChannelLabel::Command("git status".into()));
@@ -394,7 +397,8 @@ fn channel_label_from_interaction() {
         cwd: "/repo".into(),
         stdout: Some("ok\n".into()),
         stderr: None,
-        exit_code: 0,
+        exit_code: Some(0),
+        error: None,
     };
     assert_eq!(cmd_no_args.channel_label(), ChannelLabel::Command("git".into()));
 
@@ -501,7 +505,8 @@ fn round_is_empty() {
         cwd: "/repo".into(),
         stdout: None,
         stderr: None,
-        exit_code: 0,
+        exit_code: Some(0),
+        error: None,
     }]);
     assert!(!round.is_empty());
 }
@@ -649,7 +654,8 @@ fn recorder_saves_single_round() {
         cwd: "/repo".into(),
         stdout: Some("ok\n".into()),
         stderr: None,
-        exit_code: 0,
+        exit_code: Some(0),
+        error: None,
     });
     recorder.save();
 
@@ -672,7 +678,8 @@ fn recorder_saves_multi_round_with_barriers() {
         cwd: "/repo".into(),
         stdout: Some("ok\n".into()),
         stderr: None,
-        exit_code: 0,
+        exit_code: Some(0),
+        error: None,
     });
     recorder.barrier();
     recorder.record(Interaction::GhApi {
@@ -708,7 +715,8 @@ fn recorder_applies_masks() {
         cwd: "/Users/bob/dev/repo".into(),
         stdout: Some("ok\n".into()),
         stderr: None,
-        exit_code: 0,
+        exit_code: Some(0),
+        error: None,
     });
     recorder.save();
 
@@ -991,7 +999,7 @@ impl CommandRunner for RestFailureRunner {
         if self.transport_failure {
             return Err(self.stderr.clone());
         }
-        Ok(CommandOutput { stdout: self.stdout.clone(), stderr: self.stderr.clone(), success: false })
+        Ok(CommandOutput { stdout: self.stdout.clone(), stderr: self.stderr.clone(), exit_code: Some(1) })
     }
     async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
         true
@@ -1141,4 +1149,80 @@ async fn classified_issue_budget_recording_has_no_failure_response() {
         assert_eq!(failure.error, first.error);
     }
     replay.finish();
+}
+
+// Full-output recording/replay preserves every numeric code and termination
+// without a code. Generate arbitrary codes, retaining 0/1/2/17 as fixed edges.
+#[hegel::test]
+fn command_exit_status_survives_record_replay(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+
+    use crate::providers::testing::MockRunner;
+
+    let label = crate::providers::command_channel_label("pgrep", &["-x", "flotillad"]);
+    let generated = tc.draw(gs::integers::<i32>());
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let temp = tempfile::tempdir().expect("recording directory");
+        for exit_code in [Some(0), Some(1), Some(2), Some(17), Some(generated), None] {
+            let path = temp.path().join("command.yaml");
+            let session = Session::recording(&path, Masks::new());
+            let inner = Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput {
+                stdout: "output\n".into(),
+                stderr: "diagnostic\n".into(),
+                exit_code,
+            })]));
+            let recording = RecordingRunner::new(session.clone(), inner);
+            let live = recording.run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await.expect("live");
+            session.finish();
+            let session = Session::replaying(&path, Masks::new());
+            let replay = ReplayRunner::new(session.clone());
+            let output = replay.run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await.expect("replay");
+            assert_eq!(output.exit_code, exit_code);
+            assert_eq!(output.success(), exit_code == Some(0));
+            assert_eq!((output.stdout, output.stderr), (live.stdout, live.stderr));
+            session.finish();
+            // The string convenience API selects stderr for every failure,
+            // including explicit null/no-code termination, and stdout for zero.
+            let session = Session::replaying(&path, Masks::new());
+            let output = ReplayRunner::new(session.clone()).run("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await;
+            let expected = if exit_code == Some(0) { Ok("output\n".to_string()) } else { Err("diagnostic\n".to_string()) };
+            assert_eq!(output, expected);
+            session.finish();
+        }
+    });
+}
+
+// Existing integer and omitted status fields remain decodable; an explicit
+// null newly represents termination without a numeric exit code.
+#[test]
+fn legacy_command_exit_status_is_readable() {
+    for (field, expected) in [("", Some(0)), ("exit_code: 42\n", Some(42)), ("exit_code: null\n", None)] {
+        let yaml = format!("channel: command\ncmd: pgrep\nargs: []\ncwd: /\n{field}");
+        let interaction: Interaction = serde_yml::from_str(&yaml).expect("decode command");
+        let Interaction::Command { exit_code, .. } = interaction else { panic!("command") };
+        assert_eq!(exit_code, expected);
+    }
+}
+
+// Raw-output execution failures survive recording as errors, rather than an
+// exit code 1 that pgrep callers must interpret as a successful empty match.
+#[tokio::test]
+async fn command_execution_error_survives_record_replay() {
+    use crate::providers::testing::MockRunner;
+    let temp = tempfile::tempdir().expect("recording directory");
+    let path = temp.path().join("failure.yaml");
+    let label = crate::providers::command_channel_label("pgrep", &["-x", "flotillad"]);
+    let mut masks = Masks::new();
+    masks.add("/private/runtime", "{runtime}");
+    let session = Session::recording(&path, masks.clone());
+    let inner = Arc::new(MockRunner::with_outputs(vec![Err("cannot execute in /private/runtime".into())]));
+    let expected =
+        RecordingRunner::new(session.clone(), inner).run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await.err();
+    session.finish();
+    assert!(!std::fs::read_to_string(&path).expect("recording").contains("/private/runtime"));
+    let session = Session::replaying(&path, masks);
+    let actual = ReplayRunner::new(session.clone()).run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await.err();
+    assert_eq!(actual, expected);
+    assert_eq!(actual.as_deref(), Some("cannot execute in /private/runtime"));
+    session.finish();
 }

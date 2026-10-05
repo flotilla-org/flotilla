@@ -150,7 +150,14 @@ pub(crate) fn http_channel_label_with<const ENABLED: bool, L: ChannelLabeler + ?
 pub struct CommandOutput {
     pub stdout: String,
     pub stderr: String,
-    pub success: bool,
+    /// Numeric exit status, or None when the process terminated without a code.
+    pub exit_code: Option<i32>,
+}
+
+impl CommandOutput {
+    pub fn success(&self) -> bool {
+        self.exit_code == Some(0)
+    }
 }
 
 /// Handle to a supervised long-lived command spawned by a [`CommandRunner`].
@@ -311,7 +318,7 @@ pub trait CommandRunner: Send + Sync {
     async fn path_exists(&self, path: &Path) -> Result<bool, String> {
         let path = path.to_string_lossy();
         let args = ["-e", &*path];
-        self.run_output("test", &args, Path::new("/"), &command_channel_label("test", &args)).await.map(|output| output.success)
+        self.run_output("test", &args, Path::new("/"), &command_channel_label("test", &args)).await.map(|output| output.success())
     }
 
     /// Choose a Flotilla-owned writable scratch base in this runner's
@@ -332,7 +339,7 @@ pub trait CommandRunner: Send + Sync {
                     &ChannelLabel::Default,
                 )
                 .await;
-            if output.is_ok_and(|output| output.success) {
+            if output.is_ok_and(|output| output.success()) {
                 return Ok(preferred.join("flotilla"));
             }
             tracing::debug!(rejected_path = %preferred.display(), "preferred scratch directory is missing or unwritable; using fallback");
@@ -476,7 +483,7 @@ impl CommandRunner for ProcessCommandRunner {
         Ok(CommandOutput {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            success: output.status.success(),
+            exit_code: output.status.code(),
         })
     }
 
@@ -935,8 +942,8 @@ pub(crate) mod testing {
                     .into_iter()
                     .map(|response| {
                         Ok(match response {
-                            Ok(stdout) => CommandOutput { stdout, stderr: String::new(), success: true },
-                            Err(stderr) => CommandOutput { stdout: String::new(), stderr, success: false },
+                            Ok(stdout) => CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) },
+                            Err(stderr) => CommandOutput { stdout: String::new(), stderr, exit_code: Some(1) },
                         })
                     })
                     .collect(),
@@ -964,7 +971,7 @@ pub(crate) mod testing {
     impl CommandRunner for MockRunner {
         async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
             let output = self.run_output(cmd, args, cwd, label).await?;
-            if output.success {
+            if output.success() {
                 Ok(output.stdout)
             } else {
                 Err(output.stderr)
@@ -1011,21 +1018,21 @@ pub(crate) mod testing {
     #[tokio::test]
     async fn mock_runner_preserves_outputs_and_order() {
         let runner = MockRunner::with_outputs(vec![
-            Ok(CommandOutput { stdout: "headers/body".into(), stderr: "exit failure".into(), success: false }),
+            Ok(CommandOutput { stdout: "headers/body".into(), stderr: "exit failure".into(), exit_code: Some(1) }),
             Err("spawn failure".into()),
-            Ok(CommandOutput { stdout: "success".into(), stderr: "warning".into(), success: true }),
-            Ok(CommandOutput { stdout: "success".into(), stderr: "warning".into(), success: true }),
-            Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: false }),
+            Ok(CommandOutput { stdout: "success".into(), stderr: "warning".into(), exit_code: Some(0) }),
+            Ok(CommandOutput { stdout: "success".into(), stderr: "warning".into(), exit_code: Some(0) }),
+            Ok(CommandOutput { stdout: String::new(), stderr: String::new(), exit_code: Some(1) }),
         ]);
         let label = ChannelLabel::Default;
         // Exit failure still exposes both streams through the raw-output API.
         let output = runner.run_output("gh", &["api"], Path::new("/"), &label).await.expect("output");
-        assert_eq!((output.stdout.as_str(), output.stderr.as_str(), output.success), ("headers/body", "exit failure", false));
+        assert_eq!((output.stdout.as_str(), output.stderr.as_str(), output.success()), ("headers/body", "exit failure", false));
         // A spawn failure has no command output.
         assert_eq!(runner.run_output("missing", &[], Path::new("/"), &label).await.err().as_deref(), Some("spawn failure"));
         // Successful raw output also preserves stderr.
         let output = runner.run_output("raw-ok", &[], Path::new("/"), &label).await.expect("successful output");
-        assert_eq!((output.stdout.as_str(), output.stderr.as_str(), output.success), ("success", "warning", true));
+        assert_eq!((output.stdout.as_str(), output.stderr.as_str(), output.success()), ("success", "warning", true));
         // The convenience API selects stdout on success, stderr on failure.
         assert_eq!(runner.run("ok", &[], Path::new("/"), &label).await, Ok("success".into()));
         assert_eq!(runner.run("empty", &[], Path::new("/"), &label).await, Err(String::new()));
@@ -1040,7 +1047,7 @@ pub(crate) mod testing {
         let legacy = MockRunner::new(vec![Ok("legacy success".into()), Err("legacy failure".into())]);
         assert_eq!(legacy.run("ok", &[], Path::new("/"), &label).await, Ok("legacy success".into()));
         let output = legacy.run_output("fail", &[], Path::new("/"), &label).await.expect("legacy output");
-        assert_eq!((output.stdout.as_str(), output.stderr.as_str(), output.success), ("", "legacy failure", false));
+        assert_eq!((output.stdout.as_str(), output.stderr.as_str(), output.success()), ("", "legacy failure", false));
     }
 
     // Exhausting the subprocess queue remains a hard failure, even for raw output calls.

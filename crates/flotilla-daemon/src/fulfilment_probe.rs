@@ -159,7 +159,7 @@ pub(crate) async fn probe_kind(
     if env.get("HOME").is_some_and(|home| scratch == Path::new(&home)) {
         return Err("probe scratch directory must not be HOME".to_string());
     }
-    if !runner.run_output("mkdir", &["-p", &scratch_name], parent, &ChannelLabel::Default).await.is_ok_and(|output| output.success) {
+    if !runner.run_output("mkdir", &["-p", &scratch_name], parent, &ChannelLabel::Default).await.is_ok_and(|output| output.success()) {
         return Err(format!("cannot create probe scratch directory {} from parent {}", scratch.display(), parent.display()));
     }
     let mut image_digest = None;
@@ -172,7 +172,7 @@ pub(crate) async fn probe_kind(
         .await
         .ok()
         .and_then(Result::ok);
-        facts.image_present = inspected.as_ref().map(|output| output.success);
+        facts.image_present = inspected.as_ref().map(|output| output.success());
         image_digest = inspected.as_ref().and_then(|output| {
             serde_json::from_str::<serde_json::Value>(&output.stdout).ok()?.get(0)?.get("Id")?.as_str().map(ToString::to_string)
         });
@@ -187,11 +187,11 @@ pub(crate) async fn probe_kind(
             // launchd GUI domain is the host-native signal for that session.
             if let Ok(output) = run_in_realisation(runner, &spec.realisation, image, "id", &["-u"], scratch).await {
                 let uid = output.stdout.trim();
-                if output.success && uid.parse::<u32>().is_ok() {
+                if output.success() && uid.parse::<u32>().is_ok() {
                     facts.gui_session_logged_in =
                         run_in_realisation(runner, &spec.realisation, image, "launchctl", &["print", &format!("gui/{uid}")], scratch)
                             .await
-                            .is_ok_and(|session| session.success);
+                            .is_ok_and(|session| session.success());
                 }
             }
         }
@@ -201,7 +201,7 @@ pub(crate) async fn probe_kind(
     facts.free_vessel_slots = (!pool_available).then_some(0);
     for tool in TOOLCHAINS {
         if let Ok(output) = run_in_realisation(runner, &spec.realisation, image, tool, &["--version"], scratch).await {
-            if output.success {
+            if output.success() {
                 let version = output.stdout.lines().next().or_else(|| output.stderr.lines().next()).unwrap_or_default().trim();
                 if !version.is_empty() {
                     facts.toolchains.insert((*tool).to_string(), version.to_string());
@@ -211,7 +211,7 @@ pub(crate) async fn probe_kind(
     }
     for (harness, binary) in HARNESSES {
         let Ok(output) = run_in_realisation(runner, &spec.realisation, image, binary, &["--version"], scratch).await else { continue };
-        if !output.success {
+        if !output.success() {
             continue;
         }
         // `claude --version` prints "2.1.283 (Claude Code)" and `codex --version`
@@ -253,13 +253,13 @@ pub(crate) async fn probe_kind(
                 .await
                 {
                     let diagnostic = format!("{} {}", result.stdout, result.stderr).to_ascii_lowercase();
-                    let rejected_model = !result.success
+                    let rejected_model = !result.success()
                         && diagnostic.contains("model")
                         && ["unsupported", "unknown", "invalid", "unavailable", "not found", "denied"]
                             .iter()
                             .any(|reason| diagnostic.contains(reason));
-                    let fact =
-                        (result.success || rejected_model).then_some(ModelFact { usable: result.success, source: ModelFactSource::Probe });
+                    let fact = (result.success() || rejected_model)
+                        .then_some(ModelFact { usable: result.success(), source: ModelFactSource::Probe });
                     model_probes.entries.insert(key, CachedModelProbe { observed_at: Utc::now(), fact: fact.clone() });
                     if let Some(fact) = fact {
                         observed.models.insert(model, fact);
@@ -457,7 +457,7 @@ mod tests {
                 }
                 _ => return Err("unavailable".into()),
             };
-            Ok(flotilla_core::providers::CommandOutput { stdout, stderr: String::new(), success: true })
+            Ok(flotilla_core::providers::CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) })
         }
 
         async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {

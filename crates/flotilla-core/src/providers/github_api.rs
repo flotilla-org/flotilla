@@ -441,7 +441,7 @@ impl GhApiClient {
             return Err("304 but no cached response".into());
         }
 
-        if !output.success {
+        if !output.success() {
             let legacy_error = rate_limit_error_from_response(&output.stdout, "REST core").unwrap_or_else(|| output.stderr.clone());
             let error = if matches!(error_mode, RestErrorMode::Classified) {
                 github_rate_limit(&output.stdout, Utc::now())

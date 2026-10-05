@@ -225,7 +225,11 @@ impl CommandRunner for ConditionalIssueRunner {
         cwd: &Path,
         label: &ChannelLabel,
     ) -> Result<crate::providers::CommandOutput, String> {
-        self.run(cmd, args, cwd, label).await.map(|stdout| crate::providers::CommandOutput { stdout, stderr: String::new(), success: true })
+        self.run(cmd, args, cwd, label).await.map(|stdout| crate::providers::CommandOutput {
+            stdout,
+            stderr: String::new(),
+            exit_code: Some(0),
+        })
     }
 }
 

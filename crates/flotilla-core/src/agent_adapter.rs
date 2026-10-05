@@ -914,7 +914,7 @@ async fn seed_codex_workspace_trust(
         .run_output("pwd", &["-P"], cwd, &ChannelLabel::Default)
         .await
         .map_err(|error| format!("resolve canonical Codex workspace {}: {error}", cwd.display()))?;
-    if !output.success {
+    if !output.success() {
         return Err(format!("resolve canonical Codex workspace {}: {}", cwd.display(), output.stderr.trim()));
     }
     let canonical_cwd = output.stdout.trim();
@@ -963,7 +963,7 @@ async fn seed_claude_headless_state(runner: &dyn CommandRunner, cwd: &Path, conf
         .run_output("pwd", &["-P"], cwd, &ChannelLabel::Default)
         .await
         .map_err(|error| format!("resolve canonical Claude workspace {}: {error}", cwd.display()))?;
-    if !output.success {
+    if !output.success() {
         return Err(format!("resolve canonical Claude workspace {}: {}", cwd.display(), output.stderr.trim()));
     }
     let canonical_cwd = output.stdout.trim();

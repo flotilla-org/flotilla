@@ -30,7 +30,7 @@ impl ParsedObservationResponse {
             .response(response)
             .document(document)
             .maybe_limit(limit)
-            .success(output.success)
+            .success(output.success())
             .stderr(output.stderr)
             .headers(headers)
             .build()
@@ -154,7 +154,7 @@ mod tests {
         elapsed: std::time::Duration,
     ) {
         let parsed = raw.map(|stdout| {
-            ParsedObservationResponse::from_output(CommandOutput { stdout: stdout.into(), stderr: String::new(), success: true })
+            ParsedObservationResponse::from_output(CommandOutput { stdout: stdout.into(), stderr: String::new(), exit_code: Some(0) })
         });
         telemetry.record(shape, subjects, parsed.as_ref(), elapsed);
     }
@@ -208,7 +208,7 @@ mod tests {
             let failed = ParsedObservationResponse::from_output(CommandOutput {
                 stdout: "HTTP/2 200 OK\r\nX-RateLimit-Used: 99\r\n\r\n{\"data\":{\"rateLimit\":{\"cost\":1}}}".into(),
                 stderr: "private-stderr".into(),
-                success: false,
+                exit_code: Some(1),
             });
             telemetry.record(QueryShape::BoundBatch, 0, Some(&failed), std::time::Duration::ZERO);
         });

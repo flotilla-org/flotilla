@@ -421,7 +421,7 @@ impl RepositoryInspector for GitRepositoryInspector {
             .operational_entry_paths(checkout, &commit)
             .await
             .map_err(|error| format!("git grep operational entries in {}: {error}", checkout.display()))?;
-        let paths = if grep.success || grep.stderr.trim().is_empty() {
+        let paths = if grep.success() || grep.stderr.trim().is_empty() {
             grep.stdout
         } else {
             return Err(format!("git grep operational entries in {}: {}", checkout.display(), grep.stderr.trim()));

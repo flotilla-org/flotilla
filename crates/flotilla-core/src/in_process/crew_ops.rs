@@ -1447,7 +1447,7 @@ impl CrewService {
             };
             let output = vcs.push_current_branch("origin").await;
             let outcome = match output {
-                Ok(output) if output.success => {
+                Ok(output) if output.success() => {
                     CheckoutArchiveOutcome::builder().checkout(checkout.metadata.name).status(CheckoutArchiveStatus::Archived).build()
                 }
                 Ok(output) => {

@@ -154,7 +154,10 @@ pub async fn drain(host: String, generation: String, incoming: &Path, targets: &
             None => Err("installed cleat path is not UTF-8".into()),
         };
         let (stdout, stderr, success, mut error) = match output {
-            Ok(output) => (output.stdout, output.stderr, output.success, None),
+            Ok(output) => {
+                let success = output.success();
+                (output.stdout, output.stderr, success, None)
+            }
             Err(error) => (String::new(), String::new(), false, Some(error)),
         };
         // Execution failures take precedence over parsing and report warnings.
@@ -351,7 +354,7 @@ pub fn assess_drain(report: &RollReport) -> BuildAssessment {
 }
 
 fn parsed(output: Result<CommandOutput, String>) -> Option<Value> {
-    output.ok().filter(|output| output.success).and_then(|output| serde_json::from_str(&output.stdout).ok())
+    output.ok().filter(|output| output.success()).and_then(|output| serde_json::from_str(&output.stdout).ok())
 }
 
 /// Observe the alias explicitly. This also avoids any older CLI's ambient

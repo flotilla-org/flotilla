@@ -249,8 +249,8 @@ impl CommandRunner for HangingSshRunner {
         label: &ChannelLabel,
     ) -> Result<flotilla_core::providers::CommandOutput, String> {
         match self.run(cmd, args, cwd, label).await {
-            Ok(stdout) => Ok(flotilla_core::providers::CommandOutput { stdout, stderr: String::new(), success: true }),
-            Err(stderr) => Ok(flotilla_core::providers::CommandOutput { stdout: String::new(), stderr, success: false }),
+            Ok(stdout) => Ok(flotilla_core::providers::CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) }),
+            Err(stderr) => Ok(flotilla_core::providers::CommandOutput { stdout: String::new(), stderr, exit_code: Some(1) }),
         }
     }
 
@@ -8870,8 +8870,8 @@ impl CommandRunner for StartupForgeRunner {
         label: &ChannelLabel,
     ) -> Result<flotilla_core::providers::CommandOutput, String> {
         match self.run(cmd, args, cwd, label).await {
-            Ok(stdout) => Ok(flotilla_core::providers::CommandOutput { stdout, stderr: String::new(), success: true }),
-            Err(stderr) => Ok(flotilla_core::providers::CommandOutput { stdout: String::new(), stderr, success: false }),
+            Ok(stdout) => Ok(flotilla_core::providers::CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) }),
+            Err(stderr) => Ok(flotilla_core::providers::CommandOutput { stdout: String::new(), stderr, exit_code: Some(1) }),
         }
     }
     async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {

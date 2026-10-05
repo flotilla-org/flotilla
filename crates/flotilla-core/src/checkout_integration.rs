@@ -266,7 +266,7 @@ async fn inspect_landed(
     };
     let args = vec!["pr", "view", id, "--json", "number,state,mergedAt,baseRefName,mergeable,headRefOid"];
     match providers.runner.run_output("gh", &args, checkout_path, &ChannelLabel::Default).await {
-        Ok(output) if output.success => match serde_json::from_str::<serde_json::Value>(&output.stdout) {
+        Ok(output) if output.success() => match serde_json::from_str::<serde_json::Value>(&output.stdout) {
             Ok(value) => {
                 let item = match value {
                     serde_json::Value::Array(items) => items.into_iter().next(),
@@ -608,7 +608,7 @@ mod tests {
             self.run(cmd, args, cwd, label).await.map(|stdout| crate::providers::CommandOutput {
                 stdout,
                 stderr: String::new(),
-                success: true,
+                exit_code: Some(0),
             })
         }
     }

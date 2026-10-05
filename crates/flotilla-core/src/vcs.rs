@@ -289,7 +289,7 @@ mod git_config_guard_tests {
             .run_output("git", &["-C", child, "--git-dir=.git", "status"], Path::new("/"), &ChannelLabel::Default)
             .await
             .expect("missing explicit gitdir must be reported by Git, not the config guard");
-        assert!(!output.success);
+        assert!(!output.success());
         assert!(output.stderr.contains("not a git repository"), "{}", output.stderr);
         assert!(!marker.exists(), "ancestor fsmonitor must never run");
     }
@@ -798,7 +798,7 @@ impl FlotillaVcs {
             Ok(current) => current,
         };
         let status = backend.working_tree_status(false).await?;
-        if !status.success || !status.stdout.trim().is_empty() || !backend.embedded_repositories().await?.is_empty() {
+        if !status.success() || !status.stdout.trim().is_empty() || !backend.embedded_repositories().await?.is_empty() {
             return Ok(preserve(CheckoutPreservationReason::DirtyCheckout));
         }
         if current.trim() != branch {
@@ -1052,7 +1052,7 @@ impl Vcs for FlotillaVcs {
 
     async fn is_clean(&self) -> VcsCheck {
         match self.cli().working_tree_status(false).await {
-            Ok(output) if output.success => {
+            Ok(output) if output.success() => {
                 let mut details = output
                     .stdout
                     .lines()
@@ -1083,14 +1083,14 @@ impl Vcs for FlotillaVcs {
     async fn unpushed_commits(&self, merged_head: Option<&str>) -> VcsCheck {
         if let Some(head_sha) = merged_head {
             let ancestor = self.cli().head_is_ancestor_of(head_sha).await;
-            if ancestor.is_ok_and(|output| output.success) {
+            if ancestor.is_ok_and(|output| output.success()) {
                 return VcsCheck::True(vec![format!("HEAD is preserved by merged change request head {head_sha}")]);
             }
         }
 
         let upstream = self.cli().head_upstream().await;
         let upstream = match upstream {
-            Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+            Ok(output) if output.success() && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
             _ => return self.unpushed_without_upstream().await,
         };
         self.parse_unpushed_count(self.cli().unpushed_count(Some(&upstream)).await)
@@ -1098,7 +1098,7 @@ impl Vcs for FlotillaVcs {
 
     async fn head_in_history_of(&self, revision: &str) -> Result<bool, String> {
         let result = self.cli().head_is_ancestor_of(revision).await?;
-        if result.success {
+        if result.success() {
             Ok(true)
         } else if result.stderr.trim().is_empty() {
             // `git merge-base --is-ancestor` exits 1 without diagnostics when
@@ -1188,7 +1188,7 @@ impl Vcs for FlotillaVcs {
 
     async fn remote_ref_digest(&self, remote: &str, reference: &str) -> Result<Option<String>, String> {
         let output = self.cli().remote_ref(remote, reference).await?;
-        if !output.success {
+        if !output.success() {
             return Err(non_empty_output_or("remote ref inspection failed", &output.stderr));
         }
         Ok(output.stdout.lines().find_map(|line| {
@@ -1207,14 +1207,14 @@ impl Vcs for FlotillaVcs {
             Some(base_ref) => format!("origin/{base_ref}"),
             None => {
                 let output = self.cli().default_remote_branch("origin").await?;
-                if !output.success || output.stdout.trim().is_empty() {
+                if !output.success() || output.stdout.trim().is_empty() {
                     return Err(non_empty_output_or("the base ref could not be determined", &output.stderr));
                 }
                 output.stdout.trim().to_string()
             }
         };
         let mut output = self.cli().commit_count(&format!("{base_ref}..HEAD")).await?;
-        let fallback = match (output.success, local_base_ref) {
+        let fallback = match (output.success(), local_base_ref) {
             (false, Some(local_base_ref)) => self.cli().remote_url("origin").await.is_err().then_some(local_base_ref),
             _ => None,
         };
@@ -1224,7 +1224,7 @@ impl Vcs for FlotillaVcs {
             base_ref = local_base_ref.to_string();
             output = self.cli().commit_count(&format!("{base_ref}..HEAD")).await?;
         }
-        if !output.success {
+        if !output.success() {
             return Err(non_empty_output_or(&format!("could not compare branch with base ref {base_ref}"), &output.stderr));
         }
         let count = output
@@ -1237,12 +1237,12 @@ impl Vcs for FlotillaVcs {
 
     async fn exclude_file_path(&self) -> Result<Option<PathBuf>, String> {
         let output = self.cli().git_path("info/exclude").await?;
-        Ok((output.success && !output.stdout.trim().is_empty()).then(|| PathBuf::from(output.stdout.trim())))
+        Ok((output.success() && !output.stdout.trim().is_empty()).then(|| PathBuf::from(output.stdout.trim())))
     }
 
     async fn inside_work_tree(&self) -> Result<bool, String> {
         let output = self.cli().output(&["rev-parse", "--is-inside-work-tree"]).await?;
-        if output.success {
+        if output.success() {
             // `false` means inside a bare repository or a `.git` directory: not a
             // plain directory, so it is refused rather than treated as one.
             return match output.stdout.trim() {
@@ -1259,22 +1259,22 @@ impl Vcs for FlotillaVcs {
     async fn path_is_ignored(&self, path: &Path) -> Result<bool, String> {
         let path = path.to_str().ok_or("ignore path is not UTF-8")?;
         let output = self.cli().output(&["check-ignore", "--quiet", "--", path]).await?;
-        if !output.success && !output.stderr.trim().is_empty() {
+        if !output.success() && !output.stderr.trim().is_empty() {
             return Err(format!("checkout ignore inspection failed: {}", output.stderr.trim()));
         }
-        Ok(output.success)
+        Ok(output.success())
     }
 
     async fn clean_revision(&self) -> Result<String, String> {
         let status = self.cli().working_tree_status(true).await?;
-        if !status.success {
+        if !status.success() {
             return Err(format!("checkout status failed: {}", status.stderr.trim()));
         }
         if !status.stdout.is_empty() {
             return Err(format!("manifest directory {} has changes not represented by a revision", self.checkout.as_path().display()));
         }
         let head = self.cli().head_commit().await?;
-        if !head.success {
+        if !head.success() {
             return Err(format!("resolve manifest revision: {}", head.stderr.trim()));
         }
         Ok(head.stdout.trim().to_string())
@@ -1389,7 +1389,7 @@ impl<'a> GitCliBackend<'a> {
         if !target_exists {
             return Ok(());
         }
-        let result = self.worktree_remove(target).await.and_then(|output| if output.success { Ok(()) } else { Err(output.stderr) });
+        let result = self.worktree_remove(target).await.and_then(|output| if output.success() { Ok(()) } else { Err(output.stderr) });
         if let Err(error) = result {
             if let Err(restore) = self.worktree_registration(target, CheckoutRegistration::Protect { reason: &reason }).await {
                 return Err(format!("{error}; registration protection restoration failed: {restore}"));
@@ -1488,12 +1488,12 @@ impl VcsBackend for GitCliBackend<'_> {
         let branch_ref = format!("refs/heads/{branch}");
         let bootstrap_ref = bootstrap_branch_ref(branch);
         let head = self.read_ref(&branch_ref).await?;
-        if !head.success {
+        if !head.success() {
             self.delete_ref(&bootstrap_ref).await?;
             return Ok(CheckoutOwnership::Missing);
         }
         let bootstrap = self.read_ref(&bootstrap_ref).await?;
-        if !bootstrap.success {
+        if !bootstrap.success() {
             return Ok(CheckoutOwnership::PreExisting);
         }
         if head.stdout.trim() != bootstrap.stdout.trim() {
@@ -1772,8 +1772,8 @@ impl VcsBackend for GitCliBackend<'_> {
 impl FlotillaVcs {
     async fn unpushed_without_upstream(&self) -> VcsCheck {
         match self.cli().remote_branches_containing_head().await {
-            Ok(output) if output.success && !output.stdout.trim().is_empty() => VcsCheck::True(Vec::new()),
-            Ok(output) if output.success => self.parse_unpushed_count(self.cli().unpushed_count(None).await),
+            Ok(output) if output.success() && !output.stdout.trim().is_empty() => VcsCheck::True(Vec::new()),
+            Ok(output) if output.success() => self.parse_unpushed_count(self.cli().unpushed_count(None).await),
             Ok(output) => {
                 VcsCheck::Unknown(vec![non_empty_output_or("could not inspect remote branches for pushed check", &output.stderr)])
             }
@@ -1783,7 +1783,7 @@ impl FlotillaVcs {
 
     fn parse_unpushed_count(&self, result: Result<CommandOutput, String>) -> VcsCheck {
         match result {
-            Ok(output) if output.success => match output.stdout.trim().parse::<usize>() {
+            Ok(output) if output.success() => match output.stdout.trim().parse::<usize>() {
                 Ok(0) => VcsCheck::True(Vec::new()),
                 Ok(count) => VcsCheck::False(vec![format!("{count} unpushed commit{}", if count == 1 { "" } else { "s" })]),
                 Err(_) => VcsCheck::Unknown(vec![format!("could not parse unpushed commit count: {}", output.stdout.trim())]),
@@ -1822,7 +1822,7 @@ async fn inspect_embedded_repositories(runner: &dyn CommandRunner, checkout_path
         .run_output("find", &find_args, checkout_path, &command_channel_label("find", &find_args))
         .await
         .map_err(|error| format!("embedded repository scan could not run: {error}"))?;
-    if !output.success {
+    if !output.success() {
         return Err(non_empty_output_or("embedded repository scan failed", &output.stderr));
     }
 
@@ -1842,7 +1842,7 @@ async fn inspect_embedded_repositories(runner: &dyn CommandRunner, checkout_path
         let path_arg = path.to_string_lossy();
         let ignored = embedded_git_output(runner, checkout_path, &["check-ignore", "--quiet", "--", &path_arg])
             .await
-            .is_ok_and(|output| output.success);
+            .is_ok_and(|output| output.success());
         let repository = inspect_embedded_repository(runner, checkout_path, path).await;
         if !ignored || repository.local_commits != Some(0) {
             repositories.push(repository);
@@ -1854,9 +1854,9 @@ async fn inspect_embedded_repositories(runner: &dyn CommandRunner, checkout_path
 async fn inspect_embedded_repository(runner: &dyn CommandRunner, checkout_path: &Path, path: PathBuf) -> EmbeddedRepository {
     let path_arg = path.to_string_lossy();
     let branch = match embedded_git_output(runner, checkout_path, &["-C", &path_arg, "symbolic-ref", "--short", "-q", "HEAD"]).await {
-        Ok(output) if output.success && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+        Ok(output) if output.success() && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
         _ => match embedded_git_output(runner, checkout_path, &["-C", &path_arg, "rev-parse", "--short", "HEAD"]).await {
-            Ok(output) if output.success && !output.stdout.trim().is_empty() => format!("detached at {}", output.stdout.trim()),
+            Ok(output) if output.success() && !output.stdout.trim().is_empty() => format!("detached at {}", output.stdout.trim()),
             _ => "unknown".to_string(),
         },
     };
@@ -1864,12 +1864,12 @@ async fn inspect_embedded_repository(runner: &dyn CommandRunner, checkout_path: 
         embedded_git_output(runner, checkout_path, &["-C", &path_arg, "rev-list", "--count", "HEAD", "--all", "--not", "--remotes"])
             .await
             .ok()
-            .filter(|output| output.success)
+            .filter(|output| output.success())
             .and_then(|output| output.stdout.trim().parse().ok());
     let uncommitted_entries = embedded_git_output(runner, checkout_path, &["-C", &path_arg, "status", "--porcelain"])
         .await
         .ok()
-        .filter(|output| output.success)
+        .filter(|output| output.success())
         .map(|output| output.stdout.lines().count());
     EmbeddedRepository::builder()
         .path(path)
@@ -1902,7 +1902,7 @@ async fn remove_worktree_path(runner: &dyn CommandRunner, target: &str) -> Resul
     for predicate in ["-e", "-L"] {
         let args = [predicate, target];
         let remaining = runner.run_output("test", &args, Path::new("/"), &command_channel_label("test", &args)).await?;
-        if remaining.success {
+        if remaining.success() {
             return Err(format!("checkout cleanup reported success but path remains: {target}"));
         }
     }
@@ -1920,11 +1920,11 @@ async fn remove_empty_worktree_parents(runner: &dyn CommandRunner, clone_path: &
         let path = parent.to_string_lossy();
         let rmdir_args = [&*path];
         match runner.run_output("rmdir", &rmdir_args, Path::new("/"), &command_channel_label("rmdir", &rmdir_args)).await {
-            Ok(output) if output.success => {}
+            Ok(output) if output.success() => {}
             Ok(_) => {
                 let test_args = ["-e", &*path];
                 let exists = runner.run_output("test", &test_args, Path::new("/"), &command_channel_label("test", &test_args)).await?;
-                if exists.success {
+                if exists.success() {
                     break;
                 }
             }
@@ -2085,10 +2085,10 @@ mod tests {
         let vcs = GitCliBackend::new(&repo, &*runner);
 
         let status = vcs.working_tree_status(true).await.expect("status");
-        assert!(status.success);
+        assert!(status.success());
         assert!(status.stdout.contains("draft.ignored"));
         let head = vcs.head_commit().await.expect("head");
-        assert!(head.success);
+        assert!(head.success());
         assert_eq!(head.stdout.trim().len(), 40);
         session.finish();
     }
@@ -2235,9 +2235,9 @@ mod tests {
         .expect("add convoy worktree");
         let commit = GitCliBackend::explicit_checkout(&new_worktree, &*runner).head_commit_text().await.expect("worktree HEAD");
         vcs.update_ref("refs/flotilla/bootstrap/convoy/new", commit.trim()).await.expect("bootstrap ref");
-        assert!(vcs.read_ref("refs/flotilla/bootstrap/convoy/new").await.expect("read bootstrap ref").success);
+        assert!(vcs.read_ref("refs/flotilla/bootstrap/convoy/new").await.expect("read bootstrap ref").success());
         assert!(vcs.worktree_list().await.expect("worktree list").contains("convoy/new"));
-        assert!(vcs.worktree_remove(new_worktree.to_str().expect("new worktree path")).await.expect("remove worktree").success);
+        assert!(vcs.worktree_remove(new_worktree.to_str().expect("new worktree path")).await.expect("remove worktree").success());
         vcs.worktree_prune().await.expect("prune worktree");
         vcs.delete_branch("convoy/new").await.expect("delete owned branch");
         vcs.delete_ref("refs/flotilla/bootstrap/convoy/new").await.expect("delete bootstrap ref");
@@ -2422,11 +2422,11 @@ mod tests {
                     return if self.transport {
                         Err("removal transport unavailable".into())
                     } else {
-                        Ok(CommandOutput { stdout: String::new(), stderr: "suppression refusée".into(), success: false })
+                        Ok(CommandOutput { stdout: String::new(), stderr: "suppression refusée".into(), exit_code: Some(1) })
                     };
                 }
                 let mut output = crate::providers::ProcessCommandRunner.run_output(cmd, args, cwd, label).await?;
-                if !output.success && args.windows(2).any(|pair| pair == ["worktree", "lock"] || pair == ["worktree", "unlock"]) {
+                if !output.success() && args.windows(2).any(|pair| pair == ["worktree", "lock"] || pair == ["worktree", "unlock"]) {
                     output.stderr = "message Git localisé".into();
                 }
                 Ok(output)

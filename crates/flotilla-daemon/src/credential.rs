@@ -2853,7 +2853,7 @@ mod tests {
             } else {
                 true
             };
-            Ok(CommandOutput { stdout, stderr: String::new(), success })
+            Ok(CommandOutput { stdout, stderr: String::new(), exit_code: Some(if success { 0 } else { 1 }) })
         }
 
         async fn run_with_input(
@@ -2904,7 +2904,7 @@ mod tests {
     impl CommandRunner for PathCommandRunner {
         async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
             let output = self.run_output(cmd, args, cwd, label).await?;
-            if output.success {
+            if output.success() {
                 Ok(output.stdout)
             } else {
                 Err(output.stderr)
@@ -2922,7 +2922,7 @@ mod tests {
             Ok(CommandOutput {
                 stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                success: output.status.success(),
+                exit_code: output.status.code(),
             })
         }
 

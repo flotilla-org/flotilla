@@ -225,7 +225,7 @@ pub(crate) mod test_support {
             Err(format!("unexpected test process command: {cmd}"))
         }
         async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-            Ok(CommandOutput { stdout: self.run(cmd, args, cwd, label).await?, stderr: String::new(), success: true })
+            Ok(CommandOutput { stdout: self.run(cmd, args, cwd, label).await?, stderr: String::new(), exit_code: Some(0) })
         }
         async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
             cmd == "claude" && args == ["--version"]
