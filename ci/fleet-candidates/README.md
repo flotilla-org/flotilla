@@ -243,6 +243,35 @@ by launchd, verify `cleat` appears in provider discovery, then exercise both
 dev-mode transitions and confirm the socket remains free after a daemon exit
 while dev mode is enabled.
 
+After flotillad health confirmation (or preserved dev mode), the incoming
+installer runs the installed `cleat server drain --json` for `default`, the
+ambient `CLEAT_DAEMON` logical name, and every live logical daemon discovered by
+`cleat daemons --json`, deduplicated by runtime root and name. Generation names
+such as `work@3` are addressed as `work`. Cleat discovers the ambient
+`CLEAT_RUNTIME_DIR`, XDG state root, and host default state root; run the installer
+in the crew daemon's environment so private roots are discoverable. Independent
+container runtimes must be checked from their own environment after deployment.
+
+Each attempt retains inventory, command arguments, stdout, stderr, exit status,
+and the complete drain reports (`changed`, `installed`, `old`, `current`,
+`warning`) in `~/.local/opt/flotilla-fleet/diagnostics/cleat-drain-*.json` (or the
+configured `FLEET_INSTALL_ROOT`). A nonzero exit, malformed report, discovery
+failure, or drain warning makes installation return nonzero after attempting the
+remaining daemons. The confirmed generation and cleat aliases stay selected;
+there is no rollback for drain failures. Correct the cause and retry the same
+generation; drain is idempotent. SHA metadata is required by cleat itself.
+
+As the host-local equivalent of the fleet skew view, run `fleet-install status`
+on each host: it labels the host, prints the installed cleat SHA, and lists all
+live generations with their serving/draining state, SHA, and `SKEW`, `current`,
+or `unknown` comparison. Old draining generations can legitimately show skew
+until their sessions finish; a serving generation with skew needs attention.
+Status only queries inventory/build information and never starts or drains a
+daemon. `scripts/test-fleet-install.sh` exercises this through the existing
+process fixture boundary on Linux and Darwin. Live drains, attachment of fresh
+crews, and continued service of existing sessions are operator checks after
+deployment.
+
 The consumer verifies the outer size and digest, safely extracts the archive,
 and verifies every inner file against its manifest before atomically selecting
 the read-only generation. The same generation carries the exact skill source

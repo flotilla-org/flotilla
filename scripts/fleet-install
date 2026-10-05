@@ -502,6 +502,106 @@ PY
   fi
 }
 
+# Keep cleat turnover outside flotillad's rollback transaction: a drain can
+# move an alias even when retiring the old generation subsequently fails.
+cleat_diagnostics() {
+  local mode="$1"
+  python3 - "$CURRENT_LINK/bin/cleat" "$FLEET_ROOT" "$mode" <<'CLEAT'
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+
+binary, fleet_root, mode = sys.argv[1:]
+host = socket.gethostname()
+errors = []
+commands = []
+
+def run(args):
+    try:
+        result = subprocess.run([binary, *args], capture_output=True, text=True, timeout=30)
+        record = dict(args=args, exit_code=result.returncode, stdout=result.stdout, stderr=result.stderr)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        record = dict(args=args, exit_code=None, stdout="", stderr=str(error))
+    commands.append(record)
+    if record["exit_code"] != 0:
+        errors.append(f"{' '.join(args)} failed (exit {record['exit_code']}): {record['stderr'].strip()}")
+    try:
+        value = json.loads(record["stdout"])
+    except ValueError:
+        errors.append(f"{' '.join(args)} returned invalid JSON")
+        value = None
+    record["report"] = value
+    return value
+
+inventory = run(["daemons", "--json"])
+if not isinstance(inventory, list):
+    errors.append("cleat daemon inventory is unavailable")
+    inventory = []
+valid = []
+for daemon in inventory:
+    if (not isinstance(daemon, dict)
+        or not isinstance(daemon.get("runtime_root"), str)
+        or not Path(daemon["runtime_root"]).is_absolute()
+        or not isinstance(daemon.get("name"), str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:@(?:legacy|[0-9]+))?", daemon["name"])
+        or daemon["name"].split("@")[0] in (".", "..")):
+        errors.append("invalid cleat daemon inventory entry")
+        continue
+    valid.append(daemon)
+
+if mode == "drain":
+    # Match cleat's persistent-root precedence, independent of a crew's ambient
+    # generation selection. Explicitly address the logical name, never @N.
+    root = os.environ.get("CLEAT_RUNTIME_DIR")
+    if root is None:
+        state = os.environ.get("XDG_STATE_HOME", "")
+        root = str((Path(state) if Path(state).is_absolute() else Path.home() / ".local/state") / "cleat")
+    targets = {(str(Path(root).absolute()), "default")}
+    ambient = os.environ.get("CLEAT_DAEMON")
+    if ambient:
+        targets.add((str(Path(root).absolute()), ambient.split("@")[0]))
+    targets.update((d["runtime_root"], d["name"].split("@")[0]) for d in valid if d.get("alive") is True)
+    for runtime_root, name in sorted(targets):
+        report = run(["--runtime-root", runtime_root, "--server", name, "server", "drain", "--json"])
+        if (not isinstance(report, dict) or not all(key in report for key in ("changed", "installed", "old", "current", "warning"))):
+            errors.append(f"{runtime_root}/{name}: invalid drain report")
+        elif report.get("warning"):
+            errors.append(f"{runtime_root}/{name}: {report['warning']}")
+        print(f"cleat drain {host} {runtime_root}/{name}: {json.dumps(report)}")
+    directory = Path(fleet_root) / "diagnostics"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    with tempfile.NamedTemporaryFile(mode="w", prefix=f"cleat-drain-{stamp}-", suffix=".json", dir=directory, delete=False) as output:
+        json.dump(dict(host=host, generation=os.readlink(Path(fleet_root) / "current"), commands=commands, errors=errors), output, indent=2)
+        output.write("\n")
+    print(f"fleet-install: cleat diagnostics: {output.name}")
+else:
+    version = run(["version", "--json"])
+    client = version.get("client") if isinstance(version, dict) else None
+    installed = client.get("git_sha") if isinstance(client, dict) else None
+    print(f"cleat host {host}: installed SHA {installed or 'unknown'}")
+    alive = [d for d in valid if d.get("alive") is True]
+    if not alive:
+        print("  serving: unavailable (no live daemons)")
+    for daemon in alive:
+        build = daemon.get("build") or {}
+        sha = build.get("git_sha") if isinstance(build, dict) else None
+        skew = "unknown" if not installed or not sha else ("current" if installed == sha else "SKEW")
+        print(f"  {daemon['runtime_root']}/{daemon['name']}: {daemon.get('drain_state', 'unknown')} SHA {sha or 'unknown'} ({skew})")
+
+for error in errors:
+    print(f"fleet-install: cleat: {error}", file=sys.stderr)
+if errors:
+    raise SystemExit(1)
+CLEAT
+}
+
 write_launcher() {
   local name="$1"
   local launcher="$FLEET_BIN_DIR/$name"
@@ -985,6 +1085,9 @@ activate_staged_generation() {
     await_confirmation_watchdog "$generation" "$rollback_generation"
     prune_after_confirmation
   fi
+  if ! cleat_diagnostics drain; then
+    die "cleat drain failed or warned; installed generation $generation remains active; inspect diagnostics and retry drain (no rollback)"
+  fi
 }
 
 handoff_activation() {
@@ -1087,6 +1190,11 @@ show_status() {
   printf 'current: %s (peer protocol %s)\n' "${current:-<none>}" "${current_version:-unknown}"
   printf 'latest:  %s (peer protocol %s)\n' "$latest" "$target_version"
   show_fleet_spread
+  if [[ -x "$CURRENT_LINK/bin/cleat" ]]; then
+    cleat_diagnostics status || printf 'cleat:   diagnostics incomplete on this host\n' >&2
+  else
+    printf 'cleat:   unavailable (no current fleet binary)\n'
+  fi
   if [[ -n "$current_version" && "$current_version" != "$target_version" ]]; then
     printf 'warning: peer protocol changes from %s to %s; mixed generations may not peer\n' "$current_version" "$target_version"
   fi

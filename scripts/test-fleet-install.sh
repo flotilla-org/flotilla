@@ -85,6 +85,46 @@ if [[ "\${1:-}" == --socket && "\${3:-}" == resource && "\${4:-}" == validate &&
 fi
 EOF
     fi
+    if [[ "$name" == cleat ]]; then
+      # Process boundary double for cleat's documented inventory/drain CLI.
+      cat >"$bundle/bin/$name" <<'CLEAT_FAKE'
+#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+root = os.environ.get("CLEAT_RUNTIME_DIR", str(Path.home() / ".local/state/cleat"))
+sha = "installed-sha"
+if args == ["daemons", "--json"]:
+    if os.environ.get("CLEAT_INVENTORY_FAIL") == "1":
+        print("inventory refused", file=sys.stderr)
+        sys.exit(4)
+    print(os.environ.get("CLEAT_INVENTORY", json.dumps([
+        dict(runtime_root=root, name="default@1", alive=True, drain_state="serving", build=dict(git_sha=sha))])))
+elif args == ["version", "--json"]:
+    print(json.dumps(dict(client=dict(git_sha=sha))))
+elif len(args) == 7 and args[0] == "--runtime-root" and args[2] == "--server" and args[4:] == ["server", "drain", "--json"]:
+    name = args[3]
+    assert "@" not in name, "must drain logical daemon"
+    if os.environ.get("CLEAT_CALL_LOG"):
+        with open(os.environ["CLEAT_CALL_LOG"], "a") as log:
+            print(json.dumps(args), file=log)
+    if name == os.environ.get("CLEAT_FAIL_NAME"):
+        print("drain refused", file=sys.stderr)
+        sys.exit(7)
+    if name == os.environ.get("CLEAT_BAD_JSON_NAME"):
+        print("not json")
+        sys.exit(0)
+    print(json.dumps(dict(changed=os.environ.get("CLEAT_CHANGED", "true") == "true",
+        installed=dict(git_sha=sha), old=dict(name=name + "@1", build=dict(git_sha="old-sha")),
+        current=dict(name=name + "@2", build=dict(git_sha=sha)),
+        warning="old daemon could not be told to drain" if name == os.environ.get("CLEAT_WARNING_NAME") else None)))
+else:
+    sys.exit(99)
+CLEAT_FAKE
+    fi
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty\n' >"$bundle/lib/libghostty-vt.so.0"
@@ -194,6 +234,9 @@ if [[ "${1:-}" == --socket && "${3:-}" == resource && "${4:-}" == validate ]]; t
   [[ "${FLEET_VALIDATE_FAIL_FOR:-}" != "$(basename "$(dirname "$(dirname "$0")")")" ]] || exit 1
 fi
 SH
+    fi
+    if [[ "$name" == cleat ]]; then
+      cp "$test_root/bundle-$generation/fleet-candidate-linux-x86_64-gnu2.36/bin/cleat" "$bundle/bin/cleat"
     fi
     chmod 0755 "$bundle/bin/$name"
   done
@@ -726,10 +769,12 @@ grep -Fq 'flotilla daemon stop' "$test_root/daemon.out" || fail 'daemon refusal 
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'failed daemon preflight switched current'
 
 : >"$test_root/systemctl.log"
-if FLEET_HEALTH_FAIL_FOR="$generation_two" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=0 \
+if CLEAT_CALL_LOG="$test_root/unhealthy-drains.jsonl" FLEET_HEALTH_FAIL_FOR="$generation_two" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=0 \
   run_installer "$generation_two" >"$test_root/health-rollback.out" 2>&1; then
   fail 'unhealthy Linux generation was accepted'
 fi
+# Drain follows health confirmation so a failed candidate cannot move cleat aliases.
+test ! -e "$test_root/unhealthy-drains.jsonl" || fail 'unhealthy generation drained cleat'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
   || fail 'unhealthy Linux generation did not roll current back'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/previous")" = "$generation_two" \
@@ -797,6 +842,89 @@ test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/previous")" =
 if leftover_work_dirs="$(compgen -G "$test_root/home/.local/opt/flotilla-fleet/.fleet-install.*")"; then
   fail "successful upgrade left fleet-install work directories behind: $leftover_work_dirs"
 fi
+
+# Issue #2041: activation drains each logical name/root once, including default,
+# retains complete reports, and leaves a confirmed installation active on failure.
+cleat_root="$test_root/runtime root"
+cleat_inventory="$(python3 - "$cleat_root" <<'PY'
+import json
+import sys
+root = sys.argv[1]
+print(json.dumps([
+    dict(runtime_root=root, name="default@1", alive=True, drain_state="draining", build=dict(git_sha="old-sha")),
+    dict(runtime_root=root, name="default@2", alive=True, drain_state="serving", build=dict(git_sha="installed-sha")),
+    dict(runtime_root=root, name="crew@3", alive=True, drain_state="serving", build=dict(git_sha="old-sha")),
+    dict(runtime_root=root + "/private", name="crew@1", alive=True, drain_state="serving", build=None),
+    dict(runtime_root=root, name="dead@1", alive=False),
+]))
+PY
+)"
+CLEAT_RUNTIME_DIR="$cleat_root" CLEAT_INVENTORY="$cleat_inventory" CLEAT_CALL_LOG="$test_root/drains.jsonl" \
+  run_installer "$generation_two" >"$test_root/drains.out"
+python3 - "$test_root/drains.jsonl" "$cleat_root" "$test_root/home/.local/opt/flotilla-fleet/diagnostics" <<'PY'
+import json
+from pathlib import Path
+import sys
+calls = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+assert len(calls) == 3, calls
+assert {(c[1], c[3]) for c in calls} == {(sys.argv[2], "default"), (sys.argv[2], "crew"), (sys.argv[2] + "/private", "crew")}
+report = json.loads(max(Path(sys.argv[3]).glob("*.json"), key=lambda p: p.stat().st_mtime_ns).read_text())
+assert not report["errors"], report
+reports = [c["report"] for c in report["commands"] if "drain" in c["args"]]
+assert len(reports) == 3
+assert all(r["changed"] and r["installed"]["git_sha"] == "installed-sha" and r["old"]["build"]["git_sha"] == "old-sha" and r["current"]["build"]["git_sha"] == "installed-sha" and r["warning"] is None for r in reports)
+PY
+# Empty inventory still addresses default and an explicit ambient logical name.
+CLEAT_RUNTIME_DIR="$cleat_root" CLEAT_INVENTORY='[]' CLEAT_DAEMON='ambient@4' \
+  CLEAT_CALL_LOG="$test_root/empty-drains.jsonl" run_installer "$generation_two" >"$test_root/empty-drains.out"
+python3 - "$test_root/empty-drains.jsonl" "$cleat_root" <<'PY'
+import json
+from pathlib import Path
+import sys
+calls = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+assert len(calls) == 2
+assert {(c[1], c[3]) for c in calls} == {(sys.argv[2], "default"), (sys.argv[2], "ambient")}
+PY
+# Idempotent drains are successful and their changed=false report is retained.
+CLEAT_CHANGED=false run_installer "$generation_two" >"$test_root/drain-unchanged.out"
+grep -Fq '"changed": false' "$test_root/drain-unchanged.out" || fail 'unchanged drain report missing'
+# A warning after alias movement, non-zero exit, malformed JSON, and failed
+# discovery all surface failure, preserve current, and continue other drains.
+for failure in warning exit json inventory; do
+  : >"$test_root/drain-errors.jsonl"
+  if CLEAT_RUNTIME_DIR="$cleat_root" CLEAT_INVENTORY="$cleat_inventory" CLEAT_CALL_LOG="$test_root/drain-errors.jsonl" \
+    CLEAT_WARNING_NAME="$(if [[ "$failure" == warning ]]; then echo crew; fi)" \
+    CLEAT_FAIL_NAME="$(if [[ "$failure" == exit ]]; then echo crew; fi)" \
+    CLEAT_BAD_JSON_NAME="$(if [[ "$failure" == json ]]; then echo crew; fi)" \
+    CLEAT_INVENTORY_FAIL="$(if [[ "$failure" == inventory ]]; then echo 1; fi)" \
+    run_installer "$generation_two" >"$test_root/drain-$failure.out" 2>&1; then
+    fail "cleat $failure was swallowed"
+  fi
+  test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_two" || fail 'drain failure rolled back installation'
+  grep -Fq 'remains active' "$test_root/drain-$failure.out" || fail 'drain failure omitted no-rollback diagnosis'
+  python3 - "$test_root/drain-errors.jsonl" "$test_root/home/.local/opt/flotilla-fleet/diagnostics" "$failure" <<'PY'
+import json
+from pathlib import Path
+import sys
+calls = Path(sys.argv[1]).read_text().splitlines()
+assert len(calls) == (1 if sys.argv[3] == "inventory" else 3), calls
+report = json.loads(max(Path(sys.argv[2]).glob("*.json"), key=lambda p: p.stat().st_mtime_ns).read_text())
+assert report["errors"], report
+assert len(report["commands"]) == len(calls) + 1
+PY
+done
+# Status names this host, reports each live serving/draining SHA and unknowns,
+# and must never invoke drain or create new diagnostics.
+before_diagnostics="$(find "$test_root/home/.local/opt/flotilla-fleet/diagnostics" -type f | sort)"
+CLEAT_RUNTIME_DIR="$cleat_root" CLEAT_INVENTORY="$cleat_inventory" CLEAT_CALL_LOG="$test_root/status-drains.jsonl" \
+  run_installer status >"$test_root/cleat-status.out"
+grep -Fq "cleat host $(hostname): installed SHA installed-sha" "$test_root/cleat-status.out" || fail 'status omitted installed SHA/host'
+grep -Fq 'default@1: draining SHA old-sha (SKEW)' "$test_root/cleat-status.out" || fail 'status hid old draining generation'
+grep -Fq 'default@2: serving SHA installed-sha (current)' "$test_root/cleat-status.out" || fail 'status omitted current generation'
+grep -Fq 'crew@3: serving SHA old-sha (SKEW)' "$test_root/cleat-status.out" || fail 'status hid un-drained named daemon'
+grep -Fq 'crew@1: serving SHA unknown (unknown)' "$test_root/cleat-status.out" || fail 'status guessed unknown SHA'
+test ! -e "$test_root/status-drains.jsonl" || fail 'status mutated cleat aliases'
+test "$before_diagnostics" = "$(find "$test_root/home/.local/opt/flotilla-fleet/diagnostics" -type f | sort)" || fail 'status wrote diagnostics'
 
 run_installer rollback >"$test_root/rollback.out"
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'rollback did not restore previous generation'
