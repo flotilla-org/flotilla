@@ -1372,6 +1372,7 @@ pub struct InProcessDaemon {
     host_registry: crate::host_registry::HostRegistry,
     local_environment_id: EnvironmentId,
     environment_manager: Arc<EnvironmentManager>,
+    cleat_roll_report: Mutex<Option<crate::cleat_roll::RollReport>>,
     /// Discovery dependencies and configuration used for all daemon-side
     /// provider detection, both at startup and for later repo additions.
     discovery: Arc<DiscoveryRuntime>,
@@ -1853,6 +1854,7 @@ impl InProcessDaemon {
             ),
             local_environment_id: local_environment_id.clone(),
             environment_manager: Arc::clone(&environment_manager),
+            cleat_roll_report: Mutex::new(None),
             discovery: Arc::clone(&discovery),
             issue_query_port: Arc::clone(&issue_query_port),
             checkout_providers: Arc::clone(&checkout_providers),

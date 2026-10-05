@@ -1,0 +1,37 @@
+{
+  "drain": {
+    "stdout": "{\"changed\":true,\"installed\":{\"version\":\"0.1.0\",\"git_sha\":\"c1e7a7692bbbb93d7c246e2669bebae922343c88\",\"dirty\":false,\"profile\":\"release\",\"opt_level\":\"3\",\"target\":\"x86_64-unknown-linux-gnu\",\"protocol_version\":12,\"ghostty_vt\":true},\"old\":{\"name\":\"default@26\",\"generation\":26,\"build\":{\"version\":\"0.1.0\",\"git_sha\":\"fd66a7121149e85eb8fbc57a99a388b0c91dae6c\",\"dirty\":false,\"profile\":\"release\",\"opt_level\":\"3\",\"target\":\"x86_64-unknown-linux-gnu\",\"protocol_version\":11,\"ghostty_vt\":true},\"session_count\":3},\"current\":{\"name\":\"default@27\",\"generation\":27,\"build\":{\"version\":\"0.1.0\",\"git_sha\":\"c1e7a7692bbbb93d7c246e2669bebae922343c88\",\"dirty\":false,\"profile\":\"release\",\"opt_level\":\"3\",\"target\":\"x86_64-unknown-linux-gnu\",\"protocol_version\":12,\"ghostty_vt\":true},\"session_count\":0},\"warning\":null}\n",
+    "stderr": "",
+    "success": true
+  },
+  "installed": {
+    "dirty": false,
+    "ghostty_vt": true,
+    "git_sha": "c1e7a7692bbbb93d7c246e2669bebae922343c88",
+    "opt_level": "3",
+    "profile": "release",
+    "protocol_version": 12,
+    "target": "x86_64-unknown-linux-gnu",
+    "version": "0.1.0"
+  },
+  "current": {
+    "stdout": "{\"client\":{\"dirty\":false,\"ghostty_vt\":true,\"git_sha\":\"c1e7a7692bbbb93d7c246e2669bebae922343c88\",\"opt_level\":\"3\",\"profile\":\"release\",\"protocol_version\":12,\"target\":\"x86_64-unknown-linux-gnu\",\"version\":\"0.1.0\"},\"daemon\":{\"dirty\":false,\"ghostty_vt\":true,\"git_sha\":\"c1e7a7692bbbb93d7c246e2669bebae922343c88\",\"opt_level\":\"3\",\"profile\":\"release\",\"protocol_version\":12,\"target\":\"x86_64-unknown-linux-gnu\",\"version\":\"0.1.0\"},\"generation\":27}\n",
+    "stderr": "",
+    "success": true
+  },
+  "listing": {
+    "stdout": "[{\"generation\":26,\"alive\":true,\"drain_state\":\"draining\",\"build\":{\"version\":\"0.1.0\",\"git_sha\":\"fd66a7121149e85eb8fbc57a99a388b0c91dae6c\",\"dirty\":false,\"profile\":\"release\",\"opt_level\":\"3\",\"target\":\"x86_64-unknown-linux-gnu\",\"protocol_version\":11,\"ghostty_vt\":true},\"name\":\"default@26\",\"runtime_root\":\"{root}\"},{\"generation\":27,\"alive\":true,\"drain_state\":\"serving\",\"build\":{\"version\":\"0.1.0\",\"git_sha\":\"c1e7a7692bbbb93d7c246e2669bebae922343c88\",\"dirty\":false,\"profile\":\"release\",\"opt_level\":\"3\",\"target\":\"x86_64-unknown-linux-gnu\",\"protocol_version\":12,\"ghostty_vt\":true},\"name\":\"default@27\",\"runtime_root\":\"{root}\"}]\n",
+    "stderr": "",
+    "success": true
+  },
+  "empty": {
+    "stdout": "",
+    "stderr": "connect daemon: No such file or directory (os error 2)\n",
+    "success": false
+  },
+  "stale": {
+    "stdout": "{\"client\":{\"dirty\":false,\"ghostty_vt\":true,\"git_sha\":\"c1e7a7692bbbb93d7c246e2669bebae922343c88\",\"opt_level\":\"3\",\"profile\":\"release\",\"protocol_version\":12,\"target\":\"x86_64-unknown-linux-gnu\",\"version\":\"0.1.0\"},\"daemon\":{\"dirty\":false,\"ghostty_vt\":true,\"git_sha\":\"fd66a7121149e85eb8fbc57a99a388b0c91dae6c\",\"opt_level\":\"3\",\"profile\":\"release\",\"protocol_version\":11,\"target\":\"x86_64-unknown-linux-gnu\",\"version\":\"0.1.0\"},\"generation\":26}\n",
+    "stderr": "",
+    "success": true
+  }
+}

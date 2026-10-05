@@ -1,7 +1,10 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::Path,
+};
 
 use flotilla_protocol::result_set::CleatEndpoint;
-use flotilla_resources::{ConditionValue, HostCondition, TerminalSession};
+use flotilla_resources::{Environment, HostCondition, TerminalSession, TerminalSessionPhase};
 
 use super::InProcessDaemon;
 use crate::{
@@ -10,24 +13,59 @@ use crate::{
     providers::ChannelLabel,
 };
 
+#[derive(Default)]
+struct CleatInventory {
+    targets: Vec<CleatTarget>,
+    errors: Vec<String>,
+    information: BTreeSet<String>,
+}
+
 impl InProcessDaemon {
-    async fn crew_cleat_targets(&self, require_local: bool) -> Result<(Vec<CleatTarget>, Vec<String>), String> {
+    async fn crew_cleat_targets(&self, require_local: bool) -> Result<CleatInventory, String> {
         let namespaces = self.resource_backend.local_namespaces::<TerminalSession>().await.map_err(|error| error.to_string())?;
         let mut endpoints = HashMap::<_, Vec<CleatEndpoint>>::new();
-        let mut errors = vec![];
+        let mut inventory = CleatInventory::default();
+        let mut vessels = HashMap::<_, BTreeSet<String>>::new();
         for namespace in namespaces {
             let sessions = self.resource_backend.using::<TerminalSession>(&namespace).list().await.map_err(|error| error.to_string())?;
             for session in sessions.items.into_iter().filter(|session| session.spec.pool == "cleat") {
+                // Stopped records are retained history, not live daemon inventory.
+                if session.status.as_ref().is_none_or(|status| status.phase != TerminalSessionPhase::Running) {
+                    continue;
+                }
+                let vessel = session
+                    .metadata
+                    .labels
+                    .get(flotilla_resources::VESSEL_REF_LABEL)
+                    .cloned()
+                    .unwrap_or_else(|| session.spec.env_ref.clone());
                 if let Some(environment) = self.resolve_environment_ref(&session.spec.env_ref) {
                     if let Some(endpoint) = session.status.and_then(|status| status.cleat_endpoint) {
+                        vessels.entry(environment.id.clone()).or_default().insert(vessel);
                         endpoints.entry(environment.id).or_default().push(endpoint);
                     }
                 } else if session.status.is_some_and(|status| status.cleat_endpoint.is_some()) {
-                    errors.push(format!("crew cleat environment unavailable: {}", session.spec.env_ref));
+                    let environment = self.resource_backend.using::<Environment>(&namespace).get(&session.spec.env_ref).await.ok();
+                    if environment
+                        .as_ref()
+                        .and_then(|environment| environment.spec.docker.as_ref())
+                        .is_some_and(|docker| docker.host_ref == self.environment_manager.local_host_id().as_str())
+                    {
+                        inventory
+                            .information
+                            .insert(format!("{vessel}: vessel cleat unknown, refreshes on restart (environment runner unavailable)"));
+                    } else if environment
+                        .as_ref()
+                        .and_then(|environment| environment.spec.host_direct.as_ref())
+                        .is_some_and(|direct| direct.host_ref == self.environment_manager.local_host_id().as_str())
+                    {
+                        inventory.errors.push(format!("host cleat environment unavailable: {}", session.spec.env_ref));
+                    }
+                    // Missing or foreign environment evidence cannot establish
+                    // actionable local host skew.
                 }
             }
         }
-        let mut targets = vec![];
         for (id, state) in self.environment_manager.managed_environments() {
             let (bag, local, contained) = match state {
                 ManagedEnvironmentKind::Direct(state) => {
@@ -45,22 +83,35 @@ impl InProcessDaemon {
                 continue;
             }
             let Some(runner) = self.environment_manager.environment_runner(&id) else {
-                errors.push(format!("crew cleat runner unavailable for {id}"));
+                if contained {
+                    inventory.information.insert(format!("{id}: vessel cleat unknown, refreshes on restart (runner unavailable)"));
+                } else {
+                    inventory.errors.push(format!("host cleat runner unavailable for {id}"));
+                }
                 continue;
             };
             let environment = CleatEnvironment::builder().id(id.clone()).bag(bag).runner(runner).contained(contained).build();
             match cleat_roll::crew_targets(&environment, endpoints.get(&id).map_or(&[], Vec::as_slice)) {
-                Ok(environment_targets) => targets.extend(environment_targets),
-                Err(error) => errors.push(format!("{id}: {error}")),
+                Ok(environment_targets) => inventory.targets.extend(environment_targets.into_iter().map(|mut target| {
+                    target.vessels = vessels.get(&id).map_or_else(Vec::new, |vessels| vessels.iter().cloned().collect());
+                    target
+                })),
+                Err(error) if contained => {
+                    inventory.information.insert(format!("{id}: vessel cleat unknown, refreshes on restart ({error})"));
+                }
+                Err(error) => inventory.errors.push(format!("{id}: {error}")),
             }
         }
-        Ok((targets, errors))
+        Ok(inventory)
     }
 
     pub async fn post_install_cleat(&self, incoming: &Path, generation: &str, diagnostics_dir: &Path) -> Result<RollReport, String> {
-        let (targets, errors) = self.crew_cleat_targets(true).await?;
-        let mut report = cleat_roll::drain(self.host_name.to_string(), generation.to_string(), incoming, &targets, errors).await;
+        let inventory = self.crew_cleat_targets(true).await?;
+        let mut report =
+            cleat_roll::drain(self.host_name.to_string(), generation.to_string(), incoming, &inventory.targets, inventory.errors).await;
+        report.information.extend(inventory.information);
         cleat_roll::persist(&mut report, diagnostics_dir).await;
+        *self.cleat_roll_report.lock().await = Some(report.clone());
         Ok(report)
     }
 
@@ -81,24 +132,19 @@ impl InProcessDaemon {
             .ok()
             .and_then(|output| serde_json::from_str::<serde_json::Value>(&output).ok())
             .and_then(|value| value["client"]["git_sha"].as_str().map(str::to_string));
-        let (targets, mut messages) = match self.crew_cleat_targets(false).await {
-            Ok(targets) => targets,
-            Err(error) => (vec![], vec![error]),
+        let inventory = match self.crew_cleat_targets(false).await {
+            Ok(inventory) => inventory,
+            Err(error) => CleatInventory { errors: vec![error], ..Default::default() },
         };
-        messages.extend(cleat_roll::build_skew(installed.as_deref(), &targets).await);
-        if messages.is_empty() {
-            return None;
+        let report = self.cleat_roll_report.lock().await.clone();
+        let mut assessment = cleat_roll::build_skew(installed.as_deref(), &inventory.targets, report.as_ref()).await;
+        assessment.actionable.extend(inventory.errors);
+        assessment.information.extend(inventory.information);
+        if let Some(report) = report.as_ref() {
+            let drain = cleat_roll::assess_drain(report);
+            assessment.actionable.extend(drain.actionable);
         }
-        Some(
-            HostCondition::builder()
-                .condition_type("CleatBuildSkew")
-                .value(ConditionValue::False)
-                .reason("InstalledServingMismatch")
-                .message(messages.join("; "))
-                .observed_at(self.clock.now())
-                .blocks_readiness(false)
-                .build(),
-        )
+        assessment.into_condition(self.clock.now())
     }
 }
 
@@ -109,7 +155,7 @@ mod tests {
     use async_trait::async_trait;
     use flotilla_protocol::{qualified_path::HostId, EnvironmentId, EnvironmentStatus, HostName, ImageId};
     use flotilla_resources::{
-        InMemoryBackend, InputMeta, ResourceBackend, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
+        ConditionValue, InMemoryBackend, InputMeta, ResourceBackend, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus,
     };
 
     use super::*;
@@ -219,13 +265,60 @@ mod tests {
                         daemon: daemon_name.into(),
                         session: name.into(),
                     }),
+                    phase: TerminalSessionPhase::Running,
                     ..Default::default()
                 })
                 .await
                 .expect("record crew endpoint");
         }
-        let (targets, errors) = daemon.crew_cleat_targets(true).await.expect("known targets");
-        assert!(errors.is_empty(), "{errors:?}");
+        let environment_spec = serde_json::from_value(serde_json::json!({"docker": {
+            "host_ref": daemon.environment_manager.local_host_id().as_str(), "image": "pinned-image"
+        }}))
+        .expect("stored Docker spec");
+        backend
+            .using::<Environment>("other-namespace")
+            .create(&InputMeta::builder().name("unregistered-vessel-env".into()).build(), &environment_spec)
+            .await
+            .expect("stored environment");
+        let sessions = backend.using::<TerminalSession>("other-namespace");
+        let missing = sessions
+            .create(
+                &InputMeta::builder()
+                    .name("missing-runner".into())
+                    .labels(std::collections::BTreeMap::from([(flotilla_resources::VESSEL_REF_LABEL.into(), "work-vessel".into())]))
+                    .build(),
+                &TerminalSessionSpec::builder()
+                    .env_ref("unregistered-vessel-env".into())
+                    .role("coder".into())
+                    .source(TerminalSessionSource::Tool { command: "sh".into() })
+                    .cwd("/".into())
+                    .pool("cleat".into())
+                    .build(),
+            )
+            .await
+            .expect("retained vessel session");
+        sessions
+            .update_status("missing-runner", &missing.metadata.resource_version, &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                cleat_endpoint: Some(CleatEndpoint {
+                    runtime_root: "/var/lib/flotilla/cleat".into(),
+                    daemon: "default@1".into(),
+                    session: "coder".into(),
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("retained endpoint");
+        let inventory = daemon.crew_cleat_targets(true).await.expect("known targets");
+        assert!(inventory.errors.is_empty(), "{:?}", inventory.errors);
+        assert_eq!(inventory.information.len(), 1);
+        assert!(inventory
+            .information
+            .iter()
+            .next()
+            .expect("vessel info")
+            .contains("work-vessel: vessel cleat unknown, refreshes on restart"));
+        let targets = inventory.targets;
         assert_eq!(targets.len(), 4);
         assert!(targets.iter().any(|target| target.runtime_root == Path::new("/host-home/.local/state/cleat") && target.name == "default"));
         assert!(targets.iter().any(|target| target.environment == "contained-work"
@@ -248,6 +341,12 @@ mod tests {
                 .on_run("/installed/cleat", &["version", "--json"], Ok(r#"{"client":{"git_sha":"new"}}"#.into()))
                 .on_run("/installed/cleat", &version_args, Ok(r#"{"daemon":{"git_sha":"old"}}"#.into()))
                 .on_run("/installed/cleat", &version_args, Ok(r#"{"daemon":{"git_sha":"new"}}"#.into()))
+                .on_run("readlink", &["/crew/cleat/.default.current"], Err("no sidecar".into()))
+                .on_run("readlink", &["/crew/cleat/.default.current"], Err("no sidecar".into()))
+                .on_run("readlink", &["/crew/cleat/default"], Err("legacy".into()))
+                .on_run("readlink", &["/crew/cleat/default"], Err("legacy".into()))
+                .on_run("/installed/cleat", &["--runtime-root", "/crew/cleat", "--server", "default", "daemons", "--json"], Ok("[]".into()))
+                .on_run("/installed/cleat", &["--runtime-root", "/crew/cleat", "--server", "default", "daemons", "--json"], Ok("[]".into()))
                 .build(),
         );
         let directory = tempfile::tempdir().expect("config");
