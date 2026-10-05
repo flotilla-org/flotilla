@@ -594,6 +594,8 @@ async fn apply_http_watch<T: Resource>(
 
 // The origin's per-kind sequence includes deletes. Never advance past a hole,
 // including a historical event skipped during schema-decode quarantine.
+// A dropped final event needs a later event/reconnect to expose it; the digest
+// safety net for that case is tracked in https://github.com/flotilla-org/flotilla/issues/2638.
 // These watches are unfiltered. Both authoritative stores assign numeric, dense
 // versions independently per (group, version, kind, namespace), not Kubernetes'
 // opaque versions. Relay writes must not alter this direct stream's position.

@@ -387,6 +387,8 @@ impl InMemoryBackend {
         let mut state = self.replicas.lock().await;
         let old = state.partitions.remove(&replica_key).unwrap_or_default();
         let mut objects = HashMap::new();
+        // Absent names retain deletion fences against delayed relays. A recreated
+        // key is absent from old.objects, so insertion below stamps it afresh.
         let mut synced_at_by_name = old.synced_at_by_name;
         for object in &listed.items {
             let name = &object.metadata.name;
