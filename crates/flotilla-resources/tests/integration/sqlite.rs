@@ -1027,7 +1027,7 @@ async fn watch_from_version_replays_events_persisted_before_restart() {
 }
 
 #[tokio::test]
-async fn watch_replay_skips_an_undecodable_historical_event_and_reaches_later_resources() {
+async fn watch_replay_quarantines_an_undecodable_event_and_requires_a_snapshot() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("resources.sqlite");
 
@@ -1049,19 +1049,12 @@ async fn watch_replay_skips_an_undecodable_historical_event_and_reaches_later_re
         .await
         .expect("create current-schema event");
 
-    let mut watch = backend
+    let error = backend
         .using::<CurrentReplayCredential>("flotilla")
         .watch(WatchStart::FromVersion("0".to_string()))
         .await
-        .expect("watch should start");
-    let event = timeout(Duration::from_secs(1), watch.next())
-        .await
-        .expect("watch replay should remain live past the poison event")
-        .expect("later event should be delivered")
-        .expect("later event should decode");
-
-    let WatchEvent::Added(object) = event else { panic!("expected added event") };
-    assert_eq!(object.metadata.name, "healthy");
+        .expect_err("undecodable event leaves a replay gap");
+    assert!(matches!(error, ResourceError::WatchExpired { .. }));
 
     let diagnostics = backend.diagnostics().await.expect("read quarantine diagnostics").expect("sqlite diagnostics");
     let [quarantine] = diagnostics.event_decode_quarantines.as_slice() else {
@@ -1118,10 +1111,8 @@ async fn compaction_removes_a_superseded_event_quarantine_with_its_event() {
     let backend =
         ResourceBackend::Sqlite(SqliteBackend::open_with_event_retention(&path, retention).expect("sqlite backend should reopen"));
     let resolver = backend.using::<CurrentReplayCredential>("flotilla");
-    let mut watch = resolver.watch(WatchStart::FromVersion("0".to_string())).await.expect("watch should start");
-    let replayed = watch.next().await.expect("superseding event should replay").expect("superseding event should decode");
-    let WatchEvent::Modified(object) = replayed else { panic!("expected modified event") };
-    assert_eq!(object.spec.username, "current");
+    let error = resolver.watch(WatchStart::FromVersion("0".to_string())).await.expect_err("quarantine invalidates replay");
+    assert!(matches!(error, ResourceError::WatchExpired { .. }));
     assert_eq!(
         backend.diagnostics().await.expect("read quarantine diagnostics").expect("sqlite diagnostics").event_decode_quarantines.len(),
         1
@@ -1240,4 +1231,26 @@ async fn snapshot_skips_unchanged_sqlite_rows_while_applying_changes() {
     assert_eq!(read.get("added").await.expect("added").object.spec.workflow_ref, "after");
     assert!(matches!(read.get("deleted").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
     writer.replace(&source.list().await.expect("snapshot"), Utc::now()).await.expect("repeat resync without row writes");
+}
+
+#[tokio::test]
+async fn legacy_replica_cursor_requires_one_snapshot_before_resume() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("resources.sqlite");
+    let origin = flotilla_protocol::NodeId::new("origin");
+    let authority = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
+    authority.using::<Convoy>("flotilla").create(&convoy_meta("retained"), &convoy_spec("workflow")).await.expect("create");
+    let listed = authority.using::<Convoy>("flotilla").list().await.expect("snapshot");
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("open"));
+    backend.replica_writer::<Convoy>(origin.clone(), "flotilla").replace(&listed, chrono::Utc::now()).await.expect("seed");
+    drop(backend);
+    let connection = rusqlite::Connection::open(&path).expect("raw store");
+    connection.execute("ALTER TABLE replica_cursors DROP COLUMN complete_prefix", []).expect("simulate previous-generation schema");
+    drop(connection);
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("upgrade"));
+    let writer = backend.replica_writer::<Convoy>(origin, "flotilla");
+    assert!(writer.cursor().await.expect("legacy cursor").is_none(), "old log positions do not prove a prefix");
+    assert_eq!(backend.including_replicas::<Convoy>("flotilla").list().await.expect("preserved replicas").items.len(), 1);
+    writer.replace(&listed, chrono::Utc::now()).await.expect("repair proof");
+    assert_eq!(writer.cursor().await.expect("proven cursor").expect("prefix").resource_version, listed.resource_version);
 }

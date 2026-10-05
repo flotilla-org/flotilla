@@ -288,7 +288,7 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
 }
 
 #[tokio::test]
-async fn http_replication_resnapshots_old_cursor_without_replaying_undecodable_history() {
+async fn http_replication_resnapshots_after_quarantined_history() {
     let temp = tempfile::tempdir().expect("tempdir");
     let origin_path = temp.path().join("origin.sqlite");
     let origin = ResourceBackend::Sqlite(SqliteBackend::open(&origin_path).expect("open origin store"));
@@ -356,7 +356,7 @@ async fn http_replication_resnapshots_old_cursor_without_replaying_undecodable_h
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind origin resource HTTP socket");
     let server_backend = origin.clone();
     let server = tokio::spawn(async move {
-        for _ in 0..2 {
+        for _ in 0..3 {
             let (mut stream, _) = listener.accept().await.expect("accept resource HTTP request");
             let first_byte = tokio::io::AsyncReadExt::read_u8(&mut stream).await.expect("read HTTP preface");
             let backend = server_backend.clone();
@@ -386,11 +386,8 @@ async fn http_replication_resnapshots_old_cursor_without_replaying_undecodable_h
     .await
     .expect("replication should advance past the quarantined event");
 
-    // #2636: a reconnect uses the complete current snapshot even when its old
-    // cursor could resume. Superseded history need not decode to recover state;
-    // the storage replay-quarantine contract remains covered in resources tests.
     let diagnostics = origin.diagnostics().await.expect("read origin diagnostics").expect("sqlite diagnostics");
-    assert!(diagnostics.event_decode_quarantines.is_empty(), "snapshot recovery must not need historical replay");
+    assert_eq!(diagnostics.event_decode_quarantines.len(), 1, "resume must expose the quarantined event gap");
 
     replicator.abort();
     server.abort();
@@ -447,6 +444,7 @@ async fn http_replicator_relists_after_an_origin_generation_change() {
     let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind replicator HTTP socket");
     let requested_targets = Arc::new(StdMutex::new(Vec::new()));
     let server_targets = Arc::clone(&requested_targets);
+    let old_generation = old_list.generation.expect("old generation");
     let server = tokio::spawn(async move {
         loop {
             let (mut stream, _) = listener.accept().await.expect("accept replicator HTTP request");
@@ -461,6 +459,12 @@ async fn http_replicator_relists_after_an_origin_generation_change() {
             let target =
                 request.lines().next().and_then(|line| line.split_whitespace().nth(1)).expect("replicator HTTP request target").to_string();
             server_targets.lock().expect("requested targets lock").push(target.clone());
+            if target.contains("watch=true") && target.contains(&format!("generation={old_generation}")) {
+                tokio::io::AsyncWriteExt::write_all(&mut stream, b"HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("reject expired generation");
+                continue;
+            }
             if target.contains("watch=true") {
                 tokio::io::AsyncWriteExt::write_all(
                     &mut stream,
@@ -510,20 +514,21 @@ async fn http_replicator_relists_after_an_origin_generation_change() {
     .expect("generation relist timeout");
 
     tokio::time::timeout(Duration::from_secs(2), async {
-        while requested_targets.lock().expect("requested targets lock").len() < 2 {
+        while requested_targets.lock().expect("requested targets lock").len() < 3 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("replacement watch request timeout");
     let requested_targets = requested_targets.lock().expect("requested targets lock").clone();
-    assert_eq!(requested_targets.len(), 2);
-    assert!(!requested_targets[0].contains("watch=true"), "the replicator must inspect the origin generation before resuming");
-    assert!(requested_targets[1].contains("watch=true"));
+    assert_eq!(requested_targets.len(), 3);
+    assert!(requested_targets[0].contains("watch=true"), "try the proven cursor first");
+    assert!(!requested_targets[1].contains("watch=true"), "expired generation requires a snapshot");
+    assert!(requested_targets[2].contains("watch=true"));
     assert!(
-        requested_targets[1].contains(&format!("generation={new_generation}")),
+        requested_targets[2].contains(&format!("generation={new_generation}")),
         "the replacement watch must be scoped to the new generation: {}",
-        requested_targets[1]
+        requested_targets[2]
     );
     replicator.abort();
     server.abort();
@@ -544,8 +549,6 @@ async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
         .await
         .expect("create initial convoy");
     let initial = origin.using::<Convoy>("flotilla").list().await.expect("list initial origin");
-    let initial_body = serde_json::to_vec(&list_resource_kind(&origin, "flotilla", "convoys").await.expect("encode initial list").value)
-        .expect("encode initial response");
 
     let holder_backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let origin_root = NodeId::new("remote-root");
@@ -597,19 +600,19 @@ async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
                 targets.len()
             };
             if target.contains("watch=true") {
-                let body = if request_number == 2 { b"not-json\n".as_slice() } else { b"".as_slice() };
+                let body = if request_number == 1 { b"not-json\n".as_slice() } else { b"".as_slice() };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.expect("write watch response headers");
                 tokio::io::AsyncWriteExt::write_all(&mut stream, body).await.expect("write watch response body");
-                if request_number > 2 {
+                if request_number > 1 {
                     std::future::pending::<()>().await;
                 }
                 continue;
             }
-            let body = if request_number == 1 { &initial_body } else { &fresh_body };
+            let body = &fresh_body;
             let response =
                 format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
             tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.expect("write list response headers");
@@ -636,17 +639,16 @@ async fn http_replicator_takes_a_fresh_list_after_a_resumed_watch_fails() {
     .await
     .expect("fresh relist timeout");
     tokio::time::timeout(Duration::from_secs(2), async {
-        while requested_targets.lock().expect("requested targets lock").len() < 4 {
+        while requested_targets.lock().expect("requested targets lock").len() < 3 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("replacement watch request timeout");
     let requested_targets = requested_targets.lock().expect("requested targets lock").clone();
-    assert!(!requested_targets[0].contains("watch=true"));
-    assert!(requested_targets[1].contains("watch=true"));
-    assert!(!requested_targets[2].contains("watch=true"), "a failed resumed watch must trigger a fresh list");
-    assert!(requested_targets[3].contains("watch=true"));
+    assert!(requested_targets[0].contains("watch=true"), "valid prefix resumes without listing");
+    assert!(!requested_targets[1].contains("watch=true"), "a failed resumed watch triggers a fresh list");
+    assert!(requested_targets[2].contains("watch=true"));
 
     replicator.abort();
     server.abort();

@@ -1055,7 +1055,7 @@ async fn reconnect_repairs_a_delete_missing_before_the_cursor() {
 
 async fn await_replica_names(daemon: &InProcessDaemon, expected: &[&str]) {
     // Allow bounded retry backoff (five virtual seconds): a sequence gap must repair now,
-    // whereas a missing final event is repaired by the periodic resnapshot.
+    // failed snapshot requests must retry without dropping the previous set.
     for _ in 0..500 {
         let mut names: Vec<_> = daemon
             .resource_backend()
@@ -1079,7 +1079,7 @@ async fn await_replica_names(daemon: &InProcessDaemon, expected: &[&str]) {
     );
 }
 
-async fn missed_delete_scenario(sequence_gap: bool, fail_resync: bool) {
+async fn missed_delete_scenario(fail_resync: bool) {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use flotilla_daemon::server::test_support::spawn_in_memory_request_mesh_with_filter;
@@ -1098,15 +1098,21 @@ async fn missed_delete_scenario(sequence_gap: bool, fail_resync: bool) {
     let failing = Arc::new(AtomicBool::new(false));
     let failures = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicUsize::new(0));
+    let successful_snapshots = Arc::new(AtomicUsize::new(0));
     // Stands in for the peer network boundary, dropping deletion envelopes and
     // making snapshot requests fail at the real authoritative dispatcher.
     let filter = {
         let failing = Arc::clone(&failing);
         let failures = Arc::clone(&failures);
         let dropped = Arc::clone(&dropped);
+        let successful_snapshots = Arc::clone(&successful_snapshots);
+        let origin = feta.node_id().clone();
         Arc::new(move |mut message: PeerWireMessage| {
-            if let PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { command, .. }) = &mut message {
-                if let CommandAction::ResourceWatch { kind, replica_sources: false, .. } = &mut command.action {
+            if let PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { target_node_id, command, .. }) = &mut message {
+                if let CommandAction::ResourceWatch { kind, cursor, replica_sources: false, .. } = &mut command.action {
+                    if target_node_id == &origin && kind == "convoys" && cursor.is_none() && !failing.load(Ordering::SeqCst) {
+                        successful_snapshots.fetch_add(1, Ordering::SeqCst);
+                    }
                     if kind == "convoys" && failing.load(Ordering::SeqCst) {
                         *kind = "unavailable-test-kind".to_string();
                         failures.fetch_add(1, Ordering::SeqCst);
@@ -1132,6 +1138,7 @@ async fn missed_delete_scenario(sequence_gap: bool, fail_resync: bool) {
         .await
         .expect("connect mesh");
     await_replica_names(&kiwi, &["gone", "retained"]).await;
+    assert!(successful_snapshots.swap(0, Ordering::SeqCst) >= 1, "initial snapshot delivered");
     authority.delete("gone").await.expect("delete at authority");
     for _ in 0..20_000 {
         if dropped.load(Ordering::SeqCst) > 0 {
@@ -1141,7 +1148,7 @@ async fn missed_delete_scenario(sequence_gap: bool, fail_resync: bool) {
     }
     assert!(dropped.load(Ordering::SeqCst) > 0, "test must actually drop the deletion");
     failing.store(fail_resync, Ordering::SeqCst);
-    if sequence_gap {
+    {
         let current = authority.get("retained").await.expect("live object");
         authority
             .update(
@@ -1151,8 +1158,6 @@ async fn missed_delete_scenario(sequence_gap: bool, fail_resync: bool) {
             )
             .await
             .expect("deliver event after gap");
-    } else {
-        tokio::time::advance(Duration::from_secs(301)).await;
     }
     if fail_resync {
         for _ in 0..500 {
@@ -1163,10 +1168,20 @@ async fn missed_delete_scenario(sequence_gap: bool, fail_resync: bool) {
         }
         assert!(failures.load(Ordering::SeqCst) > 0, "test must exercise a failed listing");
         await_replica_names(&kiwi, &["gone", "retained"]).await;
+        assert!(
+            kiwi.resource_backend()
+                .replica_writer::<Convoy>(feta.node_id().clone(), "flotilla")
+                .cursor()
+                .await
+                .expect("cursor after failed repair")
+                .is_none(),
+            "gap repair must retry a snapshot, not the old resume cursor"
+        );
         failing.store(false, Ordering::SeqCst);
         tokio::time::advance(Duration::from_secs(31)).await;
     }
     await_replica_names(&kiwi, &["retained"]).await;
+    assert_eq!(successful_snapshots.load(Ordering::SeqCst), 1, "gap requires exactly one successful resnapshot");
     drop(mesh);
 }
 
@@ -1174,28 +1189,25 @@ async fn missed_delete_scenario(sequence_gap: bool, fail_resync: bool) {
 // before accepting subsequent events, preserving live objects.
 #[tokio::test(start_paused = true)]
 async fn sequence_gap_repairs_a_missed_delete() {
-    missed_delete_scenario(true, false).await;
+    missed_delete_scenario(false).await;
 }
 
-// #2636: a missed final delete has no subsequent sequence to check. Periodic
-// resync repairs it, but a transient failed listing must drop nothing.
+// #2636: a sequence gap forces repair, but a failed listing must drop nothing.
 #[tokio::test(start_paused = true)]
-async fn periodic_resync_preserves_replicas_on_listing_failure_then_repairs() {
-    missed_delete_scenario(false, true).await;
+async fn gap_resnapshot_preserves_replicas_on_listing_failure_then_repairs() {
+    missed_delete_scenario(true).await;
 }
 
-// Generated scenario choices cover a final missing event versus a sequence hole,
-// and transient snapshot failure versus success. Each phase checks the object set.
+// Generated scenarios cover transient snapshot failure versus success.
 #[hegel::test]
 fn generated_missed_delete_resync(tc: hegel::TestCase) {
-    let gap = tc.draw(hegel::generators::booleans());
     let failure = tc.draw(hegel::generators::booleans());
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
         .build()
         .expect("runtime")
-        .block_on(missed_delete_scenario(gap, failure));
+        .block_on(missed_delete_scenario(failure));
 }
 
 // #2640 review: unfiltered origin watches use a dense numeric sequence scoped
@@ -1262,6 +1274,94 @@ async fn other_namespace_writes_do_not_force_replication_resnapshots() {
         }
         assert!(converged, "live update must arrive");
         assert_eq!(requests.load(Ordering::SeqCst), snapshots, "other namespaces must not force resnapshot");
+        drop(mesh);
+    }
+}
+
+// Resume a proven prefix without data transfer; only an expired horizon or a
+// quarantined log hole authorizes a single complete origin snapshot.
+#[tokio::test]
+async fn reconnect_uses_log_until_horizon_or_quarantine_requires_one_snapshot() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use flotilla_daemon::server::test_support::spawn_in_memory_request_mesh_with_filter;
+    use flotilla_protocol::{CommandAction, PeerWireMessage, RoutedPeerMessage};
+    use flotilla_resources::EventRetention;
+
+    for repair in ["valid", "horizon", "quarantine"] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
+        let origin_path = temp.path().join("origin.sqlite");
+        let backend = ResourceBackend::Sqlite(
+            SqliteBackend::open_with_event_retention(&origin_path, EventRetention::new(2).expect("retention")).expect("origin store"),
+        );
+        let feta = daemon_with_backend(temp.path().join("feta"), "feta-root", "feta", backend).await;
+        let authority = feta.resource_backend().using::<Convoy>("flotilla");
+        let spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).build();
+        for name in ["gone", "retained"] {
+            authority.create(&InputMeta::builder().name(name.to_string()).build(), &spec).await.expect("create");
+        }
+        let writer = kiwi.resource_backend().replica_writer::<Convoy>(feta.node_id().clone(), "flotilla");
+        let listed = authority.list().await.expect("snapshot");
+        writer.replace(&listed, chrono::Utc::now()).await.expect("establish complete prefix");
+        authority.delete("gone").await.expect("delete while disconnected");
+        if repair == "horizon" {
+            for workflow in ["second", "third"] {
+                let current = authority.get("retained").await.expect("retained");
+                authority
+                    .update(
+                        &InputMeta::builder().name("retained".to_string()).build(),
+                        &current.metadata.resource_version,
+                        &ConvoySpec::builder().workflow_ref(workflow.to_string()).build(),
+                    )
+                    .await
+                    .expect("advance horizon");
+            }
+        } else if repair == "quarantine" {
+            let connection = rusqlite::Connection::open(&origin_path).expect("raw store");
+            let body: String = connection
+                .query_row("SELECT body_json FROM resource_events WHERE kind = 'Convoy' AND event_version = 3", [], |row| row.get(0))
+                .expect("delete event");
+            let mut body: serde_json::Value = serde_json::from_str(&body).expect("event JSON");
+            body["spec"].as_object_mut().expect("deleted spec").remove("workflow_ref");
+            connection
+                .execute("UPDATE resource_events SET body_json = ?1 WHERE kind = 'Convoy' AND event_version = 3", [serde_json::to_string(
+                    &body,
+                )
+                .expect("encode")])
+                .expect("poison final delete");
+        }
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let origin = feta.node_id().clone();
+        let filter = {
+            let snapshots = Arc::clone(&snapshots);
+            Arc::new(move |message: PeerWireMessage| {
+                if let PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { target_node_id, command, .. }) = &message {
+                    if target_node_id == &origin
+                        && matches!(&command.action,
+                        CommandAction::ResourceWatch { kind, replica_sources: false, cursor: None, .. } if kind == "convoys")
+                    {
+                        snapshots.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                Some(message)
+            })
+        };
+        let mesh = spawn_in_memory_request_mesh_with_filter(vec![Arc::clone(&kiwi), Arc::clone(&feta)], Some(&["Convoy"]), filter)
+            .await
+            .expect("reconnect");
+        await_replica_names(&kiwi, &["retained"]).await;
+        assert_eq!(snapshots.load(Ordering::SeqCst), usize::from(repair != "valid"), "{repair}: full snapshots are exceptional");
+        assert_eq!(
+            writer.cursor().await.expect("cursor").expect("prefix").resource_version,
+            authority.list().await.expect("current authority").resource_version
+        );
+        if repair == "quarantine" {
+            assert_eq!(
+                feta.resource_backend().diagnostics().await.expect("diagnostics").expect("SQLite").event_decode_quarantines.len(),
+                1
+            );
+        }
         drop(mesh);
     }
 }

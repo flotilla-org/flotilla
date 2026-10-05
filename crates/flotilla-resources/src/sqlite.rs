@@ -40,7 +40,6 @@ const SLOW_STORE_OPERATION: Duration = Duration::from_millis(100);
 struct ReplicaMutation {
     kind: StoredReplicaEventKind,
     name: String,
-    resource_version: String,
     value: Value,
     synced_at: DateTime<Utc>,
 }
@@ -368,6 +367,22 @@ impl SqliteBackend {
                 "#,
             )
             .map_err(|err| ResourceError::other(format!("initialize sqlite resource store: {err}")))?;
+        let has_prefix = connection
+            .prepare("PRAGMA table_info(replica_cursors)")
+            .map_err(|err| Self::map_sqlite(err, "inspect replica prefix schema"))?
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|err| Self::map_sqlite(err, "read replica prefix schema"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| Self::map_sqlite(err, "decode replica prefix schema"))?
+            .iter()
+            .any(|name| name == "complete_prefix");
+        if !has_prefix {
+            // Old cursors could be advanced by relays or skipped decode failures.
+            // Do not trust them until an authoritative snapshot establishes a prefix.
+            connection
+                .execute("ALTER TABLE replica_cursors ADD COLUMN complete_prefix INTEGER NOT NULL DEFAULT 0", [])
+                .map_err(|err| Self::map_sqlite(err, "add replica prefix proof"))?;
+        }
         let workflow_templates_reset = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM resource_store_migrations WHERE name = 'workflow-template-definitions-v1')",
@@ -1169,10 +1184,10 @@ impl SqliteBackend {
                 tx.execute(
                     r#"
                     INSERT INTO replica_cursors
-                        (origin_root, group_name, version, kind, namespace, resource_version, generation, last_synced_at)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                        (origin_root, group_name, version, kind, namespace, resource_version, generation, last_synced_at, complete_prefix)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)
                     ON CONFLICT(origin_root, group_name, version, kind, namespace)
-                    DO UPDATE SET resource_version = excluded.resource_version,
+                    DO UPDATE SET complete_prefix = 1, resource_version = excluded.resource_version,
                                   generation = excluded.generation,
                                   last_synced_at = excluded.last_synced_at
                     "#,
@@ -1224,12 +1239,11 @@ impl SqliteBackend {
         synced_at: DateTime<Utc>,
     ) -> Result<(), ResourceError> {
         let name = object.metadata.name.clone();
-        let resource_version = object.metadata.resource_version.clone();
         let value = Self::encode_object(object)?;
         self.apply_replica_value::<T>(
             origin_root,
             namespace,
-            ReplicaMutation::builder().kind(kind).name(name).resource_version(resource_version).value(value).synced_at(synced_at).build(),
+            ReplicaMutation::builder().kind(kind).name(name).value(value).synced_at(synced_at).build(),
         )
         .await
     }
@@ -1247,7 +1261,6 @@ impl SqliteBackend {
             ReplicaMutation::builder()
                 .kind(StoredReplicaEventKind::Deleted)
                 .name(tombstone.name.clone())
-                .resource_version(tombstone.resource_version.clone())
                 .value(Self::encode_tombstone::<T>(tombstone))
                 .synced_at(synced_at)
                 .build(),
@@ -1261,7 +1274,7 @@ impl SqliteBackend {
         namespace: &str,
         mutation: ReplicaMutation,
     ) -> Result<(), ResourceError> {
-        let ReplicaMutation { kind, name, resource_version, value, synced_at } = mutation;
+        let ReplicaMutation { kind, name, value, synced_at } = mutation;
         let key = Self::store_key::<T>(namespace);
         let operation_key = key.clone();
         let origin = origin_root.to_string();
@@ -1356,15 +1369,6 @@ impl SqliteBackend {
                         .map_err(|err| Self::map_sqlite(err, "write sqlite replica tombstone"))?;
                     }
                 }
-                tx.execute(
-                    r#"
-                UPDATE replica_cursors
-                SET resource_version = ?6, last_synced_at = ?7
-                WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5
-                "#,
-                    params![origin, key.0, key.1, key.2, key.3, resource_version, synced],
-                )
-                .map_err(|err| Self::map_sqlite(err, "advance sqlite replica cursor"))?;
                 tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite replica event"))?;
                 Ok(true)
             })
@@ -1381,6 +1385,41 @@ impl SqliteBackend {
         Ok(())
     }
 
+    pub(crate) async fn invalidate_replica_cursor_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+    ) -> Result<(), ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        let origin = origin_root.to_string();
+        self.call("invalidate replica prefix", move |connection| {
+            connection.execute("UPDATE replica_cursors SET complete_prefix = 0 WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5", params![origin, key.0, key.1, key.2, key.3])
+                .map_err(|err| Self::map_sqlite(err, "invalidate replica prefix"))?;
+            Ok(())
+        }).await
+    }
+
+    pub(crate) async fn advance_replica_cursor_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+        previous: &ReplicaCursor,
+        next: &str,
+    ) -> Result<(), ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        let origin = origin_root.to_string();
+        let previous = previous.clone();
+        let next = next.to_string();
+        self.call("advance proven replica prefix", move |connection| {
+            let changed = connection.execute(
+                "UPDATE replica_cursors SET resource_version = ?6 WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND complete_prefix = 1 AND resource_version = ?7 AND generation IS ?8",
+                params![origin, key.0, key.1, key.2, key.3, next, previous.resource_version, previous.generation],
+            ).map_err(|err| Self::map_sqlite(err, "advance replica prefix"))?;
+            if changed != 1 { return Err(ResourceError::invalid("replica prefix changed concurrently")); }
+            Ok(())
+        }).await
+    }
+
     pub(crate) async fn replica_cursor_typed<T: Resource>(
         &self,
         origin_root: &NodeId,
@@ -1393,7 +1432,7 @@ impl SqliteBackend {
                 .query_row(
                     r#"
                     SELECT resource_version, generation FROM replica_cursors
-                    WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5
+                    WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND complete_prefix = 1
                     "#,
                     params![origin, key.0, key.1, key.2, key.3],
                     |row| Ok(ReplicaCursor { resource_version: row.get(0)?, generation: row.get(1)? }),
@@ -1920,6 +1959,7 @@ impl SqliteBackend {
             })
             .await?;
 
+        let has_gap = !replay.quarantines.is_empty();
         for warning in replay.quarantines {
             tracing::warn!(
                 kind = T::API_PATHS.kind,
@@ -1929,6 +1969,13 @@ impl SqliteBackend {
                 error = %warning.error,
                 "quarantined undecodable stored resource event"
             );
+        }
+
+        if has_gap {
+            return Err(ResourceError::WatchExpired {
+                requested_version: "quarantined event leaves a sequence gap; snapshot required".to_string(),
+                compacted_through: None,
+            });
         }
 
         let replay_stream = stream::iter(replay.events.into_iter().map(Ok));
