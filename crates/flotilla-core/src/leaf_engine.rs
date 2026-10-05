@@ -665,8 +665,28 @@ impl LeafSubscriptionTable {
             }
         }
 
+        let mut last_retry_deadline = None;
         loop {
+            // A level-triggered delivery must retry even if no resource changes
+            // after the failed attempt. The durable deadline survives restart.
+            let retry_at = match &row.watcher {
+                LeafWatcher::TurnDelivery { convoy, source, .. } => convoy_objects
+                    .get(convoy)
+                    .and_then(|convoy| convoy.status.as_ref())
+                    .and_then(|status| status.turn_deliveries.get(source))
+                    .and_then(|delivery| delivery.failure.as_ref())
+                    .filter(|failure| failure.kind == flotilla_resources::TurnDeliveryFailureKind::Transient)
+                    .map(|failure| failure.retry_at)
+                    .filter(|deadline| Some(*deadline) != last_retry_deadline),
+                _ => None,
+            };
+            let retry_delay = retry_at.map_or(Duration::from_secs(86400), |at| (at - Utc::now()).to_std().unwrap_or_default());
             tokio::select! {
+                _ = tokio::time::sleep(retry_delay), if retry_at.is_some() => {
+                    // If evidence no longer fires, await its next change rather
+                    // than spinning on the already expired durable deadline.
+                    last_retry_deadline = retry_at;
+                }
                 event = convoy_watch.next() => {
                     let event = event.ok_or_else(|| ResourceError::other("convoy resource watch closed"))??;
                     apply_read_event(event, &mut convoy_objects);
@@ -840,10 +860,10 @@ impl LeafSubscriptionTable {
             return Ok(());
         }
         if status.phase == ConvoyPhase::Pending {
-            return Err(DeliveryError::permanent("wrong convoy kind or phase for turn delivery"));
+            return Err(DeliveryError::from("wrong convoy kind or phase for turn delivery".to_string()));
         }
         if !status.crew_work.get(&rule.to.vessel).is_some_and(|crew| crew.contains_key(&rule.to.role)) {
-            return Err(DeliveryError::permanent("turn-delivery target crew is absent"));
+            return Err(DeliveryError::from("turn-delivery target crew is absent".to_string()));
         }
         let claim = status.crew_work.get(&rule.to.vessel).and_then(|crew| crew.get(&rule.to.role));
         let claim_at = claim.and_then(|claim| claim.finished_at);
@@ -2892,6 +2912,17 @@ fn evaluate_row(
 
 #[cfg(test)]
 mod tests {
+    #[derive(Clone)]
+    struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("tracing scenario").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
     use std::{
         collections::BTreeMap,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -2913,6 +2944,11 @@ mod tests {
         event_sink::broadcast_test_sink,
         providers::github_api::{GithubRateLimit, GithubRateLimitKind, GithubRetrySource},
     };
+
+    fn captured_subscriber(logs: Arc<std::sync::Mutex<Vec<u8>>>, level: tracing::Level) -> impl tracing::Subscriber + Send + Sync {
+        let writer = Writer(logs);
+        tracing_subscriber::fmt().without_time().with_ansi(false).with_max_level(level).with_writer(move || writer.clone()).finish()
+    }
 
     // #2560: the inactivity bound follows the newest tool/hook evidence, not
     // total turn age or refreshed screen timestamps. Generated ages straddle
@@ -4600,45 +4636,34 @@ mod tests {
     // deadline; neither repeated ticks nor a reconstructed subscription retries early.
     #[test]
     fn delivery_failures_are_durable_and_log_once() {
-        #[derive(Clone)]
-        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Writer {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("tracing scenario").extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        for kind in 0..3 {
-            // Pending convoy, transient missing observation, and hold without a CR.
-            let permanent = kind != 1;
+        for kind in 0..5 {
+            // Pending convoy, missing observation, permanent hold failure, and timed retry.
+            let permanent = kind == 2;
             let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let writer = Writer(logs.clone());
-            let subscriber = tracing_subscriber::fmt()
-                .without_time()
-                .with_ansi(false)
-                .with_max_level(tracing::Level::WARN)
-                .with_writer(move || writer.clone())
-                .finish();
+            let subscriber = captured_subscriber(logs.clone(), tracing::Level::WARN);
             tracing::subscriber::with_default(subscriber, || {
                 tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tracing scenario").block_on(async {
                     let (backend, _, _) = project_supervision_case(&[]).await;
-                    let limit = if kind == 2 { 0 } else { 3 };
+                    let limit = if kind == 2 || kind == 3 { 0 } else { 3 };
                     let mut wake = supervision_wake_with_limit(&backend, limit);
                     let convoys = backend.using::<Convoy>("flotilla");
                     let convoy = convoys.get("stalled-work").await.expect("tracing scenario");
                     let mut status = convoy.status.expect("tracing scenario");
                     status.phase = ConvoyPhase::Landing;
-                    if kind == 0 {
+                    if kind == 0 || kind == 3 {
                         status.phase = ConvoyPhase::Pending;
                     }
                     status.crew_work.get_mut("work").expect("tracing scenario").get_mut("coder").expect("tracing scenario").finished_at =
                         Some(Utc::now() - chrono::Duration::seconds(2));
+                    let target_crew = status.crew_work["work"]["coder"].clone();
+                    if kind == 4 {
+                        status.crew_work.get_mut("work").unwrap().remove("coder");
+                    }
                     convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.expect("tracing scenario");
                     let rule = TurnDeliveryRule::builder()
-                        .on(if kind == 2 { "$issue.state == closed" } else { "$cr.checks == fail" }.parse().expect("tracing scenario"))
+                        .on(if kind == 2 || kind == 3 { "$issue.state == closed" } else { "$cr.checks == fail" }
+                            .parse()
+                            .expect("tracing scenario"))
                         .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".into()).role("coder".into()).build())
                         .brief("continue".into())
                         .hold(HoldAct::ChangeRequestComment { body: "paused".into() })
@@ -4649,7 +4674,7 @@ mod tests {
                         operator: LeafOperator::Equal,
                         literal: "fail".into(),
                     };
-                    if kind == 2 {
+                    if kind == 2 || kind == 3 {
                         let records = backend.using::<Issue>("flotilla");
                         let name = flotilla_resources::issue_record_name("github.com", "team/repo", 1);
                         let record = records
@@ -4715,6 +4740,20 @@ mod tests {
                         assert_eq!(failure.attempts, 1);
                         assert!(failure.retry_at > Utc::now());
                     }
+                    if kind == 3 {
+                        // No observation or convoy event after the watch starts:
+                        // its own deadline must re-evaluate this level-triggered leaf.
+                        let current = convoys.get("stalled-work").await.expect("convoy");
+                        let mut status = current.status.expect("status");
+                        status.turn_deliveries.get_mut("checks").unwrap().failure.as_mut().unwrap().retry_at =
+                            Utc::now() + chrono::Duration::milliseconds(30);
+                        convoys.update_status("stalled-work", &current.metadata.resource_version, &status).await.expect("deadline");
+                        let row = wake.subscriptions.rows().await.into_iter().next().expect("row");
+                        let _ = tokio::time::timeout(Duration::from_millis(150), wake.subscriptions.watch_row_once(row)).await;
+                        let status = convoys.get("stalled-work").await.unwrap().status.unwrap();
+                        assert_eq!(status.turn_deliveries["checks"].failure.as_ref().unwrap().attempts, 2);
+                        return;
+                    }
                     // Advance the durable deadline without a wall-clock sleep.
                     let current = convoys.get("stalled-work").await.expect("tracing scenario");
                     let mut status = current.status.expect("tracing scenario");
@@ -4735,7 +4774,12 @@ mod tests {
                         .find(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { source, .. } if source == "checks"))
                         .expect("tracing scenario");
                     wake.subscriptions
-                        .fire(row.id, LeafFire { subscription_id: row.id, watcher_id: uuid::Uuid::nil(), leaf, value: "fail".into() })
+                        .fire(row.id, LeafFire {
+                            subscription_id: row.id,
+                            watcher_id: uuid::Uuid::nil(),
+                            leaf: leaf.clone(),
+                            value: "fail".into(),
+                        })
                         .await;
                     let status = convoys.get("stalled-work").await.expect("tracing scenario").status.expect("tracing scenario");
                     let failure = status.turn_deliveries["checks"].failure.as_ref().expect("tracing scenario");
@@ -4743,10 +4787,28 @@ mod tests {
                     if !permanent {
                         assert_eq!(failure.retry_at.signed_duration_since(failure.failed_at), chrono::Duration::seconds(10));
                     }
+                    if kind == 0 || kind == 4 {
+                        let current = convoys.get("stalled-work").await.unwrap();
+                        let mut status = current.status.unwrap();
+                        status.phase = ConvoyPhase::Landing;
+                        status.crew_work.get_mut("work").unwrap().insert("coder".into(), target_crew);
+                        status.turn_deliveries.get_mut("checks").unwrap().failure.as_mut().unwrap().retry_at = Utc::now();
+                        convoys.update_status("stalled-work", &current.metadata.resource_version, &status).await.unwrap();
+                        wake.subscriptions
+                            .fire(row.id, LeafFire { subscription_id: row.id, watcher_id: uuid::Uuid::nil(), leaf, value: "fail".into() })
+                            .await;
+                        let status = convoys.get("stalled-work").await.unwrap().status.unwrap();
+                        let failure = status.turn_deliveries["checks"].failure.as_ref().unwrap();
+                        assert_eq!(failure.attempts, 3);
+                        assert!(
+                            !failure.reason.contains("phase") && !failure.reason.contains("crew is absent"),
+                            "recovery must get past the old failure"
+                        );
+                    }
                 });
             });
             let text = String::from_utf8(logs.lock().expect("tracing scenario").clone()).expect("tracing scenario");
-            assert_eq!(text.matches("turn delivery failed").count(), 1, "{text}");
+            assert_eq!(text.matches("turn delivery failed").count(), if kind == 0 || kind == 4 { 2 } else { 1 }, "{text}");
             assert!(text.contains("source=checks"));
         }
     }
@@ -4754,25 +4816,8 @@ mod tests {
     // #2654: unchanged operator fallback emits once across ticks, including a restart.
     #[test]
     fn unchanged_governorless_stall_logs_once() {
-        #[derive(Clone)]
-        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Writer {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("tracing scenario").extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
         let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let writer = Writer(logs.clone());
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || writer.clone())
-            .finish();
+        let subscriber = captured_subscriber(logs.clone(), tracing::Level::WARN);
         tracing::subscriber::with_default(subscriber, || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tracing scenario").block_on(async {
                 let (backend, mut wake, _) = project_supervision_case(&[]).await;
@@ -5792,25 +5837,8 @@ mod tests {
     // duplicate ticks with different crew phases but the same decision stay quiet.
     #[test]
     fn unchanged_subscription_decisions_log_once() {
-        #[derive(Clone)]
-        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Writer {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("tracing scenario").extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
         let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let writer = Writer(logs.clone());
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(move || writer.clone())
-            .finish();
+        let subscriber = captured_subscriber(logs.clone(), tracing::Level::DEBUG);
         tracing::subscriber::with_default(subscriber, || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tracing scenario").block_on(active_checks_scenario(
                 &[true],
