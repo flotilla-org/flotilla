@@ -1,4 +1,11 @@
-use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap},
+    future::Future,
+    hash::{Hash, Hasher},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use chrono::Utc;
 #[cfg(feature = "test-support")]
@@ -22,6 +29,14 @@ use super::remote_commands::RemoteCommandRouter;
 const REPLICATION_NAMESPACE: &str = "flotilla";
 // Interim anti-entropy until bucket digests avoid transferring unchanged stores.
 const REPLICATION_RESYNC: Duration = Duration::from_secs(300);
+// Stable staggering by receiver/origin/store/kind avoids fleet-roll bursts while
+// retaining a maximum five-minute repair interval. No process-global RNG state.
+fn resync_interval<T: Resource>(receiver: &NodeId, origin: &NodeId, store: ReplicationStore) -> Duration {
+    let mut hash = DefaultHasher::new();
+    (receiver, origin, store.health_kind::<T>()).hash(&mut hash);
+    REPLICATION_RESYNC.saturating_sub(Duration::from_secs(hash.finish() % 31))
+}
+
 const REPLICATION_RETRY: RetryBackoff =
     RetryBackoff { initial: Duration::from_millis(100), maximum: Duration::from_secs(30), reset_after: Duration::from_secs(60) };
 
@@ -516,7 +531,10 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
 ) -> Result<(), String> {
     let remote = ResourceBackend::Http(http).using::<T>(REPLICATION_NAMESPACE);
     let writer = store.backend(daemon).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
+    // Allow one immediate fresh listing after a watch failure; a second failure
+    // returns to supervise_kind's backoff. A stable periodic timeout resets it.
     let mut retried_watch = false;
+    let interval = resync_interval::<T>(daemon.node_id(), peer, store);
     loop {
         // A cursor is only a log position: relayed or skipped events can advance
         // it without delivering every key. Reconcile the successful complete
@@ -529,7 +547,7 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
         writer.replace(&listed, Utc::now()).await.map_err(|error| error.to_string())?;
         let watch = remote.watch(start).await.map_err(|error| error.to_string())?;
         daemon.report_resource_replication_healthy(peer, &store.health_kind::<T>()).await;
-        match tokio::time::timeout(REPLICATION_RESYNC, apply_http_watch(watch, &writer, listed.resource_version)).await {
+        match tokio::time::timeout(interval, apply_http_watch(watch, &writer, listed.resource_version)).await {
             Ok(Err(error)) if !retried_watch => {
                 debug!(%peer, kind = T::API_PATHS.kind, %error, "replica watch failed; relisting origin");
                 retried_watch = true;
@@ -623,7 +641,7 @@ async fn run_routed_watch<T: Resource>(
     let mut initial = Vec::<ResourceObject<T>>::new();
     let mut initializing = true;
 
-    let deadline = tokio::time::sleep(REPLICATION_RESYNC);
+    let deadline = tokio::time::sleep(resync_interval::<T>(daemon.node_id(), peer, store));
     tokio::pin!(deadline);
     let mut version = None;
     loop {
@@ -902,6 +920,26 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    // Resyncs remain bounded by five minutes and deterministic for one stream,
+    // but origin/store/kind/receiver identities spread otherwise simultaneous scans.
+    #[test]
+    fn resync_deadlines_are_bounded_and_staggered() {
+        let mut intervals = std::collections::HashSet::new();
+        for receiver in ["kiwi", "udder"] {
+            for origin in ["feta", "gouda", "beaufort"] {
+                for store in [ReplicationStore::Durable, ReplicationStore::Observed] {
+                    let receiver = NodeId::new(receiver);
+                    let origin = NodeId::new(origin);
+                    let interval = resync_interval::<Convoy>(&receiver, &origin, store);
+                    assert!((Duration::from_secs(270)..=Duration::from_secs(300)).contains(&interval));
+                    assert_eq!(interval, resync_interval::<Convoy>(&receiver, &origin, store));
+                    intervals.insert(interval);
+                }
+            }
+        }
+        assert!(intervals.len() > 1, "fleet streams must not all resync simultaneously");
+    }
 
     #[test]
     fn routed_replication_decodes_name_tombstones() {
