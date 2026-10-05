@@ -1087,6 +1087,9 @@ pub struct WorkflowSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TurnDeliveryStatus {
+    /// Remove this decoder default one fleet roll after delivery failures are stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<TurnDeliveryFailure>,
     #[serde(default)]
     pub episodes: Vec<TurnDeliveryEpisode>,
     /// The operator brief waiting for its target crew member's turn boundary.
@@ -1097,6 +1100,23 @@ pub struct TurnDeliveryStatus {
     /// the compatibility default one fleet roll after this field is deployed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_supervisor_turn: Option<PendingSupervisorTurn>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TurnDeliveryFailureKind {
+    Permanent,
+    Transient,
+}
+
+/// A parked permanent failure or a transient retry with a durable deadline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct TurnDeliveryFailure {
+    pub reason: String,
+    pub failed_at: DateTime<Utc>,
+    pub kind: TurnDeliveryFailureKind,
+    pub attempts: u32,
+    pub retry_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1550,6 +1570,10 @@ pub enum ConvoyStatusPatch {
         vessel: String,
         role: String,
         prompt: String,
+    },
+    FailTurnDelivery {
+        source: String,
+        failure: TurnDeliveryFailure,
     },
     RefuseTurnDelivery {
         source: String,
@@ -2077,6 +2101,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::RecordTurnDelivery { source, episode, vessel, role, prompt } => {
                 let delivery = status.turn_deliveries.entry(source.clone()).or_default();
+                delivery.failure = None;
                 if !delivery.episodes.iter().any(|existing| existing.subject_revision == episode.subject_revision) {
                     delivery.episodes.push(episode.clone());
                 }
@@ -2094,8 +2119,20 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 status.phase = ConvoyPhase::Active;
                 status.finished_at = None;
             }
+            Self::FailTurnDelivery { source, failure } => {
+                let delivery = status.turn_deliveries.entry(source.clone()).or_default();
+                let changed = delivery.failure.as_ref().is_none_or(|prior| prior.kind != failure.kind || prior.reason != failure.reason);
+                delivery.failure = Some(failure.clone());
+                // Keep unrelated settlement/operator attention and the original
+                // raised_at across backoff attempts with unchanged failure evidence.
+                if changed && status.attention.as_ref().is_none_or(|attention| attention.source == *source) {
+                    status.attention =
+                        Some(ConvoyAttention { source: source.clone(), reason: failure.reason.clone(), raised_at: failure.failed_at });
+                }
+            }
             Self::RefuseTurnDelivery { source, episode, attention } => {
                 let delivery = status.turn_deliveries.entry(source.clone()).or_default();
+                delivery.failure = None;
                 if !delivery.episodes.iter().any(|existing| existing.subject_revision == episode.subject_revision) {
                     delivery.episodes.push(episode.clone());
                 }
@@ -2630,6 +2667,33 @@ mod subject_tests {
         .apply(&mut status);
         assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Stalled);
         assert_eq!(status.stalled.expect("stall").proposed_disposition, Some(StallProposedDisposition::Fail));
+    }
+
+    #[test]
+    fn delivery_retry_preserves_original_and_unrelated_attention() {
+        let now = Utc::now();
+        let failure = TurnDeliveryFailure::builder()
+            .reason("missing observation".into())
+            .failed_at(now)
+            .kind(TurnDeliveryFailureKind::Transient)
+            .attempts(1)
+            .retry_at(now + chrono::Duration::seconds(5))
+            .build();
+        let mut status = ConvoyStatus::default();
+        ConvoyStatusPatch::FailTurnDelivery { source: "checks".into(), failure: failure.clone() }.apply(&mut status);
+        let original = status.attention.clone();
+        let retry = TurnDeliveryFailure { attempts: 2, failed_at: now + chrono::Duration::seconds(5), ..failure.clone() };
+        ConvoyStatusPatch::FailTurnDelivery { source: "checks".into(), failure: retry.clone() }.apply(&mut status);
+        assert_eq!(status.attention, original);
+        assert_eq!(status.turn_deliveries["checks"].failure.as_ref().expect("delivery retry fixture").attempts, 2);
+        let unrelated = ConvoyAttention { source: "settlement".into(), reason: "operator decision".into(), raised_at: now };
+        status.attention = Some(unrelated.clone());
+        ConvoyStatusPatch::FailTurnDelivery {
+            source: "checks".into(),
+            failure: TurnDeliveryFailure { reason: "new failure".into(), ..retry },
+        }
+        .apply(&mut status);
+        assert_eq!(status.attention, Some(unrelated));
     }
 
     #[test]

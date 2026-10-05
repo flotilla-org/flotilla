@@ -211,7 +211,7 @@ impl flotilla_core::leaf_engine::RemoteTurnDelivery for RemoteCommandRouterInner
         request: &flotilla_core::leaf_engine::TurnDeliveryRequest,
     ) -> Result<flotilla_resources::TurnDeliveryRung, String> {
         let router = RemoteCommandRouter { inner: self };
-        let command = Command::builder().action(CommandAction::DeliverCrewTurn { request: request.clone() }).build();
+        let command = Command::builder().action(CommandAction::DeliverCrewTurn { request: Box::new(request.clone()) }).build();
         // Controller deliveries have no interactive surface. Pending commands
         // and their oneshots are keyed by unique request_id, not session_id;
         // session_id is used only for query projection at the receiver.

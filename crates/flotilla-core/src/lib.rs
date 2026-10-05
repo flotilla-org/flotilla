@@ -20,6 +20,7 @@ pub mod convoy_branch_refresh;
 pub mod convoy_ensure;
 pub mod daemon;
 pub mod data;
+pub mod decision_log;
 pub mod demand_lifecycle;
 pub mod environment_manager;
 pub mod event_sink;

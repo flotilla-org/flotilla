@@ -269,6 +269,7 @@ async fn actuator_refuses_delivery_and_hold_after_service_stops() {
         role: "coder".into(),
         brief: "continue".into(),
         subject_revision: "head".into(),
+        subject: None,
         sender: CrewMessageSender::FlotillaNudge,
     };
     assert_eq!(actuator.deliver(&request).await.expect_err("stopped delivery"), "daemon stopped before turn delivery");
@@ -414,4 +415,37 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
         assert!(unscoped.project.is_none());
         assert!(unscoped.project_error.is_none());
     });
+}
+
+// #2654: hold resolution follows produced/adopted subjects, including discovered
+// PRs with no legacy binding. Explicit firing identity wins when there are many.
+#[tokio::test]
+async fn turn_hold_resolves_discovered_pr_without_legacy_binding() {
+    let (_, backend, _, _) = fixture(CrewWorkPhase::Done).await;
+    let mut convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("hold subject scenario");
+    convoy.spec.change_request = None;
+    let subject = flotilla_protocol::Subject {
+        kind: flotilla_protocol::SubjectKind::ChangeRequest,
+        source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "team/repo".into() },
+        id: "2643".into(),
+    };
+    assert!(turn_hold_subject(&convoy, None).is_err());
+    convoy.status.as_mut().expect("hold subject scenario").discover_subject(
+        subject.clone(),
+        flotilla_protocol::Relationship::Produces,
+        flotilla_resources::SubjectDiscoverySource::Claim,
+        Utc::now(),
+    );
+    assert_eq!(turn_hold_subject(&convoy, None).expect("hold subject scenario"), subject);
+    let other = flotilla_protocol::Subject { id: "42".into(), ..subject.clone() };
+    convoy.status.as_mut().expect("hold subject scenario").discover_subject(
+        other,
+        flotilla_protocol::Relationship::Produces,
+        flotilla_resources::SubjectDiscoverySource::Claim,
+        Utc::now(),
+    );
+    assert!(turn_hold_subject(&convoy, None).is_err(), "ambiguous holds must not comment on an arbitrary PR");
+    assert_eq!(turn_hold_subject(&convoy, Some(&subject)).expect("hold subject scenario"), subject);
+    let issue = flotilla_protocol::Subject { kind: flotilla_protocol::SubjectKind::Issue, ..subject };
+    assert!(turn_hold_subject(&convoy, Some(&issue)).is_err());
 }

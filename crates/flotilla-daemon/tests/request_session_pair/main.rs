@@ -3542,7 +3542,7 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
             .build();
         let error = topology
             .client
-            .execute(Command::builder().action(CommandAction::DeliverCrewTurn { request }).build())
+            .execute(Command::builder().action(CommandAction::DeliverCrewTurn { request: Box::new(request) }).build())
             .await
             .expect_err("clients cannot submit internal controller commands");
         assert!(error.contains("internal controller command"), "{error}");
@@ -3677,7 +3677,7 @@ async fn internal_turn_delivery_rejects_non_controller_sender() {
             .build();
         let mut events = daemon.subscribe();
         let id = daemon
-            .execute(Command::builder().action(CommandAction::DeliverCrewTurn { request }).build())
+            .execute(Command::builder().action(CommandAction::DeliverCrewTurn { request: Box::new(request) }).build())
             .await
             .expect("receiver accepts envelope");
         let result = await_command_result(&mut events, id).await;
@@ -3702,7 +3702,7 @@ async fn internal_turn_delivery_rejects_forwarded_client_caller() {
         CommandCaller { principal_ref: PrincipalRef { namespace: "flotilla".into(), name: "client".into() }, process: None, crew: None };
     let mut events = daemon.subscribe();
     let id = daemon
-        .execute_for_caller(Command::builder().action(CommandAction::DeliverCrewTurn { request }).build(), Some(caller))
+        .execute_for_caller(Command::builder().action(CommandAction::DeliverCrewTurn { request: Box::new(request) }).build(), Some(caller))
         .await
         .expect("receiver accepts envelope");
     let result = await_command_result(&mut events, id).await;

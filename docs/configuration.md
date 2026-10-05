@@ -302,9 +302,15 @@ remains host-local. Configure the filter and rotation bounds in that host's
 ```toml
 [logging]
 filter = "info,flotilla_daemon::peer=debug"
-max_bytes = 10485760
-generations = 4
+max_bytes = 52428800
+generations = 9
 ```
+
+The defaults shown retain ten files of 50 MiB each (500 MiB maximum). At the
+incident's pre-fix rate of 10 MiB per half-hour that is roughly 25 hours;
+transition-only decisions should extend this substantially. Size retention
+has no age guarantee: verify a 10 MiB sample spans several hours on feta after
+deployment. Existing explicit rotation settings still override these defaults.
 
 The filter uses `RUST_LOG` directive syntax. When it is omitted, the daemon
 uses `RUST_LOG` and then its built-in defaults. Restart the daemon after
