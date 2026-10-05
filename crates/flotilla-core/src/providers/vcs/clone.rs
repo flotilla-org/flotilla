@@ -107,36 +107,30 @@ impl ReferenceCloneStrategy {
             )
             .await
             .is_ok();
-        let provenance = if local_exists || remote_exists {
-            self.runner
-                .run(
-                    "git",
-                    &["clone", "--reference", reference_dir, "--branch", branch, &remote_url, target],
-                    std::path::Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
-            CheckoutBranchProvenance::PreExisting
-        } else {
-            let base = base_ref.ok_or_else(|| format!("branch {branch} does not exist and no base ref was supplied"))?;
-            self.runner
-                .run(
-                    "git",
-                    &["clone", "--reference", reference_dir, "--no-checkout", &remote_url, target],
-                    std::path::Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
-            self.runner
-                .run(
-                    "git",
-                    &["-C", target, "checkout", "-b", branch, &format!("origin/{base}")],
-                    std::path::Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
-            CheckoutBranchProvenance::CreatedForConvoy
-        };
+        if local_exists || remote_exists {
+            return Err(format!("checkout branch {branch} already exists; choose a fresh branch name"));
+        }
+        if !GitCliBackend::new(std::path::Path::new("/"), &*self.runner).remote_heads(&remote_url, &local_ref).await?.trim().is_empty() {
+            return Err(format!("checkout branch {branch} already exists on remote; choose a fresh branch name"));
+        }
+        let base = base_ref.ok_or_else(|| format!("branch {branch} does not exist and no base ref was supplied"))?;
+        self.runner
+            .run(
+                "git",
+                &["clone", "--reference", reference_dir, "--no-checkout", &remote_url, target],
+                std::path::Path::new("/"),
+                &ChannelLabel::Default,
+            )
+            .await?;
+        self.runner
+            .run(
+                "git",
+                &["-C", target, "checkout", "-b", branch, &format!("origin/{base}")],
+                std::path::Path::new("/"),
+                &ChannelLabel::Default,
+            )
+            .await?;
+        let provenance = CheckoutBranchProvenance::CreatedForConvoy;
         let backend = GitCliBackend::checkout_root(target_path, &*self.runner);
         let commit = backend.head_commit_text().await?.trim().to_string();
         if provenance == CheckoutBranchProvenance::CreatedForConvoy {

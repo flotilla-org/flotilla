@@ -1159,3 +1159,32 @@ async fn fresh_failed_change_request_lookup_waits_for_the_landing_ttl_before_ret
     assert!(matches!(deps, CheckoutPrepared::None));
     assert_eq!(*runtime.inspections.lock().expect("inspections lock"), 0, "forge failures should be rate-limited by the TTL");
 }
+
+// #2698: a convoy checkout cannot reuse another live Checkout's requested
+// branch, including while that other checkout is still pending materialisation.
+#[tokio::test]
+async fn convoy_checkout_refuses_branch_held_by_checkout() {
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let checkouts = backend.using::<Checkout>(NAMESPACE);
+    let spec = CheckoutSpec::Worktree(
+        CheckoutWorktreeSpec::builder()
+            .clone_ref("clone".into())
+            .r#ref("reused".into())
+            .base_ref("main".into())
+            .target_path("/checkout/new".into())
+            .env_ref("host".into())
+            .repo_ref(RepositoryKey(repo_key(REPO_URL)))
+            .build(),
+    );
+    checkouts.create(&meta("old"), &spec).await.expect("existing checkout");
+    let checkout = checkouts
+        .create(
+            &InputMeta::builder().name("new".into()).labels(BTreeMap::from([(CONVOY_LABEL.into(), "new-convoy".into())])).build(),
+            &spec,
+        )
+        .await
+        .expect("new checkout");
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE);
+    let prepared = reconciler.prepare(&checkout).await.expect("prepare");
+    assert!(matches!(prepared, CheckoutPrepared::Failed(message) if message.contains("reused") && message.contains("old")));
+}

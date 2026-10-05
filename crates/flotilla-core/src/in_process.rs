@@ -3399,6 +3399,105 @@ impl InProcessDaemon {
         }
     }
 
+    /// Creation requires a fresh forge lookup: a cached absence must not
+    /// authorize reusing a branch whose earlier request has since closed.
+    pub async fn validate_new_checkout_branch(&self, checkout: &ResourceObject<ResourceCheckout>) -> Result<(), String> {
+        let namespace = self.provisioning_namespace().await;
+        let repository = self
+            .resource_backend
+            .including_replicas::<Repository>(&namespace)
+            .get(&checkout.spec.repo_ref().to_string())
+            .await
+            .map_err(|error| error.to_string())?
+            .object;
+        if repository
+            .spec
+            .forge()
+            .is_none_or(|forge| !forge.service_url.starts_with("https://") && !forge.service_url.starts_with("http://"))
+        {
+            return Ok(());
+        }
+        let (candidates, failures) =
+            self.convoy_admission.repository_change_request_candidates(std::slice::from_ref(checkout.spec.repo_ref())).await;
+        if let Some(error) = failures.into_iter().next() {
+            return Err(error);
+        }
+        for (_, _, provider) in candidates {
+            if let Some((id, request)) =
+                provider.find_change_request_by_branch(checkout.spec.branch()).await.map_err(|error| error.to_string())?
+            {
+                return Err(format!(
+                    "checkout branch {} conflicts with {:?} change request #{}; choose a fresh branch name",
+                    checkout.spec.branch(),
+                    request.status,
+                    id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a checkout's PR from live VCS facts rather than its provisioning ref.
+    /// New automatic associations require an open request; terminal requests are
+    /// retained only when this checkout already observed them while open or has
+    /// merge evidence dating from its own lifetime.
+    pub async fn resolve_live_checkout_change_request(
+        &self,
+        checkout: &ResourceObject<ResourceCheckout>,
+        vcs: &dyn crate::vcs::Vcs,
+        path: &Path,
+    ) -> Result<Option<String>, String> {
+        let namespace = self.provisioning_namespace().await;
+        let repository = self
+            .resource_backend
+            .including_replicas::<Repository>(&namespace)
+            .get(&checkout.spec.repo_ref().to_string())
+            .await
+            .map_err(|error| error.to_string())?
+            .object;
+        if repository
+            .spec
+            .forge()
+            .is_none_or(|forge| !forge.service_url.starts_with("https://") && !forge.service_url.starts_with("http://"))
+        {
+            return Ok(None);
+        }
+        let branch = vcs.read_repository(path, crate::vcs::RepositoryRead::CurrentBranch).await?;
+        let mut branches = vec![branch.trim().to_string()];
+        if let Ok(upstream) = vcs.read_repository(path, crate::vcs::RepositoryRead::UpstreamOf("@{upstream}")).await {
+            let remote = vcs.read_repository(path, crate::vcs::RepositoryRead::TrackedRemote(branch.trim())).await?;
+            let upstream = upstream.trim();
+            let upstream_branch =
+                if remote.trim() == "." { upstream } else { upstream.strip_prefix(&format!("{}/", remote.trim())).unwrap_or(upstream) };
+            if !branches.iter().any(|candidate| candidate == upstream_branch) {
+                branches.push(upstream_branch.to_string());
+            }
+        }
+        for branch in branches.into_iter().filter(|branch| !branch.is_empty() && branch != "HEAD") {
+            if let Some(request) = self.resolve_convoy_change_request(std::slice::from_ref(checkout.spec.repo_ref()), &branch, None).await?
+            {
+                let terminal = matches!(
+                    request.status,
+                    flotilla_protocol::ChangeRequestStatus::Merged | flotilla_protocol::ChangeRequestStatus::Closed
+                );
+                let prior = checkout.status.as_ref().map(|status| &status.integration);
+                let previously_open = prior
+                    .and_then(|integration| integration.change_request.as_ref())
+                    .is_some_and(|observed| observed.id == request.id && observed.state != flotilla_resources::ChangeRequestState::Merged);
+                let merged_during_checkout = prior
+                    .and_then(|integration| integration.landed_evidence.as_ref())
+                    .filter(|evidence| evidence.change_request_id == request.id)
+                    .and_then(|evidence| evidence.merged_at.as_deref())
+                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                    .is_some_and(|at| at >= checkout.metadata.creation_timestamp);
+                if !terminal || previously_open || merged_during_checkout {
+                    return Ok(Some(request.id));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Persist every branch-matching PR across the convoy's repositories.
     /// Successful lookups are written even when another repository lookup fails;
     /// the first error is returned after those writes.
@@ -3464,21 +3563,22 @@ impl InProcessDaemon {
             }
         }
         for repository in &convoy.spec.repositories {
-            // A checkout observation already identifies this repository's PR.
-            // Reuse that durable fact instead of spending another provider lookup.
-            if observed_subjects.iter().any(|subject| {
-                change_request_address_with_forges(&repository.url, &subject.id, &forges)
-                    .ok()
-                    .and_then(|address| flotilla_protocol::Subject::from_leaf(&address))
-                    .is_some_and(|candidate| candidate == *subject)
-            }) {
+            // Once a checkout exists, its owning environment resolves live
+            // branch/upstream facts. The provisioning ref is no longer evidence
+            // of the branch the crew is working on, even before it opens a PR.
+            if checkouts.values().any(|checkout| checkout.spec.repo_ref() == &repository.repo_ref) {
                 continue;
             }
             if let Some((_, result)) =
                 resolution.and_then(|refresh| refresh.repositories.iter().find(|(key, _)| key == &repository.repo_ref))
             {
                 match result {
-                    Ok(Some(request)) => {
+                    Ok(Some(request))
+                        if matches!(
+                            request.status,
+                            flotilla_protocol::ChangeRequestStatus::Open | flotilla_protocol::ChangeRequestStatus::Draft
+                        ) =>
+                    {
                         let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
                         if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
                             if should_discover(&subject) {
@@ -3486,13 +3586,18 @@ impl InProcessDaemon {
                             }
                         }
                     }
-                    Ok(None) => {}
+                    Ok(_) => {}
                     Err(error) => errors.push(error.clone()),
                 }
                 continue;
             }
             match self.resolve_convoy_change_request(std::slice::from_ref(&repository.repo_ref), branch, None).await {
-                Ok(Some(request)) => {
+                Ok(Some(request))
+                    if matches!(
+                        request.status,
+                        flotilla_protocol::ChangeRequestStatus::Open | flotilla_protocol::ChangeRequestStatus::Draft
+                    ) =>
+                {
                     let address = change_request_address_with_forges(&repository.url, &request.id, &forges)?;
                     if let Some(subject) = flotilla_protocol::Subject::from_leaf(&address) {
                         if should_discover(&subject) {
@@ -3500,7 +3605,7 @@ impl InProcessDaemon {
                         }
                     }
                 }
-                Ok(None) => {}
+                Ok(_) => {}
                 Err(error) => errors.push(error),
             }
         }

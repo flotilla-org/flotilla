@@ -1160,6 +1160,12 @@ impl Vcs for FlotillaVcs {
                 provenance: CheckoutBranchProvenance::PreExisting,
             });
         }
+        if branch != "HEAD" {
+            let advertised = GitCliBackend::new(Path::new("/"), &*self.runner).remote_heads(url, &format!("refs/heads/{branch}")).await?;
+            if !advertised.trim().is_empty() {
+                return Err(format!("checkout branch {branch} already exists on remote; choose a fresh branch name"));
+            }
+        }
         let staging = format!("{target}.flotilla-clone-partial");
         remove_worktree_path(&*self.runner, &staging).await?;
         let clone_ref = base_ref.unwrap_or(branch);
@@ -1627,23 +1633,20 @@ impl VcsBackend for GitCliBackend<'_> {
                 .await
                 .map_err(|error| format!("inspect remote convoy branch {branch}: {error}"))?;
             if !advertised.trim().is_empty() {
-                let refspec = format!("{remote_head}:refs/remotes/origin/{branch}");
-                self.fetch("origin", &refspec).await.map_err(|error| format!("fetch convoy branch {branch}: {error}"))?;
+                return Err(format!("checkout branch {branch} already exists on remote; choose a fresh branch name"));
             }
         }
         let remote_exists = self.ref_exists(&remote_ref).await;
+        if local_exists || remote_exists {
+            return Err(format!("checkout branch {branch} already exists; choose a fresh branch name"));
+        }
         let provenance = if !local_exists && !remote_exists && base_ref.is_some() {
             CheckoutBranchProvenance::CreatedForConvoy
         } else {
             CheckoutBranchProvenance::PreExisting
         };
 
-        if local_exists {
-            // Sibling vessels can intentionally attach to one convoy branch.
-            self.worktree_add(WorktreeAdd::ExistingLocal { target, branch }).await?;
-        } else if remote_exists {
-            self.worktree_add(WorktreeAdd::TrackingRemote { target, branch }).await?;
-        } else if let Some(base_ref) = base_ref {
+        if let Some(base_ref) = base_ref {
             let remote_base_ref = format!("refs/remotes/origin/{base_ref}");
             if has_origin {
                 // A force refspec catches a rebased or force-pushed base branch.
@@ -1956,6 +1959,34 @@ mod tests {
         let mut vcs = FlotillaVcs::new(ExecutionEnvironmentPath::new(cwd), runner, strategy);
         vcs.explicit_checkout = explicit;
         vcs
+    }
+
+    // #2698: a new convoy checkout must refuse an existing branch, whether
+    // unoccupied or held by another worktree, without adopting its stale tip.
+    #[tokio::test]
+    async fn convoy_checkout_refuses_reused_branch() {
+        for occupied in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            git(root, &["init", "-b", "main"]);
+            git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+            git(root, &["switch", "-c", "reused"]);
+            git(root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "old convoy tip"]);
+            git(root, &["switch", "main"]);
+            if occupied {
+                git(root, &["worktree", "add", root.join("old").to_str().expect("old path"), "reused"]);
+            }
+            let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+            let vcs = test_fl(root, runner, true);
+            let target = root.join("new");
+            let error = vcs
+                .materialise_checkout("reused", Some("main"), target.to_str().expect("target"), "flotilla-managed: convoy/new")
+                .await
+                .err()
+                .expect("existing branch must be refused");
+            assert!(error.contains("reused"), "conflict must name the branch: {error}");
+            assert!(!target.exists(), "refusal must not create a checkout");
+        }
     }
 
     #[tokio::test]
