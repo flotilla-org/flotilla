@@ -1,0 +1,25 @@
+[
+ {
+  "Id": "dbb8a5519c4d1f0529c9ac380b9e61b51b75275359dc2e282a61370deab3a12d",
+  "Name": "/flotilla-env-env-convoy-5e84a210e5a64a4b880dc9467945f0f5-work",
+  "State": {
+   "Status": "exited",
+   "Running": false,
+   "Paused": false,
+   "Restarting": false,
+   "OOMKilled": false,
+   "Dead": false,
+   "Pid": 0,
+   "ExitCode": 137,
+   "Error": "",
+   "StartedAt": "2026-10-05T10:00:42.035517987Z",
+   "FinishedAt": "2026-10-05T10:13:16.373085004Z"
+  },
+  "HostConfig": {
+   "Memory": 0,
+   "MemorySwap": 0,
+   "NanoCpus": 8000000000,
+   "Init": true
+  }
+ }
+]

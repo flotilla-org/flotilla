@@ -79,6 +79,11 @@ async fn environment_actuator_translates_mounts_into_provider_create_opts() {
         vec![("GITHUB_TOKEN".to_string(), "secret".to_string())],
     );
     let spec = DockerEnvironmentSpec {
+        memory_policy: flotilla_resources::EnvironmentMemoryPolicy {
+            host_memory_percent: 30,
+            expected_concurrent_crews: 3,
+            swap_bytes: 1_073_741_824,
+        },
         host_ref: "01HXYZ".to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
         declared_agent_adapters: Default::default(),
@@ -96,6 +101,7 @@ async fn environment_actuator_translates_mounts_into_provider_create_opts() {
 
     assert_eq!(opts.provisioned_mounts, vec![ProvisionedMount::new("/Users/alice/dev/flotilla", "/workspace", ProvisionedMountMode::Rw)]);
     assert_eq!(opts.image_pull_policy, ImagePullPolicy::Never);
+    assert_eq!(opts.memory_policy, spec.memory_policy);
     assert_eq!(opts.tokens, vec![("GITHUB_TOKEN".to_string(), "secret".to_string())]);
 }
 

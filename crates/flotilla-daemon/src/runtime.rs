@@ -1888,7 +1888,26 @@ async fn reconcile_provisioned_environment(
     let Some(handle) = handle else {
         return fail_unavailable_environment(state, namespace, &env_id, &format!("Docker container {container_id} is not running")).await;
     };
-    match handle.status().await {
+    let status = handle.status().await;
+    let observation = match handle.runtime_observation().await {
+        Ok(observation) => observation,
+        Err(error)
+            if matches!(status, Ok(flotilla_protocol::EnvironmentStatus::Stopped | flotilla_protocol::EnvironmentStatus::Failed(_))) =>
+        {
+            // Richer evidence is best effort once liveness establishes death.
+            // Keep existing samples and fail backing rather than retry forever.
+            warn!(container = %container_id, %error, "terminal backing observation unavailable");
+            None
+        }
+        Err(error) => return Err(format!("Docker container {container_id} observation failed: {error}; will retry")),
+    };
+    if let Some(observation) = &observation {
+        record_environment_observation(state, namespace, &env_id, observation).await?;
+    }
+    if let Some(termination) = observation.as_ref().and_then(|observation| observation.termination.as_ref()) {
+        return fail_unavailable_environment(state, namespace, &env_id, &format!("Docker container {container_id} {termination}")).await;
+    }
+    match status {
         Ok(flotilla_protocol::EnvironmentStatus::Running) => {}
         Ok(status @ (flotilla_protocol::EnvironmentStatus::Stopped | flotilla_protocol::EnvironmentStatus::Failed(_))) => {
             return fail_unavailable_environment(
@@ -1897,7 +1916,7 @@ async fn reconcile_provisioned_environment(
                 &env_id,
                 &format!("Docker container {container_id} is not running (status: {status:?})"),
             )
-            .await
+            .await;
         }
         Ok(status) => {
             return Err(format!("Docker container {container_id} for environment {env_id} is not ready (status: {status:?}); will retry"))
@@ -2304,6 +2323,64 @@ fn github_app_scope_from_grants(
     scope
 }
 
+/// Persist diagnostics before marking backing failed: dependency watchers may
+/// immediately start teardown, and neither inspect nor cgroup evidence survives it.
+async fn record_environment_observation(
+    state: &ControllerRuntimeState,
+    namespace: &str,
+    env_id: &EnvironmentId,
+    observation: &flotilla_protocol::EnvironmentRuntimeObservation,
+) -> Result<(), String> {
+    use flotilla_resources::apply_status_patch;
+    let backend = state.daemon.resource_backend();
+    let environments = backend.using::<Environment>(namespace);
+    let environment = environments.get(env_id.as_str()).await.map_err(|error| error.to_string())?;
+    if let Some(observation) =
+        changed_runtime_observation(environment.status.as_ref().and_then(|status| status.runtime_observation.as_ref()), observation)
+    {
+        apply_status_patch(&environments, env_id.as_str(), &EnvironmentStatusPatch::ObserveRuntime { observation })
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let vessels = backend.using::<Vessel>(namespace);
+    for vessel in vessels.list().await.map_err(|error| error.to_string())?.items {
+        if vessel.status.as_ref().and_then(|status| status.environment_ref.as_deref()) != Some(env_id.as_str()) {
+            continue;
+        }
+        if let Some(observation) =
+            changed_runtime_observation(vessel.status.as_ref().and_then(|status| status.runtime_observation.as_ref()), observation)
+        {
+            apply_status_patch(&vessels, &vessel.metadata.name, &VesselStatusPatch::ObserveRuntime { observation })
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Keep a sample's original timestamp while its value is unchanged. Compare
+/// each dependent independently so newly attached vessels still get their first
+/// observation even when the Environment already has the same evidence.
+fn changed_runtime_observation(
+    current: Option<&flotilla_protocol::EnvironmentRuntimeObservation>,
+    incoming: &flotilla_protocol::EnvironmentRuntimeObservation,
+) -> Option<flotilla_protocol::EnvironmentRuntimeObservation> {
+    let mut merged = current.cloned().unwrap_or_default();
+    merged.merge(incoming);
+    if let Some(current) = current {
+        if merged.container_id == current.container_id
+            && merged.started_at == current.started_at
+            && merged.memory_usage_bytes == current.memory_usage_bytes
+        {
+            merged.memory_observed_at.clone_from(&current.memory_observed_at);
+        }
+        if &merged == current {
+            return None;
+        }
+    }
+    Some(merged)
+}
+
 async fn fail_unavailable_environment(
     state: &Arc<ControllerRuntimeState>,
     namespace: &str,
@@ -2315,6 +2392,31 @@ async fn fail_unavailable_environment(
     if let Some(container_id) = registered_container {
         state.provisioned_environments.lock().await.remove(&container_id);
     }
+    let mut retained_paths = Vec::new();
+    let backend = state.daemon.resource_backend();
+    for vessel in backend.using::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?.items {
+        let Some(status) = vessel.status.as_ref().filter(|status| status.environment_ref.as_deref() == Some(env_id.as_str())) else {
+            continue;
+        };
+        for checkout in status.checkout_refs.values() {
+            match backend.using::<Checkout>(namespace).get(checkout).await {
+                Ok(checkout) => {
+                    if let Some(path) = checkout.status.as_ref().and_then(|status| status.path.clone()) {
+                        retained_paths.push(path);
+                    }
+                }
+                Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+    retained_paths.sort();
+    retained_paths.dedup();
+    let message = if retained_paths.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message}; recover work from retained checkout(s): {}", retained_paths.join(", "))
+    };
     flotilla_resources::apply_status_patch(
         &state.daemon.resource_backend().using::<Environment>(namespace),
         env_id.as_str(),
@@ -2611,6 +2713,7 @@ async fn ensure_default_policies(backend: &ResourceBackend, namespace: &str, pro
             &PlacementPolicySpec::builder()
                 .pool(profile.docker_pool.clone())
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    memory_policy: Default::default(),
                     host_ref: profile.host_id.clone(),
                     image: DEFAULT_DOCKER_IMAGE.to_string().into(),
                     pull_policy: Default::default(),
@@ -4544,6 +4647,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
                 tools,
                 prepared_auth,
                 cpu_limit: Some(jobs),
+                memory_policy: spec.memory_policy.clone(),
             })
             .await
         {
@@ -6894,6 +6998,7 @@ mod tests {
         let repository = flotilla_resources::RepositoryKey("github.com-flotilla-org-flotilla".to_string());
         let expected = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository]))]);
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            memory_policy: Default::default(),
             host_ref: "host-a".to_string(),
             image: "crew:latest".to_string(),
             declared_agent_adapters: BTreeSet::new(),
@@ -8524,6 +8629,7 @@ mod tests {
             .with_environment_tools(with_fourth_tool(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::new(),
@@ -8628,6 +8734,7 @@ mod tests {
             )),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::new(),
@@ -8762,6 +8869,7 @@ mod tests {
         );
         let credential_refs = BTreeSet::from(["claude-max".to_string(), "github-crew-pr".to_string()]);
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::new(),
@@ -8846,6 +8954,7 @@ mod tests {
             .with_agent_material(agent_material),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
@@ -8936,6 +9045,7 @@ mod tests {
                 .create(&empty_meta(name), &EnvironmentSpec {
                     host_direct: None,
                     docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                        memory_policy: Default::default(),
                         host_ref: "host-test".to_string(),
                         image: "test".to_string(),
                         declared_agent_adapters: required.clone(),
@@ -9041,6 +9151,7 @@ mod tests {
             .with_agent_material(agent_material),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
@@ -9125,6 +9236,7 @@ mod tests {
             .with_agent_material(agent_material),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "registry.example/crew:latest".to_string(),
             declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
@@ -9225,6 +9337,7 @@ mod tests {
                 state.with_credential_store(credential_store)
             });
             let spec = flotilla_resources::DockerEnvironmentSpec {
+                memory_policy: Default::default(),
                 host_ref: "host-test".to_string(),
                 image: "registry.example/crew:latest".to_string(),
                 declared_agent_adapters: BTreeSet::new(),
@@ -9468,6 +9581,7 @@ mod tests {
                 &flotilla_resources::EnvironmentSpec {
                     host_direct: None,
                     docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                        memory_policy: Default::default(),
                         host_ref: "host-test".to_string(),
                         image: "contained-image".to_string(),
                         declared_agent_adapters: BTreeSet::new(),
@@ -9548,6 +9662,7 @@ mod tests {
             "host-direct-host-test".to_string(),
         ));
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::new(),
@@ -9598,6 +9713,7 @@ mod tests {
             .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf())),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::new(),
@@ -9620,6 +9736,7 @@ mod tests {
         assert!(provider.create_opts.lock().await.is_none(), "reserved mount collisions should fail before invoking the provider");
 
         let cli_collision_spec = flotilla_resources::DockerEnvironmentSpec {
+            memory_policy: Default::default(),
             mounts: vec![flotilla_resources::EnvironmentMount {
                 source_path: "/host/replacement-flotilla".to_string(),
                 target_path: "/usr/local/bin/flotilla".to_string(),
@@ -11102,6 +11219,7 @@ mod tests {
             PlacementPolicySpec::builder()
                 .pool("passthrough".to_string())
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    memory_policy: Default::default(),
                     host_ref: feta_host_ref.clone(),
                     image: "test-image".to_string().into(),
                     pull_policy: Default::default(),
@@ -11296,6 +11414,7 @@ mod tests {
         assert!(registered.agent_adapters.get("claude-code").is_some());
 
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::from(["codex".to_string(), "missing-adapter".to_string()]),
@@ -11320,6 +11439,7 @@ mod tests {
             .create(&empty_meta(name), &EnvironmentSpec {
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    memory_policy: Default::default(),
                     host_ref,
                     image: "contained-image".to_string(),
                     declared_agent_adapters,
@@ -12071,6 +12191,7 @@ mod tests {
             .create(&empty_meta(orphaned_id.as_str()), &EnvironmentSpec {
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    memory_policy: Default::default(),
                     host_ref: "deleted-host".to_string(),
                     image: "contained-image".to_string(),
                     declared_agent_adapters: BTreeSet::new(),
@@ -12205,6 +12326,7 @@ mod tests {
             .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf())),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
             declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
@@ -14755,6 +14877,7 @@ mod tests {
         let docker_spec = PlacementPolicySpec::builder()
             .pool("cleat".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                memory_policy: Default::default(),
                 host_ref: "udder".to_string(),
                 image: "crew:test".into(),
                 pull_policy: Default::default(),
@@ -14873,6 +14996,7 @@ mod tests {
             let spec = PlacementPolicySpec::builder()
                 .pool("cleat".to_string())
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    memory_policy: Default::default(),
                     host_ref: host.to_string(),
                     image: "crew:test".into(),
                     pull_policy: Default::default(),
@@ -14888,6 +15012,7 @@ mod tests {
             let mut spec = PlacementPolicySpec::builder().pool("cleat".to_string()).build();
             if docker {
                 spec.docker_per_vessel = Some(DockerPerVesselPlacementPolicySpec {
+                    memory_policy: Default::default(),
                     host_ref: host.to_string(),
                     image: "ubuntu:24.04".into(),
                     pull_policy: Default::default(),
@@ -14936,6 +15061,7 @@ mod tests {
         invalid.host_direct =
             Some(HostDirectPlacementPolicySpec { host_ref: "kiwi".to_string(), checkout: HostDirectPlacementPolicyCheckout::Worktree });
         invalid.docker_per_vessel = Some(DockerPerVesselPlacementPolicySpec {
+            memory_policy: Default::default(),
             host_ref: "kiwi".to_string(),
             image: "crew:test".into(),
             pull_policy: Default::default(),
@@ -15080,6 +15206,7 @@ mod tests {
                     .pool("operator-edited-pool".to_string())
                     .priority(20)
                     .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                        memory_policy: Default::default(),
                         host_ref: "operator-edited-host".to_string(),
                         image: "operator/image:latest".to_string().into(),
                         pull_policy: flotilla_resources::DockerImagePullPolicy::Never,
@@ -15102,6 +15229,7 @@ mod tests {
         assert_eq!(
             reconciled.spec.docker_per_vessel,
             Some(DockerPerVesselPlacementPolicySpec {
+                memory_policy: Default::default(),
                 host_ref: profile.host_id,
                 image: "operator/image:latest".to_string().into(),
                 pull_policy: flotilla_resources::DockerImagePullPolicy::Never,
@@ -16481,4 +16609,5 @@ mod tests {
             let _ = handle.await;
         }
     }
+    mod memory_tests;
 }

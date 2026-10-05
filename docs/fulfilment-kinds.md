@@ -39,3 +39,50 @@ an unavailable pool reports zero free slots.
 `flotilla fulfilment list`, `flotilla host list`, and the TUI fleet pane use
 these same Host facts. They are observations, not admissions; the policy based
 admission path remains active in A1.
+
+## Contained crew memory budgets
+
+The Docker placement policy carries `docker_per_vessel.memory_policy`:
+
+```yaml
+memory_policy:
+  host_memory_percent: 50
+  expected_concurrent_crews: 4
+  swap_bytes: 0
+```
+
+Every newly provisioned Docker crew gets a hard RAM limit of
+`Docker MemTotal × host_memory_percent / 100 / expected_concurrent_crews`.
+The default assigns one eighth of host RAM per crew and reserves half of the
+host's RAM for services and interactive workloads at the expected concurrency.
+This is a quota, not an admission reservation: operators must size expected
+concurrency for the crews and other workloads they permit on that host.
+`swap_bytes` is additional swap per crew. Its default disables swap; Docker's
+`--memory-swap` receives RAM plus swap, not the swap amount alone.
+Zero concurrency, percentages outside 1–100, budgets below Docker's 6 MiB
+minimum, unknown capacity, and unsupported memory/swap enforcement refuse
+provisioning. Existing containers retain their original limits until replaced.
+Policy snapshots freeze the budget for admitted work, and registration preserves
+operator-authored budgets.
+
+Environment and Vessel status carry `runtime_observation`; Convoy status and
+`convoy explain` retain per-vessel `environment_observations`. Observations include
+configured limits, last successful cgroup RAM usage with its timestamp, and exit
+code, inferred signal, Docker `OOMKilled`, cause and supporting journal evidence.
+On Linux with the systemd cgroup v2 driver, RAM usage is sampled from
+`memory.current`. Unchanged usage retains its original sample timestamp and does
+not trigger status writes; changed usage or other evidence does. Unavailable
+cgroups preserve the previous sample; missing
+samples stay unknown. Exit 137 alone proves neither a kernel OOM nor an oomd
+kill. Host attribution requires a full container ID match in the kill record,
+inside the container's start-to-finish journal window. Journal access is best
+effort; unavailable evidence leaves the kill cause unknown. Conventional exit
+143 is classified as a normal SIGTERM stop (including external SIGTERM; inspect
+cannot identify who sent it), but a stop of backing that should be
+Ready still fails the vessel. Dirty work remains protected by existing reclaim
+checks, and the failure message lists retained checkout paths for recovery.
+
+The operator acceptance check after deployment is to run a deliberately
+memory-hungry crew, confirm it hits its own cgroup limit, and confirm
+`convoy explain` reports the limits and `cgroup_oom` death cause. This check must
+not run as part of unit tests or CI.

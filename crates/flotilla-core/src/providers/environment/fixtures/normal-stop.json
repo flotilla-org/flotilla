@@ -1,0 +1,25 @@
+[
+ {
+  "Id": "db68fdcd4e2cecd9eabbf8b82a71f890507fef4b7ecadd8c07c4e423284d5e75",
+  "Name": "/rec-stop",
+  "State": {
+   "Status": "exited",
+   "Running": false,
+   "Paused": false,
+   "Restarting": false,
+   "OOMKilled": false,
+   "Dead": false,
+   "Pid": 0,
+   "ExitCode": 143,
+   "Error": "",
+   "StartedAt": "2026-10-05T10:35:43.068062935Z",
+   "FinishedAt": "2026-10-05T10:35:45.164337174Z"
+  },
+  "HostConfig": {
+   "Memory": 0,
+   "MemorySwap": 0,
+   "NanoCpus": 0,
+   "Init": true
+  }
+ }
+]

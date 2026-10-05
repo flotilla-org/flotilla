@@ -30,6 +30,7 @@ impl FieldOwnedResource for PlacementPolicy {
         FieldOwnership::new("spec.docker_per_vessel.host_ref", WriterRole::ReconcileLoop),
         FieldOwnership::new("spec.docker_per_vessel.image", WriterRole::Operator),
         FieldOwnership::new("spec.docker_per_vessel.pull_policy", WriterRole::Operator),
+        FieldOwnership::new("spec.docker_per_vessel.memory_policy", WriterRole::Operator),
         FieldOwnership::new("spec.docker_per_vessel.agent_adapters", WriterRole::Operator),
         FieldOwnership::new("spec.docker_per_vessel.default_cwd", WriterRole::Operator),
         FieldOwnership::new("spec.docker_per_vessel.env", WriterRole::Operator),
@@ -90,6 +91,9 @@ pub struct DockerPerVesselPlacementPolicySpec {
     /// are intentionally outside placement policy and are tracked separately.
     #[serde(default)]
     pub pull_policy: DockerImagePullPolicy,
+    /// ADR 0047: default previous-generation policies for one fleet roll.
+    #[serde(default)]
+    pub memory_policy: crate::environment::EnvironmentMemoryPolicy,
     /// Agent adapters the image recipe promises will be available after provisioning.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub agent_adapters: BTreeSet<String>,

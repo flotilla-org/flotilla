@@ -5831,6 +5831,7 @@ async fn standing_ensure_holds_failed_convoy_while_backing_is_live_then_restarts
             &ResourceEnvironmentSpec {
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    memory_policy: Default::default(),
                     host_ref: "local".to_string(),
                     image: "standing:latest".to_string(),
                     declared_agent_adapters: BTreeSet::new(),
@@ -6581,6 +6582,7 @@ async fn default_remote_placement_resolves_replicated_credentials_before_admissi
             &PlacementPolicySpec::builder()
                 .pool("passthrough".to_string())
                 .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
+                    memory_policy: Default::default(),
                     host_ref: "udder-id".to_string(),
                     image: "crew:latest".to_string().into(),
                     pull_policy: Default::default(),
@@ -6837,6 +6839,7 @@ async fn agentless_ssh_host_is_selected_for_trusted_work_and_routes_to_its_owner
             &PlacementPolicySpec::builder()
                 .pool("cleat".to_string())
                 .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
+                    memory_policy: Default::default(),
                     host_ref: "ssh-host".to_string(),
                     image: "crew:latest".to_string().into(),
                     pull_policy: Default::default(),
@@ -7197,6 +7200,7 @@ async fn create_docker_placement(backend: &ResourceBackend, policy_name: &str, h
             &PlacementPolicySpec::builder()
                 .pool("passthrough".to_string())
                 .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
+                    memory_policy: Default::default(),
                     host_ref: host_ref.to_string(),
                     image: "crew:latest".to_string().into(),
                     pull_policy: Default::default(),
@@ -7629,6 +7633,7 @@ async fn remote_placement_uses_replicated_host_capabilities() {
             &PlacementPolicySpec::builder()
                 .pool("passthrough".to_string())
                 .docker_per_vessel(flotilla_resources::DockerPerVesselPlacementPolicySpec {
+                    memory_policy: Default::default(),
                     host_ref: "feta-host".to_string(),
                     image: "crew:latest".to_string().into(),
                     pull_policy: Default::default(),

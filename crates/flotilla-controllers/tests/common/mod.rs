@@ -191,6 +191,7 @@ pub async fn create_docker_worktree_policy(backend: &ResourceBackend, namespace:
         PlacementPolicySpec::builder()
             .pool(fixture.pool)
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                memory_policy: Default::default(),
                 host_ref: fixture.host_ref,
                 image: fixture.image.into(),
                 pull_policy: Default::default(),
@@ -222,6 +223,7 @@ pub async fn create_ready_host_direct_environment(
     environments
         .update_status(&name, &created.metadata.resource_version, &EnvironmentStatus {
             configured_limits: None,
+            runtime_observation: None,
             phase: EnvironmentPhase::Ready,
             ready: true,
             docker_container_id: None,
@@ -251,6 +253,7 @@ pub async fn create_ready_docker_environment(
     environments
         .update_status(name, &created.metadata.resource_version, &EnvironmentStatus {
             configured_limits: None,
+            runtime_observation: None,
             phase: EnvironmentPhase::Ready,
             ready: true,
             docker_container_id: Some(format!("container-{name}")),

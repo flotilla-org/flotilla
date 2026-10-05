@@ -1235,6 +1235,24 @@ fn reconcile_internal(
 ) -> InternalReconcileOutcome {
     let status = convoy.status.clone().unwrap_or_default();
 
+    // Copy runtime evidence on the convoy's authority host, before failure or
+    // cleanup can remove vessels. Remote vessel hosts never write convoy status.
+    for vessel in vessels.values() {
+        let Some(observation) = vessel.status.as_ref().and_then(|status| status.runtime_observation.as_ref()) else {
+            continue;
+        };
+        let prior = status.environment_observations.get(&vessel.spec.vessel_name);
+        let mut merged = prior.cloned().unwrap_or_default();
+        merged.merge(observation);
+        if prior != Some(&merged) {
+            return InternalReconcileOutcome {
+                patch: Some(ConvoyStatusPatch::ObserveEnvironment { vessel: vessel.spec.vessel_name.clone(), observation: merged }),
+                actuations: Vec::new(),
+                events: Vec::new(),
+            };
+        }
+    }
+
     if status.phase.is_terminal() {
         return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, InternalReconcileOutcome {
             patch: None,

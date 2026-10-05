@@ -1,0 +1,4 @@
+Oct 05 11:13:10 feta systemd-oomd[1155]: Considered 110 cgroups for killing, top candidates were:
+Oct 05 11:13:10 feta systemd-oomd[1155]:         Path: /system.slice/docker-dbb8a5519c4d1f0529c9ac380b9e61b51b75275359dc2e282a61370deab3a12d.scope
+Oct 05 11:13:10 feta systemd-oomd[1155]:                 Swap Usage: 51.8G
+Oct 05 11:13:10 feta systemd-oomd[1155]: Marked /system.slice/docker-dbb8a5519c4d1f0529c9ac380b9e61b51b75275359dc2e282a61370deab3a12d.scope for killing due to memory used (62839951360) / total (66473824256) and swap used (59929223168) / total (66473422848) being more than 90.00%

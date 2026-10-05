@@ -1156,6 +1156,7 @@ impl ReadProjections<'_> {
         artifacts.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.address.cmp(&b.address)));
 
         Ok(ConvoyExplanation {
+            environment_observations: convoy.status.as_ref().map(|status| status.environment_observations.clone()).unwrap_or_default(),
             skills: convoy
                 .status
                 .as_ref()

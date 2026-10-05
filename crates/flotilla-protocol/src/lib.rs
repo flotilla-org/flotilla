@@ -31,7 +31,10 @@ pub mod test_support;
 use std::fmt;
 
 pub use attach_plan::{ResolvedAttachAction, ResolvedAttachPlan};
-pub use environment::{EnvironmentId, EnvironmentInfo, EnvironmentKind, EnvironmentSpec, EnvironmentStatus, ImageId, ImageSource};
+pub use environment::{
+    EnvironmentExitCause, EnvironmentId, EnvironmentInfo, EnvironmentKind, EnvironmentMemoryLimits, EnvironmentRuntimeObservation,
+    EnvironmentSpec, EnvironmentStatus, EnvironmentTermination, ImageId, ImageSource,
+};
 pub use host::{HostName, HostPath, RepoIdentity};
 pub use host_summary::{
     DiscoveryFact, HostEnvironment, HostIdentity, HostProviderStatus, HostSnapshot, HostSummary, NodeInfo, SystemInfo, ToolInventory,

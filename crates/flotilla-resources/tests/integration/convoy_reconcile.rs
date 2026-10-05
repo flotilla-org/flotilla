@@ -788,6 +788,7 @@ fn vessel_object_with_image_digest(
         },
         status: Some(VesselStatus {
             configured_limits: None,
+            runtime_observation: None,
             placement_decision: None,
             phase,
             message: message.map(str::to_string),

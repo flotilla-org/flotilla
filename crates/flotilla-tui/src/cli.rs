@@ -888,6 +888,21 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             }
         }
     };
+    for (vessel, observation) in &explanation.environment_observations {
+        println!("Environment for vessel {vessel}:");
+        if let Some(limits) = &observation.memory_limits {
+            println!("  Memory limit: {} bytes; swap limit: {} bytes", limits.memory_bytes, limits.swap_bytes);
+        }
+        if let Some(usage) = observation.memory_usage_bytes {
+            println!("  Last memory usage: {usage} bytes (observed {})", observation.memory_observed_at.as_deref().unwrap_or("unknown"));
+        }
+        if let Some(termination) = &observation.termination {
+            println!("  {termination}; Docker OOMKilled={}", termination.oom_killed);
+            if let Some(evidence) = &termination.evidence {
+                println!("  Evidence: {evidence}");
+            }
+        }
+    }
     if explanation.vessel_placements.is_empty() {
         if let Some(placement) = &explanation.placement {
             write_placement("Fulfilment", placement);

@@ -991,6 +991,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
         PlacementPolicySpec::builder()
             .pool("cleat".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                memory_policy: Default::default(),
                 host_ref: HOST_REF.to_string(),
                 image: "ghcr.io/flotilla/dev:latest".to_string().into(),
                 pull_policy: Default::default(),
@@ -1003,6 +1004,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
     )
     .await;
     create_ready_docker_environment(&backend, NAMESPACE, "env-workspace-multi-fresh", DockerEnvironmentSpec {
+        memory_policy: Default::default(),
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
         declared_agent_adapters: Default::default(),
@@ -1227,6 +1229,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
         PlacementPolicySpec::builder()
             .pool("cleat".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                memory_policy: Default::default(),
                 host_ref: HOST_REF.to_string(),
                 image: "ghcr.io/flotilla/dev:latest".to_string().into(),
                 pull_policy: Default::default(),
@@ -1240,6 +1243,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
     .await;
     let environment_ref = "env-workspace-docker-stance";
     create_ready_docker_environment(&backend, NAMESPACE, environment_ref, DockerEnvironmentSpec {
+        memory_policy: Default::default(),
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
         declared_agent_adapters: Default::default(),
@@ -1310,6 +1314,11 @@ async fn contained_docker_placement_propagates_never_pull_policy_to_environment(
         PlacementPolicySpec::builder()
             .pool("cleat".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                memory_policy: flotilla_resources::EnvironmentMemoryPolicy {
+                    host_memory_percent: 30,
+                    expected_concurrent_crews: 3,
+                    swap_bytes: 0,
+                },
                 host_ref: HOST_REF.to_string(),
                 image: "flotilla-dev-env:latest".to_string().into(),
                 pull_policy: DockerImagePullPolicy::Never,
@@ -1338,6 +1347,8 @@ async fn contained_docker_placement_propagates_never_pull_policy_to_environment(
                     Some(docker)
                         if docker.image == "flotilla-dev-env:latest"
                             && docker.pull_policy == DockerImagePullPolicy::Never
+                            && docker.memory_policy.host_memory_percent == 30
+                            && docker.memory_policy.expected_concurrent_crews == 3
                 )
         )
     }));
@@ -1699,6 +1710,7 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
     PlacementPolicySpec::builder()
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+memory_policy: Default::default(),
             host_ref: HOST_REF.to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string().into(),
             pull_policy: Default::default(),
@@ -1711,6 +1723,7 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
     "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree",
     "/workspace",
     Some(DockerEnvironmentSpec {
+memory_policy: Default::default(),
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
         declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
@@ -1746,6 +1759,7 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
     PlacementPolicySpec::builder()
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+memory_policy: Default::default(),
             host_ref: HOST_REF.to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string().into(),
             pull_policy: Default::default(),
@@ -1758,6 +1772,7 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
     "/workspace",
     "/app",
     Some(DockerEnvironmentSpec {
+memory_policy: Default::default(),
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
         declared_agent_adapters: Default::default(),
@@ -2946,6 +2961,7 @@ async fn fleet_image_baseline_bump_provisions_on_three_hosts_without_policy_edit
             PlacementPolicySpec::builder()
                 .pool("cleat".to_string())
                 .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                    memory_policy: Default::default(),
                     host_ref: name.to_string(),
                     image: DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() },
                     pull_policy: DockerImagePullPolicy::Always,
@@ -3040,6 +3056,7 @@ async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: 
         PlacementPolicySpec::builder()
             .pool("cleat".to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                memory_policy: Default::default(),
                 host_ref: HOST_REF.to_string(),
                 image: DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() },
                 pull_policy: DockerImagePullPolicy::Always,
@@ -3052,6 +3069,7 @@ async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: 
     )
     .await;
     create_ready_docker_environment(&backend, NAMESPACE, "env-vessel", DockerEnvironmentSpec {
+        memory_policy: Default::default(),
         host_ref: HOST_REF.to_string(),
         image: "crew:v1".to_string(),
         declared_agent_adapters: Default::default(),

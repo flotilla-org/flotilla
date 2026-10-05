@@ -852,6 +852,10 @@ pub enum InputValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ConvoyStatus {
+    /// Per-vessel runtime evidence survives backing environment teardown.
+    /// ADR 0047: keep this decoder default for one roll.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment_observations: BTreeMap<String, flotilla_protocol::EnvironmentRuntimeObservation>,
     /// Frozen ensure configuration that admitted this generation. Previous
     /// generations have no baseline; an explicit roll establishes one.
     /// Future ConvoyEnsureSpec changes must also decode this embedded stored
@@ -1379,6 +1383,10 @@ pub struct PlacementStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyStatusPatch {
+    ObserveEnvironment {
+        vessel: String,
+        observation: flotilla_protocol::EnvironmentRuntimeObservation,
+    },
     RecordEnsureAdmission {
         config: crate::ConvoyEnsureSpec,
     },
@@ -1596,12 +1604,21 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
         // that exact phase. Mutation audit records remain appendable, and
         // SetStalled may clear stale attention.
         if status.phase.is_terminal()
-            && !matches!(self, Self::RecordLifecycleMutation { .. } | Self::SetStalled { .. } | Self::SetTeardownWait { .. })
+            && !matches!(
+                self,
+                Self::ObserveEnvironment { .. }
+                    | Self::RecordLifecycleMutation { .. }
+                    | Self::SetStalled { .. }
+                    | Self::SetTeardownWait { .. }
+            )
             && !matches!(self, Self::MarkConvoyAbandoned { expected_phase, .. } if *expected_phase == status.phase && status.phase != ConvoyPhase::Abandoned)
         {
             return;
         }
         match self {
+            Self::ObserveEnvironment { vessel, observation } => {
+                status.environment_observations.entry(vessel.clone()).or_default().merge(observation)
+            }
             Self::RecordEnsureAdmission { config } => {
                 status.ensure_admission.get_or_insert_with(|| config.clone());
             }

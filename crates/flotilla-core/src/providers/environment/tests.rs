@@ -37,15 +37,21 @@ struct RecordingRunner {
     calls: Mutex<Vec<(String, Vec<String>, PathBuf)>>,
     result: Result<String, String>,
     image_environment: Mutex<VecDeque<Result<String, String>>>,
+    memory_info: Option<Result<String, String>>,
 }
 
 impl RecordingRunner {
     fn new_ok(output: &str) -> Self {
-        Self { calls: Mutex::new(vec![]), result: Ok(output.to_string()), image_environment: Mutex::new(VecDeque::new()) }
+        Self {
+            calls: Mutex::new(vec![]),
+            result: Ok(output.to_string()),
+            image_environment: Mutex::new(VecDeque::new()),
+            memory_info: None,
+        }
     }
 
     fn new_err(msg: &str) -> Self {
-        Self { calls: Mutex::new(vec![]), result: Err(msg.to_string()), image_environment: Mutex::new(VecDeque::new()) }
+        Self { calls: Mutex::new(vec![]), result: Err(msg.to_string()), image_environment: Mutex::new(VecDeque::new()), memory_info: None }
     }
 
     /// Answers the next `docker image inspect --format '{{json .Config.Env}}'`
@@ -64,6 +70,13 @@ impl RecordingRunner {
 #[async_trait]
 impl CommandRunner for RecordingRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        // Host capacity probe fixture, independent of the command under test.
+        if cmd == "docker" && args == ["info", "--format", "{{json .}}"] {
+            return self
+                .memory_info
+                .clone()
+                .unwrap_or_else(|| Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into()));
+        }
         self.calls.lock().expect("calls mutex").push((cmd.to_string(), args.iter().map(|a| a.to_string()).collect(), cwd.to_path_buf()));
         if cmd == "docker" && args.starts_with(&["inspect", "--format", "{{.Image}}"]) {
             return Ok("sha256:test-image-digest\n".to_string());
@@ -172,6 +185,10 @@ impl QueuedRunner {
 #[async_trait]
 impl CommandRunner for QueuedRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        // Host capacity probe fixture, independent of the command under test.
+        if cmd == "docker" && args == ["info", "--format", "{{json .}}"] {
+            return Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into());
+        }
         self.calls.lock().expect("calls mutex").push((cmd.to_string(), args.iter().map(|a| a.to_string()).collect(), cwd.to_path_buf()));
         let mut queue = self.responses.lock().expect("responses mutex");
         queue.pop_front().unwrap_or(Err("no more responses".into()))
@@ -296,6 +313,7 @@ async fn create_returns_handle() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     let id = EnvironmentId::new("test-env-1");
@@ -351,6 +369,7 @@ async fn create_runs_container_as_the_host_user() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("host-user"), &image, opts).await.expect("create environment as host user");
@@ -380,6 +399,7 @@ async fn create_removes_container_when_image_digest_cannot_be_resolved() {
         image_pull_policy: ImagePullPolicy::Always,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     let error = match provider.create(EnvironmentId::new("invalid-digest"), &image, opts).await {
@@ -412,6 +432,7 @@ async fn create_translates_image_pull_policy_to_docker_run() {
             image_pull_policy: policy,
             prepared_auth: Default::default(),
             cpu_limit: Some(8),
+            memory_policy: Default::default(),
         };
 
         provider.create(EnvironmentId::new(docker_value), &image, opts).await.expect("image policy should create an environment");
@@ -441,6 +462,7 @@ async fn create_uses_the_credential_scoped_docker_config_for_pull_on_run() {
         image_pull_policy: ImagePullPolicy::Always,
         prepared_auth: super::PreparedEnvironmentAuth::RegistryConfig { directory: DaemonHostPath::new("/run/flotilla/registry-auth") },
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("private-registry"), &image, opts).await.expect("create authenticated environment");
@@ -468,6 +490,7 @@ async fn create_reports_infrastructure_and_requested_mount_metadata() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     let id = EnvironmentId::new("test-env-metadata");
@@ -508,6 +531,7 @@ async fn create_rejects_a_mount_targeting_the_reserved_daemon_socket_directory()
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     let error = provider
@@ -542,6 +566,7 @@ async fn create_rejects_a_mount_targeting_a_reserved_tool_file() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     let error = provider
@@ -586,6 +611,7 @@ async fn create_delivers_tool_assets_and_applies_tool_environment() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("tool-delivery"), &image, opts).await.expect("Docker should lower provider-neutral tool assets");
@@ -611,6 +637,7 @@ fn path_prepending_opts(image_pull_policy: ImagePullPolicy) -> CreateOpts {
         image_pull_policy,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     }
 }
 
@@ -793,6 +820,7 @@ async fn create_mounts_the_flotilla_binary_directory_so_atomic_replacements_stay
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("upgrade-visible"), &image, opts).await.expect("create environment");
@@ -826,6 +854,7 @@ async fn create_uses_requested_mount_modes_in_docker_arguments() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("test-env-mount-modes"), &image, opts).await.expect("create");
@@ -863,6 +892,7 @@ async fn protected_git_mount_rejects_a_comma_in_its_path() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
     let error = provider.create(EnvironmentId::new("comma"), &ImageId::new("ubuntu:22.04"), opts).await.err().expect("unsafe mount syntax");
     assert!(error.contains("comma"), "{error}");
@@ -895,6 +925,7 @@ async fn list_preserves_provisioned_mount_metadata() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("test-env-list"), &image, opts).await.expect("create");
@@ -946,6 +977,7 @@ async fn list_fails_on_malformed_reference_repo_mount_metadata() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("test-env-list-malformed"), &image, opts).await.expect("create");
@@ -973,6 +1005,7 @@ async fn list_rejects_missing_reference_repo_mount_metadata() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     provider.create(EnvironmentId::new("test-env-list-missing"), &image, opts).await.expect("create");
@@ -996,6 +1029,7 @@ async fn provisioned_handle_returns_its_initialized_runner() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     let handle = provider.create(EnvironmentId::new("test-env-runner"), &image, opts).await.expect("create");
@@ -1023,6 +1057,7 @@ async fn status_returns_running() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     let id = EnvironmentId::new("test-env-status");
@@ -1056,6 +1091,7 @@ async fn env_vars_parses_output() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     let id = EnvironmentId::new("test-env-vars");
@@ -1091,6 +1127,7 @@ async fn destroy_calls_docker_rm() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         prepared_auth: Default::default(),
         cpu_limit: None,
+        memory_policy: Default::default(),
     };
 
     let id = EnvironmentId::new("test-env-destroy");
@@ -1325,4 +1362,204 @@ fn hop_chain_resolves_remote_plus_environment_plus_terminal() {
     assert_eq!(context.nesting_depth, 2, "nesting_depth should be 2 after remote + environment hops");
     assert_eq!(context.current_host.as_str(), "feta", "current_host should be updated to feta");
     assert_eq!(context.current_environment, Some(EnvironmentId::new("env1")), "current_environment should be env1");
+}
+
+// #2653: every contained environment must bound RAM and disable swap by default.
+#[tokio::test]
+async fn create_bounds_memory_and_swap() {
+    let runner = Arc::new(RecordingRunner::new_ok("container-id"));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    provider
+        .create(EnvironmentId::new("memory-test"), &flotilla_protocol::ImageId::new("test-image"), CreateOpts {
+            tokens: Vec::new(),
+            working_directory: None,
+            provisioned_mounts: Vec::new(),
+            tools: Vec::new(),
+            image_pull_policy: ImagePullPolicy::Never,
+            prepared_auth: Default::default(),
+            cpu_limit: None,
+            memory_policy: Default::default(),
+        })
+        .await
+        .expect("create");
+    let calls = runner.calls();
+    let args = &calls.iter().find(|(cmd, args, _)| cmd == "docker" && args.first().is_some_and(|arg| arg == "run")).expect("docker run").1;
+    assert!(args.windows(2).any(|pair| pair == ["--memory", "8589934592"]));
+    assert!(args.windows(2).any(|pair| pair == ["--memory-swap", "8589934592"]));
+}
+
+// Subprocess boundary: replay the operator's real inspect/journal recordings.
+struct InspectionRunner {
+    inspect: String,
+    usage: Option<String>,
+    oomd: Option<String>,
+    calls: Mutex<Vec<(String, Vec<String>)>>,
+}
+
+#[async_trait]
+impl CommandRunner for InspectionRunner {
+    async fn run(&self, cmd: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+        self.calls.lock().expect("calls").push((cmd.into(), args.iter().map(|arg| (*arg).into()).collect()));
+        match cmd {
+            "docker" if args.first() == Some(&"ps") => Ok("container\tenv-test\timage\t[]".into()),
+            "docker" if args == ["inspect", "container"] => Ok(self.inspect.clone()),
+            "journalctl" if args.contains(&"--unit=systemd-oomd") => self.oomd.clone().ok_or("journal access denied".into()),
+            "journalctl" => Err("kernel journal access denied".into()),
+            "cat" => self.usage.clone().ok_or("cgroup unavailable".into()),
+            _ => Err(format!("unexpected command: {cmd} {args:?}")),
+        }
+    }
+    async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+        self.run(cmd, args, cwd, label).await.map(|stdout| CommandOutput { stdout, stderr: String::new(), success: true })
+    }
+    async fn exists(&self, _: &str, _: &[&str]) -> bool {
+        true
+    }
+}
+
+// #2653: true cgroup OOM, host oomd, ordinary failure and normal SIGTERM
+// are distinct, and recorded limits survive classification.
+#[tokio::test]
+async fn recorded_container_deaths_are_classified_through_the_provider() {
+    use flotilla_protocol::EnvironmentExitCause;
+    let cases = [
+        (include_str!("fixtures/cgroup-oomkilled.json"), None, EnvironmentExitCause::CgroupOom, 137, Some(9), true),
+        (
+            include_str!("fixtures/oomd-exit137.json"),
+            Some(include_str!("fixtures/oomd-journal.txt").into()),
+            EnvironmentExitCause::HostOomd,
+            137,
+            Some(9),
+            false,
+        ),
+        (include_str!("fixtures/nonzero-exit3.json"), None, EnvironmentExitCause::NonzeroExit, 3, None, false),
+        (include_str!("fixtures/normal-stop.json"), None, EnvironmentExitCause::NormalStop, 143, Some(15), false),
+        (include_str!("fixtures/oomd-exit137.json"), None, EnvironmentExitCause::Signal, 137, Some(9), false),
+    ];
+    for (inspect, oomd, cause, code, signal, oom_killed) in cases {
+        let runner = Arc::new(InspectionRunner { inspect: inspect.into(), usage: None, oomd, calls: Mutex::new(Vec::new()) });
+        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let handles = provider.list().await.expect("list");
+        let observation = handles[0].runtime_observation().await.expect("inspect").expect("Docker observation");
+        let termination = observation.termination.expect("terminated");
+        assert_eq!(
+            (termination.cause, termination.exit_code, termination.signal, termination.oom_killed),
+            (cause, code, signal, oom_killed)
+        );
+        if cause == EnvironmentExitCause::CgroupOom {
+            assert_eq!(
+                observation.memory_limits,
+                Some(flotilla_protocol::EnvironmentMemoryLimits { memory_bytes: 67108864, swap_bytes: 0 })
+            );
+        }
+        if cause == EnvironmentExitCause::HostOomd {
+            assert!(termination
+                .evidence
+                .expect("matching journal evidence")
+                .contains("dbb8a5519c4d1f0529c9ac380b9e61b51b75275359dc2e282a61370deab3a12d.scope for killing"));
+        }
+        let calls = runner.calls.lock().expect("calls");
+        for (_, args) in calls.iter().filter(|(cmd, _)| cmd == "journalctl") {
+            assert!(args.contains(&"--since".into()) && args.contains(&"--until".into()), "journal evidence must be time bounded");
+        }
+    }
+}
+
+// #2653: a candidate-list mention does not prove oomd killed this container.
+// The generator spans absent evidence, candidates only, wrong scope and a kill.
+#[hegel::test]
+fn oomd_requires_a_matching_kill_record(tc: hegel::TestCase) {
+    use flotilla_protocol::EnvironmentExitCause;
+    use hegel::generators as gs;
+    let choice = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+    let journal = include_str!("fixtures/oomd-journal.txt");
+    let evidence = match choice {
+        0 => String::new(),
+        1 => journal.lines().filter(|line| !line.contains("Marked ")).collect::<Vec<_>>().join("\n"),
+        2 => journal.replace("dbb8a5519c4d1f0529c9ac380b9e61b51b75275359dc2e282a61370deab3a12d", "other-container"),
+        _ => journal.into(),
+    };
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let provider = DockerEnvironmentProvider::new(Arc::new(InspectionRunner {
+            inspect: include_str!("fixtures/oomd-exit137.json").into(),
+            usage: None,
+            oomd: Some(evidence),
+            calls: Mutex::new(Vec::new()),
+        }));
+        let handles = provider.list().await.expect("list");
+        let termination = handles[0].runtime_observation().await.expect("inspect").expect("observation").termination.expect("termination");
+        assert_eq!(termination.cause, if choice == 3 { EnvironmentExitCause::HostOomd } else { EnvironmentExitCause::Signal });
+    });
+}
+
+// #2653: placement policy changes the hard RAM and combined RAM/swap flags.
+#[tokio::test]
+async fn create_uses_configured_memory_policy() {
+    let runner = Arc::new(RecordingRunner::new_ok("container-id"));
+    let provider = DockerEnvironmentProvider::new(runner.clone());
+    let mut opts = path_prepending_opts(ImagePullPolicy::Never);
+    opts.tools.clear();
+    opts.memory_policy =
+        flotilla_resources::EnvironmentMemoryPolicy { host_memory_percent: 25, expected_concurrent_crews: 2, swap_bytes: 1073741824 };
+    provider.create(EnvironmentId::new("configured-memory"), &flotilla_protocol::ImageId::new("image"), opts).await.expect("create");
+    let args = docker_run_args(&runner);
+    assert!(args.windows(2).any(|pair| pair == ["--memory", "8589934592"]));
+    assert!(args.windows(2).any(|pair| pair == ["--memory-swap", "9663676416"]));
+}
+
+// #2653: unavailable capacity or unsupported enforcement must never run an
+// unbounded crew. Invalid/malformed/empty outputs and unsupported kernels refuse.
+#[tokio::test]
+async fn create_refuses_unenforceable_memory_limits() {
+    for info in [
+        Err("Docker info unavailable".into()),
+        Ok(String::new()),
+        Ok(r#"{"MemTotal":0,"MemoryLimit":true,"SwapLimit":true}"#.into()),
+        Ok(r#"{"MemTotal":68719476736,"MemoryLimit":false,"SwapLimit":true}"#.into()),
+        Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":false}"#.into()),
+    ] {
+        let mut runner = RecordingRunner::new_ok("container-id");
+        runner.memory_info = Some(info);
+        let runner = Arc::new(runner);
+        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let mut opts = path_prepending_opts(ImagePullPolicy::Never);
+        opts.tools.clear();
+        assert!(provider.create(EnvironmentId::new("unsupported-memory"), &flotilla_protocol::ImageId::new("image"), opts).await.is_err());
+        assert!(!runner.calls().iter().any(|(_, args, _)| args.first().is_some_and(|arg| arg == "run")));
+    }
+}
+
+// Last-known RAM usage comes from the cgroup counter. Generate zero, large
+// counters, unavailable/empty, malformed and overflowing responses explicitly.
+#[hegel::test]
+fn running_memory_samples_do_not_invent_usage(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let choice = tc.draw(gs::integers::<usize>().min_value(0).max_value(4));
+    let bytes = tc.draw(gs::integers::<u64>().min_value(0).max_value(u64::MAX));
+    let (usage, expected) = match choice {
+        0 => (Some(format!("{bytes}\n")), Some(bytes)),
+        1 => (None, None),
+        2 => (Some(String::new()), None),
+        3 => (Some("not a counter".into()), None),
+        _ => (Some("18446744073709551616".into()), None),
+    };
+    // A synthetic running state derived from the real inspect shape; death
+    // recordings remain verbatim. The subprocess counter is the varied boundary.
+    let mut inspect: serde_json::Value = serde_json::from_str(include_str!("fixtures/cgroup-oomkilled.json")).expect("fixture");
+    inspect[0]["State"]["Status"] = "running".into();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let provider = DockerEnvironmentProvider::new(Arc::new(InspectionRunner {
+            inspect: inspect.to_string(),
+            usage,
+            oomd: None,
+            calls: Mutex::new(Vec::new()),
+        }));
+        let handles = provider.list().await.expect("list");
+        let observation = handles[0].runtime_observation().await.expect("inspect").expect("observation");
+        assert_eq!(observation.memory_usage_bytes, expected);
+        assert_eq!(observation.memory_observed_at.is_some(), expected.is_some());
+        assert!(observation.termination.is_none());
+    });
 }

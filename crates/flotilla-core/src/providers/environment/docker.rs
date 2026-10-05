@@ -72,6 +72,20 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
     }
 
     async fn create(&self, id: EnvironmentId, image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String> {
+        let info = self
+            .inner
+            .runner
+            .run("docker", &["info", "--format", "{{json .}}"], Path::new("/"), &ChannelLabel::Default)
+            .await
+            .map_err(|error| format!("Docker host memory preflight failed: {error}"))?;
+        let info: DockerMemoryInfo = serde_json::from_str(&info).map_err(|error| format!("read Docker host memory: {error}"))?;
+        if !info.memory_limit || !info.swap_limit {
+            return Err("Docker host cannot enforce memory and swap limits".into());
+        }
+        let limits = opts.memory_policy.resolve(info.mem_total)?;
+        let memory = limits.memory_bytes.to_string();
+        // Docker wants RAM + swap; equal values explicitly disable swap.
+        let memory_swap = (limits.memory_bytes + limits.swap_bytes).to_string();
         let container_name = format!("flotilla-env-{}", id);
 
         let requested_mounts = opts.provisioned_mounts;
@@ -182,6 +196,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             "-e",
             &env_id_env,
         ]);
+        args.extend(["--memory", memory.as_str(), "--memory-swap", memory_swap.as_str()]);
         let cpu_limit = opts.cpu_limit.map(|limit| limit.to_string());
         if let Some(limit) = cpu_limit.as_deref() {
             args.extend(["--cpus", limit]);
@@ -496,6 +511,10 @@ impl ProvisionedEnvironment for DockerProvisionedEnvironment {
         self.inner.status(&self.container_name).await
     }
 
+    async fn runtime_observation(&self) -> Result<Option<flotilla_protocol::EnvironmentRuntimeObservation>, String> {
+        observation(self.inner.runner.as_ref(), &self.container_name).await.map(Some)
+    }
+
     async fn env_vars(&self) -> Result<HashMap<String, String>, String> {
         self.inner.env_vars(&self.container_name).await
     }
@@ -507,4 +526,145 @@ impl ProvisionedEnvironment for DockerProvisionedEnvironment {
     async fn destroy(&self) -> Result<(), String> {
         self.inner.destroy(&self.container_name).await
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerMemoryInfo {
+    mem_total: u64,
+    memory_limit: bool,
+    swap_limit: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerInspection {
+    id: String,
+    state: DockerState,
+    host_config: DockerHostConfig,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerState {
+    status: String,
+    #[serde(rename = "OOMKilled")]
+    oom_killed: bool,
+    exit_code: i32,
+    started_at: String,
+    finished_at: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerHostConfig {
+    memory: u64,
+    memory_swap: i64,
+}
+
+/// Full inspect is necessary: the OOM flag alone misses userspace oomd kills.
+async fn observation(runner: &dyn CommandRunner, container: &str) -> Result<flotilla_protocol::EnvironmentRuntimeObservation, String> {
+    let raw = runner.run("docker", &["inspect", container], Path::new("/"), &ChannelLabel::Default).await?;
+    let inspect = parse_inspection(&raw)?;
+    let mut oomd = String::new();
+    let mut kernel = String::new();
+    if (inspect.state.status == "exited" || inspect.state.status == "dead") && inspect.state.exit_code == 137 && !inspect.state.oom_killed {
+        // Bound evidence to this container's lifetime. Journal access is best
+        // effort: permission errors must never turn unknown SIGKILL into OOM.
+        let start = chrono::DateTime::parse_from_rfc3339(&inspect.state.started_at)
+            .map_err(|error| format!("invalid Docker StartedAt: {error}"))?;
+        let finish = chrono::DateTime::parse_from_rfc3339(&inspect.state.finished_at)
+            .map_err(|error| format!("invalid Docker FinishedAt: {error}"))?;
+        let start = start.with_timezone(&chrono::Utc).format("%Y-%m-%d %H:%M:%S UTC").to_string();
+        // Include the fractional finishing second in journalctl's window.
+        let finish = (finish.with_timezone(&chrono::Utc) + chrono::Duration::seconds(1)).format("%Y-%m-%d %H:%M:%S UTC").to_string();
+        let time = ["--since", start.as_str(), "--until", finish.as_str()];
+        let mut args = vec!["--no-pager", "--utc", "--output=short-iso", "--unit=systemd-oomd"];
+        args.extend(time);
+        oomd = runner.run("journalctl", &args, Path::new("/"), &ChannelLabel::Default).await.unwrap_or_default();
+        let mut args = vec!["--no-pager", "--utc", "--output=short-iso", "--kernel"];
+        args.extend(time);
+        kernel = runner.run("journalctl", &args, Path::new("/"), &ChannelLabel::Default).await.unwrap_or_default();
+    }
+    let mut observation = classify_inspection(&inspect, &oomd, &kernel);
+    if observation.termination.is_none() {
+        // The systemd cgroup path is optional; unavailable/non-systemd hosts
+        // retain their previous sample rather than inventing a zero-byte usage.
+        if inspect.id.len() == 64 && inspect.id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            let path = format!("/sys/fs/cgroup/system.slice/docker-{}.scope/memory.current", inspect.id);
+            if let Ok(raw) = runner.run("cat", &[&path], Path::new("/"), &ChannelLabel::Default).await {
+                observation.memory_usage_bytes = raw.trim().parse().ok();
+                if observation.memory_usage_bytes.is_some() {
+                    observation.memory_observed_at = Some(chrono::Utc::now().to_rfc3339());
+                }
+            }
+        }
+    }
+    Ok(observation)
+}
+
+fn parse_inspection(raw: &str) -> Result<DockerInspection, String> {
+    let mut inspections: Vec<DockerInspection> = serde_json::from_str(raw).map_err(|error| format!("decode Docker inspect: {error}"))?;
+    if inspections.len() != 1 {
+        return Err("expected exactly one Docker inspect record".into());
+    }
+    let inspect = inspections.remove(0);
+    if inspect.id.len() != 64 || !inspect.id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Docker inspect returned an invalid container ID".into());
+    }
+    Ok(inspect)
+}
+
+fn classify_inspection(inspect: &DockerInspection, oomd: &str, kernel: &str) -> flotilla_protocol::EnvironmentRuntimeObservation {
+    use flotilla_protocol::{EnvironmentExitCause, EnvironmentMemoryLimits, EnvironmentRuntimeObservation, EnvironmentTermination};
+    let memory_limits = u64::try_from(inspect.host_config.memory_swap).ok().and_then(|combined| {
+        (inspect.host_config.memory > 0).then_some(())?;
+        Some(EnvironmentMemoryLimits {
+            memory_bytes: inspect.host_config.memory,
+            swap_bytes: combined.checked_sub(inspect.host_config.memory)?,
+        })
+    });
+    let mut observation = EnvironmentRuntimeObservation {
+        container_id: Some(inspect.id.clone()),
+        started_at: Some(inspect.state.started_at.clone()),
+        memory_limits,
+        ..Default::default()
+    };
+    if inspect.state.status != "exited" && inspect.state.status != "dead" {
+        return observation;
+    }
+    let code = inspect.state.exit_code;
+    let signal = (129..=192).contains(&code).then_some(code - 128);
+    let scope = format!("docker-{}.scope", inspect.id);
+    // Match the systemd-oomd format recorded on feta (Docker 27, systemd/cgroup v2).
+    // Other journal formats remain unknown unless they provide this kill evidence.
+    let oomd_kill = oomd.lines().find(|line| line.contains(&scope) && line.contains("Marked ") && line.contains(" for killing"));
+    let kernel_kill =
+        kernel.lines().find(|line| line.contains(&inspect.id) && (line.contains("oom-kill:") || line.contains("Killed process")));
+    let (cause, evidence) = if inspect.state.oom_killed {
+        (EnvironmentExitCause::CgroupOom, None)
+    } else if code == 137 && oomd_kill.is_some() {
+        (EnvironmentExitCause::HostOomd, oomd_kill.map(str::to_string))
+    } else if code == 137 && kernel_kill.is_some() {
+        (EnvironmentExitCause::KernelOom, kernel_kill.map(str::to_string))
+    // 143 conventionally denotes SIGTERM: this includes external SIGTERM, since
+    // inspect alone cannot establish whether Docker stop delivered the signal.
+    } else if code == 0 || code == 143 {
+        (EnvironmentExitCause::NormalStop, None)
+    } else if signal.is_some() {
+        (EnvironmentExitCause::Signal, None)
+    } else {
+        (EnvironmentExitCause::NonzeroExit, None)
+    };
+    observation.termination = Some(
+        EnvironmentTermination::builder()
+            .exit_code(code)
+            .maybe_signal(signal)
+            .oom_killed(inspect.state.oom_killed)
+            .cause(cause)
+            .finished_at(inspect.state.finished_at.clone())
+            .maybe_evidence(evidence)
+            .build(),
+    );
+    observation
 }

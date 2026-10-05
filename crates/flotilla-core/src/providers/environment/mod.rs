@@ -34,6 +34,7 @@ pub struct CreateOpts {
     pub prepared_auth: PreparedEnvironmentAuth,
     /// CPU quota for this vessel. None leaves the provider's default.
     pub cpu_limit: Option<usize>,
+    pub memory_policy: flotilla_resources::EnvironmentMemoryPolicy,
 }
 
 /// Auth admitted by credential preflight for this environment's image pull.
@@ -230,6 +231,10 @@ pub trait ProvisionedEnvironment: Send + Sync {
     fn container_name(&self) -> Option<&str>;
     fn provisioned_mounts(&self) -> Vec<ProvisionedMount>;
     async fn status(&self) -> Result<EnvironmentStatus, String>;
+    /// Provider observations are optional for non-Docker adapters.
+    async fn runtime_observation(&self) -> Result<Option<flotilla_protocol::EnvironmentRuntimeObservation>, String> {
+        Ok(None)
+    }
     async fn env_vars(&self) -> Result<HashMap<String, String>, String>;
     fn runner(&self) -> Arc<dyn CommandRunner>;
     async fn destroy(&self) -> Result<(), String>;

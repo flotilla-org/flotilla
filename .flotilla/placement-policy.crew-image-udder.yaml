@@ -11,6 +11,10 @@ spec:
     host_ref: b2aac222-c72f-458e-baa0-b089c52c16af
     image:
       image_baseline_ref: fleet-crew
+    memory_policy:
+      host_memory_percent: 50
+      expected_concurrent_crews: 4
+      swap_bytes: 0
     pull_policy: always
     agent_adapters:
       - claude-code
