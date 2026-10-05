@@ -95,6 +95,27 @@ pub(super) async fn serve_resource_http_with_daemon(
         };
     }
     let query = parse_query(raw_query);
+    if let Some(mode) = query.get("digest") {
+        if name.is_some() {
+            return write_error(&mut stream, 400, "digests require a collection").await;
+        }
+        let expected_root = query.get("expectedRoot").cloned().unwrap_or_default();
+        let query = match mode.as_str() {
+            "root" => flotilla_resources::DigestQuery::Root,
+            "children" if !expected_root.is_empty() => flotilla_resources::DigestQuery::Children { expected_root },
+            "snapshot" if !expected_root.is_empty() => {
+                let Some(bucket) = query.get("bucket").and_then(|value| value.parse::<u8>().ok()) else {
+                    return write_error(&mut stream, 400, "invalid digest bucket").await;
+                };
+                flotilla_resources::DigestQuery::Snapshot { expected_root, bucket }
+            }
+            _ => return write_error(&mut stream, 400, "invalid digest query").await,
+        };
+        return match flotilla_resources::digest_resource_kind(&backend, namespace, kind, &query).await {
+            Ok(digest) => write_json(&mut stream, 200, &serde_json::to_value(digest).map_err(|error| error.to_string())?).await,
+            Err(error) => write_resource_error(&mut stream, error).await,
+        };
+    }
     let include_replicas = query_flag(&query, &["includeReplicas", "include-replicas", "include_replicas"]);
     let replica_sources = query_flag(&query, &["replicaSources", "replica-sources", "replica_sources"]);
     let all_provenances = query_flag(&query, &["allProvenances", "all-provenances", "all_provenances"]);

@@ -8,7 +8,8 @@ use flotilla_protocol::NodeId;
 #[cfg(feature = "test-support")]
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordType};
 use flotilla_resources::{
-    HttpBackend, ReadWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceProvenance, WatchEvent, WatchStart,
+    DigestQuery, HttpBackend, PartitionDigest, ReadWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceProvenance, WatchEvent,
+    WatchStart,
 };
 #[cfg(feature = "test-support")]
 use flotilla_resources::{K8sWatchEvent, ResourceList, ResourceObject};
@@ -18,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use super::remote_commands::RemoteCommandRouter;
+
+const DIGEST_INTERVAL: Duration = Duration::from_secs(60);
 
 const REPLICATION_NAMESPACE: &str = "flotilla";
 const REPLICATION_RETRY: RetryBackoff =
@@ -556,7 +559,7 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
         let result = match remote.watch(start).await {
             Ok(watch) => {
                 daemon.report_resource_replication_healthy(peer, &store.health_kind::<T>()).await;
-                apply_http_watch(watch, &writer, prefix.resource_version.clone()).await
+                apply_http_watch(watch, &writer, prefix.resource_version.clone(), &remote, peer).await
             }
             Err(error) => Err(OriginWatchFailure::from_resource(error)),
         };
@@ -580,22 +583,123 @@ async fn apply_http_watch<T: Resource>(
     mut watch: flotilla_resources::WatchStream<T>,
     writer: &flotilla_resources::ReplicaWriter<T>,
     snapshot_version: String,
+    remote: &flotilla_resources::TypedResolver<T>,
+    peer: &NodeId,
 ) -> Result<(), OriginWatchFailure> {
     // Relay updates share the writer but cannot move this direct stream's
     // expected sequence. Its position starts at the authoritative snapshot.
     let mut version = Some(snapshot_version);
-    while let Some(event) = watch.next().await {
+    let mut digest_tick = tokio::time::interval_at(tokio::time::Instant::now() + DIGEST_INTERVAL, DIGEST_INTERVAL);
+    digest_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let event = tokio::select! {
+            event = watch.next() => match event { Some(event) => event, None => return Ok(()) },
+            _ = digest_tick.tick() => {
+                match reconcile_digest::<T, _, _>(writer, peer, |query| async move { remote.digest(&query).await.map_err(|error| error.to_string()) }).await {
+                    // Reopen from the proven cut, discarding buffered older events.
+                    Ok(true)=>return Ok(()),
+                    Ok(false)=>{},
+                    Err(error)=>debug!(%peer, kind=T::API_PATHS.kind, %error, "digest repair deferred; preserving replicas"),
+                }
+                continue;
+            }
+        };
         let event = event.map_err(OriginWatchFailure::from_resource)?;
         check_sequence(&mut version, &event).map_err(OriginWatchFailure::SnapshotRequired)?;
         writer.apply_direct(event, Utc::now()).await.map_err(OriginWatchFailure::from_resource)?;
     }
-    Ok(())
+}
+
+/// Run beside the direct log consumer, so live events cannot be applied during
+/// an authoritative snapshot replacement. Relay sources are never authorities.
+async fn reconcile_digest<T: Resource, F, Fut>(
+    writer: &flotilla_resources::ReplicaWriter<T>,
+    peer: &NodeId,
+    mut fetch: F,
+) -> Result<bool, String>
+where
+    F: FnMut(DigestQuery) -> Fut,
+    Fut: Future<Output = Result<PartitionDigest, String>>,
+{
+    let remote = fetch(DigestQuery::Root).await?;
+    if remote.origin != *peer || remote.kind != T::API_PATHS.kind || remote.namespace != REPLICATION_NAMESPACE {
+        return Err("digest authority identity mismatch".into());
+    }
+    let previous = writer.cursor().await.map_err(|error| error.to_string())?.ok_or("digest needs an established replica prefix")?;
+    let generation = previous.generation.clone();
+    // A generation change is handled by the log's generation check on reconnect;
+    // do not compare an old-generation replica as if it were current.
+    if generation != remote.generation {
+        return Err("digest generation changed; log reconnect required".into());
+    }
+    let local = writer.digest(generation).await.map_err(|error| error.to_string())?;
+    if local.root == remote.root {
+        return Ok(false);
+    }
+    let children = fetch(DigestQuery::Children { expected_root: remote.root.clone() }).await?;
+    if children.root != remote.root
+        || children.origin != remote.origin
+        || children.generation != remote.generation
+        || children.kind != remote.kind
+        || children.namespace != remote.namespace
+    {
+        return Err("digest tree changed during drill-down".into());
+    }
+    children.validate_tree::<T>().map_err(|error| error.to_string())?;
+    let remote_hashes =
+        children.children.as_ref().filter(|hashes| hashes.len() == flotilla_resources::DIGEST_FANOUT).ok_or("incomplete digest tree")?;
+    let local_hashes = local.children.as_ref().ok_or("incomplete replica digest tree")?;
+    // Fetch and validate every differing bucket before replacing any. Partial
+    // availability or concurrent authoritative writes cannot imply deletion.
+    let mut snapshots = Vec::new();
+    for (bucket, (authority, replica)) in remote_hashes.iter().zip(local_hashes).enumerate() {
+        if authority == replica {
+            continue;
+        }
+        let snapshot = fetch(DigestQuery::Snapshot { expected_root: remote.root.clone(), bucket: bucket as u8 }).await?;
+        let listed = snapshot.snapshot::<T>(&children, bucket as u8).map_err(|error| error.to_string())?;
+        snapshots.push((bucket as u8, listed));
+    }
+    // Confirm the cut is still current before acting on absence. A write during
+    // the last bucket read defers the whole repair to the next interval.
+    let confirmed = fetch(DigestQuery::Children { expected_root: remote.root.clone() }).await?;
+    if confirmed.root != remote.root || confirmed.generation != remote.generation {
+        return Err("digest snapshot cut changed".into());
+    }
+    let synced_at = Utc::now();
+    for (bucket, listed) in snapshots {
+        writer.replace_bucket(bucket, &listed, synced_at).await.map_err(|error| error.to_string())?;
+    }
+    writer.confirm_digest_position(&remote, &previous).await.map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+#[cfg(feature = "test-support")]
+async fn fetch_routed_digest<T: Resource>(
+    router: &RemoteCommandRouter,
+    peer: &NodeId,
+    store: ReplicationStore,
+    query: DigestQuery,
+) -> Result<PartitionDigest, String> {
+    let result = router
+        .dispatch_query(
+            Command::builder()
+                .node_id(peer.clone())
+                .action(CommandAction::QueryResourceDigest { namespace: REPLICATION_NAMESPACE.into(), kind: store.kind::<T>(), query })
+                .build(),
+            uuid::Uuid::new_v4(),
+        )
+        .await?;
+    match result {
+        CommandValue::ResourceDigest(value) => serde_json::from_value(*value).map_err(|error| error.to_string()),
+        CommandValue::Error { message } => Err(message),
+        other => Err(format!("unexpected digest response: {other:?}")),
+    }
 }
 
 // The origin's per-kind sequence includes deletes. Never advance past a hole,
 // including a historical event skipped during schema-decode quarantine.
-// A dropped final event needs a later event/reconnect to expose it; the digest
-// safety net for that case is tracked in https://github.com/flotilla-org/flotilla/issues/2638.
+// A dropped final event is repaired by the periodic digest safety net.
 // These watches are unfiltered. Both authoritative stores assign numeric, dense
 // versions independently per (group, version, kind, namespace), not Kubernetes'
 // opaque versions. Relay writes must not alter this direct stream's position.
@@ -682,8 +786,20 @@ async fn run_routed_watch<T: Resource>(
     let mut initializing = prefix.is_none();
 
     let mut version = prefix.map(|prefix| prefix.resource_version);
+    let mut digest_tick = tokio::time::interval_at(tokio::time::Instant::now() + DIGEST_INTERVAL, DIGEST_INTERVAL);
+    digest_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let received = events.recv().await;
+        let received = tokio::select! {
+            event = events.recv() => event,
+            _ = digest_tick.tick(), if !initializing => {
+                match reconcile_digest::<T,_,_>(&writer,peer,|query| fetch_routed_digest::<T>(router,peer,store,query)).await {
+                    Ok(true)=>{let _=router.dispatch_cancel(command_id).await;return Ok(());},
+                    Ok(false)=>{},
+                    Err(error)=>debug!(%peer,kind=T::API_PATHS.kind,%error,"digest repair deferred; preserving replicas"),
+                }
+                continue;
+            }
+        };
         match received {
             Ok(DaemonEvent::CommandStepUpdate {
                 command_id: event_command_id,
@@ -1276,3 +1392,72 @@ mod tests {
 
 #[cfg(test)]
 mod relay_tests;
+
+#[cfg(test)]
+mod digest_tests {
+    use flotilla_resources::{Convoy, ConvoySpec, InMemoryBackend, InputMeta};
+
+    use super::*;
+
+    // A write during drill-down invalidates its cut before any bucket is
+    // replaced, even when an earlier bucket snapshot was already fetched.
+    #[tokio::test]
+    async fn concurrent_authority_write_defers_all_bucket_repairs() {
+        let peer = NodeId::new("authority");
+        let authority =
+            ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(peer.clone()).using::<Convoy>(REPLICATION_NAMESPACE);
+        let holder = ResourceBackend::InMemory(InMemoryBackend::default());
+        let writer = holder.replica_writer::<Convoy>(peer.clone(), REPLICATION_NAMESPACE);
+        let spec = ConvoySpec::builder().workflow_ref("workflow".into()).build();
+        for name in ["gone", "retained"] {
+            authority.create(&InputMeta::builder().name(name.into()).build(), &spec).await.expect("create");
+        }
+        writer.replace(&authority.list().await.expect("seed"), Utc::now()).await.expect("snapshot");
+        authority.delete("gone").await.expect("delete");
+        let current = authority.get("retained").await.expect("retained");
+        authority
+            .update(
+                &InputMeta::builder().name("retained".into()).build(),
+                &current.metadata.resource_version,
+                &ConvoySpec::builder().workflow_ref("new".into()).build(),
+            )
+            .await
+            .expect("modify");
+        let mut snapshots = 0;
+        let result = reconcile_digest::<Convoy, _, _>(&writer, &peer, |query| {
+            let should_write = if matches!(query, DigestQuery::Snapshot { .. }) {
+                snapshots += 1;
+                snapshots == 2
+            } else {
+                false
+            };
+            let authority = authority.clone();
+            let spec = spec.clone();
+            async move {
+                if should_write {
+                    authority.create(&InputMeta::builder().name("concurrent".into()).build(), &spec).await.expect("concurrent write");
+                }
+                authority.digest(&query).await.map_err(|error| error.to_string())
+            }
+        })
+        .await;
+        assert!(result.is_err(), "a concurrent write must refuse the old snapshot cut");
+        let before = holder.including_replicas::<Convoy>(REPLICATION_NAMESPACE).list().await.expect("replicas");
+        assert_eq!(before.items.len(), 2, "no earlier bucket was applied after the later read failed");
+        assert!(before.items.iter().any(|item| item.object.metadata.name == "gone"));
+        assert_eq!(
+            before.items.iter().find(|item| item.object.metadata.name == "retained").expect("retained").object.spec.workflow_ref,
+            "workflow"
+        );
+        reconcile_digest::<Convoy, _, _>(&writer, &peer, |query| {
+            let authority = authority.clone();
+            async move { authority.digest(&query).await.map_err(|error| error.to_string()) }
+        })
+        .await
+        .expect("stable retry");
+        assert_eq!(
+            writer.digest(None).await.expect("holder root").root,
+            authority.digest(&DigestQuery::Root).await.expect("authority root").root
+        );
+    }
+}

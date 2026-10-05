@@ -464,9 +464,62 @@ impl<T: Resource> ReplicaWriter<T> {
         ensure_replication_enabled::<T>()?;
         match &self.backend {
             ResourceBackend::InMemory(backend) => {
-                backend.replace_replicas_typed(&self.origin_root, &self.namespace, listed, synced_at).await
+                backend.replace_replicas_typed(&self.origin_root, &self.namespace, listed, synced_at, None).await
             }
-            ResourceBackend::Sqlite(backend) => backend.replace_replicas_typed(&self.origin_root, &self.namespace, listed, synced_at).await,
+            ResourceBackend::Sqlite(backend) => {
+                backend.replace_replicas_typed(&self.origin_root, &self.namespace, listed, synced_at, None).await
+            }
+            ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
+        }
+    }
+
+    /// Replace only one complete authoritative hash bucket; never move the log cursor.
+    pub async fn replace_bucket(&self, bucket: u8, listed: &ResourceList<T>, synced_at: DateTime<Utc>) -> Result<(), ResourceError> {
+        ensure_replication_enabled::<T>()?;
+        if listed
+            .items
+            .iter()
+            .any(|object| crate::digest_bucket(&object.metadata.name) != bucket || object.metadata.namespace != self.namespace)
+        {
+            return Err(ResourceError::invalid("snapshot contains keys outside its partition"));
+        }
+        match &self.backend {
+            ResourceBackend::InMemory(backend) => {
+                backend.replace_replicas_typed(&self.origin_root, &self.namespace, listed, synced_at, Some(bucket)).await
+            }
+            ResourceBackend::Sqlite(backend) => {
+                backend.replace_replicas_typed(&self.origin_root, &self.namespace, listed, synced_at, Some(bucket)).await
+            }
+            ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
+        }
+    }
+
+    /// A repaired, complete hierarchy proves a log cut. Confirm it atomically
+    /// with the cached set before advancing the direct-origin prefix.
+    pub async fn confirm_digest_position(&self, proof: &crate::PartitionDigest, previous: &ReplicaCursor) -> Result<(), ResourceError> {
+        if proof.origin != self.origin_root
+            || proof.kind != T::API_PATHS.kind
+            || proof.namespace != self.namespace
+            || proof.generation != previous.generation
+        {
+            return Err(ResourceError::invalid("digest prefix identity mismatch"));
+        }
+        match &self.backend {
+            ResourceBackend::InMemory(backend) => {
+                backend.confirm_replica_digest_typed::<T>(&self.origin_root, &self.namespace, proof, previous).await
+            }
+            ResourceBackend::Sqlite(backend) => {
+                backend.confirm_replica_digest_typed::<T>(&self.origin_root, &self.namespace, proof, previous).await
+            }
+            ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
+        }
+    }
+
+    pub async fn digest(&self, generation: Option<String>) -> Result<crate::PartitionDigest, ResourceError> {
+        ensure_replication_enabled::<T>()?;
+        match &self.backend {
+            ResourceBackend::InMemory(backend) => backend.replica_digest_typed::<T>(&self.origin_root, &self.namespace, generation).await,
+            ResourceBackend::Sqlite(backend) => backend.replica_digest_typed::<T>(&self.origin_root, &self.namespace, generation).await,
             ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
         }
     }
@@ -578,6 +631,10 @@ impl<T: Resource> TypedResolver<T> {
     /// HTTP uses collection metadata from the standard list endpoint.
     pub async fn current_position(&self) -> Result<crate::ResourcePosition, ResourceError> {
         dispatch_backend!(self, current_position_typed)
+    }
+
+    pub async fn digest(&self, query: &crate::DigestQuery) -> Result<crate::PartitionDigest, ResourceError> {
+        dispatch_backend!(self, digest_typed, query)
     }
 
     pub async fn list(&self) -> Result<ResourceList<T>, ResourceError> {

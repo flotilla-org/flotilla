@@ -333,3 +333,34 @@ async fn observed_checkout_http_relay_keeps_ephemeral_origin_and_deletes() {
     .await
     .expect("observation delete reaches third host");
 }
+
+// HTTP digest requests use the same authoritative handler as production. A
+// percent-encoded query or read-view listing must not accidentally replace it.
+#[tokio::test]
+async fn http_digest_drill_down_reads_only_the_requested_partition() {
+    use flotilla_resources::{digest_bucket, DigestQuery};
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let local = backend.using::<WorkflowTemplate>("flotilla");
+    local.create(&InputMeta::builder().name("retained".into()).build(), &single_agent_workflow_spec()).await.expect("create");
+    let sockets = TestSocketDir::new();
+    let path = sockets.socket_path("digest.sock");
+    let listener = UnixListener::bind(&path).expect("bind resource API");
+    let server = tokio::spawn(async move {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().await.expect("accept digest request");
+            let first = stream.read_u8().await.expect("request byte");
+            serve_resource_http(stream, first, backend.clone()).await.expect("serve digest");
+        }
+    });
+    let remote = ResourceBackend::Http(HttpBackend::from_unix_socket(&path).expect("HTTP client")).using::<WorkflowTemplate>("flotilla");
+    let root = remote.digest(&DigestQuery::Root).await.expect("remote root");
+    assert!(root.items.is_none() && root.children.is_none(), "roots transfer no bodies or child hashes");
+    let children = remote.digest(&DigestQuery::Children { expected_root: root.root.clone() }).await.expect("remote children");
+    children.validate_tree::<WorkflowTemplate>().expect("complete hierarchy");
+    let bucket = digest_bucket("retained");
+    let snapshot = remote.digest(&DigestQuery::Snapshot { expected_root: root.root, bucket }).await.expect("remote bucket");
+    let listed = snapshot.snapshot::<WorkflowTemplate>(&children, bucket).expect("validated bucket");
+    assert_eq!(listed.items.len(), 1);
+    assert_eq!(listed.items[0].metadata.name, "retained");
+    server.await.expect("server");
+}

@@ -729,6 +729,16 @@ impl std::fmt::Display for StallProposedDisposition {
     }
 }
 
+/// Authoritative key/version anti-entropy reads; roots bind child and snapshot
+/// requests to the same complete collection cut.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "query", rename_all = "snake_case")]
+pub enum ResourceDigestQuery {
+    Root,
+    Children { expected_root: String },
+    Snapshot { expected_root: String, bucket: u8 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum CommandAction {
@@ -1022,6 +1032,11 @@ pub enum CommandAction {
         namespace: Option<String>,
         name: String,
     },
+    QueryResourceDigest {
+        namespace: String,
+        kind: String,
+        query: ResourceDigestQuery,
+    },
     QueryResourceList {
         namespace: String,
         kind: String,
@@ -1101,6 +1116,7 @@ impl CommandAction {
                 | CommandAction::QueryCrewList { .. }
                 | CommandAction::QueryDaemonLogs { .. }
                 | CommandAction::QueryExplainConvoy { .. }
+                | CommandAction::QueryResourceDigest { .. }
                 | CommandAction::QueryResourceList { .. }
                 | CommandAction::QueryResourceGet { .. }
                 | CommandAction::Attach { .. }
@@ -1178,6 +1194,7 @@ impl Command {
             CommandAction::QueryCrewList { .. } => "query crew list",
             CommandAction::QueryDaemonLogs { .. } => "query daemon logs",
             CommandAction::QueryExplainConvoy { .. } => "explain convoy",
+            CommandAction::QueryResourceDigest { .. } => "query resource digest",
             CommandAction::QueryResourceList { .. } => "query resource list",
             CommandAction::QueryResourceGet { .. } => "query resource get",
             CommandAction::ResourceApply { .. } => "apply resource",
@@ -1346,6 +1363,7 @@ pub enum CommandValue {
     ResourceDeleted(Box<ResourceJsonResponse>),
     ResourceAlreadyDeleted(Box<ResourceJsonResponse>),
     ResourceWatchEvent(Box<ResourceReadEnvelope>),
+    ResourceDigest(Box<serde_json::Value>),
     EnvironmentSpecRead {
         spec: crate::EnvironmentSpec,
     },

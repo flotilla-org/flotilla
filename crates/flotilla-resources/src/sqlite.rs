@@ -27,6 +27,8 @@ use crate::{
     FieldOwnershipViolation,
 };
 
+mod digest;
+
 type StoreKey = (String, String, String, String);
 type WatchersByStore = HashMap<StoreKey, WatchChannel<StoredEvent>>;
 type ReplicaWatchersByStore = HashMap<StoreKey, WatchChannel<StoredReplicaEvent>>;
@@ -163,6 +165,7 @@ impl SqliteBackend {
         let mut backend = Self::from_connection(connection, event_retention)?;
         let read = RusqliteConnection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|err| ResourceError::other(format!("open sqlite resource read connection: {err}")))?;
+        Self::register_digest_functions(&read)?;
         read.busy_timeout(READ_BUSY_TIMEOUT)
             .map_err(|err| ResourceError::other(format!("configure sqlite resource read busy timeout: {err}")))?;
         backend.read_connection = Some(read.into());
@@ -176,6 +179,7 @@ impl SqliteBackend {
             .await
             .map_err(|err| ResourceError::other(format!("open sqlite resource read connection: {err}")))?;
         read.call(|connection| {
+            Self::register_digest_functions(connection)?;
             connection.busy_timeout(READ_BUSY_TIMEOUT).map_err(|err| ResourceError::other(format!("configure sqlite read timeout: {err}")))
         })
         .await
@@ -458,6 +462,7 @@ impl SqliteBackend {
             );
         }
         Self::compact_existing_events(connection, event_retention)?;
+        Self::initialize_digests(connection)?;
         Ok(())
     }
 
@@ -1099,6 +1104,7 @@ impl SqliteBackend {
         namespace: &str,
         listed: &ResourceList<T>,
         synced_at: DateTime<Utc>,
+        bucket: Option<u8>,
     ) -> Result<(), ResourceError> {
         let key = Self::store_key::<T>(namespace);
         let operation_key = key.clone();
@@ -1121,16 +1127,18 @@ impl SqliteBackend {
             .call("replace replica snapshot", move |connection| {
                 let tx = connection.transaction().map_err(|err| Self::map_sqlite(err, "begin sqlite replica replacement"))?;
                 let old = {
-                    let mut statement = tx
-                        .prepare(
-                            r#"
-                            SELECT name, body_json, last_synced_at FROM replica_objects
-                            WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5
-                            "#,
-                        )
+                    let sql=if bucket.is_some() {
+                        "SELECT o.name,o.body_json,o.last_synced_at FROM digest_entries d JOIN replica_objects o
+                         ON o.origin_root=d.origin AND o.group_name=d.group_name AND o.version=d.version AND o.kind=d.kind AND o.namespace=d.namespace AND o.name=d.name
+                         WHERE d.origin=?1 AND d.group_name=?2 AND d.version=?3 AND d.kind=?4 AND d.namespace=?5 AND d.bucket=?6"
+                    } else {
+                        "SELECT name,body_json,last_synced_at FROM replica_objects
+                         WHERE origin_root=?1 AND group_name=?2 AND version=?3 AND kind=?4 AND namespace=?5 AND ?6 IS NULL"
+                    };
+                    let mut statement = tx.prepare(sql)
                         .map_err(|err| Self::map_sqlite(err, "prepare old sqlite replicas"))?;
                     let rows = statement
-                        .query_map(params![origin, key.0, key.1, key.2, key.3], |row| {
+                        .query_map(params![origin, key.0, key.1, key.2, key.3, bucket], |row| {
                             Ok((row.get::<_, String>(0)?, (row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
                         })
                         .map_err(|err| Self::map_sqlite(err, "query old sqlite replicas"))?;
@@ -1181,7 +1189,8 @@ impl SqliteBackend {
                     )
                     .map_err(|err| Self::map_sqlite(err, "fence snapshot-deleted replica"))?;
                 }
-                tx.execute(
+                if bucket.is_none() {
+                    tx.execute(
                     r#"
                     INSERT INTO replica_cursors
                         (origin_root, group_name, version, kind, namespace, resource_version, generation, last_synced_at, complete_prefix)
@@ -1193,7 +1202,8 @@ impl SqliteBackend {
                     "#,
                     params![origin, key.0, key.1, key.2, key.3, resource_version, generation, synced],
                 )
-                .map_err(|err| Self::map_sqlite(err, "write sqlite replica cursor"))?;
+                    .map_err(|err| Self::map_sqlite(err, "write sqlite replica cursor"))?;
+                }
                 tx.commit().map_err(|err| Self::map_sqlite(err, "commit sqlite replica replacement"))?;
 
                 let mut events = encoded

@@ -188,7 +188,8 @@ pub async fn build_plan(
     let issue_source = forge_issue_source(&repo.identity);
 
     match action {
-        CommandAction::QueryResourceList { .. }
+        CommandAction::QueryResourceDigest { .. }
+        | CommandAction::QueryResourceList { .. }
         | CommandAction::QueryResourceGet { .. }
         | CommandAction::QueryExplainConvoy { .. }
         | CommandAction::ResourceApply { .. }
