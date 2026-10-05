@@ -24,6 +24,7 @@ fn yaml_round_trip() {
                 stdout: Some("clean\n".into()),
                 stderr: None,
                 exit_code: Some(0),
+                error: None,
             },
             Interaction::GhApi {
                 label: None,
@@ -87,6 +88,7 @@ fn replay_session_serves_in_order() {
             stdout: Some("ok\n".into()),
             stderr: None,
             exit_code: Some(0),
+            error: None,
         }],
     };
 
@@ -383,6 +385,7 @@ fn channel_label_from_interaction() {
         stdout: Some("ok\n".into()),
         stderr: None,
         exit_code: Some(0),
+        error: None,
     };
     // DefaultLabeler uses subcommand: "git status"
     assert_eq!(cmd.channel_label(), ChannelLabel::Command("git status".into()));
@@ -395,6 +398,7 @@ fn channel_label_from_interaction() {
         stdout: Some("ok\n".into()),
         stderr: None,
         exit_code: Some(0),
+        error: None,
     };
     assert_eq!(cmd_no_args.channel_label(), ChannelLabel::Command("git".into()));
 
@@ -502,6 +506,7 @@ fn round_is_empty() {
         stdout: None,
         stderr: None,
         exit_code: Some(0),
+        error: None,
     }]);
     assert!(!round.is_empty());
 }
@@ -650,6 +655,7 @@ fn recorder_saves_single_round() {
         stdout: Some("ok\n".into()),
         stderr: None,
         exit_code: Some(0),
+        error: None,
     });
     recorder.save();
 
@@ -673,6 +679,7 @@ fn recorder_saves_multi_round_with_barriers() {
         stdout: Some("ok\n".into()),
         stderr: None,
         exit_code: Some(0),
+        error: None,
     });
     recorder.barrier();
     recorder.record(Interaction::GhApi {
@@ -709,6 +716,7 @@ fn recorder_applies_masks() {
         stdout: Some("ok\n".into()),
         stderr: None,
         exit_code: Some(0),
+        error: None,
     });
     recorder.save();
 
@@ -1173,6 +1181,13 @@ fn command_exit_status_survives_record_replay(tc: hegel::TestCase) {
             assert_eq!(output.success(), exit_code == Some(0));
             assert_eq!((output.stdout, output.stderr), (live.stdout, live.stderr));
             session.finish();
+            // The string convenience API selects stderr for every failure,
+            // including explicit null/no-code termination, and stdout for zero.
+            let session = Session::replaying(&path, Masks::new());
+            let output = ReplayRunner::new(session.clone()).run("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await;
+            let expected = if exit_code == Some(0) { Ok("output\n".to_string()) } else { Err("diagnostic\n".to_string()) };
+            assert_eq!(output, expected);
+            session.finish();
         }
     });
 }
@@ -1187,4 +1202,27 @@ fn legacy_command_exit_status_is_readable() {
         let Interaction::Command { exit_code, .. } = interaction else { panic!("command") };
         assert_eq!(exit_code, expected);
     }
+}
+
+// Raw-output execution failures survive recording as errors, rather than an
+// exit code 1 that pgrep callers must interpret as a successful empty match.
+#[tokio::test]
+async fn command_execution_error_survives_record_replay() {
+    use crate::providers::testing::MockRunner;
+    let temp = tempfile::tempdir().expect("recording directory");
+    let path = temp.path().join("failure.yaml");
+    let label = crate::providers::command_channel_label("pgrep", &["-x", "flotillad"]);
+    let mut masks = Masks::new();
+    masks.add("/private/runtime", "{runtime}");
+    let session = Session::recording(&path, masks.clone());
+    let inner = Arc::new(MockRunner::with_outputs(vec![Err("cannot execute in /private/runtime".into())]));
+    let expected =
+        RecordingRunner::new(session.clone(), inner).run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await.err();
+    session.finish();
+    assert!(!std::fs::read_to_string(&path).expect("recording").contains("/private/runtime"));
+    let session = Session::replaying(&path, masks);
+    let actual = ReplayRunner::new(session.clone()).run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &label).await.err();
+    assert_eq!(actual, expected);
+    assert_eq!(actual.as_deref(), Some("cannot execute in /private/runtime"));
+    session.finish();
 }

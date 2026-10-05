@@ -34,6 +34,8 @@ pub enum Interaction {
         stderr: Option<String>,
         #[serde(default = "successful_exit_code")]
         exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     #[serde(rename = "gh_api")]
     GhApi {
@@ -468,7 +470,8 @@ impl ReplayRunner {
 impl CommandRunner for ReplayRunner {
     async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
         let interaction = self.session.next(label);
-        let Interaction::Command { cmd: expected_cmd, args: expected_args, cwd: expected_cwd, stdout, stderr, exit_code, .. } = interaction
+        let Interaction::Command { cmd: expected_cmd, args: expected_args, cwd: expected_cwd, stdout, stderr, exit_code, error, .. } =
+            interaction
         else {
             panic!("ReplayRunner: expected command interaction");
         };
@@ -479,6 +482,9 @@ impl CommandRunner for ReplayRunner {
         let actual_cwd = cwd.to_string_lossy();
         assert_eq!(actual_cwd, expected_cwd, "ReplayRunner: cwd mismatch for '{cmd}'");
 
+        if let Some(error) = error {
+            return Err(error);
+        }
         if exit_code == Some(0) {
             Ok(stdout.unwrap_or_default())
         } else {
@@ -500,7 +506,8 @@ impl CommandRunner for ReplayRunner {
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         let interaction = self.session.next(label);
-        let Interaction::Command { cmd: expected_cmd, args: expected_args, cwd: expected_cwd, stdout, stderr, exit_code, .. } = interaction
+        let Interaction::Command { cmd: expected_cmd, args: expected_args, cwd: expected_cwd, stdout, stderr, exit_code, error, .. } =
+            interaction
         else {
             panic!("ReplayRunner: expected command interaction");
         };
@@ -511,6 +518,9 @@ impl CommandRunner for ReplayRunner {
         let actual_cwd = cwd.to_string_lossy();
         assert_eq!(actual_cwd, expected_cwd, "ReplayRunner: cwd mismatch for '{cmd}'");
 
+        if let Some(error) = error {
+            return Err(error);
+        }
         Ok(CommandOutput { stdout: stdout.unwrap_or_default(), stderr: stderr.unwrap_or_default(), exit_code })
     }
 
@@ -768,7 +778,7 @@ fn explicit_label(label: &ChannelLabel, default: &ChannelLabel) -> Option<String
 
 fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
     match interaction {
-        Interaction::Command { label, cmd, args, cwd, stdout, stderr, exit_code } => Interaction::Command {
+        Interaction::Command { label, cmd, args, cwd, stdout, stderr, exit_code, error } => Interaction::Command {
             label: label.clone(),
             cmd: masks.unmask(cmd),
             args: args.iter().map(|a| masks.unmask(a)).collect(),
@@ -776,6 +786,7 @@ fn unmask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             stdout: stdout.as_ref().map(|s| masks.unmask(s)),
             stderr: stderr.as_ref().map(|s| masks.unmask(s)),
             exit_code: *exit_code,
+            error: error.as_ref().map(|s| masks.unmask(s)),
         },
         Interaction::GhApi { label, method, endpoint, status, body, headers } => Interaction::GhApi {
             label: label.clone(),
@@ -815,6 +826,8 @@ impl RecordingRunner {
         let request = ChannelRequest::Command { cmd, args };
         let default = DefaultLabeler.label_for(&request);
         let explicit = explicit_label(label, &default);
+        // String-only calls have discarded native status; keep their historical
+        // 0/1 encoding. Full-output calls retain status and execution errors.
         let (stdout, stderr, exit_code) = match result {
             Ok(out) => (Some(out.clone()), None, Some(0)),
             Err(err) => (None, Some(err.clone()), Some(1)),
@@ -827,6 +840,7 @@ impl RecordingRunner {
             stdout,
             stderr,
             exit_code,
+            error: None,
         });
     }
 }
@@ -870,6 +884,7 @@ impl CommandRunner for RecordingRunner {
                     stdout: Some(output.stdout.clone()),
                     stderr: Some(output.stderr.clone()),
                     exit_code: output.exit_code,
+                    error: None,
                 });
             }
             Err(err) => {
@@ -880,7 +895,8 @@ impl CommandRunner for RecordingRunner {
                     cwd: cwd.to_string_lossy().to_string(),
                     stdout: None,
                     stderr: Some(err.clone()),
-                    exit_code: Some(1),
+                    exit_code: None,
+                    error: Some(err.clone()),
                 });
             }
         }
@@ -904,22 +920,7 @@ impl CommandRunner for RecordingRunner {
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, input: &[u8]) -> Result<String, String> {
         let result = self.inner.run_with_input(cmd, args, cwd, label, input).await;
 
-        let request = ChannelRequest::Command { cmd, args };
-        let default = DefaultLabeler.label_for(&request);
-        let explicit = explicit_label(label, &default);
-        let (stdout, stderr, exit_code) = match &result {
-            Ok(out) => (Some(out.clone()), None, Some(0)),
-            Err(err) => (None, Some(err.clone()), Some(1)),
-        };
-        self.session.record(Interaction::Command {
-            label: explicit,
-            cmd: cmd.to_string(),
-            args: args.iter().map(|arg| (*arg).to_string()).collect(),
-            cwd: cwd.to_string_lossy().to_string(),
-            stdout,
-            stderr,
-            exit_code,
-        });
+        self.record_run(cmd, args, cwd, label, &result);
         result
     }
 
@@ -1197,7 +1198,7 @@ pub fn test_http_client(session: &Session) -> Arc<dyn super::HttpClient> {
 
 fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
     match interaction {
-        Interaction::Command { label, cmd, args, cwd, stdout, stderr, exit_code } => Interaction::Command {
+        Interaction::Command { label, cmd, args, cwd, stdout, stderr, exit_code, error } => Interaction::Command {
             label: label.clone(),
             cmd: masks.mask(cmd),
             args: args.iter().map(|a| masks.mask(a)).collect(),
@@ -1205,6 +1206,7 @@ fn mask_interaction(interaction: &Interaction, masks: &Masks) -> Interaction {
             stdout: stdout.as_ref().map(|s| masks.mask(s)),
             stderr: stderr.as_ref().map(|s| masks.mask(s)),
             exit_code: *exit_code,
+            error: error.as_ref().map(|s| masks.mask(s)),
         },
         Interaction::GhApi { label, method, endpoint, status, body, headers } => Interaction::GhApi {
             label: label.clone(),
