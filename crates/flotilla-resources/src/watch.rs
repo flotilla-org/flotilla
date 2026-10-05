@@ -18,6 +18,15 @@ use crate::{
     resource::{K8sResourceObject, Resource, ResourceObject},
 };
 
+/// A collection's list/watch boundary, independent of its objects.
+/// Capture before a point read and resume from this position to avoid losing
+/// mutations concurrent with that read. Versions are opaque, not object versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourcePosition {
+    pub resource_version: String,
+    pub generation: Option<String>,
+}
+
 // Shared live payloads borrow their JSON tree; owned replay payloads can reuse
 // their strings. Both return owned objects without an intermediate tree clone.
 pub(crate) fn decode_watch_object<'de, T: Resource>(

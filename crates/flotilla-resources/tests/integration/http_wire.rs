@@ -404,3 +404,18 @@ async fn renamed_label_selector_reads_legacy_http_metadata() {
     let request = request_rx.await.expect("request");
     assert!(!request.contains("labelSelector"), "equality selector would hide legacy labels: {request}");
 }
+
+// HTTP position reads use the collection endpoint and accept opaque versions
+// and generations without decoding unrelated (even invalid) resource specs.
+#[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "requires socket bind")]
+async fn current_position_reads_only_collection_metadata() {
+    let body = r#"{"metadata":{"resourceVersion":"opaque-7","generation":"epoch-2"},"items":[{"spec":"invalid"}]}"#;
+    let (url, request) = spawn_one_shot_server(response("200 OK", body)).await;
+    let backend = ResourceBackend::Http(HttpBackend::new(flotilla_resources::tls::client(), url));
+    let position = backend.using::<Convoy>("flotilla").current_position().await.expect("position");
+    assert_eq!(position.resource_version, "opaque-7");
+    assert_eq!(position.generation.as_deref(), Some("epoch-2"));
+    let request = request.await.expect("request");
+    assert!(request.starts_with("GET /apis/flotilla.work/v1/namespaces/flotilla/convoys HTTP/1.1"));
+}

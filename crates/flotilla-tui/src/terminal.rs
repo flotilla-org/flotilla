@@ -32,11 +32,17 @@ fn attach_argv(plan: &ResolvedAttachPlan) -> Result<(String, Vec<String>), Strin
     };
     let mut argv = args
         .iter()
-        .map(|value| match value {
-            Arg::Literal(value) | Arg::Quoted(value) => value.clone(),
-            Arg::NestedCommand(inner) => arg::flatten(inner, 1),
+        .map(|value| {
+            Ok(match value {
+                Arg::Literal(value) | Arg::Quoted(value) => value.clone(),
+                Arg::NestedCommand(inner) => arg::flatten(inner, 1),
+                Arg::EnvAssignment { key, value } => {
+                    arg::validate_env_key(key)?;
+                    format!("{key}={value}")
+                }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, String>>()?;
     if argv.is_empty() {
         return Err("attach resolution produced an empty command".to_string());
     }
@@ -127,6 +133,33 @@ mod tests {
     use flotilla_protocol::{arg::Arg, ResolvedAttachPlan};
 
     use super::attach_argv;
+
+    // Direct argv has no shell boundary: assignment values retain their bytes.
+    // Glue: one mapping from the structured assignment to env's argv element.
+    // Direct argv rejects the same invalid identifiers as shell flattening,
+    // while reporting a recoverable error to the caller.
+    #[test]
+    fn env_assignment_rejects_invalid_argv_keys() {
+        for key in ["", "A=B", "FOO-BAR", "9KEY", "A;cmd"] {
+            let plan = ResolvedAttachPlan::command(vec![Arg::Literal("env".into()), Arg::EnvAssignment {
+                key: key.into(),
+                value: "value".into(),
+            }]);
+            assert!(attach_argv(&plan).is_err());
+        }
+    }
+
+    #[test]
+    fn env_assignment_becomes_unquoted_argv() {
+        let plan = ResolvedAttachPlan::command(vec![
+            Arg::Literal("env".into()),
+            Arg::EnvAssignment { key: "KEY".into(), value: "it's a $VALUE".into() },
+            Arg::Literal("bash".into()),
+        ]);
+        let (program, args) = attach_argv(&plan).expect("attach argv");
+        assert_eq!(program, "env");
+        assert_eq!(args, ["KEY=it's a $VALUE", "bash"]);
+    }
 
     #[test]
     fn attach_plan_becomes_direct_argv_without_a_shell_boundary() {

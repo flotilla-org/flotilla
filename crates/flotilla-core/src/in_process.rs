@@ -64,22 +64,22 @@ use flotilla_protocol::{
 use flotilla_resources::{
     active_change_request_subjects, api_version, apply_resource_document, apply_status_patch as apply_resource_status_patch,
     apply_status_patch_checked as apply_resource_status_patch_checked, capped_github_app_permissions, change_request_address,
-    change_request_address_with_forges, change_request_record_name, external_patches as convoy_external_patches, get_resource_kind,
-    get_resource_kind_including_replicas, host_direct_environment_name, list_resource_kind, list_resource_kind_including_replicas,
-    normalize_issue_source, normalize_project_spec, observed_change_request_subjects, resolve_project_issue_sources, AllocationDecision,
-    BoundChangeRequest, CapabilityNeed, ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout,
-    CheckoutPhase as ResourceCheckoutPhase, CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock,
-    Convoy as ResourceConvoy, ConvoyEnsure, ConvoyIssue, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch,
-    CredentialConsumer, CredentialGrant, CredentialSource, CredentialSpec, CrewCompletionPending, CrewMessageSender, CrewSource, CrewSpec,
-    DocumentKey, Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentGrant,
-    FulfilmentKind, Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IssueSnapshot,
-    IssueSourceResolution, IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectMeta,
-    ObservedChangeRequestState, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Platform,
-    Project, ProjectSpec, ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resolution,
-    ResolutionAction, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RoleHandoff, SupervisionTarget,
-    SystemClock, TerminalCrewContext, TurnDeliveryRung, VesselRequirement, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase,
-    WorkflowTemplate, WorkflowTemplateSpec, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL,
-    ROLE_LABEL,
+    change_request_address_with_forges, change_request_record_name, current_resource_kind_position,
+    external_patches as convoy_external_patches, get_resource_kind, get_resource_kind_including_replicas, host_direct_environment_name,
+    list_resource_kind, list_resource_kind_including_replicas, normalize_issue_source, normalize_project_spec,
+    observed_change_request_subjects, resolve_project_issue_sources, AllocationDecision, BoundChangeRequest, CapabilityNeed,
+    ChangeRequest as ResourceChangeRequest, Checkout as ResourceCheckout, CheckoutPhase as ResourceCheckoutPhase,
+    CheckoutSpec as ResourceCheckoutSpec, CheckoutStatus as ResourceCheckoutStatus, Clock, Convoy as ResourceConvoy, ConvoyEnsure,
+    ConvoyIssue, ConvoyProvisioningState, ConvoyRepositorySpec, ConvoySpec, ConvoyStatusPatch, CredentialConsumer, CredentialGrant,
+    CredentialSource, CredentialSpec, CrewCompletionPending, CrewMessageSender, CrewSource, CrewSpec, DocumentKey,
+    Environment as ResourceEnvironment, EnvironmentPhase, EventRecorder, EventRegarding, Forge, ForgeKind, FulfilmentGrant, FulfilmentKind,
+    Host as ResourceHost, HostStatus as ResourceHostStatus, InMemoryBackend, InputMeta, InputValue, IssueSnapshot, IssueSourceResolution,
+    IssueSourceUnavailable, LandingCredentialScope, LifecycleAuthority, ManifestRoot, ObjectMeta, ObservedChangeRequestState,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, Platform, Project, ProjectSpec,
+    ReadResourceObject, Repository, RepositoryIdentity, RepositoryKey, RepositorySpec, RepositoryTrust, Resolution, ResolutionAction,
+    Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance, RoleHandoff, SupervisionTarget, SystemClock,
+    TerminalCrewContext, TurnDeliveryRung, VesselRequirement, WatchEvent, WatchStart, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
+    WorkflowTemplateSpec, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, GENERATION_LABEL, PROJECT_LABEL, ROLE_LABEL,
 };
 #[cfg(test)]
 use flotilla_resources::{
@@ -7273,7 +7273,7 @@ impl DaemonHandle for InProcessDaemon {
                 // Take the collection cursor before reading the object. A
                 // concurrent mutation can then be replayed (at worst as a
                 // duplicate) instead of being hidden behind a newer cursor.
-                let cursor_list = match list_resource_kind(&self.resource_backend, namespace, kind).await {
+                let position = match current_resource_kind_position(&self.resource_backend, namespace, kind).await {
                     Ok(listed) => listed,
                     Err(error) => return Ok(CommandValue::Error { message: error.to_string() }),
                 };
@@ -7284,8 +7284,8 @@ impl DaemonHandle for InProcessDaemon {
                     }
                     Err(error) => return Ok(CommandValue::Error { message: error.to_string() }),
                 };
-                let resource_version = cursor_list.value["metadata"]["resourceVersion"].as_str().unwrap_or_default().to_string();
-                let generation = cursor_list.value["metadata"]["generation"].as_str().map(ToOwned::to_owned);
+                let resource_version = position.resource_version;
+                let generation = position.generation;
                 let mut value = visible.value;
                 if visible.kind == "Project" {
                     match serde_json::from_value::<flotilla_resources::ProjectSpec>(value["spec"].clone()) {

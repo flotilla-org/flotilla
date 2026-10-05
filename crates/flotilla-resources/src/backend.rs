@@ -536,6 +536,12 @@ impl<T: Resource> TypedResolver<T> {
         dispatch_backend!(self, get_typed, name)
     }
 
+    /// Read the local collection's list/watch position without decoding objects.
+    /// HTTP uses collection metadata from the standard list endpoint.
+    pub async fn current_position(&self) -> Result<crate::ResourcePosition, ResourceError> {
+        dispatch_backend!(self, current_position_typed)
+    }
+
     pub async fn list(&self) -> Result<ResourceList<T>, ResourceError> {
         dispatch_backend!(self, list_typed)
     }

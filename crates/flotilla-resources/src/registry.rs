@@ -347,6 +347,19 @@ pub async fn quarantine_undecodable_stored_objects(backend: &ResourceBackend, na
     Ok(())
 }
 
+/// Read the local stream position for a registered kind (including aliases).
+pub async fn current_resource_kind_position(
+    backend: &ResourceBackend,
+    namespace: &str,
+    requested_kind: &str,
+) -> Result<crate::ResourcePosition, ResourceError> {
+    dispatch_resource_kind!(lookup_resource_kind(requested_kind)?.resource, current_position_typed(backend, namespace).await)
+}
+
+async fn current_position_typed<T: Resource>(backend: &ResourceBackend, namespace: &str) -> Result<crate::ResourcePosition, ResourceError> {
+    backend.using::<T>(namespace).current_position().await
+}
+
 pub async fn list_resource_kind(
     backend: &ResourceBackend,
     namespace: &str,
