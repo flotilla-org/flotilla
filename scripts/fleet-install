@@ -990,8 +990,9 @@ prune_generations() {
   [[ -x "$CURRENT_LINK/bin/flotilla" ]] \
     || die "unsafe or missing current target: $CURRENT_LINK; inspect and restore the link to an installed release with an executable CLI before retrying"
   if [[ "$dry_run" == 1 ]]; then options+=(--dry-run); fi
+  # Bash 3.2 under set -u needs an unset-safe expansion for an empty array.
   "$CURRENT_LINK/bin/flotilla" fleet prune --fleet-root "$FLEET_ROOT" \
-    --keep-others "${FLEET_INSTALL_KEEP_OTHERS:-3}" "${options[@]}"
+    --keep-others "${FLEET_INSTALL_KEEP_OTHERS:-3}" ${options[@]+"${options[@]}"}
 }
 
 prune_after_confirmation() {
