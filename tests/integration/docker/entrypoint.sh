@@ -22,11 +22,7 @@ fi
 
 # --- Build authorized_keys from shared keys ---
 refresh_authorized_keys() {
-    if [ -d "${SHARED_KEYS_DIR}" ]; then
-        cat "${SHARED_KEYS_DIR}"/*.pub > "${SSH_DIR}/authorized_keys" 2>/dev/null || true
-        chmod 600 "${SSH_DIR}/authorized_keys"
-        chown "${FLOTILLA_USER}:${FLOTILLA_USER}" "${SSH_DIR}/authorized_keys"
-    fi
+    bash /refresh-authorized-keys.sh "${SHARED_KEYS_DIR}" "${SSH_DIR}" "${FLOTILLA_USER}:${FLOTILLA_USER}"
 }
 
 # --- Fix ownership (before first refresh so the file is created with correct parent) ---

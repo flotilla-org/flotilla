@@ -45,6 +45,7 @@ RUN useradd -m -s /bin/bash flotilla \
     && chown flotilla:flotilla /home/flotilla/.ssh
 
 COPY tests/integration/docker/entrypoint.sh /entrypoint.sh
+COPY tests/integration/docker/refresh-authorized-keys.sh /refresh-authorized-keys.sh
 RUN chmod +x /entrypoint.sh
 
 EXPOSE 22
