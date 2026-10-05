@@ -482,6 +482,8 @@ impl CommandRunner for ReplayRunner {
         let actual_cwd = cwd.to_string_lossy();
         assert_eq!(actual_cwd, expected_cwd, "ReplayRunner: cwd mismatch for '{cmd}'");
 
+        // The full-output recording distinguishes execution failure from an
+        // ordinary nonzero status, even though this convenience API returns Err for both.
         if let Some(error) = error {
             return Err(error);
         }
@@ -894,7 +896,7 @@ impl CommandRunner for RecordingRunner {
                     args: args.iter().map(|s| s.to_string()).collect(),
                     cwd: cwd.to_string_lossy().to_string(),
                     stdout: None,
-                    stderr: Some(err.clone()),
+                    stderr: None,
                     exit_code: None,
                     error: Some(err.clone()),
                 });
