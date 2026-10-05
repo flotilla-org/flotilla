@@ -84,4 +84,6 @@ accept_template "$root/../../share/flotilla/codex-home"
 cp "$root/../../scripts/fleet-install" "$root/generation_validation.py" "$install_root/"
 PATH="$(dirname "$(command -v python3)"):$PATH" "$install_root/fleet-install" __validate_fixture "$fixtures/valid.json"
 
+python3 -m unittest discover -s "$root" -p 'test_*.py'
+
 echo "generation validator parity passed"

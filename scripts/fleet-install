@@ -49,6 +49,11 @@ die() {
   exit 1
 }
 
+require_generation_validator() {
+  [[ -f "$GENERATION_VALIDATOR" && -r "$GENERATION_VALIDATOR" ]] \
+    || die "generation validator is missing or unreadable: $GENERATION_VALIDATOR; sync fleet-install and generation_validation.py together"
+}
+
 cleanup() {
   local status=$?
   # Before the generation flip there is no health watchdog to restore launchd.
@@ -201,19 +206,7 @@ latest_generation() {
     local response="$WORK_DIR/packages-$page.json"
     download "$FLEET_API_URL/packages/$FLEET_OWNER?type=generic&q=$FLEET_PACKAGE&limit=100&page=$page" "$response"
     local count
-    count="$(python3 - "$response" "$FLEET_PACKAGE" "$all" <<'PY'
-import json
-import sys
-
-packages = json.load(open(sys.argv[1]))
-if not isinstance(packages, list):
-    raise SystemExit("package listing is not an array")
-with open(sys.argv[3], "a") as output:
-    for package in packages:
-        if package.get("type") == "generic" and package.get("name") == sys.argv[2]:
-            print(json.dumps([package.get("created_at", ""), package.get("version", "")]), file=output)
-print(len(packages))
-PY
+    count="$(python3 "$GENERATION_VALIDATOR" package-page -- "$response" "$FLEET_PACKAGE" "$all"
 )"
     [[ "$count" =~ ^[0-9]+$ ]] || die 'invalid package listing response'
     (( count == 100 )) || break
@@ -234,15 +227,7 @@ PY
       continue
     fi
     die "could not verify advertised generation $candidate"
-  done < <(python3 - "$all" <<'PY'
-import json
-import sys
-
-rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
-rows = [row for row in rows if row[0] and row[1]]
-for row in sorted(rows, reverse=True):
-    print(row[1])
-PY
+  done < <(python3 "$GENERATION_VALIDATOR" package-versions -- "$all"
 )
   die "Forgejo has no completed $PLATFORM flotilla-fleet generations"
 }
@@ -279,94 +264,28 @@ require_generation_manifest() {
 manifest_value() {
   local manifest="$1"
   local expression="$2"
-  python3 - "$manifest" "$expression" <<'PY'
-import json
-import sys
-
-value = json.load(open(sys.argv[1]))
-for part in sys.argv[2].split("."):
-    value = value[part]
-print(value)
-PY
+  python3 "$GENERATION_VALIDATOR" value -- "$manifest" "$expression"
 }
 
 platform_value() {
   local manifest="$1"
   local field="$2"
-  python3 - "$manifest" "$PLATFORM" "$field" <<'PY'
-import json
-import sys
-
-print(json.load(open(sys.argv[1]))["platforms"][sys.argv[2]][sys.argv[3]])
-PY
+  python3 "$GENERATION_VALIDATOR" platform-value -- "$manifest" "$PLATFORM" "$field"
 }
 
 sha256_file() {
-  python3 - "$1" <<'PY'
-import hashlib
-import sys
-
-digest = hashlib.sha256()
-with open(sys.argv[1], "rb") as source:
-    for block in iter(lambda: source.read(1024 * 1024), b""):
-        digest.update(block)
-print(digest.hexdigest())
-PY
+  python3 "$GENERATION_VALIDATOR" sha256 -- "$1"
 }
 
 file_size() {
-  python3 - "$1" <<'PY'
-import os
-import sys
-
-print(os.path.getsize(sys.argv[1]))
-PY
+  python3 "$GENERATION_VALIDATOR" size -- "$1"
 }
 
 extract_and_verify() {
   local archive="$1"
   local destination="$2"
   local generation_manifest="$3"
-  python3 - "$archive" "$destination" "$PLATFORM" <<'PY'
-import shutil
-import sys
-import tarfile
-from pathlib import Path, PurePosixPath
-
-archive = Path(sys.argv[1])
-destination = Path(sys.argv[2])
-platform = sys.argv[3]
-expected_root = "fleet-signed-darwin-aarch64" if platform == "darwin-aarch64" else f"fleet-candidate-{platform}"
-with tarfile.open(archive, "r:gz") as bundle:
-    members = bundle.getmembers()
-    names = set()
-    roots = set()
-    for member in members:
-        path = PurePosixPath(member.name)
-        normalized = str(path)
-        if path.is_absolute() or ".." in path.parts or not path.parts or normalized in names:
-            raise SystemExit(f"unsafe or duplicate archive path: {member.name}")
-        if not (member.isfile() or member.isdir()):
-            raise SystemExit(f"unsupported archive entry: {member.name}")
-        names.add(normalized)
-        roots.add(path.parts[0])
-    if roots != {expected_root}:
-        raise SystemExit(f"archive has an unexpected bundle directory: expected {expected_root}, got {sorted(roots)}")
-    for member in members:
-        target = destination.joinpath(*PurePosixPath(member.name).parts)
-        if member.isdir():
-            target.mkdir(parents=True, exist_ok=True)
-            target.chmod(member.mode & 0o777)
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        source = bundle.extractfile(member)
-        if source is None:
-            raise SystemExit(f"archive entry cannot be read: {member.name}")
-        with source, target.open("wb") as output:
-            shutil.copyfileobj(source, output)
-        target.chmod(member.mode & 0o777)
-shutil.move(str(destination / expected_root), str(destination / "release"))
-PY
+  python3 "$GENERATION_VALIDATOR" extract -- "$archive" "$destination" "$PLATFORM"
   verify_release "$destination/release" "$generation_manifest"
   cp "$generation_manifest" "$destination/release/.generation.json"
 }
@@ -418,18 +337,7 @@ verify_darwin_signatures() {
     entitlements="$WORK_DIR/codesign-entitlements-${relative//\//-}.plist"
     "$codesign" --display --entitlements - --xml "$path" >"$entitlements" 2>/dev/null \
       || die "entitlements inspection failed: $relative"
-    python3 - "$entitlements" "$relative" <<'PY'
-import plistlib
-import sys
-
-content = open(sys.argv[1], "rb").read()
-try:
-    entitlements = plistlib.loads(content) if content.strip() else {}
-except plistlib.InvalidFileException as error:
-    raise SystemExit(f"signed Darwin payload has unreadable entitlements: {sys.argv[2]}: {error}")
-if entitlements != {}:
-    raise SystemExit(f"signed Darwin payload has unexpected entitlements: {sys.argv[2]}")
-PY
+    python3 "$GENERATION_VALIDATOR" entitlements -- "$entitlements" "$relative"
   done
 }
 
@@ -444,14 +352,7 @@ current_generation() {
 protocol_version() {
   local link="$1"
   [[ -f "$link/manifest.json" ]] || return 0
-  python3 - "$link/manifest.json" <<'PY'
-import json
-import sys
-try:
-    print(json.load(open(sys.argv[1])).get("peer_protocol_version", ""))
-except (OSError, ValueError):
-    pass
-PY
+  python3 "$GENERATION_VALIDATOR" protocol -- "$link/manifest.json"
 }
 
 show_fleet_spread() {
@@ -970,6 +871,7 @@ require_handoff_lock() {
 install_generation() {
   local generation="$1"
   require_generation "$generation"
+  require_generation_validator
   acquire_install_lock
   mkdir -p "$RELEASES_DIR"
   local old rollback_generation confirmation_token
@@ -1052,6 +954,7 @@ show_status() {
 }
 
 rollback() {
+  require_generation_validator
   acquire_install_lock
   [[ -L "$CURRENT_LINK" ]] || die 'no current generation to roll back'
   [[ -L "$PREVIOUS_LINK" ]] || die 'no previous generation to roll back to'
@@ -1215,6 +1118,7 @@ usage() {
 main() {
   if [[ "${1:-}" == __validate_fixture ]]; then
     [[ $# -eq 2 ]] || usage
+    require_generation_validator
     python3 "$GENERATION_VALIDATOR" fixture "$2"
     return
   fi
@@ -1245,6 +1149,7 @@ main() {
       show_status
       ;;
     latest)
+      require_generation_validator
       local generation
       # Allocate in the parent shell so cleanup and the activation handoff
       # retain ownership when latest_generation runs in command substitution.

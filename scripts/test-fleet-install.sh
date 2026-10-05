@@ -15,6 +15,19 @@ fail() {
   exit 1
 }
 
+# An incomplete installer/module deployment refuses before creating fleet state,
+# for both download selection and mutations (including rollback).
+for operation in latest 20260815T210000Z-r1-f111111111111-caaaaaaaaaaaa rollback; do
+  if FLEET_INSTALL_ROOT="$test_root/missing-validator-root" \
+    FLEET_GENERATION_VALIDATOR="$test_root/missing-validator.py" \
+    bash "$installer" "$operation" >"$test_root/missing-validator.log" 2>&1; then
+    fail "missing validator allowed $operation"
+  fi
+  grep -Fq 'generation validator is missing or unreadable:' "$test_root/missing-validator.log" \
+    || fail 'missing validator did not explain the incomplete deployment'
+  test ! -e "$test_root/missing-validator-root" || fail 'missing validator created fleet state'
+done
+
 file_sha256() {
   python3 - "$1" <<'PY'
 import hashlib
