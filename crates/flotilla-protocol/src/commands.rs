@@ -739,6 +739,20 @@ pub enum ResourceDigestQuery {
     Snapshot { expected_root: String, bucket: u8 },
 }
 
+/// A generation-stamped authoritative digest or complete bucket snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct ResourceDigest {
+    pub origin: crate::NodeId,
+    pub kind: String,
+    pub namespace: String,
+    pub generation: Option<String>,
+    pub resource_version: String,
+    pub root: String,
+    pub children: Option<Vec<String>>,
+    pub bucket: Option<u8>,
+    pub items: Option<Vec<serde_json::Value>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum CommandAction {
@@ -1363,7 +1377,7 @@ pub enum CommandValue {
     ResourceDeleted(Box<ResourceJsonResponse>),
     ResourceAlreadyDeleted(Box<ResourceJsonResponse>),
     ResourceWatchEvent(Box<ResourceReadEnvelope>),
-    ResourceDigest(Box<serde_json::Value>),
+    ResourceDigest(Box<ResourceDigest>),
     EnvironmentSpecRead {
         spec: crate::EnvironmentSpec,
     },

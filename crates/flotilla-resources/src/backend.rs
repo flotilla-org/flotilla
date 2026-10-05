@@ -634,6 +634,7 @@ impl<T: Resource> TypedResolver<T> {
     }
 
     pub async fn digest(&self, query: &crate::DigestQuery) -> Result<crate::PartitionDigest, ResourceError> {
+        ensure_replication_enabled::<T>()?;
         dispatch_backend!(self, digest_typed, query)
     }
 

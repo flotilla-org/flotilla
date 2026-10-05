@@ -84,3 +84,11 @@ collection size. The 60-second safety-net interval bounds quiet-store repair
 latency while keeping routine exchanges small; log sync retains low-latency
 updates. The benchmark is retained for later tuning rather than claiming a
 production throughput result.
+
+Full snapshot replacement currently refreshes a leaf for each inserted/removed
+key in both backends. Its hashing cost can therefore reach O(N² / 256), unlike
+the benchmark's once-per-touched-bucket batch. At 100k+ keys this exceptional
+log-gap/horizon repair path can be substantially more expensive than the sizing
+microbenchmark suggests. Periodic matching roots do not pay that cost. Deferring
+leaf refresh to once per touched bucket during full replacement is a separate
+optimization; the current transaction/lock still preserves digest correctness.

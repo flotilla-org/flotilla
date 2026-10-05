@@ -358,7 +358,7 @@ async fn http_digest_drill_down_reads_only_the_requested_partition() {
     let children = remote.digest(&DigestQuery::Children { expected_root: root.root.clone() }).await.expect("remote children");
     children.validate_tree::<WorkflowTemplate>().expect("complete hierarchy");
     let bucket = digest_bucket("retained");
-    let snapshot = remote.digest(&DigestQuery::Snapshot { expected_root: root.root, bucket }).await.expect("remote bucket");
+    let snapshot = remote.digest(&DigestQuery::Snapshot { expected_root: root.root.clone(), bucket }).await.expect("remote bucket");
     let listed = snapshot.snapshot::<WorkflowTemplate>(&children, bucket).expect("validated bucket");
     assert_eq!(listed.items.len(), 1);
     assert_eq!(listed.items[0].metadata.name, "retained");

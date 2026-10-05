@@ -589,17 +589,20 @@ async fn apply_http_watch<T: Resource>(
     // Relay updates share the writer but cannot move this direct stream's
     // expected sequence. Its position starts at the authoritative snapshot.
     let mut version = Some(snapshot_version);
+    let mut digest_failures = DigestFailures::default();
     let mut digest_tick = tokio::time::interval_at(tokio::time::Instant::now() + DIGEST_INTERVAL, DIGEST_INTERVAL);
     digest_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let event = tokio::select! {
             event = watch.next() => match event { Some(event) => event, None => return Ok(()) },
             _ = digest_tick.tick() => {
-                match reconcile_digest::<T, _, _>(writer, peer, |query| async move { remote.digest(&query).await.map_err(|error| error.to_string()) }).await {
+                let result=reconcile_digest::<T, _, _>(writer, peer, |query| async move { remote.digest(&query).await.map_err(|error| error.to_string()) }).await;
+                digest_failures.report::<T>(peer,&result);
+                match result {
                     // Reopen from the proven cut, discarding buffered older events.
                     Ok(true)=>return Ok(()),
                     Ok(false)=>{},
-                    Err(error)=>debug!(%peer, kind=T::API_PATHS.kind, %error, "digest repair deferred; preserving replicas"),
+                    Err(_)=>{},
                 }
                 continue;
             }
@@ -607,6 +610,32 @@ async fn apply_http_watch<T: Resource>(
         let event = event.map_err(OriginWatchFailure::from_resource)?;
         check_sequence(&mut version, &event).map_err(OriginWatchFailure::SnapshotRequired)?;
         writer.apply_direct(event, Utc::now()).await.map_err(OriginWatchFailure::from_resource)?;
+    }
+}
+
+/// Warn on a sustained failure run, then every third failure; reset on success.
+#[derive(Default)]
+struct DigestFailures {
+    consecutive: u64,
+}
+impl DigestFailures {
+    fn record(&mut self, failed: bool) -> bool {
+        if !failed {
+            self.consecutive = 0;
+            return false;
+        }
+        self.consecutive = self.consecutive.saturating_add(1);
+        self.consecutive >= 3 && self.consecutive.is_multiple_of(3)
+    }
+    fn report<T: Resource>(&mut self, peer: &NodeId, result: &Result<bool, String>) {
+        let warn = self.record(result.is_err());
+        if let Err(error) = result {
+            if warn {
+                warn!(%peer,kind=T::API_PATHS.kind,consecutive=self.consecutive,%error,"digest safety net repeatedly failed; preserving replicas");
+            } else {
+                debug!(%peer,kind=T::API_PATHS.kind,%error,"digest repair deferred; preserving replicas");
+            }
+        }
     }
 }
 
@@ -656,9 +685,10 @@ where
         if authority == replica {
             continue;
         }
-        let snapshot = fetch(DigestQuery::Snapshot { expected_root: remote.root.clone(), bucket: bucket as u8 }).await?;
-        let listed = snapshot.snapshot::<T>(&children, bucket as u8).map_err(|error| error.to_string())?;
-        snapshots.push((bucket as u8, listed));
+        let bucket = u8::try_from(bucket).expect("validated 256-way digest tree");
+        let snapshot = fetch(DigestQuery::Snapshot { expected_root: remote.root.clone(), bucket }).await?;
+        let listed = snapshot.snapshot::<T>(&children, bucket).map_err(|error| error.to_string())?;
+        snapshots.push((bucket, listed));
     }
     // Confirm the cut is still current before acting on absence. A write during
     // the last bucket read defers the whole repair to the next interval.
@@ -691,7 +721,7 @@ async fn fetch_routed_digest<T: Resource>(
         )
         .await?;
     match result {
-        CommandValue::ResourceDigest(value) => serde_json::from_value(*value).map_err(|error| error.to_string()),
+        CommandValue::ResourceDigest(value) => Ok((*value).into()),
         CommandValue::Error { message } => Err(message),
         other => Err(format!("unexpected digest response: {other:?}")),
     }
@@ -786,16 +816,19 @@ async fn run_routed_watch<T: Resource>(
     let mut initializing = prefix.is_none();
 
     let mut version = prefix.map(|prefix| prefix.resource_version);
+    let mut digest_failures = DigestFailures::default();
     let mut digest_tick = tokio::time::interval_at(tokio::time::Instant::now() + DIGEST_INTERVAL, DIGEST_INTERVAL);
     digest_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let received = tokio::select! {
             event = events.recv() => event,
             _ = digest_tick.tick(), if !initializing => {
-                match reconcile_digest::<T,_,_>(&writer,peer,|query| fetch_routed_digest::<T>(router,peer,store,query)).await {
+                let result=reconcile_digest::<T,_,_>(&writer,peer,|query| fetch_routed_digest::<T>(router,peer,store,query)).await;
+                digest_failures.report::<T>(peer,&result);
+                match result {
                     Ok(true)=>{let _=router.dispatch_cancel(command_id).await;return Ok(());},
                     Ok(false)=>{},
-                    Err(error)=>debug!(%peer,kind=T::API_PATHS.kind,%error,"digest repair deferred; preserving replicas"),
+                    Err(_)=>{},
                 }
                 continue;
             }
@@ -1067,6 +1100,18 @@ fn record_watch_event<T: Resource>(record: ResourceReadRecord) -> Result<Option<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn digest_failures_warn_after_three_and_reset_after_success() {
+        let mut failures = super::DigestFailures::default();
+        for run in 0..3 {
+            for count in 1u64..=9 {
+                assert_eq!(failures.record(true), count.is_multiple_of(3), "run {run}, failure {count}");
+            }
+            assert!(!failures.record(false));
+            assert_eq!(failures.consecutive, 0);
+        }
+    }
+
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,

@@ -55,7 +55,7 @@ fn cached_digest_tracks_committed_versions(tc: hegel::TestCase) {
                 .await
                 .expect("concurrent write");
             assert!(
-                local.digest(&DigestQuery::Children { expected_root: root.root }).await.is_err(),
+                local.digest(&DigestQuery::Children { expected_root: root.root.clone() }).await.is_err(),
                 "writes invalidate an in-progress tree"
             );
         }
@@ -102,4 +102,82 @@ async fn sqlite_digest_indexes_survive_reopen() {
         replica_root.root,
         reopened.replica_writer::<Convoy>(NodeId::new("other-origin"), "ns").digest(None).await.expect("unaffected replica root").root
     );
+}
+
+#[tokio::test]
+async fn sqlite_bootstraps_preexisting_local_and_replica_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("store.sqlite");
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("open"));
+    let local = backend.using::<Convoy>("ns");
+    let object = local
+        .create(&InputMeta::builder().name("existing".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+        .await
+        .expect("create");
+    let writer = backend.replica_writer::<Convoy>(NodeId::new("remote"), "ns");
+    writer.apply(WatchEvent::Added(object.clone()), chrono::Utc::now()).await.expect("replica");
+    let local_root = local.digest(&DigestQuery::Root).await.expect("local digest").root.clone();
+    let replica_root = writer.digest(None).await.expect("replica digest").root.clone();
+    drop((local, writer, backend));
+    let raw = rusqlite::Connection::open(&path).expect("raw connection");
+    raw.execute_batch(
+        "DROP TABLE digest_nodes; DROP TABLE digest_entries;
+        DELETE FROM resource_store_migrations WHERE name='digest-index-v1';",
+    )
+    .expect("simulate pre-digest database");
+    drop(raw);
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("reopen"));
+    let local = backend.using::<Convoy>("ns");
+    let writer = backend.replica_writer::<Convoy>(NodeId::new("remote"), "ns");
+    assert_eq!(local_root, local.digest(&DigestQuery::Root).await.expect("bootstrap local").root);
+    assert_eq!(replica_root, writer.digest(None).await.expect("bootstrap replica").root);
+    writer.apply(WatchEvent::Deleted(object), chrono::Utc::now()).await.expect("delete replica");
+    assert_ne!(replica_root, writer.digest(None).await.expect("updated replica").root);
+    assert_eq!(local_root, local.digest(&DigestQuery::Root).await.expect("unaffected local").root);
+}
+
+#[tokio::test]
+async fn quarantine_cannot_prove_authoritative_absence() {
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open_in_memory().expect("open"));
+    let local = backend.using::<Convoy>("ns");
+    let root = local.digest(&DigestQuery::Root).await.expect("empty root");
+    // Exercise the public corruption/cleanup path with a persistent store.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("store.sqlite");
+    {
+        let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("open"));
+        backend
+            .using::<Convoy>("ns")
+            .create(&InputMeta::builder().name("poisoned".into()).build(), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+            .await
+            .expect("create");
+    }
+    let raw = rusqlite::Connection::open(&path).expect("raw connection");
+    raw.execute("UPDATE resource_objects SET body_json='{}' WHERE name='poisoned'", []).expect("corrupt");
+    drop(raw);
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("reopen"));
+    let local = backend.using::<Convoy>("ns");
+    assert!(local.list().await.expect("quarantine").items.is_empty());
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if !backend.diagnostics().await.expect("diagnostics").expect("sqlite").decode_quarantines.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cleanup completed");
+    for query in [DigestQuery::Root, DigestQuery::Children { expected_root: root.root.clone() }, DigestQuery::Snapshot {
+        expected_root: root.root.clone(),
+        bucket: 0,
+    }] {
+        let error = local.digest(&query).await.expect_err("quarantine refuses proof");
+        assert!(error.to_string().contains("quarantined"));
+    }
+    local
+        .create(&InputMeta::builder().name("poisoned".into()).build(), &ConvoySpec::builder().workflow_ref("repaired".into()).build())
+        .await
+        .expect("recreate");
+    assert!(local.digest(&DigestQuery::Root).await.is_ok());
 }

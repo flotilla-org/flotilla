@@ -11,17 +11,31 @@ pub const DIGEST_FANOUT: usize = 256;
 
 pub use flotilla_protocol::ResourceDigestQuery as DigestQuery;
 
-#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
-pub struct PartitionDigest {
-    pub origin: NodeId,
-    pub kind: String,
-    pub namespace: String,
-    pub generation: Option<String>,
-    pub resource_version: String,
-    pub root: String,
-    pub children: Option<Vec<String>>,
-    pub bucket: Option<u8>,
-    pub items: Option<Vec<serde_json::Value>>,
+/// Hashing and validation behavior around the protocol's typed data envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PartitionDigest(flotilla_protocol::ResourceDigest);
+
+impl std::ops::Deref for PartitionDigest {
+    type Target = flotilla_protocol::ResourceDigest;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for PartitionDigest {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl From<flotilla_protocol::ResourceDigest> for PartitionDigest {
+    fn from(value: flotilla_protocol::ResourceDigest) -> Self {
+        Self(value)
+    }
+}
+impl From<PartitionDigest> for flotilla_protocol::ResourceDigest {
+    fn from(value: PartitionDigest) -> Self {
+        value.0
+    }
 }
 
 pub fn digest_bucket(name: &str) -> u8 {
@@ -148,7 +162,7 @@ impl PartitionDigest {
             hash.update([bucket as u8]);
             field(&mut hash, child);
         }
-        Self {
+        Self(flotilla_protocol::ResourceDigest {
             origin,
             kind: T::API_PATHS.kind.into(),
             namespace: namespace.into(),
@@ -158,7 +172,7 @@ impl PartitionDigest {
             children: Some(hashes),
             bucket: None,
             items: None,
-        }
+        })
     }
     pub(crate) fn select(mut self, query: &DigestQuery) -> Result<Self, ResourceError> {
         let expected = match query {
@@ -199,7 +213,7 @@ mod tests {
         let root = local.digest(&DigestQuery::Root).await.expect("root");
         let children = local.digest(&DigestQuery::Children { expected_root: root.root.clone() }).await.expect("tree");
         let bucket = digest_bucket("retained");
-        let mut snapshot = local.digest(&DigestQuery::Snapshot { expected_root: root.root, bucket }).await.expect("snapshot");
+        let mut snapshot = local.digest(&DigestQuery::Snapshot { expected_root: root.root.clone(), bucket }).await.expect("snapshot");
         snapshot.snapshot::<Convoy>(&children, bucket).expect("complete snapshot");
         let mut duplicate = snapshot.clone();
         duplicate.items.as_mut().expect("items").push(snapshot.items.as_ref().expect("items")[0].clone());

@@ -7262,9 +7262,7 @@ impl DaemonHandle for InProcessDaemon {
                 };
                 let result = flotilla_resources::digest_resource_kind(&backend, namespace, kind, query).await;
                 match result {
-                    Ok(digest) => {
-                        Ok(CommandValue::ResourceDigest(Box::new(serde_json::to_value(digest).map_err(|error| error.to_string())?)))
-                    }
+                    Ok(digest) => Ok(CommandValue::ResourceDigest(Box::new(digest.into()))),
                     Err(error) => Ok(CommandValue::Error { message: error.to_string() }),
                 }
             }
