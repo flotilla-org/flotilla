@@ -1,0 +1,25 @@
+[
+ {
+  "Id": "50ca36b4da073c6e0ee4f1e7423743510ff37cf876c4e8e5455af73e04241d36",
+  "Name": "/rec-exit3",
+  "State": {
+   "Status": "exited",
+   "Running": false,
+   "Paused": false,
+   "Restarting": false,
+   "OOMKilled": false,
+   "Dead": false,
+   "Pid": 0,
+   "ExitCode": 3,
+   "Error": "",
+   "StartedAt": "2026-10-05T10:35:42.776853969Z",
+   "FinishedAt": "2026-10-05T10:35:42.853274919Z"
+  },
+  "HostConfig": {
+   "Memory": 0,
+   "MemorySwap": 0,
+   "NanoCpus": 0,
+   "Init": null
+  }
+ }
+]

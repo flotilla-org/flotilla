@@ -2040,6 +2040,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     environments
         .update_status(&environment_name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
             configured_limits: None,
+            runtime_observation: None,
             phase: flotilla_resources::EnvironmentPhase::Ready,
             ready: true,
             docker_container_id: None,

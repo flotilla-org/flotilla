@@ -40,6 +40,9 @@ pub struct VesselStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configured_limits: Option<ConfiguredResourceLimits>,
     pub phase: VesselPhase,
+    /// ADR 0047: previous-generation records omit this; retain default for one roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_observation: Option<flotilla_protocol::EnvironmentRuntimeObservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_decision: Option<PlacementDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +83,9 @@ pub struct VesselStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VesselStatusPatch {
+    ObserveRuntime {
+        observation: flotilla_protocol::EnvironmentRuntimeObservation,
+    },
     CredentialDelivery {
         retry: Option<ControllerRetry>,
     },
@@ -121,6 +127,7 @@ pub enum VesselStatusPatch {
 impl StatusPatch<VesselStatus> for VesselStatusPatch {
     fn apply(&self, status: &mut VesselStatus) {
         match self {
+            Self::ObserveRuntime { observation } => status.runtime_observation.get_or_insert_with(Default::default).merge(observation),
             Self::CredentialDelivery { retry } => status.credential_delivery_retry = retry.clone(),
             Self::CredentialRefresh { retry } => status.credential_refresh_retry = retry.clone(),
             Self::MarkProvisioning { observed_policy_ref, observed_policy_version, placement_decision, started_at, message } => {

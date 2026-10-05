@@ -57,6 +57,7 @@ impl DockerEnvironmentActuator {
                     "the contained host-daemon requirement",
                 ))],
             cpu_limit: None,
+            memory_policy: spec.memory_policy.clone(),
         }
     }
 }

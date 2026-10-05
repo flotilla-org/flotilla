@@ -417,6 +417,8 @@ pub struct ExplainedSettlement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyExplanation {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub environment_observations: std::collections::BTreeMap<String, crate::environment::EnvironmentRuntimeObservation>,
     pub namespace: String,
     pub convoy: String,
     pub phase: String,

@@ -69,6 +69,7 @@ macro_rules! define_patch_kinds {
 }
 
 define_patch_kinds! {
+    ConvoyObserveEnvironment => NONE,
     ConvoySetStalled => NONE,
     ConvoySetNudgeObligations => NONE,
     ConvoySetTeardownWait => NONE,
@@ -120,6 +121,7 @@ define_patch_kinds! {
     TerminalMarkFailed => DUPLICATE,
     TerminalMarkReconcileDegraded => NONE,
     TerminalClearReconcileDegraded => NONE,
+    VesselObserveRuntime => NONE,
     VesselMarkProvisioning => DUPLICATE,
     VesselMarkReady => DUPLICATE,
     VesselStageLandingCredentials => DUPLICATE,
@@ -140,6 +142,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         | ConvoyStatusPatch::UnlinkSubject { .. } => {
             panic!("admission and subject patches are outside this lifecycle contract")
         }
+        ConvoyStatusPatch::ObserveEnvironment { .. } => PatchKind::ConvoyObserveEnvironment,
         ConvoyStatusPatch::SetStalled { .. } => PatchKind::ConvoySetStalled,
         ConvoyStatusPatch::SetNudgeObligations { .. } => PatchKind::ConvoySetNudgeObligations,
         ConvoyStatusPatch::SetTeardownWait { .. } => PatchKind::ConvoySetTeardownWait,
@@ -205,6 +208,7 @@ fn vessel_patch_kind(patch: &VesselStatusPatch) -> PatchKind {
         VesselStatusPatch::CredentialDelivery { .. } | VesselStatusPatch::CredentialRefresh { .. } => {
             panic!("credential status patches are outside this lifecycle contract")
         }
+        VesselStatusPatch::ObserveRuntime { .. } => PatchKind::VesselObserveRuntime,
         VesselStatusPatch::MarkProvisioning { .. } => PatchKind::VesselMarkProvisioning,
         VesselStatusPatch::MarkReady { .. } => PatchKind::VesselMarkReady,
         VesselStatusPatch::MarkInterrupted { .. } => PatchKind::VesselMarkInterrupted,
@@ -296,6 +300,7 @@ fn pending_brief() -> PendingBrief {
 
 fn active_convoy_status() -> ConvoyStatus {
     ConvoyStatus {
+        environment_observations: Default::default(),
         ensure_admission: None,
         unlinked_subjects: Vec::new(),
         subjects: Vec::new(),

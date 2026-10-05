@@ -914,6 +914,7 @@ async fn create_ready_docker_env(backend: &ResourceBackend, name: &str) {
         .create(&meta(name), &EnvironmentSpec {
             host_direct: None,
             docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                memory_policy: Default::default(),
                 host_ref: HOST_REF.to_string(),
                 image: "ubuntu:24.04".to_string(),
                 declared_agent_adapters: Default::default(),

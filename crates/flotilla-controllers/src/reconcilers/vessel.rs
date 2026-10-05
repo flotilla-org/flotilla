@@ -347,6 +347,22 @@ impl Reconciler for VesselReconciler {
         }) {
             return Ok(VesselPrepared::none());
         }
+        // Once backing is known, its failure takes precedence over planning
+        // dependencies: retain the recorded death cause and recovery paths.
+        if let Some(environment_ref) = obj.status.as_ref().and_then(|status| status.environment_ref.as_ref()) {
+            match self.environments.get(environment_ref).await {
+                Ok(environment) if environment.status.as_ref().is_some_and(|status| status.phase == EnvironmentPhase::Failed) => {
+                    let message = environment
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.message.clone())
+                        .unwrap_or_else(|| format!("environment {environment_ref} failed"));
+                    return Ok(VesselPrepared::failed(message));
+                }
+                Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let placement_policy = match self.placement_dependency(obj, &obj.spec.placement_policy_ref).await {
             Ok(policy) => policy,
             Err(ResourceError::NotFound { .. }) => {
@@ -490,6 +506,13 @@ impl Reconciler for VesselReconciler {
                             spec: EnvironmentSpec {
                                 host_direct: None,
                                 docker: Some(DockerEnvironmentSpec {
+                                    memory_policy: placement_policy
+                                        .spec
+                                        .docker_per_vessel
+                                        .as_ref()
+                                        .expect("Docker strategy")
+                                        .memory_policy
+                                        .clone(),
                                     host_ref: host_ref.clone(),
                                     image: image.clone(),
                                     declared_agent_adapters: declared_agent_adapters.clone(),
@@ -907,6 +930,13 @@ impl Reconciler for VesselReconciler {
                             spec: EnvironmentSpec {
                                 host_direct: None,
                                 docker: Some(DockerEnvironmentSpec {
+                                    memory_policy: placement_policy
+                                        .spec
+                                        .docker_per_vessel
+                                        .as_ref()
+                                        .expect("Docker strategy")
+                                        .memory_policy
+                                        .clone(),
                                     host_ref: host_ref.clone(),
                                     image: image.clone(),
                                     declared_agent_adapters: declared_agent_adapters.clone(),

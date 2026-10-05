@@ -1,0 +1,25 @@
+[
+ {
+  "Id": "9bda716d8fa4ab1b8992590832892d2f88c508355e37fb74e9f062599360c705",
+  "Name": "/rec-oom",
+  "State": {
+   "Status": "exited",
+   "Running": false,
+   "Paused": false,
+   "Restarting": false,
+   "OOMKilled": true,
+   "Dead": false,
+   "Pid": 0,
+   "ExitCode": 137,
+   "Error": "",
+   "StartedAt": "2026-10-05T10:35:42.397224692Z",
+   "FinishedAt": "2026-10-05T10:35:42.553815378Z"
+  },
+  "HostConfig": {
+   "Memory": 67108864,
+   "MemorySwap": 67108864,
+   "NanoCpus": 0,
+   "Init": null
+  }
+ }
+]

@@ -22,6 +22,7 @@ fn docker(pool: &str, priority: i32, host: &str, image: &str) -> PlacementPolicy
         .pool(pool.to_string())
         .priority(priority)
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+            memory_policy: Default::default(),
             host_ref: host.to_string(),
             image: image.to_string().into(),
             pull_policy: DockerImagePullPolicy::IfNotPresent,
@@ -47,6 +48,7 @@ fn placement_policy_declares_every_spec_leaf_and_no_status_fields() {
         ("spec.docker_per_vessel.host_ref", WriterRole::ReconcileLoop),
         ("spec.docker_per_vessel.image", WriterRole::Operator),
         ("spec.docker_per_vessel.pull_policy", WriterRole::Operator),
+        ("spec.docker_per_vessel.memory_policy", WriterRole::Operator),
         ("spec.docker_per_vessel.agent_adapters", WriterRole::Operator),
         ("spec.docker_per_vessel.default_cwd", WriterRole::Operator),
         ("spec.docker_per_vessel.env", WriterRole::Operator),

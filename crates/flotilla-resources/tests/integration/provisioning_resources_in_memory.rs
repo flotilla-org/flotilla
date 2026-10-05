@@ -75,6 +75,7 @@ async fn vessel_metadata_and_status_roundtrip() {
     let updated = resolver
         .update_status("convoy-fix-bug-123-implement", &created.metadata.resource_version, &VesselStatus {
             configured_limits: None,
+            runtime_observation: None,
             placement_decision: None,
             phase: VesselPhase::Ready,
             message: None,
@@ -112,6 +113,7 @@ async fn environment_and_checkout_specs_serialize_through_in_memory_backend() {
     let env_spec = EnvironmentSpec {
         host_direct: None,
         docker: Some(DockerEnvironmentSpec {
+            memory_policy: Default::default(),
             host_ref: "01HXYZ".to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string(),
             declared_agent_adapters: Default::default(),
@@ -184,6 +186,7 @@ fn docker_per_vessel_policy_uses_vessel_spelling_in_serialized_resources() {
     let spec = PlacementPolicySpec::builder()
         .pool("docker".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+            memory_policy: Default::default(),
             host_ref: "01HXYZ".to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string().into(),
             pull_policy: DockerImagePullPolicy::Never,
@@ -202,6 +205,7 @@ fn docker_per_vessel_policy_uses_vessel_spelling_in_serialized_resources() {
                 "host_ref": "01HXYZ",
                 "image": "ghcr.io/flotilla/dev:latest",
                 "pull_policy": "never",
+                "memory_policy": {"host_memory_percent": 50, "expected_concurrent_crews": 4, "swap_bytes": 0},
                 "default_cwd": "/workspace",
                 "env": {"FOO": "bar"},
                 "checkout": {"fresh_clone_in_container": {"clone_path": "/workspace"}}

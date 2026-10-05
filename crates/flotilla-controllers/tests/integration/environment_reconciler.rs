@@ -56,6 +56,7 @@ async fn a_provisioning_failure_marks_the_environment_failed() {
         .create(&InputMeta::builder().name("env-waiting".to_string()).build(), &EnvironmentSpec {
             host_direct: None,
             docker: Some(DockerEnvironmentSpec {
+                memory_policy: Default::default(),
                 host_ref: "host-a".to_string(),
                 image: "crew-image".to_string(),
                 declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
@@ -111,6 +112,7 @@ async fn failed_environment_without_a_container_still_runs_terminal_cleanup() {
         .create(&InputMeta::builder().name("env-failed".to_string()).build(), &EnvironmentSpec {
             host_direct: None,
             docker: Some(DockerEnvironmentSpec {
+                memory_policy: Default::default(),
                 host_ref: "host-a".to_string(),
                 image: "crew-image".to_string(),
                 declared_agent_adapters: BTreeSet::new(),
@@ -170,6 +172,7 @@ async fn foreign_environment_is_not_actuated_or_finalized() {
         .create(&InputMeta::builder().name("env-udder".to_string()).build(), &EnvironmentSpec {
             host_direct: None,
             docker: Some(DockerEnvironmentSpec {
+                memory_policy: Default::default(),
                 host_ref: "udder".to_string(),
                 image: "crew:latest".to_string(),
                 declared_agent_adapters: BTreeSet::new(),
@@ -206,6 +209,7 @@ async fn orphaned_environment_can_finalize_after_its_host_disappears() {
         .create(&InputMeta::builder().name("env-orphaned".to_string()).build(), &EnvironmentSpec {
             host_direct: None,
             docker: Some(DockerEnvironmentSpec {
+                memory_policy: Default::default(),
                 host_ref: "deleted-host".to_string(),
                 image: "crew:latest".to_string(),
                 declared_agent_adapters: BTreeSet::new(),

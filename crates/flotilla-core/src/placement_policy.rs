@@ -104,6 +104,7 @@ mod tests {
         PlacementPolicySpec::builder()
             .pool(pool.to_string())
             .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+                memory_policy: Default::default(),
                 host_ref: host.to_string(),
                 image: "registration-default:latest".to_string().into(),
                 pull_policy: DockerImagePullPolicy::IfNotPresent,
@@ -161,6 +162,7 @@ mod tests {
         let runtime = operator_spec.docker_per_vessel.as_mut().expect("docker strategy");
         runtime.image = DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() };
         runtime.pull_policy = DockerImagePullPolicy::Never;
+        runtime.memory_policy.host_memory_percent = 30;
         runtime.agent_adapters = BTreeSet::from(["codex".to_string()]);
         runtime.default_cwd = Some("/operator-workspace".to_string());
         runtime.env = BTreeMap::from([("OPERATOR".to_string(), "true".to_string())]);
@@ -177,6 +179,7 @@ mod tests {
         reconcile_registered_policy(&backend, NAMESPACE, "docker-shared", &docker("remote", "remote")).await.expect("registration refresh");
         let refreshed = policies.get("docker-shared").await.expect("refreshed policy");
         let runtime = refreshed.spec.docker_per_vessel.expect("docker strategy");
+        assert_eq!(runtime.memory_policy.host_memory_percent, 30);
 
         assert_eq!(runtime.host_ref, "remote");
         assert_eq!(runtime.image, DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".to_string() });

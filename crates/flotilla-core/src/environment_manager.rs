@@ -364,6 +364,7 @@ impl EnvironmentManager {
             image_pull_policy: Default::default(),
             prepared_auth: PreparedEnvironmentAuth::NoRegistryCredential,
             cpu_limit: None,
+            memory_policy: Default::default(),
         };
         let handle = env_provider.create(env_id.clone(), &image, opts).await?;
         let (env_bag, provider_registry) = self.probe_provisioned_environment(&env_id, &handle, config_base).await?;

@@ -500,3 +500,130 @@ token_env_vars: []
         });
     }
 }
+
+/// Hard limits in bytes; `swap_bytes` excludes RAM (unlike Docker's CLI flag).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentMemoryLimits {
+    pub memory_bytes: u64,
+    pub swap_bytes: u64,
+}
+
+/// Persisted evidence, shared by environment, vessel, convoy and explain.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct EnvironmentRuntimeObservation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limits: Option<EnvironmentMemoryLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_usage_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_observed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination: Option<EnvironmentTermination>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct EnvironmentTermination {
+    pub exit_code: i32,
+    /// Inferred from the conventional 128+signal exit status, not waitpid evidence.
+    pub signal: Option<i32>,
+    pub oom_killed: bool,
+    pub cause: EnvironmentExitCause,
+    pub finished_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentExitCause {
+    CgroupOom,
+    HostOomd,
+    KernelOom,
+    Signal,
+    NonzeroExit,
+    NormalStop,
+}
+
+impl std::fmt::Display for EnvironmentTermination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cause = match self.cause {
+            EnvironmentExitCause::CgroupOom => "killed: out of memory (container cgroup)",
+            EnvironmentExitCause::HostOomd => "killed: out of memory (host oomd)",
+            EnvironmentExitCause::KernelOom => "killed: out of memory (host kernel OOM)",
+            EnvironmentExitCause::Signal => "killed by signal (cause unknown)",
+            EnvironmentExitCause::NonzeroExit => "container exited unsuccessfully",
+            EnvironmentExitCause::NormalStop => "container stopped",
+        };
+        write!(f, "{cause}; exit code {}", self.exit_code)?;
+        if let Some(signal) = self.signal {
+            write!(f, "; signal {signal}")?;
+        }
+        Ok(())
+    }
+}
+
+impl EnvironmentRuntimeObservation {
+    /// A stopped container cannot be sampled. Retain the last successful
+    /// sample (with its timestamp), and never replace it with missing data.
+    pub fn merge(&mut self, observation: &Self) {
+        let replaced = self.container_id.as_ref().zip(observation.container_id.as_ref()).is_some_and(|(old, new)| old != new)
+            || self.started_at.as_ref().zip(observation.started_at.as_ref()).is_some_and(|(old, new)| old != new);
+        if replaced {
+            *self = observation.clone();
+            return;
+        }
+        if observation.container_id.is_some() {
+            self.container_id.clone_from(&observation.container_id);
+        }
+        if observation.started_at.is_some() {
+            self.started_at.clone_from(&observation.started_at);
+        }
+        if observation.memory_limits.is_some() {
+            self.memory_limits.clone_from(&observation.memory_limits);
+        }
+        if observation.memory_usage_bytes.is_some() {
+            self.memory_usage_bytes = observation.memory_usage_bytes;
+            self.memory_observed_at.clone_from(&observation.memory_observed_at);
+        }
+        if observation.termination.is_some() {
+            self.termination.clone_from(&observation.termination);
+        }
+    }
+}
+
+#[cfg(test)]
+mod observation_incarnation_tests {
+    use super::*;
+
+    // A replacement or restart is a new backing incarnation. Its running
+    // observation cannot inherit the old container's death or memory sample.
+    #[test]
+    fn a_new_incarnation_replaces_old_runtime_evidence() {
+        for (id, started) in [("new", "first"), ("old", "second")] {
+            let mut observation = EnvironmentRuntimeObservation {
+                container_id: Some("old".into()),
+                started_at: Some("first".into()),
+                memory_usage_bytes: Some(123),
+                memory_observed_at: Some("old sample".into()),
+                termination: Some(
+                    EnvironmentTermination::builder()
+                        .exit_code(137)
+                        .signal(9)
+                        .oom_killed(true)
+                        .cause(EnvironmentExitCause::CgroupOom)
+                        .finished_at("old finish".into())
+                        .build(),
+                ),
+                ..Default::default()
+            };
+            let replacement =
+                EnvironmentRuntimeObservation { container_id: Some(id.into()), started_at: Some(started.into()), ..Default::default() };
+            observation.merge(&replacement);
+            assert_eq!(observation, replacement);
+        }
+    }
+}

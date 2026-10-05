@@ -3231,6 +3231,7 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
     let remote_policy = PlacementPolicySpec::builder()
         .pool("cleat".to_string())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
+            memory_policy: Default::default(),
             host_ref: "remote-docker-host".to_string(),
             image: "crew:latest".to_string().into(),
             pull_policy: Default::default(),
