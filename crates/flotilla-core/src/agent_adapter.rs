@@ -1110,8 +1110,6 @@ impl AgentAdapterRegistry {
 
 #[cfg(test)]
 mod tests {
-    const SETTLEMENT_YIELD: &str = "If checks are still pending when you reach settlement, report the PR state and yield at the turn boundary; flotilla wakes you when checks settle, and you then take the clean final snapshot.";
-
     use std::{
         collections::{BTreeMap, BTreeSet},
         process::Command as ProcessCommand,
@@ -1140,6 +1138,8 @@ mod tests {
             ProcessCommandRunner,
         },
     };
+
+    const SETTLEMENT_YIELD: &str = "If checks are still pending when you reach settlement, report the PR state and yield at the turn boundary; flotilla wakes you when checks settle, and you then take the clean final snapshot.";
 
     fn discovered_registry() -> AgentAdapterRegistry {
         let env = EnvironmentBag::new()
