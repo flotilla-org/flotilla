@@ -53,8 +53,9 @@ pub struct PreparedCheckout {
 pub trait CheckoutRuntime: Send + Sync {
     /// Refuse a new branch that is already a forge change-request head.
     /// Existing targets are retries and must remain recoverable.
-    async fn validate_new_branch(&self, _checkout: &ResourceObject<Checkout>) -> Result<(), String> {
-        Ok(())
+    /// Ok(Some) names a permanent conflict; Err is a retryable lookup failure.
+    async fn validate_new_branch(&self, _checkout: &ResourceObject<Checkout>) -> Result<Option<String>, String> {
+        Ok(None)
     }
 
     /// Restore registration protection through the checkout's owning environment.
@@ -365,7 +366,15 @@ where
             let conflict = self.checkouts.list().await?.items.into_iter().find(|other| {
                 other.metadata.name != obj.metadata.name
                     && other.metadata.deletion_timestamp.is_none()
-                    && other.status.as_ref().is_none_or(|status| status.phase != CheckoutPhase::Gone)
+                    && match other.status.as_ref().map(|status| status.phase).unwrap_or(CheckoutPhase::Pending) {
+                        CheckoutPhase::Ready | CheckoutPhase::Preparing | CheckoutPhase::Terminating => true,
+                        // Pending siblings reserve in creation order; names break timestamp ties.
+                        CheckoutPhase::Pending => {
+                            (other.metadata.creation_timestamp, &other.metadata.name)
+                                < (obj.metadata.creation_timestamp, &obj.metadata.name)
+                        }
+                        CheckoutPhase::Failed | CheckoutPhase::Gone => false,
+                    }
                     && other.spec.repo_ref() == obj.spec.repo_ref()
                     && other.spec.env_ref() == obj.spec.env_ref()
                     && other.spec.branch() == obj.spec.branch()
@@ -377,8 +386,13 @@ where
                     other.metadata.name
                 )));
             }
-            if let Err(error) = self.runtime.validate_new_branch(obj).await {
-                return Ok(CheckoutPrepared::Failed(error));
+            match self.runtime.validate_new_branch(obj).await {
+                Ok(Some(conflict)) => return Ok(CheckoutPrepared::Failed(conflict)),
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(checkout = %obj.metadata.name, %error, "checkout branch validation unavailable; retrying");
+                    return Ok(CheckoutPrepared::Waiting);
+                }
             }
         }
 

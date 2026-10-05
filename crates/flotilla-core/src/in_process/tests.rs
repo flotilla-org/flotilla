@@ -9425,7 +9425,8 @@ async fn checkout_branch_switch_discovers_actual_request_and_unlink_wins() {
         )
         .await
         .expect("checkout");
-    let conflict = fixture.daemon.validate_new_checkout_branch(&checkout).await.expect_err("old merged head must refuse creation");
+    let conflict =
+        fixture.daemon.validate_new_checkout_branch(&checkout).await.expect("forge lookup").expect("old merged head must refuse creation");
     assert!(conflict.contains("requested") && conflict.contains("#7"), "{conflict}");
     let runner = Arc::new(crate::providers::ProcessCommandRunner);
     let vcs = crate::vcs::FlotillaVcs::new(
@@ -9544,6 +9545,6 @@ async fn checkout_creation_does_not_reuse_cached_branch_absence() {
         )
         .await
         .expect("checkout");
-    let error = fixture.daemon.validate_new_checkout_branch(&checkout).await.expect_err("fresh conflict");
+    let error = fixture.daemon.validate_new_checkout_branch(&checkout).await.expect("forge lookup").expect("fresh conflict");
     assert!(error.contains("reused") && error.contains("#7"), "{error}");
 }

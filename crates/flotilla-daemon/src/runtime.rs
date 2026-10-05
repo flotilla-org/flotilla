@@ -5306,12 +5306,12 @@ fn removal_source_path(removal: &CheckoutRemoval) -> &str {
 
 #[async_trait]
 impl CheckoutRuntime for RoutingCheckoutRuntime {
-    async fn validate_new_branch(&self, checkout: &ResourceObject<Checkout>) -> Result<(), String> {
-        let Some(target) = checkout.spec.target_path() else { return Ok(()) };
+    async fn validate_new_branch(&self, checkout: &ResourceObject<Checkout>) -> Result<Option<String>, String> {
+        let Some(target) = checkout.spec.target_path() else { return Ok(None) };
         let env_ref = checkout.spec.env_ref().ok_or("checkout environment unavailable")?;
         let environment = self.state.daemon.resolve_environment_ref(env_ref).ok_or("checkout environment unavailable")?;
         if environment.runner.path_exists(Path::new(target)).await? {
-            return Ok(());
+            return Ok(None);
         }
         self.state.daemon.validate_new_checkout_branch(checkout).await
     }
