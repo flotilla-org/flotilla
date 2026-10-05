@@ -1239,3 +1239,54 @@ pub async fn assert_slow_replica_watch_is_bounded(backend: ResourceBackend) {
     writer.apply(WatchEvent::Modified(object), Utc::now()).await.expect("replicate after recovery");
     assert!(matches!(recovered.next().await, Some(Ok(flotilla_resources::ReadWatchEvent::Modified(_)))));
 }
+
+// #2636: complete snapshots remove absent keys, preserve unchanged provenance,
+// and fence delayed relay writes. Empty/repeated snapshots are safe as well.
+pub async fn assert_replica_snapshot_reconciliation(backend: ResourceBackend) {
+    let authority = ResourceBackend::InMemory(InMemoryBackend::default()).using::<Convoy>("flotilla");
+    authority.create(&convoy_meta("gone"), &convoy_spec("template")).await.expect("create");
+    authority.create(&convoy_meta("retained"), &convoy_spec("template")).await.expect("create");
+    let initial = authority.list().await.expect("initial snapshot");
+    let synced = Utc::now();
+    let writer = backend.replica_writer::<Convoy>(flotilla_protocol::NodeId::new("authority"), "flotilla");
+    writer.replace(&initial, synced).await.expect("seed");
+    authority.delete("gone").await.expect("delete");
+    let current = authority.list().await.expect("current snapshot");
+    writer.replace(&current, synced + chrono::Duration::seconds(1)).await.expect("resync");
+    let read = backend.including_replicas::<Convoy>("flotilla");
+    assert_eq!(read.list().await.expect("replicas").items.len(), 1);
+    assert!(matches!(read.get("retained").await.expect("retained").provenance,
+        ResourceProvenance::Replica { last_synced_at, .. } if last_synced_at == synced));
+    writer
+        .apply(WatchEvent::Added(initial.items.iter().find(|object| object.metadata.name == "gone").expect("old object").clone()), synced)
+        .await
+        .expect("delayed relay");
+    assert!(matches!(read.get("gone").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+    authority.delete("retained").await.expect("delete remaining");
+    let empty = authority.list().await.expect("empty snapshot");
+    for _ in 0..2 {
+        writer.replace(&empty, synced + chrono::Duration::seconds(2)).await.expect("empty resync");
+        assert!(read.list().await.expect("empty replicas").items.is_empty());
+    }
+    writer.apply(WatchEvent::Added(initial.items[0].clone()), synced).await.expect("old relay after repeated empty snapshot");
+    assert!(read.list().await.expect("fenced replicas").items.is_empty());
+    writer.invalidate_cursor().await.expect("force snapshot retry");
+    assert!(writer.cursor().await.expect("invalidated cursor").is_none());
+    assert!(read.list().await.expect("preserved empty set").items.is_empty());
+    writer.replace(&empty, synced + chrono::Duration::seconds(2)).await.expect("reestablish prefix");
+    let prefix = writer.cursor().await.expect("cursor").expect("snapshot prefix");
+    let first = authority.create(&convoy_meta("first"), &convoy_spec("template")).await.expect("next event");
+    let second = authority.create(&convoy_meta("second"), &convoy_spec("template")).await.expect("later event");
+    let direct_time = synced + chrono::Duration::seconds(3);
+    writer.apply(WatchEvent::Added(second.clone()), direct_time).await.expect("relay ahead of prefix");
+    assert_eq!(writer.cursor().await.expect("cursor"), Some(prefix.clone()), "relays cannot prove a complete prefix");
+    writer.apply_direct(WatchEvent::Added(second.clone()), direct_time).await.expect_err("cannot advance past a hole");
+    assert_eq!(writer.cursor().await.expect("cursor"), Some(prefix));
+    writer.apply(WatchEvent::Added(first.clone()), direct_time).await.expect("relay duplicate");
+    writer.apply_direct(WatchEvent::Added(first), direct_time).await.expect("contiguous duplicate advances prefix");
+    writer.apply_direct(WatchEvent::Added(second.clone()), direct_time).await.expect("contiguous next event");
+    assert_eq!(writer.cursor().await.expect("cursor").expect("prefix").resource_version, second.metadata.resource_version);
+    writer.invalidate_cursor().await.expect("invalidate after gap");
+    assert!(writer.cursor().await.expect("cursor").is_none());
+    assert_eq!(read.list().await.expect("preserved cached rows").items.len(), 2);
+}

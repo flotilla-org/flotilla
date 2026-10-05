@@ -500,6 +500,44 @@ impl<T: Resource> ReplicaWriter<T> {
         }
     }
 
+    /// Apply a direct origin event, then commit its contiguous prefix. Relay
+    /// `apply` never advances this cursor. A crash between these operations only
+    /// replays an already-applied event; it cannot skip a missing event.
+    pub async fn apply_direct(&self, event: crate::WatchEvent<T>, synced_at: DateTime<Utc>) -> Result<(), ResourceError> {
+        let previous = self.cursor().await?.ok_or_else(|| ResourceError::invalid("replica prefix missing; snapshot required"))?;
+        let next = match &event {
+            crate::WatchEvent::Added(object) | crate::WatchEvent::Modified(object) | crate::WatchEvent::Deleted(object) => {
+                &object.metadata.resource_version
+            }
+            crate::WatchEvent::DeletedByName(tombstone) => &tombstone.resource_version,
+        }
+        .clone();
+        let prior = previous.resource_version.parse::<u64>().map_err(|err| ResourceError::invalid(err.to_string()))?;
+        if prior.checked_add(1) != next.parse::<u64>().ok() {
+            return Err(ResourceError::invalid("replica sequence gap; snapshot required"));
+        }
+        self.apply(event, synced_at).await?;
+        match &self.backend {
+            ResourceBackend::InMemory(backend) => {
+                backend.advance_replica_cursor_typed::<T>(&self.origin_root, &self.namespace, &previous, &next).await
+            }
+            ResourceBackend::Sqlite(backend) => {
+                backend.advance_replica_cursor_typed::<T>(&self.origin_root, &self.namespace, &previous, &next).await
+            }
+            ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
+        }
+    }
+
+    /// Require a new authoritative snapshot without removing cached objects.
+    pub async fn invalidate_cursor(&self) -> Result<(), ResourceError> {
+        ensure_replication_enabled::<T>()?;
+        match &self.backend {
+            ResourceBackend::InMemory(backend) => backend.invalidate_replica_cursor_typed::<T>(&self.origin_root, &self.namespace).await,
+            ResourceBackend::Sqlite(backend) => backend.invalidate_replica_cursor_typed::<T>(&self.origin_root, &self.namespace).await,
+            ResourceBackend::Http(_) => Err(ResourceError::invalid("HTTP backends cannot hold replicas")),
+        }
+    }
+
     pub async fn cursor(&self) -> Result<Option<ReplicaCursor>, ResourceError> {
         ensure_replication_enabled::<T>()?;
         match &self.backend {

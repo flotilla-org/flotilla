@@ -387,13 +387,23 @@ impl InMemoryBackend {
         let mut state = self.replicas.lock().await;
         let old = state.partitions.remove(&replica_key).unwrap_or_default();
         let mut objects = HashMap::new();
-        let mut synced_at_by_name = HashMap::new();
+        // Absent names retain deletion fences against delayed relays. A recreated
+        // key is absent from old.objects, so insertion below stamps it afresh.
+        let mut synced_at_by_name = old.synced_at_by_name;
         for object in &listed.items {
-            objects.insert(object.metadata.name.clone(), Self::encode_object(object)?);
-            synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
+            let name = &object.metadata.name;
+            let encoded = Self::encode_object(object)?;
+            let unchanged = old.objects.get(name) == Some(&encoded);
+            objects.insert(name.clone(), encoded);
+            if !unchanged {
+                synced_at_by_name.insert(name.clone(), synced_at);
+            }
         }
         let mut events = Vec::new();
         for (name, value) in &objects {
+            if old.objects.get(name) == Some(value) {
+                continue;
+            }
             events.push(StoredReplicaEvent {
                 origin_root: origin_root.clone(),
                 synced_at,
@@ -403,6 +413,8 @@ impl InMemoryBackend {
         }
         for (name, value) in old.objects {
             if !objects.contains_key(&name) {
+                // Fence stale relays as well as removing the visible replica.
+                synced_at_by_name.insert(name, synced_at);
                 events.push(StoredReplicaEvent {
                     origin_root: origin_root.clone(),
                     synced_at,
@@ -471,10 +483,6 @@ impl InMemoryBackend {
                 partition.synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
             }
         }
-        partition.cursor = Some(ReplicaCursor {
-            resource_version: object.metadata.resource_version.clone(),
-            generation: partition.cursor.as_ref().and_then(|cursor| cursor.generation.clone()),
-        });
         Self::notify_replica_watchers(&mut state, &store_key, StoredReplicaEvent {
             origin_root: origin_root.clone(),
             synced_at,
@@ -509,16 +517,47 @@ impl InMemoryBackend {
         }
         partition.objects.remove(&tombstone.name);
         partition.synced_at_by_name.insert(tombstone.name.clone(), synced_at);
-        partition.cursor = Some(ReplicaCursor {
-            resource_version: tombstone.resource_version.clone(),
-            generation: partition.cursor.as_ref().and_then(|cursor| cursor.generation.clone()),
-        });
         Self::notify_replica_watchers(&mut state, &store_key, StoredReplicaEvent {
             origin_root: origin_root.clone(),
             synced_at,
             kind: StoredReplicaEventKind::Deleted,
             object: encoded,
         });
+        Ok(())
+    }
+
+    pub(crate) async fn invalidate_replica_cursor_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+    ) -> Result<(), ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.invalidate_replica_cursor_typed::<T>(origin_root, namespace).await;
+        }
+        let key = (origin_root.clone(), Self::store_key::<T>(namespace));
+        if let Some(partition) = self.replicas.lock().await.partitions.get_mut(&key) {
+            partition.cursor = None;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn advance_replica_cursor_typed<T: Resource>(
+        &self,
+        origin_root: &NodeId,
+        namespace: &str,
+        previous: &ReplicaCursor,
+        next: &str,
+    ) -> Result<(), ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.advance_replica_cursor_typed::<T>(origin_root, namespace, previous, next).await;
+        }
+        let key = (origin_root.clone(), Self::store_key::<T>(namespace));
+        let mut replicas = self.replicas.lock().await;
+        let partition = replicas.partitions.get_mut(&key).ok_or_else(|| ResourceError::invalid("replica prefix missing"))?;
+        if partition.cursor.as_ref() != Some(previous) {
+            return Err(ResourceError::invalid("replica prefix changed concurrently"));
+        }
+        partition.cursor = Some(ReplicaCursor { resource_version: next.to_string(), generation: previous.generation.clone() });
         Ok(())
     }
 
