@@ -20,7 +20,7 @@ use std::{
 use flotilla_protocol::arg::shell_quote;
 use flotilla_transport::message::{stream_message_session, MessageSession};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, BufReader, ReadBuf},
+    io::{AsyncRead, AsyncReadExt, ReadBuf},
     process::{Child, ChildStderr, ChildStdout, Command},
     task::JoinHandle,
 };
@@ -48,7 +48,8 @@ impl fmt::Display for DaemonEndpoint {
 
 /// A daemon on another host, reached by running `flotilla daemon-bridge`
 /// there over OpenSSH.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(start_fn(vis = "pub(crate)"))]
 pub struct SshEndpoint {
     /// `ssh://[user@]host[:port]`, which OpenSSH accepts as a destination.
     destination: String,
@@ -56,6 +57,7 @@ pub struct SshEndpoint {
     remote_flotilla: String,
     /// Remote daemon socket; the remote default when absent.
     remote_socket: Option<String>,
+    #[builder(default = "ssh".into())]
     ssh_program: OsString,
 }
 
@@ -75,7 +77,7 @@ impl SshEndpoint {
             Some("/") | None => "flotilla".to_string(),
             Some(path) => path.to_string(),
         };
-        Ok(Self { destination: format!("ssh://{authority}"), remote_flotilla, remote_socket: None, ssh_program: "ssh".into() })
+        Ok(Self::builder().destination(format!("ssh://{authority}")).remote_flotilla(remote_flotilla).build())
     }
 
     /// Use a non-default daemon socket on the remote host.
@@ -171,15 +173,17 @@ pub(crate) struct StderrTail {
 }
 
 impl StderrTail {
-    fn capture(stderr: ChildStderr) -> Self {
+    fn capture(mut stderr: ChildStderr) -> Self {
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&buffer);
         let reader = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            let mut chunk = [0; STDERR_TAIL_BYTES];
+            while let Ok(count) = stderr.read(&mut chunk).await {
+                if count == 0 {
+                    break;
+                }
                 let mut buffer = sink.lock().expect("stderr tail lock");
-                buffer.extend_from_slice(line.as_bytes());
-                buffer.push(b'\n');
+                buffer.extend_from_slice(&chunk[..count]);
                 if buffer.len() > STDERR_TAIL_BYTES {
                     let excess = buffer.len() - STDERR_TAIL_BYTES;
                     buffer.drain(..excess);

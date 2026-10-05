@@ -488,6 +488,22 @@ pub async fn connect_or_spawn(socket_path: &Path, config_dir: &Path, state_dir: 
     connect_or_spawn_with_optional_surface(socket_path, config_dir, state_dir, None).await
 }
 
+/// Viewer connection policy: SSH always requires an existing remote daemon;
+/// local callers can either require one or permit the usual supervised spawn.
+pub async fn connect_endpoint_or_spawn_with_surface(
+    endpoint: &DaemonEndpoint,
+    config_dir: &Path,
+    state_dir: &Path,
+    require_host_daemon: bool,
+    surface: SurfaceDeclaration,
+) -> Result<Arc<SocketDaemon>, String> {
+    match endpoint {
+        DaemonEndpoint::Ssh(_) => SocketDaemon::connect_endpoint_with_surface(endpoint, surface).await,
+        DaemonEndpoint::Local(socket_path) if require_host_daemon => connect_required_host_daemon_with_surface(socket_path, surface).await,
+        DaemonEndpoint::Local(socket_path) => connect_or_spawn_with_surface(socket_path, config_dir, state_dir, surface).await,
+    }
+}
+
 pub async fn connect_or_spawn_with_surface(
     socket_path: &Path,
     config_dir: &Path,

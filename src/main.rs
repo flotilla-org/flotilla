@@ -839,14 +839,8 @@ async fn connect_cli_socket(
 ) -> Result<Arc<flotilla_tui::socket::SocketDaemon>, String> {
     let surface =
         cli_surface_from(std::env::var("FLOTILLA_CREW_ROLE").ok().as_deref(), std::env::var("FLOTILLA_NAMESPACE").ok().as_deref());
-    if let Some(remote) = remote {
-        // A remote daemon is never spawned or replaced from this host.
-        flotilla_tui::socket::SocketDaemon::connect_endpoint_with_surface(&DaemonEndpoint::Ssh(remote.clone()), surface).await
-    } else if require_host_daemon {
-        flotilla_tui::socket::connect_required_host_daemon_with_surface(socket_path, surface).await
-    } else {
-        flotilla_tui::socket::connect_or_spawn_with_surface(socket_path, config_dir, state_dir, surface).await
-    }
+    let endpoint = remote.cloned().map(DaemonEndpoint::Ssh).unwrap_or_else(|| DaemonEndpoint::Local(socket_path.to_path_buf()));
+    flotilla_tui::socket::connect_endpoint_or_spawn_with_surface(&endpoint, config_dir, state_dir, require_host_daemon, surface).await
 }
 
 fn cli_surface_from(crew_role: Option<&str>, namespace: Option<&str>) -> flotilla_protocol::SurfaceDeclaration {
@@ -866,6 +860,7 @@ fn main() -> Result<()> {
     color_eyre::install()?;
     let mut cli = Cli::try_parse().unwrap_or_else(|error| exit_cli_parse_error(error));
     let format = OutputFormat::from_json_flag(cli.json);
+    let remote_daemon_selected = cli.remote_daemon().is_ok_and(|endpoint| endpoint.is_some());
     let command = cli.command.take();
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -874,7 +869,7 @@ fn main() -> Result<()> {
     if let Err(error) = &result {
         let message = format!("{error:?}");
         let already_reexecuted = std::env::var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV).ok();
-        if should_reexec_for_incompatible_daemon(&message, already_reexecuted.as_deref()) {
+        if should_reexec_for_incompatible_daemon(&message, already_reexecuted.as_deref(), remote_daemon_selected) {
             std::env::set_var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV, flotilla_tui::socket::BUILD_ID);
             if let Err(reexec_error) = reexec_current_process() {
                 return Err(color_eyre::eyre::eyre!(incompatible_daemon_reexec_failure(&message, &reexec_error)));
@@ -955,8 +950,12 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
     }
 }
 
-fn should_reexec_for_incompatible_daemon(error: &str, already_reexecuted_build: Option<&str>) -> bool {
-    flotilla_tui::socket::reconnect::is_incompatible_daemon_error(error) && already_reexecuted_build != Some(flotilla_tui::socket::BUILD_ID)
+fn should_reexec_for_incompatible_daemon(error: &str, already_reexecuted_build: Option<&str>, remote_daemon_selected: bool) -> bool {
+    // Re-exec can pick up a newly installed local client. It cannot upgrade a
+    // remote daemon, and on Windows would detach a replacement and exit zero.
+    !remote_daemon_selected
+        && flotilla_tui::socket::reconnect::is_incompatible_daemon_error(error)
+        && already_reexecuted_build != Some(flotilla_tui::socket::BUILD_ID)
 }
 
 fn incompatible_daemon_reexec_failure(incompatibility: &str, reexec_error: &dyn std::fmt::Display) -> String {
@@ -3238,9 +3237,16 @@ mod tests {
     #[test]
     fn incompatible_daemon_reexecs_once_per_client_build() {
         let mismatch = "daemon protocol version mismatch: daemon has 18, client has 17";
-        assert!(should_reexec_for_incompatible_daemon(mismatch, None));
-        assert!(!should_reexec_for_incompatible_daemon(mismatch, Some(flotilla_tui::socket::BUILD_ID)));
-        assert!(!should_reexec_for_incompatible_daemon("daemon unavailable", None));
+        assert!(should_reexec_for_incompatible_daemon(mismatch, None, false));
+        assert!(!should_reexec_for_incompatible_daemon(mismatch, Some(flotilla_tui::socket::BUILD_ID), false));
+        assert!(!should_reexec_for_incompatible_daemon("daemon unavailable", None, false));
+    }
+
+    #[test]
+    fn incompatible_remote_daemon_reports_failure_without_reexec() {
+        for error in ["daemon protocol version mismatch", "wire generation mismatch"] {
+            assert!(!should_reexec_for_incompatible_daemon(error, None, true));
+        }
     }
 
     #[test]
