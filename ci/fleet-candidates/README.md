@@ -46,6 +46,12 @@ directory):
 
 Fleet consumers install `generation_validation.py` beside `fleet-install`, or
 set `FLEET_GENERATION_VALIDATOR` to its absolute path while provisioning.
+Bootstrap archive safety, manifest reads, package ordering, checksums and Darwin
+entitlements now use named commands in that same host-side validator. They run
+before trusting candidate executables. Sync the installer and validator together;
+keep the existing validator rollback rule: validate old releases without requiring
+payloads introduced by newer generations.
+
 Neither helper contains credentials; the three host tools continue to read
 their existing token files at runtime.
 

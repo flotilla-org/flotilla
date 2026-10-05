@@ -5,6 +5,9 @@ import argparse
 import hashlib
 import json
 import os
+import plistlib
+import shutil
+import tarfile
 import re
 import subprocess
 import sys
@@ -377,6 +380,99 @@ def validate_fixture(path):
     validate_skill_bundle(fixture["skill_bundle"], sources)
 
 
+def collect_package_page(response, package_name, output_path):
+    packages = json.loads(Path(response).read_text())
+    if not isinstance(packages, list):
+        raise ValidationError("package listing is not an array")
+    with open(output_path, "a") as output:
+        for package in packages:
+            if package.get("type") == "generic" and package.get("name") == package_name:
+                print(json.dumps([package.get("created_at", ""), package.get("version", "")]), file=output)
+    print(len(packages))
+
+
+def package_versions(path):
+    rows = [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
+    rows = [row for row in rows if row[0] and row[1]]
+    for row in sorted(rows, reverse=True):
+        print(row[1])
+
+
+def manifest_value(manifest, expression):
+    value = json.loads(Path(manifest).read_text())
+    for part in expression.split("."):
+        value = value[part]
+    print(value)
+
+
+def platform_value(manifest, platform, field):
+    print(json.loads(Path(manifest).read_text())["platforms"][platform][field])
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    print(digest.hexdigest())
+
+
+def file_size(path):
+    print(os.path.getsize(path))
+
+
+def extract_archive(archive, destination, platform):
+    archive = Path(archive)
+    destination = Path(destination)
+    expected_root = "fleet-signed-darwin-aarch64" if platform == "darwin-aarch64" else f"fleet-candidate-{platform}"
+    with tarfile.open(archive, "r:gz") as bundle:
+        members = bundle.getmembers()
+        names = set()
+        roots = set()
+        for member in members:
+            path = PurePosixPath(member.name)
+            normalized = str(path)
+            if path.is_absolute() or ".." in path.parts or not path.parts or normalized in names:
+                raise ValidationError(f"unsafe or duplicate archive path: {member.name}")
+            if not (member.isfile() or member.isdir()):
+                raise ValidationError(f"unsupported archive entry: {member.name}")
+            names.add(normalized)
+            roots.add(path.parts[0])
+        if roots != {expected_root}:
+            raise ValidationError(f"archive has an unexpected bundle directory: expected {expected_root}, got {sorted(roots)}")
+        for member in members:
+            target = destination.joinpath(*PurePosixPath(member.name).parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                target.chmod(member.mode & 0o777)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = bundle.extractfile(member)
+            if source is None:
+                raise ValidationError(f"archive entry cannot be read: {member.name}")
+            with source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
+            target.chmod(member.mode & 0o777)
+    shutil.move(str(destination / expected_root), str(destination / "release"))
+
+
+def validate_entitlements(path, relative):
+    content = Path(path).read_bytes()
+    try:
+        entitlements = plistlib.loads(content) if content.strip() else {}
+    except plistlib.InvalidFileException as error:
+        raise ValidationError(f"signed Darwin payload has unreadable entitlements: {relative}: {error}")
+    if entitlements != {}:
+        raise ValidationError(f"signed Darwin payload has unexpected entitlements: {relative}")
+
+
+def protocol_version(path):
+    try:
+        print(json.loads(Path(path).read_text()).get("peer_protocol_version", ""))
+    except (OSError, ValueError):
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -396,6 +492,32 @@ def main():
     skill_sources.add_argument("--catalog-output")
     codex_home = sub.add_parser("codex-home")
     codex_home.add_argument("root")
+    helper = sub.add_parser('package-page')
+    helper.add_argument('response')
+    helper.add_argument('package_name')
+    helper.add_argument('output_path')
+    helper = sub.add_parser('package-versions')
+    helper.add_argument('path')
+    helper = sub.add_parser('value')
+    helper.add_argument('manifest')
+    helper.add_argument('expression')
+    helper = sub.add_parser('platform-value')
+    helper.add_argument('manifest')
+    helper.add_argument('platform')
+    helper.add_argument('field')
+    helper = sub.add_parser('sha256')
+    helper.add_argument('path')
+    helper = sub.add_parser('size')
+    helper.add_argument('path')
+    helper = sub.add_parser('extract')
+    helper.add_argument('archive')
+    helper.add_argument('destination')
+    helper.add_argument('platform')
+    helper = sub.add_parser('entitlements')
+    helper.add_argument('path')
+    helper.add_argument('relative')
+    helper = sub.add_parser('protocol')
+    helper.add_argument('path')
     args = parser.parse_args()
     try:
         if args.command == "fixture":
@@ -404,12 +526,30 @@ def main():
             validate_skill_source_paths(json.loads(Path(args.manifest).read_text()), args.catalog_output)
         elif args.command == "codex-home":
             validate_codex_home_template(args.root)
-        else:
+        elif args.command in ("generation", "release"):
             outer = json.loads(Path(args.manifest).read_text())
         if args.command == "generation":
             validate_generation(outer, args.generation, args.platform, require_installable=args.installable)
         elif args.command == "release":
             validate_release(args.root, outer, args.platform)
+        elif args.command == 'package-page':
+            collect_package_page(args.response, args.package_name, args.output_path)
+        elif args.command == 'package-versions':
+            package_versions(args.path)
+        elif args.command == 'value':
+            manifest_value(args.manifest, args.expression)
+        elif args.command == 'platform-value':
+            platform_value(args.manifest, args.platform, args.field)
+        elif args.command == 'sha256':
+            sha256_file(args.path)
+        elif args.command == 'size':
+            file_size(args.path)
+        elif args.command == 'extract':
+            extract_archive(args.archive, args.destination, args.platform)
+        elif args.command == 'entitlements':
+            validate_entitlements(args.path, args.relative)
+        elif args.command == 'protocol':
+            protocol_version(args.path)
     except (OSError, json.JSONDecodeError, ValidationError) as error:
         parser.exit(1, f"generation validation: {error}\n")
 
