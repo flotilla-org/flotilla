@@ -108,6 +108,24 @@ impl HttpBackend {
         Ok(crate::ResourcePosition { resource_version: list.metadata.resource_version, generation: list.metadata.generation })
     }
 
+    pub(crate) async fn digest_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        query: &crate::DigestQuery,
+    ) -> Result<crate::PartitionDigest, ResourceError> {
+        let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
+        let parameters = match query {
+            crate::DigestQuery::Root => vec![("digest", "root".to_string())],
+            crate::DigestQuery::Children { expected_root } => vec![("digest", "children".into()), ("expectedRoot", expected_root.clone())],
+            crate::DigestQuery::Snapshot { expected_root, bucket } => {
+                vec![("digest", "snapshot".into()), ("expectedRoot", expected_root.clone()), ("bucket", bucket.to_string())]
+            }
+        };
+        let response =
+            self.http.get(url).query(&parameters).send().await.map_err(|error| ResourceError::other(format!("GET digest: {error}")))?;
+        Self::decode_response(response, None).await
+    }
+
     pub(crate) async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
         let response = self.http.get(url).send().await.map_err(|err| ResourceError::other(format!("LIST resources: {err}")))?;

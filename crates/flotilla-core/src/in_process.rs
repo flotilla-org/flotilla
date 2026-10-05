@@ -7255,6 +7255,17 @@ impl DaemonHandle for InProcessDaemon {
                 Ok(explanation) => Ok(CommandValue::ConvoyExplanation(Box::new(explanation))),
                 Err(message) => Ok(CommandValue::Error { message }),
             },
+            CommandAction::QueryResourceDigest { namespace, kind, query } => {
+                let (kind, backend) = match kind.strip_prefix("observed/") {
+                    Some(kind) => (kind, self.observed_resource_backend()),
+                    None => (kind.as_str(), self.resource_backend()),
+                };
+                let result = flotilla_resources::digest_resource_kind(&backend, namespace, kind, query).await;
+                match result {
+                    Ok(digest) => Ok(CommandValue::ResourceDigest(Box::new(digest.into()))),
+                    Err(error) => Ok(CommandValue::Error { message: error.to_string() }),
+                }
+            }
             CommandAction::QueryResourceList { namespace, kind, include_replicas } => {
                 let listed = if *include_replicas {
                     list_resource_kind_including_replicas(&self.resource_backend, namespace, kind).await

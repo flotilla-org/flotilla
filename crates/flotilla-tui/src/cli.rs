@@ -1305,6 +1305,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::CrewList(crew) => format_crew_list_human(crew),
         CommandValue::DaemonLogs { lines } => lines.join("\n"),
         CommandValue::ConvoyExplanation(explanation) => format_convoy_explanation_human(explanation),
+        CommandValue::ResourceDigest(value) => serde_json::to_string_pretty(value).unwrap_or_default(),
         CommandValue::ResourceRead(response) => {
             let mut output = String::new();
             for record in &response.records {

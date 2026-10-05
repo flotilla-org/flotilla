@@ -46,6 +46,7 @@ struct ReplicaState {
 #[derive(Debug, Default)]
 struct ReplicaPartition {
     objects: HashMap<String, Value>,
+    digest: crate::digest::DigestIndex,
     // Retained for deleted names as a tombstone so an older relayed write
     // cannot resurrect an object after a newer delete.
     synced_at_by_name: HashMap<String, chrono::DateTime<Utc>>,
@@ -55,6 +56,7 @@ struct ReplicaPartition {
 #[derive(Debug)]
 struct ResourceStore {
     objects: HashMap<String, Value>,
+    digest: crate::digest::DigestIndex,
     tombstones: HashMap<String, ResourceTombstone>,
     next_version: u64,
     watchers: WatchChannel<StoredEvent>,
@@ -88,6 +90,9 @@ impl ResourceStore {
     }
 
     fn push_event(&mut self, event: StoredEvent, max_events: usize) {
+        let name = event.object["metadata"]["name"].as_str().expect("encoded event name");
+        let version = event.version.to_string();
+        self.digest.set(name, (!matches!(event.kind, StoredEventKind::Deleted)).then_some(version.as_str()));
         let excess = self.event_log.len().saturating_add(1).saturating_sub(max_events);
         if excess > 0 {
             if let Some(last_removed) = self.event_log.get(excess - 1) {
@@ -104,6 +109,7 @@ impl Default for ResourceStore {
     fn default() -> Self {
         Self {
             objects: HashMap::new(),
+            digest: crate::digest::DigestIndex::default(),
             tombstones: HashMap::new(),
             next_version: 1,
             watchers: WatchChannel::default(),
@@ -378,15 +384,29 @@ impl InMemoryBackend {
         namespace: &str,
         listed: &ResourceList<T>,
         synced_at: chrono::DateTime<Utc>,
+        bucket: Option<u8>,
     ) -> Result<(), ResourceError> {
         if let Some(backend) = &self.durable_replicas {
-            return backend.replace_replicas_typed::<T>(origin_root, namespace, listed, synced_at).await;
+            return backend.replace_replicas_typed::<T>(origin_root, namespace, listed, synced_at, bucket).await;
         }
         let store_key = Self::store_key::<T>(namespace);
         let replica_key = (origin_root.clone(), store_key.clone());
         let mut state = self.replicas.lock().await;
-        let old = state.partitions.remove(&replica_key).unwrap_or_default();
-        let mut objects = HashMap::new();
+        let mut old = state.partitions.remove(&replica_key).unwrap_or_default();
+        let mut digest = std::mem::take(&mut old.digest);
+        // Move the unaffected map intact. Only the selected leaf is compared,
+        // cloned, decoded or notified; sparse repair never scans other bodies.
+        let mut objects = if let Some(bucket) = bucket {
+            let mut unaffected = std::mem::take(&mut old.objects);
+            for name in digest.names(bucket) {
+                if let Some(value) = unaffected.remove(name) {
+                    old.objects.insert(name.clone(), value);
+                }
+            }
+            unaffected
+        } else {
+            HashMap::new()
+        };
         // Absent names retain deletion fences against delayed relays. A recreated
         // key is absent from old.objects, so insertion below stamps it afresh.
         let mut synced_at_by_name = old.synced_at_by_name;
@@ -395,12 +415,15 @@ impl InMemoryBackend {
             let encoded = Self::encode_object(object)?;
             let unchanged = old.objects.get(name) == Some(&encoded);
             objects.insert(name.clone(), encoded);
+            digest.set(name, Some(&object.metadata.resource_version));
             if !unchanged {
                 synced_at_by_name.insert(name.clone(), synced_at);
             }
         }
         let mut events = Vec::new();
-        for (name, value) in &objects {
+        for object in &listed.items {
+            let name = &object.metadata.name;
+            let value = objects.get(name).expect("encoded snapshot object");
             if old.objects.get(name) == Some(value) {
                 continue;
             }
@@ -414,6 +437,7 @@ impl InMemoryBackend {
         for (name, value) in old.objects {
             if !objects.contains_key(&name) {
                 // Fence stale relays as well as removing the visible replica.
+                digest.set(&name, None);
                 synced_at_by_name.insert(name, synced_at);
                 events.push(StoredReplicaEvent {
                     origin_root: origin_root.clone(),
@@ -425,8 +449,13 @@ impl InMemoryBackend {
         }
         state.partitions.insert(replica_key, ReplicaPartition {
             objects,
+            digest,
             synced_at_by_name,
-            cursor: Some(ReplicaCursor { resource_version: listed.resource_version.clone(), generation: listed.generation.clone() }),
+            cursor: if bucket.is_some() {
+                old.cursor
+            } else {
+                Some(ReplicaCursor { resource_version: listed.resource_version.clone(), generation: listed.generation.clone() })
+            },
         });
         for event in events {
             Self::notify_replica_watchers(&mut state, &store_key, event);
@@ -476,10 +505,12 @@ impl InMemoryBackend {
         match kind {
             StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
                 partition.objects.insert(object.metadata.name.clone(), encoded.clone());
+                partition.digest.set(&object.metadata.name, Some(&object.metadata.resource_version));
                 partition.synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
             }
             StoredReplicaEventKind::Deleted => {
                 partition.objects.remove(&object.metadata.name);
+                partition.digest.set(&object.metadata.name, None);
                 partition.synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
             }
         }
@@ -516,6 +547,7 @@ impl InMemoryBackend {
             return Ok(());
         }
         partition.objects.remove(&tombstone.name);
+        partition.digest.set(&tombstone.name, None);
         partition.synced_at_by_name.insert(tombstone.name.clone(), synced_at);
         Self::notify_replica_watchers(&mut state, &store_key, StoredReplicaEvent {
             origin_root: origin_root.clone(),
@@ -615,6 +647,82 @@ impl InMemoryBackend {
             Ok(crate::ResourcePosition { resource_version: store.current_version().to_string(), generation: self.generation.clone() })
         })
         .await
+    }
+
+    pub(crate) async fn digest_typed<T: Resource>(
+        &self,
+        namespace: &str,
+        query: &crate::DigestQuery,
+    ) -> Result<crate::PartitionDigest, ResourceError> {
+        self.with_store::<T, _>(namespace, |store| {
+            let mut response = crate::PartitionDigest::new::<T>(
+                self.local_root(),
+                namespace,
+                self.generation.clone(),
+                store.current_version().to_string(),
+                store.digest.hashes(),
+            )
+            .select(query)?;
+            if let crate::DigestQuery::Snapshot { bucket, .. } = query {
+                let items = store
+                    .digest
+                    .names(*bucket)
+                    .map(|name| {
+                        let value = store.objects.get(name).ok_or_else(|| ResourceError::invalid("incomplete digest index"))?;
+                        Self::decode_object::<T>(value.clone())?;
+                        Ok(value.clone())
+                    })
+                    .collect::<Result<Vec<_>, ResourceError>>()?;
+                response.bucket = Some(*bucket);
+                response.items = Some(items);
+            }
+            Ok(response)
+        })
+        .await
+    }
+
+    pub(crate) async fn confirm_replica_digest_typed<T: Resource>(
+        &self,
+        origin: &NodeId,
+        namespace: &str,
+        proof: &crate::PartitionDigest,
+        previous: &ReplicaCursor,
+    ) -> Result<(), ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.confirm_replica_digest_typed::<T>(origin, namespace, proof, previous).await;
+        }
+        let mut replicas = self.replicas.lock().await;
+        let partition = replicas
+            .partitions
+            .get_mut(&(origin.clone(), Self::store_key::<T>(namespace)))
+            .ok_or_else(|| ResourceError::invalid("missing replica prefix"))?;
+        let digest = crate::PartitionDigest::new::<T>(
+            origin.clone(),
+            namespace,
+            previous.generation.clone(),
+            String::new(),
+            partition.digest.hashes(),
+        );
+        if digest.root != proof.root || partition.cursor.as_ref() != Some(previous) {
+            return Err(ResourceError::invalid("replica set changed during digest repair"));
+        }
+        partition.cursor = Some(ReplicaCursor { resource_version: proof.resource_version.clone(), generation: proof.generation.clone() });
+        Ok(())
+    }
+
+    pub(crate) async fn replica_digest_typed<T: Resource>(
+        &self,
+        origin: &NodeId,
+        namespace: &str,
+        generation: Option<String>,
+    ) -> Result<crate::PartitionDigest, ResourceError> {
+        if let Some(backend) = &self.durable_replicas {
+            return backend.replica_digest_typed::<T>(origin, namespace, generation).await;
+        }
+        let replicas = self.replicas.lock().await;
+        let empty = ReplicaPartition::default();
+        let partition = replicas.partitions.get(&(origin.clone(), Self::store_key::<T>(namespace))).unwrap_or(&empty);
+        Ok(crate::PartitionDigest::new::<T>(origin.clone(), namespace, generation, String::new(), partition.digest.hashes()))
     }
 
     pub(crate) async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
