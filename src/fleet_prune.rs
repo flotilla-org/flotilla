@@ -116,13 +116,22 @@ async fn protected(root: &Path, runner: &impl CommandRunner, processes: &impl Pr
 }
 
 fn resolve_missing(path: &Path) -> io::Result<PathBuf> {
-    match fs::canonicalize(path) {
-        Ok(path) => Ok(path),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let parent = path.parent().ok_or(error)?;
-            Ok(resolve_missing(parent)?.join(path.file_name().ok_or_else(|| io::Error::other("missing filename"))?))
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for name in missing.into_iter().rev() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(ancestor.file_name().ok_or_else(|| io::Error::other("missing filename"))?);
+                ancestor = ancestor.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -196,6 +205,9 @@ async fn prune(
         generations.iter().map(|path| path.file_name().expect("generation filename").to_string_lossy().into_owned()).collect();
     names.sort_by_key(|name| std::cmp::Reverse(name.len()));
     for release in candidates(generations, &initial, keep) {
+        // A failed recheck aborts before mutating this release. Earlier deletions
+        // remain committed; the installer reports failure without rolling back
+        // the healthy generation.
         if protected(&root, runner, processes).await?.contains(&release) {
             continue;
         }
@@ -305,6 +317,21 @@ mod tests {
             fs::canonicalize(NativeProcesses.executable(pid).expect("executable")).expect("canonical executable"),
             fs::canonicalize(std::env::current_exe().expect("current executable")).expect("canonical current executable")
         );
+    }
+
+    // Missing executable suffixes keep their path after existing symlink
+    // ancestors resolve. Generate zero through 32 missing path components.
+    #[cfg(unix)]
+    #[test]
+    fn resolves_missing_suffixes() {
+        let root = tempfile::tempdir().expect("root");
+        fs::create_dir(root.path().join("real")).expect("real ancestor");
+        link(root.path(), "alias", "real");
+        let canonical = fs::canonicalize(root.path().join("real")).expect("canonical ancestor");
+        for depth in 0..=32 {
+            let suffix: PathBuf = (0..depth).map(|i| format!("missing-{i}")).collect();
+            assert_eq!(resolve_missing(&root.path().join("alias").join(&suffix)).expect("resolve missing"), canonical.join(suffix));
+        }
     }
 
     // Retention is by generation name, excluding every protected generation.
