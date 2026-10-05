@@ -259,3 +259,23 @@ async fn diagnostics_retain_failed_attempts_and_surface_storage_errors() {
     assert!(report.errors[0].contains("write roll diagnostics"));
     assert_eq!(report.attempts[0].report, stored.attempts[0].report);
 }
+
+// Returning a diagnostics path promises a complete readable report immediately,
+// including to synchronous callers. An async read can hide a pending write race.
+#[tokio::test(flavor = "current_thread")]
+async fn retained_report_is_immediately_readable() {
+    let directory = tempfile::tempdir().expect("diagnostics directory");
+    for index in 0..256 {
+        let mut report = RollReport::builder()
+            .host("host".into())
+            .generation(format!("generation-{index}"))
+            .attempts(vec![])
+            .errors(vec!["diagnostic".repeat(1024)])
+            .build();
+        persist(&mut report, directory.path()).await;
+        let path = report.diagnostics_path.as_ref().expect("retained report");
+        let bytes = std::fs::read(path).expect("read immediately");
+        let stored: serde_json::Value = serde_json::from_slice(&bytes).expect("complete report JSON");
+        assert_eq!(stored, serde_json::to_value(&report).expect("returned report"));
+    }
+}
