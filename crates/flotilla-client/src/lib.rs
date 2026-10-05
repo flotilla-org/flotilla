@@ -11,6 +11,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+pub use endpoint::{DaemonEndpoint, SshEndpoint};
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_protocol::{
     Command, ConnectionRole, DaemonEvent, LeafFire, Message, NodeId, QueryCursor, QueryId, ReplayCursor, RepoInfo, Request, Response,
@@ -22,6 +23,9 @@ use flotilla_transport::message::MessageSession;
 use tokio::sync::{broadcast, oneshot, Mutex};
 use tracing::{debug, error, warn};
 
+#[cfg(unix)]
+pub mod bridge;
+pub mod endpoint;
 pub mod launchd;
 pub mod reconnect;
 pub mod resource;
@@ -218,6 +222,24 @@ impl SocketDaemon {
     pub async fn connect_with_surface(socket_path: &Path, surface: SurfaceDeclaration) -> Result<Arc<Self>, String> {
         let session = connect_unix_message_session(socket_path).await?;
         from_session_stateful_bounded(socket_path, session, Some(&surface)).await
+    }
+
+    /// Connect to an existing daemon at `endpoint`. Neither endpoint kind
+    /// spawns a daemon.
+    pub async fn connect_endpoint(endpoint: &DaemonEndpoint) -> Result<Arc<Self>, String> {
+        match endpoint {
+            DaemonEndpoint::Local(socket_path) => Self::connect(socket_path).await,
+            DaemonEndpoint::Ssh(ssh) => connect_ssh(ssh, None).await,
+        }
+    }
+
+    /// Connect to an existing daemon and declare the client's surface in Hello.
+    /// Neither endpoint kind spawns a daemon.
+    pub async fn connect_endpoint_with_surface(endpoint: &DaemonEndpoint, surface: SurfaceDeclaration) -> Result<Arc<Self>, String> {
+        match endpoint {
+            DaemonEndpoint::Local(socket_path) => Self::connect_with_surface(socket_path, surface).await,
+            DaemonEndpoint::Ssh(ssh) => connect_ssh(ssh, Some(&surface)).await,
+        }
     }
 
     /// Build a client from an existing `MessageSession`, performing a Hello
@@ -468,6 +490,22 @@ pub async fn connect_or_spawn(socket_path: &Path, config_dir: &Path, state_dir: 
     connect_or_spawn_with_optional_surface(socket_path, config_dir, state_dir, None).await
 }
 
+/// Viewer connection policy: SSH always requires an existing remote daemon;
+/// local callers can either require one or permit the usual supervised spawn.
+pub async fn connect_endpoint_or_spawn_with_surface(
+    endpoint: &DaemonEndpoint,
+    config_dir: &Path,
+    state_dir: &Path,
+    require_host_daemon: bool,
+    surface: SurfaceDeclaration,
+) -> Result<Arc<SocketDaemon>, String> {
+    match endpoint {
+        DaemonEndpoint::Ssh(_) => SocketDaemon::connect_endpoint_with_surface(endpoint, surface).await,
+        DaemonEndpoint::Local(socket_path) if require_host_daemon => connect_required_host_daemon_with_surface(socket_path, surface).await,
+        DaemonEndpoint::Local(socket_path) => connect_or_spawn_with_surface(socket_path, config_dir, state_dir, surface).await,
+    }
+}
+
 pub async fn connect_or_spawn_with_surface(
     socket_path: &Path,
     config_dir: &Path,
@@ -530,7 +568,7 @@ async fn connect_or_spawn_with_optional_surface(
 
 #[cfg(not(unix))]
 async fn connect_unix_message_session(_socket_path: &Path) -> Result<MessageSession, String> {
-    Err("local Unix daemon sockets are unsupported on this platform; connect to a remote daemon (no local daemon will be spawned)"
+    Err("local Unix daemon sockets are unsupported on this platform; connect to a remote daemon with --daemon ssh://HOST or FLOTILLA_DAEMON (no local daemon will be spawned)"
         .to_string())
 }
 
@@ -795,19 +833,48 @@ async fn from_session_stateful_bounded(
     session: MessageSession,
     surface: Option<&SurfaceDeclaration>,
 ) -> Result<Arc<SocketDaemon>, String> {
+    hello_within(&socket_path.display().to_string(), HELLO_HANDSHAKE_TIMEOUT, session, surface).await
+}
+
+async fn hello_within(
+    endpoint: &str,
+    timeout: Duration,
+    session: MessageSession,
+    surface: Option<&SurfaceDeclaration>,
+) -> Result<Arc<SocketDaemon>, String> {
     let result = match surface {
-        Some(surface) => {
-            tokio::time::timeout(HELLO_HANDSHAKE_TIMEOUT, SocketDaemon::from_session_stateful_with_surface(session, surface.clone())).await
-        }
-        None => tokio::time::timeout(HELLO_HANDSHAKE_TIMEOUT, SocketDaemon::from_session_stateful(session)).await,
+        Some(surface) => tokio::time::timeout(timeout, SocketDaemon::from_session_stateful_with_surface(session, surface.clone())).await,
+        None => tokio::time::timeout(timeout, SocketDaemon::from_session_stateful(session)).await,
     };
     match result {
         Ok(result) => result,
         Err(_) => Err(format!(
-            "daemon at {} accepted the connection but did not complete the Hello handshake within {}s — it may be wedged; check or restart it",
-            socket_path.display(),
-            HELLO_HANDSHAKE_TIMEOUT.as_secs()
+            "daemon at {endpoint} accepted the connection but did not complete the Hello handshake within {}s — it may be wedged; check or restart it",
+            timeout.as_secs()
         )),
+    }
+}
+
+/// Bound for the Hello handshake over SSH, which also covers connecting,
+/// authenticating and starting the remote bridge.
+const SSH_HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Connect through an SSH bridge. A failure reports what ssh said; nothing is
+/// spawned locally.
+async fn connect_ssh(endpoint: &SshEndpoint, surface: Option<&SurfaceDeclaration>) -> Result<Arc<SocketDaemon>, String> {
+    let (session, stderr) = endpoint.open()?;
+    match hello_within(&endpoint.to_string(), SSH_HELLO_HANDSHAKE_TIMEOUT, session, surface).await {
+        Ok(daemon) => Ok(daemon),
+        Err(error) => {
+            // The failed handshake dropped the session, which kills ssh and
+            // closes its stderr.
+            let stderr = stderr.finish(Duration::from_secs(2)).await;
+            if stderr.is_empty() {
+                Err(format!("cannot reach daemon via {endpoint}: {error}"))
+            } else {
+                Err(format!("cannot reach daemon via {endpoint}: {error} (ssh: {stderr})"))
+            }
+        }
     }
 }
 
