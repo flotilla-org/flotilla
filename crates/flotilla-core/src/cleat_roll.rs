@@ -13,6 +13,7 @@ use std::{
 use flotilla_protocol::{result_set::CleatEndpoint, EnvironmentId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::io::AsyncWriteExt;
 
 use crate::providers::{discovery::EnvironmentBag, ChannelLabel, CommandOutput, CommandRunner};
 
@@ -189,6 +190,10 @@ pub async fn drain(host: String, generation: String, incoming: &Path, targets: &
             Ok(output) => (output.stdout, output.stderr, output.success, None),
             Err(error) => (String::new(), String::new(), false, Some(error)),
         };
+        // Execution failures take precedence over parsing and report warnings.
+        // Parse failures are errors only for successful commands; warnings are
+        // surfaced only after successful execution and valid report decoding.
+        // Raw output and any decoded report remain retained in every case.
         let parsed = serde_json::from_str::<DrainReport>(&stdout);
         let parsed_report = match parsed {
             Ok(parsed) => Some(parsed),
@@ -234,7 +239,6 @@ pub async fn persist(report: &mut RollReport, directory: &Path) {
         options.mode(0o600);
         let mut file = options.open(&path).await.map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec_pretty(report).map_err(|error| error.to_string())?;
-        use tokio::io::AsyncWriteExt;
         file.write_all(&bytes).await.map_err(|error| error.to_string())
     }
     .await;
