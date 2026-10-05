@@ -36,6 +36,9 @@ pub enum VesselPhase {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VesselStatus {
+    /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
     pub phase: VesselPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_decision: Option<PlacementDecision>,
@@ -91,6 +94,7 @@ pub enum VesselStatusPatch {
         message: Option<String>,
     },
     MarkReady {
+        configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
         placement_decision: Option<PlacementDecision>,
         environment_ref: Option<String>,
         image_ref: Option<String>,
@@ -130,6 +134,7 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 status.message = message.clone();
             }
             Self::MarkReady {
+                configured_limits,
                 placement_decision,
                 environment_ref,
                 image_ref,
@@ -140,6 +145,7 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 effective_stance,
                 ready_at,
             } => {
+                status.configured_limits = configured_limits.clone();
                 status.phase = VesselPhase::Ready;
                 if let Some(placement_decision) = placement_decision {
                     status.placement_decision.get_or_insert_with(|| placement_decision.clone());

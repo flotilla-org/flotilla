@@ -113,3 +113,12 @@ mod tests {
         assert_eq!(allocation.reservation_reason, None);
     }
 }
+
+/// Limits actually configured at provisioning or terminal launch; absence means
+/// unknown, rather than unlimited. These are configuration facts, not usage.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfiguredResourceLimits {
+    pub cpus: Option<usize>,
+    pub build_jobs: Option<usize>,
+    pub linker_threads: Option<usize>,
+}

@@ -4775,7 +4775,16 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .await);
         }
         self.state.provisioned_environments.lock().await.insert(container_id.clone(), ActiveProvisionedEnvironment { handle });
-        Ok(DockerProvisioning { container_id, image_ref, image_digest })
+        Ok(DockerProvisioning {
+            container_id,
+            image_ref,
+            image_digest,
+            configured_limits: Some(flotilla_protocol::ConfiguredResourceLimits {
+                cpus: Some(context.rust_build_jobs().await?),
+                build_jobs: Some(context.rust_build_jobs().await?),
+                linker_threads: Some(context.rust_build_jobs().await?),
+            }),
+        })
     }
 
     async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String> {
@@ -5848,8 +5857,11 @@ impl TerminalRuntime for TerminalControllerRuntime {
         } else {
             self.state.agentless_ssh.get(&spec.env_ref).map(|profile| profile.provisioning.host_id.as_str())
         };
+        let mut configured_limits = None;
         if let Some(host_ref) = host_ref {
             let jobs = self.state.rust_build_jobs(host_ref).await?;
+            configured_limits =
+                Some(flotilla_protocol::ConfiguredResourceLimits { cpus: None, build_jobs: Some(jobs), linker_threads: Some(jobs) });
             let wrapper = self.state.rustc_wrapper_for_environment(&spec.env_ref).await?;
             // The fulfilment cap owns the workspace wrapper for host-direct
             // terminals, including Tool sessions that can run Cargo. It
@@ -5877,6 +5889,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             }
         }
         Ok(TerminalRuntimeState::builder()
+            .maybe_configured_limits(configured_limits)
             .session_id(session_id)
             .maybe_pid(None)
             .started_at(Utc::now())
@@ -11321,6 +11334,7 @@ mod tests {
             .await
             .expect("create environment record");
         flotilla_resources::apply_status_patch(&environments, name, &EnvironmentStatusPatch::MarkReady {
+            configured_limits: None,
             docker_container_id: Some(container_id.to_string()),
             image_ref: Some("contained-image".to_string()),
             image_digest: Some("sha256:test-interior".to_string()),
@@ -12071,6 +12085,7 @@ mod tests {
             .await
             .expect("create orphaned environment");
         flotilla_resources::apply_status_patch(&environments, orphaned_id.as_str(), &EnvironmentStatusPatch::MarkReady {
+            configured_limits: None,
             docker_container_id: Some("orphaned-container".to_string()),
             image_ref: Some("contained-image".to_string()),
             image_digest: Some("sha256:contained".to_string()),
@@ -13862,6 +13877,7 @@ mod tests {
             .expect("create running terminal resource");
         let mut running = TerminalSessionStatus::default();
         TerminalSessionStatusPatch::MarkRunning {
+            configured_limits: None,
             session_id: session_name.to_string(),
             pid: None,
             started_at: Utc::now(),

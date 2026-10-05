@@ -22,18 +22,23 @@ use flotilla_resources::{
 use crate::{
     entity::{self, EntityRef},
     keys::{
-        ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY, KEY_CONVOY_MESSAGE, KEY_CONVOY_NAME,
-        KEY_CONVOY_PHASE, KEY_CONVOY_STANDING, KEY_CONVOY_SUPERSEDED, KEY_CONVOY_WORKFLOW, KEY_COUNT_CHECKOUTS, KEY_COUNT_CONVOYS,
-        KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL, KEY_COUNT_VESSELS, KEY_CREW_ROLES, KEY_DISPLAY_LABEL,
-        KEY_DISPLAY_LABEL_MEDIUM, KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_INDEPENDENT_HOST, KEY_MEMBERSHIP_PROJECT,
+        ARCHIPELAGO_ORDINAL, CATALOG_TTL_MS, KEY_CHECKOUT_BRANCH, KEY_CHECKOUT_PATH, KEY_CONVOY, KEY_CONVOY_ALTERNATIVES,
+        KEY_CONVOY_COST_CLASS, KEY_CONVOY_HOST_NAME, KEY_CONVOY_HOST_REF, KEY_CONVOY_KIND, KEY_CONVOY_MESSAGE, KEY_CONVOY_MINIMAL,
+        KEY_CONVOY_MINIMAL_ALTERNATIVES, KEY_CONVOY_NAME, KEY_CONVOY_PHASE, KEY_CONVOY_POLICY, KEY_CONVOY_STANDING, KEY_CONVOY_SUPERSEDED,
+        KEY_CONVOY_WORKFLOW, KEY_COUNT_CHECKOUTS, KEY_COUNT_CONVOYS, KEY_COUNT_INDEPENDENTS, KEY_COUNT_ISSUES, KEY_COUNT_TOTAL,
+        KEY_COUNT_VESSELS, KEY_CREW_ADAPTER, KEY_CREW_MODEL, KEY_CREW_ROLES, KEY_DISPLAY_LABEL, KEY_DISPLAY_LABEL_MEDIUM,
+        KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_INDEPENDENT_HOST, KEY_MEMBERSHIP_PROJECT,
         KEY_MEMBERSHIP_REPOSITORY_KEY, KEY_MEMBERSHIP_REPOSITORY_SLUG, KEY_MEMBERSHIP_SUBPATH, KEY_PRIMARY_ACTION_KEY,
         KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET, KEY_PRIMARY_ACTION_VEHICLE,
         KEY_PRIMARY_DIRECT_DAEMON, KEY_PRIMARY_DIRECT_HOST, KEY_PRIMARY_DIRECT_REASON, KEY_PRIMARY_DIRECT_RUNTIME_ROOT,
         KEY_PRIMARY_DIRECT_SESSION, KEY_PRIMARY_DIRECT_TRANSPORT, KEY_PROJECT_NAME, KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE,
         KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE,
-        KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG, KEY_SURFACE_STATE, KEY_VESSEL, KEY_VESSEL_HOST, KEY_VESSEL_NAME, KEY_WORKSPACE_PRIMARY_STATE,
-        KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE, SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR,
-        SOURCE_FLOTILLA,
+        KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG, KEY_SURFACE_STATE, KEY_VESSEL, KEY_VESSEL_ALTERNATIVES, KEY_VESSEL_BUILD_JOBS,
+        KEY_VESSEL_COST_CLASS, KEY_VESSEL_CPUS, KEY_VESSEL_ENV, KEY_VESSEL_HOST, KEY_VESSEL_HOST_NAME, KEY_VESSEL_HOST_REF,
+        KEY_VESSEL_IMAGE_DIGEST, KEY_VESSEL_IMAGE_REF, KEY_VESSEL_IMAGE_SHORT_DIGEST, KEY_VESSEL_KIND, KEY_VESSEL_LINKER_THREADS,
+        KEY_VESSEL_MINIMAL, KEY_VESSEL_MINIMAL_ALTERNATIVES, KEY_VESSEL_NAME, KEY_VESSEL_POLICY, KEY_VESSEL_STANCE,
+        KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE, SEGMENT_PROJECT,
+        SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
     recipe::{DirectTransport, Recipe, RecipeMint},
     wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
@@ -1016,6 +1021,9 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
             facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), &vessel.host, mint));
         }
     }
+    if let Some(decision) = &convoy.placement_decision {
+        facts.extend(placement_facts(decision, true));
+    }
     catalog.assert_entity(convoy_entity, facts, ordinal);
     for vessel in &convoy.vessels {
         project_vessel(catalog, convoy, vessel, &project, repo.as_deref(), mint);
@@ -1051,6 +1059,47 @@ fn project_vessel(
         (KEY_VESSEL_HOST, MetadataValue::text(vessel.host.to_string())),
         (KEY_STATUS_STATE, MetadataValue::text(badge.state.as_str())),
     ]);
+    if let Some(decision) = &vessel.placement_decision {
+        facts.extend(placement_facts(decision, false));
+    }
+    for (key, value) in [
+        (KEY_VESSEL_ENV, vessel.environment_ref.as_ref()),
+        (KEY_VESSEL_STANCE, vessel.effective_stance.as_ref()),
+        (KEY_VESSEL_IMAGE_REF, vessel.image_ref.as_ref()),
+        (KEY_VESSEL_IMAGE_DIGEST, vessel.image_digest.as_ref()),
+    ] {
+        if let Some(value) = value {
+            facts.push((key, MetadataValue::text(value)));
+        }
+    }
+    if let Some(digest) = &vessel.image_digest {
+        let digest = digest.split_once(':').map_or(digest.as_str(), |(_, value)| value);
+        facts.push((KEY_VESSEL_IMAGE_SHORT_DIGEST, MetadataValue::text(digest.chars().take(12).collect::<String>())));
+    }
+    if let Some(limits) = &vessel.configured_limits {
+        for (key, limit) in
+            [(KEY_VESSEL_CPUS, limits.cpus), (KEY_VESSEL_BUILD_JOBS, limits.build_jobs), (KEY_VESSEL_LINKER_THREADS, limits.linker_threads)]
+        {
+            if let Some(limit) = limit.and_then(|value| i64::try_from(value).ok()) {
+                facts.push((key, MetadataValue::Integer(limit)));
+            }
+        }
+    }
+    for crew in &vessel.crew {
+        if let Some(session) = &crew.session {
+            let mut crew_facts = vec![
+                (KEY_SESSION, MetadataValue::text(session)),
+                (crate::keys::KEY_CREW_ROLE, MetadataValue::text(&crew.role)),
+                (KEY_VESSEL, MetadataValue::text(&entity.id)),
+            ];
+            for (key, value) in [(KEY_CREW_ADAPTER, crew.adapter.as_ref()), (KEY_CREW_MODEL, crew.model.as_ref())] {
+                if let Some(value) = value {
+                    crew_facts.push((key, MetadataValue::text(value)));
+                }
+            }
+            catalog.assert_entity(entity::session(session), crew_facts, ordinal);
+        }
+    }
     facts.extend(label_tier_facts(&vessel.name));
     facts.extend(surface_facts(vessel.surface_state));
     if !vessel.crew.is_empty() {
@@ -1203,3 +1252,44 @@ fn direct_facts(endpoint: Option<&CleatEndpoint>, host: &HostName, mint: &dyn Re
 
 #[cfg(test)]
 mod tests;
+
+fn placement_facts(decision: &flotilla_protocol::PlacementDecision, convoy: bool) -> Vec<(&'static str, MetadataValue)> {
+    let keys = if convoy {
+        [
+            KEY_CONVOY_POLICY,
+            KEY_CONVOY_KIND,
+            KEY_CONVOY_HOST_REF,
+            KEY_CONVOY_HOST_NAME,
+            KEY_CONVOY_COST_CLASS,
+            KEY_CONVOY_MINIMAL,
+            KEY_CONVOY_ALTERNATIVES,
+            KEY_CONVOY_MINIMAL_ALTERNATIVES,
+        ]
+    } else {
+        [
+            KEY_VESSEL_POLICY,
+            KEY_VESSEL_KIND,
+            KEY_VESSEL_HOST_REF,
+            KEY_VESSEL_HOST_NAME,
+            KEY_VESSEL_COST_CLASS,
+            KEY_VESSEL_MINIMAL,
+            KEY_VESSEL_ALTERNATIVES,
+            KEY_VESSEL_MINIMAL_ALTERNATIVES,
+        ]
+    };
+    let mut facts = vec![
+        (keys[0], MetadataValue::text(&decision.policy_name)),
+        (keys[2], MetadataValue::text(decision.target_host.reference.to_string())),
+        (keys[3], MetadataValue::text(&decision.target_host.display_name)),
+        (keys[6], MetadataValue::text(serde_json::to_string(&decision.viable_not_selected).expect("placement candidates serialize"))),
+        (keys[7], MetadataValue::StringList(decision.minimal_alternatives.clone())),
+    ];
+    if let Some(allocation) = &decision.allocation {
+        facts.push((keys[1], MetadataValue::text(&allocation.chosen_kind)));
+        if let Some(candidate) = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind) {
+            facts.push((keys[4], MetadataValue::text(&candidate.cost_class)));
+            facts.push((keys[5], MetadataValue::Bool(candidate.minimal)));
+        }
+    }
+    facts
+}

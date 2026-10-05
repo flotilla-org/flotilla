@@ -68,6 +68,10 @@ pub enum EnvironmentPhase {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentStatus {
+    /// Configured limits, not usage. Remove the decoder default one fleet roll
+    /// after this field lands (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
     pub phase: EnvironmentPhase,
     #[serde(default)]
     pub ready: bool,
@@ -87,11 +91,22 @@ pub struct EnvironmentStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentStatusPatch {
-    MarkReady { docker_container_id: Option<String>, image_ref: Option<String>, image_digest: Option<String> },
-    MarkFailed { message: String },
+    MarkReady {
+        configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
+        docker_container_id: Option<String>,
+        image_ref: Option<String>,
+        image_digest: Option<String>,
+    },
+    MarkFailed {
+        message: String,
+    },
     MarkTerminating,
-    CredentialDelivery { retry: Option<ControllerRetry> },
-    CredentialRefresh { retry: Option<ControllerRetry> },
+    CredentialDelivery {
+        retry: Option<ControllerRetry>,
+    },
+    CredentialRefresh {
+        retry: Option<ControllerRetry>,
+    },
 }
 
 impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
@@ -99,7 +114,8 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
         match self {
             Self::CredentialDelivery { retry } => status.credential_delivery_retry = retry.clone(),
             Self::CredentialRefresh { retry } => status.credential_refresh_retry = retry.clone(),
-            Self::MarkReady { docker_container_id, image_ref, image_digest } => {
+            Self::MarkReady { configured_limits, docker_container_id, image_ref, image_digest } => {
+                status.configured_limits = configured_limits.clone();
                 status.phase = EnvironmentPhase::Ready;
                 status.ready = true;
                 status.docker_container_id = docker_container_id.clone();

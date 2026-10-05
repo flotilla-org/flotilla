@@ -274,6 +274,10 @@ pub enum InnerCommandStatus {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSessionStatus {
+    /// Configured limits, not usage. Remove the decoder default one fleet roll
+    /// after this field lands (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
     pub phase: TerminalSessionPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -460,6 +464,7 @@ pub enum TerminalSessionStatusPatch {
         endpoint: Option<flotilla_protocol::result_set::CleatEndpoint>,
     },
     MarkRunning {
+        configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
         session_id: String,
         pid: Option<i64>,
         started_at: DateTime<Utc>,
@@ -527,7 +532,8 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
             }
             Self::ClearRetiredLaunches => status.retired_launches.clear(),
             Self::ObserveCleatEndpoint { endpoint } => status.cleat_endpoint = endpoint.clone(),
-            Self::MarkRunning { session_id, pid, started_at, crew, launch_command, delivered_message_id } => {
+            Self::MarkRunning { configured_limits, session_id, pid, started_at, crew, launch_command, delivered_message_id } => {
+                status.configured_limits = configured_limits.clone();
                 status.phase = TerminalSessionPhase::Running;
                 status.session_id = Some(session_id.clone());
                 status.pid = *pid;

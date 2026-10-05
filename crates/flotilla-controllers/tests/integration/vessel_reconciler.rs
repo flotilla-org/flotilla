@@ -307,7 +307,12 @@ async fn ready_vessel_records_requested_and_effective_stance() {
 
     assert!(matches!(
         outcome.patch,
-        Some(flotilla_resources::VesselStatusPatch::MarkReady { requested_stance: Stance::Trusted, effective_stance: Stance::Trusted, .. })
+        Some(flotilla_resources::VesselStatusPatch::MarkReady {
+            configured_limits: None,
+            requested_stance: Stance::Trusted,
+            effective_stance: Stance::Trusted,
+            ..
+        })
     ));
 }
 
@@ -2764,6 +2769,7 @@ async fn create_running_terminal(
         .expect("terminal create should succeed");
     sessions
         .update_status(name, &created.metadata.resource_version, &TerminalSessionStatus {
+            configured_limits: None,
             last_tool_activity_at: None,
             last_output_digest: None,
             last_output_activity_at: None,

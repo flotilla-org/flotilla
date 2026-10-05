@@ -2051,6 +2051,9 @@ fn placement_status(workspace: &ResourceObject<Vessel>) -> PlacementStatus {
         if let Some(decision) = &status.placement_decision {
             fields.insert("placement_decision".to_string(), json!(decision));
         }
+        if let Some(limits) = &status.configured_limits {
+            fields.insert("configured_limits".to_string(), json!(limits));
+        }
         insert_optional_field(&mut fields, "environment_ref", status.environment_ref.clone());
         insert_optional_field(&mut fields, "image_ref", status.image_ref.clone());
         insert_optional_field(&mut fields, "image_digest", status.image_digest.clone());

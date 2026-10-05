@@ -69,6 +69,7 @@ pub const KEY_WORK_PHASE: &str = "flotilla.work.phase";
 pub const KEY_VESSEL_HOST: &str = "flotilla.vessel.host";
 /// Host currently carrying an independent terminal session.
 pub const KEY_INDEPENDENT_HOST: &str = "flotilla.independent.host";
+/// Execution environment resource name; absent before placement.
 pub const KEY_VESSEL_ENV: &str = "flotilla.vessel.env";
 pub const KEY_CREW_ROLES: &str = "flotilla.crew.roles";
 /// Standing project role (a `ConvoyEnsure` declaration). Distinct from
@@ -278,3 +279,80 @@ pub const KEY_READINESS_BLOCKERS: &str = "flotilla.readiness.blockers";
 /// A convoy or standing role requires exactly one vessel with a terminal;
 /// multi-vessel convoys expose attachment on each vessel instead.
 pub const KEY_READINESS_ATTACH_AVAILABLE: &str = "flotilla.readiness.attach_available";
+
+// Raw placement configuration and observed crew launch facts (#2650).
+
+/// Selected placement policy name.
+pub const KEY_VESSEL_POLICY: &str = "flotilla.vessel.policy";
+
+/// Chosen fulfilment kind; absent for pre-allocation records.
+pub const KEY_VESSEL_KIND: &str = "flotilla.vessel.kind";
+
+/// Effective execution stance: contained or host-direct.
+pub const KEY_VESSEL_STANCE: &str = "flotilla.vessel.stance";
+
+/// Canonical placement host resource reference.
+pub const KEY_VESSEL_HOST_REF: &str = "flotilla.vessel.host_ref";
+
+/// Placement host display name.
+pub const KEY_VESSEL_HOST_NAME: &str = "flotilla.vessel.host_name";
+
+/// Selected fulfilment candidate cost class.
+pub const KEY_VESSEL_COST_CLASS: &str = "flotilla.vessel.cost_class";
+
+/// Whether the selected fulfilment candidate was minimal.
+pub const KEY_VESSEL_MINIMAL: &str = "flotilla.vessel.minimal";
+
+/// JSON-encoded viable not selected placement candidates.
+pub const KEY_VESSEL_ALTERNATIVES: &str = "flotilla.vessel.alternatives";
+
+/// Names of minimal alternative placement policies.
+pub const KEY_VESSEL_MINIMAL_ALTERNATIVES: &str = "flotilla.vessel.minimal_alternatives";
+
+/// Image reference used at provisioning; absent for host-direct.
+pub const KEY_VESSEL_IMAGE_REF: &str = "flotilla.vessel.image_ref";
+
+/// Full immutable image digest reported at provisioning.
+pub const KEY_VESSEL_IMAGE_DIGEST: &str = "flotilla.vessel.image_digest";
+
+/// First twelve digest characters, excluding the algorithm prefix.
+pub const KEY_VESSEL_IMAGE_SHORT_DIGEST: &str = "flotilla.vessel.image_short_digest";
+
+/// Configured container CPU quota as an integer; absent for host-direct or unknown.
+pub const KEY_VESSEL_CPUS: &str = "flotilla.vessel.cpus";
+
+/// Configured Cargo build-job limit, integer; absence means unknown.
+pub const KEY_VESSEL_BUILD_JOBS: &str = "flotilla.vessel.build_jobs";
+
+/// Configured linker-thread limit, integer; absence means unknown.
+pub const KEY_VESSEL_LINKER_THREADS: &str = "flotilla.vessel.linker_threads";
+
+/// Observed launch adapter on a crew-session entity; absent before launch.
+pub const KEY_CREW_ADAPTER: &str = "flotilla.crew.adapter";
+
+/// Observed launch model on a crew-session entity; absent when unknown.
+pub const KEY_CREW_MODEL: &str = "flotilla.crew.model";
+
+/// Convoy-wide selected placement policy name.
+pub const KEY_CONVOY_POLICY: &str = "flotilla.convoy.policy";
+
+/// Convoy-wide chosen fulfilment kind.
+pub const KEY_CONVOY_KIND: &str = "flotilla.convoy.kind";
+
+/// Convoy-wide canonical placement host reference.
+pub const KEY_CONVOY_HOST_REF: &str = "flotilla.convoy.host_ref";
+
+/// Convoy-wide placement host display name.
+pub const KEY_CONVOY_HOST_NAME: &str = "flotilla.convoy.host_name";
+
+/// Convoy-wide selected candidate cost class.
+pub const KEY_CONVOY_COST_CLASS: &str = "flotilla.convoy.cost_class";
+
+/// Whether the convoy-wide selected candidate was minimal.
+pub const KEY_CONVOY_MINIMAL: &str = "flotilla.convoy.minimal";
+
+/// JSON-encoded convoy-wide viable not selected candidates.
+pub const KEY_CONVOY_ALTERNATIVES: &str = "flotilla.convoy.alternatives";
+
+/// Names of convoy-wide minimal alternative placement policies.
+pub const KEY_CONVOY_MINIMAL_ALTERNATIVES: &str = "flotilla.convoy.minimal_alternatives";

@@ -1198,6 +1198,10 @@ impl ConvoyRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct VesselRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_limits: Option<crate::ConfiguredResourceLimits>,
     #[builder(default)]
     #[serde(default)]
     pub readiness: Readiness,
@@ -1262,6 +1266,12 @@ pub struct VesselRow {
 /// Crew membership summary on a vessel row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrewMemberSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub role: String,
     pub command_preview: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -226,6 +226,7 @@ enum PlannedPatch {
         message: String,
     },
     Ready {
+        configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
         placement_decision: Option<PlacementDecision>,
         environment_ref: String,
         image: Option<ImageStamp>,
@@ -1155,8 +1156,17 @@ impl Reconciler for VesselReconciler {
             }
         }
 
+        let mut configured_limits =
+            self.environments.get(&resolved_environment_ref).await?.status.and_then(|status| status.configured_limits);
+        for terminal_ref in &terminal_refs {
+            if let Some(limits) = self.terminal_sessions.get(terminal_ref).await?.status.and_then(|status| status.configured_limits) {
+                configured_limits = Some(limits);
+                break;
+            }
+        }
         Ok(VesselPrepared {
             patch: PlannedPatch::Ready {
+                configured_limits,
                 placement_decision,
                 environment_ref: resolved_environment_ref,
                 image,
@@ -1204,6 +1214,7 @@ impl Reconciler for VesselReconciler {
                 }
             }
             PlannedPatch::Ready {
+                configured_limits,
                 placement_decision,
                 environment_ref,
                 image,
@@ -1212,6 +1223,7 @@ impl Reconciler for VesselReconciler {
                 requested_stance,
                 effective_stance,
             } => Some(VesselStatusPatch::MarkReady {
+                configured_limits: configured_limits.clone(),
                 placement_decision: placement_decision.clone(),
                 environment_ref: Some(environment_ref.clone()),
                 image_ref: image.as_ref().map(|image| image.image_ref.clone()),

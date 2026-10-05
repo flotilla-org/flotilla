@@ -1163,6 +1163,7 @@ async fn managed_claude_permission_prompt_marks_terminal_as_needing_input() {
         .expect("terminal create");
     let mut status = TerminalSessionStatus::default();
     TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "terminal-demo-coder".into(),
         pid: None,
         started_at: chrono::Utc::now(),
@@ -1276,6 +1277,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
             .expect("terminal create");
         let mut status = TerminalSessionStatus::default();
         TerminalSessionStatusPatch::MarkRunning {
+            configured_limits: None,
             session_id: name.clone(),
             pid: None,
             started_at: chrono::Utc::now(),
@@ -1693,6 +1695,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
         .expect("terminal create");
     let mut status = TerminalSessionStatus::default();
     TerminalSessionStatusPatch::MarkRunning {
+        configured_limits: None,
         session_id: "terminal-stranded-work-coder".into(),
         pid: None,
         started_at: chrono::Utc::now(),
@@ -2036,6 +2039,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
         .expect("placement host environment");
     environments
         .update_status(&environment_name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
+            configured_limits: None,
             phase: flotilla_resources::EnvironmentPhase::Ready,
             ready: true,
             docker_container_id: None,

@@ -17,6 +17,7 @@ use flotilla_resources::{
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct TerminalRuntimeState {
+    pub configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
     pub session_id: String,
     pub pid: Option<i64>,
     pub started_at: DateTime<Utc>,
@@ -579,6 +580,7 @@ where
             }
             TerminalSessionPhase::Starting => match prepared {
                 TerminalPrepared::Running(state) => Some(TerminalSessionStatusPatch::MarkRunning {
+                    configured_limits: state.configured_limits.clone(),
                     session_id: state.session_id.clone(),
                     pid: state.pid,
                     started_at: state.started_at,

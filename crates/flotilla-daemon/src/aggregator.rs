@@ -2479,7 +2479,18 @@ impl Aggregator {
                     CrewSource::Tool { command } => command.clone(),
                     CrewSource::Agent { selector, prompt, .. } => prompt.clone().unwrap_or_else(|| selector.capability.clone()),
                 };
+                let session = self.terminal_sessions.values().find(|session| {
+                    session.object.metadata.namespace == convoy_ref.namespace
+                        && session.object.metadata.labels.get(CONVOY_LABEL) == Some(&convoy_ref.name)
+                        && session.object.metadata.labels.get(VESSEL_LABEL) == Some(&definition.name)
+                        && session.object.spec.role == process.role
+                        && self.read_host(&session.provenance).as_ref() == Some(&vessel_host)
+                });
+                let observed_crew = session.and_then(|session| session.object.status.as_ref()?.crew.as_ref());
                 CrewMemberSummary {
+                    session: session.map(|session| format!("{}/{}/{}", vessel_host, convoy_ref.namespace, session.object.metadata.name)),
+                    adapter: observed_crew.map(|crew| crew.adapter.clone()),
+                    model: observed_crew.and_then(|crew| crew.model.clone()),
                     role: process.role.clone(),
                     command_preview,
                     requested_stance: requested_stance.clone(),
@@ -2568,6 +2579,19 @@ impl Aggregator {
             .name(&definition.name)
             .phase(work_phase(state.map(|state| state.phase).unwrap_or(ResourceWorkPhase::Pending)))
             .maybe_placement_decision(placement_decision)
+            .maybe_environment_ref(
+                placement
+                    .and_then(|placement| placement.fields.get("environment_ref"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            )
+            .maybe_configured_limits(
+                matching_sessions().find_map(|session| session.object.status.as_ref()?.configured_limits.clone()).or_else(|| {
+                    placement
+                        .and_then(|placement| placement.fields.get("configured_limits"))
+                        .and_then(|value| serde_json::from_value(value.clone()).ok())
+                }),
+            )
             .crew(crew)
             .maybe_ready_at(state.and_then(|state| state.ready_at))
             .maybe_started_at(state.and_then(|state| state.started_at))
@@ -5886,6 +5910,8 @@ mod tests {
                 ("effective_stance".to_string(), serde_json::json!("contained")),
                 ("image_ref".to_string(), serde_json::json!("registry.example/crew:latest")),
                 ("image_digest".to_string(), serde_json::json!("sha256:test-image")),
+                ("environment_ref".to_string(), serde_json::json!("env-work")),
+                ("configured_limits".to_string(), serde_json::json!({"cpus": 4, "build_jobs": 4, "linker_threads": 4})),
             ]),
         });
 
@@ -5895,8 +5921,66 @@ mod tests {
         assert_eq!(vessel.effective_stance.as_deref(), Some("contained"));
         assert_eq!(vessel.image_ref.as_deref(), Some("registry.example/crew:latest"));
         assert_eq!(vessel.image_digest.as_deref(), Some("sha256:test-image"));
+        // #2650: frozen placement facts remain visible even when the terminal
+        // replica has not arrived; unknown launch adapter/model stay absent.
+        assert_eq!(vessel.environment_ref.as_deref(), Some("env-work"));
+        assert_eq!(
+            vessel.configured_limits,
+            Some(flotilla_protocol::ConfiguredResourceLimits { cpus: Some(4), build_jobs: Some(4), linker_threads: Some(4) })
+        );
+        assert_eq!(vessel.crew[0].adapter, None);
+        assert_eq!(vessel.crew[0].model, None);
         assert_eq!(vessel.crew[0].requested_stance.as_deref(), Some("workspace-write"));
         assert_eq!(vessel.crew[0].effective_stance.as_deref(), Some("contained"));
+    }
+
+    // #2650: launch facts come from the matching observed session, including
+    // replicas; a configured launch model may remain unknown.
+    #[tokio::test]
+    async fn vessel_crew_launch_facts_follow_session_provenance() {
+        for remote in [false, true] {
+            for model in [None, Some("gpt-6.1-sol".to_string())] {
+                let state = AggregatorProjectionState::new();
+                let (events, _) = broadcast::channel(16);
+                let mut aggregator = Aggregator::new(state, HostName::new("kiwi"), events)
+                    .with_attach_resolver(Arc::new(CountingAttachResolver::with_origin("remote-placement", "feta")));
+                let host = HostName::new(if remote { "feta" } else { "kiwi" });
+                let provenance = if remote {
+                    let origin = flotilla_protocol::NodeId::new("remote-placement");
+                    aggregator.origin_hosts.insert(origin.clone(), host.clone());
+                    ResourceProvenance::Replica { origin_root: origin, last_synced_at: Utc::now() }
+                } else {
+                    ResourceProvenance::Local
+                };
+                let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Running).call();
+                let status = convoy.status.as_mut().expect("convoy status");
+                let definition = &mut status.workflow_snapshot.as_mut().expect("workflow snapshot").vessels[0];
+                definition
+                    .crew
+                    .push(CrewSpec::builder().role("coder".to_string()).source(CrewSource::Tool { command: "codex".to_string() }).build());
+                let definition = definition.clone();
+                let work = status.work.get_mut("implement").expect("implement work");
+                work.placement = Some(PlacementStatus { fields: BTreeMap::from([("host".to_string(), serde_json::json!(host))]) });
+                let mut session = session_object("terminal-placement-coder").await;
+                session.spec.role = "coder".into();
+                session.metadata.labels =
+                    BTreeMap::from([(CONVOY_LABEL.into(), convoy.metadata.name.clone()), (VESSEL_LABEL.into(), "implement".into())]);
+                session.status.as_mut().expect("running session status").crew = Some(
+                    flotilla_resources::CrewSessionStatus::builder()
+                        .id("crew-placement".to_string())
+                        .adapter("codex".to_string())
+                        .maybe_model(model.clone())
+                        .stance("contained".to_string())
+                        .build(),
+                );
+                aggregator.replace_replica_sessions(vec![ReadResourceObject { object: session, provenance }]).await;
+                let resource = ResourceRef::new("flotilla/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("kiwi"));
+                let row = aggregator.summarize_vessel(&resource, &definition, Some(work), None, None);
+                assert_eq!(row.crew[0].adapter.as_deref(), Some("codex"));
+                assert_eq!(row.crew[0].model, model);
+                assert_eq!(row.crew[0].session.as_deref(), Some(format!("{host}/flotilla/terminal-placement-coder").as_str()));
+            }
+        }
     }
 
     #[tokio::test]
