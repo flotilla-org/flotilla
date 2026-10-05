@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use flotilla_core::{
     agents::{AgentEntry, SharedAgentStateStore},
     daemon::DaemonHandle,
@@ -63,6 +64,38 @@ unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN
 exec gh api "$@"
 "#;
 
+#[async_trait]
+trait LedgerCreationAuthority: Send + Sync {
+    async fn reserve(&self, address: &LeafAddress) -> Result<bool, String>;
+}
+
+#[derive(bon::Builder)]
+struct RoutedLedgerCreation<'a> {
+    dispatcher: &'a RequestDispatcher<'a>,
+    node_id: flotilla_protocol::NodeId,
+    namespace: String,
+    name: String,
+}
+
+#[async_trait]
+impl LedgerCreationAuthority for RoutedLedgerCreation<'_> {
+    async fn reserve(&self, address: &LeafAddress) -> Result<bool, String> {
+        match self
+            .dispatcher
+            .artifact_home_action(&self.node_id, CommandAction::ArtifactReserveLedgerComment {
+                namespace: self.namespace.clone(),
+                name: self.name.clone(),
+                address: address.clone(),
+            })
+            .await?
+        {
+            CommandValue::LedgerCommentCreationReserved { granted } => Ok(granted),
+            CommandValue::Error { message } => Err(message),
+            other => Err(format!("unexpected ledger reservation result: {other:?}")),
+        }
+    }
+}
+
 // Projection needs both the resource identity and the execution world's
 // runner, cwd, and delivered credential metadata.
 #[allow(clippy::too_many_arguments)]
@@ -75,6 +108,7 @@ async fn project_decision_ledger(
     runner: &dyn CommandRunner,
     cwd: &Path,
     delivery_env: &BTreeMap<String, String>,
+    authority: &dyn LedgerCreationAuthority,
 ) -> Result<Vec<String>, String> {
     let convoy = backend.including_replicas::<Convoy>(namespace).get(convoy_name).await.map_err(|error| error.to_string())?.object;
     let sources = backend.including_replicas::<Checkout>(namespace).list().await.map_err(|error| error.to_string())?;
@@ -86,7 +120,7 @@ async fn project_decision_ledger(
         if !projected.insert(leaf.address.clone()) {
             continue;
         }
-        let url = project_ledger_comment(convoy_name, producer, body, &leaf.address, runner, cwd, delivery_env).await?;
+        let url = project_ledger_comment(convoy_name, producer, body, &leaf.address, runner, cwd, delivery_env, authority).await?;
         urls.push(url);
     }
     Ok(urls)
@@ -94,7 +128,8 @@ async fn project_decision_ledger(
 
 /// Projects a machine-owned comment: revisions replace the whole body, including
 /// manual edits. Identity is carried by the generated marker on the final line.
-/// Listing and writing are not atomic; concurrent first projections can race.
+/// The artifact authority grants at most one POST attempt per change request.
+/// Every retry lists first, recovering accepted writes even after response loss.
 #[allow(clippy::too_many_arguments)]
 async fn project_ledger_comment(
     convoy_name: &str,
@@ -104,6 +139,7 @@ async fn project_ledger_comment(
     runner: &dyn CommandRunner,
     cwd: &Path,
     delivery_env: &BTreeMap<String, String>,
+    authority: &dyn LedgerCreationAuthority,
 ) -> Result<String, String> {
     let LeafAddress::ChangeRequest { service, scope, number } = address else {
         return Err("decision ledger projection has an invalid change request binding".to_string());
@@ -218,6 +254,9 @@ curl --fail-with-body --silent --show-error \
         let id = comment.get("id").and_then(serde_json::Value::as_u64).ok_or("existing ledger comment has no numeric ID")?;
         ("PATCH", format!("repos/{scope}/issues/comments/{id}"))
     } else {
+        if !authority.reserve(address).await? {
+            return Err("ledger comment creation is pending or uncertain; retry lookup, or reconcile the reserved attempt at the artifact authority".into());
+        }
         ("POST", endpoint)
     };
     let input = serde_json::to_vec(&serde_json::json!({ "body": format!("{text}\n{marker}") })).map_err(|error| error.to_string())?;
@@ -284,12 +323,13 @@ async fn project_decision_ledger_once(
     runner: &dyn CommandRunner,
     cwd: &Path,
     delivery_env: &BTreeMap<String, String>,
+    authority: &dyn LedgerCreationAuthority,
 ) -> Result<Vec<String>, String> {
     // Recheck every current binding even for identical content: a stored first
     // URL cannot prove that PRs bound after the previous put received the ledger.
     let mut last_error = None;
     for attempt in 0..3 {
-        match project_decision_ledger(backend, namespace, convoy, producer, body, runner, cwd, delivery_env).await {
+        match project_decision_ledger(backend, namespace, convoy, producer, body, runner, cwd, delivery_env, authority).await {
             Ok(url) => return Ok(url),
             Err(error) => last_error = Some(error),
         }
@@ -383,15 +423,36 @@ impl<'a> RequestDispatcher<'a> {
         }
     }
 
+    async fn artifact_home_action(&self, node_id: &flotilla_protocol::NodeId, action: CommandAction) -> Result<CommandValue, String> {
+        let mut events = self.daemon.subscribe();
+        let command_id = self
+            .remote_command_router
+            .dispatch_execute_for_caller(
+                Command { node_id: Some(node_id.clone()), provisioning_target: None, context_repo: None, action },
+                Some(self.caller.clone()),
+            )
+            .await?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match events.recv().await {
+                    Ok(DaemonEvent::CommandFinished { command_id: finished, result, .. }) if finished == command_id => return Ok(result),
+                    Ok(_) => {}
+                    Err(error) => return Err(format!("artifact home command event unavailable: {error}")),
+                }
+            }
+        })
+        .await
+        .map_err(|_| "artifact home command timed out".to_string())?
+    }
+
     async fn dispatch_request_artifact_put(&self, id: u64, request: Request) -> Message {
-        let Request::ArtifactPut { kind, subject, mut summary, media_type, source_path } = request else {
+        let Request::ArtifactPut { kind, subject, summary, media_type, source_path } = request else {
             return Message::error_response(id, "ArtifactPut request selected the wrong handler");
         };
         let result = Box::pin(async {
             let caller = self.caller.crew.as_ref().ok_or_else(|| missing_crew_message("artifact put"))?;
             let subject = if kind == "decision-ledger" && subject.is_empty() { caller.convoy.clone() } else { subject };
-            let config = self.daemon.config_store();
-            let settings = config.load_daemon_config()?;
+            let settings = self.daemon.config_store().load_daemon_config()?;
             let blobs = self.remote_command_router.blob_store()?;
             let backend = self.daemon.resource_backend();
             let namespace = self.daemon.provisioning_namespace().await;
@@ -404,15 +465,53 @@ impl<'a> RequestDispatcher<'a> {
             let source_path = absolute_crew_path(&source_path, &session.spec.cwd);
             let temporary = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
             runner.read_file_to(&source_path, temporary.path()).await?;
-            if kind == "decision-ledger" {
-                if subject != caller.convoy {
-                    return Err("decision ledger subject must be its convoy".to_string());
-                }
-                if !summary.is_empty() {
-                    return Err("decision ledger summary is daemon-owned".to_string());
-                }
-                // Validation runs before the forge write; a path is never treated as content.
+            if kind == "decision-ledger" && !summary.is_empty() {
+                return Err("decision ledger summary is daemon-owned".to_string());
+            }
+            let input = ArtifactPutInput::builder()
+                .kind(kind)
+                .subject(subject)
+                .summary(summary)
+                .media_type(media_type)
+                .body(ArtifactBody::File(temporary.path().to_path_buf()))
+                .build();
+            // Store and validate the artifact before requesting permission for any forge POST.
+            let (name, mut spec, owner) = service.prepare_put(caller, input, &settings.artifact_retention_days).await?;
+            let target = self
+                .daemon
+                .resolve_existing_convoy_target(&CommandAction::QueryExplainConvoy {
+                    namespace: Some(namespace.clone()),
+                    name: caller.convoy.clone(),
+                })
+                .await?;
+            let node_id = match target {
+                Some(target) => target.node_id,
+                None if self.daemon.has_authoritative_convoy(&namespace, &caller.convoy).await? => self.daemon.node_id().clone(),
+                None => return Err("convoy home is unavailable for artifact put".to_string()),
+            };
+            let document = |spec: &flotilla_resources::ArtifactSpec| {
+                serde_json::json!({
+                    "apiVersion": "flotilla.work/v1", "kind": "Artifact",
+                    "metadata": { "name": name, "ownerReferences": [owner] }, "spec": spec,
+                })
+            };
+            let store = async |spec: &flotilla_resources::ArtifactSpec| match self
+                .artifact_home_action(&node_id, CommandAction::ResourceApply { namespace: namespace.clone(), document: document(spec) })
+                .await?
+            {
+                CommandValue::ResourceObject(_) => Ok(()),
+                CommandValue::Error { message } => Err(format!("artifact storage failed: {message}")),
+                other => Err(format!("unexpected artifact home result: {other:?}")),
+            };
+            store(&spec).await?;
+            if spec.kind == "decision-ledger" {
                 let body = crate::artifact::read_decision_ledger(temporary.path())?;
+                let authority = RoutedLedgerCreation::builder()
+                    .dispatcher(self)
+                    .node_id(node_id.clone())
+                    .namespace(namespace.clone())
+                    .name(name.clone())
+                    .build();
                 let projection = async {
                     let delivery_env = self.daemon.ledger_delivery_environment(&namespace, &session.spec.env_ref).await?;
                     project_decision_ledger_once(
@@ -424,102 +523,19 @@ impl<'a> RequestDispatcher<'a> {
                         runner.as_ref(),
                         Path::new(&session.spec.cwd),
                         &delivery_env,
+                        &authority,
                     )
                     .await
                 }
                 .await;
-                summary = decision_ledger_projection_summary(projection);
+                spec.summary = decision_ledger_projection_summary(projection);
+                store(&spec).await?;
             }
-            let input = ArtifactPutInput::builder()
-                .kind(kind)
-                .subject(subject)
-                .summary(summary)
-                .media_type(media_type)
-                .body(ArtifactBody::File(temporary.path().to_path_buf()))
-                .build();
-            let target = self
-                .daemon
-                .resolve_existing_convoy_target(&CommandAction::QueryExplainConvoy {
-                    namespace: Some(namespace.clone()),
-                    name: caller.convoy.clone(),
-                })
-                .await?;
-            match target {
-                Some(target) if target.node_id != *self.daemon.node_id() => {
-                    let (name, spec, owner) = service
-                        .prepare_put(caller, input, &settings.artifact_retention_days)
-                        .await
-                        .map_err(|error| format!("artifact put failed: {error}"))?;
-                    let digest = spec.digest.clone();
-                    let document = serde_json::json!({
-                        "apiVersion": "flotilla.work/v1",
-                        "kind": "Artifact",
-                        "metadata": { "name": name, "ownerReferences": [owner] },
-                        "spec": spec,
-                    });
-                    let mut events = self.daemon.subscribe();
-                    let command_id = self
-                        .remote_command_router
-                        .dispatch_execute_for_caller(
-                            Command {
-                                node_id: Some(target.node_id),
-                                provisioning_target: None,
-                                context_repo: None,
-                                action: CommandAction::ResourceApply { namespace, document },
-                            },
-                            Some(self.caller.clone()),
-                        )
-                        .await
-                        .map_err(|error| format!("artifact storage dispatch failed: {error}"))?;
-                    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                        loop {
-                            match events.recv().await {
-                                Ok(DaemonEvent::CommandFinished { command_id: finished, result, .. }) if finished == command_id => {
-                                    break Ok(result);
-                                }
-                                Ok(_) => {}
-                                Err(error) => break Err(format!("artifact home command event unavailable: {error}")),
-                            }
-                        }
-                    })
-                    .await
-                    .map_err(|_| "artifact home command timed out".to_string())??;
-                    match result {
-                        CommandValue::ResourceObject(_) => Ok(Response::ArtifactPut {
-                            address: format!("artifact/{name}"),
-                            view_url: flotilla_core::config::artifact_view_url(&spec, &settings.blob_stores),
-                            digest,
-                        }),
-                        CommandValue::Error { message } => Err(format!("artifact storage failed: {message}")),
-                        other => Err(format!("unexpected artifact home result: {other:?}")),
-                    }
-                }
-                Some(_) => {
-                    let object = service
-                        .put(caller, input, &settings.artifact_retention_days)
-                        .await
-                        .map_err(|error| format!("artifact put failed: {error}"))?;
-                    Ok(Response::ArtifactPut {
-                        address: format!("artifact/{}", object.metadata.name),
-                        view_url: flotilla_core::config::artifact_view_url(&object.spec, &settings.blob_stores),
-                        digest: object.spec.digest,
-                    })
-                }
-                None => {
-                    if !self.daemon.has_authoritative_convoy(&namespace, &caller.convoy).await? {
-                        return Err("convoy home is unavailable for artifact put".to_string());
-                    }
-                    let object = service
-                        .put(caller, input, &settings.artifact_retention_days)
-                        .await
-                        .map_err(|error| format!("artifact put failed: {error}"))?;
-                    Ok(Response::ArtifactPut {
-                        address: format!("artifact/{}", object.metadata.name),
-                        view_url: flotilla_core::config::artifact_view_url(&object.spec, &settings.blob_stores),
-                        digest: object.spec.digest,
-                    })
-                }
-            }
+            Ok(Response::ArtifactPut {
+                address: format!("artifact/{name}"),
+                view_url: flotilla_core::config::artifact_view_url(&spec, &settings.blob_stores),
+                digest: spec.digest,
+            })
         })
         .await;
         match result {
@@ -892,13 +908,20 @@ impl<'a> RequestDispatcher<'a> {
 
 #[cfg(test)]
 mod ledger_projection_tests {
-    use std::{path::PathBuf, sync::Mutex};
+    use std::{
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Mutex,
+        },
+    };
 
     use async_trait::async_trait;
     use flotilla_core::providers::CommandOutput;
     use flotilla_resources::{
         ArtifactSpec, BoundChangeRequest, ConvoyRepositorySpec, ConvoySpec, InMemoryBackend, InputMeta, RepositoryKey,
     };
+    use tokio::sync::Barrier;
 
     use super::*;
 
@@ -1049,10 +1072,19 @@ mod ledger_projection_tests {
         let runner = IsolatedForgeRunner::new(Some("scoped-test-token"));
         let delivery_env =
             BTreeMap::from([("GITHUB_TOKEN_FILE".to_string(), runner.token_file.as_ref().expect("token file").display().to_string())]);
-        let url =
-            project_decision_ledger(&backend, "flotilla", "demo", "coder", b"## Decision ledger\n", &runner, Path::new("/"), &delivery_env)
-                .await
-                .expect("project with staged credential");
+        let url = project_decision_ledger(
+            &backend,
+            "flotilla",
+            "demo",
+            "coder",
+            b"## Decision ledger\n",
+            &runner,
+            Path::new("/"),
+            &delivery_env,
+            &AllowCreation,
+        )
+        .await
+        .expect("project with staged credential");
         assert_eq!(url.first().map(String::as_str), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
     }
 
@@ -1074,6 +1106,7 @@ mod ledger_projection_tests {
                 &runner,
                 Path::new("/"),
                 &delivery_env,
+                &AllowCreation,
             )
             .await
             .expect_err("missing or empty credential");
@@ -1089,10 +1122,19 @@ mod ledger_projection_tests {
             ("FORGEJO_TOKEN_FILE".to_string(), runner.token_file.as_ref().expect("token file").display().to_string()),
             ("FORGEJO_API_URL".to_string(), "https://forgejo.example/api/v1".to_string()),
         ]);
-        let url =
-            project_decision_ledger(&backend, "flotilla", "demo", "coder", b"## Decision ledger\n", &runner, Path::new("/"), &delivery_env)
-                .await
-                .expect("project with staged credential");
+        let url = project_decision_ledger(
+            &backend,
+            "flotilla",
+            "demo",
+            "coder",
+            b"## Decision ledger\n",
+            &runner,
+            Path::new("/"),
+            &delivery_env,
+            &AllowCreation,
+        )
+        .await
+        .expect("project with staged credential");
         assert_eq!(url.first().map(String::as_str), Some("https://forgejo.example/acme/repo/pulls/42#issuecomment-7"));
     }
 
@@ -1157,18 +1199,29 @@ mod ledger_projection_tests {
         let address = LeafAddress::ChangeRequest { service, scope, number };
         let first = b"## Decision ledger\n\nReplay recording for #2600: initial revision.";
         let revised = b"## Decision ledger\n\nReplay recording for #2600: updated revision.";
-        let url = project_ledger_comment("replay-2600", "coder", first, &address, runner.as_ref(), Path::new("/"), &env)
+        let url = project_ledger_comment("replay-2600", "coder", first, &address, runner.as_ref(), Path::new("/"), &env, &AllowCreation)
             .await
             .expect("first projection");
-        let updated = project_ledger_comment("replay-2600", "coder", revised, &address, runner.as_ref(), Path::new("/"), &env)
-            .await
-            .expect("PATCH revision");
+        let updated =
+            project_ledger_comment("replay-2600", "coder", revised, &address, runner.as_ref(), Path::new("/"), &env, &AllowCreation)
+                .await
+                .expect("PATCH revision");
         assert_eq!(updated, url);
-        let retry = project_ledger_comment("replay-2600", "coder", revised, &address, runner.as_ref(), Path::new("/"), &env)
-            .await
-            .expect("unchanged retry");
+        let retry =
+            project_ledger_comment("replay-2600", "coder", revised, &address, runner.as_ref(), Path::new("/"), &env, &AllowCreation)
+                .await
+                .expect("unchanged retry");
         assert_eq!(retry, url);
         session.finish();
+    }
+
+    pub(super) struct AllowCreation;
+
+    #[async_trait]
+    impl LedgerCreationAuthority for AllowCreation {
+        async fn reserve(&self, _: &LeafAddress) -> Result<bool, String> {
+            Ok(true)
+        }
     }
 
     // The runner replaces the forge process boundary; comments are real in-memory state.
@@ -1176,21 +1229,34 @@ mod ledger_projection_tests {
     struct CommentRunner {
         comments: Mutex<Vec<serde_json::Value>>,
         writes: Mutex<Vec<(String, String)>>,
+        first_listings: Option<Arc<Barrier>>,
+        listings: AtomicUsize,
+        lose_response: AtomicBool,
+        refuse_write: AtomicBool,
     }
 
     #[async_trait]
     impl CommandRunner for CommentRunner {
         async fn run(&self, _cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
-            let comments = self.comments.lock().expect("comments lock");
-            // GitHub lists use --slurp; the final Forgejo shell argument is
-            // the page number. This boundary stand-in leaves later pages empty.
-            if args.contains(&"--slurp") {
-                Ok(serde_json::json!([*comments]).to_string())
-            } else if args.last() == Some(&"1") {
-                Ok(serde_json::json!(*comments).to_string())
-            } else {
-                Ok("[]".into())
+            let first_page = args.contains(&"--slurp") || args.last() == Some(&"1");
+            let listing = {
+                let comments = self.comments.lock().expect("comments lock");
+                if args.contains(&"--slurp") {
+                    serde_json::json!([*comments]).to_string()
+                } else if first_page {
+                    serde_json::json!(*comments).to_string()
+                } else {
+                    "[]".into()
+                }
+            };
+            // Pin the race: both callers capture an empty first listing before
+            // either can request a creation reservation at the authority.
+            if first_page && self.listings.fetch_add(1, Ordering::SeqCst) < 2 {
+                if let Some(barrier) = &self.first_listings {
+                    barrier.wait().await;
+                }
             }
+            Ok(listing)
         }
 
         async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
@@ -1208,6 +1274,9 @@ mod ledger_projection_tests {
             let method = args.iter().find(|arg| matches!(**arg, "POST" | "PATCH")).expect("write method");
             let endpoint = args.iter().find(|arg| arg.starts_with("repos/")).expect("write endpoint");
             self.writes.lock().expect("writes lock").push(((*method).into(), (*endpoint).into()));
+            if self.refuse_write.load(Ordering::SeqCst) {
+                return Err("forge refused the write".into());
+            }
             let mut comments = self.comments.lock().expect("comments lock");
             let body = serde_json::from_slice::<serde_json::Value>(input).expect("JSON")["body"].clone();
             let id = if *method == "PATCH" {
@@ -1221,11 +1290,146 @@ mod ledger_projection_tests {
             } else {
                 comments.push(comment.clone());
             }
+            if self.lose_response.swap(false, Ordering::SeqCst) {
+                return Err("accepted write response lost".into());
+            }
             Ok(comment.to_string())
         }
 
         async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
             false
+        }
+    }
+
+    pub(super) struct StoredLedgerCreation {
+        backend: ResourceBackend,
+        name: String,
+    }
+
+    #[async_trait]
+    impl LedgerCreationAuthority for StoredLedgerCreation {
+        async fn reserve(&self, address: &LeafAddress) -> Result<bool, String> {
+            flotilla_resources::reserve_ledger_comment_creation(&self.backend, "flotilla", &self.name, address)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    pub(super) async fn stored_creation(backend: ResourceBackend) -> StoredLedgerCreation {
+        let name = flotilla_resources::artifact_record_name("demo", "coder", "decision-ledger", "demo");
+        let spec = flotilla_resources::ArtifactSpec::builder()
+            .convoy("demo".into())
+            .producer("coder".into())
+            .kind("decision-ledger".into())
+            .subject("demo".into())
+            .digest("digest".into())
+            .size(1)
+            .media_type("text/markdown".into())
+            .expires_at(chrono::Utc::now())
+            .build();
+        backend
+            .using::<flotilla_resources::Artifact>("flotilla")
+            .create(&InputMeta::builder().name(name.clone()).build(), &spec)
+            .await
+            .expect("ledger envelope");
+        StoredLedgerCreation { backend, name }
+    }
+
+    // #2623: concurrent empty listings must emit exactly one POST. Both forges
+    // recover its identity after response loss, retries, and subsequent revisions.
+    #[tokio::test]
+    async fn concurrent_ledger_creation_has_one_identity_on_both_forges() {
+        for service in ["github.com", "forgejo.example"] {
+            for sqlite in [false, true] {
+                let backend = if sqlite {
+                    ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open_in_memory().expect("sqlite"))
+                } else {
+                    ResourceBackend::InMemory(InMemoryBackend::default())
+                };
+                let authority = stored_creation(backend).await;
+                let runner = CommentRunner {
+                    first_listings: Some(Arc::new(Barrier::new(2))),
+                    lose_response: AtomicBool::new(true),
+                    ..Default::default()
+                };
+                let env = if service == "github.com" { github_delivery_env() } else { forgejo_delivery_env() };
+                let address = LeafAddress::ChangeRequest { service: service.into(), scope: "acme/repo".into(), number: 42 };
+                let first = b"## Decision ledger\nfirst";
+                let revised = b"## Decision ledger\nrevised";
+                let project = async |body: &[u8]| {
+                    project_ledger_comment("demo", "coder", body, &address, &runner, Path::new("/"), &env, &authority).await
+                };
+                let (one, two) = tokio::join!(project(first), project(first));
+                assert!(one.is_err() || two.is_err(), "one accepted response is deliberately lost");
+                assert_eq!(runner.comments.lock().expect("comments").len(), 1);
+                assert_eq!(runner.writes.lock().expect("writes").iter().filter(|(method, _)| method == "POST").count(), 1);
+                let url = project(first).await.expect("recover accepted comment by marker");
+                assert_eq!(project(revised).await.expect("revision"), url);
+                assert_eq!(project(revised).await.expect("unchanged revision"), url);
+                assert_eq!(runner.comments.lock().expect("comments").len(), 1);
+                assert_eq!(runner.writes.lock().expect("writes").iter().map(|(method, _)| method.as_str()).collect::<Vec<_>>(), [
+                    "POST", "PATCH"
+                ]);
+                // Persisted reservations survive serialized round trips and spec revisions.
+                let resolver = authority.backend.using::<flotilla_resources::Artifact>("flotilla");
+                let stored = resolver.get(&authority.name).await.expect("reserved ledger");
+                let round_trip: flotilla_resources::ResourceObject<flotilla_resources::Artifact> =
+                    serde_json::from_value(serde_json::to_value(&stored).expect("serialize")).expect("decode");
+                assert_eq!(round_trip.status, stored.status);
+                assert!(matches!(
+                    resolver
+                        .update_status(&authority.name, &stored.metadata.resource_version, &flotilla_resources::ArtifactStatus::default())
+                        .await,
+                    Err(flotilla_resources::ResourceError::Invalid { .. })
+                ));
+                resolver
+                    .update(&InputMeta::from(&stored.metadata), &stored.metadata.resource_version, &stored.spec)
+                    .await
+                    .expect("revise envelope");
+                assert!(!authority.reserve(&address).await.expect("reservation retained"));
+            }
+        }
+    }
+
+    // Restart must not forget a creation attempt whose external outcome is unknown.
+    #[tokio::test]
+    async fn ledger_creation_reservation_survives_authority_restart() {
+        let directory = tempfile::tempdir().expect("authority store");
+        let path = directory.path().join("resources.sqlite");
+        let address = LeafAddress::ChangeRequest { service: "github.com".into(), scope: "acme/repo".into(), number: 42 };
+        let name = {
+            let authority = stored_creation(ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open(&path).expect("open"))).await;
+            assert!(authority.reserve(&address).await.expect("first reservation"));
+            authority.name
+        };
+        let authority = StoredLedgerCreation {
+            backend: ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open(&path).expect("reopen")),
+            name,
+        };
+        assert!(!authority.reserve(&address).await.expect("durable reservation"));
+    }
+
+    // An absent comment after a reserved attempt is uncertain. Never retry POST,
+    // including when a process stops after reservation or the forge refuses it.
+    #[tokio::test]
+    async fn ledger_uncertain_creation_never_reposts() {
+        for service in ["github.com", "forgejo.example"] {
+            for sent in [false, true] {
+                let authority = stored_creation(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+                let runner = CommentRunner { refuse_write: AtomicBool::new(true), ..Default::default() };
+                let env = if service == "github.com" { github_delivery_env() } else { forgejo_delivery_env() };
+                let address = LeafAddress::ChangeRequest { service: service.into(), scope: "acme/repo".into(), number: 42 };
+                if !sent {
+                    assert!(authority.reserve(&address).await.expect("reserve before crash"));
+                }
+                let project =
+                    async || project_ledger_comment("demo", "coder", b"ledger", &address, &runner, Path::new("/"), &env, &authority).await;
+                assert!(project().await.is_err());
+                runner.refuse_write.store(false, Ordering::SeqCst);
+                assert!(project().await.expect_err("uncertain retry").contains("pending or uncertain"));
+                assert!(runner.comments.lock().expect("comments").is_empty());
+                assert_eq!(runner.writes.lock().expect("writes").len(), usize::from(sent));
+            }
         }
     }
 
@@ -1239,15 +1443,23 @@ mod ledger_projection_tests {
             let address = LeafAddress::ChangeRequest { service: service.into(), scope: "acme/repo".into(), number: 42 };
             let first = b"## Decision ledger\nfirst";
             let revised = b"## Decision ledger\nrevised";
-            let url =
-                project_ledger_comment("demo", "coder", first, &address, &runner, Path::new("/"), &env).await.expect("first projection");
+            let url = project_ledger_comment("demo", "coder", first, &address, &runner, Path::new("/"), &env, &AllowCreation)
+                .await
+                .expect("first projection");
             assert_eq!(runner.writes.lock().expect("writes lock").as_slice(), [(
                 "POST".into(),
                 "repos/acme/repo/issues/42/comments".into()
             )]);
-            assert_eq!(project_ledger_comment("demo", "coder", first, &address, &runner, Path::new("/"), &env).await.expect("retry"), url);
+            assert_eq!(
+                project_ledger_comment("demo", "coder", first, &address, &runner, Path::new("/"), &env, &AllowCreation)
+                    .await
+                    .expect("retry"),
+                url
+            );
             assert_eq!(runner.writes.lock().expect("writes lock").len(), 1);
-            project_ledger_comment("demo", "coder", revised, &address, &runner, Path::new("/"), &env).await.expect("revision");
+            project_ledger_comment("demo", "coder", revised, &address, &runner, Path::new("/"), &env, &AllowCreation)
+                .await
+                .expect("revision");
             assert_eq!(runner.comments.lock().expect("comments lock").len(), 1);
             assert_eq!(runner.writes.lock().expect("writes lock")[1], ("PATCH".into(), "repos/acme/repo/issues/comments/1".into()));
             let older = runner.comments.lock().expect("comments lock")[0].clone();
@@ -1256,7 +1468,9 @@ mod ledger_projection_tests {
             newer["html_url"] = serde_json::json!("https://forge.example/comment/9");
             // Deliberately unsorted: listing order must not decide which duplicate wins.
             *runner.comments.lock().expect("comments lock") = vec![newer, older.clone()];
-            project_ledger_comment("demo", "coder", first, &address, &runner, Path::new("/"), &env).await.expect("legacy duplicates");
+            project_ledger_comment("demo", "coder", first, &address, &runner, Path::new("/"), &env, &AllowCreation)
+                .await
+                .expect("legacy duplicates");
             let comments = runner.comments.lock().expect("comments lock");
             assert_eq!(comments.len(), 2);
             assert_eq!(comments[1], older);
@@ -1279,7 +1493,7 @@ mod ledger_projection_tests {
                 }));
                 let address = LeafAddress::ChangeRequest { service: service.into(), scope: "acme/repo".into(), number: 42 };
                 let env = if service == "github.com" { github_delivery_env() } else { forgejo_delivery_env() };
-                let error = project_ledger_comment("demo", "coder", body, &address, &runner, Path::new("/"), &env)
+                let error = project_ledger_comment("demo", "coder", body, &address, &runner, Path::new("/"), &env, &AllowCreation)
                     .await
                     .expect_err("existing comment URL is unusable");
                 assert!(error.contains("no HTTPS URL"), "{error}");
@@ -1310,9 +1524,19 @@ mod ledger_projection_tests {
         backend.using::<Convoy>("flotilla").create(&InputMeta::builder().name("demo".to_string()).build(), &spec).await.expect("convoy");
         let runner = CapturingRunner::default();
         let body = b"## Decision ledger\n\n1. **Brief silence:** Naming\n- **Choice:** demo\n- **Alternative:** example\n- **If asking were free:** Which?\n";
-        let url = project_decision_ledger(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"), &github_delivery_env())
-            .await
-            .expect("project ledger");
+        let url = project_decision_ledger(
+            &backend,
+            "flotilla",
+            "demo",
+            "coder",
+            body,
+            &runner,
+            Path::new("/"),
+            &github_delivery_env(),
+            &AllowCreation,
+        )
+        .await
+        .expect("project ledger");
         assert_eq!(url.first().map(String::as_str), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
         let (args, input) = runner.calls.lock().expect("capture lock").pop().expect("gh call");
         assert!(args.iter().any(|arg| arg == "repos/flotilla-org/flotilla/issues/42/comments"));
@@ -1361,10 +1585,19 @@ mod ledger_projection_tests {
             .await
             .expect("new PR binding");
         let runner = CapturingRunner::default();
-        let result =
-            project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"), &github_delivery_env())
-                .await
-                .expect("reuse comment");
+        let result = project_decision_ledger_once(
+            &backend,
+            "flotilla",
+            "demo",
+            "coder",
+            body,
+            &runner,
+            Path::new("/"),
+            &github_delivery_env(),
+            &AllowCreation,
+        )
+        .await
+        .expect("reuse comment");
         assert_eq!(result.first().map(String::as_str), Some(comment_url));
         assert_eq!(result.len(), 2);
         let calls = runner.calls.lock().expect("capture lock");
@@ -1436,10 +1669,19 @@ mod ledger_projection_tests {
         backend.using::<Convoy>("flotilla").create(&InputMeta::builder().name("demo".to_string()).build(), &spec).await.expect("convoy");
         let runner = LostResponseRunner { posts: Mutex::new(0), comment: Mutex::new(None) };
         let body = b"## Decision ledger\n\n1. **Brief silence:** Naming\n- **Choice:** demo\n- **Alternative:** example\n- **If asking were free:** Which?\n";
-        let url =
-            project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"), &github_delivery_env())
-                .await
-                .expect("transient failure retries and finds accepted comment");
+        let url = project_decision_ledger_once(
+            &backend,
+            "flotilla",
+            "demo",
+            "coder",
+            body,
+            &runner,
+            Path::new("/"),
+            &github_delivery_env(),
+            &AllowCreation,
+        )
+        .await
+        .expect("transient failure retries and finds accepted comment");
         assert_eq!(url.first().map(String::as_str), Some("https://github.com/flotilla-org/flotilla/pull/42#issuecomment-7"));
         assert_eq!(*runner.posts.lock().expect("posts lock"), 1);
     }
@@ -1516,10 +1758,19 @@ mod ledger_projection_tests {
                 marker: format!("<!-- flotilla-decision-ledger:{name}:{} -->", BlobDigest::of(body).as_str()),
                 first_page_len,
             };
-            let url =
-                project_decision_ledger_once(&backend, "flotilla", "demo", "coder", body, &runner, Path::new("/"), &forgejo_delivery_env())
-                    .await
-                    .expect("find comment on second page");
+            let url = project_decision_ledger_once(
+                &backend,
+                "flotilla",
+                "demo",
+                "coder",
+                body,
+                &runner,
+                Path::new("/"),
+                &forgejo_delivery_env(),
+                &AllowCreation,
+            )
+            .await
+            .expect("find comment on second page");
             assert_eq!(url.first().map(String::as_str), Some("https://forgejo.example/acme/repo/pulls/42#issuecomment-7"));
             assert_eq!(*runner.pages.lock().expect("pages lock"), ["1", "2", "3"]);
         }

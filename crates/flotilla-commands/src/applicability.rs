@@ -91,6 +91,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::RepositoryRemoteRemove { .. }
         | CommandAction::Refresh { .. }
         | CommandAction::QueryIssueOpenInBrowser { .. }
+        | CommandAction::ArtifactReserveLedgerComment { .. }
         | CommandAction::ResourceApply { .. }
         | CommandAction::ResourceManifestResolve { .. }
         | CommandAction::ConvoyEnsureRoll { .. }

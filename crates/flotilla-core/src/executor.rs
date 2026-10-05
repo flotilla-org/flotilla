@@ -192,6 +192,7 @@ pub async fn build_plan(
         | CommandAction::QueryResourceList { .. }
         | CommandAction::QueryResourceGet { .. }
         | CommandAction::QueryExplainConvoy { .. }
+        | CommandAction::ArtifactReserveLedgerComment { .. }
         | CommandAction::ResourceApply { .. }
         | CommandAction::ResourceManifestResolve { .. }
         | CommandAction::ConvoyEnsureRoll { .. }
