@@ -15,6 +15,8 @@ pub enum Arg {
     Literal(String),
     /// Shell-quoted at flatten time (single-quoted, no expansion).
     Quoted(String),
+    /// Identifier key and a value shell-quoted at the current depth.
+    EnvAssignment { key: String, value: String },
     /// Subtree rendered as a single shell-quoted argument at the next depth.
     NestedCommand(Vec<Arg>),
 }
@@ -24,6 +26,7 @@ impl Arg {
         let indent = "  ".repeat(depth);
         match self {
             Arg::Literal(s) => write!(f, "{indent}{s}"),
+            Arg::EnvAssignment { key, value } => write!(f, "{indent}{key}={value:?}"),
             Arg::Quoted(s) => write!(f, "{indent}\"{s}\""),
             Arg::NestedCommand(inner) => {
                 writeln!(f, "{indent}NestedCommand(")?;
@@ -49,6 +52,9 @@ impl fmt::Display for Arg {
 /// `NestedCommand` subtrees are recursively flattened and the result is
 /// single-quoted as a single argument.
 ///
+/// Panics if an `EnvAssignment` key is not an ASCII shell identifier
+/// (`[A-Za-z_][A-Za-z0-9_]*`). Like `Literal`, keys are constructed by trusted resolvers.
+///
 /// The `depth` parameter tracks nesting level (pass 0 at the top level).
 /// Currently it is threaded through for future use but does not affect quoting
 /// strategy — single-quoting is used at all depths.
@@ -58,6 +64,15 @@ pub fn flatten(args: &[Arg], depth: usize) -> String {
         .map(|arg| match arg {
             Arg::Literal(s) => s.clone(),
             Arg::Quoted(s) => shell_quote(s),
+            Arg::EnvAssignment { key, value } => {
+                let mut bytes = key.bytes();
+                assert!(
+                    bytes.next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+                        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_'),
+                    "invalid environment assignment key: {key:?}"
+                );
+                format!("{key}={}", shell_quote(value))
+            }
             Arg::NestedCommand(inner) => {
                 let rendered = flatten(inner, depth + 1);
                 shell_quote(&rendered)
@@ -74,6 +89,38 @@ pub fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Env assignments preserve empty values, whitespace, quotes and expansion
+    // syntax at every depth. Exhaust this finite boundary-value generator.
+    #[test]
+    fn env_assignment_nested_values() {
+        for key in ["_", "FOO", "a_09"] {
+            for value in ["", "hello world", "it's \"quoted\"", "$HOME `cmd`", "line\nbreak", "a=b"] {
+                let assignment = Arg::EnvAssignment { key: key.into(), value: value.into() };
+                let decoded: Arg = serde_json::from_str(&serde_json::to_string(&assignment).unwrap()).unwrap();
+                assert_eq!(decoded, assignment);
+                let mut args = vec![assignment];
+                let mut expected = format!("{key}={}", shell_quote(value));
+                for depth in 0..=3 {
+                    assert_eq!(flatten(&args, depth), expected);
+                    args = vec![Arg::NestedCommand(args)];
+                    expected = shell_quote(&expected);
+                }
+            }
+        }
+    }
+
+    // Invalid keys must never become executable shell syntax, even nested.
+    #[test]
+    fn env_assignment_rejects_invalid_keys() {
+        for key in ["", "9FOO", "FOO-BAR", "A=B", "A;cmd", "A B", "é", "A\n"] {
+            for nested in [false, true] {
+                let arg = Arg::EnvAssignment { key: key.into(), value: "value".into() };
+                let args = if nested { vec![Arg::NestedCommand(vec![arg])] } else { vec![arg] };
+                assert!(std::panic::catch_unwind(|| flatten(&args, 0)).is_err(), "accepted {key:?}");
+            }
+        }
+    }
 
     // ── flatten tests ───────────────────────────────────────────────
 

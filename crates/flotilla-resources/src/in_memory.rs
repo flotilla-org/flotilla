@@ -571,6 +571,13 @@ impl InMemoryBackend {
         .await
     }
 
+    pub(crate) async fn current_position_typed<T: Resource>(&self, namespace: &str) -> Result<crate::ResourcePosition, ResourceError> {
+        self.with_store::<T, _>(namespace, |store| {
+            Ok(crate::ResourcePosition { resource_version: store.current_version().to_string(), generation: self.generation.clone() })
+        })
+        .await
+    }
+
     pub(crate) async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
         self.with_store::<T, _>(namespace, |store| {
             let mut items = Vec::with_capacity(store.objects.len());

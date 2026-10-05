@@ -803,6 +803,11 @@ pub fn resolver<F: ResourceContractFixture>(backend: ResourceBackend, namespace:
 
 pub async fn assert_create_get_list_roundtrip_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {
     let resolver = resolver::<F>(backend, "flotilla");
+    // A position is the same list/watch boundary on empty and populated stores.
+    let empty_position = resolver.current_position().await.expect("empty position");
+    let empty_list = resolver.list().await.expect("empty list");
+    assert_eq!(empty_position.resource_version, empty_list.resource_version);
+    assert_eq!(empty_position.generation, empty_list.generation);
     let created = resolver.create(&F::meta("alpha"), &F::spec()).await.expect("create should succeed");
 
     assert_eq!(created.metadata.name, "alpha", "{} create should preserve name", F::label());
@@ -817,6 +822,25 @@ pub async fn assert_create_get_list_roundtrip_with_backend<F: ResourceContractFi
     assert_eq!(listed.resource_version, created.metadata.resource_version);
     assert_eq!(listed.items.len(), 1);
     assert_eq!(listed.items[0].metadata.name, "alpha");
+    let position = resolver.current_position().await.expect("populated position");
+    assert_eq!(position.resource_version, listed.resource_version);
+    assert_eq!(position.generation, listed.generation);
+
+    // Capture before a point read: an intervening mutation must be replayed,
+    // even when the point read already sees it (duplicates are safe).
+    let beta = resolver.create(&F::meta("beta"), &F::spec()).await.expect("concurrent create");
+    resolver.get("beta").await.expect("point read sees mutation");
+    let start = match position.generation {
+        Some(generation) => WatchStart::FromVersionInGeneration { resource_version: position.resource_version, generation },
+        None => WatchStart::FromVersion(position.resource_version),
+    };
+    let mut watch = resolver.watch(start).await.expect("resume from position");
+    let event =
+        timeout(Duration::from_secs(2), watch.next()).await.expect("replay must arrive").expect("replayed event").expect("valid event");
+    match event {
+        WatchEvent::Added(object) => assert_eq!(object.metadata.resource_version, beta.metadata.resource_version),
+        _ => panic!("expected added mutation"),
+    }
 }
 
 pub async fn assert_create_get_list_roundtrip<F: ResourceContractFixture>() {

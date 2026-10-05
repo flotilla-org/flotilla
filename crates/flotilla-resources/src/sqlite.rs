@@ -1408,6 +1408,14 @@ impl SqliteBackend {
         .await
     }
 
+    pub(crate) async fn current_position_typed<T: Resource>(&self, namespace: &str) -> Result<crate::ResourcePosition, ResourceError> {
+        let key = Self::store_key::<T>(namespace);
+        self.read_call("read resource position", move |connection| {
+            Ok(crate::ResourcePosition { resource_version: Self::current_version(connection, &key)?.to_string(), generation: None })
+        })
+        .await
+    }
+
     pub(crate) async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
         let key = Self::store_key::<T>(namespace);
         let quarantine_key = key.clone();
@@ -2190,6 +2198,29 @@ mod latency_tests {
             .expect_err("store must report busy")
             .to_string()
             .contains("store busy"));
+    }
+
+    // Position must consult only the stream counter, without decoding or
+    // quarantining unrelated resource bodies.
+    #[tokio::test]
+    async fn current_position_does_not_decode_objects() {
+        let backend = SqliteBackend::open_in_memory().expect("store");
+        let hosts = ResourceBackend::Sqlite(backend.clone()).using::<Host>("flotilla");
+        let created = hosts.create(&InputMeta::builder().name("broken".into()).build(), &HostSpec::default()).await.expect("create");
+        backend
+            .connection
+            .call(|connection| {
+                connection
+                    .execute("UPDATE resource_objects SET body_json = 'invalid JSON'", [])
+                    .map_err(|error| crate::ResourceError::other(error.to_string()))?;
+                Ok::<_, crate::ResourceError>(())
+            })
+            .await
+            .expect("corrupt body");
+        let position = hosts.current_position().await.expect("position despite invalid body");
+        assert_eq!(position.resource_version, created.metadata.resource_version);
+        assert_eq!(position.generation, None);
+        assert!(backend.diagnostics().await.expect("diagnostics").decode_quarantines.is_empty());
     }
 
     #[tokio::test]

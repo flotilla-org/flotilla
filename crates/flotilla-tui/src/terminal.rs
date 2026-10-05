@@ -35,6 +35,7 @@ fn attach_argv(plan: &ResolvedAttachPlan) -> Result<(String, Vec<String>), Strin
         .map(|value| match value {
             Arg::Literal(value) | Arg::Quoted(value) => value.clone(),
             Arg::NestedCommand(inner) => arg::flatten(inner, 1),
+            Arg::EnvAssignment { key, value } => format!("{key}={value}"),
         })
         .collect::<Vec<_>>();
     if argv.is_empty() {
@@ -127,6 +128,20 @@ mod tests {
     use flotilla_protocol::{arg::Arg, ResolvedAttachPlan};
 
     use super::attach_argv;
+
+    // Direct argv has no shell boundary: assignment values retain their bytes.
+    // Glue: one mapping from the structured assignment to env's argv element.
+    #[test]
+    fn env_assignment_becomes_unquoted_argv() {
+        let plan = ResolvedAttachPlan::command(vec![
+            Arg::Literal("env".into()),
+            Arg::EnvAssignment { key: "KEY".into(), value: "it's a $VALUE".into() },
+            Arg::Literal("bash".into()),
+        ]);
+        let (program, args) = attach_argv(&plan).expect("attach argv");
+        assert_eq!(program, "env");
+        assert_eq!(args, ["KEY=it's a $VALUE", "bash"]);
+    }
 
     #[test]
     fn attach_plan_becomes_direct_argv_without_a_shell_boundary() {

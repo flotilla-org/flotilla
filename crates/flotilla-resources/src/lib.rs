@@ -170,14 +170,15 @@ pub use project::{
 };
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, forge_clone_key, forge_repo_key, repo_key};
 pub use registry::{
-    apply_manifest_resource_document, apply_resource_document, collect_resource_replica_kind, decode_stored_resource_document,
-    delete_resource_kind, get_resource_kind, get_resource_kind_all_provenances, get_resource_kind_including_replicas,
-    home_bound_authorship_collisions, list_resource_kind, list_resource_kind_including_replicas, list_resource_kind_replica_sources,
-    patch_resource_annotation, patch_resource_annotations, patch_resource_status, quarantine_undecodable_stored_objects,
-    registered_resource_namespaces, replica_cursor_for_resource_kind, resource_document_spec_hash, resource_list_api_version,
-    validate_resource_document, watch_resource_kind, watch_resource_kind_from, watch_resource_kind_including_replicas,
-    watch_resource_kind_replica_sources, DynamicResourceDelete, DynamicResourceList, DynamicResourceObject, DynamicResourceWatch,
-    HomeBoundAuthorshipCollision, RegisteredResourceKind, MANIFEST_WRITER_SOURCE, REGISTERED_RESOURCE_KINDS,
+    apply_manifest_resource_document, apply_resource_document, collect_resource_replica_kind, current_resource_kind_position,
+    decode_stored_resource_document, delete_resource_kind, get_resource_kind, get_resource_kind_all_provenances,
+    get_resource_kind_including_replicas, home_bound_authorship_collisions, list_resource_kind, list_resource_kind_including_replicas,
+    list_resource_kind_replica_sources, patch_resource_annotation, patch_resource_annotations, patch_resource_status,
+    quarantine_undecodable_stored_objects, registered_resource_namespaces, replica_cursor_for_resource_kind, resource_document_spec_hash,
+    resource_list_api_version, validate_resource_document, watch_resource_kind, watch_resource_kind_from,
+    watch_resource_kind_including_replicas, watch_resource_kind_replica_sources, DynamicResourceDelete, DynamicResourceList,
+    DynamicResourceObject, DynamicResourceWatch, HomeBoundAuthorshipCollision, RegisteredResourceKind, MANIFEST_WRITER_SOURCE,
+    REGISTERED_RESOURCE_KINDS,
 };
 pub use replica::{ReadResourceList, ReadResourceObject, ReadWatchEvent, ReplicaCursor, ReplicationClass, ResourceProvenance};
 pub use repository::{
@@ -212,7 +213,7 @@ pub use usage::{usage_record_name, Usage, UsagePace, UsageProviderCost, UsageSpe
 pub use vessel::{
     Vessel, VesselPhase, VesselSpec, VesselStatus, VesselStatusPatch, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
-pub use watch::{ResourceList, ResourceTombstone, WatchEvent, WatchStart, WatchStream};
+pub use watch::{ResourceList, ResourcePosition, ResourceTombstone, WatchEvent, WatchStart, WatchStream};
 
 #[doc(hidden)]
 #[macro_export]

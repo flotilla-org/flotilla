@@ -95,6 +95,19 @@ impl HttpBackend {
         ResourceObject::from_k8s_object(object)
     }
 
+    pub(crate) async fn current_position_typed<T: Resource>(&self, namespace: &str) -> Result<crate::ResourcePosition, ResourceError> {
+        // Standard Kubernetes list metadata defines the watch boundary. Ignore
+        // items rather than decoding resource specs; no custom endpoint required.
+        #[derive(Deserialize)]
+        struct PositionResponse {
+            metadata: crate::resource::K8sListMeta,
+        }
+        let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
+        let response = self.http.get(url).send().await.map_err(|err| ResourceError::other(format!("GET resource position: {err}")))?;
+        let list: PositionResponse = Self::decode_response(response, None).await?;
+        Ok(crate::ResourcePosition { resource_version: list.metadata.resource_version, generation: list.metadata.generation })
+    }
+
     pub(crate) async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
         let response = self.http.get(url).send().await.map_err(|err| ResourceError::other(format!("LIST resources: {err}")))?;

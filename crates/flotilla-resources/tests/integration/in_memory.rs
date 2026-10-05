@@ -226,6 +226,10 @@ async fn observed_backend_surfaces_generation_on_list_and_watch() {
 
     let listed = resolver.list().await.expect("list should succeed");
     let generation = listed.generation.clone().expect("observed list should expose generation");
+    // Position retains the generation required to resume an observed stream.
+    let position = resolver.current_position().await.expect("position");
+    assert_eq!(position.resource_version, listed.resource_version);
+    assert_eq!(position.generation, listed.generation);
     let watch = resolver
         .watch(flotilla_resources::WatchStart::FromVersionInGeneration {
             generation: generation.clone(),
@@ -371,4 +375,48 @@ async fn observed_store_restart_retains_replicas_and_resets_local_generation() {
     assert_ne!(restarted_origin.generation, listed.generation);
     writer.replace(&restarted_origin, chrono::Utc::now()).await.expect("replace old origin generation");
     assert!(read.list().await.expect("old facts discarded").items.is_empty());
+}
+
+// Generated create/update/delete sequences keep position equal to list's
+// boundary after every operation, including empty collections and no-op writes.
+#[hegel::test]
+fn current_position_tracks_mutation_sequences(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(12));
+    let operations: Vec<_> = (0..count).map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(2))).collect();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        for backend in [
+            ResourceBackend::InMemory(InMemoryBackend::default()),
+            ResourceBackend::InMemory(InMemoryBackend::observed()),
+            ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open_in_memory().expect("sqlite")),
+        ] {
+            let resolver = backend.using::<Convoy>("flotilla");
+            for operation in std::iter::once(3).chain(operations.iter().copied()) {
+                match operation {
+                    0 => {
+                        let _ = resolver.create(&convoy_meta("alpha"), &convoy_spec("template-a")).await;
+                    }
+                    1 => {
+                        if let Ok(object) = resolver.get("alpha").await {
+                            resolver
+                                .update(&convoy_meta("alpha"), &object.metadata.resource_version, &object.spec)
+                                .await
+                                .expect("no-op update");
+                        }
+                    }
+                    2 => {
+                        let _ = resolver.delete("alpha").await;
+                    }
+                    _ => {}
+                }
+                let listed = resolver.list().await.expect("list");
+                let position = resolver.current_position().await.expect("position");
+                assert_eq!(position.resource_version, listed.resource_version);
+                assert_eq!(position.generation, listed.generation);
+                let other = backend.using::<Convoy>("other").current_position().await.expect("other namespace");
+                assert_eq!(other.resource_version, "0");
+            }
+        }
+    });
 }
