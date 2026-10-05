@@ -322,6 +322,13 @@ strict Apple signature and designated-requirement verification, the recorded
 authority, and empty entitlements on all three executables and every bundled
 dynamic library. Consumer Macs hold no signing credential.
 
+The installer confirms readiness with the current generation's `flotilla --socket
+SOCKET fleet check`. It requires an exact wire-generation/protocol handshake and a local
+fleet row; it never starts a daemon or re-execs a different generation. The shell
+keeps the confirmation deadline, watchdog and rollback policy, and reports the
+last refusal after the deadline expires. Status delegates
+wire-generation grouping to `flotilla --socket SOCKET fleet spread`.
+
 The first live proof installed generation
 `20260815T233635Z-r84-f63871b20ec6f-c4e78c7c83873` into isolated roots on
 Kiwi and Udder. All three programs reported their versions on both platforms;

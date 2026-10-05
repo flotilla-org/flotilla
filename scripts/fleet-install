@@ -464,41 +464,8 @@ show_fleet_spread() {
     return
   fi
 
-  local response="$WORK_DIR/fleet-health.json"
-  if ! FLOTILLA_CONTAINED_HOST_DAEMON=1 "$CURRENT_LINK/bin/flotilla" --json host list >"$response" 2>/dev/null; then
+  if ! FLOTILLA_CONTAINED_HOST_DAEMON=1 "$CURRENT_LINK/bin/flotilla" --socket "$DAEMON_SOCKET" fleet spread 2>/dev/null; then
     printf 'fleet:   unavailable (daemon query failed)\n'
-    return
-  fi
-  if ! python3 - "$response" <<'PY'
-import json
-import sys
-
-try:
-    response = json.load(open(sys.argv[1]))
-except (OSError, ValueError):
-    raise SystemExit(1)
-if not isinstance(response, dict) or response.get("kind") != "fleet_health":
-    raise SystemExit(1)
-hosts = response.get("hosts")
-if not isinstance(hosts, list):
-    raise SystemExit(1)
-
-spread = {}
-for host in hosts:
-    if not isinstance(host, dict) or not isinstance(host.get("host"), str):
-        raise SystemExit(1)
-    generation = host.get("daemon_generation")
-    if not isinstance(generation, str) or not generation:
-        generation = "unknown"
-    name = host["host"] + (" (local)" if host.get("is_local") is True else "")
-    spread.setdefault(generation, []).append(name)
-
-print("fleet wire generations:")
-for generation in sorted(spread, key=lambda value: (value == "unknown", value)):
-    print(f"  {generation}: {', '.join(sorted(spread[generation]))}")
-PY
-  then
-    printf 'fleet:   unavailable (invalid daemon response)\n'
   fi
 }
 
@@ -728,29 +695,9 @@ restart_darwin_daemon_service() {
 }
 
 probe_daemon_health() {
-  local response="$WORK_DIR/daemon-health.json"
-  # This candidate CLI's socket hello requires an exact build and protocol
-  # fingerprint match. A successful fleet query therefore proves both that
-  # the selected daemon answered and that its control plane is ready.
-  if ! FLOTILLA_CONTAINED_HOST_DAEMON=1 "$CURRENT_LINK/bin/flotilla" --json fleet >"$response" 2>/dev/null; then
-    return 1
-  fi
-  python3 - "$response" <<'PY'
-import json
-import sys
-
-try:
-    response = json.load(open(sys.argv[1]))
-except (OSError, ValueError):
-    raise SystemExit(1)
-if not isinstance(response, dict) or response.get("kind") != "fleet_health":
-    raise SystemExit(1)
-hosts = response.get("hosts")
-if not isinstance(hosts, list):
-    raise SystemExit(1)
-if not any(isinstance(host, dict) and host.get("is_local") is True for host in hosts):
-    raise SystemExit(1)
-PY
+  # This candidate CLI requires an exact wire-generation handshake and a local fleet
+  # row. The check neither starts a daemon nor re-execs another generation.
+  FLOTILLA_CONTAINED_HOST_DAEMON=1 "$CURRENT_LINK/bin/flotilla" --socket "$DAEMON_SOCKET" fleet check >/dev/null 2>"$WORK_DIR/daemon-health.stderr"
 }
 
 wait_for_daemon_generation() {
@@ -758,11 +705,16 @@ wait_for_daemon_generation() {
   [[ "$CONFIRM_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] \
     || die "health confirmation timeout must be a non-negative integer: $CONFIRM_TIMEOUT_SECONDS"
   local deadline=$((SECONDS + CONFIRM_TIMEOUT_SECONDS))
+  : >"$WORK_DIR/daemon-health.stderr"
   while true; do
     if [[ "$(current_generation)" == "$generation" ]] && probe_daemon_health; then
       return 0
     fi
-    ((SECONDS < deadline)) || return 1
+    if ((SECONDS >= deadline)); then
+      # Keep retries quiet, but retain the last refusal in the failure log.
+      [[ ! -s "$WORK_DIR/daemon-health.stderr" ]] || cat "$WORK_DIR/daemon-health.stderr" >&2
+      return 1
+    fi
     sleep 1
   done
 }

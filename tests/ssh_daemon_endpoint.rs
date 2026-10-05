@@ -171,3 +171,61 @@ async fn absent_remote_daemon_does_not_touch_local_daemon_state() {
     assert!(error.contains("no daemon is listening"), "{error}");
     assert!(!absent.exists() && !config.exists() && !state.exists(), "remote failure must not enter local daemon startup");
 }
+
+// The real installer CLI must reject an incompatible wire generation in one
+// attempt, retaining the socket and creating no daemon state. A protocol stand-in
+// occupies only the socket boundary; child-process execution exercises re-exec.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installer_health_rejects_incompatible_wire_without_reexec_or_spawn() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    for subcommand in ["check", "spread"] {
+        let directory = TestSocketDir::new();
+        let socket = directory.socket_path("daemon.sock");
+        let config = directory.path().join("config");
+        let state = directory.path().join("state");
+        let listener = UnixListener::bind(&socket).expect("bind incompatible daemon");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept installer CLI");
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                assert!(matches!(read_message(&mut reader).await, Some(Message::Hello { .. })));
+                observed.fetch_add(1, Ordering::SeqCst);
+                write_message(&mut writer, daemon_hello("incompatible-protocol-sources")).await;
+            }
+        });
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_flotilla"));
+        command
+            .arg("--config-dir")
+            .arg(&config)
+            .arg("--state-dir")
+            .arg(&state)
+            .arg("--socket")
+            .arg(&socket)
+            .args(["fleet", subcommand])
+            .env_remove("FLOTILLA_REEXEC_BUILD")
+            .env_remove("FLOTILLA_DAEMON_SOCKET")
+            .env_remove("FLOTILLA_DAEMON")
+            .env_remove(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV)
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(Duration::from_secs(5), command.output()).await.expect("CLI finishes").expect("CLI output");
+        server.abort();
+        let _ = server.await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "installer CLI must not re-exec: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(socket.exists(), "installer CLI must not remove the daemon socket");
+        assert!(!config.exists() && !state.exists(), "installer CLI must not create daemon state");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("wire generation mismatch"));
+        if subcommand == "check" {
+            assert!(!output.status.success(), "incompatible wire generation is not ready");
+        } else {
+            assert!(output.status.success(), "status diagnostics remain best effort");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("daemon query failed"));
+        }
+    }
+}

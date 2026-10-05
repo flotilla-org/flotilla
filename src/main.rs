@@ -706,6 +706,10 @@ struct ResourceStatusPatchArgs {
 
 #[derive(clap::Subcommand)]
 enum FleetSubCommand {
+    /// Confirm this wire generation's daemon responds with a local fleet row (never starts a daemon)
+    Check,
+    /// Show hosts grouped by wire generation (never starts a daemon)
+    Spread,
     /// Run this generation's post-install cleat turnover after health confirmation
     PostInstall {
         #[arg(long)]
@@ -876,6 +880,10 @@ fn cli_surface_from(crew_role: Option<&str>, namespace: Option<&str>) -> flotill
 // Parsing and dispatch run in sequence rather than nested: clap's derived
 // builders and the dispatch future both need large frames in unoptimised
 // builds, and stacking them overflowed Windows' 1 MiB main thread (#2588).
+fn allows_daemon_reexec(command: &Option<SubCommand>) -> bool {
+    !matches!(command, Some(SubCommand::Fleet { command: Some(FleetSubCommand::Check | FleetSubCommand::Spread) }))
+}
+
 fn main() -> Result<()> {
     flotilla_core::tls::install_default_provider();
     color_eyre::install()?;
@@ -883,6 +891,7 @@ fn main() -> Result<()> {
     let format = OutputFormat::from_json_flag(cli.json);
     let remote_daemon_selected = cli.remote_daemon().is_ok_and(|endpoint| endpoint.is_some());
     let command = cli.command.take();
+    let allow_daemon_reexec = allows_daemon_reexec(&command);
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = runtime.block_on(Box::pin(run_command(cli, command, format)));
@@ -890,7 +899,7 @@ fn main() -> Result<()> {
     if let Err(error) = &result {
         let message = format!("{error:?}");
         let already_reexecuted = std::env::var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV).ok();
-        if should_reexec_for_incompatible_daemon(&message, already_reexecuted.as_deref(), remote_daemon_selected) {
+        if allow_daemon_reexec && should_reexec_for_incompatible_daemon(&message, already_reexecuted.as_deref(), remote_daemon_selected) {
             std::env::set_var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV, flotilla_tui::socket::BUILD_ID);
             if let Err(reexec_error) = reexec_current_process() {
                 return Err(color_eyre::eyre::eyre!(incompatible_daemon_reexec_failure(&message, &reexec_error)));
@@ -927,6 +936,18 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
         Some(SubCommand::Topology(TopologyArgs { dot })) => run_topology_command(&cli, format, dot).await,
         Some(SubCommand::Logs(LogsArgs { host, since, level, target })) => run_logs(&cli, host.as_deref(), since, level, target).await,
         Some(SubCommand::Fleet { command: None }) => run_fleet_health(&cli, format).await,
+        Some(SubCommand::Fleet { command: Some(FleetSubCommand::Check) }) => {
+            flotilla_core::fleet_health::check(query_installer_health(&cli).await).map_err(|error| color_eyre::eyre::eyre!(error))
+        }
+        Some(SubCommand::Fleet { command: Some(FleetSubCommand::Spread) }) => {
+            let result = query_installer_health(&cli).await;
+            match &result {
+                Err(error) | Ok(CommandValue::Error { message: error }) => eprintln!("fleet status: {error}"),
+                _ => {}
+            }
+            print!("{}", flotilla_core::fleet_health::spread(result));
+            Ok(())
+        }
         Some(SubCommand::Fleet { command: Some(FleetSubCommand::PostInstall { cleat_bin, generation, diagnostics_dir }) }) => {
             cli.require_local_daemon("fleet post-install")?;
             run_control_command(
@@ -1783,6 +1804,20 @@ fn ls_crew_scope(project: Option<&str>, all: bool, env: impl Fn(&str) -> Option<
     let crew_id = env("FLOTILLA_CREW_ID");
     let convoy = if crew_id.is_none() { env("FLOTILLA_CONVOY") } else { None };
     (crew_id, convoy)
+}
+
+async fn query_installer_health(cli: &Cli) -> Result<CommandValue, String> {
+    cli.require_local_daemon("fleet health").map_err(|error| error.to_string())?;
+    let CliPaths { config_dir, state_dir, socket_path } = cli.client_paths()?;
+    // Readiness belongs to this wire generation: never spawn, restart or
+    // re-exec during install confirmation to bypass a fingerprint mismatch.
+    let daemon = connect_cli_socket(None, &socket_path, &config_dir, &state_dir, true).await?;
+    daemon
+        .execute_query(
+            Command { node_id: None, provisioning_target: None, context_repo: None, action: CommandAction::QueryFleetHealth {} },
+            uuid::Uuid::new_v4(),
+        )
+        .await
 }
 
 async fn run_fleet_health(cli: &Cli, format: OutputFormat) -> Result<()> {
@@ -4287,6 +4322,19 @@ mod tests {
     fn cli_parses_host_noun() {
         let cli = Cli::try_parse_from(["flotilla", "host", "list"]).expect("host list should parse");
         assert!(matches!(cli.command, Some(SubCommand::Domain(DomainCommand::Host(_)))));
+    }
+
+    // Installer readiness and diagnostics must query the selected generation;
+    // an incompatible wire generation must not cause either command to re-exec its CLI.
+    #[test]
+    fn installer_health_commands_require_exact_wire_generation() {
+        for subcommand in ["check", "spread"] {
+            let cli = Cli::try_parse_from(["flotilla", "--socket", "/fleet/run/daemon.sock", "fleet", subcommand]).expect("health command");
+            assert!(!super::allows_daemon_reexec(&cli.command));
+            assert_eq!(cli.remote_daemon().expect("local socket"), None);
+        }
+        let cli = Cli::try_parse_from(["flotilla", "fleet"]).expect("dashboard");
+        assert!(super::allows_daemon_reexec(&cli.command));
     }
 
     #[test]

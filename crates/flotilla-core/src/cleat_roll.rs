@@ -239,7 +239,10 @@ pub async fn persist(report: &mut RollReport, directory: &Path) {
         options.mode(0o600);
         let mut file = options.open(&path).await.map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec_pretty(report).map_err(|error| error.to_string())?;
-        file.write_all(&bytes).await.map_err(|error| error.to_string())
+        file.write_all(&bytes).await.map_err(|error| error.to_string())?;
+        // Tokio file writes may still be buffered; the returned path must be
+        // readable immediately by a caller using synchronous filesystem I/O.
+        file.flush().await.map_err(|error| error.to_string())
     }
     .await;
     if let Err(error) = result {

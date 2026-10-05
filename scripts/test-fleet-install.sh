@@ -68,6 +68,19 @@ chmod 0600 "$test_root/home/.config/flotilla/fleet-reader-token"
 # Process boundary double: the fixture CLI stands in for the incoming binary's
 # post-install subcommand; Rust tests cover cleat inventory and drain behavior.
 add_post_install_fixture() {
+  cat >>"$1" <<EOF
+if [[ "\${1:-}" == --socket && "\${3:-}" == fleet && "\${4:-}" == check ]]; then
+  if [[ -n "\${FLEET_CHECK_LOG:-}" ]]; then printf '%s|%s|%s\\n' "\$0" "\$*" "\${FLOTILLA_CONTAINED_HOST_DAEMON:-}" >>"\$FLEET_CHECK_LOG"; fi
+  if [[ "\${FLEET_HEALTH_FAIL_FOR:-}" == "$2" ]]; then printf 'fixture readiness failure\\n' >&2; exit 1; fi
+  exit 0
+fi
+if [[ "\${1:-}" == --socket && "\${3:-}" == fleet && "\${4:-}" == spread ]]; then
+  if [[ -n "\${FLEET_SPREAD_LOG:-}" ]]; then printf '%s|%s\\n' "\$0" "\$*" >>"\$FLEET_SPREAD_LOG"; fi
+  [[ -n "\${FLEET_SPREAD_TEXT:-}" ]] || exit 1
+  printf '%s\\n' "\$FLEET_SPREAD_TEXT"
+  exit 0
+fi
+EOF
   cat >>"$1" <<'SH'
 if [[ "${1:-}" == --socket && "${3:-}" == --json && "${4:-}" == fleet && "${5:-}" == post-install ]]; then
   if [[ -n "${POST_INSTALL_LOG:-}" ]]; then printf '%s|%s\n' "$0" "$*" >>"$POST_INSTALL_LOG"; fi
@@ -89,7 +102,7 @@ make_generation() {
   local bundle="$test_root/bundle-$generation/fleet-candidate-linux-x86_64-gnu2.36"
   mkdir -p "$directory" "$bundle/bin" "$bundle/lib"
   for name in flotilla flotillad cleat; do
-    printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then echo "daemon stop requested"; exit "${STOP_FAIL:-0}"; fi\nif [[ "%s" == flotilla && "${1:-}" == --json && "${2:-}" == fleet ]]; then\n  [[ "${FLEET_HEALTH_FAIL_FOR:-}" != "%s" ]] || exit 1\n  printf '\''{"kind":"fleet_health","hosts":[{"host":"test","is_local":true,"daemon_generation":"%s"}],"dispatch_queue":{"entries":[]}}\\n'\''\n  exit 0\nfi\nif [[ "%s" == flotilla && "${1:-}" == --json && "${2:-}" == host && "${3:-}" == list ]]; then\n  [[ -n "${FLEET_HOST_LIST_JSON:-}" ]] || exit 1\n  printf "%%s\\n" "$FLEET_HOST_LIST_JSON"\n  exit 0\nfi\nprintf "%s from %s\\n"\n' "$name" "$generation" "$generation" "$name" "$name" "$generation" >"$bundle/bin/$name"
+    printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then echo "daemon stop requested"; exit "${STOP_FAIL:-0}"; fi\n' >"$bundle/bin/$name"
     if [[ "$name" == flotilla ]]; then
       cat >>"$bundle/bin/$name" <<EOF
 if [[ "\${1:-}" == --socket && "\${3:-}" == resource && "\${4:-}" == validate && "\${5:-}" == --from-daemon && "\${FLEET_VALIDATE_FAIL_FOR:-}" == "$generation" ]]; then
@@ -97,7 +110,8 @@ if [[ "\${1:-}" == --socket && "\${3:-}" == resource && "\${4:-}" == validate &&
 fi
 EOF
     fi
-    if [[ "$name" == flotilla ]]; then add_post_install_fixture "$bundle/bin/$name"; fi
+    if [[ "$name" == flotilla ]]; then add_post_install_fixture "$bundle/bin/$name" "$generation"; fi
+    printf 'printf "%s from %s\\n"\n' "$name" "$generation" >>"$bundle/bin/$name"
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty\n' >"$bundle/lib/libghostty-vt.so.0"
@@ -195,7 +209,7 @@ add_darwin_derivative() {
   local bundle="$test_root/darwin-$generation/fleet-signed-darwin-aarch64"
   mkdir -p "$bundle/bin" "$bundle/lib"
   for name in flotilla flotillad cleat; do
-    printf '#!/usr/bin/env bash\nif [[ "%s" == flotilla && "${1:-}" == --json && "${2:-}" == fleet ]]; then\n  [[ "${FLEET_HEALTH_FAIL_FOR:-}" != "%s" ]] || exit 1\n  printf '\''{"kind":"fleet_health","hosts":[{"host":"test","is_local":true,"daemon_generation":"%s"}],"dispatch_queue":{"entries":[]}}\\n'\''\n  exit 0\nfi\nprintf "%s signed for %s\\n"\n' "$name" "$generation" "$generation" "$name" "$generation" >"$bundle/bin/$name"
+    printf '#!/usr/bin/env bash\n' >"$bundle/bin/$name"
     if [[ "$name" == flotilla ]]; then
       cat >>"$bundle/bin/$name" <<'SH'
 if [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then
@@ -208,7 +222,8 @@ if [[ "${1:-}" == --socket && "${3:-}" == resource && "${4:-}" == validate ]]; t
 fi
 SH
     fi
-    if [[ "$name" == flotilla ]]; then add_post_install_fixture "$bundle/bin/$name"; fi
+    if [[ "$name" == flotilla ]]; then add_post_install_fixture "$bundle/bin/$name" "$generation"; fi
+    printf 'printf "%s signed for %s\\n"\n' "$name" "$generation" >>"$bundle/bin/$name"
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty signed\n' >"$bundle/lib/libghostty-vt.dylib"
@@ -584,7 +599,7 @@ test "$(link_generation "$first_install_home/.local/opt/flotilla-fleet/current")
 for old in 00 01 02 03; do
   mkdir -p "$test_root/home/.local/opt/flotilla-fleet/releases/$old"
 done
-run_installer "$generation_one" >"$test_root/install-one.out"
+FLEET_CHECK_LOG="$test_root/check.log" run_installer "$generation_one" >"$test_root/install-one.out"
 test ! -d "$test_root/home/.local/opt/flotilla-fleet/releases/00" || fail 'healthy install did not prune'
 for old in 01 02 03; do
   test -d "$test_root/home/.local/opt/flotilla-fleet/releases/$old" || fail 'default retention lost old release'
@@ -595,6 +610,8 @@ fi
 grep -Fq "generation $generation_one confirmed healthy" "$test_root/install-one.out" \
   || fail 'healthy Linux install was not confirmed'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'exact generation was not selected'
+grep -Fq -- "--socket $test_root/home/.config/flotilla/run/flotilla.sock fleet check|1" "$test_root/check.log" || fail 'confirmation did not delegate exact local readiness'
+
 # Failed health confirmation never prunes even when K=0.
 if FLEET_INSTALL_KEEP_OTHERS=0 FLEET_HEALTH_FAIL_FOR="$generation_one" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=0 \
   run_installer "$generation_one" >"$test_root/no-previous.out" 2>&1; then
@@ -648,23 +665,13 @@ grep -Fq 'warning: peer protocol changes from 20 to 21' <<<"$status" || fail 'st
 grep -Fq "skipping incomplete linux-x86_64-gnu2.36 generation $generation_incomplete" "$test_root/status.err" \
   || fail 'latest did not explain why it skipped an incomplete generation'
 
-fleet_health='{"kind":"fleet_health","hosts":[{"host":"feta","is_local":true,"daemon_generation":"111111111111"},{"host":"kiwi","is_local":false,"daemon_generation":"222222222222"},{"host":"mango","is_local":false,"daemon_generation":"111111111111"},{"host":"pear","is_local":false}],"dispatch_queue":{"entries":[]}}'
-fleet_status="$(DAEMON_RUNNING=1 FLEET_HOST_LIST_JSON="$fleet_health" run_installer status 2>"$test_root/fleet-status.err")"
-grep -Fq 'fleet wire generations:' <<<"$fleet_status" || fail 'status omitted reachable fleet spread'
-grep -Fq '  111111111111: feta (local), mango' <<<"$fleet_status" || fail 'status did not group hosts on the current wire generation'
-grep -Fq '  222222222222: kiwi' <<<"$fleet_status" || fail 'status omitted a pending wire generation'
-grep -Fq '  unknown: pear' <<<"$fleet_status" || fail 'status omitted a host with unknown generation'
+# The binary owns grouping and response validation; the shell only delegates.
+fleet_spread=$'fleet wire generations:\n  generation-fixture: host-fixture (local)'
+fleet_status="$(DAEMON_RUNNING=1 FLEET_SPREAD_TEXT="$fleet_spread" FLEET_SPREAD_LOG="$test_root/spread.log" run_installer status 2>"$test_root/fleet-status.err")"
+grep -Fq "$fleet_spread" <<<"$fleet_status" || fail 'status omitted the binary generation report'
+grep -Fq -- "--socket $test_root/home/.config/flotilla/run/flotilla.sock fleet spread" "$test_root/spread.log" || fail 'status did not delegate spread to the local socket'
 unreachable_status="$(DAEMON_RUNNING=1 run_installer status 2>"$test_root/unreachable-status.err")"
-grep -Fq 'fleet:   unavailable (daemon query failed)' <<<"$unreachable_status" \
-  || fail 'status did not degrade gracefully when the daemon query failed'
-
-for bad_payload in 'not json at all' '{"kind":"host_list","hosts":[]}' '{"kind":"fleet_health","hosts":"nope"}' '{"kind":"fleet_health","hosts":[{"is_local":true}]}'; do
-  invalid_status="$(DAEMON_RUNNING=1 FLEET_HOST_LIST_JSON="$bad_payload" run_installer status 2>"$test_root/invalid-status.err")"
-  grep -Fq 'fleet:   unavailable (invalid daemon response)' <<<"$invalid_status" \
-    || fail "status did not degrade gracefully on invalid daemon payload: $bad_payload"
-  grep -Fq "current: $generation_one" <<<"$invalid_status" \
-    || fail 'invalid daemon payload disturbed local status reporting'
-done
+grep -Fq 'fleet:   unavailable (daemon query failed)' <<<"$unreachable_status" || fail 'status did not degrade gracefully when the binary query failed'
 
 if run_installer "$generation_incomplete" >"$test_root/incomplete-exact.out" 2>&1; then
   fail 'an explicitly requested incomplete generation was accepted'
@@ -722,7 +729,7 @@ grep -Fq 'incoming installer refused activation' "$test_root/handoff-failure.out
   || fail 'incoming installer failure was not reported'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
   || fail 'handoff failure switched current'
-"$test_root/home/.local/opt/flotilla-fleet/current/bin/flotilla" --json fleet >/dev/null \
+"$test_root/home/.local/opt/flotilla-fleet/current/bin/flotilla" --socket "$test_root/home/.config/flotilla/run/flotilla.sock" fleet check >/dev/null \
   || fail 'handoff failure did not leave the old generation restartable'
 
 if FLEET_VALIDATE_FAIL_FOR="$generation_two" run_installer "$generation_two" >"$test_root/validation.out" 2>&1; then
@@ -744,6 +751,7 @@ if POST_INSTALL_LOG="$test_root/unhealthy-post-install.log" FLEET_HEALTH_FAIL_FO
   run_installer "$generation_two" >"$test_root/health-rollback.out" 2>&1; then
   fail 'unhealthy Linux generation was accepted'
 fi
+grep -Fq 'fixture readiness failure' "$test_root/health-rollback.out" || fail 'health refusal diagnostic was not retained'
 test ! -e "$test_root/unhealthy-post-install.log" || fail 'post-install ran before health confirmation'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
   || fail 'unhealthy Linux generation did not roll current back'
