@@ -1253,42 +1253,57 @@ fn direct_facts(endpoint: Option<&CleatEndpoint>, host: &HostName, mint: &dyn Re
 #[cfg(test)]
 mod tests;
 
+#[derive(bon::Builder)]
+struct PlacementKeys {
+    policy: &'static str,
+    kind: &'static str,
+    host_ref: &'static str,
+    host_name: &'static str,
+    cost_class: &'static str,
+    minimal: &'static str,
+    alternatives: &'static str,
+    minimal_alternatives: &'static str,
+}
+
 fn placement_facts(decision: &flotilla_protocol::PlacementDecision, convoy: bool) -> Vec<(&'static str, MetadataValue)> {
     let keys = if convoy {
-        [
-            KEY_CONVOY_POLICY,
-            KEY_CONVOY_KIND,
-            KEY_CONVOY_HOST_REF,
-            KEY_CONVOY_HOST_NAME,
-            KEY_CONVOY_COST_CLASS,
-            KEY_CONVOY_MINIMAL,
-            KEY_CONVOY_ALTERNATIVES,
-            KEY_CONVOY_MINIMAL_ALTERNATIVES,
-        ]
+        PlacementKeys {
+            policy: KEY_CONVOY_POLICY,
+            kind: KEY_CONVOY_KIND,
+            host_ref: KEY_CONVOY_HOST_REF,
+            host_name: KEY_CONVOY_HOST_NAME,
+            cost_class: KEY_CONVOY_COST_CLASS,
+            minimal: KEY_CONVOY_MINIMAL,
+            alternatives: KEY_CONVOY_ALTERNATIVES,
+            minimal_alternatives: KEY_CONVOY_MINIMAL_ALTERNATIVES,
+        }
     } else {
-        [
-            KEY_VESSEL_POLICY,
-            KEY_VESSEL_KIND,
-            KEY_VESSEL_HOST_REF,
-            KEY_VESSEL_HOST_NAME,
-            KEY_VESSEL_COST_CLASS,
-            KEY_VESSEL_MINIMAL,
-            KEY_VESSEL_ALTERNATIVES,
-            KEY_VESSEL_MINIMAL_ALTERNATIVES,
-        ]
+        PlacementKeys {
+            policy: KEY_VESSEL_POLICY,
+            kind: KEY_VESSEL_KIND,
+            host_ref: KEY_VESSEL_HOST_REF,
+            host_name: KEY_VESSEL_HOST_NAME,
+            cost_class: KEY_VESSEL_COST_CLASS,
+            minimal: KEY_VESSEL_MINIMAL,
+            alternatives: KEY_VESSEL_ALTERNATIVES,
+            minimal_alternatives: KEY_VESSEL_MINIMAL_ALTERNATIVES,
+        }
     };
     let mut facts = vec![
-        (keys[0], MetadataValue::text(&decision.policy_name)),
-        (keys[2], MetadataValue::text(decision.target_host.reference.to_string())),
-        (keys[3], MetadataValue::text(&decision.target_host.display_name)),
-        (keys[6], MetadataValue::text(serde_json::to_string(&decision.viable_not_selected).expect("placement candidates serialize"))),
-        (keys[7], MetadataValue::StringList(decision.minimal_alternatives.clone())),
+        (keys.policy, MetadataValue::text(&decision.policy_name)),
+        (keys.host_ref, MetadataValue::text(decision.target_host.reference.to_string())),
+        (keys.host_name, MetadataValue::text(&decision.target_host.display_name)),
+        (
+            keys.alternatives,
+            MetadataValue::text(serde_json::to_string(&decision.viable_not_selected).expect("placement candidates serialize")),
+        ),
+        (keys.minimal_alternatives, MetadataValue::StringList(decision.minimal_alternatives.clone())),
     ];
     if let Some(allocation) = &decision.allocation {
-        facts.push((keys[1], MetadataValue::text(&allocation.chosen_kind)));
+        facts.push((keys.kind, MetadataValue::text(&allocation.chosen_kind)));
         if let Some(candidate) = allocation.candidates.iter().find(|candidate| candidate.kind == allocation.chosen_kind) {
-            facts.push((keys[4], MetadataValue::text(&candidate.cost_class)));
-            facts.push((keys[5], MetadataValue::Bool(candidate.minimal)));
+            facts.push((keys.cost_class, MetadataValue::text(&candidate.cost_class)));
+            facts.push((keys.minimal, MetadataValue::Bool(candidate.minimal)));
         }
     }
     facts

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use flotilla_protocol::CanonicalHostId;
+use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits};
 use flotilla_resources::{
     controller::{ReconcileOutcome, Reconciler},
     DockerEnvironmentSpec, Environment, EnvironmentPhase, EnvironmentStatusPatch, Host, ResourceBackend, ResourceError, ResourceObject,
@@ -19,7 +19,7 @@ pub trait DockerEnvironmentRuntime: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DockerProvisioning {
-    pub configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
+    pub configured_limits: Option<ConfiguredResourceLimits>,
     pub container_id: String,
     pub image_ref: String,
     pub image_digest: String,

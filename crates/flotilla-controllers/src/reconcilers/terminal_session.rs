@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{CanonicalHostId, PrincipalRef, ResourceRef};
+use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, PrincipalRef, ResourceRef};
 use flotilla_resources::{
     api_version,
     controller::{Actuation, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
@@ -17,7 +17,7 @@ use flotilla_resources::{
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct TerminalRuntimeState {
-    pub configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
+    pub configured_limits: Option<ConfiguredResourceLimits>,
     pub session_id: String,
     pub pid: Option<i64>,
     pub started_at: DateTime<Utc>,

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
+use flotilla_protocol::ConfiguredResourceLimits;
 pub use flotilla_protocol::{CrewMessageDelivery, CrewMessageSender};
 use serde::{Deserialize, Serialize};
 
@@ -277,7 +278,7 @@ pub struct TerminalSessionStatus {
     /// Configured limits, not usage. Remove the decoder default one fleet roll
     /// after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
+    pub configured_limits: Option<ConfiguredResourceLimits>,
     pub phase: TerminalSessionPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -464,7 +465,7 @@ pub enum TerminalSessionStatusPatch {
         endpoint: Option<flotilla_protocol::result_set::CleatEndpoint>,
     },
     MarkRunning {
-        configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
+        configured_limits: Option<ConfiguredResourceLimits>,
         session_id: String,
         pid: Option<i64>,
         started_at: DateTime<Utc>,

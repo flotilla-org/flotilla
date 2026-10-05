@@ -30,6 +30,7 @@ use flotilla_core::{
     },
     HostName,
 };
+use flotilla_protocol::ConfiguredResourceLimits;
 use flotilla_resources::{
     canonicalize_repo_url, clone_key,
     controller::{ControllerLoop, ReconcileOutcome, Reconciler},
@@ -54,11 +55,7 @@ struct FakeDockerRuntime {
 impl DockerEnvironmentRuntime for FakeDockerRuntime {
     async fn provision(&self, name: &str, spec: &flotilla_resources::DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
         Ok(DockerProvisioning {
-            configured_limits: Some(flotilla_protocol::ConfiguredResourceLimits {
-                cpus: Some(4),
-                build_jobs: Some(4),
-                linker_threads: Some(4),
-            }),
+            configured_limits: Some(ConfiguredResourceLimits { cpus: Some(4), build_jobs: Some(4), linker_threads: Some(4) }),
             container_id: format!("container-{name}"),
             image_ref: spec.image.clone(),
             image_digest: "sha256:test-image".to_string(),
@@ -207,11 +204,7 @@ impl TerminalRuntime for FakeTerminalRuntime {
         _tags: &[flotilla_resources::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         Ok(TerminalRuntimeState {
-            configured_limits: Some(flotilla_protocol::ConfiguredResourceLimits {
-                cpus: None,
-                build_jobs: Some(4),
-                linker_threads: Some(4),
-            }),
+            configured_limits: Some(ConfiguredResourceLimits { cpus: None, build_jobs: Some(4), linker_threads: Some(4) }),
             session_id: format!("session-{name}"),
             pid: Some(42),
             started_at: Utc::now(),
@@ -332,10 +325,7 @@ async fn controller_loops_drive_host_direct_workspace_to_ready() {
     let status = workspace.status.expect("workspace status should be present");
     // #2650: host-direct configured limits survive launch into Vessel status;
     // no container quota is invented for a host-direct vessel.
-    assert_eq!(
-        status.configured_limits,
-        Some(flotilla_protocol::ConfiguredResourceLimits { cpus: None, build_jobs: Some(4), linker_threads: Some(4) })
-    );
+    assert_eq!(status.configured_limits, Some(ConfiguredResourceLimits { cpus: None, build_jobs: Some(4), linker_threads: Some(4) }));
     assert_eq!(status.phase, VesselPhase::Ready);
     assert_eq!(status.environment_ref.as_deref(), Some("host-direct-01HXYZ"));
     assert_eq!(status.checkout_refs.values().next().map(String::as_str), Some("checkout-convoy-a"));
@@ -647,7 +637,7 @@ async fn environment_controller_marks_docker_environment_ready() {
     // recomputing them from potentially changed host configuration.
     assert_eq!(
         environments.get("docker-env").await.expect("ready environment").status.expect("environment status").configured_limits,
-        Some(flotilla_protocol::ConfiguredResourceLimits { cpus: Some(4), build_jobs: Some(4), linker_threads: Some(4) })
+        Some(ConfiguredResourceLimits { cpus: Some(4), build_jobs: Some(4), linker_threads: Some(4) })
     );
     harness.shutdown().await;
 }

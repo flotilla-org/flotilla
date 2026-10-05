@@ -2741,3 +2741,26 @@ fn placement_catalog_omits_unknown_facts() {
         assert!(!patch.set.contains_key(key), "unknown {key} must be absent");
     }
 }
+
+// Known launch fields override environment fields; unknown launch fields must
+// preserve recorded configuration, especially a contained vessel's CPU quota.
+#[hegel::test]
+fn launch_limits_preserve_unoverridden_environment_fields(tc: hegel::TestCase) {
+    use flotilla_protocol::ConfiguredResourceLimits;
+    // Exhaust all 64 optional-field combinations for generated quota values,
+    // including zero and normal bounds; each run exercises quota preservation.
+    let values: Vec<usize> = (0..6).map(|_| tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(64))).collect();
+    for mask in 0..64 {
+        let field = |index: usize| (mask & (1 << index) != 0).then_some(values[index]);
+        let environment = ConfiguredResourceLimits { cpus: field(0), build_jobs: field(1), linker_threads: field(2) };
+        let launch = ConfiguredResourceLimits { cpus: field(3), build_jobs: field(4), linker_threads: field(5) };
+        let merged = environment.clone().with_overrides(launch.clone());
+        for (prior, applied, observed) in [
+            (environment.cpus, launch.cpus, merged.cpus),
+            (environment.build_jobs, launch.build_jobs, merged.build_jobs),
+            (environment.linker_threads, launch.linker_threads, merged.linker_threads),
+        ] {
+            assert_eq!(observed, applied.or(prior));
+        }
+    }
+}

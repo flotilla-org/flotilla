@@ -14,7 +14,7 @@ use flotilla_core::{
     },
     in_process::BRIEF_ARTIFACTS_ANNOTATION,
 };
-use flotilla_protocol::{CanonicalHostId, PlacementDecision};
+use flotilla_protocol::{CanonicalHostId, ConfiguredResourceLimits, PlacementDecision};
 use flotilla_resources::{
     artifact_record_name, canonicalize_repo_url,
     controller::{
@@ -226,7 +226,7 @@ enum PlannedPatch {
         message: String,
     },
     Ready {
-        configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
+        configured_limits: Option<ConfiguredResourceLimits>,
         placement_decision: Option<PlacementDecision>,
         environment_ref: String,
         image: Option<ImageStamp>,
@@ -1160,7 +1160,9 @@ impl Reconciler for VesselReconciler {
             self.environments.get(&resolved_environment_ref).await?.status.and_then(|status| status.configured_limits);
         for terminal_ref in &terminal_refs {
             if let Some(limits) = self.terminal_sessions.get(terminal_ref).await?.status.and_then(|status| status.configured_limits) {
-                configured_limits = Some(limits);
+                // Only host-direct launches record terminal limits today. Merge
+                // known fields so future launch caps cannot erase a container quota.
+                configured_limits = Some(configured_limits.take().unwrap_or_default().with_overrides(limits));
                 break;
             }
         }

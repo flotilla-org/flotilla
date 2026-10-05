@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use flotilla_protocol::ConfiguredResourceLimits;
 use serde::{Deserialize, Serialize};
 
 use crate::{placement_policy::DockerImagePullPolicy, resource::define_resource, status_patch::StatusPatch, ControllerRetry};
@@ -71,7 +72,7 @@ pub struct EnvironmentStatus {
     /// Configured limits, not usage. Remove the decoder default one fleet roll
     /// after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
+    pub configured_limits: Option<ConfiguredResourceLimits>,
     pub phase: EnvironmentPhase,
     #[serde(default)]
     pub ready: bool,
@@ -92,7 +93,7 @@ pub struct EnvironmentStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentStatusPatch {
     MarkReady {
-        configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
+        configured_limits: Option<ConfiguredResourceLimits>,
         docker_container_id: Option<String>,
         image_ref: Option<String>,
         image_digest: Option<String>,

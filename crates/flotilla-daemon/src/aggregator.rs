@@ -24,8 +24,8 @@ use flotilla_protocol::{
         ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ReadinessBlocker, ReadinessState, ResultDelta, SessionPhase,
         StandingRoleHold, StandingRoleRow, SurfaceState, VesselRow, WorkPhase,
     },
-    AttachableId, Change, DaemonEvent, EntryOp, HostName, LifecycleAuthority, ManagedTerminal, PaneExitAttention, RepoDelta, RepoIdentity,
-    RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
+    AttachableId, Change, ConfiguredResourceLimits, DaemonEvent, EntryOp, HostName, LifecycleAuthority, ManagedTerminal, PaneExitAttention,
+    RepoDelta, RepoIdentity, RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{
     api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
@@ -2507,6 +2507,19 @@ impl Aggregator {
                     && self.read_host(&session.provenance).as_ref() == Some(&vessel_host)
             })
         };
+        let placement_limits = placement.and_then(|placement| placement.fields.get("configured_limits")).and_then(|value| {
+            match serde_json::from_value::<ConfiguredResourceLimits>(value.clone()) {
+                Ok(limits) => Some(limits),
+                Err(error) => {
+                    debug!(convoy = %convoy_ref.name, vessel = %definition.name, %error, "could not decode configured placement limits");
+                    None
+                }
+            }
+        });
+        let configured_limits = match matching_sessions().find_map(|session| session.object.status.as_ref()?.configured_limits.clone()) {
+            Some(limits) => Some(placement_limits.unwrap_or_default().with_overrides(limits)),
+            None => placement_limits,
+        };
         let completion_pending = matching_sessions()
             .filter_map(|session| session.object.status.as_ref()?.completion_pending.as_ref())
             .min_by_key(|pending| pending.attempted_at)
@@ -2585,13 +2598,7 @@ impl Aggregator {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned),
             )
-            .maybe_configured_limits(
-                matching_sessions().find_map(|session| session.object.status.as_ref()?.configured_limits.clone()).or_else(|| {
-                    placement
-                        .and_then(|placement| placement.fields.get("configured_limits"))
-                        .and_then(|value| serde_json::from_value(value.clone()).ok())
-                }),
-            )
+            .maybe_configured_limits(configured_limits)
             .crew(crew)
             .maybe_ready_at(state.and_then(|state| state.ready_at))
             .maybe_started_at(state.and_then(|state| state.started_at))
@@ -5926,7 +5933,7 @@ mod tests {
         assert_eq!(vessel.environment_ref.as_deref(), Some("env-work"));
         assert_eq!(
             vessel.configured_limits,
-            Some(flotilla_protocol::ConfiguredResourceLimits { cpus: Some(4), build_jobs: Some(4), linker_threads: Some(4) })
+            Some(ConfiguredResourceLimits { cpus: Some(4), build_jobs: Some(4), linker_threads: Some(4) })
         );
         assert_eq!(vessel.crew[0].adapter, None);
         assert_eq!(vessel.crew[0].model, None);
@@ -5960,7 +5967,12 @@ mod tests {
                     .push(CrewSpec::builder().role("coder".to_string()).source(CrewSource::Tool { command: "codex".to_string() }).build());
                 let definition = definition.clone();
                 let work = status.work.get_mut("implement").expect("implement work");
-                work.placement = Some(PlacementStatus { fields: BTreeMap::from([("host".to_string(), serde_json::json!(host))]) });
+                work.placement = Some(PlacementStatus {
+                    fields: BTreeMap::from([
+                        ("host".to_string(), serde_json::json!(host)),
+                        ("configured_limits".to_string(), serde_json::json!({"cpus": 8, "build_jobs": 4, "linker_threads": 4})),
+                    ]),
+                });
                 let mut session = session_object("terminal-placement-coder").await;
                 session.spec.role = "coder".into();
                 session.metadata.labels =
@@ -5973,11 +5985,17 @@ mod tests {
                         .stance("contained".to_string())
                         .build(),
                 );
+                session.status.as_mut().expect("session status").configured_limits =
+                    Some(ConfiguredResourceLimits { cpus: None, build_jobs: Some(2), linker_threads: None });
                 aggregator.replace_replica_sessions(vec![ReadResourceObject { object: session, provenance }]).await;
                 let resource = ResourceRef::new("flotilla/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("kiwi"));
                 let row = aggregator.summarize_vessel(&resource, &definition, Some(work), None, None);
                 assert_eq!(row.crew[0].adapter.as_deref(), Some("codex"));
                 assert_eq!(row.crew[0].model, model);
+                assert_eq!(
+                    row.configured_limits,
+                    Some(ConfiguredResourceLimits { cpus: Some(8), build_jobs: Some(2), linker_threads: Some(4) })
+                );
                 assert_eq!(row.crew[0].session.as_deref(), Some(format!("{host}/flotilla/terminal-placement-coder").as_str()));
             }
         }

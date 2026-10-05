@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
-use flotilla_protocol::PlacementDecision;
+use flotilla_protocol::{ConfiguredResourceLimits, PlacementDecision};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -38,7 +38,7 @@ pub enum VesselPhase {
 pub struct VesselStatus {
     /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
+    pub configured_limits: Option<ConfiguredResourceLimits>,
     pub phase: VesselPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_decision: Option<PlacementDecision>,
@@ -94,7 +94,7 @@ pub enum VesselStatusPatch {
         message: Option<String>,
     },
     MarkReady {
-        configured_limits: Option<flotilla_protocol::ConfiguredResourceLimits>,
+        configured_limits: Option<ConfiguredResourceLimits>,
         placement_decision: Option<PlacementDecision>,
         environment_ref: Option<String>,
         image_ref: Option<String>,
