@@ -373,9 +373,6 @@ pub fn observed_change_request_subjects(
     let mut subjects = Vec::new();
     for name in expected {
         let Some(checkout) = checkouts.get(&name) else { continue };
-        if convoy.spec.r#ref.as_deref() != Some(checkout.spec.branch()) {
-            continue;
-        }
         let Some(observed) = checkout.status.as_ref().and_then(|status| status.integration.change_request.as_ref()) else {
             continue;
         };
@@ -387,7 +384,17 @@ pub fn observed_change_request_subjects(
             .ok_or_else(|| format!("checkout {name} repository {} is absent from convoy", checkout.spec.repo_ref()))?;
         let address = change_request_address_with_forges(&repository.url, &observed.id, forges)?;
         if let Some(subject) = Subject::from_leaf(&address) {
-            if !adopted.contains(&subject) && !subjects.contains(&subject) {
+            let terminal = observed.state != crate::ChangeRequestState::Open;
+            let merged_during_checkout = checkout
+                .status
+                .as_ref()
+                .and_then(|status| status.integration.landed_evidence.as_ref())
+                .filter(|evidence| evidence.change_request_id == observed.id)
+                .and_then(|evidence| evidence.merged_at.as_deref())
+                .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+                .is_some_and(|at| at >= checkout.metadata.creation_timestamp);
+            let already_produced = convoy.status.as_ref().is_some_and(|status| status.produces(&subject));
+            if (!terminal || merged_during_checkout || already_produced) && !adopted.contains(&subject) && !subjects.contains(&subject) {
                 subjects.push(subject);
             }
         }

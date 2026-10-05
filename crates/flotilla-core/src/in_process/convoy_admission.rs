@@ -246,12 +246,12 @@ impl ConvoyAdmission {
         repository_keys: &[RepositoryKey],
     ) -> (Vec<(RepositoryKey, String, Arc<dyn ChangeRequestTracker>)>, Vec<String>) {
         let namespace = self.provisioning_namespace().await;
-        let repositories = self.backend.clone().using::<Repository>(&namespace);
+        let repositories = self.backend.including_replicas::<Repository>(&namespace);
         let mut candidates = Vec::new();
         let mut failures = Vec::new();
         for repository_key in repository_keys {
             let repository = match repositories.get(&repository_key.to_string()).await {
-                Ok(repository) => repository,
+                Ok(repository) => repository.object,
                 Err(error) => {
                     failures.push(format!("repository {repository_key}: {error}"));
                     continue;

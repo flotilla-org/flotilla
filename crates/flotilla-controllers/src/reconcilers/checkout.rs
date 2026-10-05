@@ -51,6 +51,12 @@ pub struct PreparedCheckout {
 
 #[async_trait]
 pub trait CheckoutRuntime: Send + Sync {
+    /// Refuse a new branch that is already a forge change-request head.
+    /// Existing targets are retries and must remain recoverable.
+    async fn validate_new_branch(&self, _checkout: &ResourceObject<Checkout>) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Restore registration protection through the checkout's owning environment.
     async fn protect_worktree_in(&self, _env_ref: &str, _clone_path: &str, _target: &str, _reason: &str) -> Result<(), String> {
         Ok(())
@@ -353,6 +359,27 @@ where
                 });
             }
             return Ok(CheckoutPrepared::None);
+        }
+
+        if has_convoy_owner {
+            let conflict = self.checkouts.list().await?.items.into_iter().find(|other| {
+                other.metadata.name != obj.metadata.name
+                    && other.metadata.deletion_timestamp.is_none()
+                    && other.status.as_ref().is_none_or(|status| status.phase != CheckoutPhase::Gone)
+                    && other.spec.repo_ref() == obj.spec.repo_ref()
+                    && other.spec.env_ref() == obj.spec.env_ref()
+                    && other.spec.branch() == obj.spec.branch()
+            });
+            if let Some(other) = conflict {
+                return Ok(CheckoutPrepared::Failed(format!(
+                    "checkout branch {} conflicts with Checkout {}; choose a fresh branch name",
+                    obj.spec.branch(),
+                    other.metadata.name
+                )));
+            }
+            if let Err(error) = self.runtime.validate_new_branch(obj).await {
+                return Ok(CheckoutPrepared::Failed(error));
+            }
         }
 
         match &obj.spec {
