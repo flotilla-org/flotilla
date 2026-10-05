@@ -201,7 +201,7 @@ latest_generation() {
     local response="$WORK_DIR/packages-$page.json"
     download "$FLEET_API_URL/packages/$FLEET_OWNER?type=generic&q=$FLEET_PACKAGE&limit=100&page=$page" "$response"
     local count
-    count="$(python3 "$GENERATION_VALIDATOR" package-page "$response" "$FLEET_PACKAGE" "$all"
+    count="$(python3 "$GENERATION_VALIDATOR" package-page -- "$response" "$FLEET_PACKAGE" "$all"
 )"
     [[ "$count" =~ ^[0-9]+$ ]] || die 'invalid package listing response'
     (( count == 100 )) || break
@@ -222,7 +222,7 @@ latest_generation() {
       continue
     fi
     die "could not verify advertised generation $candidate"
-  done < <(python3 "$GENERATION_VALIDATOR" package-versions "$all"
+  done < <(python3 "$GENERATION_VALIDATOR" package-versions -- "$all"
 )
   die "Forgejo has no completed $PLATFORM flotilla-fleet generations"
 }
@@ -259,28 +259,28 @@ require_generation_manifest() {
 manifest_value() {
   local manifest="$1"
   local expression="$2"
-  python3 "$GENERATION_VALIDATOR" value "$manifest" "$expression"
+  python3 "$GENERATION_VALIDATOR" value -- "$manifest" "$expression"
 }
 
 platform_value() {
   local manifest="$1"
   local field="$2"
-  python3 "$GENERATION_VALIDATOR" platform-value "$manifest" "$PLATFORM" "$field"
+  python3 "$GENERATION_VALIDATOR" platform-value -- "$manifest" "$PLATFORM" "$field"
 }
 
 sha256_file() {
-  python3 "$GENERATION_VALIDATOR" sha256 "$1"
+  python3 "$GENERATION_VALIDATOR" sha256 -- "$1"
 }
 
 file_size() {
-  python3 "$GENERATION_VALIDATOR" size "$1"
+  python3 "$GENERATION_VALIDATOR" size -- "$1"
 }
 
 extract_and_verify() {
   local archive="$1"
   local destination="$2"
   local generation_manifest="$3"
-  python3 "$GENERATION_VALIDATOR" extract "$archive" "$destination" "$PLATFORM"
+  python3 "$GENERATION_VALIDATOR" extract -- "$archive" "$destination" "$PLATFORM"
   verify_release "$destination/release" "$generation_manifest"
   cp "$generation_manifest" "$destination/release/.generation.json"
 }
@@ -332,7 +332,7 @@ verify_darwin_signatures() {
     entitlements="$WORK_DIR/codesign-entitlements-${relative//\//-}.plist"
     "$codesign" --display --entitlements - --xml "$path" >"$entitlements" 2>/dev/null \
       || die "entitlements inspection failed: $relative"
-    python3 "$GENERATION_VALIDATOR" entitlements "$entitlements" "$relative"
+    python3 "$GENERATION_VALIDATOR" entitlements -- "$entitlements" "$relative"
   done
 }
 
@@ -347,7 +347,7 @@ current_generation() {
 protocol_version() {
   local link="$1"
   [[ -f "$link/manifest.json" ]] || return 0
-  python3 "$GENERATION_VALIDATOR" protocol "$link/manifest.json"
+  python3 "$GENERATION_VALIDATOR" protocol -- "$link/manifest.json"
 }
 
 show_fleet_spread() {

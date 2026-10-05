@@ -4,6 +4,8 @@ import hashlib
 import io
 import json
 import plistlib
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -24,6 +26,35 @@ class BootstrapValidationTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+
+    # Exercise the executable boundary with installer argument ordering, including
+    # a dash-leading package name. Validation failures produce concise refusals.
+    def test_cli_dispatch(self):
+        def run(*args):
+            return subprocess.run([sys.executable, validation.__file__, *map(str, args)], capture_output=True, text=True)
+
+        manifest = self.root / "manifest.json"
+        manifest.write_text(json.dumps({"signing": {"identity": "team"}, "platforms": {"linux": {"size": 7}}}))
+        for args, expected in ((["value", "--", manifest, "signing.identity"], "team\n"),
+                               (["platform-value", "--", manifest, "linux", "size"], "7\n")):
+            result = run(*args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, expected)
+        page = self.root / "page.json"
+        rows = self.root / "rows.jsonl"
+        page.write_text(json.dumps([{"type": "generic", "name": "-fleet", "created_at": "today", "version": "v1"}]))
+        result = run("package-page", "--", page, "-fleet", rows)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "1\n")
+        self.assertEqual(json.loads(rows.read_text()), ["today", "v1"])
+        broken = self.root / "broken"
+        broken.write_text("not an archive or plist")
+        for args in (("value", manifest, "missing"), ("extract", broken, self.root / "out", "linux"),
+                     ("entitlements", broken, "bin/tool")):
+            result = run(*args)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("generation validation:", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
 
     # Hashing and sizing preserve exact bytes, including empty files and both
     # sides of the streaming chunk boundary. No executable is invoked.

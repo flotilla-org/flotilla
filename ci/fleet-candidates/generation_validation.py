@@ -6,12 +6,13 @@ import hashlib
 import json
 import os
 import plistlib
-import shutil
-import tarfile
 import re
+import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+from xml.parsers.expat import ExpatError
 from pathlib import Path, PurePosixPath
 
 PLATFORMS = ("linux-x86_64-gnu2.36", "darwin-aarch64")
@@ -460,7 +461,7 @@ def validate_entitlements(path, relative):
     content = Path(path).read_bytes()
     try:
         entitlements = plistlib.loads(content) if content.strip() else {}
-    except plistlib.InvalidFileException as error:
+    except (plistlib.InvalidFileException, ExpatError) as error:
         raise ValidationError(f"signed Darwin payload has unreadable entitlements: {relative}: {error}")
     if entitlements != {}:
         raise ValidationError(f"signed Darwin payload has unexpected entitlements: {relative}")
@@ -492,32 +493,32 @@ def main():
     skill_sources.add_argument("--catalog-output")
     codex_home = sub.add_parser("codex-home")
     codex_home.add_argument("root")
-    helper = sub.add_parser('package-page')
-    helper.add_argument('response')
-    helper.add_argument('package_name')
-    helper.add_argument('output_path')
-    helper = sub.add_parser('package-versions')
-    helper.add_argument('path')
-    helper = sub.add_parser('value')
-    helper.add_argument('manifest')
-    helper.add_argument('expression')
-    helper = sub.add_parser('platform-value')
-    helper.add_argument('manifest')
-    helper.add_argument('platform')
-    helper.add_argument('field')
-    helper = sub.add_parser('sha256')
-    helper.add_argument('path')
-    helper = sub.add_parser('size')
-    helper.add_argument('path')
-    helper = sub.add_parser('extract')
-    helper.add_argument('archive')
-    helper.add_argument('destination')
-    helper.add_argument('platform')
-    helper = sub.add_parser('entitlements')
-    helper.add_argument('path')
-    helper.add_argument('relative')
-    helper = sub.add_parser('protocol')
-    helper.add_argument('path')
+    helper = sub.add_parser("package-page")
+    helper.add_argument("response")
+    helper.add_argument("package_name")
+    helper.add_argument("output_path")
+    helper = sub.add_parser("package-versions")
+    helper.add_argument("path")
+    helper = sub.add_parser("value")
+    helper.add_argument("manifest")
+    helper.add_argument("expression")
+    helper = sub.add_parser("platform-value")
+    helper.add_argument("manifest")
+    helper.add_argument("platform")
+    helper.add_argument("field")
+    helper = sub.add_parser("sha256")
+    helper.add_argument("path")
+    helper = sub.add_parser("size")
+    helper.add_argument("path")
+    helper = sub.add_parser("extract")
+    helper.add_argument("archive")
+    helper.add_argument("destination")
+    helper.add_argument("platform")
+    helper = sub.add_parser("entitlements")
+    helper.add_argument("path")
+    helper.add_argument("relative")
+    helper = sub.add_parser("protocol")
+    helper.add_argument("path")
     args = parser.parse_args()
     try:
         if args.command == "fixture":
@@ -526,31 +527,29 @@ def main():
             validate_skill_source_paths(json.loads(Path(args.manifest).read_text()), args.catalog_output)
         elif args.command == "codex-home":
             validate_codex_home_template(args.root)
-        elif args.command in ("generation", "release"):
-            outer = json.loads(Path(args.manifest).read_text())
-        if args.command == "generation":
-            validate_generation(outer, args.generation, args.platform, require_installable=args.installable)
+        elif args.command == "generation":
+            validate_generation(json.loads(Path(args.manifest).read_text()), args.generation, args.platform, require_installable=args.installable)
         elif args.command == "release":
-            validate_release(args.root, outer, args.platform)
-        elif args.command == 'package-page':
+            validate_release(args.root, json.loads(Path(args.manifest).read_text()), args.platform)
+        elif args.command == "package-page":
             collect_package_page(args.response, args.package_name, args.output_path)
-        elif args.command == 'package-versions':
+        elif args.command == "package-versions":
             package_versions(args.path)
-        elif args.command == 'value':
+        elif args.command == "value":
             manifest_value(args.manifest, args.expression)
-        elif args.command == 'platform-value':
+        elif args.command == "platform-value":
             platform_value(args.manifest, args.platform, args.field)
-        elif args.command == 'sha256':
+        elif args.command == "sha256":
             sha256_file(args.path)
-        elif args.command == 'size':
+        elif args.command == "size":
             file_size(args.path)
-        elif args.command == 'extract':
+        elif args.command == "extract":
             extract_archive(args.archive, args.destination, args.platform)
-        elif args.command == 'entitlements':
+        elif args.command == "entitlements":
             validate_entitlements(args.path, args.relative)
-        elif args.command == 'protocol':
+        elif args.command == "protocol":
             protocol_version(args.path)
-    except (OSError, json.JSONDecodeError, ValidationError) as error:
+    except (OSError, json.JSONDecodeError, tarfile.TarError, KeyError, ValidationError) as error:
         parser.exit(1, f"generation validation: {error}\n")
 
 
