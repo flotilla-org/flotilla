@@ -4286,6 +4286,7 @@ async fn convoy_explain_surfaces_queued_turn_age_and_blocker() {
     assert_eq!(turns.len(), 1);
     assert_eq!(turns[0].source, "review");
     assert_eq!(turns[0].subject_revision, "head");
+    assert_eq!(serde_json::to_value(&turns[0]).unwrap()["rung"], "warm-session");
     assert_eq!(turns[0].queued_at, queued_at.to_rfc3339());
     assert_eq!(turns[0].age_seconds, 601);
     assert!(turns[0].overdue);

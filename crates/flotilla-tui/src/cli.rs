@@ -1100,7 +1100,10 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                 turn.vessel,
                 turn.role,
                 turn.subject_revision,
-                turn.rung,
+                match turn.rung {
+                    flotilla_protocol::TurnDeliveryRung::WarmSession => "warm-session",
+                    flotilla_protocol::TurnDeliveryRung::FreshAgent => "fresh-agent",
+                },
                 turn.queued_at,
                 turn.age_seconds,
                 if turn.overdue { " OVERDUE" } else { "" },

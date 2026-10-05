@@ -336,13 +336,14 @@ fn convoy_explain_formats_queued_turn_age_and_blocker() {
         "change_request_stale_after_seconds": 30, "checkouts": [], "change_requests": [], "subscriptions": [],
         "crew_deliveries": [], "decision_ledgers": [], "settlement": {"mode": "no_exit", "satisfied": false, "unmet": []},
         "queued_turns": [{"source": "review", "subject_revision": "head", "vessel": "work", "role": "coder", "message_id": "turn",
-            "rung": "WarmSession", "queued_at": "2026-10-05T13:42:35+00:00", "age_seconds": 301,
+            "rung": "warm-session", "queued_at": "2026-10-05T13:42:35+00:00", "age_seconds": 301,
             "blocking_reason": "attention Unobservable; waiting for turn readiness or submission evidence", "overdue": true}]
     }))
     .unwrap();
     let output = format_convoy_explanation_human(&explanation);
     assert!(output.contains("Queued turns (not submitted):"), "{output}");
     assert!(output.contains("review work/coder revision=head"), "{output}");
+    assert!(output.contains("rung=warm-session"), "{output}");
     assert!(output.contains("age=301s OVERDUE: attention Unobservable"), "{output}");
 }
 

@@ -1133,6 +1133,8 @@ impl LeafSubscriptionTable {
                     judged_claim_at: judged_at,
                     outcome: TurnDeliveryOutcome::Queued {
                         rung,
+                        // Start the age at acceptance, after credential staging and remote delivery.
+                        // The earlier `now` is also wall time and precedes the actuator call.
                         queued_at: Utc::now(),
                         vessel: rule.to.vessel.clone(),
                         role: rule.to.role.clone(),
@@ -1216,6 +1218,17 @@ fn compose_subject_turn_brief(
     )
 }
 
+pub(crate) fn queued_turn_session<'a>(
+    sessions: &'a BTreeMap<String, ResourceObject<TerminalSession>>,
+    vessel: &str,
+    role: &str,
+) -> Option<&'a ResourceObject<TerminalSession>> {
+    sessions.values().find(|session| {
+        session.metadata.labels.get(VESSEL_LABEL).is_some_and(|label| label == vessel)
+            && session.metadata.labels.get(ROLE_LABEL).is_some_and(|label| label == role)
+    })
+}
+
 pub(crate) fn queued_turn_evidence(session: Option<&ResourceObject<TerminalSession>>, message_id: &str) -> (bool, String) {
     let Some(session) = session else { return (false, "terminal session unavailable".into()) };
     let status = session.status.as_ref();
@@ -1297,35 +1310,30 @@ impl ReconcilerWake {
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         let Some(status) = &convoy.status else { return Ok(()) };
-        if status.phase.is_terminal() {
-            return Ok(());
-        }
+        let mut observations = Vec::new();
         for (source, delivery) in &status.turn_deliveries {
             for episode in &delivery.episodes {
                 let TurnDeliveryOutcome::Queued { vessel, role, message_id, .. } = &episode.outcome else { continue };
-                let session = sessions.values().find(|session| {
-                    session.metadata.labels.get(VESSEL_LABEL) == Some(vessel) && session.metadata.labels.get(ROLE_LABEL) == Some(role)
-                });
-                let (confirmed, blocking_reason) = queued_turn_evidence(session, message_id);
-                let patch = flotilla_resources::ConvoyStatusPatch::ObserveQueuedTurnDelivery {
+                let (confirmed, blocking_reason) = queued_turn_evidence(queued_turn_session(sessions, vessel, role), message_id);
+                observations.push(flotilla_resources::QueuedTurnObservation {
                     source: source.clone(),
                     subject_revision: episode.subject_revision.clone(),
                     confirmed,
                     blocking_reason,
-                    observed_at: now,
-                };
-                let mut next = status.clone();
-                patch.apply(&mut next);
-                if next != *status {
-                    flotilla_resources::apply_status_patch(
-                        &self.subscriptions.inner.backend.clone().using::<Convoy>(namespace),
-                        &convoy.metadata.name,
-                        &patch,
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                }
+                });
             }
+        }
+        let patch = flotilla_resources::ConvoyStatusPatch::ObserveQueuedTurnDeliveries { observations, observed_at: now };
+        let mut next = status.clone();
+        patch.apply(&mut next);
+        if next != *status {
+            flotilla_resources::apply_status_patch(
+                &self.subscriptions.inner.backend.clone().using::<Convoy>(namespace),
+                &convoy.metadata.name,
+                &patch,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -3129,6 +3137,13 @@ mod tests {
                     assert_eq!(*queued_at, start);
                     assert!(blocking_reason.contains("attention"));
                 }
+                // Terminal settlement can race a submission receipt. It must neither
+                // strand the episode nor retain its queued-turn advisory.
+                let convoy = convoys.get("stalled-work").await.unwrap();
+                let mut status = convoy.status.unwrap();
+                let terminal_phase = [ConvoyPhase::Landed, ConvoyPhase::Failed, ConvoyPhase::Cancelled, ConvoyPhase::Abandoned][state];
+                status.phase = terminal_phase;
+                convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.unwrap();
                 let session = sessions.get("resumed-coder").await.unwrap();
                 if receipt_kind == 2 {
                     let mut spec = session.spec.clone();
@@ -3156,10 +3171,60 @@ mod tests {
                     rung: delivered_rung, ..
                 } if delivered_rung == rung));
                 assert!(status.attention.is_none());
+                assert_eq!(status.phase, terminal_phase, "receipt observations must preserve the terminal outcome");
                 assert_eq!(status.turn_deliveries["review"].episodes.len(), 1);
                 assert_eq!(queued_turn_evidence(None, "turn"), (false, "terminal session unavailable".into()));
             }
         });
+    }
+
+    // A health tick applies all queued observations atomically, with one resource
+    // watch event even when several blockers and the advisory attention change.
+    #[tokio::test]
+    async fn queued_turn_observations_write_once_per_convoy() {
+        use futures::FutureExt;
+        let (backend, wake, _) = idle_nudge_scenario().await;
+        let now = Utc::now();
+        let convoys = backend.using::<Convoy>("flotilla");
+        let convoy = convoys.get("stalled-work").await.unwrap();
+        let mut status = convoy.status.unwrap();
+        status.phase = ConvoyPhase::Interrupted;
+        status.stalled = None;
+        status.attention = None;
+        for source in ["review", "checks"] {
+            status.turn_deliveries.insert(source.into(), flotilla_resources::TurnDeliveryStatus {
+                episodes: vec![TurnDeliveryEpisode {
+                    subject_revision: "head".into(),
+                    evidence_at: now,
+                    judged_claim_at: now,
+                    outcome: TurnDeliveryOutcome::Queued {
+                        rung: TurnDeliveryRung::WarmSession,
+                        queued_at: now - chrono::Duration::seconds(301),
+                        vessel: "work".into(),
+                        role: "coder".into(),
+                        message_id: source.into(),
+                        blocking_reason: "initial".into(),
+                    },
+                    sender: Default::default(),
+                }],
+                ..Default::default()
+            });
+        }
+        let convoy = convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.unwrap();
+        let mut watch = convoys.watch(WatchStart::Now).await.unwrap();
+        wake.observe_queued_turns("flotilla", &convoy, &BTreeMap::new(), now).await.unwrap();
+        assert!(matches!(watch.next().await.unwrap().unwrap(), WatchEvent::Modified(_)));
+        assert!(watch.next().now_or_never().is_none(), "one tick must emit only one status update");
+        let observed = convoys.get("stalled-work").await.unwrap();
+        let attention = observed.status.as_ref().unwrap().attention.as_ref().unwrap();
+        assert!(attention.reason.contains("review"));
+        assert!(attention.reason.contains("checks"));
+        for delivery in observed.status.as_ref().unwrap().turn_deliveries.values() {
+            let TurnDeliveryOutcome::Queued { blocking_reason, .. } = &delivery.episodes[0].outcome else { panic!("queued") };
+            assert_eq!(blocking_reason, "terminal session unavailable");
+        }
+        wake.observe_queued_turns("flotilla", &observed, &BTreeMap::new(), now).await.unwrap();
+        assert!(watch.next().now_or_never().is_none(), "unchanged batches must not write");
     }
 
     // #2560: the inactivity bound follows the newest tool/hook evidence, not

@@ -469,7 +469,7 @@ pub struct ExplainedQueuedTurn {
     pub vessel: String,
     pub role: String,
     pub message_id: String,
-    pub rung: String,
+    pub rung: TurnDeliveryRung,
     pub queued_at: String,
     pub age_seconds: i64,
     pub blocking_reason: String,

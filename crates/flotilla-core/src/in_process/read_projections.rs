@@ -1075,9 +1075,7 @@ impl ReadProjections<'_> {
                     else {
                         return None;
                     };
-                    let session = selected_sessions.values().find(|session| {
-                        session.metadata.labels.get(VESSEL_LABEL) == Some(vessel) && session.metadata.labels.get(ROLE_LABEL) == Some(role)
-                    });
+                    let session = crate::leaf_engine::queued_turn_session(&selected_sessions, vessel, role);
                     let (confirmed, blocking_reason) = crate::leaf_engine::queued_turn_evidence(session, message_id);
                     // A receipt can arrive between health ticks; explain must not call it blocked.
                     if confirmed {
@@ -1090,7 +1088,7 @@ impl ReadProjections<'_> {
                         vessel: vessel.clone(),
                         role: role.clone(),
                         message_id: message_id.clone(),
-                        rung: format!("{rung:?}"),
+                        rung: *rung,
                         queued_at: queued_at.to_rfc3339(),
                         age_seconds: age.num_seconds().max(0),
                         blocking_reason,
