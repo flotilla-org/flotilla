@@ -1202,3 +1202,42 @@ async fn slow_replica_watch_is_bounded() {
 async fn replica_snapshots_reconcile_without_relay_resurrection() {
     common::contract::assert_replica_snapshot_reconciliation(backend()).await;
 }
+
+// #2640 review: resnapshot writes scale with changed keys. SQLite triggers
+// enforce that unchanged replica rows receive no INSERT, UPDATE or DELETE.
+#[tokio::test]
+async fn snapshot_skips_unchanged_sqlite_rows_while_applying_changes() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("resources.sqlite");
+    let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite"));
+    let source = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default()).using::<Convoy>("flotilla");
+    for name in ["unchanged", "updated", "deleted"] {
+        source.create(&convoy_meta(name), &convoy_spec("before")).await.expect("create");
+    }
+    let writer = backend.replica_writer::<Convoy>(flotilla_protocol::NodeId::new("origin"), "flotilla");
+    writer.replace(&source.list().await.expect("snapshot"), Utc::now()).await.expect("seed");
+    let connection = rusqlite::Connection::open(&path).expect("raw sqlite");
+    connection
+        .execute_batch(
+            r#"
+        CREATE TRIGGER reject_unchanged_insert BEFORE INSERT ON replica_objects
+        WHEN NEW.name = 'unchanged' BEGIN SELECT RAISE(ABORT, 'unchanged insert'); END;
+        CREATE TRIGGER reject_unchanged_update BEFORE UPDATE ON replica_objects
+        WHEN OLD.name = 'unchanged' BEGIN SELECT RAISE(ABORT, 'unchanged update'); END;
+        CREATE TRIGGER reject_unchanged_delete BEFORE DELETE ON replica_objects
+        WHEN OLD.name = 'unchanged' BEGIN SELECT RAISE(ABORT, 'unchanged delete'); END;
+    "#,
+        )
+        .expect("install write guards");
+    let before = source.get("updated").await.expect("get");
+    source.update(&convoy_meta("updated"), &before.metadata.resource_version, &convoy_spec("after")).await.expect("update");
+    source.delete("deleted").await.expect("delete");
+    source.create(&convoy_meta("added"), &convoy_spec("after")).await.expect("add");
+    writer.replace(&source.list().await.expect("snapshot"), Utc::now()).await.expect("resync must not write unchanged rows");
+    let read = backend.including_replicas::<Convoy>("flotilla");
+    assert_eq!(read.list().await.expect("replicas").items.len(), 3);
+    assert_eq!(read.get("updated").await.expect("updated").object.spec.workflow_ref, "after");
+    assert_eq!(read.get("added").await.expect("added").object.spec.workflow_ref, "after");
+    assert!(matches!(read.get("deleted").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+    writer.replace(&source.list().await.expect("snapshot"), Utc::now()).await.expect("repeat resync without row writes");
+}

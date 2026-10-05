@@ -1197,3 +1197,71 @@ fn generated_missed_delete_resync(tc: hegel::TestCase) {
         .expect("runtime")
         .block_on(missed_delete_scenario(gap, failure));
 }
+
+// #2640 review: unfiltered origin watches use a dense numeric sequence scoped
+// to (kind, namespace). Other namespaces must not cause gap-repair snapshots.
+#[tokio::test(start_paused = true)]
+async fn other_namespace_writes_do_not_force_replication_resnapshots() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use flotilla_daemon::server::test_support::spawn_in_memory_request_mesh_with_filter;
+    use flotilla_protocol::{CommandAction, PeerWireMessage, RoutedPeerMessage};
+
+    for sqlite in [false, true] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
+        let feta = if sqlite {
+            sqlite_daemon(temp.path().join("feta"), "feta-root", "feta").await
+        } else {
+            daemon(temp.path().join("feta"), "feta-root", "feta").await
+        };
+        let origin = feta.node_id().clone();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let filter = {
+            let requests = Arc::clone(&requests);
+            Arc::new(move |message: PeerWireMessage| {
+                if let PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { target_node_id, command, .. }) = &message {
+                    if target_node_id == &origin
+                        && matches!(&command.action,
+                        CommandAction::ResourceWatch { kind, replica_sources: false, .. } if kind == "convoys")
+                    {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                Some(message)
+            })
+        };
+        let authority = feta.resource_backend().using::<Convoy>("flotilla");
+        let meta = InputMeta::builder().name("retained".to_string()).build();
+        let spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).build();
+        let created = authority.create(&meta, &spec).await.expect("create");
+        let mesh = spawn_in_memory_request_mesh_with_filter(vec![Arc::clone(&kiwi), Arc::clone(&feta)], Some(&["Convoy"]), filter)
+            .await
+            .expect("connect mesh");
+        await_replica_names(&kiwi, &["retained"]).await;
+        let snapshots = requests.load(Ordering::SeqCst);
+        let other = feta.resource_backend().using::<Convoy>("other-namespace");
+        other.create(&meta, &spec).await.expect("create in other namespace");
+        other.delete("retained").await.expect("delete in other namespace");
+        let updated = authority
+            .update(&meta, &created.metadata.resource_version, &ConvoySpec::builder().workflow_ref("updated-workflow".to_string()).build())
+            .await
+            .expect("update origin");
+        assert_eq!(
+            updated.metadata.resource_version.parse::<u64>().expect("numeric version"),
+            created.metadata.resource_version.parse::<u64>().expect("numeric version") + 1
+        );
+        let mut converged = false;
+        for _ in 0..500 {
+            let record = kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get("retained").await.expect("replica");
+            if record.object.metadata.resource_version == updated.metadata.resource_version {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(converged, "live update must arrive");
+        assert_eq!(requests.load(Ordering::SeqCst), snapshots, "other namespaces must not force resnapshot");
+        drop(mesh);
+    }
+}

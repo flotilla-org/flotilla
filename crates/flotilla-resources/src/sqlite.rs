@@ -1121,24 +1121,19 @@ impl SqliteBackend {
                         .map_err(|err| Self::map_sqlite(err, "query old sqlite replicas"))?;
                     rows.collect::<Result<HashMap<_, _>, _>>().map_err(|err| Self::map_sqlite(err, "read old sqlite replica row"))?
                 };
-                tx.execute(
-                    r#"
-                    DELETE FROM replica_objects
-                    WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5
-                    "#,
-                    params![origin, key.0, key.1, key.2, key.3],
-                )
-                .map_err(|err| Self::map_sqlite(err, "clear sqlite replica partition"))?;
                 for (name, body) in &encoded {
-                    let object_synced =
-                        old.get(name).filter(|(old_body, _)| old_body == body).map(|(_, timestamp)| timestamp).unwrap_or(&synced);
+                    if old.get(name).is_some_and(|(old_body, _)| old_body == body) {
+                        continue;
+                    }
                     tx.execute(
                         r#"
                         INSERT INTO replica_objects
                             (origin_root, group_name, version, kind, namespace, name, body_json, last_synced_at)
                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                        ON CONFLICT(origin_root, group_name, version, kind, namespace, name)
+                        DO UPDATE SET body_json = excluded.body_json, last_synced_at = excluded.last_synced_at
                         "#,
-                        params![origin, key.0, key.1, key.2, key.3, name, body, object_synced],
+                        params![origin, key.0, key.1, key.2, key.3, name, body, synced],
                     )
                     .map_err(|err| Self::map_sqlite(err, "insert sqlite replica object"))?;
                     tx.execute(
@@ -1152,6 +1147,14 @@ impl SqliteBackend {
                 }
                 let new_names = encoded.iter().map(|(name, _)| name.clone()).collect::<std::collections::HashSet<_>>();
                 for name in old.keys().filter(|name| !new_names.contains(*name)) {
+                    tx.execute(
+                        r#"
+                        DELETE FROM replica_objects
+                        WHERE origin_root = ?1 AND group_name = ?2 AND version = ?3 AND kind = ?4 AND namespace = ?5 AND name = ?6
+                        "#,
+                        params![origin, key.0, key.1, key.2, key.3, name],
+                    )
+                    .map_err(|err| Self::map_sqlite(err, "remove snapshot-deleted replica"))?;
                     tx.execute(
                         r#"
                         INSERT INTO replica_tombstones (origin_root, group_name, version, kind, namespace, name, last_synced_at)

@@ -558,6 +558,9 @@ async fn apply_http_watch<T: Resource>(
 
 // The origin's per-kind sequence includes deletes. Never advance past a hole,
 // including a historical event skipped during schema-decode quarantine.
+// These watches are unfiltered. Both authoritative stores assign numeric, dense
+// versions independently per (group, version, kind, namespace), not Kubernetes'
+// opaque versions. Relay writes must not alter this direct stream's position.
 fn check_sequence<T: Resource>(version: &mut Option<String>, event: &WatchEvent<T>) -> Result<(), String> {
     let next = match event {
         WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => &object.metadata.resource_version,
@@ -654,8 +657,11 @@ async fn run_routed_watch<T: Resource>(
                         }
                     }
                 }
+                let was_initializing = initializing;
                 apply_response(&writer, &mut initial, &mut initializing, *response).await?;
-                if version.is_none() && !initializing {
+                if was_initializing && !initializing {
+                    // The snapshot's final bookmark is the position preceding
+                    // the first live event, so that first event is checked too.
                     version = Some(snapshot_version);
                 }
             }
