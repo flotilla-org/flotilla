@@ -1,7 +1,10 @@
 """Real-boundary regressions for the multi-host wedge family."""
 
 import json
+import os
+import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +17,8 @@ from conftest import (
     stop_daemon,
     wait_for,
 )
+
+REFRESH_SCRIPT = Path(__file__).parent / "docker" / "refresh-authorized-keys.sh"
 
 RECONNECT_MESSAGES = (
     "SSH connection dropped, will reconnect",
@@ -114,6 +119,62 @@ def wait_connected():
     )
 
 
+@pytest.mark.parametrize("read_fails", [False, True])
+def test_00_key_refresh_preserves_published_keys(tmp_path, read_fails):
+    shared = tmp_path / "shared"
+    ssh = tmp_path / "ssh"
+    binaries = tmp_path / "bin"
+    for directory in (shared, ssh, binaries):
+        directory.mkdir()
+    (shared / "a.pub").write_text("peer-a\n")
+    (shared / "b.pub").write_text("peer-b\n")
+    authorized = ssh / "authorized_keys"
+    authorized.write_text("previous-keys\n")
+    authorized.chmod(0o600)
+
+    # Pause the real refresh after a partial read, widening the race without
+    # relying on scheduler timing. A failed read must preserve the old keys too.
+    started = tmp_path / "started"
+    release = tmp_path / "release"
+    cat = binaries / "cat"
+    cat.write_text(
+        "#!/usr/bin/env bash\n"
+        'head -n 1 "$1"\n'
+        'touch "$REFRESH_STARTED"\n'
+        'while [ ! -e "$REFRESH_RELEASE" ]; do sleep 0.01; done\n'
+        'if [ "$REFRESH_FAIL" = 1 ]; then exit 1; fi\n'
+        "shift\n"
+        'exec /bin/cat "$@"\n'
+    )
+    cat.chmod(0o755)
+    process = subprocess.Popen(
+        [
+            "bash", str(REFRESH_SCRIPT), str(shared), str(ssh),
+            f"{os.getuid()}:{os.getgid()}",
+        ],
+        env={
+            **os.environ,
+            "PATH": f"{binaries}:{os.environ['PATH']}",
+            "REFRESH_STARTED": str(started),
+            "REFRESH_RELEASE": str(release),
+            "REFRESH_FAIL": "1" if read_fails else "0",
+        },
+    )
+    try:
+        wait_for(started.exists, "partial key read", timeout=5, interval=0.01)
+        assert authorized.read_text() == "previous-keys\n"
+        release.touch()
+        assert process.wait(timeout=5) == 0
+        expected = "previous-keys\n" if read_fails else "peer-a\npeer-b\n"
+        assert authorized.read_text() == expected
+        assert authorized.stat().st_mode & 0o777 == 0o600
+        assert authorized.stat().st_uid == os.getuid()
+        assert list(ssh.iterdir()) == [authorized]
+    finally:
+        release.touch()
+        process.wait(timeout=5)
+
+
 def test_01_one_sided_daemon_restart_recovers(topology):
     """#992: a restarted peer gets a new generation and resumes replication."""
     initial_generation = max(peer_generations())
@@ -159,13 +220,16 @@ def test_01_one_sided_daemon_restart_recovers(topology):
 
 
 def test_02_transport_death_re_resolves_forwarded_socket(topology):
-    """#1008: killing only SSH recovers the same daemon session promptly."""
+    """#1008/#2667: SSH death reconverges within four attempts and 30 seconds."""
+    max_attempts = 4
+    recovery_timeout = 30
     initial_generation = max(peer_generations())
     remote_pid = docker_exec(
         "node-b", "cat ~/.config/flotilla/flotillad.pid"
     ).stdout.strip()
     initial_log = daemon_log("node-a")
     killed_at = time.monotonic()
+    deadline = killed_at + recovery_timeout
     killed = docker_exec(
         "node-a", "pkill -f '^ssh -N -L '"
     )
@@ -174,27 +238,54 @@ def test_02_transport_death_re_resolves_forwarded_socket(topology):
         f"stdout: {killed.stdout}\nstderr: {killed.stderr}"
     )
 
-    wait_for(
-        lambda: max(peer_generations(), default=0) > initial_generation,
+    def within_attempt_budget():
+        attempts = [
+            int(event["fields"]["attempt"])
+            for event in daemon_events("node-a", len(initial_log))
+            if event.get("fields", {}).get("message") == "reconnecting after backoff"
+        ]
+        assert max(attempts, default=0) <= max_attempts, (
+            f"transport exceeded {max_attempts} reconnect attempts: {attempts}\n"
+            f"{daemon_log('node-a')[len(initial_log):]}"
+        )
+
+    def transport_reconnected():
+        within_attempt_budget()
+        return (
+            max(peer_generations(), default=0) > initial_generation
+            and peer_entry()["link"] == "Connected"
+        )
+
+    def wait_for_recovery(predicate, description, interval):
+        try:
+            wait_for(
+                predicate,
+                description,
+                timeout=max(0, deadline - time.monotonic()),
+                interval=interval,
+            )
+        except TimeoutError as error:
+            raise AssertionError(
+                f"transport and replication should reconverge within {recovery_timeout} seconds: "
+                f"{description}\n{daemon_log('node-a')[len(initial_log):]}"
+            ) from error
+
+    wait_for_recovery(
+        transport_reconnected,
         "SSH transport reconnects with a new forwarded socket",
-        timeout=10,
         interval=0.25,
     )
-    assert time.monotonic() - killed_at < 5, (
-        "transport should recover within the first one-second backoff"
-    )
-    wait_connected()
     assert docker_exec(
         "node-b", "cat ~/.config/flotilla/flotillad.pid"
     ).stdout.strip() == remote_pid
-    recovery_log = daemon_log("node-a")[len(initial_log):]
-    assert "reconnection failed" not in recovery_log
-
+    # Each successful kill/reconnect advances the generation, so repetitions
+    # get distinct markers and must observe a new write, never an old replica.
+    marker_name = f"transport-recovery-{initial_generation}"
     document = "\n".join([
         "apiVersion: flotilla.work/v1",
         "kind: Host",
         "metadata:",
-        "  name: transport-recovery",
+        f"  name: {marker_name}",
         "  namespace: flotilla",
         "spec: {}",
         "",
@@ -210,20 +301,24 @@ def test_02_transport_death_re_resolves_forwarded_socket(topology):
     assert applied.returncode == 0, applied.stderr
 
     def template_replicated():
+        within_attempt_budget()
         listed = flotilla_json(
             "node-a",
             "resource list hosts --include-replicas",
         )
         return any(
-            item["metadata"]["name"] == "transport-recovery"
+            item["metadata"]["name"] == marker_name
             for item in listed_objects(listed)
         )
 
-    wait_for(
+    wait_for_recovery(
         template_replicated,
         "replicators re-resolve the replacement forwarded socket",
-        timeout=10,
         interval=0.5,
+    )
+    assert time.monotonic() <= deadline, (
+        f"transport and replication should reconverge within {recovery_timeout} seconds\n"
+        f"{daemon_log('node-a')[len(initial_log):]}"
     )
 
 
