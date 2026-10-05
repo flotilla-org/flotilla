@@ -26,6 +26,7 @@ impl Arg {
         let indent = "  ".repeat(depth);
         match self {
             Arg::Literal(s) => write!(f, "{indent}{s}"),
+            // Display is a diagnostic tree, not executable shell syntax.
             Arg::EnvAssignment { key, value } => write!(f, "{indent}{key}={value:?}"),
             Arg::Quoted(s) => write!(f, "{indent}\"{s}\""),
             Arg::NestedCommand(inner) => {
@@ -65,12 +66,7 @@ pub fn flatten(args: &[Arg], depth: usize) -> String {
             Arg::Literal(s) => s.clone(),
             Arg::Quoted(s) => shell_quote(s),
             Arg::EnvAssignment { key, value } => {
-                let mut bytes = key.bytes();
-                assert!(
-                    bytes.next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
-                        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_'),
-                    "invalid environment assignment key: {key:?}"
-                );
+                validate_env_key(key).expect("invalid environment assignment key");
                 format!("{key}={}", shell_quote(value))
             }
             Arg::NestedCommand(inner) => {
@@ -80,6 +76,16 @@ pub fn flatten(args: &[Arg], depth: usize) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Validate a shell environment identifier before constructing an assignment.
+pub fn validate_env_key(key: &str) -> Result<(), String> {
+    let mut bytes = key.bytes();
+    if bytes.next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_') && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        Ok(())
+    } else {
+        Err(format!("invalid environment assignment key: {key:?}"))
+    }
 }
 
 pub fn shell_quote(s: &str) -> String {

@@ -34,6 +34,7 @@ impl TerminalPool for PassthroughTerminalPool {
         if !env_vars.is_empty() {
             args.push(Arg::Literal("env".into()));
             for (k, v) in env_vars {
+                flotilla_protocol::arg::validate_env_key(k)?;
                 args.push(Arg::EnvAssignment { key: k.clone(), value: v.clone() });
             }
         }
@@ -88,6 +89,16 @@ mod tests {
     }
 
     // ── attach_args tests ──────────────────────────────────────────
+
+    // Bad caller-supplied names are recoverable errors before shell flattening.
+    #[test]
+    fn attach_args_rejects_invalid_env_keys() {
+        let pool = PassthroughTerminalPool;
+        for key in ["", "FOO-BAR", "A=B", "9KEY", "A;cmd"] {
+            let env = vec![(key.to_string(), "value".to_string())];
+            assert!(pool.attach_args("s", "bash", &ExecutionEnvironmentPath::new("/tmp"), &env).is_err());
+        }
+    }
 
     #[test]
     fn attach_args_simple_command() {
