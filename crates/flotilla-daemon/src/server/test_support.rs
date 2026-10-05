@@ -4,7 +4,7 @@ use flotilla_client::SocketDaemon;
 use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_protocol::{
     result_set::{ConvoyPhase, ConvoyRow},
-    CommandCaller, HostName, NodeInfo, ResourceRef, SurfaceDeclaration,
+    CommandCaller, GoodbyeReason, HostName, NodeInfo, PeerWireMessage, ResourceRef, SurfaceDeclaration,
 };
 use flotilla_resources::{api_version, Convoy, InputMeta, Project, ProjectSpec, Resource, WorkflowTemplate};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
@@ -12,7 +12,11 @@ use tokio::sync::{mpsc, watch, Mutex, Notify};
 use super::{build_remote_command_router, peer_runtime::PeerRuntime, spawn_peer_networking_runtime};
 use crate::{
     blob_store::TieredBlobStore,
-    peer::{channel_transport::channel_transport_pair_with_nodes, PeerManager},
+    peer::{
+        channel_transport::{channel_transport_pair_with_nodes, ChannelTransport},
+        transport::{PeerConnectionStatus, PeerSender, PeerTransport},
+        PeerManager,
+    },
     server::PeerConnectionEvent,
 };
 
@@ -90,6 +94,16 @@ pub async fn spawn_in_memory_request_mesh_with_replication_kinds(
     hosts: Vec<Arc<InProcessDaemon>>,
     replication_kinds: Option<&'static [&'static str]>,
 ) -> Result<InMemoryRequestMesh, String> {
+    spawn_in_memory_request_mesh_with_filter(hosts, replication_kinds, Arc::new(Some)).await
+}
+
+/// A network-boundary fault injector for replication scenarios. Returning None
+/// drops one envelope; changing a request can simulate a failed authoritative list.
+pub async fn spawn_in_memory_request_mesh_with_filter(
+    hosts: Vec<Arc<InProcessDaemon>>,
+    replication_kinds: Option<&'static [&'static str]>,
+    filter: EnvelopeFilter,
+) -> Result<InMemoryRequestMesh, String> {
     if hosts.is_empty() {
         return Err("request mesh needs at least one host".into());
     }
@@ -111,13 +125,13 @@ pub async fn spawn_in_memory_request_mesh_with_replication_kinds(
                 flotilla_protocol::ConfigLabel(hosts[right].host_name().to_string()),
                 hosts[right].host_name().clone(),
                 None,
-                Box::new(left_transport),
+                Box::new(FilteredTransport { inner: left_transport, filter: Arc::clone(&filter) }),
             );
             peer_managers[right].lock().await.add_configured_target(
                 flotilla_protocol::ConfigLabel(hosts[left].host_name().to_string()),
                 hosts[left].host_name().clone(),
                 None,
-                Box::new(right_transport),
+                Box::new(FilteredTransport { inner: right_transport, filter: Arc::clone(&filter) }),
             );
         }
     }
@@ -357,4 +371,58 @@ async fn spawn_in_memory_request_topology_stateful_with_options(
         shutdown_tx,
         _tasks: vec![leader_runtime_handle, follower_runtime_handle, client_session_handle],
     })
+}
+
+pub type EnvelopeFilter = Arc<dyn Fn(PeerWireMessage) -> Option<PeerWireMessage> + Send + Sync>;
+
+struct FilteredTransport {
+    inner: ChannelTransport,
+    filter: EnvelopeFilter,
+}
+
+struct FilteredSender {
+    inner: Arc<dyn PeerSender>,
+    filter: EnvelopeFilter,
+}
+
+#[async_trait::async_trait]
+impl PeerSender for FilteredSender {
+    async fn send(&self, message: PeerWireMessage) -> Result<(), String> {
+        match (self.filter)(message) {
+            Some(message) => self.inner.send(message).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn retire(&self, reason: GoodbyeReason) -> Result<(), String> {
+        self.inner.retire(reason).await
+    }
+}
+
+#[async_trait::async_trait]
+impl PeerTransport for FilteredTransport {
+    async fn connect(&mut self) -> Result<(), String> {
+        self.inner.connect().await
+    }
+    async fn disconnect(&mut self) -> Result<(), String> {
+        self.inner.disconnect().await
+    }
+    fn status(&self) -> PeerConnectionStatus {
+        self.inner.status()
+    }
+    fn connection_address(&self) -> String {
+        self.inner.connection_address()
+    }
+    async fn subscribe(&mut self) -> Result<mpsc::Receiver<PeerWireMessage>, String> {
+        self.inner.subscribe().await
+    }
+    fn sender(&self) -> Option<Arc<dyn PeerSender>> {
+        self.inner.sender().map(|inner| Arc::new(FilteredSender { inner, filter: Arc::clone(&self.filter) }) as Arc<dyn PeerSender>)
+    }
+    fn remote_session_id(&self) -> Option<uuid::Uuid> {
+        self.inner.remote_session_id()
+    }
+    fn remote_node_info(&self) -> Option<NodeInfo> {
+        self.inner.remote_node_info()
+    }
 }

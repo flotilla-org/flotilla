@@ -288,7 +288,7 @@ async fn resource_http_lists_and_watches_over_a_unix_socket() {
 }
 
 #[tokio::test]
-async fn http_replication_skips_an_old_schema_event_and_reaches_unrelated_resources() {
+async fn http_replication_resnapshots_old_cursor_without_replaying_undecodable_history() {
     let temp = tempfile::tempdir().expect("tempdir");
     let origin_path = temp.path().join("origin.sqlite");
     let origin = ResourceBackend::Sqlite(SqliteBackend::open(&origin_path).expect("open origin store"));
@@ -386,14 +386,11 @@ async fn http_replication_skips_an_old_schema_event_and_reaches_unrelated_resour
     .await
     .expect("replication should advance past the quarantined event");
 
+    // #2636: a reconnect uses the complete current snapshot even when its old
+    // cursor could resume. Superseded history need not decode to recover state;
+    // the storage replay-quarantine contract remains covered in resources tests.
     let diagnostics = origin.diagnostics().await.expect("read origin diagnostics").expect("sqlite diagnostics");
-    let [quarantine] = diagnostics.event_decode_quarantines.as_slice() else {
-        panic!("expected one visible event quarantine, got {:?}", diagnostics.event_decode_quarantines)
-    };
-    assert_eq!(quarantine.kind, "Convoy");
-    assert_eq!(quarantine.name, "superseded");
-    assert_eq!(quarantine.event_version, 1);
-    assert!(quarantine.error.contains("workflow_ref"), "unexpected quarantine error: {}", quarantine.error);
+    assert!(diagnostics.event_decode_quarantines.is_empty(), "snapshot recovery must not need historical replay");
 
     replicator.abort();
     server.abort();

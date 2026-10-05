@@ -6,9 +6,7 @@ use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_protocol::NodeId;
 #[cfg(feature = "test-support")]
-use flotilla_protocol::{
-    Command, CommandAction, CommandValue, DaemonEvent, ResourceCursor, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordType,
-};
+use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordType};
 use flotilla_resources::{
     HttpBackend, ReadWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceProvenance, WatchEvent, WatchStart,
 };
@@ -22,6 +20,8 @@ use tracing::{debug, warn};
 use super::remote_commands::RemoteCommandRouter;
 
 const REPLICATION_NAMESPACE: &str = "flotilla";
+// Interim anti-entropy until bucket digests avoid transferring unchanged stores.
+const REPLICATION_RESYNC: Duration = Duration::from_secs(300);
 const REPLICATION_RETRY: RetryBackoff =
     RetryBackoff { initial: Duration::from_millis(100), maximum: Duration::from_secs(30), reset_after: Duration::from_secs(60) };
 
@@ -516,56 +516,61 @@ pub(super) async fn replicate_kind_over_http<T: Resource>(
 ) -> Result<(), String> {
     let remote = ResourceBackend::Http(http).using::<T>(REPLICATION_NAMESPACE);
     let writer = store.backend(daemon).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
-    let mut listed = remote.list().await.map_err(|error| error.to_string())?;
-    // Validate the persisted cache before trusting its cursor. The SQLite
-    // backend quarantines an undecodable replica partition and removes this
-    // cursor, turning a cache schema mismatch into the full relist below.
-    store.backend(daemon).including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
-    let cursor = writer.cursor().await.map_err(|error| error.to_string())?;
-    if let Some(cursor) = cursor.clone().filter(|cursor| cursor.generation == listed.generation) {
-        let start = match cursor.generation {
-            Some(generation) => WatchStart::FromVersionInGeneration { generation, resource_version: cursor.resource_version },
-            None => WatchStart::FromVersion(cursor.resource_version),
-        };
-        match remote.watch(start).await {
-            Ok(watch) => {
-                daemon.report_resource_replication_healthy(peer, &store.health_kind::<T>()).await;
-                match apply_http_watch(watch, &writer).await {
-                    Ok(()) => return Ok(()),
-                    Err(error) => {
-                        debug!(%peer, kind = T::API_PATHS.kind, %error, "replica cursor watch failed; relisting origin");
-                        listed = remote.list().await.map_err(|error| error.to_string())?;
-                    }
-                }
+    let mut retried_watch = false;
+    loop {
+        // A cursor is only a log position: relayed or skipped events can advance
+        // it without delivering every key. Reconcile the successful complete
+        // listing before trusting a resumed watch, including absent keys.
+        let listed = remote.list().await.map_err(|error| error.to_string())?;
+        // Quarantine incompatible persisted replicas before replacement emits
+        // deletion events containing their old bodies.
+        store.backend(daemon).including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
+        let start = WatchStart::resuming_from(&listed);
+        writer.replace(&listed, Utc::now()).await.map_err(|error| error.to_string())?;
+        let watch = remote.watch(start).await.map_err(|error| error.to_string())?;
+        daemon.report_resource_replication_healthy(peer, &store.health_kind::<T>()).await;
+        match tokio::time::timeout(REPLICATION_RESYNC, apply_http_watch(watch, &writer, listed.resource_version)).await {
+            Ok(Err(error)) if !retried_watch => {
+                debug!(%peer, kind = T::API_PATHS.kind, %error, "replica watch failed; relisting origin");
+                retried_watch = true;
             }
-            Err(error) => {
-                debug!(%peer, kind = T::API_PATHS.kind, %error, "replica cursor rejected; relisting origin");
-            }
+            Ok(result) => return result,
+            Err(_) => retried_watch = false,
         }
-    } else if cursor.is_some() {
-        debug!(
-            %peer,
-            kind = T::API_PATHS.kind,
-            stored_generation = ?cursor.as_ref().and_then(|cursor| cursor.generation.as_deref()),
-            origin_generation = ?listed.generation,
-            "replica origin generation changed; replacing local view"
-        );
     }
-
-    let start = WatchStart::resuming_from(&listed);
-    writer.replace(&listed, Utc::now()).await.map_err(|error| error.to_string())?;
-    let watch = remote.watch(start).await.map_err(|error| error.to_string())?;
-    daemon.report_resource_replication_healthy(peer, &store.health_kind::<T>()).await;
-    apply_http_watch(watch, &writer).await
 }
 
 async fn apply_http_watch<T: Resource>(
     mut watch: flotilla_resources::WatchStream<T>,
     writer: &flotilla_resources::ReplicaWriter<T>,
+    snapshot_version: String,
 ) -> Result<(), String> {
+    // Relay updates share the writer but cannot move this direct stream's
+    // expected sequence. Its position starts at the authoritative snapshot.
+    let mut version = Some(snapshot_version);
     while let Some(event) = watch.next().await {
-        writer.apply(event.map_err(|error| error.to_string())?, Utc::now()).await.map_err(|error| error.to_string())?;
+        let event = event.map_err(|error| error.to_string())?;
+        check_sequence(&mut version, &event)?;
+        writer.apply(event, Utc::now()).await.map_err(|error| error.to_string())?;
     }
+    Ok(())
+}
+
+// The origin's per-kind sequence includes deletes. Never advance past a hole,
+// including a historical event skipped during schema-decode quarantine.
+fn check_sequence<T: Resource>(version: &mut Option<String>, event: &WatchEvent<T>) -> Result<(), String> {
+    let next = match event {
+        WatchEvent::Added(object) | WatchEvent::Modified(object) | WatchEvent::Deleted(object) => &object.metadata.resource_version,
+        WatchEvent::DeletedByName(tombstone) => &tombstone.resource_version,
+    };
+    if let Some(previous) = version {
+        let previous = previous.parse::<u64>().map_err(|error| error.to_string())?;
+        let next_number = next.parse::<u64>().map_err(|error| error.to_string())?;
+        if previous.checked_add(1) != Some(next_number) {
+            return Err(format!("resourceVersion sequence gap: after {previous}, received {next_number}; resnapshot required"));
+        }
+    }
+    *version = Some(next.clone());
     Ok(())
 }
 
@@ -576,18 +581,11 @@ async fn replicate_kind_over_routed_watch<T: Resource>(
     peer: &NodeId,
     store: ReplicationStore,
 ) -> Result<(), String> {
-    let writer = store.backend(daemon).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     store.backend(daemon).including_replicas::<T>(REPLICATION_NAMESPACE).list().await.map_err(|error| error.to_string())?;
-    let cursor = writer.cursor().await.map_err(|error| error.to_string())?;
-    match run_routed_watch::<T>(router, daemon, peer, cursor.clone(), store).await {
-        Ok(()) => Ok(()),
-        Err(error)
-            if cursor.is_some() && (error.contains("expired") || error.contains("generation") || error.contains("resourceVersion")) =>
-        {
-            debug!(%peer, kind = T::API_PATHS.kind, %error, "replica cursor rejected; relisting origin");
-            run_routed_watch::<T>(router, daemon, peer, None, store).await
-        }
-        Err(error) => Err(error),
+    loop {
+        // Cursor-less watches send a complete snapshot followed by a bookmark.
+        // Only that bookmark commits replacement; partial/failed lists do nothing.
+        run_routed_watch::<T>(router, daemon, peer, store).await?;
     }
 }
 
@@ -596,11 +594,8 @@ async fn run_routed_watch<T: Resource>(
     router: &RemoteCommandRouter,
     daemon: &Arc<InProcessDaemon>,
     peer: &NodeId,
-    cursor: Option<flotilla_resources::ReplicaCursor>,
     store: ReplicationStore,
 ) -> Result<(), String> {
-    let resuming = cursor.is_some();
-    let protocol_cursor = cursor.map(|cursor| ResourceCursor::from_position(cursor.resource_version, cursor.generation));
     let mut events = daemon.subscribe();
     let command_id = router
         .dispatch_execute_for_principal(
@@ -614,7 +609,7 @@ async fn run_routed_watch<T: Resource>(
                     name: None,
                     include_replicas: false,
                     replica_sources: false,
-                    cursor: protocol_cursor,
+                    cursor: None,
                 },
             },
             None,
@@ -623,10 +618,20 @@ async fn run_routed_watch<T: Resource>(
     daemon.report_resource_replication_healthy(peer, &store.health_kind::<T>()).await;
     let writer = store.backend(daemon).replica_writer::<T>(peer.clone(), REPLICATION_NAMESPACE);
     let mut initial = Vec::<ResourceObject<T>>::new();
-    let mut initializing = !resuming;
+    let mut initializing = true;
 
+    let deadline = tokio::time::sleep(REPLICATION_RESYNC);
+    tokio::pin!(deadline);
+    let mut version = None;
     loop {
-        match events.recv().await {
+        let received = tokio::select! {
+            result = events.recv() => result,
+            _ = &mut deadline => {
+                router.dispatch_cancel(command_id).await?;
+                return Ok(());
+            }
+        };
+        match received {
             Ok(DaemonEvent::CommandStepUpdate {
                 command_id: event_command_id,
                 status: flotilla_protocol::StepStatus::Produced { value },
@@ -638,7 +643,21 @@ async fn run_routed_watch<T: Resource>(
                 if response.resource_kind != T::API_PATHS.kind {
                     continue;
                 }
+                let snapshot_version = response.cursor.position()?.0;
+                if !initializing {
+                    for record in &response.records {
+                        if let Some(event) = record_watch_event::<T>(record.clone())? {
+                            if let Err(error) = check_sequence(&mut version, &event) {
+                                let _ = router.dispatch_cancel(command_id).await;
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
                 apply_response(&writer, &mut initial, &mut initializing, *response).await?;
+                if version.is_none() && !initializing {
+                    version = Some(snapshot_version);
+                }
             }
             Ok(DaemonEvent::CommandFinished { command_id: event_command_id, result, .. }) if event_command_id == command_id => {
                 return match result {
@@ -649,7 +668,7 @@ async fn run_routed_watch<T: Resource>(
             }
             Ok(_) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!(%peer, kind = T::API_PATHS.kind, skipped, "resource replicator lagged; reconnect will resume from stored cursor");
+                warn!(%peer, kind = T::API_PATHS.kind, skipped, "resource replicator lagged; reconnect will resnapshot");
                 return Err("resource replicator event subscriber lagged".to_string());
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err("daemon event stream closed".to_string()),

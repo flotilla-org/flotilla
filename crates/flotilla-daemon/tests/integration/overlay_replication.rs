@@ -1014,3 +1014,186 @@ async fn observed_resources_replicate_checkout_queries_and_independent_attach_ta
     assert!(kiwi.resolve_attach_command_on_host_internal("terminal-independent", Some(&HostName::new("feta"))).await.is_err());
     drop(topology);
 }
+
+// #2636: a missed deletion followed by a later event advances the cursor past
+// the tombstone. A successful authoritative snapshot must repair the object set.
+#[tokio::test]
+async fn reconnect_repairs_a_delete_missing_before_the_cursor() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
+    let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
+    let authority = feta.resource_backend().using::<Convoy>("flotilla");
+    authority
+        .create(&InputMeta::builder().name("gone".to_string()).build(), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
+        .await
+        .expect("create");
+    let writer = kiwi.resource_backend().replica_writer::<Convoy>(feta.node_id().clone(), "flotilla");
+    writer.replace(&authority.list().await.expect("snapshot"), chrono::Utc::now()).await.expect("seed replica");
+    authority.delete("gone").await.expect("delete");
+    let retained = authority
+        .create(
+            &InputMeta::builder().name("retained".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("later create");
+    writer.apply(flotilla_resources::WatchEvent::Added(retained), chrono::Utc::now()).await.expect("deliver later event only");
+    let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("reconnect");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let listed = kiwi.resource_backend().including_replicas::<Convoy>("flotilla").list().await.expect("replicas");
+            if listed.items.len() == 1 && listed.items[0].object.metadata.name == "retained" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("resync must remove the missed deletion and retain live objects");
+    drop(topology);
+}
+
+async fn await_replica_names(daemon: &InProcessDaemon, expected: &[&str]) {
+    // Allow bounded retry backoff (five virtual seconds): a sequence gap must repair now,
+    // whereas a missing final event is repaired by the periodic resnapshot.
+    for _ in 0..500 {
+        let mut names: Vec<_> = daemon
+            .resource_backend()
+            .including_replicas::<Convoy>("flotilla")
+            .list()
+            .await
+            .expect("replicas")
+            .items
+            .into_iter()
+            .map(|source| source.object.metadata.name)
+            .collect();
+        names.sort();
+        if names == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "replicas did not converge to {expected:?}: {:?}",
+        daemon.resource_backend().including_replicas::<Convoy>("flotilla").list().await.expect("replicas")
+    );
+}
+
+async fn missed_delete_scenario(sequence_gap: bool, fail_resync: bool) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use flotilla_daemon::server::test_support::spawn_in_memory_request_mesh_with_filter;
+    use flotilla_protocol::{
+        CommandAction, CommandPeerEvent, CommandValue, PeerWireMessage, ResourceRecordType, RoutedPeerMessage, StepStatus,
+    };
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
+    let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
+    let authority = feta.resource_backend().using::<Convoy>("flotilla");
+    let spec = ConvoySpec::builder().workflow_ref("workflow".to_string()).build();
+    for name in ["gone", "retained"] {
+        authority.create(&InputMeta::builder().name(name.to_string()).build(), &spec).await.expect("create");
+    }
+    let failing = Arc::new(AtomicBool::new(false));
+    let failures = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    // Stands in for the peer network boundary, dropping deletion envelopes and
+    // making snapshot requests fail at the real authoritative dispatcher.
+    let filter = {
+        let failing = Arc::clone(&failing);
+        let failures = Arc::clone(&failures);
+        let dropped = Arc::clone(&dropped);
+        Arc::new(move |mut message: PeerWireMessage| {
+            if let PeerWireMessage::Routed(RoutedPeerMessage::CommandRequest { command, .. }) = &mut message {
+                if let CommandAction::ResourceWatch { kind, replica_sources: false, .. } = &mut command.action {
+                    if kind == "convoys" && failing.load(Ordering::SeqCst) {
+                        *kind = "unavailable-test-kind".to_string();
+                        failures.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+            if let PeerWireMessage::Routed(RoutedPeerMessage::CommandEvent { event, .. }) = &message {
+                if let CommandPeerEvent::StepUpdate { status: StepStatus::Produced { value }, .. } = event.as_ref() {
+                    if let CommandValue::ResourceWatchEvent(response) = value.as_ref() {
+                        if response.resource_kind == "Convoy"
+                            && response.records.iter().any(|record| record.record_type == ResourceRecordType::Deleted)
+                        {
+                            dropped.fetch_add(1, Ordering::SeqCst);
+                            return None;
+                        }
+                    }
+                }
+            }
+            Some(message)
+        })
+    };
+    let mesh = spawn_in_memory_request_mesh_with_filter(vec![Arc::clone(&kiwi), Arc::clone(&feta)], Some(&["Convoy"]), filter)
+        .await
+        .expect("connect mesh");
+    await_replica_names(&kiwi, &["gone", "retained"]).await;
+    authority.delete("gone").await.expect("delete at authority");
+    for _ in 0..20_000 {
+        if dropped.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(dropped.load(Ordering::SeqCst) > 0, "test must actually drop the deletion");
+    failing.store(fail_resync, Ordering::SeqCst);
+    if sequence_gap {
+        let current = authority.get("retained").await.expect("live object");
+        authority
+            .update(
+                &InputMeta::builder().name("retained".to_string()).build(),
+                &current.metadata.resource_version,
+                &ConvoySpec::builder().workflow_ref("updated-workflow".to_string()).build(),
+            )
+            .await
+            .expect("deliver event after gap");
+    } else {
+        tokio::time::advance(Duration::from_secs(301)).await;
+    }
+    if fail_resync {
+        for _ in 0..500 {
+            if failures.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(failures.load(Ordering::SeqCst) > 0, "test must exercise a failed listing");
+        await_replica_names(&kiwi, &["gone", "retained"]).await;
+        failing.store(false, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(31)).await;
+    }
+    await_replica_names(&kiwi, &["retained"]).await;
+    drop(mesh);
+}
+
+// #2636: a hole in the origin's event sequence forces a complete snapshot
+// before accepting subsequent events, preserving live objects.
+#[tokio::test(start_paused = true)]
+async fn sequence_gap_repairs_a_missed_delete() {
+    missed_delete_scenario(true, false).await;
+}
+
+// #2636: a missed final delete has no subsequent sequence to check. Periodic
+// resync repairs it, but a transient failed listing must drop nothing.
+#[tokio::test(start_paused = true)]
+async fn periodic_resync_preserves_replicas_on_listing_failure_then_repairs() {
+    missed_delete_scenario(false, true).await;
+}
+
+// Generated scenario choices cover a final missing event versus a sequence hole,
+// and transient snapshot failure versus success. Each phase checks the object set.
+#[hegel::test]
+fn generated_missed_delete_resync(tc: hegel::TestCase) {
+    let gap = tc.draw(hegel::generators::booleans());
+    let failure = tc.draw(hegel::generators::booleans());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("runtime")
+        .block_on(missed_delete_scenario(gap, failure));
+}

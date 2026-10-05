@@ -420,3 +420,8 @@ fn current_position_tracks_mutation_sequences(tc: hegel::TestCase) {
         }
     });
 }
+
+#[tokio::test]
+async fn replica_snapshots_reconcile_without_relay_resurrection() {
+    common::contract::assert_replica_snapshot_reconciliation(ResourceBackend::InMemory(InMemoryBackend::default())).await;
+}

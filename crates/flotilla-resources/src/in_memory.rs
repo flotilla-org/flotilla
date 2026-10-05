@@ -387,13 +387,21 @@ impl InMemoryBackend {
         let mut state = self.replicas.lock().await;
         let old = state.partitions.remove(&replica_key).unwrap_or_default();
         let mut objects = HashMap::new();
-        let mut synced_at_by_name = HashMap::new();
+        let mut synced_at_by_name = old.synced_at_by_name;
         for object in &listed.items {
-            objects.insert(object.metadata.name.clone(), Self::encode_object(object)?);
-            synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
+            let name = &object.metadata.name;
+            let encoded = Self::encode_object(object)?;
+            let unchanged = old.objects.get(name) == Some(&encoded);
+            objects.insert(name.clone(), encoded);
+            if !unchanged {
+                synced_at_by_name.insert(name.clone(), synced_at);
+            }
         }
         let mut events = Vec::new();
         for (name, value) in &objects {
+            if old.objects.get(name) == Some(value) {
+                continue;
+            }
             events.push(StoredReplicaEvent {
                 origin_root: origin_root.clone(),
                 synced_at,
@@ -403,6 +411,8 @@ impl InMemoryBackend {
         }
         for (name, value) in old.objects {
             if !objects.contains_key(&name) {
+                // Fence stale relays as well as removing the visible replica.
+                synced_at_by_name.insert(name, synced_at);
                 events.push(StoredReplicaEvent {
                     origin_root: origin_root.clone(),
                     synced_at,

@@ -1197,3 +1197,8 @@ async fn slow_convoy_watch_is_bounded() {
 async fn slow_replica_watch_is_bounded() {
     common::contract::assert_slow_replica_watch_is_bounded(backend()).await;
 }
+
+#[tokio::test]
+async fn replica_snapshots_reconcile_without_relay_resurrection() {
+    common::contract::assert_replica_snapshot_reconciliation(backend()).await;
+}

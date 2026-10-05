@@ -1239,3 +1239,35 @@ pub async fn assert_slow_replica_watch_is_bounded(backend: ResourceBackend) {
     writer.apply(WatchEvent::Modified(object), Utc::now()).await.expect("replicate after recovery");
     assert!(matches!(recovered.next().await, Some(Ok(flotilla_resources::ReadWatchEvent::Modified(_)))));
 }
+
+// #2636: complete snapshots remove absent keys, preserve unchanged provenance,
+// and fence delayed relay writes. Empty/repeated snapshots are safe as well.
+pub async fn assert_replica_snapshot_reconciliation(backend: ResourceBackend) {
+    let authority = ResourceBackend::InMemory(InMemoryBackend::default()).using::<Convoy>("flotilla");
+    authority.create(&convoy_meta("gone"), &convoy_spec("template")).await.expect("create");
+    authority.create(&convoy_meta("retained"), &convoy_spec("template")).await.expect("create");
+    let initial = authority.list().await.expect("initial snapshot");
+    let synced = Utc::now();
+    let writer = backend.replica_writer::<Convoy>(flotilla_protocol::NodeId::new("authority"), "flotilla");
+    writer.replace(&initial, synced).await.expect("seed");
+    authority.delete("gone").await.expect("delete");
+    let current = authority.list().await.expect("current snapshot");
+    writer.replace(&current, synced + chrono::Duration::seconds(1)).await.expect("resync");
+    let read = backend.including_replicas::<Convoy>("flotilla");
+    assert_eq!(read.list().await.expect("replicas").items.len(), 1);
+    assert!(matches!(read.get("retained").await.expect("retained").provenance,
+        ResourceProvenance::Replica { last_synced_at, .. } if last_synced_at == synced));
+    writer
+        .apply(WatchEvent::Added(initial.items.iter().find(|object| object.metadata.name == "gone").expect("old object").clone()), synced)
+        .await
+        .expect("delayed relay");
+    assert!(matches!(read.get("gone").await, Err(flotilla_resources::ResourceError::NotFound { .. })));
+    authority.delete("retained").await.expect("delete remaining");
+    let empty = authority.list().await.expect("empty snapshot");
+    for _ in 0..2 {
+        writer.replace(&empty, synced + chrono::Duration::seconds(2)).await.expect("empty resync");
+        assert!(read.list().await.expect("empty replicas").items.is_empty());
+    }
+    writer.apply(WatchEvent::Added(initial.items[0].clone()), synced).await.expect("old relay after repeated empty snapshot");
+    assert!(read.list().await.expect("fenced replicas").items.is_empty());
+}
