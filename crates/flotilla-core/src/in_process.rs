@@ -8,8 +8,6 @@ mod attach;
 mod checkout_providers;
 mod crew_ops;
 pub(crate) use crew_ops::convoy_message_address;
-#[cfg(test)]
-use crew_ops::{convoy_sender_address, frame_crew_message, queue_pending_crew_message, terminal_meta_with_vessel_credentials};
 pub use crew_ops::{ConvoyResumeOutcome, CrewRoutingContext};
 use crew_ops::{CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator};
 // Exercise the real controller in the existing private daemon scenario harness

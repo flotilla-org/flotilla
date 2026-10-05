@@ -44,6 +44,9 @@ pub(super) struct CheckoutLifetimeKey {
 
 pub(super) type CheckoutVcsCache = HashMap<CheckoutLifetimeKey, Arc<OnceCell<Arc<CheckoutProvider>>>>;
 
+/// Shares VCS lookup state between the daemon and CrewService.
+/// InProcessDaemon drives retirement through the observed-checkout watch;
+/// CrewService uses lookup leases for archive pushes.
 #[derive(bon::Builder)]
 pub(super) struct CheckoutProviders {
     resource_backend: ResourceBackend,
