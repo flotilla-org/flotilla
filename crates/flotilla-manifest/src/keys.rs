@@ -312,7 +312,7 @@ pub const KEY_VESSEL_MINIMAL_ALTERNATIVES: &str = "flotilla.vessel.minimal_alter
 /// Image reference used at provisioning; absent for host-direct.
 pub const KEY_VESSEL_IMAGE_REF: &str = "flotilla.vessel.image_ref";
 
-/// Full immutable image digest reported at provisioning.
+/// Historical presentation key for the immutable local Docker image ID.
 pub const KEY_VESSEL_IMAGE_DIGEST: &str = "flotilla.vessel.image_digest";
 
 /// First twelve digest characters, excluding the algorithm prefix.

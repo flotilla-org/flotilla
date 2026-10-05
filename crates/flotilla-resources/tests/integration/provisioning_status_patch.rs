@@ -125,14 +125,15 @@ fn environment_status_patch_marks_ready_and_failed() {
         configured_limits: None,
         docker_container_id: Some("container-123".to_string()),
         image_ref: Some("registry.example/crew:latest".to_string()),
-        image_digest: Some("sha256:first".to_string()),
+        local_image_id: Some("sha256:first".to_string()),
+        registry_digest: None,
     }
     .apply(&mut status);
     assert_eq!(status.phase, EnvironmentPhase::Ready);
     assert!(status.ready);
     assert_eq!(status.docker_container_id.as_deref(), Some("container-123"));
     assert_eq!(status.image_ref.as_deref(), Some("registry.example/crew:latest"));
-    assert_eq!(status.image_digest.as_deref(), Some("sha256:first"));
+    assert_eq!(status.local_image_id.as_deref(), Some("sha256:first"));
 
     EnvironmentStatusPatch::MarkFailed { message: "docker run failed".to_string() }.apply(&mut status);
     assert_eq!(status.phase, EnvironmentPhase::Failed);
@@ -364,7 +365,8 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
         placement_decision: None,
         environment_ref: Some("env-a".to_string()),
         image_ref: Some("registry.example/crew:latest".to_string()),
-        image_digest: Some("sha256:test-image".to_string()),
+        local_image_id: Some("sha256:test-image".to_string()),
+        registry_digest: None,
         checkout_refs: Default::default(),
         terminal_session_refs: vec!["term-a".to_string(), "term-b".to_string()],
         requested_stance: Stance::WorkspaceWrite,
@@ -375,14 +377,15 @@ fn vessel_status_patch_marks_provisioning_ready_and_failed() {
     assert_eq!(status.phase, VesselPhase::Ready);
     assert_eq!(status.terminal_session_refs.len(), 2);
     assert_eq!(status.image_ref.as_deref(), Some("registry.example/crew:latest"));
-    assert_eq!(status.image_digest.as_deref(), Some("sha256:test-image"));
+    assert_eq!(status.local_image_id.as_deref(), Some("sha256:test-image"));
 
     VesselStatusPatch::MarkReady {
         configured_limits: None,
         placement_decision: None,
         environment_ref: Some("env-a".to_string()),
         image_ref: Some("registry.example/crew:latest".to_string()),
-        image_digest: Some("sha256:test-image".to_string()),
+        local_image_id: Some("sha256:test-image".to_string()),
+        registry_digest: None,
         checkout_refs: Default::default(),
         terminal_session_refs: vec!["term-a".to_string(), "term-b".to_string()],
         requested_stance: Stance::WorkspaceWrite,

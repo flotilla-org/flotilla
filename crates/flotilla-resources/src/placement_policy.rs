@@ -125,7 +125,10 @@ pub enum DockerCheckoutStrategy {
 #[serde(untagged)]
 pub enum DockerImageSource {
     Literal(String),
+    // Generation 1 baseline remains authoritative. Retire after generation 2
+    // stops writing baseline references and its subsequent fleet roll.
     Baseline { image_baseline_ref: String },
+    Composition { composition: Box<crate::ImageComposition> },
 }
 
 impl From<String> for DockerImageSource {
@@ -146,24 +149,20 @@ impl DockerImageSource {
     /// an operator rather than silently using a deterministic merge winner.
     pub async fn resolve(&self, baselines: &DefinitionResolver<CrewImageBaseline>) -> Result<String, String> {
         match self {
+            Self::Composition { composition } => {
+                if let Some(identity) = &composition.identity {
+                    identity.validate()?;
+                    return Ok(identity.registry_digest.as_ref().unwrap_or(&identity.local_image_id).clone());
+                }
+                composition
+                    .baseline_image
+                    .clone()
+                    .filter(|image| !image.trim().is_empty())
+                    .ok_or_else(|| "image composition awaits placement-time build identity".to_string())
+            }
             Self::Literal(image) if !image.trim().is_empty() => Ok(image.clone()),
             Self::Literal(_) => Err("placement image is empty".to_string()),
-            Self::Baseline { image_baseline_ref: name } => {
-                let baseline = baselines.get(name).await.map_err(|error| format!("image-baseline `{name}` missing/unresolved: {error}"))?;
-                let unresolved = if baseline.metadata.deletion_timestamp.is_some() {
-                    Some("baseline is deleted")
-                } else if baseline.metadata.merge.as_ref().is_some_and(|merge| !merge.conflicts.is_empty()) {
-                    Some("baseline has unresolved merge conflicts")
-                } else if baseline.spec.image.trim().is_empty() {
-                    Some("baseline image is empty")
-                } else {
-                    None
-                };
-                if let Some(reason) = unresolved {
-                    return Err(format!("image-baseline `{name}` missing/unresolved: {reason}"));
-                }
-                Ok(baseline.spec.image)
-            }
+            Self::Baseline { image_baseline_ref: name } => Ok(CrewImageBaseline::resolve(name, baselines).await?.image),
         }
     }
 }

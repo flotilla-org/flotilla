@@ -756,7 +756,8 @@ mod tests {
                     finished_at: None,
                     message: None,
                     image_ref: None,
-                    image_digest: None,
+                    local_image_id: None,
+                    registry_digest: None,
                 })
                 .collect(),
             started_at: None,

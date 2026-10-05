@@ -22,7 +22,8 @@ pub struct DockerProvisioning {
     pub configured_limits: Option<ConfiguredResourceLimits>,
     pub container_id: String,
     pub image_ref: String,
-    pub image_digest: String,
+    pub local_image_id: String,
+    pub registry_digest: Option<String>,
 }
 
 pub struct EnvironmentReconciler<R> {
@@ -118,14 +119,16 @@ where
                 configured_limits: None,
                 docker_container_id: None,
                 image_ref: None,
-                image_digest: None,
+                local_image_id: None,
+                registry_digest: None,
             }),
             EnvironmentPhase::Pending => match prepared {
                 EnvironmentPrepared::Ready(provisioning) => Some(EnvironmentStatusPatch::MarkReady {
                     configured_limits: provisioning.configured_limits.clone(),
                     docker_container_id: Some(provisioning.container_id.clone()),
                     image_ref: Some(provisioning.image_ref.clone()),
-                    image_digest: Some(provisioning.image_digest.clone()),
+                    local_image_id: Some(provisioning.local_image_id.clone()),
+                    registry_digest: provisioning.registry_digest.clone(),
                 }),
                 EnvironmentPrepared::Failed(message) => Some(EnvironmentStatusPatch::MarkFailed { message: message.clone() }),
                 EnvironmentPrepared::Foreign | EnvironmentPrepared::None => None,

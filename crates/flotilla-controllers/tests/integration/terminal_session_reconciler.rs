@@ -40,8 +40,14 @@ async fn create_ready_environment(backend: &ResourceBackend, name: &str) {
         .await
         .expect("create environment");
     let mut status = EnvironmentStatus::default();
-    EnvironmentStatusPatch::MarkReady { configured_limits: None, docker_container_id: None, image_ref: None, image_digest: None }
-        .apply(&mut status);
+    EnvironmentStatusPatch::MarkReady {
+        configured_limits: None,
+        docker_container_id: None,
+        image_ref: None,
+        local_image_id: None,
+        registry_digest: None,
+    }
+    .apply(&mut status);
     environments.update_status(name, &environment.metadata.resource_version, &status).await.expect("mark environment ready");
 }
 
@@ -266,8 +272,14 @@ async fn terminal_session_failure_uses_injected_now_for_stopped_at() {
     environments
         .update_status("env-a", &env.metadata.resource_version, &{
             let mut status = EnvironmentStatus::default();
-            EnvironmentStatusPatch::MarkReady { configured_limits: None, docker_container_id: None, image_ref: None, image_digest: None }
-                .apply(&mut status);
+            EnvironmentStatusPatch::MarkReady {
+                configured_limits: None,
+                docker_container_id: None,
+                image_ref: None,
+                local_image_id: None,
+                registry_digest: None,
+            }
+            .apply(&mut status);
             status
         })
         .await
@@ -877,8 +889,14 @@ impl WorldBuilder for GhostRecoveryWorldBuilder {
             .await
             .map_err(|error| error.to_string())?;
         let mut env_status = EnvironmentStatus::default();
-        EnvironmentStatusPatch::MarkReady { configured_limits: None, docker_container_id: None, image_ref: None, image_digest: None }
-            .apply(&mut env_status);
+        EnvironmentStatusPatch::MarkReady {
+            configured_limits: None,
+            docker_container_id: None,
+            image_ref: None,
+            local_image_id: None,
+            registry_digest: None,
+        }
+        .apply(&mut env_status);
         environments
             .update_status("host-direct-feta", &env.metadata.resource_version, &env_status)
             .await
@@ -1148,8 +1166,14 @@ async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
         .await
         .expect("environment");
     let mut env_status = EnvironmentStatus::default();
-    EnvironmentStatusPatch::MarkReady { configured_limits: None, docker_container_id: None, image_ref: None, image_digest: None }
-        .apply(&mut env_status);
+    EnvironmentStatusPatch::MarkReady {
+        configured_limits: None,
+        docker_container_id: None,
+        image_ref: None,
+        local_image_id: None,
+        registry_digest: None,
+    }
+    .apply(&mut env_status);
     environments.update_status("env-a", &env.metadata.resource_version, &env_status).await.expect("ready environment");
     let input = InputMeta::builder()
         .name("term-a".to_string())

@@ -205,10 +205,39 @@ pub struct FulfilmentFacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub free_vessel_slots: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
+    pub image: Option<FulfilmentImage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_present: Option<bool>,
     pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FulfilmentImage {
+    pub image_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_image_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_digest: Option<String>,
+}
+impl From<String> for FulfilmentImage {
+    fn from(image_ref: String) -> Self {
+        Self { image_ref, local_image_id: None, registry_digest: None }
+    }
+}
+impl<'de> Deserialize<'de> for FulfilmentImage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // ADR 0047: remove old string decoding one roll after generation 1.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Record {
+            Legacy(String),
+            Current { image_ref: String, local_image_id: Option<String>, registry_digest: Option<String> },
+        }
+        Ok(match Record::deserialize(deserializer)? {
+            Record::Legacy(image_ref) => image_ref.into(),
+            Record::Current { image_ref, local_image_id, registry_digest } => Self { image_ref, local_image_id, registry_digest },
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

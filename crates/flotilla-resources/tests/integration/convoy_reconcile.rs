@@ -767,15 +767,15 @@ fn vessel_meta(name: &str, convoy_name: &str, task: &str) -> InputMeta {
 }
 
 fn vessel_object(convoy_name: &str, task: &str, phase: VesselPhase, message: Option<&str>) -> flotilla_resources::ResourceObject<Vessel> {
-    vessel_object_with_image_digest(convoy_name, task, phase, message, "sha256:first")
+    vessel_object_with_local_image_id(convoy_name, task, phase, message, "sha256:first")
 }
 
-fn vessel_object_with_image_digest(
+fn vessel_object_with_local_image_id(
     convoy_name: &str,
     task: &str,
     phase: VesselPhase,
     message: Option<&str>,
-    image_digest: &str,
+    local_image_id: &str,
 ) -> flotilla_resources::ResourceObject<Vessel> {
     let repository_key =
         flotilla_resources::RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository identity").key();
@@ -797,7 +797,8 @@ fn vessel_object_with_image_digest(
             observed_policy_version: Some("19".to_string()),
             environment_ref: Some(format!("env-{task}")),
             image_ref: Some("registry.example/crew:latest".to_string()),
-            image_digest: Some(image_digest.to_string()),
+            local_image_id: Some(local_image_id.to_string()),
+            registry_digest: None,
             checkout_refs: BTreeMap::from([(repository_key, format!("checkout-{task}"))]),
             terminal_session_refs: vec![format!("terminal-{task}-coder")],
             interrupted_roles: (phase == VesselPhase::Interrupted).then(|| "coder".to_string()).into_iter().collect(),
@@ -2317,7 +2318,7 @@ async fn ready_task_with_ready_workspace_moves_to_launching() {
                 && placement.fields.get("environment_ref") == Some(&serde_json::Value::String("env-implement".to_string()))
                 && placement.fields.get("image_ref")
                     == Some(&serde_json::Value::String("registry.example/crew:latest".to_string()))
-                && placement.fields.get("image_digest") == Some(&serde_json::Value::String("sha256:first".to_string()))
+                && placement.fields.get("local_image_id") == Some(&serde_json::Value::String("sha256:first".to_string()))
                 && placement.fields.get("checkout_refs") == Some(&expected_checkout_refs)
     ));
 }
@@ -2332,7 +2333,7 @@ async fn same_image_tag_moving_between_convoys_produces_distinct_settlement_test
         let outcome = reconcile_once_with_resources(
             &convoy,
             None,
-            vec![vessel_object_with_image_digest(convoy_name, "implement", VesselPhase::Ready, None, digest)],
+            vec![vessel_object_with_local_image_id(convoy_name, "implement", VesselPhase::Ready, None, digest)],
             Vec::new(),
             timestamp(20),
         )
@@ -2347,9 +2348,9 @@ async fn same_image_tag_moving_between_convoys_produces_distinct_settlement_test
     let second = testimony("convoy-second", "sha256:second").await;
 
     assert_eq!(first.fields.get("image_ref"), second.fields.get("image_ref"));
-    assert_eq!(first.fields.get("image_digest"), Some(&serde_json::json!("sha256:first")));
-    assert_eq!(second.fields.get("image_digest"), Some(&serde_json::json!("sha256:second")));
-    assert_ne!(first.fields.get("image_digest"), second.fields.get("image_digest"));
+    assert_eq!(first.fields.get("local_image_id"), Some(&serde_json::json!("sha256:first")));
+    assert_eq!(second.fields.get("local_image_id"), Some(&serde_json::json!("sha256:second")));
+    assert_ne!(first.fields.get("local_image_id"), second.fields.get("local_image_id"));
 }
 
 #[tokio::test]

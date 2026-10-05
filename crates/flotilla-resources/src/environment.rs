@@ -87,7 +87,11 @@ pub struct EnvironmentStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_digest: Option<String>,
+    // ADR 0047: remove image_digest alias one roll after generation 1.
+    #[serde(alias = "image_digest")]
+    pub local_image_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,7 +109,8 @@ pub enum EnvironmentStatusPatch {
         configured_limits: Option<ConfiguredResourceLimits>,
         docker_container_id: Option<String>,
         image_ref: Option<String>,
-        image_digest: Option<String>,
+        local_image_id: Option<String>,
+        registry_digest: Option<String>,
     },
     MarkFailed {
         message: String,
@@ -125,13 +130,14 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
             Self::ObserveRuntime { observation } => status.runtime_observation.get_or_insert_with(Default::default).merge(observation),
             Self::CredentialDelivery { retry } => status.credential_delivery_retry = retry.clone(),
             Self::CredentialRefresh { retry } => status.credential_refresh_retry = retry.clone(),
-            Self::MarkReady { configured_limits, docker_container_id, image_ref, image_digest } => {
+            Self::MarkReady { configured_limits, docker_container_id, image_ref, local_image_id, registry_digest } => {
                 status.configured_limits = configured_limits.clone();
                 status.phase = EnvironmentPhase::Ready;
                 status.ready = true;
                 status.docker_container_id = docker_container_id.clone();
                 status.image_ref = image_ref.clone();
-                status.image_digest = image_digest.clone();
+                status.local_image_id = local_image_id.clone();
+                status.registry_digest = registry_digest.clone();
                 status.message = None;
             }
             Self::MarkFailed { message } => {

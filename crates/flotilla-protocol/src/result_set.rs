@@ -1233,9 +1233,11 @@ pub struct VesselRow {
     /// Placement image reference as named when this vessel was provisioned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
-    /// Immutable Docker image content digest actually run by this vessel.
+    /// Immutable local Docker image ID actually run by this vessel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_digest: Option<String>,
+    pub local_image_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_digest: Option<String>,
     /// Names of sibling vessels this vessel depends on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]

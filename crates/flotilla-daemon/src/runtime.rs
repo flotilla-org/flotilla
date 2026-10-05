@@ -2875,10 +2875,8 @@ async fn migrate_listed_placement_policies(
                 updated.cost_class = existing.spec.cost_class;
                 // Platform is a host fact. Correct an initial local-OS
                 // registration when an agentless SSH host reports its own OS.
-                updated.grants.retain(|grant| !matches!(grant, flotilla_resources::FulfilmentGrant::Platform(_)));
-                updated
-                    .grants
-                    .extend(spec.grants.iter().filter(|grant| matches!(grant, flotilla_resources::FulfilmentGrant::Platform(_))).cloned());
+                updated.grants.retain(|grant| !grant.0.starts_with("platform:"));
+                updated.grants.extend(spec.grants.iter().filter(|grant| grant.0.starts_with("platform:")).cloned());
                 if updated != existing.spec {
                     kinds
                         .update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &updated)
@@ -2963,7 +2961,7 @@ async fn observe_fulfilment_facts(
         let current = previous
             .get(&name)
             .filter(|prior| {
-                prior.image == image
+                prior.image.as_ref().map(|image| &image.image_ref) == image.as_ref()
                     && prior.free_vessel_slots == (!pool_available).then_some(0)
                     && Utc::now().signed_duration_since(prior.observed_at).to_std().is_ok_and(|age| age < Duration::from_secs(300))
             })
@@ -4700,7 +4698,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         };
         let image_ref = handle.image().as_str().to_string();
         drop(agent_environment_claims);
-        let image_digest = match handle.image_digest() {
+        let local_image_id = match handle.local_image_id() {
             Some(digest) => digest.to_string(),
             None => {
                 return Err(discard_failed_environment(
@@ -4938,11 +4936,13 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             )
             .await);
         }
+        let handle_registry_digest = handle.registry_digest().map(str::to_owned);
         self.state.provisioned_environments.lock().await.insert(container_id.clone(), ActiveProvisionedEnvironment { handle });
         Ok(DockerProvisioning {
             container_id,
             image_ref,
-            image_digest,
+            local_image_id,
+            registry_digest: handle_registry_digest,
             configured_limits: Some(ConfiguredResourceLimits { cpus: Some(jobs), build_jobs: Some(jobs), linker_threads: Some(jobs) }),
         })
     }
@@ -6591,8 +6591,8 @@ mod tests {
     async fn agent_launch_reads_grants_from_its_own_vessel_pin() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let kinds = backend.using::<FulfilmentKind>(NAMESPACE);
-        let broad = BTreeSet::from([flotilla_resources::FulfilmentGrant::HostAccountReach]);
-        let restricted = BTreeSet::from([flotilla_resources::FulfilmentGrant::Platform("linux".to_string())]);
+        let broad = BTreeSet::from([flotilla_resources::FulfilmentGrant::host_account_reach()]);
+        let restricted = BTreeSet::from([flotilla_resources::FulfilmentGrant::platform("linux".to_string())]);
         for (name, grants) in [("broad", broad.clone()), ("restricted", restricted.clone())] {
             kinds
                 .create(&empty_meta(name), &FulfilmentKindSpec {
@@ -8307,7 +8307,7 @@ mod tests {
             &self.image
         }
 
-        fn image_digest(&self) -> Option<&str> {
+        fn local_image_id(&self) -> Option<&str> {
             Some("sha256:test-interior")
         }
 
@@ -11755,7 +11755,8 @@ mod tests {
             configured_limits: None,
             docker_container_id: Some(container_id.to_string()),
             image_ref: Some("contained-image".to_string()),
-            image_digest: Some("sha256:test-interior".to_string()),
+            local_image_id: Some("sha256:test-interior".to_string()),
+            registry_digest: None,
         })
         .await
         .expect("mark environment ready");
@@ -12508,7 +12509,8 @@ mod tests {
             configured_limits: None,
             docker_container_id: Some("orphaned-container".to_string()),
             image_ref: Some("contained-image".to_string()),
-            image_digest: Some("sha256:contained".to_string()),
+            local_image_id: Some("sha256:contained".to_string()),
+            registry_digest: None,
         })
         .await
         .expect("mark orphaned environment ready");
@@ -15480,12 +15482,12 @@ mod tests {
         assert!(kinds.iter().all(|kind| kind.metadata.name != snapshot_name));
         assert!(kinds.iter().all(|kind| kind.metadata.name != legacy_snapshot));
         for kind in kinds {
-            assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::Platform("linux".to_string())));
+            assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::platform("linux".to_string())));
             if kind.metadata.name.starts_with("docker-") {
-                assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::Network("scoped".to_string())));
+                assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::network("scoped".to_string())));
             } else {
-                assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::HostAccountReach));
-                assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::GuiSession));
+                assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::host_account_reach()));
+                assert!(kind.spec.grants.contains(&flotilla_resources::FulfilmentGrant::gui_session()));
             }
         }
         assert_eq!(policies.list().await.expect("policies and snapshots stay for A1 admission").items.len(), 8);

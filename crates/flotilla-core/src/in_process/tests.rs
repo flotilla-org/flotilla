@@ -829,7 +829,7 @@ fn placement_tiebreak_reserves_scarce_platforms_for_named_needs() {
             spec: FulfilmentKindSpec::builder()
                 .host_ref("host".to_string())
                 .pool("test".to_string())
-                .grants(BTreeSet::from([FulfilmentGrant::Platform(platform.to_string())]))
+                .grants(BTreeSet::from([FulfilmentGrant::platform(platform.to_string())]))
                 .realisation(FulfilmentRealisation::HostDirect)
                 .build(),
             status: None,
@@ -6278,7 +6278,7 @@ async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() 
             &FulfilmentKindSpec::builder()
                 .host_ref("collision".to_string())
                 .pool("passthrough".to_string())
-                .grants(BTreeSet::from([FulfilmentGrant::GuiSession]))
+                .grants(BTreeSet::from([FulfilmentGrant::gui_session()]))
                 .realisation(FulfilmentRealisation::HostDirect)
                 .build(),
         )
@@ -6293,7 +6293,7 @@ async fn capability_admission_resolves_display_name_kind_and_policy_host_refs() 
             &FulfilmentKindSpec::builder()
                 .host_ref("udder".to_string())
                 .pool("passthrough".to_string())
-                .grants(BTreeSet::from([FulfilmentGrant::GuiSession]))
+                .grants(BTreeSet::from([FulfilmentGrant::gui_session()]))
                 .realisation(FulfilmentRealisation::HostDirect)
                 .build(),
         )
@@ -6338,7 +6338,7 @@ async fn fulfilment_list_joins_host_facts_and_fleet_health_shows_local_kinds() {
                 &FulfilmentKindSpec::builder()
                     .host_ref(host_ref.to_string())
                     .pool("cleat".to_string())
-                    .grants(BTreeSet::from([FulfilmentGrant::Platform("linux".to_string())]))
+                    .grants(BTreeSet::from([FulfilmentGrant::platform("linux".to_string())]))
                     .realisation(FulfilmentRealisation::HostDirect)
                     .build(),
             )
@@ -7925,9 +7925,12 @@ async fn image_baseline_admission_fails_without_agents_and_pins_resolved_image()
         .expect_err("default selection must reject missing baseline");
     assert!(error.contains("image-baseline `fleet-crew` missing/unresolved"), "{error}");
     let baselines = backend.definitions::<CrewImageBaseline>("flotilla");
-    baselines.apply(&test_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v1".to_string() }).await.expect("baseline");
+    baselines
+        .apply(&test_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v1".to_string(), layers: None })
+        .await
+        .expect("baseline");
     let admitted = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false).await.expect("admit");
-    baselines.apply(&test_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v2".to_string() }).await.expect("bump");
+    baselines.apply(&test_meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v2".to_string(), layers: None }).await.expect("bump");
     assert_eq!(admitted.selected.expect("placement").spec.docker_per_vessel.expect("docker").image, DockerImageSource::from("crew:v1"));
     let next = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false).await.expect("next admission");
     assert_eq!(next.selected.expect("placement").spec.docker_per_vessel.expect("docker").image, DockerImageSource::from("crew:v2"));
@@ -9573,4 +9576,109 @@ async fn checkout_creation_does_not_reuse_cached_branch_absence() {
         .expect("checkout");
     let error = fixture.daemon.validate_new_checkout_branch(&checkout).await.expect_err("fresh conflict");
     assert!(error.contains("reused") && error.contains("#7"), "{error}");
+}
+
+// Behaviour (#2727): admission freezes a need-selected composition while the
+// generation-1 baseline stays the running image; a missing need refuses by name.
+#[tokio::test]
+async fn image_layer_admission_freezes_inputs_and_keeps_baseline_authoritative() {
+    use flotilla_resources::{
+        CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, ImageLayer, ImageLayerParent, ImageLayerSelection, ImageLayerSpec,
+        ImageLayerStage,
+    };
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"test-image-composition\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+    create_docker_placement(&backend, "crew-policy", "host-a", BTreeSet::new()).await;
+    let policies = backend.using::<PlacementPolicy>("flotilla");
+    let mut policy = policies.get("crew-policy").await.expect("policy");
+    policy.spec.docker_per_vessel.as_mut().expect("docker").image = DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() };
+    policies.update(&InputMeta::from(&policy.metadata), &policy.metadata.resource_version, &policy.spec).await.expect("baseline policy");
+    let base = ImageLayerSpec::builder()
+        .stage(ImageLayerStage::Base)
+        .parent(ImageLayerParent::Image(format!("debian@sha256:{}", "a".repeat(64))))
+        .repository("https://example.test/images".into())
+        .revision("1".repeat(40))
+        .fragment("Dockerfile.base".into())
+        .provides(BTreeSet::from(["os:debian-family".into()]))
+        .build();
+    let display = ImageLayerSpec::builder()
+        .stage(ImageLayerStage::Capability)
+        .parent(ImageLayerParent::Rebasable)
+        .repository("https://example.test/images".into())
+        .revision("2".repeat(40))
+        .fragment("Dockerfile.display".into())
+        .provides(BTreeSet::from(["display:headless-x11".into()]))
+        .requires(BTreeSet::from(["os:debian-family".into()]))
+        .build();
+    let layers = backend.definitions::<ImageLayer>("flotilla");
+    layers.apply(&test_meta("base"), &base).await.expect("base layer");
+    layers.apply(&test_meta("display"), &display).await.expect("display layer");
+    let baselines = backend.definitions::<CrewImageBaseline>("flotilla");
+    baselines
+        .apply(&test_meta("fleet-crew"), &CrewImageBaselineSpec {
+            image: "crew:v1".into(),
+            layers: Some(ImageLayerSelection::builder().base("base".into()).build()),
+        })
+        .await
+        .expect("baseline alongside layers");
+    let crew = CrewSpec::builder()
+        .role("tool".into())
+        .source(CrewSource::Tool { command: "true".into() })
+        .needs(BTreeSet::from(["display:headless-x11".parse().expect("open need")]))
+        .build();
+    let workflow =
+        WorkflowTemplateSpec::builder().vessels(vec![VesselRequirement::builder().name("work".into()).crew(vec![crew]).build()]).build();
+    let admitted = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false).await.expect("admission");
+    let image = admitted.selected.expect("selected").spec.docker_per_vessel.expect("docker").image;
+    let DockerImageSource::Composition { composition } = &image else { panic!("admission must store composition") };
+    assert_eq!(composition.layers.iter().map(|layer| layer.name.as_str()).collect::<Vec<_>>(), ["base", "display"]);
+    assert_eq!(composition.layers[0].spec, base);
+    assert!(composition.identity.is_none());
+    assert_eq!(image.resolve(&baselines).await.expect("running image"), "crew:v1");
+    let mut next_base = base;
+    next_base.revision = "3".repeat(40);
+    layers.apply(&test_meta("base"), &next_base).await.expect("update base");
+    assert_eq!(composition.layers[0].spec.revision, "1".repeat(40));
+    // A placement-bound composition keeps its concrete identity on readmission.
+    let mut bound = composition.clone();
+    bound.bind(flotilla_resources::PlacedImageIdentity { local_image_id: "sha256:placed".into(), registry_digest: None }).expect("bind");
+    let mut live = policies.get("crew-policy").await.expect("live policy");
+    live.spec.docker_per_vessel.as_mut().expect("docker").image = DockerImageSource::Composition { composition: bound.clone() };
+    let live = policies.update(&InputMeta::from(&live.metadata), &live.metadata.resource_version, &live.spec).await.expect("bound policy");
+    let repeated =
+        daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false).await.expect("readmission");
+    let DockerImageSource::Composition { composition: repeated } =
+        repeated.selected.expect("selected").spec.docker_per_vessel.expect("docker").image
+    else {
+        panic!("composition")
+    };
+    assert_eq!(repeated.identity, bound.identity);
+    assert_eq!(repeated.layers, bound.layers);
+    let mut restored = live.spec;
+    restored.docker_per_vessel.as_mut().expect("docker").image = DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() };
+    policies
+        .update(&InputMeta::from(&live.metadata), &live.metadata.resource_version, &restored)
+        .await
+        .expect("restore baseline selection");
+    let next = daemon.resolve_convoy_placement("flotilla", None, &[], &workflow, Some("crew-policy"), false).await.expect("next admission");
+    let DockerImageSource::Composition { composition: next } =
+        next.selected.expect("selected").spec.docker_per_vessel.expect("docker").image
+    else {
+        panic!("composition")
+    };
+    assert_eq!(next.layers[0].spec.revision, "3".repeat(40));
+    let mut missing = workflow;
+    missing.vessels[0].crew[0].needs = BTreeSet::from(["display:missing".parse().expect("need")]);
+    let error =
+        daemon.resolve_convoy_placement("flotilla", None, &[], &missing, Some("crew-policy"), false).await.expect_err("missing need");
+    assert!(error.contains("display:missing"));
 }

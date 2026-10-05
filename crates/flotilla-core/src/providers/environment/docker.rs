@@ -242,7 +242,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         args.push("infinity");
 
         self.inner.runner.run("docker", &args, Path::new("/"), &ChannelLabel::Default).await?;
-        let image_digest = match self.inner.image_digest(&container_name).await {
+        let local_image_id = match self.inner.local_image_id(&container_name).await {
             Ok(digest) => digest,
             Err(error) => {
                 let cleanup = self.inner.destroy(&container_name).await;
@@ -253,7 +253,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
             }
         };
 
-        Ok(self.inner.provisioned_environment(id, image.clone(), Some(image_digest), container_name, provisioned_mounts))
+        Ok(self.inner.provisioned_environment(id, image.clone(), Some(local_image_id), container_name, provisioned_mounts))
     }
 
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String> {
@@ -351,7 +351,7 @@ impl DockerEnvironmentProviderInner {
         self: &Arc<Self>,
         id: EnvironmentId,
         image: ImageId,
-        image_digest: Option<String>,
+        local_image_id: Option<String>,
         container_name: String,
         provisioned_mounts: Vec<ProvisionedMount>,
     ) -> EnvironmentHandle {
@@ -360,7 +360,7 @@ impl DockerEnvironmentProviderInner {
             id,
             container_name,
             image,
-            image_digest,
+            local_image_id,
             inner: Arc::clone(self),
             runner,
             provisioned_mounts,
@@ -422,7 +422,7 @@ impl DockerEnvironmentProviderInner {
         self.runner.run("docker", &args, Path::new("/"), &ChannelLabel::Default).await.map(|_| ())
     }
 
-    async fn image_digest(&self, container_name: &str) -> Result<String, String> {
+    async fn local_image_id(&self, container_name: &str) -> Result<String, String> {
         let output = self
             .runner
             .run("docker", &["inspect", "--format", "{{.Image}}", container_name], Path::new("/"), &ChannelLabel::Default)
@@ -479,7 +479,7 @@ pub struct DockerProvisionedEnvironment {
     id: EnvironmentId,
     container_name: String,
     image: ImageId,
-    image_digest: Option<String>,
+    local_image_id: Option<String>,
     inner: Arc<DockerEnvironmentProviderInner>,
     runner: Arc<dyn CommandRunner>,
     provisioned_mounts: Vec<ProvisionedMount>,
@@ -495,8 +495,12 @@ impl ProvisionedEnvironment for DockerProvisionedEnvironment {
         &self.image
     }
 
-    fn image_digest(&self) -> Option<&str> {
-        self.image_digest.as_deref()
+    fn local_image_id(&self) -> Option<&str> {
+        self.local_image_id.as_deref()
+    }
+
+    fn registry_digest(&self) -> Option<&str> {
+        Some(self.image.as_str()).filter(|image| image.contains("@sha256:"))
     }
 
     fn container_name(&self) -> Option<&str> {

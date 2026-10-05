@@ -10,6 +10,8 @@ Grilled 2026-09-27 on #2026 (rulings recorded there). Amends ADR 0022.
 
 Amended by ADR 0046: workflows no longer declare stance, so the §2 clause about a workflow *requiring* containment is superseded. Containment is the least-privilege default, and a host-direct placement comes only from a declared capability need or a recorded escalation.
 
+Amended by [ADR 0053](0053-crew-images-compose-from-declared-layers-and-freeze-in-stages.md): contained images compose from declared capability layers; credential grants still select on the work, while image availability and build delivery follow fulfilment.
+
 ## Context
 
 ADR 0022 made grants **stance-first**, and by "stance" it meant *repository trust*: fork-stance crews get model-API credentials only, and trusted-repo crews add the crew forge identity. Its migration clause also let trusted crews inherit **ambient** human identity. Two things have happened since:

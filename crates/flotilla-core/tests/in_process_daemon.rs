@@ -2542,8 +2542,8 @@ async fn capability_admission_prefers_linux_when_macos_is_reserved() {
     let kinds = backend.using::<FulfilmentKind>("flotilla");
     let kind = kinds.get("macos-scarce").await.expect("macOS kind");
     let mut spec = kind.spec.clone();
-    spec.grants.remove(&FulfilmentGrant::Platform("linux".to_string()));
-    spec.grants.insert(FulfilmentGrant::Platform("macos".to_string()));
+    spec.grants.remove(&FulfilmentGrant::platform("linux".to_string()));
+    spec.grants.insert(FulfilmentGrant::platform("macos".to_string()));
     kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("macOS grants");
     create_test_host_direct_policy(&backend, "linux-available", "feta", 0, BTreeSet::from(["codex".to_string()])).await;
 
@@ -2567,8 +2567,8 @@ async fn capability_admission_uses_only_macos_without_escalation_and_explains_fa
     let kinds = backend.using::<FulfilmentKind>("flotilla");
     let kind = kinds.get("macos-scarce").await.expect("macOS kind");
     let mut spec = kind.spec.clone();
-    spec.grants.remove(&FulfilmentGrant::Platform("linux".to_string()));
-    spec.grants.insert(FulfilmentGrant::Platform("macos".to_string()));
+    spec.grants.remove(&FulfilmentGrant::platform("linux".to_string()));
+    spec.grants.insert(FulfilmentGrant::platform("macos".to_string()));
     kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("macOS grants");
 
     let started = start_capability_convoy(&daemon, "reserved-only", |intent| {
@@ -2596,8 +2596,8 @@ async fn capability_admission_pin_to_macos_requires_escalation_when_linux_exists
     let kinds = backend.using::<FulfilmentKind>("flotilla");
     let kind = kinds.get("macos-scarce").await.expect("macOS kind");
     let mut spec = kind.spec.clone();
-    spec.grants.remove(&FulfilmentGrant::Platform("linux".to_string()));
-    spec.grants.insert(FulfilmentGrant::Platform("macos".to_string()));
+    spec.grants.remove(&FulfilmentGrant::platform("linux".to_string()));
+    spec.grants.insert(FulfilmentGrant::platform("macos".to_string()));
     kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("macOS grants");
 
     let pinned = start_capability_convoy(&daemon, "reserved-pinned", |intent| {
@@ -2874,8 +2874,8 @@ async fn allocation_expands_project_platform_matrix() {
         let kinds = backend.using::<FulfilmentKind>("flotilla");
         let kind = kinds.get(&kind_name).await.expect("kind");
         let mut spec = kind.spec.clone();
-        spec.grants.remove(&flotilla_resources::FulfilmentGrant::Platform("linux".to_string()));
-        spec.grants.insert(flotilla_resources::FulfilmentGrant::Platform(platform.to_string()));
+        spec.grants.remove(&flotilla_resources::FulfilmentGrant::platform("linux".to_string()));
+        spec.grants.insert(flotilla_resources::FulfilmentGrant::platform(platform.to_string()));
         kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("platform kind");
     }
     let workflow = flotilla_resources::WorkflowTemplateSpec::builder()
@@ -2908,8 +2908,8 @@ async fn allocation_backtracks_a_legacy_union_no_kind_covers() {
     let kinds = backend.using::<FulfilmentKind>("flotilla");
     let kind = kinds.get("direct-macos").await.expect("kind");
     let mut spec = kind.spec.clone();
-    spec.grants.remove(&flotilla_resources::FulfilmentGrant::Platform("linux".to_string()));
-    spec.grants.insert(flotilla_resources::FulfilmentGrant::Platform("macos".to_string()));
+    spec.grants.remove(&flotilla_resources::FulfilmentGrant::platform("linux".to_string()));
+    spec.grants.insert(flotilla_resources::FulfilmentGrant::platform("macos".to_string()));
     kinds.update(&InputMeta::from(&kind.metadata), &kind.metadata.resource_version, &spec).await.expect("mac kind");
     let crew = |role: &str, platform: &str| {
         flotilla_resources::CrewSpec::builder()

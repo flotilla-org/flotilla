@@ -343,7 +343,7 @@ async fn create_returns_handle() {
     let expected_id = label_val.strip_prefix("flotilla.environment=").unwrap();
     assert_eq!(handle.id().as_str(), expected_id);
     assert_eq!(handle.image().as_str(), "ubuntu:22.04");
-    assert_eq!(handle.image_digest(), Some("sha256:8c7f4e5d6a1b"));
+    assert_eq!(handle.local_image_id(), Some("sha256:8c7f4e5d6a1b"));
 
     let (inspect_cmd, inspect_args, _) = &calls[1];
     assert_eq!(inspect_cmd, "docker");
@@ -385,7 +385,7 @@ async fn create_runs_container_as_the_host_user() {
 }
 
 #[tokio::test]
-async fn create_removes_container_when_image_digest_cannot_be_resolved() {
+async fn create_removes_container_when_local_image_id_cannot_be_resolved() {
     use flotilla_protocol::ImageId;
 
     let runner = Arc::new(QueuedRunner::new([Ok("container-id-123".into()), Ok("not-a-digest".into()), Err("docker rm failed".into())]));
