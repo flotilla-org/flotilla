@@ -94,9 +94,9 @@ pub use convoy::{
     InstantiatedExitEntry, InstantiatedTurnDelivery, IssueSnapshot, LeafMaker, LifecycleMutation, NudgeObligation, PendingBrief,
     PendingSupervisorTurn, PlacementStatus, ReconcileOutcome, SettlementEvaluation, SettlementMode, StallCause, StallEvidenceSource,
     StallNudge, StallProposedDisposition, StallReason, StallRung, StallSupervisor, StalledCondition, SubjectDiscovery,
-    SubjectDiscoverySource, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryOutcome, TurnDeliveryRung, TurnDeliveryStatus,
-    UnmetSettlementExpectation, VesselPlacementPin, WorkCompletionAuthority, WorkPhase, WorkState, WorkflowSnapshot,
-    CONVOY_TEARDOWN_FINALIZER, ENSURED_FROM_ANNOTATION, FORCE_TEARDOWN_ANNOTATION, PLACEMENT_SNAPSHOT_ANNOTATION,
+    SubjectDiscoverySource, TargetMismatch, TurnDeliveryEpisode, TurnDeliveryFailure, TurnDeliveryFailureKind, TurnDeliveryOutcome,
+    TurnDeliveryRung, TurnDeliveryStatus, UnmetSettlementExpectation, VesselPlacementPin, WorkCompletionAuthority, WorkPhase, WorkState,
+    WorkflowSnapshot, CONVOY_TEARDOWN_FINALIZER, ENSURED_FROM_ANNOTATION, FORCE_TEARDOWN_ANNOTATION, PLACEMENT_SNAPSHOT_ANNOTATION,
     VESSEL_PLACEMENTS_ANNOTATION, WORKFLOW_SNAPSHOT_ANNOTATION,
 };
 pub use convoy_ensure::{

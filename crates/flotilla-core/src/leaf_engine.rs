@@ -151,6 +151,22 @@ fn actor_is_working(
     working && !silent
 }
 
+#[derive(Debug)]
+struct DeliveryError {
+    reason: String,
+    kind: flotilla_resources::TurnDeliveryFailureKind,
+}
+impl From<String> for DeliveryError {
+    fn from(reason: String) -> Self {
+        Self { reason, kind: flotilla_resources::TurnDeliveryFailureKind::Transient }
+    }
+}
+impl DeliveryError {
+    fn permanent(reason: impl Into<String>) -> Self {
+        Self { reason: reason.into(), kind: flotilla_resources::TurnDeliveryFailureKind::Permanent }
+    }
+}
+
 struct UnavailableTurnDeliveryActuator;
 
 #[async_trait]
@@ -201,6 +217,8 @@ struct LeafSubscriptionTableInner {
     reconciler_tx: broadcast::Sender<String>,
     turn_delivery: Mutex<Arc<dyn TurnDeliveryActuator>>,
     episode_limit: u32,
+    decisions: crate::decision_log::DecisionLog,
+    supervisor_context: Mutex<HashMap<(String, String), String>>,
     #[cfg(test)]
     snapshot_loads: AtomicUsize,
 }
@@ -376,6 +394,8 @@ impl LeafSubscriptionTable {
                 reconciler_tx,
                 turn_delivery: Mutex::new(Arc::new(UnavailableTurnDeliveryActuator)),
                 episode_limit,
+                decisions: Default::default(),
+                supervisor_context: Default::default(),
                 #[cfg(test)]
                 snapshot_loads: AtomicUsize::new(0),
             }),
@@ -748,12 +768,44 @@ impl LeafSubscriptionTable {
             }
             Some(LeafWatcher::TurnDelivery { convoy, source, rule }) => {
                 if let Err(error) = self.deliver_turn(subscription_id, &convoy, &source, &rule, &fire.leaf).await {
-                    tracing::warn!(%convoy, %source, %error, "turn delivery failed");
+                    let namespace = self.inner.rows.lock().await.get(&subscription_id).map(|row| row.namespace.clone());
+                    if let Some(namespace) = namespace {
+                        if let Err(record_error) = self.record_delivery_failure(&namespace, &convoy, &source, &error).await {
+                            tracing::warn!(%convoy, %source, %record_error, "could not record turn delivery failure");
+                        }
+                    }
                 }
                 let _ = self.inner.reconciler_tx.send(convoy);
             }
             None => {}
         }
+    }
+
+    async fn record_delivery_failure(&self, namespace: &str, convoy: &str, source: &str, error: &DeliveryError) -> Result<(), String> {
+        let convoys = self.inner.backend.clone().using::<Convoy>(namespace);
+        let current = convoys.get(convoy).await.map_err(|error| error.to_string())?;
+        let prior =
+            current.status.as_ref().and_then(|status| status.turn_deliveries.get(source)).and_then(|delivery| delivery.failure.as_ref());
+        let changed = prior.is_none_or(|prior| prior.reason != error.reason || prior.kind != error.kind);
+        let attempts = prior.map_or(1, |prior| prior.attempts.saturating_add(1));
+        let delay = 5_i64.saturating_mul(1_i64 << attempts.saturating_sub(1).min(6)).min(300);
+        let now = Utc::now();
+        flotilla_resources::apply_status_patch(&convoys, convoy, &flotilla_resources::ConvoyStatusPatch::FailTurnDelivery {
+            source: source.to_string(),
+            failure: flotilla_resources::TurnDeliveryFailure::builder()
+                .reason(error.reason.clone())
+                .failed_at(now)
+                .kind(error.kind)
+                .attempts(attempts)
+                .retry_at(now + chrono::Duration::seconds(delay))
+                .build(),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        if changed {
+            tracing::warn!(%convoy, %source, error = %error.reason, failure_kind = ?error.kind, attempts, retry_seconds = delay, "turn delivery failed");
+        }
+        Ok(())
     }
 
     async fn deliver_turn(
@@ -763,7 +815,7 @@ impl LeafSubscriptionTable {
         source: &str,
         rule: &TurnDeliveryRule,
         leaf: &Leaf,
-    ) -> Result<(), String> {
+    ) -> Result<(), DeliveryError> {
         let namespace = self
             .inner
             .rows
@@ -775,6 +827,24 @@ impl LeafSubscriptionTable {
         let convoys = self.inner.backend.clone().using::<Convoy>(&namespace);
         let convoy = convoys.get(convoy_name).await.map_err(|error| error.to_string())?;
         let status = convoy.status.as_ref().ok_or_else(|| format!("convoy `{convoy_name}` has no status"))?;
+        if status
+            .turn_deliveries
+            .get(source)
+            .and_then(|delivery| delivery.failure.as_ref())
+            .is_some_and(|failure| failure.kind == flotilla_resources::TurnDeliveryFailureKind::Permanent || Utc::now() < failure.retry_at)
+        {
+            return Ok(());
+        }
+        // A stale firing after settlement has no work left to deliver.
+        if status.phase.is_terminal() {
+            return Ok(());
+        }
+        if status.phase == ConvoyPhase::Pending {
+            return Err(DeliveryError::permanent("wrong convoy kind or phase for turn delivery"));
+        }
+        if !status.crew_work.get(&rule.to.vessel).is_some_and(|crew| crew.contains_key(&rule.to.role)) {
+            return Err(DeliveryError::permanent("turn-delivery target crew is absent"));
+        }
         let claim = status.crew_work.get(&rule.to.vessel).and_then(|crew| crew.get(&rule.to.role));
         let claim_at = claim.and_then(|claim| claim.finished_at);
         let active_probe = is_active_change_request_probe(status, rule, leaf);
@@ -804,7 +874,12 @@ impl LeafSubscriptionTable {
                     ".checks" => cr.checks.observed_at,
                     ".review.actionable-at-head" => cr.review.actionable_at_head.observed_at,
                     ".mergeable" => cr.mergeable.observed_at,
-                    _ => return Err(format!("turn-delivery leaf path `{}` has no firing evidence timestamp", leaf.field_path)),
+                    _ => {
+                        return Err(DeliveryError::permanent(format!(
+                            "turn-delivery leaf path `{}` has no firing evidence timestamp",
+                            leaf.field_path
+                        )))
+                    }
                 };
                 let brief = if active_conflict {
                     format!("{}\n\nPR #{number} is conflicting. Rebase onto the current base branch, rerun the gates, push, then file a settlement claim.", rule.brief.trim())
@@ -859,7 +934,12 @@ impl LeafSubscriptionTable {
                     ".state" => issue.state.observed_at,
                     ".updated-at" => issue.updated_at.observed_at,
                     path if path.starts_with(".labels.") => issue.labels.observed_at,
-                    _ => return Err(format!("turn-delivery leaf path `{}` has no firing evidence timestamp", leaf.field_path)),
+                    _ => {
+                        return Err(DeliveryError::permanent(format!(
+                            "turn-delivery leaf path `{}` has no firing evidence timestamp",
+                            leaf.field_path
+                        )))
+                    }
                 };
                 let observation = format!(
                     "- Issue updated at: `{updated_at}`\n- Issue state: {:?}\n- Issue labels: {:?}\n",
@@ -947,7 +1027,7 @@ impl LeafSubscriptionTable {
                     .unwrap_or_default();
                 (format!("{subject}@{}", artifact.spec.digest), evidence_at, brief)
             }
-            _ => return Err("turn-delivery leaf is not externally observed".into()),
+            _ => return Err(DeliveryError::permanent("turn-delivery leaf is not externally observed")),
         };
         if status
             .turn_deliveries
@@ -973,6 +1053,14 @@ impl LeafSubscriptionTable {
             .role(rule.to.role.clone())
             .brief(brief)
             .subject_revision(subject_revision.clone())
+            .maybe_subject(match &leaf.address {
+                LeafAddress::ChangeRequest { service, scope, number } => Some(flotilla_protocol::Subject {
+                    kind: flotilla_protocol::SubjectKind::ChangeRequest,
+                    source: flotilla_protocol::IssueSource { service: service.clone(), scope: scope.clone() },
+                    id: number.to_string(),
+                }),
+                _ => None,
+            })
             .sender(flotilla_resources::CrewMessageSender::FlotillaTurn { source: source.to_string() })
             .build();
         let prior_episodes = status.turn_deliveries.get(source).map_or(0, |delivery| delivery.episodes.len()) as u32;
@@ -981,6 +1069,13 @@ impl LeafSubscriptionTable {
             let reason =
                 format!("turn delivery refused after {} consecutive episodes for condition source `{source}`", self.inner.episode_limit);
             let actuator = self.inner.turn_delivery.lock().await.clone();
+            if request.subject.is_none() {
+                match flotilla_resources::active_change_request_subjects(&convoy)?.len() {
+                    0 => return Err(DeliveryError::permanent("turn-delivery convoy has no bound change request for hold")),
+                    1 => {}
+                    _ => return Err(DeliveryError::permanent("turn-delivery hold has ambiguous change request subjects")),
+                }
+            }
             actuator.hold(&request, &rule.hold, &reason).await?;
             external_patches::refuse_turn_delivery(
                 source.to_string(),
@@ -995,6 +1090,20 @@ impl LeafSubscriptionTable {
             )
         } else {
             let actuator = self.inner.turn_delivery.lock().await.clone();
+            let sessions = self
+                .inner
+                .backend
+                .including_replicas::<TerminalSession>(&namespace)
+                .list_matching_labels(&BTreeMap::from([
+                    (CONVOY_LABEL.to_string(), convoy_name.to_string()),
+                    (VESSEL_LABEL.to_string(), rule.to.vessel.clone()),
+                    (ROLE_LABEL.to_string(), rule.to.role.clone()),
+                ]))
+                .await
+                .map_err(|error| error.to_string())?;
+            if sessions.items.iter().any(|session| !matches!(session.object.spec.source, TerminalSessionSource::Agent { .. })) {
+                return Err(DeliveryError::permanent("turn-delivery target is not an agent"));
+            }
             let rung = actuator.deliver(&request).await?;
             external_patches::record_turn_delivery(
                 source.to_string(),
@@ -1148,6 +1257,7 @@ impl ReconcilerWake {
         let checkouts = backend.including_replicas::<Checkout>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let vessels = backend.including_replicas::<Vessel>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let rows = self.subscriptions.rows().await;
+        self.subscriptions.inner.supervisor_context.lock().await.retain(|(ns, name), _| ns != namespace || convoys.contains_key(name));
         for convoy in convoys.values() {
             let Some(status) = &convoy.status else { continue };
             let selected_sessions = select_convoy_children(convoy, &sessions);
@@ -1848,9 +1958,56 @@ impl ReconcilerWake {
                         .unwrap_or(0);
                     let keep_current = prior.is_some_and(|stalled| stalled.supervisor.is_some())
                         && !matches!(condition.maker, Some(LeafMaker::Supervisor { .. }));
-                    if keep_current {
+                    let context = format!(
+                        "{:?}",
+                        (
+                            &policy,
+                            status.crew_work.iter().map(|(vessel, crew)| (vessel, crew.keys().collect::<Vec<_>>())).collect::<Vec<_>>(),
+                            available_convoys
+                                .iter()
+                                .filter(|candidate| candidate.object.metadata.name != convoy.metadata.name
+                                    && candidate.object.spec.project_ref == convoy.spec.project_ref)
+                                .map(|candidate| {
+                                    let candidate = &candidate.object;
+                                    (
+                                        &candidate.metadata.name,
+                                        (
+                                            &candidate.spec.role,
+                                            candidate.spec.generation,
+                                            candidate.status.as_ref().map(|status| {
+                                                (
+                                                    &status.phase,
+                                                    status
+                                                        .crew_work
+                                                        .iter()
+                                                        .map(|(vessel, crew)| (vessel, crew.keys().collect::<Vec<_>>()))
+                                                        .collect::<Vec<_>>(),
+                                                )
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .collect::<BTreeMap<_, _>>(),
+                            available_ensures
+                                .iter()
+                                .map(|ensure| (&ensure.object.metadata.name, &ensure.object.metadata.resource_version))
+                                .collect::<BTreeMap<_, _>>(),
+                            projects
+                                .iter()
+                                .map(|project| (&project.object.metadata.name, &project.object.metadata.resource_version))
+                                .collect::<BTreeMap<_, _>>()
+                        )
+                    );
+                    let context_key = (namespace.to_string(), convoy.metadata.name.clone());
+                    let unchanged_context = self.subscriptions.inner.supervisor_context.lock().await.get(&context_key) == Some(&context);
+                    let cached_lookup = unchanged_context
+                        && prior.is_some_and(|prior| {
+                            prior.rung == StallRung::Operator && prior.supervisor.is_none() && !prior.supervision_exhausted
+                        });
+                    if keep_current || cached_lookup {
                         condition = prior.expect("checked above").clone();
                     } else {
+                        self.subscriptions.inner.supervisor_context.lock().await.remove(&context_key);
                         condition.rung = StallRung::Operator;
                         condition.supervisor = None;
                         // The cursor records consumed rungs, not failed delivery attempts.
@@ -1974,15 +2131,20 @@ impl ReconcilerWake {
                                     })
                                     .build();
                                 if let Err(error) = self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&delivery).await {
-                                    tracing::warn!(
-                                        convoy = %convoy.metadata.name,
-                                        target = %target_convoy,
-                                        %target_vessel,
-                                        %target_role,
-                                        reason = %error,
-                                        brief = %stall_supervision_log_brief(convoy, &condition),
-                                        "stall escalation fell back to operator"
-                                    );
+                                    if prior.is_none_or(|prior| {
+                                        prior.rung != StallRung::Operator
+                                            || !prior.evidence.ends_with(&format!("supervisor delivery failed: {error}"))
+                                    }) {
+                                        tracing::warn!(
+                                            convoy = %convoy.metadata.name,
+                                            target = %target_convoy,
+                                            %target_vessel,
+                                            %target_role,
+                                            reason = %error,
+                                            brief = %stall_supervision_log_brief(convoy, &condition),
+                                            "stall escalation fell back to operator"
+                                        );
+                                    }
                                     condition.evidence.push_str(&format!("; supervisor delivery failed: {error}"));
                                     condition.supervision_exhausted = false;
                                     delivery_failed = true;
@@ -2010,19 +2172,26 @@ impl ReconcilerWake {
                         }
                         if condition.supervisor.is_none() && !delivery_failed {
                             let target = unavailable_target.unwrap_or(&SupervisionTarget::Operator);
-                            tracing::warn!(
-                                convoy = %convoy.metadata.name,
-                                ?target,
-                                reason = if unavailable_target.is_some() { "supervisor_lookup_failed" }
-                                    else if start >= policy.len() { "supervision_policy_exhausted" }
-                                    else { "operator_rung_selected" },
-                                supervision_start = start,
-                                supervision_policy_len = policy.len(),
-                                evidence = %condition.evidence,
-                                brief = %stall_supervision_log_brief(convoy, &condition),
-                                "stall escalation fell back to operator"
-                            );
+                            if prior.is_none_or(|prior| {
+                                prior.rung != condition.rung
+                                    || prior.supervisor != condition.supervisor
+                                    || prior.evidence != condition.evidence
+                            }) {
+                                tracing::warn!(
+                                    convoy = %convoy.metadata.name,
+                                    ?target,
+                                    reason = if unavailable_target.is_some() { "supervisor_lookup_failed" }
+                                        else if start >= policy.len() { "supervision_policy_exhausted" }
+                                        else { "operator_rung_selected" },
+                                    supervision_start = start,
+                                    supervision_policy_len = policy.len(),
+                                    evidence = %condition.evidence,
+                                    brief = %stall_supervision_log_brief(convoy, &condition),
+                                    "stall escalation fell back to operator"
+                                );
+                            }
                             if unavailable_target.is_some() {
+                                self.subscriptions.inner.supervisor_context.lock().await.insert(context_key, context);
                                 // Operator attention is a backstop while supervisors reconnect,
                                 // not a consumed ladder. Try the same unconsumed rungs next pass.
                                 condition.supervision_exhausted = false;
@@ -2348,10 +2517,22 @@ impl ReconcilerWake {
                     }
                 }
                 for delivery in instantiate_turn_delivery(convoy, &checkouts, &observed_change_requests, &forges)? {
-                    if !is_active_change_request_probe(status, &delivery.rule, &delivery.leaf) {
-                        tracing::debug!(convoy = %convoy.metadata.name, source = %delivery.source,
+                    let eligible = is_active_change_request_probe(status, &delivery.rule, &delivery.leaf);
+                    let changed = self
+                        .subscriptions
+                        .inner
+                        .decisions
+                        .changed(format!("{namespace}/{}/{}", convoy.metadata.name, delivery.source), eligible);
+                    if !eligible {
+                        if changed {
+                            tracing::debug!(convoy = %convoy.metadata.name, source = %delivery.source,
                             reason = "skip_ineligible_active_crew_or_subject", "turn delivery subscription decision");
+                        }
                         continue;
+                    }
+                    if changed {
+                        tracing::debug!(convoy = %convoy.metadata.name, source = %delivery.source,
+                            reason = "arm_eligible_active_crew_and_subject", "turn delivery subscription decision");
                     }
                     desired.push(LeafSubscriptionRow {
                         id: uuid::Uuid::nil(),
@@ -3289,6 +3470,10 @@ mod tests {
     }
 
     fn supervision_wake(backend: &ResourceBackend) -> ReconcilerWake {
+        supervision_wake_with_limit(backend, 3)
+    }
+
+    fn supervision_wake_with_limit(backend: &ResourceBackend, limit: u32) -> ReconcilerWake {
         let (event_tx, _) = broadcast::channel(16);
         let refresher = ChangeRequestRefresher::new(
             "fleet".to_string(),
@@ -3298,7 +3483,7 @@ mod tests {
             crate::change_request_observer::ChangeRequestRefreshCadence::default(),
         );
         ReconcilerWake {
-            subscriptions: LeafSubscriptionTable::new(backend.clone(), broadcast_test_sink(event_tx), refresher),
+            subscriptions: LeafSubscriptionTable::with_episode_limit(backend.clone(), broadcast_test_sink(event_tx), refresher, limit),
             _marker: PhantomData,
         }
     }
@@ -4192,7 +4377,7 @@ mod tests {
             });
             let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8 logs");
             let warnings = text.lines().collect::<Vec<_>>();
-            assert_eq!(warnings.len(), 2, "only unavailable passes should warn: {text}");
+            assert_eq!(warnings.len(), 1, "unchanged unavailable routing warns once: {text}");
             for warning in warnings {
                 assert!(warning.contains("WARN"), "{warning}");
                 assert!(warning.contains("convoy=stalled-work"), "{warning}");
@@ -4409,6 +4594,201 @@ mod tests {
         assert!(brief.contains("unidentified crew in convoy graphql-budget@wheelhouse (resource ref: stalled-work)"), "{brief}");
         assert!(brief.contains("Reason: inferred stall. Evidence: needs decision"), "{brief}");
         assert!(!brief.contains("flotilla crew supervise"), "{brief}");
+    }
+
+    // #2654: permanent failures park once, transient failures retain a retry
+    // deadline; neither repeated ticks nor a reconstructed subscription retries early.
+    #[test]
+    fn delivery_failures_are_durable_and_log_once() {
+        #[derive(Clone)]
+        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("tracing scenario").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for kind in 0..3 {
+            // Pending convoy, transient missing observation, and hold without a CR.
+            let permanent = kind != 1;
+            let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = Writer(logs.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tracing scenario").block_on(async {
+                    let (backend, _, _) = project_supervision_case(&[]).await;
+                    let limit = if kind == 2 { 0 } else { 3 };
+                    let mut wake = supervision_wake_with_limit(&backend, limit);
+                    let convoys = backend.using::<Convoy>("flotilla");
+                    let convoy = convoys.get("stalled-work").await.expect("tracing scenario");
+                    let mut status = convoy.status.expect("tracing scenario");
+                    status.phase = ConvoyPhase::Landing;
+                    if kind == 0 {
+                        status.phase = ConvoyPhase::Pending;
+                    }
+                    status.crew_work.get_mut("work").expect("tracing scenario").get_mut("coder").expect("tracing scenario").finished_at =
+                        Some(Utc::now() - chrono::Duration::seconds(2));
+                    convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.expect("tracing scenario");
+                    let rule = TurnDeliveryRule::builder()
+                        .on(if kind == 2 { "$issue.state == closed" } else { "$cr.checks == fail" }.parse().expect("tracing scenario"))
+                        .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".into()).role("coder".into()).build())
+                        .brief("continue".into())
+                        .hold(HoldAct::ChangeRequestComment { body: "paused".into() })
+                        .build();
+                    let mut leaf = Leaf {
+                        address: LeafAddress::ChangeRequest { service: "github.com".into(), scope: "team/repo".into(), number: 1 },
+                        field_path: ".checks".into(),
+                        operator: LeafOperator::Equal,
+                        literal: "fail".into(),
+                    };
+                    if kind == 2 {
+                        let records = backend.using::<Issue>("flotilla");
+                        let name = flotilla_resources::issue_record_name("github.com", "team/repo", 1);
+                        let record = records
+                            .create(
+                                &InputMeta::builder().name(name.clone()).build(),
+                                &flotilla_resources::IssueSpec::builder()
+                                    .service("github.com".into())
+                                    .scope("team/repo".into())
+                                    .number(1)
+                                    .observing_authority("test-host".into())
+                                    .build(),
+                            )
+                            .await
+                            .expect("tracing scenario");
+                        let now = Utc::now();
+                        records
+                            .update_status(&name, &record.metadata.resource_version, &flotilla_resources::IssueStatus {
+                                state: flotilla_resources::Observation::known(flotilla_resources::ObservedIssueState::Closed, now),
+                                updated_at: flotilla_resources::Observation::known(now, now),
+                                title: Default::default(),
+                                assignees: Default::default(),
+                                labels: Default::default(),
+                            })
+                            .await
+                            .expect("tracing scenario");
+                        leaf.address = LeafAddress::Issue { service: "github.com".into(), scope: "team/repo".into(), number: 1 };
+                        leaf.field_path = ".state".into();
+                        leaf.literal = "closed".into();
+                    }
+                    for tick in 0..10 {
+                        if tick == 5 {
+                            wake = supervision_wake_with_limit(&backend, limit);
+                        }
+                        let id = uuid::Uuid::new_v4();
+                        wake.subscriptions.inner.rows.lock().await.insert(id, LeafSubscriptionRow {
+                            id,
+                            namespace: "flotilla".into(),
+                            leaves: vec![leaf.clone()],
+                            watcher: LeafWatcher::TurnDelivery {
+                                convoy: "stalled-work".into(),
+                                source: "checks".into(),
+                                rule: Box::new(rule.clone()),
+                            },
+                            maker: LeafMaker::Observed { refresher: "test".into(), external_party: "test".into() },
+                            freshness_demand: None,
+                            created_at: Utc::now(),
+                            episode_key: Default::default(),
+                        });
+                        wake.subscriptions
+                            .fire(id, LeafFire {
+                                subscription_id: id,
+                                watcher_id: uuid::Uuid::nil(),
+                                leaf: leaf.clone(),
+                                value: "fail".into(),
+                            })
+                            .await;
+                        let status = convoys.get("stalled-work").await.expect("tracing scenario").status.expect("tracing scenario");
+                        let failure = status.turn_deliveries["checks"].failure.as_ref().expect("tracing scenario");
+                        assert_eq!(failure.kind == flotilla_resources::TurnDeliveryFailureKind::Permanent, permanent);
+                        if kind == 2 {
+                            assert!(failure.reason.contains("no bound change request"));
+                        }
+                        assert_eq!(failure.attempts, 1);
+                        assert!(failure.retry_at > Utc::now());
+                    }
+                    // Advance the durable deadline without a wall-clock sleep.
+                    let current = convoys.get("stalled-work").await.expect("tracing scenario");
+                    let mut status = current.status.expect("tracing scenario");
+                    status
+                        .turn_deliveries
+                        .get_mut("checks")
+                        .expect("tracing scenario")
+                        .failure
+                        .as_mut()
+                        .expect("tracing scenario")
+                        .retry_at = Utc::now() - chrono::Duration::seconds(1);
+                    convoys.update_status("stalled-work", &current.metadata.resource_version, &status).await.expect("tracing scenario");
+                    let row = wake
+                        .subscriptions
+                        .rows()
+                        .await
+                        .into_iter()
+                        .find(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { source, .. } if source == "checks"))
+                        .expect("tracing scenario");
+                    wake.subscriptions
+                        .fire(row.id, LeafFire { subscription_id: row.id, watcher_id: uuid::Uuid::nil(), leaf, value: "fail".into() })
+                        .await;
+                    let status = convoys.get("stalled-work").await.expect("tracing scenario").status.expect("tracing scenario");
+                    let failure = status.turn_deliveries["checks"].failure.as_ref().expect("tracing scenario");
+                    assert_eq!(failure.attempts, if permanent { 1 } else { 2 });
+                    if !permanent {
+                        assert_eq!(failure.retry_at.signed_duration_since(failure.failed_at), chrono::Duration::seconds(10));
+                    }
+                });
+            });
+            let text = String::from_utf8(logs.lock().expect("tracing scenario").clone()).expect("tracing scenario");
+            assert_eq!(text.matches("turn delivery failed").count(), 1, "{text}");
+            assert!(text.contains("source=checks"));
+        }
+    }
+
+    // #2654: unchanged operator fallback emits once across ticks, including a restart.
+    #[test]
+    fn unchanged_governorless_stall_logs_once() {
+        #[derive(Clone)]
+        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("tracing scenario").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Writer(logs.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tracing scenario").block_on(async {
+                let (backend, mut wake, _) = project_supervision_case(&[]).await;
+                for tick in 0..10 {
+                    if tick == 5 {
+                        wake = supervision_wake(&backend);
+                    }
+                    let source = backend.using::<Convoy>("flotilla").get("stalled-work").await.expect("tracing scenario");
+                    let objects = HashMap::from([("stalled-work".into(), source)]);
+                    wake.sync_rows("flotilla", &objects).await.expect("tracing scenario");
+                    wake.judge_stalls("flotilla", &objects).await.expect("tracing scenario");
+                }
+            });
+        });
+        let text = String::from_utf8(logs.lock().expect("tracing scenario").clone()).expect("tracing scenario");
+        assert_eq!(text.matches("stall escalation fell back to operator").count(), 1, "{text}");
     }
 
     #[tokio::test]
@@ -5406,6 +5786,46 @@ mod tests {
         for row in table.rows().await {
             table.finish(row.id).await;
         }
+    }
+
+    // #2654: each subscription key logs its ineligible-to-eligible transition;
+    // duplicate ticks with different crew phases but the same decision stay quiet.
+    #[test]
+    fn unchanged_subscription_decisions_log_once() {
+        #[derive(Clone)]
+        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("tracing scenario").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Writer(logs.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tracing scenario").block_on(active_checks_scenario(
+                &[true],
+                false,
+                "coder",
+            ));
+        });
+        let output = String::from_utf8(logs.lock().expect("tracing scenario").clone()).expect("tracing scenario");
+        let decisions = output
+            .lines()
+            .filter(|line| line.contains("turn delivery subscription decision") && line.contains("source=checks-settled"))
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 2, "{output}");
+        assert!(decisions[0].contains("skip_ineligible_active_crew_or_subject"));
+        assert!(decisions[1].contains("arm_eligible_active_crew_and_subject"));
     }
 
     #[tokio::test]

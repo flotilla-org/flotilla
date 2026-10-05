@@ -141,6 +141,25 @@ impl crate::leaf_engine::TurnDeliveryActuator for CrewTurnDeliveryActuator {
     }
 }
 
+fn turn_hold_subject(
+    convoy: &ResourceObject<ResourceConvoy>,
+    firing_subject: Option<&flotilla_protocol::Subject>,
+) -> Result<flotilla_protocol::Subject, String> {
+    let subject = if let Some(subject) = firing_subject {
+        subject.clone()
+    } else {
+        let subjects = flotilla_resources::active_change_request_subjects(convoy)?;
+        let [subject] = subjects.as_slice() else {
+            return Err("turn-delivery hold needs one change request subject".into());
+        };
+        subject.clone()
+    };
+    if subject.kind != flotilla_protocol::SubjectKind::ChangeRequest {
+        return Err("turn-delivery hold subject is not a change request".into());
+    }
+    Ok(subject)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrewRoutingContext {
     pub command_context: CrewCommandContext,
@@ -2430,24 +2449,15 @@ impl CrewService {
     ) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace);
         let convoy = convoys.get(&request.convoy).await.map_err(|error| error.to_string())?;
-        let bound = convoy.spec.change_request.as_ref().ok_or_else(|| "turn-delivery convoy has no bound change request".to_string())?;
-        let repository = convoy
-            .spec
-            .repositories
-            .iter()
-            .find(|repository| repository.repo_ref == bound.repository_ref)
-            .ok_or_else(|| format!("bound repository {} is absent", bound.repository_ref))?;
-        let canonical = flotilla_resources::canonicalize_repo_url(&repository.url)?;
-        let repository_name = canonical
-            .split_once("://")
-            .map(|(_, rest)| rest)
-            .and_then(|rest| rest.split_once('/').map(|(_, scope)| scope))
-            .ok_or_else(|| format!("cannot derive repository scope from {}", repository.url))?;
+        // Turn producers use the typed subject set. A produced PR need not be an
+        // adopted PR in the legacy spec field; keep the firing subject for holds.
+        let subject = turn_hold_subject(&convoy, request.subject.as_ref())?;
+        let repository_name = &subject.source.scope;
         let HoldAct::ChangeRequestComment { body } = act;
         let comment = format!("{}\n\n{}", body.trim(), reason);
         let runner = self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?;
         runner
-            .run("gh", &["pr", "comment", &bound.id, "-R", repository_name, "--body", &comment], Path::new("/"), &ChannelLabel::Default)
+            .run("gh", &["pr", "comment", &subject.id, "-R", repository_name, "--body", &comment], Path::new("/"), &ChannelLabel::Default)
             .await
             .map(|_| ())
     }

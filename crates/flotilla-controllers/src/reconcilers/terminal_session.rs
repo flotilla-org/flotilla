@@ -150,6 +150,7 @@ pub trait TerminalRuntime: Send + Sync {
 
 pub struct TerminalSessionReconciler<R> {
     runtime: Arc<R>,
+    decisions: flotilla_core::decision_log::DecisionLog,
     convoys: TypedResolver<Convoy>,
     federated_convoys: Option<ReplicaReadResolver<Convoy>>,
     environments: TypedResolver<Environment>,
@@ -163,6 +164,7 @@ impl<R> TerminalSessionReconciler<R> {
     pub fn new(runtime: Arc<R>, backend: ResourceBackend, namespace: &str) -> Self {
         Self {
             runtime,
+            decisions: Default::default(),
             convoys: backend.clone().using::<Convoy>(namespace),
             federated_convoys: None,
             environments: backend.clone().using::<Environment>(namespace),
@@ -459,10 +461,15 @@ where
                             );
                         }};
                     }
-                    match outcome {
-                        TerminalDeliveryOutcome::Pending => log_delivery_decision!(debug, "wait_for_boundary_or_submission_evidence"),
-                        TerminalDeliveryOutcome::Confirmed => log_delivery_decision!(info, "submission_confirmed"),
-                        TerminalDeliveryOutcome::Unconfirmed(_) => log_delivery_decision!(info, "delivery_unconfirmed"),
+                    if self.decisions.changed(
+                        format!("delivery/{}/{}", obj.metadata.namespace, obj.metadata.name),
+                        (&message.id, readiness, outcome, attention.map(|attention| (attention.state, attention.source))),
+                    ) {
+                        match outcome {
+                            TerminalDeliveryOutcome::Pending => log_delivery_decision!(debug, "wait_for_boundary_or_submission_evidence"),
+                            TerminalDeliveryOutcome::Confirmed => log_delivery_decision!(info, "submission_confirmed"),
+                            TerminalDeliveryOutcome::Unconfirmed(_) => log_delivery_decision!(info, "delivery_unconfirmed"),
+                        }
                     }
                     return Ok(match outcome {
                         // Waiting for a turn boundary must not suppress the
@@ -658,16 +665,25 @@ where
                     let attention_changed = attention.as_ref().is_some_and(|attention| {
                         current.and_then(|status| status.attention.as_ref()).is_none_or(|previous| previous.should_replace_with(attention))
                     });
-                    tracing::debug!(
-                        convoy = ?obj.metadata.labels.get(CONVOY_LABEL),
-                        attention_state = ?attention.as_ref().map(|attention| attention.state),
-                        attention_source = ?attention.as_ref().map(|attention| attention.source),
-                        previous_state = ?current.and_then(|status| status.attention.as_ref()).map(|attention| attention.state),
-                        previous_source = ?current.and_then(|status| status.attention.as_ref()).map(|attention| attention.source),
-                        hook_precedence_seconds = TerminalAttention::FRESH_FOR.num_seconds(),
-                        reason = if attention_changed { "accept_observation" } else { "skip_precedence_or_debounce" },
-                        "terminal attention decision"
-                    );
+                    if self.decisions.changed(
+                        format!("attention/{}/{}", obj.metadata.namespace, obj.metadata.name),
+                        (
+                            attention.as_ref().map(|attention| (attention.state, attention.source)),
+                            current.and_then(|status| status.attention.as_ref()).map(|attention| (attention.state, attention.source)),
+                            attention_changed,
+                        ),
+                    ) {
+                        tracing::debug!(
+                            convoy = ?obj.metadata.labels.get(CONVOY_LABEL),
+                            attention_state = ?attention.as_ref().map(|attention| attention.state),
+                            attention_source = ?attention.as_ref().map(|attention| attention.source),
+                            previous_state = ?current.and_then(|status| status.attention.as_ref()).map(|attention| attention.state),
+                            previous_source = ?current.and_then(|status| status.attention.as_ref()).map(|attention| attention.source),
+                            hook_precedence_seconds = TerminalAttention::FRESH_FOR.num_seconds(),
+                            reason = if attention_changed { "accept_observation" } else { "skip_precedence_or_debounce" },
+                            "terminal attention decision"
+                        );
+                    }
                     let output_changed = observation
                         .output_digest
                         .as_ref()

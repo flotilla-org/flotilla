@@ -8,8 +8,8 @@ use std::{
 use chrono::{DateTime, Duration, Utc};
 use flotilla_protocol::commands::DaemonLogQuery;
 
-pub const DEFAULT_MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
-pub const DEFAULT_MAX_LOG_ARCHIVES: usize = 4;
+pub const DEFAULT_MAX_LOG_BYTES: u64 = 50 * 1024 * 1024;
+pub const DEFAULT_MAX_LOG_ARCHIVES: usize = 9;
 pub const DAEMON_LOG_DIRECTORY: &str = "log";
 pub const DAEMON_LOG_FILE: &str = "flotillad.jsonl";
 

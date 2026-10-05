@@ -23,6 +23,8 @@ pub struct TurnDeliveryRequest {
     pub role: String,
     pub brief: String,
     pub subject_revision: String,
+    /// The firing subject, including discovered PRs absent from legacy convoy spec.
+    pub subject: Option<crate::Subject>,
     pub sender: crate::CrewMessageSender,
 }
 
@@ -884,7 +886,7 @@ pub enum CommandAction {
     },
     /// Internal controller delivery, routed to the target Convoy's home.
     DeliverCrewTurn {
-        request: TurnDeliveryRequest,
+        request: Box<TurnDeliveryRequest>,
     },
     CrewSupervise {
         namespace: Option<String>,

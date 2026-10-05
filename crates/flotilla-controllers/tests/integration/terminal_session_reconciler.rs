@@ -1504,13 +1504,26 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
     runtime.pending.store(true, Ordering::SeqCst);
     runtime.observation_failed.store(true, Ordering::SeqCst);
     let now = chrono::DateTime::parse_from_rfc3339("2026-10-04T15:45:11Z").expect("epoch").with_timezone(&Utc);
+    let logs = ReclaimLogBuffer::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
     for step in 0..3 {
-        let prepared = reconciler.prepare(&session).await.expect("observation failure must preserve delivery retry");
+        let prepared =
+            reconciler.prepare(&session).with_subscriber(dispatch.clone()).await.expect("observation failure must preserve delivery retry");
         let outcome = reconciler.reconcile(&session, &prepared, now + chrono::Duration::milliseconds(step * 200));
         assert!(!matches!(outcome.patch, Some(TerminalSessionStatusPatch::MarkMessageDelivered { .. })));
         assert_eq!(outcome.requeue_after, Some(Duration::from_millis(200)));
         assert!(runtime.delivered.lock().expect("delivered mutex").is_empty());
     }
+    let output = String::from_utf8(logs.0.lock().expect("logs").clone()).expect("logs");
+    assert_eq!(output.matches("terminal crew turn delivery decision").count(), 1, "{output}");
+    assert!(output.contains("wait_for_boundary_or_submission_evidence"));
     runtime.pending.store(false, Ordering::SeqCst);
 
     let deps = reconciler.prepare(&session).await.expect("observe pending message");
@@ -2655,4 +2668,61 @@ async fn independent_owner_absence_log_does_not_claim_gate_approval() {
         .actuations
         .iter()
         .any(|actuation| matches!(actuation, Actuation::DeleteTerminalSession { name } if name == "independent")));
+}
+
+// #2654: unchanged attention decisions retain structured fields but emit once;
+// changing the incoming state emits a new decision even with the same resource key.
+#[tokio::test]
+async fn unchanged_attention_decisions_log_once() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    let sessions = backend.clone().using::<TerminalSession>("flotilla");
+    let created = sessions
+        .create(&meta("decision-crew"), &TerminalSessionSpec {
+            env_ref: "env-a".into(),
+            role: "coder".into(),
+            source: flotilla_resources::TerminalSessionSource::Tool { command: "test".into() },
+            cwd: "/workspace".into(),
+            pool: "cleat".into(),
+        })
+        .await
+        .expect("attention tracing scenario");
+    let now = Utc::now();
+    let session = sessions
+        .update_status("decision-crew", &created.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            attention: Some(TerminalAttention { state: TerminalAttentionState::Idle, source: TerminalAttentionSource::Hook, as_of: now }),
+            ..Default::default()
+        })
+        .await
+        .expect("attention tracing scenario");
+    let reconciler = TerminalSessionReconciler::new(Arc::new(HooklessTerminalRuntime), backend, "flotilla");
+    let logs = ReclaimLogBuffer::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    async {
+        for step in 1..=10 {
+            let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                output_digest: None,
+                occupancy: TerminalOccupancy::Vacant,
+                attention: Some(TerminalAttention {
+                    state: if step == 10 { TerminalAttentionState::Working } else { TerminalAttentionState::Idle },
+                    source: TerminalAttentionSource::Screen,
+                    as_of: now + chrono::Duration::seconds(step),
+                }),
+            });
+            reconciler.reconcile(&session, &prepared, now + chrono::Duration::seconds(step));
+        }
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let output = String::from_utf8(logs.0.lock().expect("attention tracing scenario").clone()).expect("attention tracing scenario");
+    assert_eq!(output.matches("terminal attention decision").count(), 2, "{output}");
+    assert!(output.contains("skip_precedence_or_debounce"));
+    assert!(output.contains("accept_observation"));
+    assert!(output.contains("attention_source=Some(Screen)"));
 }

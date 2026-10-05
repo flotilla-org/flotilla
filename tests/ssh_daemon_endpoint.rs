@@ -34,7 +34,7 @@ async fn write_message(writer: &mut tokio::net::unix::OwnedWriteHalf, message: M
 fn ssh_bridge(directory: &Path, socket: &Path) -> std::path::PathBuf {
     let path = directory.join("ssh");
     let command = format!(
-        "#!/bin/sh\nprintf 'attempt\\n' >> {}\nprintf '%s' $$ > {}\nexec env -u FLOTILLA_DAEMON {} --socket {} daemon-bridge\n",
+        "#!/bin/sh\nprintf 'attempt\\n' >> {}\nprintf '%s' $$ > {}\nexec env -u FLOTILLA_DAEMON -u FLOTILLA_DAEMON_SOCKET {} --socket {} daemon-bridge\n",
         flotilla_protocol::arg::shell_quote(&directory.join("attempts").display().to_string()),
         flotilla_protocol::arg::shell_quote(&directory.join("pid").display().to_string()),
         flotilla_protocol::arg::shell_quote(env!("CARGO_BIN_EXE_flotilla")),
