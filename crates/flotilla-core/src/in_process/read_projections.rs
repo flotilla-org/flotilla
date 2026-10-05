@@ -510,6 +510,7 @@ impl ReadProjections<'_> {
                         .configured(configured)
                         .link(link)
                         .maybe_daemon_generation(daemon_generation)
+                        .maybe_protocol_fingerprint(status.and_then(|status| status.protocol_fingerprint.clone()))
                         .maybe_daemon_version(status.and_then(|status| status.daemon_version.clone()))
                         .maybe_daemon_uptime_seconds(status.and_then(|status| {
                             status.daemon_started_at.map(|started_at| now.signed_duration_since(started_at).num_seconds().max(0) as u64)
@@ -1807,6 +1808,7 @@ mod tests {
                 heartbeat_at: Some(Utc::now()),
                 ready: true,
                 daemon_rss_bytes: Some(128 * 1024 * 1024),
+                protocol_fingerprint: Some("local-wire".to_string()),
                 ..Default::default()
             })
             .await
@@ -1820,6 +1822,8 @@ mod tests {
         let local = response.hosts.iter().find(|host| host.host == HostName::new("local")).expect("local host");
         // Fleet rows preserve the heartbeat RSS byte count.
         assert_eq!(local.daemon_rss_bytes, Some(128 * 1024 * 1024));
+        // Local fleet health uses the fingerprint from its own persisted heartbeat.
+        assert_eq!(local.protocol_fingerprint.as_deref(), Some("local-wire"));
         assert_eq!(local.fulfilments.len(), 1);
         assert_eq!(local.fulfilments[0].name, "local-kind");
     }
@@ -1930,6 +1934,7 @@ mod tests {
                 .update_status(name, &created.metadata.resource_version, &ResourceHostStatus {
                     heartbeat_at: Some(heartbeat_at),
                     daemon_generation: Some(generation.to_string()),
+                    protocol_fingerprint: Some(format!("{generation}-wire")),
                     ..Default::default()
                 })
                 .await
@@ -1981,9 +1986,14 @@ mod tests {
             .expect("fleet health");
         let remote = health.hosts.iter().find(|row| row.host == HostName::new("remote")).expect("remote health");
         assert_eq!(remote.daemon_generation.as_deref(), Some("trusted"));
+        // Remote wire identity follows the selected self-report, not a third-party observation.
+        assert_eq!(remote.protocol_fingerprint.as_deref(), Some("trusted-wire"));
         assert_eq!(remote.staleness, FleetHostStaleness::Stale);
         let local = health.hosts.iter().find(|row| row.host == HostName::new("local")).expect("local health");
         assert_ne!(local.daemon_generation.as_deref(), Some("third-party"));
+        assert!(local.protocol_fingerprint.is_none());
+        let missing = health.hosts.iter().find(|row| row.host == HostName::new("missing")).expect("missing health");
+        assert!(missing.protocol_fingerprint.is_none());
 
         // A second origin with an older heartbeat but newer sync must win in both views.
         fixture.register_remote_host("mirror-node", "remote", "mirror-id").await;
@@ -1997,6 +2007,7 @@ mod tests {
             .update_status("mirror-id", &created.metadata.resource_version, &ResourceHostStatus {
                 heartbeat_at: Some(now - chrono::Duration::minutes(10)),
                 daemon_generation: Some("newer-sync".to_string()),
+                protocol_fingerprint: Some("newer-sync-wire".to_string()),
                 ..Default::default()
             })
             .await
@@ -2019,6 +2030,7 @@ mod tests {
             .expect("fleet health with mirror");
         let remote = health.hosts.iter().find(|row| row.host == HostName::new("remote")).expect("remote mirror health");
         assert_eq!(remote.daemon_generation.as_deref(), Some("newer-sync"));
+        assert_eq!(remote.protocol_fingerprint.as_deref(), Some("newer-sync-wire"));
     }
 
     #[tokio::test]

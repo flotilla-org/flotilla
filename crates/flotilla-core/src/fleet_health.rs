@@ -22,7 +22,7 @@ pub fn spread(result: Result<CommandValue, String>) -> String {
     };
     let mut groups: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for host in &response.hosts {
-        let generation = host.daemon_generation.as_deref().filter(|generation| !generation.is_empty()).unwrap_or("unknown");
+        let generation = host.protocol_fingerprint.as_deref().filter(|generation| !generation.is_empty()).unwrap_or("unknown");
         let name = format!("{}{}", host.host, if host.is_local { " (local)" } else { "" });
         groups.entry(generation).or_default().push(name);
     }
@@ -50,7 +50,8 @@ mod tests {
             .is_local(local)
             .configured(true)
             .link(PeerConnectionState::Connected)
-            .maybe_daemon_generation(generation.map(str::to_string))
+            .daemon_generation(format!("instance-{name}"))
+            .maybe_protocol_fingerprint(generation.map(str::to_string))
             .crew_count(0)
             .convoy_count(0)
             .staleness(FleetHostStaleness::Current)
@@ -76,6 +77,35 @@ mod tests {
         }
         for result in [Err("transport failed".into()), Ok(CommandValue::Error { message: "query refused".into() }), Ok(CommandValue::Ok)] {
             assert!(check(result).is_err());
+        }
+    }
+
+    // A converged fleet groups by its handshake fingerprint even though each
+    // daemon has a different instance id. A mixed install has two wire groups.
+    #[hegel::test]
+    fn spread_groups_wire_generations_independently_of_instances(tc: hegel::TestCase) {
+        // Generate fleet sizes and which hosts have rolled; pin empty, singleton,
+        // and eight-host boundaries and both converged and mixed cases each run.
+        let count = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(8));
+        for count in [0, 1, 8, count] {
+            for rolled in 0..=count {
+                let hosts = (0..count)
+                    .map(|index| host(&format!("host-{index}"), index == 0, Some(if index < rolled { "new" } else { "old" })))
+                    .collect();
+                let output = spread(Ok(response(hosts)));
+                let groups = usize::from(rolled > 0) + usize::from(rolled < count);
+                assert_eq!(output.lines().count(), 1 + groups);
+                for (generation, range) in [("new", 0..rolled), ("old", rolled..count)] {
+                    if range.is_empty() {
+                        continue;
+                    }
+                    let names = range
+                        .map(|index| format!("host-{index}{}", if index == 0 { " (local)" } else { "" }))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    assert!(output.contains(&format!("  {generation}: {names}\n")), "{output}");
+                }
+            }
         }
     }
 

@@ -3914,6 +3914,7 @@ async fn apply_host_heartbeat_with_credentials(
         resource_store: resource_store.map(Box::new),
         daemon_rss_bytes: flotilla_core::host_summary::daemon_rss_bytes(),
         daemon_generation: health.generation.clone(),
+        protocol_fingerprint: Some(flotilla_protocol::PROTOCOL_FINGERPRINT.to_string()),
         daemon_version: Some(health.version.clone()),
         daemon_started_at: Some(health.started_at),
         disk_free_bytes,
@@ -14837,6 +14838,8 @@ mod tests {
         assert_eq!(status.capabilities.get("terminal_pools"), Some(&json!(["passthrough"])));
         assert_eq!(status.daemon_generation.as_deref(), Some("test-generation"));
         assert_eq!(status.daemon_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        // Publish the exact handshake fingerprint, independently of restart identity.
+        assert_eq!(status.protocol_fingerprint.as_deref(), Some(flotilla_protocol::PROTOCOL_FINGERPRINT));
         assert!(status.daemon_started_at.is_some());
         assert!(status.disk_free_bytes.is_some());
         assert!(status.daemon_rss_bytes.is_some_and(|bytes| bytes > 0));

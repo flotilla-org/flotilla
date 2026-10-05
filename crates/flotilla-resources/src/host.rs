@@ -144,6 +144,11 @@ pub struct HostStatus {
     pub blob_sync: Option<flotilla_protocol::BlobSyncStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_generation: Option<String>,
+    /// Wire-generation fingerprint compared by the daemon handshake.
+    /// ADR 0047: previous-generation Host records omit this field; retain the
+    /// decoder default until one fleet roll after all hosts publish it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -403,6 +408,7 @@ pub enum HostStatusPatch {
         heartbeat_at: DateTime<Utc>,
         ready: bool,
         daemon_generation: Option<String>,
+        protocol_fingerprint: Option<String>,
         daemon_version: Option<String>,
         daemon_started_at: Option<DateTime<Utc>>,
         disk_free_bytes: Option<u64>,
@@ -433,6 +439,7 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 heartbeat_at,
                 ready,
                 daemon_generation,
+                protocol_fingerprint,
                 daemon_version,
                 daemon_started_at,
                 disk_free_bytes,
@@ -464,6 +471,7 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 status.conditions.extend(sleep_conditions);
                 status.ready = *ready && !status.readiness_blocked();
                 status.daemon_generation.clone_from(daemon_generation);
+                status.protocol_fingerprint.clone_from(protocol_fingerprint);
                 status.daemon_version.clone_from(daemon_version);
                 status.daemon_started_at = *daemon_started_at;
                 status.disk_free_bytes = *disk_free_bytes;
