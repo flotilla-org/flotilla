@@ -316,6 +316,8 @@ pub fn append_convoy_work_context(
     if let Some(project_ref) = &convoy.spec.project_ref {
         content.push_str(&format!("- Island Project: `{project_ref}` — resolve current repositories and roles with `flotilla crew list` on each orientation sweep.\n"));
     }
+    // Project-scoped governors orient against live membership. Delivery crews
+    // retain admitted repository URLs and target refs as their delivery contract.
     if convoy.spec.role != "governor" || convoy.spec.project_ref.is_none() {
         content.push_str("- Repositories:\n");
         for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
