@@ -985,6 +985,13 @@ activate_staged_generation() {
     await_confirmation_watchdog "$generation" "$rollback_generation"
     prune_after_confirmation
   fi
+  # Always use the incoming generation: the previous CLI may not have this
+  # post-install step. Cleat alias turnover is outside the health rollback.
+  if ! "$release/bin/flotilla" --socket "$DAEMON_SOCKET" --json fleet post-install \
+      --cleat-bin "$release/bin/cleat" --generation "$generation" \
+      --diagnostics-dir "$FLEET_ROOT/diagnostics"; then
+    die "post-install cleat drain failed or warned; installed generation $generation remains active; inspect diagnostics and retry (no rollback)"
+  fi
 }
 
 handoff_activation() {

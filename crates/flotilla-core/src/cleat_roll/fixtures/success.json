@@ -1,0 +1,5 @@
+{
+  "stdout": "{\"changed\":true,\"installed\":{\"version\":\"0.1.0\",\"git_sha\":\"00c072b207dc943f6c93fe3b6b09abaa257695a6\",\"dirty\":false,\"profile\":\"release\",\"opt_level\":\"3\",\"target\":\"x86_64-unknown-linux-gnu\",\"protocol_version\":12,\"ghostty_vt\":true},\"old\":{\"name\":\"default@1\",\"generation\":1,\"build\":{\"version\":\"0.1.0\",\"git_sha\":\"fd66a7121149e85eb8fbc57a99a388b0c91dae6c\",\"dirty\":false,\"profile\":\"release\",\"opt_level\":\"3\",\"target\":\"x86_64-unknown-linux-gnu\",\"protocol_version\":11,\"ghostty_vt\":true},\"session_count\":0},\"current\":{\"name\":\"default@2\",\"generation\":2,\"build\":{\"version\":\"0.1.0\",\"git_sha\":\"00c072b207dc943f6c93fe3b6b09abaa257695a6\",\"dirty\":false,\"profile\":\"release\",\"opt_level\":\"3\",\"target\":\"x86_64-unknown-linux-gnu\",\"protocol_version\":12,\"ghostty_vt\":true},\"session_count\":0},\"warning\":null}\n",
+  "stderr": "",
+  "success": true
+}

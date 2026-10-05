@@ -2351,6 +2351,52 @@ impl IssueProvider for MockIssueProvider {
     }
 }
 
+// Post-install contains paths from the installing host. Pin router refusal of a
+// remote target so delivery cannot accidentally drain or write on another host.
+async fn fleet_post_install_target_scenario(remote: bool) {
+    let topology =
+        spawn_in_memory_request_topology(empty_daemon_named("leader").await, empty_daemon_named("follower").await).await.expect("topology");
+    let directory = tempfile::tempdir().expect("diagnostics directory");
+    let mut events = topology.client.subscribe();
+    let command = Command::builder()
+        .node_id(if remote { topology.follower.node_id().clone() } else { topology.leader.node_id().clone() })
+        .action(CommandAction::FleetPostInstall {
+            cleat_bin: directory.path().join("cleat"),
+            generation: "new-gen".into(),
+            diagnostics_dir: directory.path().join("diagnostics"),
+        })
+        .build();
+    let dispatched = topology.client.execute(command).await;
+    if remote {
+        assert!(matches!(dispatched, Err(message) if message.contains("must run on the installing host")));
+        assert!(!directory.path().join("diagnostics").exists());
+    } else {
+        let result = await_command_result(&mut events, dispatched.expect("dispatch local post-install")).await;
+        let CommandValue::FleetPostInstall { report, .. } = result else { panic!("expected post-install report: {result:?}") };
+        assert_eq!(report["generation"], "new-gen");
+        let saved = std::fs::read_to_string(report["diagnostics_path"].as_str().expect("diagnostics path")).expect("retained report");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&saved).expect("report JSON"), report);
+    }
+}
+
+#[tokio::test]
+async fn fleet_post_install_target_pinned_rows() {
+    for remote in [false, true] {
+        fleet_post_install_target_scenario(remote).await;
+    }
+}
+
+#[hegel::test]
+fn generated_fleet_post_install_target(tc: hegel::TestCase) {
+    // Enumerate both router targets: local execution/retention and remote refusal.
+    let remote = tc.draw(hegel::generators::booleans());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(fleet_post_install_target_scenario(remote));
+}
+
 #[tokio::test]
 async fn in_memory_request_client_routes_remote_command_result() {
     let leader = empty_daemon_named("leader").await;

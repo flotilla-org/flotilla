@@ -6,6 +6,7 @@
 #[path = "attach.rs"]
 mod attach;
 mod checkout_providers;
+mod cleat_roll;
 mod crew_ops;
 pub(crate) use crew_ops::convoy_message_address;
 pub use crew_ops::{ConvoyResumeOutcome, CrewRoutingContext};
@@ -6822,6 +6823,19 @@ impl InProcessDaemon {
             ($future:expr) => {
                 Box::pin(async { Box::pin($future).await }).await
             };
+        }
+
+        if let CommandAction::FleetPostInstall { cleat_bin, generation, diagnostics_dir } = &command.action {
+            let identity = self.start_context_free_command(id, command.description().to_string());
+            let result = match self.post_install_cleat(cleat_bin, generation, diagnostics_dir).await {
+                Ok(report) => CommandValue::FleetPostInstall {
+                    failed: report.failed(),
+                    report: serde_json::to_value(report).map_err(|error| error.to_string())?,
+                },
+                Err(message) => CommandValue::Error { message },
+            };
+            self.finish_context_free_command(id, identity, result);
+            return Ok(id);
         }
 
         match &command.action {

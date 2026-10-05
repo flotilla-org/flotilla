@@ -12,6 +12,7 @@ pub mod awareness_projection;
 mod branch_lookup_observer;
 pub mod change_request_observer;
 pub mod checkout_integration;
+pub mod cleat_roll;
 pub mod command_target;
 pub mod config;
 pub mod convert;

@@ -112,7 +112,10 @@ enum SubCommand {
     /// Read structured daemon logs from this host or a peer
     Logs(LogsArgs),
     /// Show fleet-wide host health without collapsing independent observations
-    Fleet,
+    Fleet {
+        #[command(subcommand)]
+        command: Option<FleetSubCommand>,
+    },
     /// List convoy vessels and crew sessions
     Ls(LsArgs),
     /// Attach to a running convoy crew session
@@ -701,6 +704,19 @@ struct ResourceStatusPatchArgs {
     host: Option<String>,
 }
 
+#[derive(clap::Subcommand)]
+enum FleetSubCommand {
+    /// Run this generation's post-install cleat turnover after health confirmation
+    PostInstall {
+        #[arg(long)]
+        cleat_bin: PathBuf,
+        #[arg(long)]
+        generation: String,
+        #[arg(long)]
+        diagnostics_dir: PathBuf,
+    },
+}
+
 impl Cli {
     fn client_paths(&self) -> Result<CliPaths, String> {
         let policy = PathPolicy::from_process_env();
@@ -910,7 +926,21 @@ async fn run_command(cli: Cli, command: Option<SubCommand>, format: OutputFormat
         }
         Some(SubCommand::Topology(TopologyArgs { dot })) => run_topology_command(&cli, format, dot).await,
         Some(SubCommand::Logs(LogsArgs { host, since, level, target })) => run_logs(&cli, host.as_deref(), since, level, target).await,
-        Some(SubCommand::Fleet) => run_fleet_health(&cli, format).await,
+        Some(SubCommand::Fleet { command: None }) => run_fleet_health(&cli, format).await,
+        Some(SubCommand::Fleet { command: Some(FleetSubCommand::PostInstall { cleat_bin, generation, diagnostics_dir }) }) => {
+            cli.require_local_daemon("fleet post-install")?;
+            run_control_command(
+                &cli,
+                Command {
+                    node_id: None,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::FleetPostInstall { cleat_bin, generation, diagnostics_dir },
+                },
+                format,
+            )
+            .await
+        }
         Some(SubCommand::Ls(LsArgs { project, all })) => run_fleet_list(&cli, format, project, all).await,
         Some(SubCommand::Attach(AttachArgs { reference, watch, strict, take, transient, host })) => {
             run_attach(&cli, &reference, attach_mode(watch, strict, take), transient, host.as_deref(), format).await
@@ -1605,7 +1635,7 @@ async fn run_control_command(cli: &Cli, mut command: Command, format: OutputForm
         Ok(result) => result,
         Err(message) => exit_command_error(message, format),
     };
-    if let CommandValue::Error { .. } = result {
+    if matches!(result, CommandValue::Error { .. } | CommandValue::FleetPostInstall { failed: true, .. }) {
         std::process::exit(1);
     }
     if let CommandValue::ConvoyStarted { name, attach_plan: Some(plan), binding } = result {
@@ -4262,7 +4292,26 @@ mod tests {
     #[test]
     fn cli_parses_fleet_health_dashboard() {
         let cli = Cli::try_parse_from(["flotilla", "fleet"]).expect("fleet should parse");
-        assert!(matches!(cli.command, Some(SubCommand::Fleet)));
+        assert!(matches!(cli.command, Some(SubCommand::Fleet { command: None })));
+    }
+
+    #[test]
+    fn cli_parses_incoming_generation_post_install() {
+        // Incoming CLI owns this step; the preceding generation need not parse it.
+        let cli = Cli::try_parse_from([
+            "flotilla",
+            "--json",
+            "fleet",
+            "post-install",
+            "--cleat-bin",
+            "/incoming/bin/cleat",
+            "--generation",
+            "new-gen",
+            "--diagnostics-dir",
+            "/fleet/diagnostics",
+        ])
+        .expect("post-install parses");
+        assert!(matches!(cli.command, Some(SubCommand::Fleet { command: Some(super::FleetSubCommand::PostInstall { .. }) })));
     }
 
     #[test]

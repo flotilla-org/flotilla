@@ -73,10 +73,14 @@ impl InProcessDaemon {
         requested_node: Option<&NodeId>,
     ) -> Result<CommandTarget, TargetError> {
         use CommandAction as A;
+        if matches!(action, A::FleetPostInstall { .. }) && requested_node.is_some_and(|node| node != self.node_id()) {
+            return Err(TargetError::RecordHome("fleet post-install must run on the installing host".to_string()));
+        }
 
         // Keep this exhaustive: adding a command requires choosing its execution
         // semantics here, before the transport sees it.
         let (mut reason, mut delivery) = match action {
+            A::FleetPostInstall { .. } => (TargetReason::LocalMutation, RemoteDelivery::Command),
             A::ConvoyStart { .. } | A::ConvoyCreate { .. } => (TargetReason::Admission, RemoteDelivery::Command),
             A::ConvoyDelete { .. }
             | A::ConvoyLink { .. }

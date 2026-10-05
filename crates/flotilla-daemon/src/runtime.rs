@@ -3755,6 +3755,9 @@ async fn apply_host_heartbeat_with_credentials(
     migrate_live_placement_policies(&backend, namespace, &profile.host_id, std::env::consts::OS).await?;
     let mut conditions = runtime_health.conditions().await;
     conditions.extend(file_descriptor_pressure_condition());
+    if let Some(condition) = daemon.cleat_build_skew_condition().await {
+        conditions.push(condition);
+    }
     if let Some(condition) = resource_decode_quarantine_condition(resource_store.as_ref()) {
         conditions.push(condition);
     }

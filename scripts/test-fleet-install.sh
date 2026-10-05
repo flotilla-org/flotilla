@@ -65,6 +65,18 @@ mkdir -p "$test_root/home/.config/flotilla" "$fixture_root" "$fake_bin"
 printf 'test-token\n' >"$test_root/home/.config/flotilla/fleet-reader-token"
 chmod 0600 "$test_root/home/.config/flotilla/fleet-reader-token"
 
+# Process boundary double: the fixture CLI stands in for the incoming binary's
+# post-install subcommand; Rust tests cover cleat inventory and drain behavior.
+add_post_install_fixture() {
+  cat >>"$1" <<'SH'
+if [[ "${1:-}" == --socket && "${3:-}" == --json && "${4:-}" == fleet && "${5:-}" == post-install ]]; then
+  if [[ -n "${POST_INSTALL_LOG:-}" ]]; then printf '%s|%s\n' "$0" "$*" >>"$POST_INSTALL_LOG"; fi
+  printf '%s\n' '{"kind":"fleet_post_install","report":"post-install fixture report"}'
+  exit "${POST_INSTALL_EXIT:-0}"
+fi
+SH
+}
+
 make_generation() {
   local generation="$1"
   local protocol="$2"
@@ -85,6 +97,7 @@ if [[ "\${1:-}" == --socket && "\${3:-}" == resource && "\${4:-}" == validate &&
 fi
 EOF
     fi
+    if [[ "$name" == flotilla ]]; then add_post_install_fixture "$bundle/bin/$name"; fi
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty\n' >"$bundle/lib/libghostty-vt.so.0"
@@ -195,6 +208,7 @@ if [[ "${1:-}" == --socket && "${3:-}" == resource && "${4:-}" == validate ]]; t
 fi
 SH
     fi
+    if [[ "$name" == flotilla ]]; then add_post_install_fixture "$bundle/bin/$name"; fi
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty signed\n' >"$bundle/lib/libghostty-vt.dylib"
@@ -726,10 +740,11 @@ grep -Fq 'flotilla daemon stop' "$test_root/daemon.out" || fail 'daemon refusal 
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'failed daemon preflight switched current'
 
 : >"$test_root/systemctl.log"
-if FLEET_HEALTH_FAIL_FOR="$generation_two" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=0 \
+if POST_INSTALL_LOG="$test_root/unhealthy-post-install.log" FLEET_HEALTH_FAIL_FOR="$generation_two" FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS=0 \
   run_installer "$generation_two" >"$test_root/health-rollback.out" 2>&1; then
   fail 'unhealthy Linux generation was accepted'
 fi
+test ! -e "$test_root/unhealthy-post-install.log" || fail 'post-install ran before health confirmation'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
   || fail 'unhealthy Linux generation did not roll current back'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/previous")" = "$generation_two" \
@@ -783,7 +798,7 @@ for _ in {1..50}; do
 done
 [[ -n "$orphan_confirmation_log" ]] || fail 'detached watchdog did not retain a completed rollback audit log'
 
-DAEMON_RUNNING=1 STOP_FAIL=0 run_installer latest >"$test_root/latest.out"
+POST_INSTALL_LOG="$test_root/post-install.log" DAEMON_RUNNING=1 STOP_FAIL=0 run_installer latest >"$test_root/latest.out"
 grep -Fq "handing off activation to generation $generation_two installer" "$test_root/latest.out" \
   || fail 'upgrade did not adopt the incoming generation installer'
 grep -Fq "generation $generation_two confirmed healthy" "$test_root/latest.out" \
@@ -797,6 +812,19 @@ test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/previous")" =
 if leftover_work_dirs="$(compgen -G "$test_root/home/.local/opt/flotilla-fleet/.fleet-install.*")"; then
   fail "successful upgrade left fleet-install work directories behind: $leftover_work_dirs"
 fi
+
+# The roll calls the incoming CLI after confirmation and surfaces its report.
+expected_post_install="$test_root/home/.local/opt/flotilla-fleet/releases/$generation_two/bin/flotilla"
+grep -Fq "$expected_post_install|--socket $test_root/home/.config/flotilla/run/flotilla.sock --json fleet post-install --cleat-bin $test_root/home/.local/opt/flotilla-fleet/releases/$generation_two/bin/cleat --generation $generation_two --diagnostics-dir $test_root/home/.local/opt/flotilla-fleet/diagnostics" "$test_root/post-install.log" \
+  || fail 'roll did not invoke the incoming post-install binary with its cleat and diagnostics paths'
+grep -Fq 'post-install fixture report' "$test_root/latest.out" || fail 'post-install report was swallowed'
+# Post-install failure cannot undo the confirmed incoming generation.
+if POST_INSTALL_EXIT=7 run_installer "$generation_two" >"$test_root/post-install-failed.out" 2>&1; then
+  fail 'post-install failure was swallowed'
+fi
+grep -Fq 'post-install fixture report' "$test_root/post-install-failed.out" || fail 'failed post-install report was swallowed'
+grep -Fq 'remains active' "$test_root/post-install-failed.out" || fail 'post-install failure omitted recovery state'
+test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_two" || fail 'post-install failure rolled back'
 
 run_installer rollback >"$test_root/rollback.out"
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" || fail 'rollback did not restore previous generation'

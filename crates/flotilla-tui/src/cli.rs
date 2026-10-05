@@ -1184,6 +1184,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::HostStatus(status) => format_host_status_human(status),
         CommandValue::HostProviders(providers) => format_host_providers_human(providers),
         CommandValue::FleetHealth(fleet) => format_fleet_health_human(fleet),
+        CommandValue::FleetPostInstall { report, .. } => serde_json::to_string_pretty(report).expect("JSON report serializes"),
         CommandValue::FulfilmentList(kinds) => format_fulfilment_list_human(kinds),
         CommandValue::FleetList(fleet) => format_fleet_list_human(fleet),
         CommandValue::CrewStalls(stalls) => {
