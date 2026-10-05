@@ -840,9 +840,11 @@ fn codex_composer_visible(screen: &str) -> bool {
     let trailing = &lines[index + 1..];
     // Only the last nonblank row can delimit the composer; a draft can itself
     // contain footer-like text before more draft rows or the actual footer.
+    // Codex renders a `? for shortcuts` hint below the model footer, so it is
+    // chrome rather than the last composer row.
     let footer = trailing
         .iter()
-        .rposition(|line| !line.is_empty())
+        .rposition(|line| !line.is_empty() && !codex_shortcuts_hint(line))
         .filter(|&index| trailing[index].contains(" · /") || trailing[index].contains(" · ~"));
     // Wrapped or multiline draft text is still part of the composer. A known
     // placeholder on its first row must not hide a typed continuation.
@@ -856,6 +858,11 @@ fn codex_composer_visible(screen: &str) -> bool {
         tracing::debug!(codex_version = "rust-v0.160.0", "unrecognised Codex composer text; delivery remains blocked");
     }
     idle
+}
+
+fn codex_shortcuts_hint(line: &str) -> bool {
+    // rust-v0.160.0: bottom_pane footer hint shown beneath the model footer.
+    line == "? for shortcuts"
 }
 
 fn codex_background_terminal_footer(line: &str) -> bool {
@@ -2277,6 +2284,20 @@ mod tests {
 
     // #2648: every empty-composer placeholder shipped by rust-v0.160.0 must
     // remain idle, including a cropped capture without the status footer.
+    // Live r531 screen (2026-10-05): the shortcuts hint follows the model footer.
+    #[test]
+    fn codex_idle_composer_with_shortcuts_hint_is_idle() {
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex adapter");
+        let footer = "\n\n  GPT-6.1-Sol default · /workspace · Read the crew brief\n  ? for shortcuts\n";
+        let live = format!("• Implemented in PR #2670.\n\n  Worked for 39m 18s • 1:29 PM\n\n\n› Ask Codex to do anything{footer}");
+        assert_eq!(codex.classify_screen_attention(&live), Some(TerminalAttentionState::Idle), "{live}");
+        let blank = format!("› {footer}");
+        assert_eq!(codex.classify_screen_attention(&blank), Some(TerminalAttentionState::Idle), "{blank}");
+        let draft = format!("› fix the flaky test{footer}");
+        assert_ne!(codex.classify_screen_attention(&draft), Some(TerminalAttentionState::Idle), "{draft}");
+    }
+
     #[test]
     fn codex_pinned_placeholders_are_idle() {
         let registry = discovered_registry();
