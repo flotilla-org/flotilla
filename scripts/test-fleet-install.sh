@@ -71,7 +71,7 @@ add_post_install_fixture() {
   cat >>"$1" <<EOF
 if [[ "\${1:-}" == --socket && "\${3:-}" == fleet && "\${4:-}" == check ]]; then
   if [[ -n "\${FLEET_CHECK_LOG:-}" ]]; then printf '%s|%s|%s\\n' "\$0" "\$*" "\${FLOTILLA_CONTAINED_HOST_DAEMON:-}" >>"\$FLEET_CHECK_LOG"; fi
-  [[ "\${FLEET_HEALTH_FAIL_FOR:-}" != "$2" ]] || exit 1
+  if [[ "\${FLEET_HEALTH_FAIL_FOR:-}" == "$2" ]]; then printf 'fixture readiness failure\\n' >&2; exit 1; fi
   exit 0
 fi
 if [[ "\${1:-}" == --socket && "\${3:-}" == fleet && "\${4:-}" == spread ]]; then
@@ -102,7 +102,7 @@ make_generation() {
   local bundle="$test_root/bundle-$generation/fleet-candidate-linux-x86_64-gnu2.36"
   mkdir -p "$directory" "$bundle/bin" "$bundle/lib"
   for name in flotilla flotillad cleat; do
-    printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then echo "daemon stop requested"; exit "${STOP_FAIL:-0}"; fi\nif [[ "%s" == flotilla && "${1:-}" == --json && "${2:-}" == fleet ]]; then\n  [[ "${FLEET_HEALTH_FAIL_FOR:-}" != "%s" ]] || exit 1\n  printf '\''{"kind":"fleet_health","hosts":[{"host":"test","is_local":true,"daemon_generation":"%s"}],"dispatch_queue":{"entries":[]}}\\n'\''\n  exit 0\nfi\nprintf "%s from %s\\n"\n' "$name" "$generation" "$generation" "$name" "$generation" >"$bundle/bin/$name"
+    printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then echo "daemon stop requested"; exit "${STOP_FAIL:-0}"; fi\n' >"$bundle/bin/$name"
     if [[ "$name" == flotilla ]]; then
       cat >>"$bundle/bin/$name" <<EOF
 if [[ "\${1:-}" == --socket && "\${3:-}" == resource && "\${4:-}" == validate && "\${5:-}" == --from-daemon && "\${FLEET_VALIDATE_FAIL_FOR:-}" == "$generation" ]]; then
@@ -111,6 +111,7 @@ fi
 EOF
     fi
     if [[ "$name" == flotilla ]]; then add_post_install_fixture "$bundle/bin/$name" "$generation"; fi
+    printf 'printf "%s from %s\\n"\n' "$name" "$generation" >>"$bundle/bin/$name"
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty\n' >"$bundle/lib/libghostty-vt.so.0"
@@ -208,7 +209,7 @@ add_darwin_derivative() {
   local bundle="$test_root/darwin-$generation/fleet-signed-darwin-aarch64"
   mkdir -p "$bundle/bin" "$bundle/lib"
   for name in flotilla flotillad cleat; do
-    printf '#!/usr/bin/env bash\nif [[ "%s" == flotilla && "${1:-}" == --json && "${2:-}" == fleet ]]; then\n  [[ "${FLEET_HEALTH_FAIL_FOR:-}" != "%s" ]] || exit 1\n  printf '\''{"kind":"fleet_health","hosts":[{"host":"test","is_local":true,"daemon_generation":"%s"}],"dispatch_queue":{"entries":[]}}\\n'\''\n  exit 0\nfi\nprintf "%s signed for %s\\n"\n' "$name" "$generation" "$generation" "$name" "$generation" >"$bundle/bin/$name"
+    printf '#!/usr/bin/env bash\n' >"$bundle/bin/$name"
     if [[ "$name" == flotilla ]]; then
       cat >>"$bundle/bin/$name" <<'SH'
 if [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then
@@ -222,6 +223,7 @@ fi
 SH
     fi
     if [[ "$name" == flotilla ]]; then add_post_install_fixture "$bundle/bin/$name" "$generation"; fi
+    printf 'printf "%s signed for %s\\n"\n' "$name" "$generation" >>"$bundle/bin/$name"
     chmod 0755 "$bundle/bin/$name"
   done
   printf 'ghostty signed\n' >"$bundle/lib/libghostty-vt.dylib"
@@ -727,7 +729,7 @@ grep -Fq 'incoming installer refused activation' "$test_root/handoff-failure.out
   || fail 'incoming installer failure was not reported'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
   || fail 'handoff failure switched current'
-"$test_root/home/.local/opt/flotilla-fleet/current/bin/flotilla" --json fleet >/dev/null \
+"$test_root/home/.local/opt/flotilla-fleet/current/bin/flotilla" --socket "$test_root/home/.config/flotilla/run/flotilla.sock" fleet check >/dev/null \
   || fail 'handoff failure did not leave the old generation restartable'
 
 if FLEET_VALIDATE_FAIL_FOR="$generation_two" run_installer "$generation_two" >"$test_root/validation.out" 2>&1; then
@@ -749,6 +751,7 @@ if POST_INSTALL_LOG="$test_root/unhealthy-post-install.log" FLEET_HEALTH_FAIL_FO
   run_installer "$generation_two" >"$test_root/health-rollback.out" 2>&1; then
   fail 'unhealthy Linux generation was accepted'
 fi
+grep -Fq 'fixture readiness failure' "$test_root/health-rollback.out" || fail 'health refusal diagnostic was not retained'
 test ! -e "$test_root/unhealthy-post-install.log" || fail 'post-install ran before health confirmation'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
   || fail 'unhealthy Linux generation did not roll current back'

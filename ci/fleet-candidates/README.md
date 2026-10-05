@@ -323,9 +323,10 @@ authority, and empty entitlements on all three executables and every bundled
 dynamic library. Consumer Macs hold no signing credential.
 
 The installer confirms readiness with the current generation's `flotilla --socket
-SOCKET fleet check`. It requires an exact build/protocol handshake and a local
+SOCKET fleet check`. It requires an exact wire-generation/protocol handshake and a local
 fleet row; it never starts a daemon or re-execs a different generation. The shell
-keeps the confirmation deadline, watchdog and rollback policy. Status delegates
+keeps the confirmation deadline, watchdog and rollback policy, and reports the
+last refusal after the deadline expires. Status delegates
 wire-generation grouping to `flotilla --socket SOCKET fleet spread`.
 
 The first live proof installed generation
