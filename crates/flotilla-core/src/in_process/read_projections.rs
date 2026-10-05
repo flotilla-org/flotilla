@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_manifest::{
     keys::{
@@ -41,6 +42,7 @@ use tracing::warn;
 
 use super::{resolve_convoy_candidate_indices, ConvoyAddressIdentity};
 use crate::{
+    change_request_observer::ChangeRequestRef,
     checkout_integration::LANDING_EVIDENCE_TTL,
     config::ConfigStore,
     environment_manager::EnvironmentManager,
@@ -49,13 +51,37 @@ use crate::{
         join_replica_errors, replica_sync_is_fresh, replicated_host_reports, FleetService, ResourceReplicationFailure,
     },
     host_registry::HostCounts,
-    leaf_engine::{LeafSubscriptionTable, LeafWatcher},
+    leaf_engine::{LeafFiringRecord, LeafSubscriptionRow, LeafSubscriptionTable, LeafWatcher},
     ops_entry::{
         DECLARATION_REFUSAL_ATTENTION_PREFIX, DECLARATION_REFUSAL_REASON_ANNOTATION, DECLARATION_REFUSED_SINCE_ANNOTATION,
         DECLARATION_STALE_AFTER, ENSURE_CONFIG_DRIFT_REASON_ANNOTATION, ENSURE_DRIFT_ATTENTION_PREFIX,
     },
+    providers::change_request::ObservationError,
     resource_explain::{explain_condition, explain_unmet_expectation, explained_provenance, observed_freshness},
 };
+
+/// Read projections can inspect subscription evidence without changing subscriptions or delivery.
+#[async_trait]
+pub(super) trait LeafSubscriptionRead: Send + Sync {
+    fn change_request_stale_after(&self) -> Duration;
+    async fn change_request_observation_error(&self, subject: &ChangeRequestRef) -> Option<ObservationError>;
+    async fn diagnostics(&self) -> Vec<(LeafSubscriptionRow, Vec<LeafFiringRecord>)>;
+}
+
+#[async_trait]
+impl LeafSubscriptionRead for LeafSubscriptionTable {
+    fn change_request_stale_after(&self) -> Duration {
+        LeafSubscriptionTable::change_request_stale_after(self)
+    }
+
+    async fn change_request_observation_error(&self, subject: &ChangeRequestRef) -> Option<ObservationError> {
+        LeafSubscriptionTable::change_request_observation_error(self, subject).await
+    }
+
+    async fn diagnostics(&self) -> Vec<(LeafSubscriptionRow, Vec<LeafFiringRecord>)> {
+        LeafSubscriptionTable::diagnostics(self).await
+    }
+}
 
 /// Projects resource and fleet state supplied by the daemon and FleetService.
 /// Host refresh stays with the daemon; FleetService gathers local and replica rows.
@@ -67,7 +93,7 @@ pub(super) struct ReadProjections<'a> {
     pub(super) host_name: &'a HostName,
     pub(super) node_id: &'a NodeId,
     pub(super) clock: &'a Arc<dyn Clock>,
-    pub(super) leaf_subscriptions: &'a LeafSubscriptionTable,
+    pub(super) leaf_subscriptions: &'a dyn LeafSubscriptionRead,
     pub(super) fleet: &'a FleetService,
 }
 
