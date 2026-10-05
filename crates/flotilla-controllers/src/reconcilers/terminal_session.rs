@@ -12,7 +12,7 @@ use flotilla_resources::{
     TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, Vessel, ACTUATOR_HOST_REF_ANNOTATION,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG,
     CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
-    TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
+    TERMINAL_DELIVERY_NOT_SUBMITTED_REASON, TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -50,7 +50,9 @@ impl TerminalDeliveryFailure {
     fn message(self) -> &'static str {
         match self {
             Self::StartupNotReady => "agent TUI did not become ready before the message delivery deadline; no text was sent",
-            Self::SubmissionUnconfirmed => "agent session remained idle after submit and one retry",
+            Self::SubmissionUnconfirmed => {
+                "message input may have been accepted; submission evidence was not stable; delivery held without resending"
+            }
         }
     }
 }
@@ -318,6 +320,7 @@ pub enum TerminalPrepared {
     MessageDelivered(String),
     MessageDeliveryPending,
     MessageDeliveryUnconfirmed { message_id: String, message: String },
+    MessageDeliveryNotSubmitted { message_id: String, message: String },
     Stopped,
     AgentExited(i32),
     ReceiptsRetired,
@@ -330,6 +333,12 @@ pub enum TerminalPrepared {
     OwnerMissing,
     OwnerTerminal,
     Failed(String),
+}
+
+const DELIVERY_MAX_ATTEMPTS: u32 = 3;
+
+fn delivery_retry_delay(failures: u32) -> Duration {
+    Duration::from_secs(60 * (1_u64 << failures.saturating_sub(1).min(2)))
 }
 
 fn retirement_pending(obj: &ResourceObject<TerminalSession>) -> bool {
@@ -425,8 +434,13 @@ where
             if let flotilla_resources::TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
                 if let Some(message) = head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
                     if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
-                        condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
-                            && condition.message_id.as_deref() == Some(message.id.as_str())
+                        condition.message_id.as_deref() == Some(message.id.as_str())
+                            && (condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
+                                || (condition.reason == TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
+                                    && (condition.consecutive_failures >= DELIVERY_MAX_ATTEMPTS
+                                        || Utc::now().signed_duration_since(condition.observed_at)
+                                            < chrono::Duration::from_std(delivery_retry_delay(condition.consecutive_failures))
+                                                .unwrap_or(chrono::Duration::MAX))))
                     }) {
                         return Ok(TerminalPrepared::None);
                     }
@@ -483,6 +497,12 @@ where
                             }
                         },
                         TerminalDeliveryOutcome::Confirmed => TerminalPrepared::MessageDelivered(message.id.clone()),
+                        TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady) => {
+                            TerminalPrepared::MessageDeliveryNotSubmitted {
+                                message_id: message.id.clone(),
+                                message: TerminalDeliveryFailure::StartupNotReady.message().to_string(),
+                            }
+                        }
                         TerminalDeliveryOutcome::Unconfirmed(failure) => TerminalPrepared::MessageDeliveryUnconfirmed {
                             message_id: message.id.clone(),
                             message: failure.message().to_string(),
@@ -614,6 +634,7 @@ where
                 | TerminalPrepared::CleatEndpoint(_)
                 | TerminalPrepared::MessageDelivered(_)
                 | TerminalPrepared::MessageDeliveryPending
+                | TerminalPrepared::MessageDeliveryNotSubmitted { .. }
                 | TerminalPrepared::MessageDeliveryUnconfirmed { .. }
                 | TerminalPrepared::Attention(_)
                 | TerminalPrepared::AttentionStale
@@ -642,6 +663,19 @@ where
                 }
                 TerminalPrepared::MessageDelivered(message_id) => {
                     Some(TerminalSessionStatusPatch::MarkMessageDelivered { message_id: message_id.clone() })
+                }
+                TerminalPrepared::MessageDeliveryNotSubmitted { message_id, message } => {
+                    let failures = obj.status.as_ref().map_or(1, |status| status.next_delivery_failure_count(message_id));
+                    let disposition = if failures >= DELIVERY_MAX_ATTEMPTS {
+                        "retry budget exhausted; delivery held for explicit intervention"
+                    } else {
+                        "retrying with backoff"
+                    };
+                    Some(TerminalSessionStatusPatch::MarkDeliveryNotSubmitted {
+                        message_id: message_id.clone(),
+                        message: format!("{message}; attempt {failures}/{DELIVERY_MAX_ATTEMPTS}; {disposition}"),
+                        observed_at: now,
+                    })
                 }
                 TerminalPrepared::MessageDeliveryUnconfirmed { message_id, message } => {
                     Some(TerminalSessionStatusPatch::MarkDeliveryUnconfirmed {
@@ -722,7 +756,9 @@ where
             obj.status
                 .as_ref()
                 .and_then(|status| status.degraded.as_ref())
-                .is_some_and(|condition| condition.reason != TERMINAL_DELIVERY_UNCONFIRMED_REASON)
+                .is_some_and(|condition| {
+                    condition.reason != TERMINAL_DELIVERY_UNCONFIRMED_REASON && condition.reason != TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
+                })
                 .then_some(TerminalSessionStatusPatch::ClearReconcileDegraded)
         });
 
@@ -755,6 +791,12 @@ where
             || matches!(prepared, TerminalPrepared::BriefWaiting)
         {
             outcome.requeue_after = Some(LOST_RECHECK_AFTER);
+        }
+        if let TerminalPrepared::MessageDeliveryNotSubmitted { message_id, .. } = prepared {
+            let failures = obj.status.as_ref().map_or(1, |status| status.next_delivery_failure_count(message_id));
+            if failures < DELIVERY_MAX_ATTEMPTS {
+                outcome.requeue_after = Some(delivery_retry_delay(failures));
+            }
         }
         if retirement_pending(obj) && !matches!(prepared, TerminalPrepared::ReceiptsRetired) {
             let retry = RECEIPT_RETIREMENT_RETRY_AFTER;
@@ -828,9 +870,14 @@ where
 
     fn reconcile_degraded_patch(
         &self,
-        _obj: &ResourceObject<Self::Resource>,
+        obj: &ResourceObject<Self::Resource>,
         failure: &ReconcileFailure,
     ) -> Option<TerminalSessionStatusPatch> {
+        // An unrelated observation failure cannot erase the delivery hold and
+        // make a possibly accepted message eligible for another submission.
+        if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| condition.is_delivery()) {
+            return None;
+        }
         Some(TerminalSessionStatusPatch::MarkReconcileDegraded {
             message: failure.message.clone(),
             consecutive_failures: failure.consecutive_failures,
