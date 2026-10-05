@@ -265,12 +265,15 @@ fn integration_is_fresh(status: &CheckoutStatus, now: DateTime<Utc>, max_age: Du
     now.signed_duration_since(oldest_observation).to_std().is_ok_and(|age| age < max_age)
 }
 
+/// Diagnostic identity shared by convoy and standalone registration callers.
+pub fn managed_checkout_reason(owner: Option<&str>, checkout: &str) -> String {
+    format!("flotilla-managed: {}/{}", owner.unwrap_or("standalone"), checkout)
+}
+
 fn checkout_registration_reason(checkout: &ResourceObject<Checkout>, convoy: Option<&ResourceObject<Convoy>>) -> String {
-    let owner = convoy
-        .map(|convoy| convoy.metadata.name.as_str())
-        .or_else(|| checkout.metadata.labels.get(CONVOY_LABEL).map(String::as_str))
-        .unwrap_or("managed");
-    format!("flotilla-managed: {owner}/{}", checkout.metadata.name)
+    let owner =
+        convoy.map(|convoy| convoy.metadata.name.as_str()).or_else(|| checkout.metadata.labels.get(CONVOY_LABEL).map(String::as_str));
+    managed_checkout_reason(owner, &checkout.metadata.name)
 }
 
 fn convoy_needs_delete_evidence(convoy: Option<&ResourceObject<Convoy>>) -> bool {
@@ -323,7 +326,7 @@ where
                     };
                     let reason = checkout_registration_reason(obj, convoy.as_ref());
                     if let Err(error) = self.runtime.protect_worktree_in(&spec.env_ref, &source, &spec.target_path, &reason).await {
-                        return Ok(CheckoutPrepared::Failed(error));
+                        return Err(ResourceError::other(error));
                     }
                 }
             }

@@ -661,8 +661,9 @@ pub trait Vcs: Send + Sync {
     async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String>;
     async fn create_checkout(&self, branch: &str, create_branch: bool) -> Result<(ExecutionEnvironmentPath, Checkout), String>;
     async fn remove_checkout(&self, branch: &str) -> Result<(), String>;
+    /// Providers without shared administrative registrations have nothing to protect.
     async fn checkout_registration(&self, _target: &str, _operation: CheckoutRegistration<'_>) -> Result<(), String> {
-        Err("checkout registration protection is unavailable".into())
+        Ok(())
     }
     async fn materialise_checkout(
         &self,
@@ -920,13 +921,7 @@ impl Vcs for FlotillaVcs {
         if !target_exists && !self.runner.path_exists(self.checkout.as_path()).await? {
             return Ok(CheckoutRemoval::Removed);
         }
-        self.checkout_registration(target, CheckoutRegistration::Release).await?;
-        if target_exists {
-            let remove = self.controller_cli().worktree_remove(target).await?;
-            if !remove.success && !remove.stderr.contains("is not a working tree") {
-                return Err(remove.stderr);
-            }
-        }
+        self.controller_cli().remove_protected_worktree(target).await?;
         remove_worktree_path(&*self.runner, target).await?;
         self.controller_cli().worktree_prune().await?;
         remove_empty_worktree_parents(&*self.runner, clone_path, target).await?;
@@ -1045,11 +1040,7 @@ impl Vcs for FlotillaVcs {
             return Err(error);
         }
         if matches!(self.strategy, GitCheckoutStrategy::Worktree(_)) {
-            self.checkout_registration(target, CheckoutRegistration::Release).await?;
-            let remove = self.controller_cli().worktree_remove(target).await?;
-            if !remove.success && !remove.stderr.contains("is not a working tree") {
-                return Err(remove.stderr);
-            }
+            self.controller_cli().remove_protected_worktree(target).await?;
         }
         remove_worktree_path(&*self.runner, target).await?;
         if matches!(self.strategy, GitCheckoutStrategy::Worktree(_)) {
@@ -1307,6 +1298,12 @@ enum GitAddressing {
     CheckoutRoot,
 }
 
+enum RegistrationState {
+    Missing,
+    Unlocked,
+    Locked(String),
+}
+
 /// Universal Git CLI implementation. The runner determines the command transport.
 pub struct GitCliBackend<'a> {
     checkout: &'a Path,
@@ -1334,6 +1331,72 @@ impl<'a> GitCliBackend<'a> {
     fn with_strategy(mut self, strategy: &'a GitCheckoutStrategy) -> Self {
         self.strategy = Some(strategy);
         self
+    }
+
+    async fn registration_state(&self, target: &str) -> Result<RegistrationState, String> {
+        // NUL-delimited porcelain preserves paths and reasons, independent of locale.
+        let listing = self.run(&["worktree", "list", "--porcelain", "-z"]).await?;
+        let mut identity = format!("worktree {target}");
+        if !listing.split("\0\0").any(|record| record.split('\0').next() == Some(identity.as_str())) {
+            // Git stores physical paths. Resolve an existing ancestor through the
+            // owning runner, also when the worktree itself has disappeared.
+            let target_path = Path::new(target);
+            let mut ancestor = target_path.parent().unwrap_or(Path::new("/"));
+            let mut suffix = target_path.file_name().into_iter().collect::<Vec<_>>();
+            while !self.runner.path_exists(ancestor).await? {
+                let Some(name) = ancestor.file_name() else { break };
+                suffix.push(name);
+                let Some(parent) = ancestor.parent() else { break };
+                ancestor = parent;
+            }
+            let physical = self.runner.run("pwd", &["-P"], ancestor, &command_channel_label("pwd", &["-P"])).await?;
+            let mut resolved = PathBuf::from(physical.trim_end_matches('\n'));
+            for name in suffix.into_iter().rev() {
+                resolved.push(name);
+            }
+            identity = format!("worktree {}", resolved.display());
+        }
+        for record in listing.split("\0\0") {
+            let mut fields = record.split('\0');
+            if fields.next() != Some(identity.as_str()) {
+                continue;
+            }
+            for field in fields {
+                if field == "locked" {
+                    return Ok(RegistrationState::Locked(String::new()));
+                }
+                if let Some(reason) = field.strip_prefix("locked ") {
+                    return Ok(RegistrationState::Locked(reason.into()));
+                }
+            }
+            return Ok(RegistrationState::Unlocked);
+        }
+        Ok(RegistrationState::Missing)
+    }
+
+    async fn remove_protected_worktree(&self, target: &str) -> Result<(), String> {
+        let reason = match self.registration_state(target).await? {
+            RegistrationState::Missing => return Ok(()),
+            RegistrationState::Locked(reason) => reason,
+            RegistrationState::Unlocked => {
+                format!("flotilla-managed: recovery/{}", Path::new(target).file_name().unwrap_or_default().to_string_lossy())
+            }
+        };
+        let target_exists = self.runner.path_exists(Path::new(target)).await?;
+        self.worktree_registration(target, CheckoutRegistration::Release).await?;
+        // An out-of-band directory deletion leaves only the registration;
+        // the caller's prune completes that cleanup after releasing it.
+        if !target_exists {
+            return Ok(());
+        }
+        let result = self.worktree_remove(target).await.and_then(|output| if output.success { Ok(()) } else { Err(output.stderr) });
+        if let Err(error) = result {
+            if let Err(restore) = self.worktree_registration(target, CheckoutRegistration::Protect { reason: &reason }).await {
+                return Err(format!("{error}; registration protection restoration failed: {restore}"));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn run(&self, args: &[&str]) -> Result<String, String> {
@@ -1607,22 +1670,20 @@ impl VcsBackend for GitCliBackend<'_> {
     async fn worktree_registration(&self, target: &str, operation: CheckoutRegistration<'_>) -> Result<(), String> {
         match operation {
             CheckoutRegistration::Protect { reason } => {
-                // Always run in the checkout's owning environment. Repair only this
-                // registration, preserving the host backlink when vessels use /workspace.
-                self.run(&["worktree", "repair", target]).await?;
-                let output = self.output(&["worktree", "lock", "--reason", reason, target]).await?;
-                if !output.success && !output.stderr.contains("is already locked") {
-                    return Err(output.stderr);
+                if self.runner.path_exists(Path::new(target)).await? {
+                    self.run(&["worktree", "repair", target]).await?;
+                }
+                match self.registration_state(target).await? {
+                    RegistrationState::Locked(_) => Ok(()),
+                    RegistrationState::Unlocked => self.run(&["worktree", "lock", "--reason", reason, target]).await.map(|_| ()),
+                    RegistrationState::Missing => Err(format!("checkout registration missing for {target}")),
                 }
             }
-            CheckoutRegistration::Release => {
-                let output = self.output(&["worktree", "unlock", target]).await?;
-                if !output.success && !output.stderr.contains("is not locked") && !output.stderr.contains("is not a working tree") {
-                    return Err(output.stderr);
-                }
-            }
+            CheckoutRegistration::Release => match self.registration_state(target).await? {
+                RegistrationState::Locked(_) => self.run(&["worktree", "unlock", target]).await.map(|_| ()),
+                RegistrationState::Missing | RegistrationState::Unlocked => Ok(()),
+            },
         }
-        Ok(())
     }
 
     async fn worktree_remove(&self, target: &str) -> Result<CommandOutput, String> {
@@ -2325,11 +2386,75 @@ mod tests {
                 target.join(".git").to_str().expect("host gitdir")
             );
         }
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(dir.path(), &alias).expect("parent alias");
+            let aliased_target = alias.join("managed");
+            vcs.checkout_registration(aliased_target.to_str().expect("aliased path"), CheckoutRegistration::Release)
+                .await
+                .expect("release through path alias");
+            vcs.checkout_registration(aliased_target.to_str().expect("aliased path"), CheckoutRegistration::Protect {
+                reason: "flotilla-managed: convoy/work",
+            })
+            .await
+            .expect("protect through path alias");
+            assert!(admin.join("locked").exists(), "path aliases preserve protection");
+        }
+        // Boundary fake: inject both transport and localized exit-status failures.
+        // All state reads and successful mutations use the real Git process.
+        struct RefuseRemoval {
+            transport: bool,
+        }
+        #[async_trait]
+        impl CommandRunner for RefuseRemoval {
+            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &crate::providers::ChannelLabel) -> Result<String, String> {
+                crate::providers::ProcessCommandRunner.run(cmd, args, cwd, label).await
+            }
+            async fn run_output(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &crate::providers::ChannelLabel,
+            ) -> Result<CommandOutput, String> {
+                if cmd == "git" && args.windows(2).any(|pair| pair == ["worktree", "remove"]) {
+                    return if self.transport {
+                        Err("removal transport unavailable".into())
+                    } else {
+                        Ok(CommandOutput { stdout: String::new(), stderr: "suppression refusée".into(), success: false })
+                    };
+                }
+                let mut output = crate::providers::ProcessCommandRunner.run_output(cmd, args, cwd, label).await?;
+                if !output.success && args.windows(2).any(|pair| pair == ["worktree", "lock"] || pair == ["worktree", "unlock"]) {
+                    output.stderr = "message Git localisé".into();
+                }
+                Ok(output)
+            }
+            async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+                crate::providers::ProcessCommandRunner.exists(cmd, args).await
+            }
+        }
+        for transport in [true, false] {
+            let refusing = test_fl(&source, Arc::new(RefuseRemoval { transport }), true);
+            refusing
+                .checkout_registration(target_str, CheckoutRegistration::Protect { reason: "flotilla-managed: convoy/work" })
+                .await
+                .expect("idempotence does not depend on localized Git diagnostics");
+            assert!(refusing.remove_materialised_checkout("convoy/work", target_str).await.is_err());
+            assert!(admin.join("locked").exists(), "failed teardown restores registration protection");
+            assert_eq!(std::fs::read_to_string(admin.join("locked")).expect("restored reason").trim(), "flotilla-managed: convoy/work");
+        }
+
         // A locked registration cannot be removed with the single --force used
         // by teardown; success demonstrates that teardown releases it first.
         assert_eq!(vcs.remove_materialised_checkout("convoy/work", target_str).await.expect("teardown"), CheckoutRemoval::Removed);
         assert!(!target.exists());
         assert!(!admin.exists());
+        test_fl(&source, Arc::new(RefuseRemoval { transport: false }), true)
+            .checkout_registration(target_str, CheckoutRegistration::Release)
+            .await
+            .expect("absent release is locale independent");
     }
 
     #[tokio::test]

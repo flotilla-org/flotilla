@@ -103,7 +103,7 @@ rounds:
     cwd: /
     stdout: |
       branch 'convoy/new' set up to track 'origin/main'.
-      HEAD is now at 2d8ae29 initial
+      HEAD is now at 3480649 initial
     exit_code: 0
   - channel: command
     cmd: git
@@ -115,7 +115,7 @@ rounds:
     - HEAD
     cwd: /
     stdout: |
-      2d8ae29ec54a16614cc66979d63cc9d4a79f9e59
+      34806497f311a359133b254d5e7ce42ed2b87e78
     exit_code: 0
   - channel: command
     cmd: git
@@ -124,7 +124,7 @@ rounds:
     - '{root}/repo'
     - update-ref
     - refs/flotilla/bootstrap/convoy/new
-    - '2d8ae29ec54a16614cc66979d63cc9d4a79f9e59'
+    - '34806497f311a359133b254d5e7ce42ed2b87e78'
     cwd: /
     stdout: ''
     exit_code: 0
@@ -145,13 +145,24 @@ rounds:
     - '-C'
     - '{root}/repo'
     - worktree
+    - list
+    - '--porcelain'
+    - '-z'
+    cwd: /
+    stdout: "worktree {root}/repo\0HEAD 34806497f311a359133b254d5e7ce42ed2b87e78\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 34806497f311a359133b254d5e7ce42ed2b87e78\0branch refs/heads/convoy/new\0\0"
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
     - lock
     - '--reason'
     - 'flotilla-managed: convoy/new'
     - '{root}/convoy-new'
     cwd: /
     stdout: ''
-    stderr: ''
     exit_code: 0
   - channel: command
     cmd: git
@@ -225,11 +236,34 @@ rounds:
     - '-C'
     - '{root}/repo'
     - worktree
+    - list
+    - '--porcelain'
+    - '-z'
+    cwd: /
+    stdout: "worktree {root}/repo\0HEAD 34806497f311a359133b254d5e7ce42ed2b87e78\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 34806497f311a359133b254d5e7ce42ed2b87e78\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
+    - list
+    - '--porcelain'
+    - '-z'
+    cwd: /
+    stdout: "worktree {root}/repo\0HEAD 34806497f311a359133b254d5e7ce42ed2b87e78\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 34806497f311a359133b254d5e7ce42ed2b87e78\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
     - unlock
     - '{root}/convoy-new'
     cwd: /
     stdout: ''
-    stderr: ''
     exit_code: 0
   - channel: command
     cmd: git
@@ -264,7 +298,7 @@ rounds:
     - refs/heads/convoy/new
     cwd: /
     stdout: |
-      2d8ae29ec54a16614cc66979d63cc9d4a79f9e59
+      34806497f311a359133b254d5e7ce42ed2b87e78
     stderr: ''
     exit_code: 0
   - channel: command
@@ -277,7 +311,7 @@ rounds:
     - refs/flotilla/bootstrap/convoy/new
     cwd: /
     stdout: |
-      2d8ae29ec54a16614cc66979d63cc9d4a79f9e59
+      34806497f311a359133b254d5e7ce42ed2b87e78
     stderr: ''
     exit_code: 0
   - channel: command
@@ -291,7 +325,7 @@ rounds:
     cwd: /
     stdout: |+
       worktree {root}/repo
-      HEAD 2d8ae29ec54a16614cc66979d63cc9d4a79f9e59
+      HEAD 34806497f311a359133b254d5e7ce42ed2b87e78
       branch refs/heads/main
 
     exit_code: 0
@@ -306,7 +340,7 @@ rounds:
     - convoy/new
     cwd: /
     stdout: |
-      Deleted branch convoy/new (was 2d8ae29).
+      Deleted branch convoy/new (was 3480649).
     exit_code: 0
   - channel: command
     cmd: git
@@ -345,6 +379,24 @@ rounds:
     stdout: ''
     stderr: ''
     exit_code: 1
+  - channel: command
+    cmd: test
+    args:
+    - '-e'
+    - '{root}/convoy-new'
+    cwd: /
+    stdout: ''
+    stderr: ''
+    exit_code: 0
+  - channel: command
+    cmd: test
+    args:
+    - '-e'
+    - '{root}/convoy-new'
+    cwd: /
+    stdout: ''
+    stderr: ''
+    exit_code: 0
   - channel: command
     cmd: test
     args:

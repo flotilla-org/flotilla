@@ -47,6 +47,7 @@ struct RecordingCheckoutRuntime {
     removal_blocked: Arc<Notify>,
     archive_path: Option<String>,
     path_exists: Option<bool>,
+    protection_error: Option<String>,
 }
 
 #[async_trait]
@@ -54,7 +55,10 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
     // Boundary fake: records the environment-scoped VCS registration request.
     async fn protect_worktree_in(&self, env_ref: &str, clone_path: &str, target: &str, reason: &str) -> Result<(), String> {
         self.protections.lock().expect("protections").push((env_ref.into(), clone_path.into(), target.into(), reason.into()));
-        Ok(())
+        match &self.protection_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
     }
 
     async fn checkout_path_exists_in(&self, _env_ref: &str, _path: &str) -> Result<Option<bool>, String> {
@@ -735,7 +739,7 @@ async fn ready_checkout_reconciler_patches_integration_conditions() {
 }
 
 #[tokio::test]
-async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
+async fn ready_checkout_reconciler_retries_protection_errors_without_failing_fresh_checkouts() {
     let backend = ResourceBackend::InMemory(Default::default());
     create_ready_clone(&backend, NAMESPACE, "clone-a", REPO_URL, "host-direct-a", "/checkouts/repo").await;
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
@@ -776,7 +780,7 @@ async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
         .expect("checkout status update should succeed");
     let checkout = checkouts.get("checkout-a").await.expect("checkout should exist");
     let runtime = Arc::new(RecordingCheckoutRuntime::default());
-    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend, NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE);
 
     let deps = reconciler.prepare(&checkout).await.expect("fetch dependencies should succeed");
     let outcome = reconciler.reconcile(&checkout, &deps, chrono::Utc::now());
@@ -790,8 +794,13 @@ async fn ready_checkout_reconciler_skips_fresh_integration_probe() {
         "host-direct-a".into(),
         "/checkouts/repo".into(),
         "/checkouts/convoy-a/repo.feature-cleanup".into(),
-        "flotilla-managed: managed/checkout-a".into()
+        "flotilla-managed: standalone/checkout-a".into()
     )]);
+    // Maintenance errors are retryable and leave the persisted Ready phase intact.
+    let failing = Arc::new(RecordingCheckoutRuntime { protection_error: Some("environment unavailable".into()), ..Default::default() });
+    let retrying = CheckoutReconciler::new(failing, backend, NAMESPACE);
+    assert!(retrying.prepare(&checkout).await.is_err());
+    assert_eq!(checkouts.get("checkout-a").await.expect("checkout").status.expect("status").phase, CheckoutPhase::Ready);
 }
 
 #[tokio::test]

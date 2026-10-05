@@ -13,9 +13,9 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
-    checkout_path_component, convoy_ensure::EnsureReconciler, BranchPreservationReason, CheckoutReconciler, CheckoutRemoval,
-    CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime, DockerProvisioning,
-    EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PreparedCheckout, PresentationPolicyRegistry,
+    checkout::managed_checkout_reason, checkout_path_component, convoy_ensure::EnsureReconciler, BranchPreservationReason,
+    CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime,
+    DockerProvisioning, EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PreparedCheckout, PresentationPolicyRegistry,
     PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalDeliveryFailure, TerminalDeliveryOutcome,
     TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler,
     VesselPlacementProjector, VesselReconciler,
@@ -5417,7 +5417,14 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
         target_path: &str,
     ) -> Result<PreparedCheckout, String> {
         let vcs = controller_vcs(&self.vcs, &self.runner, _clone_path)?;
-        let materialisation = vcs.materialise_checkout(branch, base_ref, target_path, &format!("flotilla-managed: {target_path}")).await?;
+        let materialisation = vcs
+            .materialise_checkout(
+                branch,
+                base_ref,
+                target_path,
+                &managed_checkout_reason(None, Path::new(target_path).file_name().unwrap_or_default().to_string_lossy().as_ref()),
+            )
+            .await?;
         Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 
@@ -5481,11 +5488,27 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 // The Clone resource may be gone while the linked checkout and
                 // its shared registration remain. Release it before deleting
                 // the last path from which its VCS can still be discovered.
-                if runner.path_exists(&Path::new(target_path).join(".git")).await? {
+                let registration = if runner.path_exists(&Path::new(target_path).join(".git")).await? {
                     let vcs = controller_vcs(&self.vcs, &self.runner, target_path)?;
                     vcs.checkout_registration(target_path, CheckoutRegistration::Release).await?;
+                    Some(vcs)
+                } else {
+                    None
+                };
+                if let Err(error) = remove_checkout_path(&*runner, utf8_path(target_path)?).await {
+                    if let Some(vcs) = registration {
+                        let reason = managed_checkout_reason(
+                            None,
+                            Path::new(target_path).file_name().unwrap_or_default().to_string_lossy().as_ref(),
+                        );
+                        if let Err(restore) =
+                            vcs.checkout_registration(target_path, CheckoutRegistration::Protect { reason: &reason }).await
+                        {
+                            return Err(format!("{error}; registration protection restoration failed: {restore}"));
+                        }
+                    }
+                    return Err(error);
                 }
-                remove_checkout_path(&*runner, utf8_path(target_path)?).await?;
                 Ok(CheckoutRemovalOutcome::Removed)
             }
             CheckoutRemoval::Worktree { branch, target_path, .. }
