@@ -104,6 +104,35 @@ fn turn_inactivity_reason(
     ))
 }
 
+// A long first turn may be legitimate; missing hooks are advisory, never a stall.
+const FIRST_HOOK_GRACE: chrono::Duration = chrono::Duration::minutes(15);
+
+fn missing_turn_hook(session: &ResourceObject<TerminalSession>, obligations: &[NudgeObligation], now: DateTime<Utc>) -> Option<String> {
+    if !matches!(session.spec.source, TerminalSessionSource::Agent { .. }) {
+        return None;
+    }
+    let status = session.status.as_ref()?;
+    let crew = status.crew.as_ref()?;
+    if status.phase != TerminalSessionPhase::Running || crate::agents::parser_for_harness(&crew.adapter).is_err() {
+        return None;
+    }
+    let started = status.started_at?;
+    let vessel = session.metadata.labels.get(VESSEL_LABEL)?;
+    let hook_seen = status.last_tool_activity_at.is_some_and(|at| at >= started)
+        || status.attention.as_ref().is_some_and(|attention| {
+            attention.source == TerminalAttentionSource::Hook
+                && attention.state != TerminalAttentionState::Unobservable
+                && attention.as_of >= started
+        }) || obligations.iter().any(|obligation| {
+        matches!(&obligation.maker, LeafMaker::Actor { vessel: actor_vessel, role } if actor_vessel == vessel && role == &session.spec.role)
+            && obligation.last_hook_at.is_some_and(|at| at >= started)
+    });
+    (!hook_seen && now.signed_duration_since(started) >= FIRST_HOOK_GRACE).then(|| {
+        format!("{} crew {}@{} has delivered no hook since session {} started at {}; check turn hook wiring (Codex notify / Claude managed settings)",
+            crew.adapter, session.spec.role, vessel, session.metadata.name, started)
+    })
+}
+
 fn actor_is_working(
     status: &flotilla_resources::TerminalSessionStatus,
     obligations: &[NudgeObligation],
@@ -1126,6 +1155,26 @@ impl ReconcilerWake {
             let selected_checkouts = select_convoy_children(convoy, &checkouts);
             let mut obligations = status.nudge_obligations.clone();
             let holding = matches!(status.phase, ConvoyPhase::Active | ConvoyPhase::Landing | ConvoyPhase::Anchored);
+            if holding {
+                let mut missing_hooks =
+                    selected_sessions.values().filter_map(|session| missing_turn_hook(session, &obligations, now)).collect::<Vec<_>>();
+                missing_hooks.sort();
+                let reason = (!missing_hooks.is_empty()).then(|| missing_hooks.join("\n"));
+                let prior = status.attention.as_ref().filter(|attention| attention.source == ConvoyAttention::MISSING_TURN_HOOK_SOURCE);
+                // Skip no-op writes here; the patch repeats the source guard after
+                // an optimistic retry so concurrent settlement attention stays intact.
+                if status.attention.as_ref().is_none_or(|attention| attention.source == ConvoyAttention::MISSING_TURN_HOOK_SOURCE)
+                    && prior.map(|attention| &attention.reason) != reason.as_ref()
+                {
+                    flotilla_resources::apply_status_patch(
+                        &backend.clone().using::<Convoy>(namespace),
+                        &convoy.metadata.name,
+                        &flotilla_resources::ConvoyStatusPatch::ObserveTurnHookHealth { reason, observed_at: now },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                }
+            }
             if let Some(stalled) =
                 status.stalled.as_ref().filter(|stalled| stalled.supervisor.is_some() && stalled.source != StallEvidenceSource::Crew)
             {
@@ -2716,6 +2765,84 @@ mod tests {
         };
         let quiet_age = if tool || hook || output { age.min(evidence_age) } else { age };
         assert_eq!(turn_inactivity_reason(&status, &obligation, now).is_some(), quiet_age >= 900);
+    }
+
+    // #2634: a hook-capable crew with no hook after the first-turn grace gets
+    // advisory attention. Screen activity does not hide it; a real hook clears it.
+    #[hegel::test]
+    fn missing_turn_hook_is_visible_and_recovers(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Ages cross the exact grace boundary; both harnesses, existing unrelated
+        // attention, and repeated observations exercise preservation and idempotence.
+        let age = tc.draw(gs::integers::<i64>().min_value(-1).max_value(1801));
+        let claude = tc.draw(gs::booleans());
+        let other_attention = tc.draw(gs::booleans());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            // Pin the boundary with unoccupied attention so generated preservation
+            // cases cannot hide an off-by-one regression.
+            for (age, other_attention) in [(899, false), (900, false), (901, false), (900, true), (age, other_attention)] {
+                let (backend, wake, _) = idle_nudge_scenario().await;
+                let start = Utc::now();
+                let now = start + chrono::Duration::seconds(age);
+                let sessions = backend.using::<TerminalSession>("flotilla");
+                let session = sessions.get("resumed-coder").await.expect("session");
+                sessions
+                    .update_status("resumed-coder", &session.metadata.resource_version, &flotilla_resources::TerminalSessionStatus {
+                        phase: TerminalSessionPhase::Running,
+                        started_at: Some(start),
+                        crew: Some(
+                            flotilla_resources::CrewSessionStatus::builder()
+                                .id("crew".into())
+                                .adapter(if claude { "claude-code" } else { "codex" }.into())
+                                .stance("trusted-implicit".into())
+                                .build(),
+                        ),
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("running session");
+                let convoys = backend.using::<Convoy>("flotilla");
+                let other = ConvoyAttention { source: "settlement".into(), reason: "keep this".into(), raised_at: start };
+                if other_attention {
+                    flotilla_resources::apply_status_patch(
+                        &convoys,
+                        "stalled-work",
+                        &flotilla_resources::ConvoyStatusPatch::SetSettlementAttention { attention: Some(other.clone()) },
+                    )
+                    .await
+                    .expect("other attention");
+                }
+                for _ in 0..2 {
+                    observe_actor(&backend, &wake, TerminalAttentionState::Working, now).await;
+                    let status = convoys.get("stalled-work").await.expect("convoy").status.expect("status");
+                    if other_attention {
+                        assert_eq!(status.attention, Some(other.clone()));
+                    } else {
+                        assert_eq!(status.attention.as_ref().map(|a| a.source.as_str()), (age >= 900).then_some("missing-turn-hook"));
+                        if let Some(attention) = status.attention {
+                            assert_eq!(attention.raised_at, now);
+                            assert!(attention.reason.contains("no hook"));
+                        }
+                    }
+                    assert!(status.stalled.is_none(), "missing hooks alone never stall a working crew");
+                }
+                let hook_at = now + chrono::Duration::seconds(1);
+                observe_actor_source(&backend, &wake, TerminalAttentionState::Idle, TerminalAttentionSource::Hook, hook_at).await;
+                let status = convoys.get("stalled-work").await.expect("convoy").status.expect("status");
+                assert_eq!(status.attention, other_attention.then_some(other));
+                assert_eq!(status.nudge_obligations[0].last_hook_at, Some(hook_at));
+                observe_actor(&backend, &wake, TerminalAttentionState::Working, hook_at + chrono::Duration::seconds(120)).await;
+                assert!(convoys
+                    .get("stalled-work")
+                    .await
+                    .expect("convoy")
+                    .status
+                    .expect("status")
+                    .attention
+                    .is_none_or(|a| a.source != "missing-turn-hook"));
+            }
+        });
     }
 
     // #2560: fresh screen redraws cannot keep a silent turn able forever.

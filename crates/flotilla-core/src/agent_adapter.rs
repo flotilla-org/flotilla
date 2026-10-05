@@ -636,12 +636,11 @@ impl CliAgentAdapter {
         if matches!(&self.flavor, AdapterFlavor::ClaudeCode { .. }) {
             args.extend([Arg::Literal("--settings".into()), Arg::Literal(CLAUDE_MANAGED_SETTINGS_PATH.into())]);
         }
-        if let AdapterFlavor::Codex { contained, .. } = &self.flavor {
+        if matches!(&self.flavor, AdapterFlavor::Codex { .. }) {
             args.push(Arg::Literal("--no-daemon".into()));
-            if !contained {
-                let notify = serde_json::to_string(crate::agents::CODEX_NOTIFY_COMMAND).expect("static notify command");
-                args.extend([Arg::Literal("-c".into()), Arg::Quoted(format!("notify={notify}"))]);
-            }
+            // Bind the hook to every invocation, independently of mutable config files.
+            let notify = serde_json::to_string(crate::agents::CODEX_NOTIFY_COMMAND).expect("static notify command");
+            args.extend([Arg::Literal("-c".into()), Arg::Quoted(format!("notify={notify}"))]);
         }
         if let Some(model) = &request.model {
             args.extend([Arg::Literal("--model".into()), Arg::Quoted(model.clone())]);
@@ -2094,6 +2093,45 @@ mod tests {
         assert_eq!(parsed["projects"][&canonical_workspace]["trust_level"].as_str(), Some("trusted"));
     }
 
+    // #2634: every Codex launch carries the hook, regardless of confinement,
+    // model selection, credential home, or permission grants. No prepare is needed.
+    #[hegel::test]
+    fn codex_launch_always_overrides_notify(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Both confinement/grant states, absent/present model, and missing/different homes.
+        let contained = tc.draw(gs::booleans());
+        let restricted = tc.draw(gs::booleans());
+        let model = tc.draw(gs::booleans()).then(|| "test-model".to_string());
+        let home = tc.draw(gs::booleans());
+        let mut env = EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex"));
+        if contained {
+            env = env.with(EnvironmentAssertion::env_var("FLOTILLA_ENVIRONMENT_ID", "contained"));
+        }
+        if home {
+            env = env.with(EnvironmentAssertion::env_var("CODEX_HOME", "/different-home"));
+        }
+        // Subprocess boundary: command rendering must not execute a process.
+        let registry = AgentAdapterRegistry::discover(&env, Arc::new(MockRunner::new(Vec::new())));
+        let plan = registry
+            .get("codex")
+            .expect("adapter")
+            .launch(&AgentLaunchRequest {
+                fulfilment_grants: restricted.then(BTreeSet::new),
+                role: "coder".into(),
+                model,
+                brief: flotilla_resources::TerminalBrief {
+                    path: "brief.md".into(),
+                    content: String::new(),
+                    artifact_digest: None,
+                    copies: Vec::new(),
+                },
+                environment: vec![("CODEX_HOME".into(), "/launch-home".into())],
+            })
+            .expect("launch");
+        assert_eq!(plan.command.matches("-c 'notify=[\"flotilla\",\"hook\",\"codex\",\"notify\"]'").count(), 1);
+        assert!(plan.command.contains("--no-daemon"));
+    }
+
     #[tokio::test]
     async fn contained_codex_seeds_notify_for_an_already_trusted_workspace() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2123,7 +2161,8 @@ mod tests {
             .launch(&AgentLaunchRequest { fulfilment_grants: None, role: "coder".into(), model: None, brief, environment: Vec::new() })
             .expect("contained Codex launch");
         assert!(plan.command.contains("--no-daemon"));
-        assert!(!plan.command.contains(" -c "));
+        // #2634: contained launches must carry notify even if the config is later rewritten.
+        assert!(plan.command.contains(" -c 'notify=[\"flotilla\",\"hook\",\"codex\",\"notify\"]'"));
 
         let config = std::fs::read_to_string(codex_home.join("config.toml")).expect("Codex config");
         let parsed = config.parse::<DocumentMut>().expect("parse updated Codex config");
