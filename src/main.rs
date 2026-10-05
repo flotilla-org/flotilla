@@ -744,7 +744,7 @@ impl Cli {
 
     /// The remote daemon selected by `--daemon` or `FLOTILLA_DAEMON`, if any.
     fn remote_daemon(&self) -> Result<Option<SshEndpoint>, String> {
-        remote_daemon_from(self.daemon.as_deref(), std::env::var("FLOTILLA_DAEMON").ok().as_deref())
+        remote_daemon_from(self.daemon.as_deref(), std::env::var("FLOTILLA_DAEMON").ok().as_deref(), self.socket.is_some())
     }
 
     /// The daemon socket-only commands talk to: a remote endpoint, else this host's socket.
@@ -763,7 +763,12 @@ impl Cli {
     }
 }
 
-fn remote_daemon_from(flag: Option<&str>, environment: Option<&str>) -> Result<Option<SshEndpoint>, String> {
+fn remote_daemon_from(flag: Option<&str>, environment: Option<&str>, explicit_socket: bool) -> Result<Option<SshEndpoint>, String> {
+    // Explicit local selection overrides a remote endpoint inherited from the
+    // environment. Clap rejects an explicit --daemon/--socket conflict.
+    if explicit_socket && flag.is_none() {
+        return Ok(None);
+    }
     flag.or(environment.filter(|value| !value.is_empty())).map(SshEndpoint::parse).transpose()
 }
 
@@ -3019,13 +3024,15 @@ mod tests {
     // `--daemon` wins over FLOTILLA_DAEMON; an empty variable selects this host.
     #[test]
     fn remote_daemon_prefers_flag_and_ignores_empty_environment() {
-        let flag = remote_daemon_from(Some("ssh://udder"), Some("ssh://kiwi")).expect("valid").expect("remote");
+        let flag = remote_daemon_from(Some("ssh://udder"), Some("ssh://kiwi"), false).expect("valid").expect("remote");
         assert_eq!(flag.to_string(), "ssh://udder");
-        let environment = remote_daemon_from(None, Some("ssh://kiwi")).expect("valid").expect("remote");
+        let environment = remote_daemon_from(None, Some("ssh://kiwi"), false).expect("valid").expect("remote");
         assert_eq!(environment.to_string(), "ssh://kiwi");
-        assert_eq!(remote_daemon_from(None, Some("")).expect("valid"), None);
-        assert_eq!(remote_daemon_from(None, None).expect("valid"), None);
-        assert!(remote_daemon_from(Some("udder"), None).is_err(), "a bare host is not an endpoint");
+        assert_eq!(remote_daemon_from(None, Some(""), false).expect("valid"), None);
+        assert_eq!(remote_daemon_from(None, None, false).expect("valid"), None);
+        assert_eq!(remote_daemon_from(None, Some("ssh://kiwi"), true).expect("explicit socket"), None);
+        assert_eq!(remote_daemon_from(None, Some("invalid environment"), true).expect("explicit socket"), None);
+        assert!(remote_daemon_from(Some("udder"), None, false).is_err(), "a bare host is not an endpoint");
     }
 
     #[test]

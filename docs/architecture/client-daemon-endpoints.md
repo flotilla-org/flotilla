@@ -12,7 +12,8 @@ flotilla --daemon ssh://udder pm connect --wheelhouse-socket \\.\pipe\wheelhouse
 wins. A path after the destination selects a remote executable, for example
 `ssh://udder/home/robert/candidates/flotilla`. The destination can include a
 user and port. `--socket` and `--daemon` are mutually exclusive CLI options.
-Local daemon lifecycle commands refuse a remote endpoint.
+An explicit `--socket` overrides `FLOTILLA_DAEMON`. Local daemon lifecycle
+commands refuse a remote endpoint.
 
 The remote executable must provide the hidden `daemon-bridge` subcommand.
 It connects to that host's existing Unix daemon socket and copies stdin/stdout
@@ -20,11 +21,17 @@ bidirectionally, including half-closes. It does not interpret messages, start
 the daemon, or replace it. A candidate CLI can therefore be tested beside the
 installed fleet CLI while the existing daemon keeps running.
 
+The remote command uses POSIX shell quoting and the non-interactive SSH PATH.
+If that PATH does not contain `flotilla`, select its absolute path in the
+endpoint suffix.
+
 The client runs OpenSSH with no PTY and batch authentication. SSH owns host-key
 and key authentication through the user's existing configuration. The message
 session owns the SSH child, terminating it when the session is dropped. Failed
 connections report the bounded tail of SSH's stderr; the Hello handshake has a
 30-second deadline covering connection, authentication and remote startup.
+Long-lived clients currently retry SSH authentication/configuration failures
+with backoff; permanent connection-error classification is tracked in #2589.
 
 The client and daemon perform their ordinary Hello handshake end to end.
 Protocol version and protocol-source fingerprint must agree; build IDs are

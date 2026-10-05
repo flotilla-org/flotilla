@@ -175,6 +175,12 @@ jobs:
           fi
           grep -q "no local daemon will be spawned" status.err || { cat status.err; exit 1; }
       - run: "cargo --config 'profile.dev.package.\"*\".debug=0' test -p flotilla-client --locked --lib windows_tests::"
+      - name: Test SSH endpoint parsing and failure diagnostics
+        run: "cargo --config 'profile.dev.package.\"*\".debug=0' test -p flotilla-client --locked --lib endpoint::"
+      - name: Test remote CLI selection and mismatch refusal
+        run: |
+          cargo --config 'profile.dev.package."*".debug=0' test --locked --bin flotilla remote_
+          cargo --config 'profile.dev.package."*".debug=0' test --locked --bin flotilla daemon_endpoint_conflicts
       - name: Test Wheelhouse named-pipe HTTP contract
         run: "cargo --config 'profile.dev.package.\"*\".debug=0' test -p flotilla-manifest --locked --lib sink::tests::"
 

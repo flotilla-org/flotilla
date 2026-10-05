@@ -233,6 +233,8 @@ impl SocketDaemon {
         }
     }
 
+    /// Connect to an existing daemon and declare the client's surface in Hello.
+    /// Neither endpoint kind spawns a daemon.
     pub async fn connect_endpoint_with_surface(endpoint: &DaemonEndpoint, surface: SurfaceDeclaration) -> Result<Arc<Self>, String> {
         match endpoint {
             DaemonEndpoint::Local(socket_path) => Self::connect_with_surface(socket_path, surface).await,
