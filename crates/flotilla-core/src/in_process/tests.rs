@@ -9126,3 +9126,126 @@ fn convoy_branch_refresh_reuses_repository_results(tc: hegel::TestCase) {
         }
     });
 }
+
+// #2677: PR-less claim exits accept the claiming crew's artifact, without any comment pointer,
+// and settle. A missing artifact (including one belonging to another crew) still refuses the claim.
+#[tokio::test]
+async fn prless_decision_ledger_claim_accepts_and_settles() {
+    let (daemon, backend, _temp, watch) = stall_test_daemon().await;
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let created = convoys
+        .create(
+            &test_meta("ledger-claim"),
+            &ConvoySpec::builder()
+                .workflow_ref("test".into())
+                .subjects(vec![flotilla_resources::DeclaredSubject {
+                    subject: flotilla_protocol::Subject {
+                        kind: flotilla_protocol::SubjectKind::Issue,
+                        source: flotilla_protocol::IssueSource { service: "forgejo.example".into(), scope: "owner/repo".into() },
+                        id: "42".into(),
+                    },
+                    relationship: flotilla_protocol::Relationship::WorksOn,
+                    issue: None,
+                    change_request: None,
+                }])
+                .build(),
+        )
+        .await
+        .expect("convoy");
+    let mut snapshot = stall_workflow_snapshot(vec![claim_crew("coder")]);
+    snapshot.exit = Some(flotilla_resources::ExitDeclaration::Claim(flotilla_resources::ClaimExit));
+    convoys
+        .update_status("ledger-claim", &created.metadata.resource_version, &ConvoyStatus {
+            phase: flotilla_resources::ConvoyPhase::Active,
+            workflow_snapshot: Some(snapshot),
+            crew_work: BTreeMap::from([(
+                "work".into(),
+                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("working crew");
+    backend
+        .using::<Vessel>("flotilla")
+        .create(&test_meta("ledger-claim-vessel"), &VesselSpec {
+            convoy_ref: "ledger-claim".into(),
+            vessel_name: "work".into(),
+            placement_policy_ref: "test".into(),
+            adopted_checkout_refs: BTreeMap::new(),
+        })
+        .await
+        .expect("vessel");
+    let context = CrewCommandContext {
+        namespace: Some("flotilla".into()),
+        convoy: Some("ledger-claim".into()),
+        vessel_ref: Some("ledger-claim-vessel".into()),
+        role: Some("coder".into()),
+        ..Default::default()
+    };
+    for producer in ["reviewer", "coder"] {
+        daemon
+            .crew_complete_with_disposition_internal(&context, None, None, None)
+            .await
+            .expect_err("claim without this crew's artifact must be refused");
+        let name = flotilla_resources::artifact_record_name("ledger-claim", producer, "decision-ledger", "ledger-claim");
+        backend
+            .using::<flotilla_resources::Artifact>("flotilla")
+            .create(
+                &test_meta(&name),
+                &flotilla_resources::ArtifactSpec::builder()
+                    .convoy("ledger-claim".into())
+                    .producer(producer.into())
+                    .kind("decision-ledger".into())
+                    .subject("ledger-claim".into())
+                    .digest("ledger".into())
+                    .size(1)
+                    .media_type("text/markdown".into())
+                    .expires_at(Utc::now() + chrono::Duration::days(1))
+                    .build(),
+            )
+            .await
+            .expect("artifact");
+    }
+    assert_eq!(
+        daemon.crew_complete_with_disposition_internal(&context, None, None, None).await.expect("artifact-backed claim"),
+        CommandValue::Ok
+    );
+    let explanation = daemon
+        .execute_query(
+            Command::builder()
+                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: "ledger-claim".into() })
+                .build(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("explain accepted claim");
+    let CommandValue::ConvoyExplanation(explanation) = explanation else { panic!("expected convoy explanation") };
+    assert!(!explanation.decision_ledgers[0].missing);
+    assert!(!explanation.decision_ledgers[0].projection_missing);
+    assert!(explanation.settlement.satisfied, "artifact-backed issue convoy must explain as settled");
+
+    // An accepted claim remains admitted on retry after evidence retention removes its artifact.
+    let ledgers = backend.using::<flotilla_resources::Artifact>("flotilla");
+    let name = flotilla_resources::artifact_record_name("ledger-claim", "coder", "decision-ledger", "ledger-claim");
+    ledgers.delete(&name).await.expect("artifact retention");
+    assert_eq!(
+        daemon.crew_complete_with_disposition_internal(&context, None, None, None).await.expect("duplicate claim"),
+        CommandValue::Ok
+    );
+    let convoy = convoys.get("ledger-claim").await.expect("convoy");
+    let claim = &convoy.status.as_ref().expect("status").crew_work["work"]["coder"];
+    assert_eq!(claim.phase, CrewWorkPhase::Done);
+    assert!(claim.decision_ledger_ref.is_none());
+    let settlement = flotilla_resources::evaluate_landing_settlement(
+        &convoy,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(30),
+        Utc::now(),
+    );
+    assert!(settlement.satisfied, "claim exit must settle without a PR comment");
+    watch.abort();
+}

@@ -980,20 +980,29 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
                 );
                 let _ = writeln!(
                     output,
-                    "  - {}/{} claimed_at={} MISSING ({detail}){}",
+                    "  - {}/{} claimed_at={} MISSING ({detail}){} comment={}",
                     ledger.vessel,
                     ledger.role,
                     ledger.claimed_at.as_deref().unwrap_or("-"),
-                    if ledger.completed_while_crew_active { " — completed while crew active" } else { "" }
+                    if ledger.completed_while_crew_active { " — completed while crew active" } else { "" },
+                    ledger.comment_url.as_deref().unwrap_or("-")
                 );
             } else {
                 let _ = writeln!(
                     output,
-                    "  - {}/{} claimed_at={} comment={}",
+                    "  - {}/{} claimed_at={} artifact={} comment={}",
                     ledger.vessel,
                     ledger.role,
                     ledger.claimed_at.as_deref().unwrap_or("-"),
+                    ledger.artifact_address.as_deref().unwrap_or("-"),
                     ledger.comment_url.as_deref().unwrap_or("-")
+                );
+            }
+            if ledger.projection_missing {
+                let _ = writeln!(
+                    output,
+                    "    PR projection MISSING ({})",
+                    ledger.projection_error.as_deref().unwrap_or("no PR comment recorded")
                 );
             }
         }

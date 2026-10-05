@@ -300,6 +300,24 @@ async fn project_decision_ledger_once(
     Err(last_error.expect("projection attempted at least once"))
 }
 
+// Projection metadata is diagnostic; even a failed projection must leave the ledger publishable.
+fn decision_ledger_projection_summary(result: Result<Vec<String>, String>) -> BTreeMap<String, serde_json::Value> {
+    let mut summary = BTreeMap::new();
+    match result {
+        Ok(urls) => {
+            if let Some(url) = urls.first() {
+                summary.insert("comment_url".into(), serde_json::json!(url));
+            }
+            summary.insert("projection_count".into(), serde_json::json!(urls.len()));
+        }
+        Err(error) => {
+            // Keep daemon-owned diagnostics within the artifact summary size limit.
+            summary.insert("projection_error".into(), serde_json::json!(error.chars().take(512).collect::<String>()));
+        }
+    }
+    summary
+}
+
 pub(super) struct RequestDispatcher<'a> {
     daemon: &'a Arc<InProcessDaemon>,
     remote_command_router: &'a RemoteCommandRouter,
@@ -395,23 +413,22 @@ impl<'a> RequestDispatcher<'a> {
                 }
                 // Validation runs before the forge write; a path is never treated as content.
                 let body = crate::artifact::read_decision_ledger(temporary.path())?;
-                let delivery_env = self.daemon.ledger_delivery_environment(&namespace, &session.spec.env_ref).await?;
-                let comment_urls = project_decision_ledger_once(
-                    &backend,
-                    &namespace,
-                    &caller.convoy,
-                    &session.spec.role,
-                    &body,
-                    runner.as_ref(),
-                    Path::new(&session.spec.cwd),
-                    &delivery_env,
-                )
-                .await
-                .map_err(|error| format!("decision ledger forge projection failed: {error}"))?;
-                if let Some(comment_url) = comment_urls.first() {
-                    summary.insert("comment_url".to_string(), serde_json::Value::String(comment_url.clone()));
+                let projection = async {
+                    let delivery_env = self.daemon.ledger_delivery_environment(&namespace, &session.spec.env_ref).await?;
+                    project_decision_ledger_once(
+                        &backend,
+                        &namespace,
+                        &caller.convoy,
+                        &session.spec.role,
+                        &body,
+                        runner.as_ref(),
+                        Path::new(&session.spec.cwd),
+                        &delivery_env,
+                    )
+                    .await
                 }
-                summary.insert("projection_count".to_string(), serde_json::json!(comment_urls.len()));
+                .await;
+                summary = decision_ledger_projection_summary(projection);
             }
             let input = ArtifactPutInput::builder()
                 .kind(kind)
@@ -1005,6 +1022,23 @@ mod ledger_projection_tests {
             .build();
         backend.using::<Convoy>("flotilla").create(&InputMeta::builder().name("demo".to_string()).build(), &spec).await.expect("convoy");
         backend
+    }
+
+    // #2677: no PR, successful projections (including duplicates/multiple PRs), and errors
+    // all produce publishable artifact metadata. Errors remain diagnostic rather than dropping the ledger.
+    #[hegel::test]
+    fn ledger_projection_metadata_preserves_artifact_evidence(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let fails = tc.draw(gs::booleans());
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let length = tc.draw(gs::integers::<usize>().min_value(0).max_value(600));
+        let urls = vec!["https://example.test/comment".to_string(); count];
+        let result = if fails { Err("é".repeat(length)) } else { Ok(urls) };
+        let summary = decision_ledger_projection_summary(result);
+        assert_eq!(summary.contains_key("projection_error"), fails);
+        assert_eq!(summary.contains_key("comment_url"), !fails && count > 0);
+        assert_eq!(summary.get("projection_count"), (!fails).then(|| serde_json::json!(count)).as_ref());
+        assert!(serde_json::to_vec(&summary).expect("metadata").len() <= 4096);
     }
 
     #[tokio::test]

@@ -216,6 +216,9 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
         }],
         decision_ledgers: vec![
             ExplainedDecisionLedger {
+                artifact_address: None,
+                projection_missing: false,
+                projection_error: None,
                 vessel: "work".into(),
                 role: "coder".into(),
                 claimed_at: Some("2026-08-21T11:59:00Z".into()),
@@ -227,6 +230,9 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 superseded: true,
             },
             ExplainedDecisionLedger {
+                artifact_address: Some("artifact/ledger".into()),
+                projection_missing: false,
+                projection_error: None,
                 vessel: "work".into(),
                 role: "coder".into(),
                 claimed_at: Some("2026-08-21T12:00:00Z".into()),
@@ -238,6 +244,9 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 superseded: false,
             },
             ExplainedDecisionLedger {
+                artifact_address: None,
+                projection_missing: false,
+                projection_error: None,
                 vessel: "review".into(),
                 role: "reviewer".into(),
                 claimed_at: Some("2026-08-21T12:01:00Z".into()),
@@ -249,6 +258,9 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
                 superseded: false,
             },
             ExplainedDecisionLedger {
+                artifact_address: None,
+                projection_missing: false,
+                projection_error: None,
                 vessel: "research".into(),
                 role: "researcher".into(),
                 claimed_at: Some("2026-08-21T12:02:00Z".into()),
@@ -270,11 +282,26 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     );
     assert!(output.contains("Message: waiting for review evidence"));
     assert!(output.contains("Crew work needing a settlement claim:\n  - work/coder (turn idle)"));
-    assert!(output.contains("work/coder claimed_at=2026-08-21T12:00:00Z comment=https://example.test/pull/1#comment-2"));
+    assert!(output
+        .contains("work/coder claimed_at=2026-08-21T12:00:00Z artifact=artifact/ledger comment=https://example.test/pull/1#comment-2"));
     assert!(output.contains("review/reviewer claimed_at=2026-08-21T12:01:00Z MISSING (crew completed without a decision ledger)"));
     assert!(output.contains(
         "research/researcher claimed_at=2026-08-21T12:02:00Z MISSING (completed by flotilla/operator with --force) — completed while crew active"
     ));
+    // #2677: the human display names durable artifact evidence with no PR comment;
+    // a failed bound projection is a separate flag, never a missing ledger.
+    let mut artifact_only = explanation;
+    artifact_only.decision_ledgers = vec![artifact_only.decision_ledgers[1].clone()];
+    artifact_only.decision_ledgers[0].comment_url = None;
+    let output = format_convoy_explanation_human(&artifact_only);
+    assert!(output.contains("artifact=artifact/ledger comment=-"));
+    assert!(!output.contains("MISSING"));
+    artifact_only.decision_ledgers[0].projection_missing = true;
+    artifact_only.decision_ledgers[0].projection_error = Some("forge unavailable".into());
+    let output = format_convoy_explanation_human(&artifact_only);
+    assert!(output.contains("artifact=artifact/ledger comment=-"));
+    assert!(output.contains("PR projection MISSING (forge unavailable)"));
+    assert!(!output.contains("crew completed without a decision ledger"));
 }
 
 #[test]

@@ -856,7 +856,9 @@ impl CrewService {
             .and_then(|status| status.crew_work.get(&context.vessel))
             .and_then(|crew| crew.get(&context.caller_role))
             .is_some_and(|claim| {
-                claim.phase == CrewWorkPhase::Done && (claim.decision_ledger_ref.is_some() || claim.completion_override.is_some())
+                // Done records an already admitted claim. A PR projection is optional evidence,
+                // and the artifact may have expired since admission; duplicate settlement stays sticky.
+                claim.phase == CrewWorkPhase::Done
             });
         if decision_ledger_ref.is_none() && forced_by.is_none() && existing_claim_is_admitted {
             return Ok(flotilla_protocol::CommandValue::Ok);

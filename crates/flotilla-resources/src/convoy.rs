@@ -1307,8 +1307,9 @@ pub struct CrewWorkState {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<String>,
-    /// Durable pointer to the PR comment containing the claim's decision ledger.
-    /// A claim without this pointer is refused unless an operator uses `--force`.
+    /// Optional pointer to the PR projection of the claim's decision ledger.
+    /// The crew's convoy-bound decision-ledger artifact satisfies the ledger expectation;
+    /// this pointer is additional evidence and is absent for PR-less claims.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_ledger_ref: Option<String>,
     /// Completion claims displaced by a brief delivered at the turn boundary.
