@@ -617,6 +617,7 @@ pub trait VcsBackend: Send + Sync {
     async fn fetch(&self, remote: &str, refspec: &str) -> Result<(), String>;
     async fn worktree_add(&self, add: WorktreeAdd<'_>) -> Result<(), String>;
     async fn create_worktree(&self, branch: &str, base_ref: Option<&str>, target: &str) -> Result<CheckoutMaterialisation, String>;
+    async fn worktree_registration(&self, target: &str, operation: CheckoutRegistration<'_>) -> Result<(), String>;
     async fn worktree_remove(&self, target: &str) -> Result<CommandOutput, String>;
     async fn worktree_prune(&self) -> Result<(), String>;
     async fn worktree_list(&self) -> Result<String, String>;
@@ -638,6 +639,13 @@ pub trait VcsBackend: Send + Sync {
     async fn push_head(&self, remote: &str) -> Result<CommandOutput, String>;
 }
 
+/// Registration protection for a managed checkout. Independent clones have no registration.
+#[derive(Debug, Clone, Copy)]
+pub enum CheckoutRegistration<'a> {
+    Protect { reason: &'a str },
+    Release,
+}
+
 /// Flotilla operations bound to one checkout, independent of its VCS or storage medium.
 #[async_trait]
 pub trait Vcs: Send + Sync {
@@ -653,7 +661,17 @@ pub trait Vcs: Send + Sync {
     async fn list_checkouts(&self) -> Result<Vec<(ExecutionEnvironmentPath, Checkout)>, String>;
     async fn create_checkout(&self, branch: &str, create_branch: bool) -> Result<(ExecutionEnvironmentPath, Checkout), String>;
     async fn remove_checkout(&self, branch: &str) -> Result<(), String>;
-    async fn materialise_checkout(&self, _branch: &str, _base_ref: Option<&str>, _target: &str) -> Result<CheckoutMaterialisation, String> {
+    /// Providers without shared administrative registrations have nothing to protect.
+    async fn checkout_registration(&self, _target: &str, _operation: CheckoutRegistration<'_>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn materialise_checkout(
+        &self,
+        _branch: &str,
+        _base_ref: Option<&str>,
+        _target: &str,
+        _registration_reason: &str,
+    ) -> Result<CheckoutMaterialisation, String> {
         Err("checkout materialisation is unavailable".into())
     }
     async fn remove_materialised_checkout(&self, _branch: &str, _target: &str) -> Result<CheckoutRemoval, String> {
@@ -865,9 +883,26 @@ impl Vcs for FlotillaVcs {
         self.cli().remove_checkout(branch).await
     }
 
-    async fn materialise_checkout(&self, branch: &str, base_ref: Option<&str>, target: &str) -> Result<CheckoutMaterialisation, String> {
+    async fn checkout_registration(&self, target: &str, operation: CheckoutRegistration<'_>) -> Result<(), String> {
+        if matches!(self.strategy, GitCheckoutStrategy::ReferenceClone(_)) {
+            return Ok(());
+        }
+        self.controller_cli().worktree_registration(target, operation).await
+    }
+
+    async fn materialise_checkout(
+        &self,
+        branch: &str,
+        base_ref: Option<&str>,
+        target: &str,
+        registration_reason: &str,
+    ) -> Result<CheckoutMaterialisation, String> {
         match &self.strategy {
-            GitCheckoutStrategy::Worktree(_) => self.controller_cli().create_worktree(branch, base_ref, target).await,
+            GitCheckoutStrategy::Worktree(_) => {
+                let result = self.controller_cli().create_worktree(branch, base_ref, target).await?;
+                self.checkout_registration(target, CheckoutRegistration::Protect { reason: registration_reason }).await?;
+                Ok(result)
+            }
             GitCheckoutStrategy::ReferenceClone(strategy) => strategy.materialise_checkout(branch, base_ref, target).await,
         }
     }
@@ -886,12 +921,7 @@ impl Vcs for FlotillaVcs {
         if !target_exists && !self.runner.path_exists(self.checkout.as_path()).await? {
             return Ok(CheckoutRemoval::Removed);
         }
-        if target_exists {
-            let remove = self.controller_cli().worktree_remove(target).await?;
-            if !remove.success && !remove.stderr.contains("is not a working tree") {
-                return Err(remove.stderr);
-            }
-        }
+        self.controller_cli().remove_protected_worktree(target).await?;
         remove_worktree_path(&*self.runner, target).await?;
         self.controller_cli().worktree_prune().await?;
         remove_empty_worktree_parents(&*self.runner, clone_path, target).await?;
@@ -1010,10 +1040,7 @@ impl Vcs for FlotillaVcs {
             return Err(error);
         }
         if matches!(self.strategy, GitCheckoutStrategy::Worktree(_)) {
-            let remove = self.controller_cli().worktree_remove(target).await?;
-            if !remove.success && !remove.stderr.contains("is not a working tree") {
-                return Err(remove.stderr);
-            }
+            self.controller_cli().remove_protected_worktree(target).await?;
         }
         remove_worktree_path(&*self.runner, target).await?;
         if matches!(self.strategy, GitCheckoutStrategy::Worktree(_)) {
@@ -1271,6 +1298,12 @@ enum GitAddressing {
     CheckoutRoot,
 }
 
+enum RegistrationState {
+    Missing,
+    Unlocked,
+    Locked(String),
+}
+
 /// Universal Git CLI implementation. The runner determines the command transport.
 pub struct GitCliBackend<'a> {
     checkout: &'a Path,
@@ -1298,6 +1331,72 @@ impl<'a> GitCliBackend<'a> {
     fn with_strategy(mut self, strategy: &'a GitCheckoutStrategy) -> Self {
         self.strategy = Some(strategy);
         self
+    }
+
+    async fn registration_state(&self, target: &str) -> Result<RegistrationState, String> {
+        // NUL-delimited porcelain preserves paths and reasons, independent of locale.
+        let listing = self.run(&["worktree", "list", "--porcelain", "-z"]).await?;
+        let mut identity = format!("worktree {target}");
+        if !listing.split("\0\0").any(|record| record.split('\0').next() == Some(identity.as_str())) {
+            // Git stores physical paths. Resolve an existing ancestor through the
+            // owning runner, also when the worktree itself has disappeared.
+            let target_path = Path::new(target);
+            let mut ancestor = target_path.parent().unwrap_or(Path::new("/"));
+            let mut suffix = target_path.file_name().into_iter().collect::<Vec<_>>();
+            while !self.runner.path_exists(ancestor).await? {
+                let Some(name) = ancestor.file_name() else { break };
+                suffix.push(name);
+                let Some(parent) = ancestor.parent() else { break };
+                ancestor = parent;
+            }
+            let physical = self.runner.run("pwd", &["-P"], ancestor, &command_channel_label("pwd", &["-P"])).await?;
+            let mut resolved = PathBuf::from(physical.trim_end_matches('\n'));
+            for name in suffix.into_iter().rev() {
+                resolved.push(name);
+            }
+            identity = format!("worktree {}", resolved.display());
+        }
+        for record in listing.split("\0\0") {
+            let mut fields = record.split('\0');
+            if fields.next() != Some(identity.as_str()) {
+                continue;
+            }
+            for field in fields {
+                if field == "locked" {
+                    return Ok(RegistrationState::Locked(String::new()));
+                }
+                if let Some(reason) = field.strip_prefix("locked ") {
+                    return Ok(RegistrationState::Locked(reason.into()));
+                }
+            }
+            return Ok(RegistrationState::Unlocked);
+        }
+        Ok(RegistrationState::Missing)
+    }
+
+    async fn remove_protected_worktree(&self, target: &str) -> Result<(), String> {
+        let reason = match self.registration_state(target).await? {
+            RegistrationState::Missing => return Ok(()),
+            RegistrationState::Locked(reason) => reason,
+            RegistrationState::Unlocked => {
+                format!("flotilla-managed: recovery/{}", Path::new(target).file_name().unwrap_or_default().to_string_lossy())
+            }
+        };
+        let target_exists = self.runner.path_exists(Path::new(target)).await?;
+        self.worktree_registration(target, CheckoutRegistration::Release).await?;
+        // An out-of-band directory deletion leaves only the registration;
+        // the caller's prune completes that cleanup after releasing it.
+        if !target_exists {
+            return Ok(());
+        }
+        let result = self.worktree_remove(target).await.and_then(|output| if output.success { Ok(()) } else { Err(output.stderr) });
+        if let Err(error) = result {
+            if let Err(restore) = self.worktree_registration(target, CheckoutRegistration::Protect { reason: &reason }).await {
+                return Err(format!("{error}; registration protection restoration failed: {restore}"));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn run(&self, args: &[&str]) -> Result<String, String> {
@@ -1566,6 +1665,25 @@ impl VcsBackend for GitCliBackend<'_> {
             self.update_ref(&bootstrap_branch_ref(branch), bootstrap_commit).await?;
         }
         Ok(CheckoutMaterialisation { commit, provenance })
+    }
+
+    async fn worktree_registration(&self, target: &str, operation: CheckoutRegistration<'_>) -> Result<(), String> {
+        match operation {
+            CheckoutRegistration::Protect { reason } => {
+                if self.runner.path_exists(Path::new(target)).await? {
+                    self.run(&["worktree", "repair", target]).await?;
+                }
+                match self.registration_state(target).await? {
+                    RegistrationState::Locked(_) => Ok(()),
+                    RegistrationState::Unlocked => self.run(&["worktree", "lock", "--reason", reason, target]).await.map(|_| ()),
+                    RegistrationState::Missing => Err(format!("checkout registration missing for {target}")),
+                }
+            }
+            CheckoutRegistration::Release => match self.registration_state(target).await? {
+                RegistrationState::Locked(_) => self.run(&["worktree", "unlock", target]).await.map(|_| ()),
+                RegistrationState::Missing | RegistrationState::Unlocked => Ok(()),
+            },
+        }
     }
 
     async fn worktree_remove(&self, target: &str) -> Result<CommandOutput, String> {
@@ -2185,7 +2303,10 @@ mod tests {
             ExecutionEnvironmentPath::new(root.join(".git")),
         ));
         let provider = FlotillaVcs::new(ExecutionEnvironmentPath::new(root), runner, strategy);
-        assert!(provider.materialise_checkout("main", None, target.to_str().expect("target path")).await.is_err());
+        assert!(provider
+            .materialise_checkout("main", None, target.to_str().expect("target path"), "flotilla-managed: convoy/main")
+            .await
+            .is_err());
         assert!(!target.join(".git").exists(), "failed adoption must leave the target untouched");
         assert_eq!(provider.current_branch().await.expect("parent branch").trim(), "main");
     }
@@ -2215,7 +2336,10 @@ mod tests {
         ));
         let vcs = FlotillaVcs::new(ExecutionEnvironmentPath::new(&source), runner, strategy);
         let target = target.to_str().expect("target path");
-        let materialised = vcs.materialise_checkout("feature/new", Some("main"), target).await.expect("reference clone materialised");
+        let materialised = vcs
+            .materialise_checkout("feature/new", Some("main"), target, "flotilla-managed: convoy/new")
+            .await
+            .expect("reference clone materialised");
         assert_eq!(materialised.provenance, CheckoutBranchProvenance::CreatedForConvoy);
         let dirty_file = Path::new(target).join("untracked.txt");
         std::fs::write(&dirty_file, "keep me\n").expect("dirty file");
@@ -2225,6 +2349,112 @@ mod tests {
         );
         std::fs::remove_file(dirty_file).expect("remove dirty file");
         assert_eq!(vcs.remove_materialised_checkout("feature/new", target).await.expect("remove clean clone"), CheckoutRemoval::Removed);
+    }
+
+    // Issue #2675: managed registrations survive a sibling's prune, recover
+    // host-path drift and an absent lock, and remain removable by teardown.
+    #[tokio::test]
+    async fn managed_registration_survives_prune_and_reconcile_then_teardown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let target = dir.path().join("managed");
+        let sibling = dir.path().join("sibling");
+        std::fs::create_dir(&source).expect("source");
+        git(&source, &["init", "-b", "main"]);
+        git(&source, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+        let vcs = test_fl(&source, Arc::new(crate::providers::ProcessCommandRunner), true);
+        let target_str = target.to_str().expect("target");
+        vcs.materialise_checkout("convoy/work", Some("main"), target_str, "flotilla-managed: convoy/work").await.expect("materialise");
+        let admin = source.join(".git/worktrees/managed");
+        assert!(admin.join("locked").exists(), "creation protects registration");
+        assert_eq!(std::fs::read_to_string(admin.join("locked")).expect("lock reason").trim(), "flotilla-managed: convoy/work");
+        git(&source, &["worktree", "add", "-b", "sibling", sibling.to_str().expect("sibling")]);
+        let hidden = dir.path().join("unmounted");
+        std::fs::rename(&target, &hidden).expect("simulate missing sibling mount");
+        git(&sibling, &["worktree", "prune", "--expire", "now"]);
+        assert!(admin.exists(), "prune preserves unavailable managed registration");
+        std::fs::rename(&hidden, &target).expect("restore mount");
+        git(&source, &["worktree", "unlock", target_str]);
+        std::fs::write(admin.join("gitdir"), "/workspace/.git\n").expect("simulate contained repair");
+        for _ in 0..2 {
+            vcs.checkout_registration(target_str, CheckoutRegistration::Protect { reason: "flotilla-managed: convoy/work" })
+                .await
+                .expect("reconcile registration");
+            assert!(admin.join("locked").exists(), "reconcile restores lock idempotently");
+            assert_eq!(
+                std::fs::read_to_string(admin.join("gitdir")).expect("gitdir").trim(),
+                target.join(".git").to_str().expect("host gitdir")
+            );
+        }
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(dir.path(), &alias).expect("parent alias");
+            let aliased_target = alias.join("managed");
+            vcs.checkout_registration(aliased_target.to_str().expect("aliased path"), CheckoutRegistration::Release)
+                .await
+                .expect("release through path alias");
+            vcs.checkout_registration(aliased_target.to_str().expect("aliased path"), CheckoutRegistration::Protect {
+                reason: "flotilla-managed: convoy/work",
+            })
+            .await
+            .expect("protect through path alias");
+            assert!(admin.join("locked").exists(), "path aliases preserve protection");
+        }
+        // Boundary fake: inject both transport and localized exit-status failures.
+        // All state reads and successful mutations use the real Git process.
+        struct RefuseRemoval {
+            transport: bool,
+        }
+        #[async_trait]
+        impl CommandRunner for RefuseRemoval {
+            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &crate::providers::ChannelLabel) -> Result<String, String> {
+                crate::providers::ProcessCommandRunner.run(cmd, args, cwd, label).await
+            }
+            async fn run_output(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &crate::providers::ChannelLabel,
+            ) -> Result<CommandOutput, String> {
+                if cmd == "git" && args.windows(2).any(|pair| pair == ["worktree", "remove"]) {
+                    return if self.transport {
+                        Err("removal transport unavailable".into())
+                    } else {
+                        Ok(CommandOutput { stdout: String::new(), stderr: "suppression refusée".into(), success: false })
+                    };
+                }
+                let mut output = crate::providers::ProcessCommandRunner.run_output(cmd, args, cwd, label).await?;
+                if !output.success && args.windows(2).any(|pair| pair == ["worktree", "lock"] || pair == ["worktree", "unlock"]) {
+                    output.stderr = "message Git localisé".into();
+                }
+                Ok(output)
+            }
+            async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+                crate::providers::ProcessCommandRunner.exists(cmd, args).await
+            }
+        }
+        for transport in [true, false] {
+            let refusing = test_fl(&source, Arc::new(RefuseRemoval { transport }), true);
+            refusing
+                .checkout_registration(target_str, CheckoutRegistration::Protect { reason: "flotilla-managed: convoy/work" })
+                .await
+                .expect("idempotence does not depend on localized Git diagnostics");
+            assert!(refusing.remove_materialised_checkout("convoy/work", target_str).await.is_err());
+            assert!(admin.join("locked").exists(), "failed teardown restores registration protection");
+            assert_eq!(std::fs::read_to_string(admin.join("locked")).expect("restored reason").trim(), "flotilla-managed: convoy/work");
+        }
+
+        // A locked registration cannot be removed with the single --force used
+        // by teardown; success demonstrates that teardown releases it first.
+        assert_eq!(vcs.remove_materialised_checkout("convoy/work", target_str).await.expect("teardown"), CheckoutRemoval::Removed);
+        assert!(!target.exists());
+        assert!(!admin.exists());
+        test_fl(&source, Arc::new(RefuseRemoval { transport: false }), true)
+            .checkout_registration(target_str, CheckoutRegistration::Release)
+            .await
+            .expect("absent release is locale independent");
     }
 
     #[tokio::test]
@@ -2247,7 +2477,9 @@ mod tests {
         let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
         let vcs = test_fl(&source, runner, true);
         let target = target.to_str().expect("target path");
-        vcs.materialise_checkout("convoy/work", Some("main"), target).await.expect("create convoy worktree");
+        vcs.materialise_checkout("convoy/work", Some("main"), target, "flotilla-managed: convoy/work")
+            .await
+            .expect("create convoy worktree");
         git(Path::new(target), &["switch", "-c", "research/result"]);
         std::fs::write(Path::new(target).join("README.md"), "research\n").expect("research result");
         git(Path::new(target), &["add", "README.md"]);
@@ -2281,7 +2513,9 @@ mod tests {
         let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
         let vcs = test_fl(&source, runner, true);
         let target = target.to_str().expect("target path");
-        vcs.materialise_checkout("convoy/work", Some("main"), target).await.expect("create convoy worktree");
+        vcs.materialise_checkout("convoy/work", Some("main"), target, "flotilla-managed: convoy/work")
+            .await
+            .expect("create convoy worktree");
         std::fs::write(Path::new(target).join("README.md"), "committed locally\n").expect("tracked file");
         std::fs::write(Path::new(target).join("new.txt"), "untracked\n").expect("dirty untracked file");
         git(Path::new(target), &["add", "README.md"]);
@@ -2348,7 +2582,9 @@ mod tests {
         let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
         let vcs = test_fl(&source, runner, true);
         let target = target.to_str().expect("target path");
-        vcs.materialise_checkout("convoy/work", Some("main"), target).await.expect("create convoy worktree");
+        vcs.materialise_checkout("convoy/work", Some("main"), target, "flotilla-managed: convoy/work")
+            .await
+            .expect("create convoy worktree");
         std::fs::create_dir(Path::new(target).join("target")).expect("build directory");
         let ignored_output = Path::new(target).join("target/big.bin");
         if let Some(gib) = live_gib {
@@ -2517,7 +2753,8 @@ mod tests {
         let runner = replay::test_runner(&session);
         let vcs = test_fl(&repo, runner.clone(), true);
 
-        let prepared = vcs.materialise_checkout("convoy/new", Some("main"), target).await.expect("prepare worktree");
+        let prepared =
+            vcs.materialise_checkout("convoy/new", Some("main"), target, "flotilla-managed: convoy/new").await.expect("prepare worktree");
         assert_eq!(prepared.provenance, CheckoutBranchProvenance::CreatedForConvoy);
         assert_eq!(prepared.commit.as_deref().map(str::len), Some(40));
         if replay::is_live() {
