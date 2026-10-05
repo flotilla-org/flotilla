@@ -31,7 +31,7 @@ impl CommandRunner for MemoryIncidentRunner {
         }
     }
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
-        self.run(cmd, args, cwd, label).await.map(|stdout| CommandOutput { stdout, stderr: String::new(), success: true })
+        self.run(cmd, args, cwd, label).await.map(|stdout| CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) })
     }
     async fn exists(&self, _: &str, _: &[&str]) -> bool {
         true

@@ -1770,12 +1770,12 @@ mod tests {
             CommandOutput {
                 stdout: format!("HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: {reset}\r\n\r\n{{\"message\":\"API rate limit exceeded\"}}"),
                 stderr: "gh: API rate limit exceeded".into(),
-                success: false,
+                exit_code: Some(1),
             },
             CommandOutput {
                 stdout: "HTTP/2 200 OK\r\n\r\n[{\"number\":896,\"title\":\"backoff\",\"state\":\"open\",\"labels\":[],\"updated_at\":\"2026-07-22T00:00:00Z\"}]".into(),
                 stderr: String::new(),
-                success: true,
+                exit_code: Some(0),
             },
         ]));
         let api = Arc::new(GhApiClient::new(runner.clone()));

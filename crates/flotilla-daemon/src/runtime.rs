@@ -5630,7 +5630,7 @@ async fn cleanup_convoy_checkout_parents(runner: &dyn CommandRunner, target: &Pa
     for parent in target.ancestors().skip(1) {
         let path = parent.to_string_lossy();
         match runner.run_output("rmdir", &["--", &path], Path::new("/"), &ChannelLabel::Default).await {
-            Ok(output) if output.success => {}
+            Ok(output) if output.success() => {}
             result => {
                 // If the existence probe fails, keep the parent and stop:
                 // uncertainty must never authorize further pruning.
@@ -5723,7 +5723,7 @@ async fn remove_checkout_path(runner: &dyn CommandRunner, target_path: &str) -> 
     runner.run("rm", &["-rf", target_path], Path::new("/"), &ChannelLabel::Default).await?;
     for predicate in ["-e", "-L"] {
         let remaining = runner.run_output("test", &[predicate, target_path], Path::new("/"), &ChannelLabel::Default).await?;
-        if remaining.success {
+        if remaining.success() {
             return Err(format!("checkout cleanup reported success but path remains: {target_path}"));
         }
     }
@@ -7611,7 +7611,7 @@ mod tests {
                 }
             }
             async fn run_output(&self, _: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<CommandOutput, String> {
-                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: false })
+                Ok(CommandOutput { stdout: String::new(), stderr: String::new(), exit_code: Some(1) })
             }
             async fn exists(&self, _: &str, _: &[&str]) -> bool {
                 false
@@ -7946,7 +7946,7 @@ mod tests {
 
         async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
             if cmd == "gh" {
-                Ok(CommandOutput { stdout: "[]".to_string(), stderr: String::new(), success: true })
+                Ok(CommandOutput { stdout: "[]".to_string(), stderr: String::new(), exit_code: Some(0) })
             } else {
                 ProcessCommandRunner.run_output(cmd, args, cwd, label).await
             }
@@ -7971,7 +7971,7 @@ mod tests {
         }
 
         async fn run_output(&self, _cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
-            Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+            Ok(CommandOutput { stdout: String::new(), stderr: String::new(), exit_code: Some(0) })
         }
 
         async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
@@ -10451,12 +10451,12 @@ mod tests {
                 .expect("inspect clone");
             if kind == 0 {
                 assert!(branch.is_err(), "a directory without its own Git entry is not a checkout");
-                assert!(!status.success, "status must not inspect the enclosing checkout");
+                assert!(!status.success(), "status must not inspect the enclosing checkout");
                 assert!(inspection.default_branch.is_none(), "clone inspection must not borrow the ancestor branch");
             } else {
                 let expected = if kind == 1 { "main" } else { "inner" };
                 assert_eq!(branch.expect("checkout branch").trim(), expected);
-                assert!(status.success && status.stdout.is_empty(), "the nested checkout itself is clean");
+                assert!(status.success() && status.stdout.is_empty(), "the nested checkout itself is clean");
                 assert_eq!(inspection.default_branch.as_deref(), Some(expected));
             }
         });
@@ -14587,11 +14587,11 @@ mod tests {
 
             async fn run_output(&self, cmd: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
                 if cmd == "mkdir" {
-                    Ok(CommandOutput { stdout: String::new(), stderr: String::new(), success: true })
+                    Ok(CommandOutput { stdout: String::new(), stderr: String::new(), exit_code: Some(0) })
                 } else if cmd == "rustc" {
                     self.entered.notify_one();
                     self.release.notified().await;
-                    Ok(CommandOutput { stdout: "rustc 1.94.1".to_string(), stderr: String::new(), success: true })
+                    Ok(CommandOutput { stdout: "rustc 1.94.1".to_string(), stderr: String::new(), exit_code: Some(0) })
                 } else {
                     Err("tool unavailable".to_string())
                 }

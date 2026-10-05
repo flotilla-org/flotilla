@@ -490,7 +490,7 @@ mod tests {
         let runner = Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput {
             stdout: "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1893456000\r\n\r\n{\"message\":\"API rate limit exceeded\"}".into(),
             stderr: "gh: HTTP 403".into(),
-            success: false,
+            exit_code: Some(1),
         })]));
         let provider =
             GitHubChangeRequest::new("github".into(), "team/one".into(), Arc::new(GhApiClient::new(runner.clone())), runner.clone());

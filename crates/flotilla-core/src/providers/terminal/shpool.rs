@@ -226,7 +226,7 @@ impl TerminalPool for ShpoolTerminalPool {
             &["--socket", &socket_str, "-c", &config_str, "attach", "--cmd", &cmd_str, "--dir", &cwd_str, session_name],
             Path::new("/")
         )?;
-        if !output.success {
+        if !output.success() {
             tracing::debug!(
                 %session_name,
                 stderr = %output.stderr,

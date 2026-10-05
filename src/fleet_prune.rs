@@ -59,11 +59,6 @@ impl Processes for NativeProcesses {
     }
 }
 
-// CommandOutput has no exit code. Preserve pgrep's 0/1 distinction explicitly;
-// neither stderr matching nor treating every failed command as "no processes"
-// would fail closed when process enumeration is unavailable.
-const ENUMERATE: &str = "pgrep -x flotillad; result=$?; printf '\\npgrep-status:%s\\n' \"$result\"";
-
 async fn protected(root: &Path, runner: &impl CommandRunner, processes: &impl Processes) -> Result<HashSet<PathBuf>, String> {
     let releases = root.join("releases");
     let mut protected = HashSet::new();
@@ -84,14 +79,14 @@ async fn protected(root: &Path, runner: &impl CommandRunner, processes: &impl Pr
             Err(error) => return Err(error.to_string()),
         }
     }
-    let output = runner.run("sh", &["-c", ENUMERATE], Path::new("/"), &ChannelLabel::Command("fleet prune".into())).await?;
-    let (pids, status) = output.trim_end().rsplit_once("\npgrep-status:").ok_or("cannot enumerate running flotillad processes")?;
-    match status {
-        "1" => return Ok(protected),
-        "0" if !pids.trim().is_empty() => {}
-        "0" => return Err("process discovery returned no executable PIDs".into()),
-        _ => return Err("cannot enumerate running flotillad processes".into()),
+    let output = runner.run_output("pgrep", &["-x", "flotillad"], Path::new("/"), &ChannelLabel::Command("fleet prune".into())).await?;
+    match output.exit_code {
+        Some(1) => return Ok(protected),
+        Some(0) if !output.stdout.trim().is_empty() => {}
+        Some(0) => return Err("process discovery returned no executable PIDs".into()),
+        _ => return Err(format!("cannot enumerate running flotillad processes: {}", output.stderr)),
     }
+    let pids = output.stdout;
     for pid in pids.split_whitespace() {
         let pid: i32 = pid.parse().map_err(|_| "invalid process PID")?;
         if pid <= 0 {
@@ -262,11 +257,11 @@ mod tests {
     // Subprocess-boundary double; verifies enumeration delegation and permits
     // PID enumeration to change between selection and each deletion.
     struct MockRunner {
-        responses: Mutex<VecDeque<Result<String, String>>>,
+        responses: Mutex<VecDeque<Result<CommandOutput, String>>>,
         calls: Mutex<Vec<(String, Vec<String>)>>,
     }
     impl MockRunner {
-        fn new(responses: Vec<Result<String, String>>) -> Self {
+        fn new(responses: Vec<Result<CommandOutput, String>>) -> Self {
             Self { responses: Mutex::new(responses.into()), calls: Mutex::new(Vec::new()) }
         }
         fn calls(&self) -> Vec<(String, Vec<String>)> {
@@ -275,20 +270,25 @@ mod tests {
     }
     #[async_trait]
     impl CommandRunner for MockRunner {
-        async fn run(&self, command: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+        async fn run(&self, _command: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
+            panic!("pruning uses run_output")
+        }
+        async fn run_output(&self, command: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
             self.calls.lock().expect("calls").push((command.into(), args.iter().map(|arg| (*arg).into()).collect()));
             self.responses.lock().expect("responses").pop_front().expect("expected enumeration call")
-        }
-        async fn run_output(&self, _command: &str, _args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
-            panic!("pruning uses run")
         }
         async fn exists(&self, _command: &str, _args: &[&str]) -> bool {
             panic!("pruning uses run")
         }
     }
 
-    fn runner(outputs: &[&str]) -> MockRunner {
-        MockRunner::new(outputs.iter().map(|output| Ok((*output).into())).collect())
+    fn runner(outputs: &[(Option<i32>, &str)]) -> MockRunner {
+        MockRunner::new(
+            outputs
+                .iter()
+                .map(|(exit_code, stdout)| Ok(CommandOutput { stdout: (*stdout).into(), stderr: String::new(), exit_code: *exit_code }))
+                .collect(),
+        )
     }
 
     fn fixture(names: &[&str]) -> TempDir {
@@ -382,7 +382,7 @@ mod tests {
                 .into(),
                 exited: HashSet::new(),
             };
-            let output = "10 11 12\npgrep-status:0\n";
+            let output = (Some(0), "10 11 12");
             let commands = runner(&[output, output, output, output, output]);
             let readonly = root.path().join("releases/04");
             fs::set_permissions(&readonly, fs::Permissions::from_mode(0o555)).expect("readonly");
@@ -392,7 +392,7 @@ mod tests {
                 assert_eq!(root.path().join(format!("releases/{i:02}")).is_dir(), retained);
                 assert_eq!(root.path().join(format!("releases/{i:02}.validator.bak")).is_file(), retained);
             }
-            assert!(commands.calls().iter().all(|(command, args)| command == "sh" && args == &["-c", ENUMERATE]));
+            assert!(commands.calls().iter().all(|(command, args)| command == "pgrep" && args == &["-x", "flotillad"]));
         }
     }
 
@@ -407,7 +407,7 @@ mod tests {
         let release = root.path().join("releases/a");
         fs::set_permissions(&release, fs::Permissions::from_mode(0o555)).expect("readonly");
         let mut report = Vec::new();
-        prune(root.path(), "1", true, &runner(&["\npgrep-status:1\n", "\npgrep-status:1\n"]), &FakeProcesses::default(), |name| {
+        prune(root.path(), "1", true, &runner(&[(Some(1), ""), (Some(1), "")]), &FakeProcesses::default(), |name| {
             report.push(name.to_owned())
         })
         .await
@@ -431,9 +431,7 @@ mod tests {
         link(&root.path().join("releases"), "a.extra", "missing");
         fs::create_dir(root.path().join("releases/a.extra-dir")).expect("sidecar directory");
         // This valid generation directory itself is retained as the newest other.
-        prune(root.path(), "1", false, &runner(&["\npgrep-status:1\n", "\npgrep-status:1\n"]), &FakeProcesses::default(), |_| {})
-            .await
-            .expect("prune");
+        prune(root.path(), "1", false, &runner(&[(Some(1), ""), (Some(1), "")]), &FakeProcesses::default(), |_| {}).await.expect("prune");
         assert!(!root.path().join("releases/a").exists());
         assert!(!root.path().join("releases/a.validator.bak").exists());
         assert!(!root.path().join("releases/a.extra").is_symlink());
@@ -471,9 +469,7 @@ mod tests {
     // deletion. A process that exited between enumeration and inspection is safe.
     #[tokio::test]
     async fn process_discovery_fails_closed() {
-        for output in
-            ["\npgrep-status:2\n", "\npgrep-status:0\n", "bad\npgrep-status:0\n", "-1\npgrep-status:0\n", "10\npgrep-status:0\n", "garbage"]
-        {
+        for output in [(Some(2), ""), (Some(0), ""), (Some(0), "bad"), (Some(0), "-1"), (Some(0), "10"), (None, "")] {
             let root = fixture(&["old"]);
             assert!(prune(root.path(), "0", false, &runner(&[output]), &FakeProcesses::default(), |_| {}).await.is_err());
             assert!(root.path().join("releases/old").exists());
@@ -483,9 +479,7 @@ mod tests {
         assert!(prune(root.path(), "0", false, &commands, &FakeProcesses::default(), |_| {}).await.is_err());
         assert!(root.path().join("releases/old").exists());
         let processes = FakeProcesses { paths: HashMap::new(), exited: [10].into() };
-        prune(root.path(), "0", false, &runner(&["10\npgrep-status:0\n", "10\npgrep-status:0\n"]), &processes, |_| {})
-            .await
-            .expect("exited process");
+        prune(root.path(), "0", false, &runner(&[(Some(0), "10"), (Some(0), "10")]), &processes, |_| {}).await.expect("exited process");
         assert!(!root.path().join("releases/old").exists());
     }
 
@@ -498,7 +492,7 @@ mod tests {
         let root = fixture(&["a", "b"]);
         fs::set_permissions(root.path().join("releases/b"), fs::Permissions::from_mode(0o555)).expect("readonly");
         let processes = FakeProcesses { paths: [(10, root.path().join("releases/b/bin/flotillad"))].into(), exited: HashSet::new() };
-        let commands = runner(&["\npgrep-status:1\n", "10\npgrep-status:0\n", "10\npgrep-status:0\n"]);
+        let commands = runner(&[(Some(1), ""), (Some(0), "10"), (Some(0), "10")]);
         prune(root.path(), "0", false, &commands, &processes, |_| {}).await.expect("prune");
         assert!(root.path().join("releases/b").is_dir());
         assert_eq!(fs::metadata(root.path().join("releases/b")).expect("metadata").permissions().mode() & 0o777, 0o555);
@@ -511,18 +505,17 @@ mod tests {
     async fn failed_recheck_and_external_executable() {
         let root = fixture(&["old"]);
         let mut reported = Vec::new();
-        let result =
-            prune(root.path(), "0", false, &runner(&["\npgrep-status:1\n", "\npgrep-status:2\n"]), &FakeProcesses::default(), |name| {
-                reported.push(name.to_owned())
-            })
-            .await;
+        let result = prune(root.path(), "0", false, &runner(&[(Some(1), ""), (Some(2), "")]), &FakeProcesses::default(), |name| {
+            reported.push(name.to_owned())
+        })
+        .await;
         assert!(result.is_err());
         assert!(reported.is_empty());
         assert!(root.path().join("releases/old.validator.bak").exists());
         assert!(root.path().join("releases/old").is_dir());
         let outside = tempfile::tempdir().expect("outside executable");
         let processes = FakeProcesses { paths: [(10, outside.path().join("flotillad"))].into(), exited: HashSet::new() };
-        prune(root.path(), "0", false, &runner(&["10\npgrep-status:0\n", "10\npgrep-status:0\n"]), &processes, |_| {})
+        prune(root.path(), "0", false, &runner(&[(Some(0), "10"), (Some(0), "10")]), &processes, |_| {})
             .await
             .expect("prune with unrelated daemon");
         assert!(!root.path().join("releases/old").exists());
@@ -542,19 +535,12 @@ mod tests {
             assert!(commands.calls().is_empty());
             assert!(root.path().join("releases/old").exists());
         }
-        prune(
-            root.path(),
-            "9999999999999999999999999999999999999999",
-            false,
-            &runner(&["\npgrep-status:1\n"]),
-            &FakeProcesses::default(),
-            |_| {},
-        )
-        .await
-        .expect("huge K");
+        prune(root.path(), "9999999999999999999999999999999999999999", false, &runner(&[(Some(1), "")]), &FakeProcesses::default(), |_| {})
+            .await
+            .expect("huge K");
         assert!(root.path().join("releases/old").exists());
         let empty = tempfile::tempdir().expect("empty root");
-        prune(empty.path(), "0", false, &runner(&["\npgrep-status:1\n"]), &FakeProcesses::default(), |_| {}).await.expect("empty store");
+        prune(empty.path(), "0", false, &runner(&[(Some(1), "")]), &FakeProcesses::default(), |_| {}).await.expect("empty store");
         assert!(!empty.path().join("releases").exists());
         assert!(generation_name(&"a".repeat(128)));
         assert!(!generation_name(&"a".repeat(129)));

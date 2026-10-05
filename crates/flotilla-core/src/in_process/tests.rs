@@ -2499,7 +2499,7 @@ impl CommandRunner for BatchedObservationRunner {
             return self.run(cmd, args, cwd, label).await.map(|stdout| crate::providers::CommandOutput {
                 stdout,
                 stderr: String::new(),
-                success: true,
+                exit_code: Some(0),
             });
         }
         let query = args.iter().find_map(|arg| arg.strip_prefix("query=")).ok_or("missing GraphQL query")?;
@@ -2518,13 +2518,13 @@ impl CommandRunner for BatchedObservationRunner {
                     "HTTP/2 200 OK\r\n\r\n{\"errors\":[{\"type\":\"FORBIDDEN\",\"message\":\"history access denied\"}]}".into()
                 },
                 stderr: String::new(),
-                success: !limited,
+                exit_code: Some(if !limited { 0 } else { 1 }),
             });
         }
         if self.rate_limit_all.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(crate::providers::CommandOutput {
                 stdout: "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 4989\r\nX-RateLimit-Reset: 1893456000\r\nRetry-After: 60\r\n\r\n{\"message\":\"You have exceeded a secondary rate limit\"}".into(),
-                stderr: String::new(), success: false,
+                stderr: String::new(), exit_code: Some(1),
             });
         }
         if query.contains("name:\"one\"") && self.hard_error_one.load(std::sync::atomic::Ordering::SeqCst) {
@@ -2534,7 +2534,7 @@ impl CommandRunner for BatchedObservationRunner {
             return Ok(crate::providers::CommandOutput {
                 stdout: "HTTP/2 403 Forbidden\r\nX-RateLimit-Reset: 1893456000\r\nX-RateLimit-Remaining: 0\r\n\r\n{\"message\":\"API rate limit exceeded\"}".into(),
                 stderr: "gh: API rate limit exceeded".into(),
-                success: false,
+                exit_code: Some(1),
             });
         }
         let requests = query
@@ -2559,7 +2559,7 @@ impl CommandRunner for BatchedObservationRunner {
         Ok(crate::providers::CommandOutput {
             stdout: format!("HTTP/2 200 OK\r\n\r\n{}", serde_json::json!({"data": {"repository": requests}})),
             stderr: String::new(),
-            success: true,
+            exit_code: Some(0),
         })
     }
 
@@ -2592,7 +2592,7 @@ impl CommandRunner for BusyObservationRunner {
             return self.run(cmd, args, cwd, label).await.map(|stdout| crate::providers::CommandOutput {
                 stdout,
                 stderr: String::new(),
-                success: true,
+                exit_code: Some(0),
             });
         }
         let query = args.iter().find_map(|arg| arg.strip_prefix("query=")).ok_or("query")?;
@@ -2605,7 +2605,11 @@ impl CommandRunner for BusyObservationRunner {
                 "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}});
             serde_json::json!({"data": {"repository": {"pr1": busy, "pr2": busy, "pr3": busy}}})
         };
-        Ok(crate::providers::CommandOutput { stdout: format!("HTTP/2 200 OK\r\n\r\n{document}"), stderr: String::new(), success: true })
+        Ok(crate::providers::CommandOutput {
+            stdout: format!("HTTP/2 200 OK\r\n\r\n{document}"),
+            stderr: String::new(),
+            exit_code: Some(0),
+        })
     }
 }
 
@@ -2694,7 +2698,7 @@ impl CommandRunner for AdmissionRestRunner {
         let endpoint = args.iter().find(|arg| arg.starts_with("repos/")).expect("REST endpoint");
         let scope = endpoint.strip_prefix("repos/").expect("repository path").split("/pulls").next().expect("scope");
         let response = self.responses.get(scope).expect("configured repository");
-        Ok(CommandOutput { stdout: response.stdout.clone(), stderr: response.stderr.clone(), success: response.success })
+        Ok(CommandOutput { stdout: response.stdout.clone(), stderr: response.stderr.clone(), exit_code: response.exit_code })
     }
 
     async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
@@ -2741,7 +2745,7 @@ fn rest_admission_response(reply: RestAdmissionReply, lookup: RestAdmissionLooku
     CommandOutput {
         stdout: format!("HTTP/2 {status}\r\n{headers}\r\n{body}"),
         stderr: if reply == Ordinary { "rate limited diagnostics unavailable".into() } else { "gh: Not Found".into() },
-        success,
+        exit_code: Some(if success { 0 } else { 1 }),
     }
 }
 

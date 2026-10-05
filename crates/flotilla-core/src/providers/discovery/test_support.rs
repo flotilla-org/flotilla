@@ -102,7 +102,7 @@ impl CommandRunner for MergedPrProcessRunner {
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         if cmd == "gh" {
-            Ok(CommandOutput { stdout: self.response(cwd, label).await?, stderr: String::new(), success: true })
+            Ok(CommandOutput { stdout: self.response(cwd, label).await?, stderr: String::new(), exit_code: Some(0) })
         } else {
             ProcessCommandRunner.run_output(cmd, args, cwd, label).await
         }
@@ -339,8 +339,8 @@ impl CommandRunner for DiscoveryMockRunner {
 
     async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
         match self.run(cmd, args, cwd, label).await {
-            Ok(stdout) => Ok(CommandOutput { stdout, stderr: String::new(), success: true }),
-            Err(stderr) => Ok(CommandOutput { stdout: String::new(), stderr, success: false }),
+            Ok(stdout) => Ok(CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) }),
+            Err(stderr) => Ok(CommandOutput { stdout: String::new(), stderr, exit_code: Some(1) }),
         }
     }
 

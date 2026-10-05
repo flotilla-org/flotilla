@@ -32,8 +32,8 @@ pub enum Interaction {
         stdout: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stderr: Option<String>,
-        #[serde(default)]
-        exit_code: i32,
+        #[serde(default = "successful_exit_code")]
+        exit_code: Option<i32>,
     },
     #[serde(rename = "gh_api")]
     GhApi {
@@ -61,6 +61,12 @@ pub enum Interaction {
         #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         response_headers: HashMap<String, String>,
     },
+}
+
+// Missing exit_code in legacy fixtures meant success; explicit null represents
+// termination without a numeric code. Keep old integer fixtures readable.
+fn successful_exit_code() -> Option<i32> {
+    Some(0)
 }
 
 impl Interaction {
@@ -473,7 +479,7 @@ impl CommandRunner for ReplayRunner {
         let actual_cwd = cwd.to_string_lossy();
         assert_eq!(actual_cwd, expected_cwd, "ReplayRunner: cwd mismatch for '{cmd}'");
 
-        if exit_code == 0 {
+        if exit_code == Some(0) {
             Ok(stdout.unwrap_or_default())
         } else {
             Err(stderr.unwrap_or_default())
@@ -505,7 +511,7 @@ impl CommandRunner for ReplayRunner {
         let actual_cwd = cwd.to_string_lossy();
         assert_eq!(actual_cwd, expected_cwd, "ReplayRunner: cwd mismatch for '{cmd}'");
 
-        Ok(CommandOutput { stdout: stdout.unwrap_or_default(), stderr: stderr.unwrap_or_default(), success: exit_code == 0 })
+        Ok(CommandOutput { stdout: stdout.unwrap_or_default(), stderr: stderr.unwrap_or_default(), exit_code })
     }
 
     async fn run_with_input(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel, _input: &[u8]) -> Result<String, String> {
@@ -810,8 +816,8 @@ impl RecordingRunner {
         let default = DefaultLabeler.label_for(&request);
         let explicit = explicit_label(label, &default);
         let (stdout, stderr, exit_code) = match result {
-            Ok(out) => (Some(out.clone()), None, 0),
-            Err(err) => (None, Some(err.clone()), 1),
+            Ok(out) => (Some(out.clone()), None, Some(0)),
+            Err(err) => (None, Some(err.clone()), Some(1)),
         };
         self.session.record(Interaction::Command {
             label: explicit,
@@ -863,7 +869,7 @@ impl CommandRunner for RecordingRunner {
                     cwd: cwd.to_string_lossy().to_string(),
                     stdout: Some(output.stdout.clone()),
                     stderr: Some(output.stderr.clone()),
-                    exit_code: if output.success { 0 } else { 1 },
+                    exit_code: output.exit_code,
                 });
             }
             Err(err) => {
@@ -874,7 +880,7 @@ impl CommandRunner for RecordingRunner {
                     cwd: cwd.to_string_lossy().to_string(),
                     stdout: None,
                     stderr: Some(err.clone()),
-                    exit_code: 1,
+                    exit_code: Some(1),
                 });
             }
         }
@@ -902,8 +908,8 @@ impl CommandRunner for RecordingRunner {
         let default = DefaultLabeler.label_for(&request);
         let explicit = explicit_label(label, &default);
         let (stdout, stderr, exit_code) = match &result {
-            Ok(out) => (Some(out.clone()), None, 0),
-            Err(err) => (None, Some(err.clone()), 1),
+            Ok(out) => (Some(out.clone()), None, Some(0)),
+            Err(err) => (None, Some(err.clone()), Some(1)),
         };
         self.session.record(Interaction::Command {
             label: explicit,
