@@ -29,11 +29,12 @@ use flotilla_protocol::{
 };
 use flotilla_resources::{
     controller::ControllerLoop, list_resource_kind, Checkout as ResourceCheckout, CheckoutSpec as ResourceCheckoutSpec, Convoy,
-    ConvoyReconciler, ConvoySpec, CrewSessionStatus, Host, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec,
-    HostStatus, HttpBackend, InMemoryBackend, InputMeta, ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy,
-    PlacementPolicySpec, ResourceBackend, ResourceError, ResourceList, ResourceProvenance, Selector, SqliteBackend, StatusPatch,
-    TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionSource, TerminalSessionSpec,
-    TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
+    ConvoyReconciler, ConvoySpec, CrewSessionStatus, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, HarnessFacts, Host,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, HostSpec, HostStatus, HttpBackend, InMemoryBackend, InputMeta,
+    ObservedCheckoutSpec as ResourceObservedCheckoutSpec, PlacementPolicy, PlacementPolicySpec, ResourceBackend, ResourceError,
+    ResourceList, ResourceProvenance, Selector, SqliteBackend, StatusPatch, TerminalAttentionState, TerminalBrief, TerminalCrewContext,
+    TerminalSession, TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, TerminalSessionStatusPatch, Vessel, WatchEvent,
+    WatchStart, WorkflowTemplate,
 };
 use flotilla_test_support::TestSocketDir;
 use flotilla_transport::message::{message_session_pair, MessageSession};
@@ -1862,6 +1863,10 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
     remote_hosts
         .update_status(&remote_host_id, &remote_host.metadata.resource_version, &HostStatus {
             capabilities: BTreeMap::from([(flotilla_resources::AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))]),
+            fulfilment_facts: BTreeMap::from([(format!("host-direct-{remote_host_id}"), FulfilmentFacts {
+                harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
+                ..Default::default()
+            })]),
             heartbeat_at: Some(chrono::Utc::now()),
             daemon_generation: Some("feta-test".to_string()),
             ready: true,
@@ -1879,7 +1884,7 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
         .expect("replicate remote host capacity");
     let remote_policy_name = format!("host-direct-{remote_host_id}");
     let remote_policies = remote_daemon.resource_backend().using::<PlacementPolicy>("flotilla");
-    remote_policies
+    let remote_policy = remote_policies
         .create(
             &InputMeta::builder().name(remote_policy_name.clone()).build(),
             &PlacementPolicySpec::builder()
@@ -1892,6 +1897,15 @@ async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option
         )
         .await
         .expect("create remote placement policy at its home");
+    remote_daemon
+        .resource_backend()
+        .using::<FulfilmentKind>("flotilla")
+        .create(
+            &InputMeta::builder().name(remote_policy_name.clone()).build(),
+            &FulfilmentKindSpec::from_policy(&remote_policy.spec, "linux").expect("kind"),
+        )
+        .await
+        .expect("remote fulfilment kind");
     daemon
         .resource_backend()
         .replica_writer::<PlacementPolicy>(node("feta"), "flotilla")

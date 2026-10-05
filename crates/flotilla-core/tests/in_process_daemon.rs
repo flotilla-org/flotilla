@@ -1866,6 +1866,16 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
     let mut status = host.status.unwrap_or_default();
     status.ready = true;
     status.heartbeat_at = Some(chrono::Utc::now());
+    // The test image contains a current harness; unknown facts are tested
+    // explicitly by removing this observation in those scenarios.
+    status.fulfilment_facts.insert("docker-test".into(), FulfilmentFacts {
+        harnesses: agent_adapters
+            .iter()
+            .filter(|adapter| adapter.as_str() == "codex")
+            .map(|adapter| (adapter.clone(), HarnessFacts { version: "1.0.0".into(), models: BTreeMap::new() }))
+            .collect(),
+        ..Default::default()
+    });
     status.capabilities.insert("docker".to_string(), serde_json::json!(true));
     status.capabilities.insert("os".to_string(), serde_json::json!("linux"));
     status.disk_free_bytes = Some(100 * 1024 * 1024 * 1024);
@@ -2297,6 +2307,14 @@ async fn create_test_host_direct_policy(
     let host = hosts.create(&InputMeta::builder().name(host_ref.to_string()).build(), &HostSpec::default()).await.expect("host create");
     hosts
         .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
+            fulfilment_facts: BTreeMap::from([(policy_name.to_string(), FulfilmentFacts {
+                harnesses: agent_adapters
+                    .iter()
+                    .filter(|adapter| adapter.as_str() == "codex")
+                    .map(|adapter| (adapter.clone(), HarnessFacts { version: "1.0.0".into(), models: BTreeMap::new() }))
+                    .collect(),
+                ..Default::default()
+            })]),
             capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(agent_adapters))].into_iter().collect(),
             heartbeat_at: Some(chrono::Utc::now()),
             ready: true,
@@ -2354,6 +2372,11 @@ async fn capability_admission_names_unobserved_kind_facts() {
     let backend = daemon.resource_backend();
     create_test_convoy_project(&backend, None).await;
     create_test_host_direct_policy(&backend, "host-direct-unobserved", "unobserved", 100, BTreeSet::from(["codex".to_string()])).await;
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let host = hosts.get("unobserved").await.expect("host");
+    let mut status = host.status.expect("status");
+    status.fulfilment_facts.clear();
+    hosts.update_status("unobserved", &host.metadata.resource_version, &status).await.expect("unknown facts");
 
     let result = start_capability_convoy(&daemon, "unobserved-harness", |intent| {
         intent.needs.push("harness:claude-code>=2.1.300".to_string());
@@ -2972,6 +2995,39 @@ async fn conflicting_role_platform_needs_split_and_name_uncovered_role() {
     );
 }
 
+// Issue #2694: observed host versions, not adapter availability, decide
+// whether a Codex crew can run. Explain must retain the rejected version gap.
+#[tokio::test]
+async fn codex_admission_refuses_old_host_and_explains_version_gap() {
+    let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
+    let backend = daemon.resource_backend();
+    create_test_convoy_project(&backend, None).await;
+    create_test_host_direct_policy(&backend, "old-codex", "old-host", 0, BTreeSet::from(["codex".into()])).await;
+    let hosts = backend.using::<ResourceHost>("flotilla");
+    let host = hosts.get("old-host").await.expect("host");
+    let mut status = host.status.expect("status");
+    status.fulfilment_facts.insert("old-codex".into(), FulfilmentFacts {
+        harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.154.0".into(), models: BTreeMap::new() })]),
+        ..Default::default()
+    });
+    hosts.update_status("old-host", &host.metadata.resource_version, &status).await.expect("probe facts");
+    let result = start_capability_convoy(&daemon, "codex-version", |_| {}).await;
+    assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+    let result = daemon
+        .execute_query(
+            Command::builder()
+                .action(CommandAction::QueryExplainConvoy { namespace: Some("flotilla".into()), name: "codex-version".into() })
+                .build(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("explain");
+    let CommandValue::ConvoyExplanation(explanation) = result else { panic!("{result:?}") };
+    assert_eq!(explanation.vessel_placements["work"].policy_name, "docker-test");
+    assert!(format!("{explanation:?}").contains("0.154.0"), "{explanation:?}");
+    assert!(explanation.role_needs.values().flatten().any(|need| need == "harness:codex>=0.160.0"));
+}
+
 #[tokio::test]
 async fn requested_model_derives_harness_need_and_selects_host_direct() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
@@ -3245,7 +3301,10 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
     let decision =
         convoy.status.and_then(|status| status.placement_decision).expect("admission should persist the complete placement decision");
     assert_eq!(decision.policy_name, "host-direct-b-remote");
-    assert!(decision.refused_candidates.is_empty());
+    // Capability-pruned hosts remain in explain even when another host wins.
+    assert_eq!(decision.refused_candidates.len(), 1);
+    assert_eq!(decision.refused_candidates[0].policy_name, "host-direct-a-empty");
+    assert!(decision.refused_candidates[0].reason.contains("harness:codex>=0.160.0"));
     assert_eq!(decision.viable_not_selected.len(), 1);
     assert_eq!(decision.viable_not_selected[0].policy_name, "host-direct-z-local");
     assert_eq!(decision.viable_not_selected[0].reason, "minimal alternative");
@@ -3333,7 +3392,13 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
     .await
     .expect("start command should finish");
 
-    assert!(matches!(result, CommandValue::Error { message } if message.contains("workflow requires agent adapter `codex`")));
+    // Capability admission now names the missing harness need before adapter
+    // preparation; it must still refuse without writing a Convoy.
+    assert!(
+        matches!(&result, CommandValue::Error { message } if message.contains("harness:codex>=0.160.0")
+        && message.contains("observed codex unknown")),
+        "{result:?}"
+    );
     assert!(matches!(
         backend.using::<ResourceConvoy>("flotilla").get("missing-adapter").await,
         Err(flotilla_resources::ResourceError::NotFound { .. })

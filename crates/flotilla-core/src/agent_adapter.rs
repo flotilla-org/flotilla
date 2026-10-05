@@ -522,9 +522,28 @@ impl Default for CapabilityTable {
     }
 }
 
+/// Minimum CLI version required by our invocation, independent of discovery
+/// or model acceptance. Admission must use this even on hosts where the
+/// adapter is not locally installed. Keep the floor beside the launch flags.
+pub fn minimum_harness_version(adapter: &str) -> Option<&'static str> {
+    match adapter {
+        // --no-daemon is part of every managed Codex invocation.
+        "codex" => Some("0.160.0"),
+        _ => None,
+    }
+}
+
 #[async_trait]
 pub trait AgentAdapter: Send + Sync {
     fn id(&self) -> &'static str;
+    fn minimum_harness_version(&self) -> Option<&'static str> {
+        minimum_harness_version(self.id())
+    }
+    /// A positive process exit can prove a launch error even if its terminal
+    /// has vanished. Screen capture enriches the diagnosis but is optional.
+    fn classify_exit_failure(&self, _exit_code: i32, _screen: &str) -> Option<String> {
+        None
+    }
     async fn prepare(&self, cwd: &ExecutionEnvironmentPath, brief: &TerminalBrief) -> Result<(), String>;
     /// Prepare an invocation with the environment selected for this particular
     /// crew process. Credential-backed paths are deliberately resolved here,
@@ -722,6 +741,14 @@ impl AgentAdapter for CliAgentAdapter {
                 Some(format!("{:x}", Sha256::digest(output.as_bytes())))
             }
         }
+    }
+
+    fn classify_exit_failure(&self, exit_code: i32, screen: &str) -> Option<String> {
+        if !matches!(self.flavor, AdapterFlavor::Codex { .. }) || exit_code != 2 {
+            return None;
+        }
+        let diagnostic = screen.lines().map(str::trim).find(|line| line.starts_with("error:"));
+        Some(format!("Codex launch usage error (exit 2): {}", diagnostic.unwrap_or("harness rejected the invocation")))
     }
 
     fn classify_screen_failure(&self, screen: &str) -> Option<&'static str> {
@@ -1151,6 +1178,25 @@ mod tests {
             &env,
             Arc::new(MockRunner::new(vec![Ok("/workspace\n".into()), Ok(".git/info/exclude\n".into()), Ok(String::new())])),
         )
+    }
+
+    // Issue #2694: every Codex launch needs the declared --no-daemon floor.
+    // Exit 2 is a usage failure; empty capture still fails visibly. Other
+    // exit codes and a live screen containing quoted errors do not prove it.
+    #[hegel::test]
+    fn codex_launch_contract_classifies_only_usage_exits(tc: hegel::TestCase) {
+        let registry = discovered_registry();
+        let codex = registry.get("codex").expect("codex");
+        assert_eq!(codex.minimum_harness_version(), Some("0.160.0"));
+        let code = tc.draw(hegel::generators::integers::<i32>().min_value(0).max_value(255));
+        let screen = if tc.draw(hegel::generators::booleans()) { "error: unexpected argument '--no-daemon' found" } else { "" };
+        let failure = codex.classify_exit_failure(code, screen);
+        assert_eq!(failure.is_some(), code == 2);
+        if let Some(message) = failure {
+            assert!(message.contains("exit 2"));
+            assert!(screen.is_empty() || message.contains(screen));
+        }
+        assert!(registry.get("claude-code").expect("claude").classify_exit_failure(code, screen).is_none());
     }
 
     #[test]

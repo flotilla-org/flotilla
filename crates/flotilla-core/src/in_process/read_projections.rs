@@ -2338,6 +2338,19 @@ mod tests {
         apply_status_patch(&sessions, "health-session", &TerminalSessionStatusPatch::ClearReconcileDegraded).await.expect("recovered");
         let explanation = fixture.projections().explain_convoy("flotilla", "health-convoy").await.expect("explanation");
         assert!(explanation.crew_deliveries[0].terminal_condition.is_none());
+        // Issue #2694: fatal launch errors must be visible with their diagnostic
+        // immediately, even before the vessel/convoy failure has rolled up.
+        let diagnostic = "Codex launch usage error (exit 2): error: unexpected argument '--no-daemon' found";
+        apply_status_patch(&sessions, "health-session", &TerminalSessionStatusPatch::MarkFailed {
+            message: diagnostic.into(),
+            stopped_at: Some(Utc::now()),
+        })
+        .await
+        .expect("usage failure");
+        let explanation = fixture.projections().explain_convoy("flotilla", "health-convoy").await.expect("failed explanation");
+        let condition = explanation.crew_deliveries[0].terminal_condition.as_ref().expect("visible failure");
+        assert!(matches!(condition, ExplainedTerminalCondition::ProcessFailed { message } if message == diagnostic));
+        assert!(condition.to_string().contains(diagnostic));
     }
 
     // #2677: a ledger artifact attributed to the claiming crew is evidence even without a PR comment.

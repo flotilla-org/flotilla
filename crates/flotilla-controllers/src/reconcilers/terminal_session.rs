@@ -108,6 +108,16 @@ pub trait TerminalRuntime: Send + Sync {
     ) -> Result<Option<i32>, String> {
         Ok(None)
     }
+    /// Classify a positively observed exit through the selected harness adapter.
+    /// A launch-contract error is terminal, rather than a resumable interruption.
+    async fn agent_exit_failure(
+        &self,
+        _session_id: &str,
+        _spec: &flotilla_resources::TerminalSessionSpec,
+        _exit_code: i32,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     async fn cleat_endpoint(
         &self,
         _session_id: &str,
@@ -400,6 +410,25 @@ where
             self.runtime.cleanup_failed_session(&obj.spec).await.map_err(ResourceError::other)?;
             return Ok(TerminalPrepared::None);
         }
+        // Read the launch receipt before liveness: the shell can disappear
+        // after a usage error, and Lost recovery must not relaunch that command.
+        if matches!(phase, TerminalSessionPhase::Running | TerminalSessionPhase::Lost)
+            && matches!(obj.spec.source, TerminalSessionSource::Agent { .. })
+        {
+            if let Some(crew) = obj.status.as_ref().and_then(|status| status.crew.as_ref()) {
+                if let Some(code) = self.runtime.agent_exit_code(&obj.spec, crew).await.map_err(ResourceError::other)? {
+                    let session_id = obj.status.as_ref().and_then(|status| status.session_id.as_deref()).unwrap_or_default();
+                    if let Some(message) =
+                        self.runtime.agent_exit_failure(session_id, &obj.spec, code).await.map_err(ResourceError::other)?
+                    {
+                        return Ok(TerminalPrepared::Failed(message));
+                    }
+                    if phase == TerminalSessionPhase::Running {
+                        return Ok(TerminalPrepared::AgentExited(code));
+                    }
+                }
+            }
+        }
         if phase == TerminalSessionPhase::Running {
             let session_id = obj
                 .status
@@ -411,13 +440,6 @@ where
                 TerminalLiveness::Stopped => return Ok(TerminalPrepared::Stopped),
                 TerminalLiveness::Lost(reason) => return Ok(TerminalPrepared::Lost(reason)),
                 TerminalLiveness::Unavailable(message) => return Err(ResourceError::other(message)),
-            }
-            if matches!(obj.spec.source, TerminalSessionSource::Agent { .. }) {
-                if let Some(crew) = obj.status.as_ref().and_then(|status| status.crew.as_ref()) {
-                    if let Some(code) = self.runtime.agent_exit_code(&obj.spec, crew).await.map_err(ResourceError::other)? {
-                        return Ok(TerminalPrepared::AgentExited(code));
-                    }
-                }
             }
             if let Some(message) = self.runtime.observe_failure(session_id, &obj.spec).await.map_err(ResourceError::other)? {
                 return Ok(TerminalPrepared::Failed(message));
@@ -712,6 +734,10 @@ where
                 }),
                 _ => None,
             },
+            TerminalSessionPhase::Lost if matches!(prepared, TerminalPrepared::Failed(_)) => {
+                let TerminalPrepared::Failed(message) = prepared else { unreachable!() };
+                Some(TerminalSessionStatusPatch::MarkFailed { message: message.clone(), stopped_at: Some(now) })
+            }
             TerminalSessionPhase::Lost if matches!(prepared, TerminalPrepared::Revived) => Some(TerminalSessionStatusPatch::MarkRevived),
             TerminalSessionPhase::Lost if matches!(prepared, TerminalPrepared::RecoverLost) => {
                 Some(TerminalSessionStatusPatch::MarkStarting)

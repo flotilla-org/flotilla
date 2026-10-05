@@ -2123,9 +2123,28 @@ impl TerminalRuntime for ExitedAgentRuntime {
     ) -> Result<TerminalRuntimeState, String> {
         panic!("running shell must not provision a replacement before exit is observed")
     }
+    async fn session_liveness(&self, _: &str, _: &TerminalSessionSpec) -> Result<TerminalLiveness, String> {
+        assert_ne!(self.0, 2, "positive usage exit must win before liveness or relaunch");
+        Ok(TerminalLiveness::Running)
+    }
     // Inject the process boundary: the parent shell has observed the child exit.
     async fn agent_exit_code(&self, _: &TerminalSessionSpec, _: &flotilla_resources::CrewSessionStatus) -> Result<Option<i32>, String> {
         Ok(Some(self.0))
+    }
+    // Use the real adapter contract behind the injected process boundary.
+    async fn agent_exit_failure(&self, _: &str, _: &TerminalSessionSpec, code: i32) -> Result<Option<String>, String> {
+        use flotilla_core::{
+            agent_adapter::AgentAdapterRegistry,
+            providers::{
+                discovery::{EnvironmentAssertion, EnvironmentBag},
+                ProcessCommandRunner,
+            },
+        };
+        let registry = AgentAdapterRegistry::discover(
+            &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
+            Arc::new(ProcessCommandRunner),
+        );
+        Ok(registry.get("codex").expect("codex").classify_exit_failure(code, "error: unexpected argument '--no-daemon' found"))
     }
     async fn kill_session(&self, _: &str, _: &TerminalSessionSpec) -> Result<(), String> {
         Ok(())
@@ -2136,7 +2155,14 @@ impl TerminalRuntime for ExitedAgentRuntime {
 // and record the actual exit so unfinished crew work can become Interrupted.
 #[tokio::test]
 async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
-    for code in [0, 42, 130, 137] {
+    for (code, phase) in [
+        (0, TerminalSessionPhase::Running),
+        (2, TerminalSessionPhase::Running),
+        (2, TerminalSessionPhase::Lost),
+        (42, TerminalSessionPhase::Running),
+        (130, TerminalSessionPhase::Running),
+        (137, TerminalSessionPhase::Running),
+    ] {
         let backend = ResourceBackend::InMemory(Default::default());
         create_ready_environment(&backend, "env-a").await;
         create_convoy_with_single_task(&backend, "flotilla", "demo", "work", "https://github.com/flotilla-org/flotilla", "main").await;
@@ -2167,7 +2193,7 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
             .expect("session");
         let running = sessions
             .update_status(&created.metadata.name, &created.metadata.resource_version, &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
+                phase,
                 session_id: Some("live-shell".into()),
                 crew: Some(
                     flotilla_resources::CrewSessionStatus::builder()
@@ -2183,11 +2209,22 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
         let reconciler = TerminalSessionReconciler::new(Arc::new(ExitedAgentRuntime(code)), backend, "flotilla");
         let prepared = reconciler.prepare(&running).await.expect("observe process");
         let outcome = reconciler.reconcile(&running, &prepared, Utc::now());
-        let mut status = running.status.expect("status");
+        let mut status = running.status.clone().expect("status");
         outcome.patch.expect("exit patch").apply(&mut status);
-        assert_eq!(status.phase, TerminalSessionPhase::Stopped);
-        assert_eq!(status.inner_exit_code, Some(code));
-        assert!(status.message.expect("recovery guidance").contains("resume"));
+        if code == 2 {
+            // Issue #2694: an immediate usage error is terminal failure,
+            // never interruption followed by automatic relaunch.
+            assert_eq!(status.phase, TerminalSessionPhase::Failed);
+            assert!(status.message.as_ref().expect("usage error").contains("unexpected argument '--no-daemon'"));
+            let mut failed = running.clone();
+            failed.status = Some(status.clone());
+            let next = reconciler.prepare(&failed).await.expect("failed launch stays terminal");
+            assert!(reconciler.reconcile(&failed, &next, Utc::now()).patch.is_none());
+        } else {
+            assert_eq!(status.phase, TerminalSessionPhase::Stopped);
+            assert_eq!(status.inner_exit_code, Some(code));
+            assert!(status.message.expect("recovery guidance").contains("resume"));
+        }
     }
 }
 

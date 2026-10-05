@@ -4725,9 +4725,19 @@ async fn fail_latest_ensured_generation(backend: &ResourceBackend, clock: &Virtu
 
 async fn configure_standing_ensure_agent(backend: &ResourceBackend, overrides: Vec<flotilla_protocol::AgentOverride>) {
     create_docker_placement(backend, "standing-agent", "standing-agent-host", BTreeSet::new()).await;
+    let policy = backend.using::<PlacementPolicy>("flotilla").get("standing-agent").await.expect("policy");
+    backend
+        .using::<FulfilmentKind>("flotilla")
+        .create(&test_meta("standing-agent"), &FulfilmentKindSpec::from_policy(&policy.spec, "linux").expect("kind"))
+        .await
+        .expect("kind");
     let hosts = backend.using::<ResourceHost>("flotilla");
     let host = hosts.get("standing-agent-host").await.expect("standing agent host");
     let mut status = host.status.expect("standing agent host status");
+    status.fulfilment_facts.insert("standing-agent".into(), flotilla_resources::FulfilmentFacts {
+        harnesses: BTreeMap::from([("codex".into(), HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() })]),
+        ..Default::default()
+    });
     status.disk_free_bytes = Some(100 * 1024 * 1024 * 1024);
     status.admission_free_space_floor_bytes = Some(20 * 1024 * 1024 * 1024);
     hosts.update_status(&host.metadata.name, &host.metadata.resource_version, &status).await.expect("standing agent host capacity");

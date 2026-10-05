@@ -255,6 +255,18 @@ async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Op
     daemon
 }
 
+// Shared routing fixtures represent a compatible installed Codex. Version
+// refusal rows publish their own observations instead of weakening coverage.
+fn compatible_codex_facts() -> flotilla_resources::FulfilmentFacts {
+    flotilla_resources::FulfilmentFacts {
+        harnesses: BTreeMap::from([("codex".into(), flotilla_resources::HarnessFacts {
+            version: "0.160.0".into(),
+            models: BTreeMap::new(),
+        })]),
+        ..Default::default()
+    }
+}
+
 async fn seed_host_capacity(daemon: &Arc<InProcessDaemon>, free_bytes: u64, floor_bytes: u64) {
     let host_id = daemon.local_host_id().expect("host identity").to_string();
     let hosts = daemon.resource_backend().using::<Host>("flotilla");
@@ -265,6 +277,7 @@ async fn seed_host_capacity(daemon: &Arc<InProcessDaemon>, free_bytes: u64, floo
     hosts
         .update_status(&host_id, &host.metadata.resource_version, &HostStatus {
             capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
+            fulfilment_facts: BTreeMap::from([(format!("host-direct-{host_id}"), compatible_codex_facts())]),
             heartbeat_at: Some(Utc::now()),
             ready: true,
             daemon_generation: Some("test-generation".to_string()),
@@ -310,7 +323,7 @@ async fn seed_target_placement_policy(topology: &InMemoryRequestTopology, namesp
     let policies = topology.follower.resource_backend().using::<PlacementPolicy>(namespace);
     let policy = PlacementPolicySpec::builder()
         .pool("cleat".to_string())
-        .host_direct(HostDirectPlacementPolicySpec { host_ref, checkout: HostDirectPlacementPolicyCheckout::Worktree })
+        .host_direct(HostDirectPlacementPolicySpec { host_ref: host_ref.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
         .build();
     policies
         .create(&InputMeta::builder().name(policy_name.to_string()).build(), &policy)
@@ -326,6 +339,11 @@ async fn seed_target_placement_policy(topology: &InMemoryRequestTopology, namesp
         )
         .await
         .expect("placement host should register its fulfilment kind");
+    let hosts = topology.follower.resource_backend().using::<Host>(namespace);
+    let host = hosts.get(&host_ref).await.expect("placement host");
+    let mut status = host.status.expect("host status");
+    status.fulfilment_facts.insert(policy_name.to_string(), compatible_codex_facts());
+    hosts.update_status(&host_ref, &host.metadata.resource_version, &status).await.expect("compatible harness facts");
     eventually(Duration::from_secs(5), Duration::from_millis(10), "home-authored placement policy should replicate to origin", || async {
         topology.leader.resource_backend().including_replicas::<PlacementPolicy>(namespace).get(policy_name).await.is_ok()
             && topology.leader.resource_backend().including_replicas::<FulfilmentKind>(namespace).get(policy_name).await.is_ok()
@@ -1066,6 +1084,124 @@ async fn forced_convoy_teardown_cascades_to_checkout_on_another_host() {
     collector_task.abort();
     checkout_task.abort();
     convoy_task.abort();
+}
+
+// Issue #2694: destination admission must enforce its probed adapter floor
+// for both local and routed dispatch, including an explicit placement pin.
+async fn codex_version_admission_row(issuer_index: usize, minor: u32) {
+    let hosts = vec![empty_daemon_named("codex-home").await, empty_daemon_named("codex-issuer").await];
+    let home = Arc::clone(&hosts[0]);
+    seed_host_capacity(&home, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
+    home.set_local_placement_capabilities(&BTreeSet::from(["codex".into()]), &["cleat".into()]).await;
+    let host_id = home.local_host_id().expect("home").to_string();
+    let backend = home.resource_backend();
+    let policy = PlacementPolicySpec::builder()
+        .pool("cleat".into())
+        .host_direct(HostDirectPlacementPolicySpec { host_ref: host_id.clone(), checkout: HostDirectPlacementPolicyCheckout::Worktree })
+        .build();
+    backend
+        .using::<PlacementPolicy>("flotilla")
+        .create(&InputMeta::builder().name("codex-direct".into()).build(), &policy)
+        .await
+        .expect("policy");
+    backend
+        .using::<FulfilmentKind>("flotilla")
+        .create(
+            &InputMeta::builder().name("codex-direct".into()).build(),
+            &FulfilmentKindSpec::from_policy(&policy, "linux").expect("kind"),
+        )
+        .await
+        .expect("kind");
+    let host = backend.using::<Host>("flotilla").get(&host_id).await.expect("host");
+    let mut status = host.status.expect("status");
+    status.fulfilment_facts.insert("codex-direct".into(), flotilla_resources::FulfilmentFacts {
+        harnesses: BTreeMap::from([("codex".into(), flotilla_resources::HarnessFacts {
+            version: format!("0.{minor}.0"),
+            models: BTreeMap::new(),
+        })]),
+        ..Default::default()
+    });
+    backend.using::<Host>("flotilla").update_status(&host_id, &host.metadata.resource_version, &status).await.expect("probe facts");
+    for host in &hosts {
+        seed_trusted_remote_convoy_project(host, "flotilla").await;
+        let workflows = host.resource_backend().using::<WorkflowTemplate>("flotilla");
+        let mut workflow = workflows.get("remote-workflow").await.expect("workflow");
+        workflow.spec.vessels[0].crew = vec![flotilla_resources::CrewSpec::builder()
+            .role("coder".into())
+            .source(flotilla_resources::CrewSource::Agent {
+                selector: flotilla_resources::Selector::for_capability("code"),
+                prompt: None,
+                brief_template: None,
+            })
+            .build()];
+        workflows
+            .update(&InputMeta::from(&workflow.metadata), &workflow.metadata.resource_version, &workflow.spec)
+            .await
+            .expect("agent workflow");
+    }
+    let mesh = spawn_in_memory_request_mesh(hosts).await.expect("mesh");
+    eventually(Duration::from_secs(5), Duration::from_millis(10), "Codex placement replicated", || async {
+        let issuer = mesh.hosts[issuer_index].resource_backend();
+        issuer.including_replicas::<Host>("flotilla").get(&host_id).await.is_ok()
+            && issuer.including_replicas::<FulfilmentKind>("flotilla").get("codex-direct").await.is_ok()
+            && issuer.including_replicas::<PlacementPolicy>("flotilla").get("codex-direct").await.is_ok()
+    })
+    .await;
+    let mut events = mesh.hosts[issuer_index].subscribe();
+    let id = mesh.clients[issuer_index]
+        .execute(
+            Command::builder()
+                .action(CommandAction::ConvoyStart {
+                    intent: Box::new(
+                        ConvoyStartIntent::builder()
+                            .project_ref("flotilla".into())
+                            .name("codex-version".into())
+                            .branch("test/codex-version".into())
+                            .placement_policy("codex-direct".into())
+                            .escalation_reason("test pinned host".into())
+                            .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                            .build(),
+                    ),
+                })
+                .build(),
+        )
+        .await
+        .expect("dispatch");
+    let result = await_command_result(&mut events, id).await;
+    if minor < 160 {
+        assert!(
+            matches!(&result, CommandValue::Error { message } if message.contains("harness:codex>=0.160.0")
+            && message.contains(&format!("0.{minor}.0"))),
+            "{result:?}"
+        );
+        assert!(backend.using::<Convoy>("flotilla").list().await.expect("convoys").items.is_empty());
+    } else {
+        assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "{result:?}");
+        assert_eq!(backend.using::<Convoy>("flotilla").list().await.expect("convoys").items.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn codex_version_admission_pinned_rows() {
+    for issuer in [0, 1] {
+        for minor in [154, 160] {
+            codex_version_admission_row(issuer, minor).await;
+        }
+    }
+}
+
+// Explicit generator covers local/remote issuance and versions on both sides
+// of the launch floor. Each run asserts the destination's durable admission.
+#[hegel::test]
+fn generated_codex_version_admission(tc: hegel::TestCase) {
+    let issuer = tc.draw(gs::integers::<usize>().min_value(0).max_value(1));
+    let minor = tc.draw(gs::integers::<u32>().min_value(150).max_value(170));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("runtime")
+        .block_on(codex_version_admission_row(issuer, minor));
 }
 
 #[hegel::test]
@@ -3222,6 +3358,7 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
             ]
             .into_iter()
             .collect(),
+            fulfilment_facts: BTreeMap::from([("remote-docker".into(), compatible_codex_facts())]),
             heartbeat_at: Some(Utc::now()),
             ready: true,
             ..HostStatus::default()
