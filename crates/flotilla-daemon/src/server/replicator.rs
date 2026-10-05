@@ -825,6 +825,8 @@ async fn run_routed_watch<T: Resource>(
     let mut initial = Vec::<ResourceObject<T>>::new();
     let mut initializing = prefix.is_none();
 
+    // One primary watch owns this key's receiver for its lifetime. A replacement
+    // watch waits for that owner to exit; queued rounds survive unrelated errors.
     let mut requests = match &digest_control {
         Some(control) => Some(control.requests.lock().await),
         None => None,
@@ -849,6 +851,8 @@ async fn run_routed_watch<T: Resource>(
             let result = reconcile_digest::<T, _, _>(&writer, peer, |query| fetch_routed_digest::<T>(router, peer, store, query)).await;
             digest_failures.report::<T>(peer, &result);
             if matches!(result, Ok(true)) {
+                // Clear readiness before acknowledging repair so callers await
+                // the replacement watch's bookmark rather than the old stream.
                 if let Some(control) = &digest_control {
                     control.ready.send_replace(false);
                 }

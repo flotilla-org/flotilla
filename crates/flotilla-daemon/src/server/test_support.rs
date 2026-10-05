@@ -112,7 +112,8 @@ impl DigestDriver {
             .clone()
     }
 
-    /// Wait until the primary watch's initial or resumed bookmark has been applied.
+    /// Wait until the current primary watch has applied a bookmark.
+    /// Readiness resets when it restarts; later bookmarks keep it ready.
     pub async fn watch_ready(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Result<(), String> {
         let control = self.control(holder, origin, kind);
         let mut ready = control.ready.subscribe();
@@ -121,6 +122,7 @@ impl DigestDriver {
     }
 
     /// Returns after reconciliation, including persisted cursor confirmation.
+    /// Queued requests survive unrelated watch errors and run on its replacement.
     /// `true` means repair; errors preserve the previous replica set and cursor.
     pub async fn round(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Result<bool, String> {
         self.watch_ready(holder, origin, kind).await?;

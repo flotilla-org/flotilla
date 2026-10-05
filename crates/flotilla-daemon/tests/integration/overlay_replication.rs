@@ -1490,6 +1490,8 @@ async fn run_digest_session_scenario(sqlite: bool, fail_snapshot: bool, advanced
     let full = whole_snapshots.load(Ordering::SeqCst);
     let before = kiwi.resource_backend().including_replicas::<Convoy>("flotilla").list().await.expect("replicas");
     assert!(!driver.round(kiwi.node_id(), feta.node_id(), "convoys").await.expect("matching round"));
+    // The driver disables this mesh's periodic ticks; watch restarts only issue
+    // ResourceWatch, so this explicit round is the sole root-fetch trigger.
     assert_eq!(roots.load(Ordering::SeqCst), 1, "explicit root exchange completed");
     assert_eq!(children.load(Ordering::SeqCst), 0, "a matching digest never drills down");
     assert!(snapshots.lock().expect("snapshots").is_empty(), "a match transfers no resource bodies");
