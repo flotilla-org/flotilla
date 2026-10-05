@@ -654,3 +654,37 @@ fn crew_stalls_format_preserves_full_evidence() {
     assert!(full.contains(&evidence));
     assert!(full.contains("artifact/evidence"));
 }
+
+// Glue: the crew query's live charter must be visible in text as well as JSON (#1986).
+#[test]
+fn crew_list_renders_live_repository_roles() {
+    use flotilla_protocol::{CrewListResponse, CrewProject, CrewProjectRepository, ProjectRepositoryRole, RepositoryKey};
+    let response = CrewListResponse::builder()
+        .convoy("governor".into())
+        .vessel("work".into())
+        .vessel_ref("vessel".into())
+        .members(vec![])
+        .project(
+            CrewProject::builder()
+                .namespace("flotilla".into())
+                .name("island".into())
+                .display_name("Island".into())
+                .repositories(vec![CrewProjectRepository::builder()
+                    .key(RepositoryKey("live-repo".into()))
+                    .alias("ops".into())
+                    .roles([ProjectRepositoryRole::Code, ProjectRepositoryRole::Ops].into())
+                    .subpath("part".into())
+                    .default_branch("main".into())
+                    .remotes(vec!["https://github.com/example/live".into()])
+                    .build()])
+                .build(),
+        )
+        .build();
+    let output = super::format_crew_list_human(&response);
+    assert!(output.contains("Live Project: flotilla/island (Island)"));
+    assert!(
+        output.contains("live-repo  alias=ops  roles=[code, ops]  subpath=part  branch=main  remotes=[https://github.com/example/live]")
+    );
+    let json = serde_json::to_value(response).expect("JSON");
+    assert_eq!(json["project"]["repositories"][0]["roles"], serde_json::json!(["code", "ops"]));
+}

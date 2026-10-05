@@ -11,8 +11,8 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_protocol::{
-    CheckoutArchiveOutcome, CheckoutArchiveStatus, CrewCommandContext, CrewListMember, CrewListResponse, EnvironmentId, HostName,
-    LeafAddress, PrincipalRef,
+    CheckoutArchiveOutcome, CheckoutArchiveStatus, CrewCommandContext, CrewListMember, CrewListResponse, CrewProject,
+    CrewProjectRepository, EnvironmentId, HostName, LeafAddress, PrincipalRef,
 };
 use flotilla_resources::{
     apply_status_patch as apply_resource_status_patch, change_request_address_with_forges, change_request_record_name,
@@ -21,7 +21,7 @@ use flotilla_resources::{
     CheckoutIntegrationStatus, Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyPhase, ConvoyStatusPatch, CrewCompletionClaim,
     CrewCompletionPending, CrewCompletionRefusalCause, CrewMessageDelivery, CrewMessageSender, CrewSource, CrewWorkPhase,
     Demand as ResourceDemand, Forge, HoldAct, InputMeta, IntegrationCondition, LifecycleAuthority, ObservedChangeRequestState,
-    PendingBrief, Presentation as ResourcePresentation, ReplicaReadResolver, Repository, RepositoryKey, Resource, ResourceBackend,
+    PendingBrief, Presentation as ResourcePresentation, Project, ReplicaReadResolver, Repository, RepositoryKey, Resource, ResourceBackend,
     ResourceError, ResourceObject, ResourceProvenance, TerminalAttentionState, TerminalBrief, TerminalCrewContext, TerminalCrewMessage,
     TerminalSession as ResourceTerminalSession, TerminalSessionIdentity, TerminalSessionPhase as ResourceTerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatusPatch, TurnDeliveryRung, TypedResolver, UnmetSettlementExpectation, Vessel,
@@ -648,6 +648,50 @@ impl CrewService {
         let context = self.resolve_crew_context(requested).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
         let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
+        let project = if let Some(project_ref) = &convoy.spec.project_ref {
+            let project = self
+                .resource_backend
+                .definitions::<Project>(&context.namespace)
+                .get(project_ref)
+                .await
+                .map_err(|error| format!("live Project `{project_ref}` unavailable: {error}"))?;
+            let repositories = self.resource_backend.including_replicas::<Repository>(&context.namespace);
+            let mut members = Vec::new();
+            for member in project.spec.repositories {
+                let remotes = match repositories.get(member.repo.0.as_str()).await {
+                    Ok(repository) => repository.object.spec.remotes().to_vec(),
+                    Err(ResourceError::NotFound { .. }) => Vec::new(),
+                    Err(error) => return Err(error.to_string()),
+                };
+                members.push(
+                    CrewProjectRepository::builder()
+                        .key(member.repo)
+                        .maybe_alias(member.alias)
+                        .roles(member.roles)
+                        .maybe_subpath(member.subpath)
+                        .maybe_default_branch(member.default_branch)
+                        .remotes(remotes)
+                        .build(),
+                );
+            }
+            Some(
+                CrewProject::builder()
+                    .namespace(context.namespace.clone())
+                    .name(project_ref.clone())
+                    .display_name(project.spec.display_name)
+                    .repositories(members)
+                    .build(),
+            )
+        } else {
+            None
+        };
+        let mut response = self.crew_state(&context, &convoy).await?;
+        response.project = project;
+        Ok(response)
+    }
+
+    // Crew handoff consumes process state independently of the live island charter.
+    async fn crew_state(&self, context: &ResolvedCrewContext, convoy: &ResourceObject<ResourceConvoy>) -> Result<CrewListResponse, String> {
         let task = convoy
             .status
             .as_ref()
@@ -702,9 +746,9 @@ impl CrewService {
             })
             .collect();
         Ok(CrewListResponse::builder()
-            .convoy(context.convoy)
-            .vessel_ref(context.vessel_ref)
-            .vessel(context.vessel)
+            .convoy(context.convoy.clone())
+            .vessel_ref(context.vessel_ref.clone())
+            .vessel(context.vessel.clone())
             .members(members)
             .credential_alerts(credential_alerts)
             .build())
@@ -1660,7 +1704,8 @@ impl CrewService {
                 },
                 Err(ResourceError::NotFound { .. }) => {
                     let anchor = anchor.ok_or_else(|| format!("crew target `{target}` disappeared during credential staging"))?;
-                    let current = self.crew_list_internal(requested).await?;
+                    let current_convoy = convoys.get(&context.convoy).await.map_err(|error| error.to_string())?;
+                    let current = self.crew_state(&context, &current_convoy).await?;
                     let repo_roots = crew_brief_repo_roots(&self.resource_backend, &context.namespace, &convoy, &repository_refs).await;
                     let repositories = self.resource_backend.clone().using::<Repository>(&context.namespace);
                     let mut fork_stance = false;

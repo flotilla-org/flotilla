@@ -1876,6 +1876,7 @@ mod tests {
                 }],
             })),
             CommandValue::CrewList(Box::new(CrewListResponse {
+                project: None,
                 convoy: "convoy-a".into(),
                 vessel_ref: "convoy-a-implement".into(),
                 vessel: "implement".into(),

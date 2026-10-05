@@ -4,7 +4,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-pub use flotilla_protocol::IssueSource;
+pub use flotilla_protocol::{IssueSource, ProjectRepositoryRole};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -216,14 +216,6 @@ pub struct ProjectRepositorySpec {
     pub subpath: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_branch: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProjectRepositoryRole {
-    Code,
-    Ops,
-    Knowledge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

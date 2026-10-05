@@ -11,7 +11,7 @@ Crew messages begin with a sender header. `[flotilla · …]` is an automated su
 
 {% block crew %}{% for member in members %}- `{{ member.role }}`: {{ member.state }}
 {% endfor %}{% endblock %}
-{% block operating_instructions %}Run `flotilla crew list` for current crew state.
+{% block operating_instructions %}Run `flotilla crew list` for current crew state and the live Project repository charter (repositories, aliases, roles, subpaths, branches, and remotes). Governors begin every orientation sweep with this command and govern the membership it returns. The Project is the current island charter; Work context records admission and delivery inputs.
 Only this top-level crew session may run `flotilla crew` or `flotilla convoy` verbs. Background delegates and sub-agents must never run those verbs. {% if is_standing %}After all delegated work has returned, record any decisions on the relevant issue and yield at the turn boundary; this standing convoy remains active.{% else %}After all delegated work has returned, this top-level session follows the settlement order in `## Decision ledger`.{% endif %}
 Contained Rust builds default to line-tables-only workspace debuginfo and no third-party dependency debuginfo. For a build requiring full workspace debuginfo, set `CARGO_PROFILE_DEV_DEBUG=full` on that Cargo command; the explicit override wins.
 Clone scratch repositories outside the vessel checkout (for example under a `mktemp -d` directory); embedded repositories make teardown refuse by default.
