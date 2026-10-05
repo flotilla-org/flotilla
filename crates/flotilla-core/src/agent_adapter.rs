@@ -1142,6 +1142,8 @@ mod tests {
         },
     };
 
+    const SETTLEMENT_YIELD: &str = "If checks are still pending when you reach settlement, report the PR state and yield at the turn boundary; flotilla wakes you when checks settle, and you then take the clean final snapshot.";
+
     fn discovered_registry() -> AgentAdapterRegistry {
         let env = EnvironmentBag::new()
             .with(EnvironmentAssertion::env_var("HOME", "/home/test"))
@@ -1236,6 +1238,9 @@ mod tests {
         assert!(content.contains("flotilla artifact put --kind decision-ledger <path>"));
         // #2596: settlement projects the ledger only after a clean final shepherd snapshot.
         let settlement = content.split("\n## Decision ledger\n").nth(1).expect("ledger section");
+        // #2690: settlement gives pending checks a yield path before the clean snapshot gate.
+        // Glue: fixed brief wording is checked through the real template renderer.
+        assert!(settlement.contains(SETTLEMENT_YIELD));
         let clean = settlement.find("Only after the final shepherd snapshot is clean").expect("clean snapshot gate");
         let put = settlement.find("flotilla artifact put --kind decision-ledger <path>").expect("artifact put");
         let complete = settlement.find("Then run `flotilla crew complete ...`").expect("completion");
@@ -1491,6 +1496,10 @@ mod tests {
         assert!(!brief.contains("pull request using the `pr-shepherd` skill"));
         assert!(!brief.contains("Future events belong to a later engagement"));
         assert!(brief.contains("claim's linked `## Decision ledger` comment"));
+        // #2690: count both occurrences: inherited settlement and the shepherd delivery block's readiness gate.
+        assert_eq!(brief.matches(SETTLEMENT_YIELD).count(), 2);
+        let settlement = brief.split("\n## Decision ledger\n").nth(1).expect("ledger section");
+        assert!(settlement.contains(SETTLEMENT_YIELD));
         assert!(brief.contains("A completion without a ledger is refused"));
         assert!(brief.contains("park the verified commit"));
         assert!(brief.contains("redispatched under the owning project"));
