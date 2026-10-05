@@ -283,9 +283,10 @@ fn sha(build: &Value) -> Option<&str> {
 pub fn assess_current(installed: Option<&str>, target: &CleatTarget, current: &Value) -> BuildAssessment {
     let mut assessment = BuildAssessment::default();
     let serving = sha(&current["daemon"]);
+    let installed = installed.filter(|sha| !sha.is_empty() && *sha != "unknown");
     if target.contained {
         assessment.information.push(format!("{}: vessel cleat {}, refreshes on restart", target.label(), serving.unwrap_or("unknown")));
-    } else if let (Some(installed), Some(serving)) = (installed.filter(|sha| !sha.is_empty() && *sha != "unknown"), serving) {
+    } else if let (Some(installed), Some(serving)) = (installed, serving) {
         if installed != serving {
             assessment.actionable.push(format!(
                 "{} {}/{}: installed {} vs serving {}",
@@ -296,6 +297,15 @@ pub fn assess_current(installed: Option<&str>, target: &CleatTarget, current: &V
                 serving
             ));
         }
+    } else {
+        assessment.information.push(format!(
+            "{} {}/{}: host cleat build unavailable (installed {}, serving {})",
+            target.label(),
+            target.runtime_root.display(),
+            target.name,
+            installed.unwrap_or("unknown"),
+            serving.unwrap_or("unknown")
+        ));
     }
     assessment
 }

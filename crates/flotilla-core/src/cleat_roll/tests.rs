@@ -318,14 +318,15 @@ fn recorded_current_observations_degrade_only_actionable_host_skew(tc: hegel::Te
     let installed = if installed_known { sha(&records.installed) } else { None };
     let assessment = assess_current(installed, &target, &current);
     assert_eq!(!assessment.actionable.is_empty(), class == 1 && installed_known && !contained);
-    assert_eq!(assessment.information.len(), usize::from(contained));
+    let informational = contained || !installed_known || class >= 2;
+    assert_eq!(assessment.information.len(), usize::from(informational));
     if contained {
         assert!(assessment.information[0].contains("refreshes on restart"));
     }
     let condition = assessment.into_condition(chrono::Utc::now());
     if class == 1 && installed_known && !contained {
         assert_eq!(condition.expect("actionable condition").value, flotilla_resources::ConditionValue::False);
-    } else if contained {
+    } else if informational {
         assert_eq!(condition.expect("informational condition").value, flotilla_resources::ConditionValue::True);
     } else {
         assert!(condition.is_none());
@@ -373,6 +374,9 @@ async fn current_alias_precedes_legacy_sidecar() {
         let current = current_target(&target(runner.clone(), "default", false)).await;
         assert_eq!(current.name, expected);
         assert_eq!(runner.calls()[0].1, ["/state/crew cleat/default"]);
+        if main != Some("default@27") {
+            assert_eq!(runner.calls()[1].1, ["/state/crew cleat/.default.current"]);
+        }
         assert_eq!(runner.remaining(), 0);
     }
 }

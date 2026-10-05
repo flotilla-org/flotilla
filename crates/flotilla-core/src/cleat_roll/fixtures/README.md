@@ -32,3 +32,20 @@ Health must query the current alias, preserve alive draining generations as
 information, and never use `cleat list` to count their sessions: that command
 may adopt daemons or sweep recordings. Counts come from the captured drain
 report and are explicitly labelled as counts at drain time.
+
+The CLI stderr prefix `connect daemon:` is part of the missing-daemon
+classification contract. Both `nonzero.json` and `generations.json` record it.
+That prefix alone never suppresses an error: `daemons --json` must also confirm
+no matching daemon is alive. A changed prefix or unavailable listing keeps the
+failure actionable rather than silently accepting it.
+
+Daemon listings are matched to the literal environment-owned runtime root and
+logical name used in the command. Flotilla does not canonicalize vessel paths
+through the host filesystem. Differently spelled/symlinked roots may omit an
+informational draining line; they cannot select the build used for the current
+alias comparison. Unknown build evidence stays visible as an informational
+condition and never degrades the host.
+
+Each target can issue two alias probes, one version query and one daemon listing,
+with a 5-second deadline per command (20 seconds worst case). Targets run
+concurrently, so this bound does not multiply by the number of environments.
