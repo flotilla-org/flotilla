@@ -900,6 +900,8 @@ impl LeafSubscriptionTable {
                 if active_probe && !merged_settlement && cr.state.value == Some(flotilla_resources::ObservedChangeRequestState::Merged) {
                     return Ok(());
                 }
+                // The fallback is agent-facing firing context only; a merged
+                // episode is identified by the PR address below, never its head.
                 let head_sha = if merged_settlement {
                     cr.head_sha.value.clone().unwrap_or_else(|| "unknown".into())
                 } else {
@@ -5983,25 +5985,24 @@ mod tests {
                 task.abort();
             }
             let rows = table.rows().await;
-            let row = table
-                .rows()
-                .await
-                .into_iter()
+            let row = rows
+                .iter()
                 .find(|row| matches!(&row.watcher, LeafWatcher::TurnDelivery { source, .. } if source == "merged-unclaimed"))
                 .expect("merged subscription");
             let empty = HashMap::new();
-            let fire = evaluate_row(
-                &row,
-                &LeafSubjects {
-                    convoys: &objects,
-                    vessels: &empty,
-                    change_requests: &HashMap::from([(name.clone(), record.clone())]),
-                    usages: &HashMap::new(),
-                    issues: &HashMap::new(),
-                    artifacts: &HashMap::new(),
-                },
-                LeafObservationStaleness { change_request: Duration::from_secs(60), issue: Duration::from_secs(60) },
-            )
+            let change_requests = HashMap::from([(name.clone(), record.clone())]);
+            let subjects = LeafSubjects {
+                convoys: &objects,
+                vessels: &empty,
+                change_requests: &change_requests,
+                usages: &HashMap::new(),
+                issues: &HashMap::new(),
+                artifacts: &HashMap::new(),
+            };
+            let fire = evaluate_row(row, &subjects, LeafObservationStaleness {
+                change_request: Duration::from_secs(60),
+                issue: Duration::from_secs(60),
+            })
             .expect("evaluate merged")
             .expect("merged fires");
             table.fire(row.id, fire).await;
@@ -6009,18 +6010,10 @@ mod tests {
             for competing in
                 rows.iter().filter(|candidate| candidate.id != row.id && matches!(candidate.watcher, LeafWatcher::TurnDelivery { .. }))
             {
-                if let Some(fire) = evaluate_row(
-                    competing,
-                    &LeafSubjects {
-                        convoys: &objects,
-                        vessels: &empty,
-                        change_requests: &HashMap::from([(name.clone(), record.clone())]),
-                        usages: &HashMap::new(),
-                        issues: &HashMap::new(),
-                        artifacts: &HashMap::new(),
-                    },
-                    LeafObservationStaleness { change_request: Duration::from_secs(60), issue: Duration::from_secs(60) },
-                )
+                if let Some(fire) = evaluate_row(competing, &subjects, LeafObservationStaleness {
+                    change_request: Duration::from_secs(60),
+                    issue: Duration::from_secs(60),
+                })
                 .expect("competing evaluation")
                 {
                     table.fire(competing.id, fire).await;

@@ -543,7 +543,8 @@ impl Selector {
 }
 
 /// Compatibility for Project and dispatch references authored before the builtin
-/// consolidation. Added 2026-10-05; remove one fleet roll after those references
+/// consolidation. These retired global names remain reserved builtin aliases;
+/// project-scoped materialized workflows keep precedence at admission. Added 2026-10-05; remove one fleet roll after those references
 /// have been rewritten to `single-agent` (ADR 0047).
 pub fn current_builtin_workflow_name(name: &str) -> &str {
     match name {
