@@ -187,7 +187,28 @@ impl AgentMaterialRegistry {
         runner: &dyn CommandRunner,
     ) -> Result<(), String> {
         let adapters = required_adapters.iter().filter_map(|adapter_id| self.adapters.get(adapter_id.as_str())).collect::<Vec<_>>();
-        let result = self.skills.stage(environment_ref, &adapters, environment, source_token_files, runner).await;
+        let result = async {
+            if let Some(crews) = decode_crew_skills(environment)? {
+                let count = crews.len();
+                if count == 0 {
+                    return remove_source_token_files(source_token_files, runner).await;
+                }
+                for (index, (role, selected)) in crews.into_iter().enumerate() {
+                    let mut crew_environment = self.crew_environment(&role, required_adapters, environment, runner).await?;
+                    crew_environment.retain(|(key, _)| key != "FLOTILLA_CREW_SKILLS" && key != "FLOTILLA_RESOLVED_SKILLS");
+                    crew_environment
+                        .push(("FLOTILLA_RESOLVED_SKILLS".into(), serde_json::to_string(&selected).expect("resolved skills serialize")));
+                    self.skills
+                        .stage(environment_ref, &adapters, &crew_environment, source_token_files, runner, index + 1 == count)
+                        .await?;
+                }
+                Ok(())
+            } else {
+                // N→N+1: running environments retain their old frozen selection.
+                self.skills.stage(environment_ref, &adapters, environment, source_token_files, runner, true).await
+            }
+        }
+        .await;
         if let Err(ref error) = result {
             let source_name = error.lines().rev().find_map(|line| line.strip_prefix(STAGE_SOURCE_PREFIX));
             let source = if let Some(path) = self.skills.source.clone() {
@@ -211,6 +232,54 @@ impl AgentMaterialRegistry {
             }
         }
         result.map_err(|error| error.lines().filter(|line| !line.starts_with(STAGE_SOURCE_PREFIX)).collect::<Vec<_>>().join("\n"))
+    }
+
+    /// Selects a crew's private scratch home while keeping refreshed credentials
+    /// linked to the vessel's delivered material. Used by staging and launch.
+    pub(crate) async fn crew_environment(
+        &self,
+        role: &str,
+        required_adapters: &BTreeSet<String>,
+        environment: &[(String, String)],
+        runner: &dyn CommandRunner,
+    ) -> Result<Vec<(String, String)>, String> {
+        if role.is_empty() || role == "." || role == ".." || role.contains('/') || role.contains('\\') {
+            return Err(format!("invalid crew home role {role:?}"));
+        }
+        let config_base = runner.writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE)).await?;
+        let mut result = environment.to_vec();
+        for adapter in required_adapters.iter().filter_map(|id| self.adapters.get(id.as_str())) {
+            let Some(destination) = adapter.skill_destination(environment, &config_base)? else { continue };
+            let base = destination.parent().expect("skill directory has a parent");
+            let home = base.join("crews").join(role);
+            // Static config seeds scratch once; auth follows atomic rotations in
+            // the delivered base. Never copy skills or another crew's state.
+            runner
+                .run(
+                    "sh",
+                    &[
+                        "-c",
+                        r#"set -eu
+mkdir -p "$2"
+for file in config.toml settings.json .claude.json; do
+  if [ -f "$1/$file" ] && [ ! -e "$2/$file" ]; then cp "$1/$file" "$2/$file"; fi
+done
+for file in auth.json .credentials.json; do
+  if [ -f "$1/$file" ]; then ln -sf "$1/$file" "$2/$file"; fi
+done"#,
+                        "flotilla-crew-home",
+                        &base.to_string_lossy(),
+                        &home.to_string_lossy(),
+                    ],
+                    Path::new("/"),
+                    &ChannelLabel::Default,
+                )
+                .await?;
+            let variable = adapter.config_home_variable();
+            result.retain(|(key, _)| key != variable);
+            result.push((variable.into(), home.to_string_lossy().into_owned()));
+        }
+        Ok(result)
     }
 
     pub(crate) async fn selected_skill_source_credentials(
@@ -429,7 +498,20 @@ async fn install_read_only_copy(contents: &[u8], destination: &Path) -> Result<b
     Ok(true)
 }
 
+type CrewSkills = BTreeMap<String, Vec<flotilla_resources::SkillCatalogEntry>>;
+
+fn decode_crew_skills(environment: &[(String, String)]) -> Result<Option<CrewSkills>, String> {
+    environment
+        .iter()
+        .find(|(key, _)| key == "FLOTILLA_CREW_SKILLS")
+        .map(|(_, value)| serde_json::from_str(value).map_err(|error| format!("decode frozen crew skills: {error}")))
+        .transpose()
+}
+
 fn decode_selected_skills(environment: &[(String, String)]) -> Result<Vec<flotilla_resources::SkillCatalogEntry>, String> {
+    if let Some(crews) = decode_crew_skills(environment)? {
+        return Ok(crews.into_values().flatten().collect());
+    }
     match environment.iter().find(|(key, _)| key == "FLOTILLA_RESOLVED_SKILLS") {
         Some((_, value)) => serde_json::from_str(value).map_err(|error| format!("decode frozen skill selection: {error}")),
         None => {
@@ -525,11 +607,12 @@ impl SkillBundle {
         environment: &[(String, String)],
         source_token_files: &BTreeMap<String, PathBuf>,
         runner: &dyn CommandRunner,
+        cleanup_tokens: bool,
     ) -> Result<(), String> {
         // Each attempt owns the cache and destination swap, but backoff must
         // leave the lock free for other crews. Cancellation releases the lock.
         if adapters.is_empty() {
-            return remove_source_token_files(source_token_files, runner).await;
+            return if cleanup_tokens { remove_source_token_files(source_token_files, runner).await } else { Ok(()) };
         }
         let config_base = runner
             .writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE))
@@ -542,7 +625,7 @@ impl SkillBundle {
             }
         }
         if destinations.is_empty() {
-            return remove_source_token_files(source_token_files, runner).await;
+            return if cleanup_tokens { remove_source_token_files(source_token_files, runner).await } else { Ok(()) };
         }
         let source = self
             .source
@@ -591,7 +674,7 @@ impl SkillBundle {
         let destination_count = destinations.len();
         for (index, (adapter, destination)) in destinations.into_iter().enumerate() {
             args[2] = destination.to_string_lossy().into_owned();
-            args[3] = (index + 1 == destination_count).to_string();
+            args[3] = (cleanup_tokens && index + 1 == destination_count).to_string();
             for attempt in 1..=3 {
                 let result = {
                     let _staging_guard = self.staging_lock.lock().await;
@@ -719,7 +802,7 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
     }
 
     fn is_managed_config_home(&self, config_home: &Path, _config_base: &Path) -> bool {
-        config_home == Path::new(CONTAINER_CODEX_HOME)
+        config_home.starts_with(Path::new(CONTAINER_CODEX_HOME))
     }
 
     fn externally_managed_home_opts_out_of_skills(&self) -> bool {
@@ -858,8 +941,8 @@ pub(crate) mod tests {
                 .map(|arg| {
                     if *arg == container_manifest {
                         source_manifest.clone()
-                    } else if *arg == format!("{CONTAINER_CODEX_HOME}/skills") {
-                        self.config_base.join("codex/skills").display().to_string()
+                    } else if let Ok(relative) = Path::new(arg).strip_prefix(CONTAINER_CODEX_HOME) {
+                        self.config_base.join("codex").join(relative).display().to_string()
                     } else {
                         (*arg).to_string()
                     }
@@ -2170,6 +2253,83 @@ esac
                 })
                 .collect::<Vec<_>>();
             assert_eq!(names, [std::ffi::OsString::from("private-source")], "{adapter} installs only the frozen selection");
+        }
+    }
+    #[tokio::test]
+    async fn crews_in_one_environment_see_only_their_own_skills() {
+        // Issue #2672: crews sharing an adapter and vessel must have disjoint
+        // homes, each containing exactly its frozen selection, including empty.
+        for adapter in [CLAUDE_CODE_ADAPTER_ID, CODEX_ADAPTER_ID] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let registry = registry(temp.path());
+            let bundle = registry.skills.source.as_ref().expect("source");
+            std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#).expect("manifest");
+            let runner = promisor_runner(temp.path());
+            let base = runner.config_base.join(if adapter == CODEX_ADAPTER_ID { "codex" } else { "claude" });
+            std::fs::create_dir_all(&base).expect("base home");
+            std::fs::write(base.join("settings.json"), "{}").expect("settings");
+            std::fs::write(base.join("auth.json"), "first-token").expect("auth");
+            let variable = if adapter == CODEX_ADAPTER_ID { "CODEX_HOME" } else { "CLAUDE_CONFIG_DIR" };
+            let virtual_base = if adapter == CODEX_ADAPTER_ID { CONTAINER_CODEX_HOME.into() } else { base.display().to_string() };
+            let token = temp.path().join("token");
+            std::fs::write(&token, "test-token").expect("token");
+            let selected = vec![flotilla_resources::SkillCatalogEntry {
+                source: "private-skills".into(),
+                repository: "example/private-skills".into(),
+                revision: "1".repeat(40),
+                name: "private-source".into(),
+                path: "skills/private-folder".into(),
+            }];
+            let environment = vec![
+                (variable.into(), virtual_base.clone()),
+                (
+                    "FLOTILLA_CREW_SKILLS".into(),
+                    serde_json::json!({"coder": selected, "reviewer": [flotilla_resources::SkillCatalogEntry {
+                    source: "private-skills".into(), repository: "example/private-skills".into(), revision: "1".repeat(40),
+                    name: "unselected".into(), path: "skills/unselected".into(),
+                }], "observer": []})
+                    .to_string(),
+                ),
+            ];
+            registry
+                .stage_skills(
+                    "shared",
+                    &BTreeSet::from([adapter.into()]),
+                    &environment,
+                    &BTreeMap::from([("private-skills".into(), token.clone())]),
+                    &runner,
+                )
+                .await
+                .expect("stage crews");
+            assert!(base.join("crews/coder/skills/private-source/SKILL.md").is_file());
+            assert_eq!(
+                std::fs::read_dir(base.join("crews/observer/skills"))
+                    .expect("empty skills")
+                    .filter(|entry| entry.as_ref().expect("entry").file_type().expect("type").is_dir())
+                    .count(),
+                0
+            );
+            assert!(base.join("crews/reviewer/skills/unselected/SKILL.md").is_file());
+            assert!(!base.join("crews/reviewer/skills/private-source").exists());
+            assert!(!base.join("crews/coder/skills/unselected").exists());
+            assert!(!base.join("skills/private-source").exists(), "no vessel-wide skill union");
+            assert!(!token.exists(), "source tokens are removed after all crews stage");
+            for role in ["coder", "observer", "reviewer"] {
+                let launch_env =
+                    registry.crew_environment(role, &BTreeSet::from([adapter.into()]), &environment, &runner).await.expect("launch home");
+                assert!(launch_env.contains(&(variable.into(), format!("{virtual_base}/crews/{role}"))));
+                assert_eq!(std::fs::read_to_string(base.join(format!("crews/{role}/settings.json"))).expect("settings"), "{}");
+                assert_eq!(std::fs::read_to_string(base.join(format!("crews/{role}/auth.json"))).expect("linked auth"), "first-token");
+            }
+            let replacement = base.join("auth.new");
+            std::fs::write(&replacement, "refreshed-token").expect("new auth");
+            std::fs::rename(replacement, base.join("auth.json")).expect("atomic refresh");
+            for role in ["coder", "observer", "reviewer"] {
+                assert_eq!(
+                    std::fs::read_to_string(base.join(format!("crews/{role}/auth.json"))).expect("refreshed linked auth"),
+                    "refreshed-token"
+                );
+            }
         }
     }
 }

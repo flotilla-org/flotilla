@@ -1289,7 +1289,6 @@ impl ConvoyAdmission {
             let resolved = &one.vessels[0];
             role.credential_signature = serde_json::to_string(&(
                 grant_set,
-                &role.crew.skills.selected,
                 &resolved.credential_refs,
                 &resolved.credential_scopes,
                 &resolved.credential_permissions,

@@ -4734,8 +4734,10 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         if let Some(agent_material) = &self.state.agent_material {
             let mut environment = resolved_agent_environment.environment.clone();
             environment.extend(delivered_credential_environment.iter().cloned());
-            if let Some(selection) = spec.env.get("FLOTILLA_RESOLVED_SKILLS") {
-                environment.push(("FLOTILLA_RESOLVED_SKILLS".to_string(), selection.clone()));
+            for key in ["FLOTILLA_CREW_SKILLS", "FLOTILLA_RESOLVED_SKILLS"] {
+                if let Some(selection) = spec.env.get(key) {
+                    environment.push((key.to_string(), selection.clone()));
+                }
             }
             let mut source_token_files = BTreeMap::new();
             let will_stage_skills =
@@ -5875,7 +5877,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let credential_env = match &self.state.credential_store {
+        let mut credential_env = match &self.state.credential_store {
             Some(store) => {
                 let runner = self.runner_for_env(&spec.env_ref)?;
                 store
@@ -5907,6 +5909,34 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 } else {
                     self.state.daemon.vcs_for_checkout(&EnvironmentId::new(&spec.env_ref), cwd.as_path()).await?
                 };
+                if let Some(material) = &self.state.agent_material {
+                    let environment =
+                        self.state.daemon.resource_backend().including_replicas::<Environment>(&context.namespace).get(&spec.env_ref).await;
+                    let docker = match environment {
+                        Ok(environment) => environment.object.spec.docker,
+                        Err(ResourceError::NotFound { .. }) => None,
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    if let Some(docker) = docker.filter(|docker| docker.env.contains_key("FLOTILLA_CREW_SKILLS")) {
+                        let required = BTreeSet::from([requirement.adapter.clone()]);
+                        let mut environment = credential_env.clone();
+                        for fragment in material.fragments(&required, &docker.env) {
+                            for (key, value) in compose_agent_environment([fragment])?.environment {
+                                if !environment.iter().any(|(existing, _)| existing == &key) {
+                                    environment.push((key, value));
+                                }
+                            }
+                        }
+                        for key in ["CODEX_HOME", "CLAUDE_CONFIG_DIR"] {
+                            if let Some(value) = docker.env.get(key) {
+                                environment.retain(|(existing, _)| existing != key);
+                                environment.push((key.into(), value.clone()));
+                            }
+                        }
+                        let runner = self.runner_for_env(&spec.env_ref)?;
+                        credential_env = material.crew_environment(&spec.role, &required, &environment, &*runner).await?;
+                    }
+                }
                 adapter.prepare_with_vcs(&cwd, &materialized_brief, &credential_env, vcs.as_ref()).await?;
                 for copy_root in &brief.copies {
                     let copy_root = ExecutionEnvironmentPath::new(copy_root);
@@ -7917,6 +7947,9 @@ mod tests {
                 || cmd == "chmod"
                 || (cmd == "sh" && args.iter().any(|arg| arg.contains("flotilla-skills-preflight")))
                 || (cmd == "sh" && args.contains(&"flotilla-prune-skill-tokens"))
+                // This runner stands in for the contained process boundary;
+                // real scratch copying and credential links are tested in agent_material.
+                || (cmd == "sh" && args.contains(&"flotilla-crew-home"))
             {
                 Ok(String::new())
             } else {
@@ -15373,6 +15406,17 @@ mod tests {
 
     #[tokio::test]
     async fn contained_claude_launch_uses_granted_invocation_environment_without_ambient_config() {
+        assert_contained_claude_invocation_home(false).await;
+    }
+
+    #[tokio::test]
+    async fn contained_claude_launch_selects_its_crew_home() {
+        // Issue #2672: new environments launch in the role home with the same
+        // granted OAuth wiring. The other test covers legacy environments.
+        assert_contained_claude_invocation_home(true).await;
+    }
+
+    async fn assert_contained_claude_invocation_home(private_home: bool) {
         let temp = TempDir::new().expect("tempdir");
         let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
         fs::create_dir_all(config.base_path()).expect("config directory");
@@ -15394,6 +15438,25 @@ mod tests {
         let workspace = temp.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
         let env_id = EnvironmentId::new("contained-claude");
+        if private_home {
+            backend
+                .using::<Environment>(NAMESPACE)
+                .create(&empty_meta(env_id.as_str()), &EnvironmentSpec {
+                    host_direct: None,
+                    docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                        memory_policy: Default::default(),
+                        host_ref: "host-test".into(),
+                        image: "contained-image".into(),
+                        declared_agent_adapters: BTreeSet::from(["claude-code".into()]),
+                        required_agent_adapters: BTreeSet::from(["claude-code".into()]),
+                        pull_policy: Default::default(),
+                        mounts: Vec::new(),
+                        env: BTreeMap::from([("FLOTILLA_CREW_SKILLS".into(), "{\"coder\":[],\"reviewer\":[]}".into())]),
+                    }),
+                })
+                .await
+                .expect("environment");
+        }
         // Credential preflight runs through the contained runner, so its
         // scratch directory must be inside the container user's writable
         // world rather than derived from daemon-host paths (#1508).
@@ -15450,7 +15513,8 @@ mod tests {
                 None,
                 "host-direct-host-test".to_string(),
             )
-            .with_credential_store(credential_store),
+            .with_credential_store(credential_store)
+            .with_agent_material(Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([] as [(&str, &str); 0]))))),
         );
         let spec = flotilla_resources::TerminalSessionSpec {
             env_ref: env_id.to_string(),
@@ -15489,10 +15553,14 @@ mod tests {
             "the contained Claude process must receive its OAuth token"
         );
         assert!(
-            launch
-                .env_vars
-                .iter()
-                .any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value == crew_config_dir.to_str().expect("UTF-8 path")),
+            launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR"
+                && value
+                    == if private_home {
+                        crew_config_dir.join("crews/coder").display().to_string()
+                    } else {
+                        crew_config_dir.display().to_string()
+                    }
+                    .as_str()),
             "the contained Claude process must receive the config directory owned by its adapter"
         );
         assert_eq!(launch.initial_size, Some(CREW_SESSION_SIZE));
