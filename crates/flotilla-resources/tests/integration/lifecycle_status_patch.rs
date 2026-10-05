@@ -105,6 +105,7 @@ define_patch_kinds! {
     ConvoyRecordTurnDelivery => CONTINUATION,
     ConvoyRefuseTurnDelivery => NONE,
     ConvoyFailTurnDelivery => NONE,
+    ConvoyObserveQueuedTurnDelivery => NONE,
     ConvoyRollUpWork => DUPLICATE_CONTINUATION_RESETTLEMENT,
     TerminalMarkStarting => NEW_ATTEMPT,
     TerminalClearRetiredLaunches => NONE,
@@ -179,6 +180,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
         ConvoyStatusPatch::RecordTurnDelivery { .. } => PatchKind::ConvoyRecordTurnDelivery,
         ConvoyStatusPatch::RefuseTurnDelivery { .. } => PatchKind::ConvoyRefuseTurnDelivery,
         ConvoyStatusPatch::FailTurnDelivery { .. } => PatchKind::ConvoyFailTurnDelivery,
+        ConvoyStatusPatch::ObserveQueuedTurnDelivery { .. } => PatchKind::ConvoyObserveQueuedTurnDelivery,
         ConvoyStatusPatch::RollUpWork { .. } => PatchKind::ConvoyRollUpWork,
     }
 }

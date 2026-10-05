@@ -1131,7 +1131,14 @@ impl LeafSubscriptionTable {
                     subject_revision: subject_revision.clone(),
                     evidence_at,
                     judged_claim_at: judged_at,
-                    outcome: TurnDeliveryOutcome::Delivered { rung, delivered_at: now },
+                    outcome: TurnDeliveryOutcome::Queued {
+                        rung,
+                        queued_at: Utc::now(),
+                        vessel: rule.to.vessel.clone(),
+                        role: rule.to.role.clone(),
+                        message_id: format!("turn-delivery:{source}:{subject_revision}"),
+                        blocking_reason: "waiting for terminal readiness or submission evidence".into(),
+                    },
                     sender: request.sender.clone(),
                 },
                 rule.to.vessel.clone(),
@@ -1209,6 +1216,33 @@ fn compose_subject_turn_brief(
     )
 }
 
+pub(crate) fn queued_turn_evidence(session: Option<&ResourceObject<TerminalSession>>, message_id: &str) -> (bool, String) {
+    let Some(session) = session else { return (false, "terminal session unavailable".into()) };
+    let status = session.status.as_ref();
+    if status.and_then(|status| status.delivered_message_id.as_deref()) == Some(message_id) {
+        return (true, String::new());
+    }
+    if let TerminalSessionSource::Agent { message: Some(message), .. } = &session.spec.source {
+        if message.delivered_through(status.and_then(|status| status.delivered_message_id.as_deref()), message_id) {
+            return (true, String::new());
+        }
+        if message.next_after(status.and_then(|status| status.delivered_message_id.as_deref())).is_some_and(|next| next.id != message_id) {
+            return (false, "waiting behind an earlier terminal message".into());
+        }
+    }
+    if let Some(condition) = status.and_then(|status| status.degraded.as_ref()) {
+        return (false, format!("{}: {}", condition.reason, condition.message));
+    }
+    match status {
+        Some(status) if status.phase == TerminalSessionPhase::Running => match &status.attention {
+            Some(attention) => (false, format!("attention {:?}; waiting for turn readiness or submission evidence", attention.state)),
+            None => (false, "waiting for startup readiness or submission evidence".into()),
+        },
+        Some(status) => (false, format!("terminal {:?}; waiting for startup readiness", status.phase)),
+        None => (false, "waiting for terminal startup".into()),
+    }
+}
+
 #[derive(Clone)]
 struct ReconcilerWake {
     subscriptions: LeafSubscriptionTable,
@@ -1255,6 +1289,47 @@ impl ReconcilerWake {
         now.signed_duration_since(episode.1) < delay
     }
 
+    async fn observe_queued_turns(
+        &self,
+        namespace: &str,
+        convoy: &ResourceObject<Convoy>,
+        sessions: &BTreeMap<String, ResourceObject<TerminalSession>>,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let Some(status) = &convoy.status else { return Ok(()) };
+        if status.phase.is_terminal() {
+            return Ok(());
+        }
+        for (source, delivery) in &status.turn_deliveries {
+            for episode in &delivery.episodes {
+                let TurnDeliveryOutcome::Queued { vessel, role, message_id, .. } = &episode.outcome else { continue };
+                let session = sessions.values().find(|session| {
+                    session.metadata.labels.get(VESSEL_LABEL) == Some(vessel) && session.metadata.labels.get(ROLE_LABEL) == Some(role)
+                });
+                let (confirmed, blocking_reason) = queued_turn_evidence(session, message_id);
+                let patch = flotilla_resources::ConvoyStatusPatch::ObserveQueuedTurnDelivery {
+                    source: source.clone(),
+                    subject_revision: episode.subject_revision.clone(),
+                    confirmed,
+                    blocking_reason,
+                    observed_at: now,
+                };
+                let mut next = status.clone();
+                patch.apply(&mut next);
+                if next != *status {
+                    flotilla_resources::apply_status_patch(
+                        &self.subscriptions.inner.backend.clone().using::<Convoy>(namespace),
+                        &convoy.metadata.name,
+                        &patch,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn judge_stalls(&self, namespace: &str, convoys: &HashMap<String, ResourceObject<Convoy>>) -> Result<(), String> {
         self.judge_stalls_at(namespace, convoys, Utc::now()).await
     }
@@ -1281,6 +1356,7 @@ impl ReconcilerWake {
         for convoy in convoys.values() {
             let Some(status) = &convoy.status else { continue };
             let selected_sessions = select_convoy_children(convoy, &sessions);
+            self.observe_queued_turns(namespace, convoy, &selected_sessions, now).await?;
             let selected_vessels = select_convoy_children(convoy, &vessels);
             let selected_checkouts = select_convoy_children(convoy, &checkouts);
             let mut obligations = status.nudge_obligations.clone();
@@ -2948,6 +3024,142 @@ mod tests {
     fn captured_subscriber(logs: Arc<std::sync::Mutex<Vec<u8>>>, level: tracing::Level) -> impl tracing::Subscriber + Send + Sync {
         let writer = Writer(logs);
         tracing_subscriber::fmt().without_time().with_ansi(false).with_max_level(level).with_writer(move || writer.clone()).finish()
+    }
+
+    // #2684: queue acceptance remains queued for every attention state. Only an
+    // exact terminal receipt confirms submission; age raises advisory attention.
+    #[hegel::test]
+    fn queued_turn_waits_for_receipt_and_exposes_bound(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // All attention states, FIFO/receipt positions, missing sessions and ages
+        // across the bound; pin the boundary cases too so shrinking cannot hide them.
+        let rung = if tc.draw(gs::booleans()) { TurnDeliveryRung::WarmSession } else { TurnDeliveryRung::FreshAgent };
+        let state = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let receipt_kind = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+        let age = tc.draw(gs::integers::<i64>().min_value(-1).max_value(601));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            for age in [-1, 0, 299, 300, 301, age] {
+                let (backend, wake, _) = idle_nudge_scenario().await;
+                let start = Utc::now();
+                let now = start + chrono::Duration::seconds(age);
+                let convoys = backend.using::<Convoy>("flotilla");
+                let convoy = convoys.get("stalled-work").await.unwrap();
+                let mut status = convoy.status.unwrap();
+                status.attention = None;
+                // The original firing need not remain eligible: health still follows receipts.
+                status.phase = ConvoyPhase::Interrupted;
+                status.stalled = None;
+                status.turn_deliveries.insert("review".into(), flotilla_resources::TurnDeliveryStatus {
+                    episodes: vec![TurnDeliveryEpisode {
+                        subject_revision: "head".into(),
+                        evidence_at: start,
+                        judged_claim_at: start,
+                        outcome: TurnDeliveryOutcome::Queued {
+                            rung,
+                            queued_at: start,
+                            vessel: "work".into(),
+                            role: "coder".into(),
+                            message_id: "turn".into(),
+                            blocking_reason: "initial".into(),
+                        },
+                        sender: Default::default(),
+                    }],
+                    ..Default::default()
+                });
+                // Stored episodes, including their original age, survive daemon restoration.
+                let status: ConvoyStatus = serde_json::from_value(serde_json::to_value(status).unwrap()).unwrap();
+                convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.unwrap();
+                let sessions = backend.using::<TerminalSession>("flotilla");
+                let session = sessions.get("resumed-coder").await.unwrap();
+                let mut spec = session.spec;
+                let TerminalSessionSource::Agent { message, .. } = &mut spec.source else { panic!("agent") };
+                let make_message = |id: &str| flotilla_resources::TerminalCrewMessage {
+                    id: id.into(),
+                    text: "review wake".into(),
+                    sender: Default::default(),
+                    delivery: flotilla_resources::CrewMessageDelivery::Queued,
+                    following: Vec::new(),
+                    acknowledged: Default::default(),
+                };
+                let mut head = make_message("turn");
+                head.append(make_message("later"));
+                *message = Some(head);
+                let session =
+                    sessions.update(&InputMeta::from(&session.metadata), &session.metadata.resource_version, &spec).await.unwrap();
+                sessions
+                    .update_status("resumed-coder", &session.metadata.resource_version, &flotilla_resources::TerminalSessionStatus {
+                        phase: TerminalSessionPhase::Running,
+                        attention: Some(TerminalAttention {
+                            state: [
+                                TerminalAttentionState::Unobservable,
+                                TerminalAttentionState::Working,
+                                TerminalAttentionState::Idle,
+                                TerminalAttentionState::NeedsInput,
+                            ][state],
+                            source: TerminalAttentionSource::Screen,
+                            as_of: now,
+                        }),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                for repeat in 0..2 {
+                    let convoy = convoys.get("stalled-work").await.unwrap();
+                    let prior_version = convoy.metadata.resource_version.clone();
+                    wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), now).await.unwrap();
+                    let observed = convoys.get("stalled-work").await.unwrap();
+                    if repeat == 1 {
+                        assert_eq!(observed.metadata.resource_version, prior_version, "unchanged queue evidence must not write every tick");
+                    }
+                    let status = observed.status.unwrap();
+                    assert!(
+                        matches!(status.turn_deliveries["review"].episodes[0].outcome, TurnDeliveryOutcome::Queued { .. }),
+                        "repeat {repeat}"
+                    );
+                    assert_eq!(
+                        status.attention.as_ref().map(|attention| attention.source.as_str()),
+                        (age > 300).then_some(ConvoyAttention::QUEUED_TURN_SOURCE)
+                    );
+                    let TurnDeliveryOutcome::Queued { queued_at, blocking_reason, .. } =
+                        &status.turn_deliveries["review"].episodes[0].outcome
+                    else {
+                        panic!("queued")
+                    };
+                    assert_eq!(*queued_at, start);
+                    assert!(blocking_reason.contains("attention"));
+                }
+                let session = sessions.get("resumed-coder").await.unwrap();
+                if receipt_kind == 2 {
+                    let mut spec = session.spec.clone();
+                    let TerminalSessionSource::Agent { message: Some(message), .. } = &mut spec.source else { panic!("message") };
+                    message.prune_acknowledged(Some("later"));
+                    sessions.update(&InputMeta::from(&session.metadata), &session.metadata.resource_version, &spec).await.unwrap();
+                } else if receipt_kind == 3 {
+                    let mut spec = session.spec.clone();
+                    let TerminalSessionSource::Agent { message, .. } = &mut spec.source else { panic!("agent") };
+                    *message = None;
+                    let session =
+                        sessions.update(&InputMeta::from(&session.metadata), &session.metadata.resource_version, &spec).await.unwrap();
+                    let mut status = session.status.unwrap();
+                    status.delivered_message_id = Some("turn".into());
+                    sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.unwrap();
+                } else {
+                    let mut status = session.status.unwrap();
+                    status.delivered_message_id = Some(if receipt_kind == 0 { "turn" } else { "later" }.into());
+                    sessions.update_status("resumed-coder", &session.metadata.resource_version, &status).await.unwrap();
+                }
+                let convoy = convoys.get("stalled-work").await.unwrap();
+                wake.judge_stalls_at("flotilla", &HashMap::from([("stalled-work".into(), convoy)]), now).await.unwrap();
+                let status = convoys.get("stalled-work").await.unwrap().status.unwrap();
+                assert!(matches!(status.turn_deliveries["review"].episodes[0].outcome, TurnDeliveryOutcome::Delivered {
+                    rung: delivered_rung, ..
+                } if delivered_rung == rung));
+                assert!(status.attention.is_none());
+                assert_eq!(status.turn_deliveries["review"].episodes.len(), 1);
+                assert_eq!(queued_turn_evidence(None, "turn"), (false, "terminal session unavailable".into()));
+            }
+        });
     }
 
     // #2560: the inactivity bound follows the newest tool/hook evidence, not
@@ -6064,8 +6276,9 @@ mod tests {
         let episodes = &status.turn_deliveries[source].episodes;
         assert_eq!(episodes.len(), 4, "same-head redelivery must not create an episode");
         assert_eq!(episodes[0].sender, flotilla_resources::CrewMessageSender::FlotillaTurn { source: source.to_string() });
-        assert!(matches!(episodes[0].outcome, TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::WarmSession, .. }));
-        assert!(matches!(episodes[1].outcome, TurnDeliveryOutcome::Delivered { rung: TurnDeliveryRung::FreshAgent, .. }));
+        // #2684: accepting a terminal FIFO entry is not confirmation of an agent turn.
+        assert_eq!(serde_json::to_value(&episodes[0].outcome).unwrap()["kind"], "queued");
+        assert!(matches!(episodes[1].outcome, TurnDeliveryOutcome::Queued { rung: TurnDeliveryRung::FreshAgent, .. }));
         assert!(matches!(episodes[3].outcome, TurnDeliveryOutcome::Refused { hold_executed: true, .. }));
         assert_eq!(actuator.requests.lock().expect("requests").len(), 3);
         assert_eq!(actuator.holds.load(Ordering::SeqCst), 1);

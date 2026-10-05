@@ -1090,6 +1090,24 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         }
     }
 
+    if !explanation.queued_turns.is_empty() {
+        output.push_str("\nQueued turns (not submitted):\n");
+        for turn in &explanation.queued_turns {
+            let _ = writeln!(
+                output,
+                "  - {} {}/{} revision={} rung={} queued_at={} age={}s{}: {}",
+                turn.source,
+                turn.vessel,
+                turn.role,
+                turn.subject_revision,
+                turn.rung,
+                turn.queued_at,
+                turn.age_seconds,
+                if turn.overdue { " OVERDUE" } else { "" },
+                turn.blocking_reason
+            );
+        }
+    }
     output.push_str("\nCrew delivery:\n");
     for (crew, skills) in &explanation.skills {
         writeln!(output, "Skills {crew}: {skills}").expect("write skill explanation");

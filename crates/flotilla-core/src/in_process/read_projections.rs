@@ -1062,6 +1062,43 @@ impl ReadProjections<'_> {
         let terminal_sessions =
             self.backend.including_replicas::<ResourceTerminalSession>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let unclaimed_work = explained_unclaimed_work(convoy.status.as_ref(), &terminal_sessions, name);
+        let selected_sessions = flotilla_resources::select_convoy_children(&convoy, &terminal_sessions);
+        let queued_turns = convoy
+            .status
+            .as_ref()
+            .into_iter()
+            .flat_map(|status| &status.turn_deliveries)
+            .flat_map(|(source, delivery)| {
+                delivery.episodes.iter().filter_map(|episode| {
+                    let flotilla_resources::TurnDeliveryOutcome::Queued { rung, queued_at, vessel, role, message_id, .. } =
+                        &episode.outcome
+                    else {
+                        return None;
+                    };
+                    let session = selected_sessions.values().find(|session| {
+                        session.metadata.labels.get(VESSEL_LABEL) == Some(vessel) && session.metadata.labels.get(ROLE_LABEL) == Some(role)
+                    });
+                    let (confirmed, blocking_reason) = crate::leaf_engine::queued_turn_evidence(session, message_id);
+                    // A receipt can arrive between health ticks; explain must not call it blocked.
+                    if confirmed {
+                        return None;
+                    }
+                    let age = now.signed_duration_since(*queued_at);
+                    Some(flotilla_protocol::commands::ExplainedQueuedTurn {
+                        source: source.clone(),
+                        subject_revision: episode.subject_revision.clone(),
+                        vessel: vessel.clone(),
+                        role: role.clone(),
+                        message_id: message_id.clone(),
+                        rung: format!("{rung:?}"),
+                        queued_at: queued_at.to_rfc3339(),
+                        age_seconds: age.num_seconds().max(0),
+                        blocking_reason,
+                        overdue: age > flotilla_resources::TurnDeliveryOutcome::QUEUED_BOUND,
+                    })
+                })
+            })
+            .collect();
         let mut crew_deliveries = terminal_sessions
             .into_iter()
             .filter(|source| source.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|convoy| convoy == name))
@@ -1219,6 +1256,7 @@ impl ReadProjections<'_> {
             change_requests,
             subscriptions,
             crew_deliveries,
+            queued_turns,
             unclaimed_work,
             decision_ledgers,
             artifacts,
