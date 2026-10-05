@@ -84,6 +84,7 @@ fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: St
         supervision: None,
         issue_source_bindings: Vec::new(),
         repositories: vec![ProjectRepositorySpec {
+            charter_store: None,
             repo: repository_key,
             alias: None,
             roles: Default::default(),
@@ -480,6 +481,7 @@ impl ProjectService<'_> {
                 .verify_key(&key)
                 .map_err(|error| format!("project member alias `{}` resolved to invalid repository {key}: {error}", member.alias))?;
             members.push(ProjectRepositorySpec {
+                charter_store: member.charter_store,
                 repo: key,
                 alias: Some(member.alias),
                 roles: member.roles,
@@ -515,7 +517,7 @@ impl ProjectService<'_> {
             .map_err(|error| error.to_string())?;
         let mut changes = if converged { vec![format!("Project/{}", declaration.name)] } else { Vec::new() };
         let (operational_changes, operational_entries) = match self
-            .materialize_project_operational_entries(&declaration.name, &bootstrap_inspection)
+            .materialize_project_operational_entries(&declaration.name, Some(&bootstrap_inspection))
             .await
         {
             Ok(outcome) => outcome,
@@ -543,22 +545,150 @@ impl ProjectService<'_> {
         }
     }
 
+    pub(super) async fn reconcile_bound_charters(&self) -> Result<(), String> {
+        let namespace = self.provisioning_namespace();
+        let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let desired = projects
+            .iter()
+            .flat_map(|project| {
+                project.spec.repositories.iter().filter_map(|member| {
+                    member
+                        .charter_store
+                        .as_ref()
+                        .filter(|binding| binding.host == self.repository_index.host)
+                        .map(|binding| crate::charter_store::ops_root_name(&project.metadata.name, member, &binding.host))
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        let roots = self.resource_backend.using::<flotilla_resources::ManifestRoot>(&namespace);
+        for root in roots.list().await.map_err(|error| error.to_string())?.items {
+            if root.spec.host == self.repository_index.host
+                && root.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some("ops-charter")
+                && !desired.contains(&root.metadata.name)
+            {
+                // Removing a source retires its health, not the records it authored.
+                roots.delete(&root.metadata.name).await.map_err(|error| error.to_string())?;
+            }
+        }
+        for project in projects {
+            if !project
+                .spec
+                .repositories
+                .iter()
+                .any(|member| member.charter_store.as_ref().is_some_and(|binding| binding.host == self.repository_index.host))
+            {
+                continue;
+            }
+            if let Err(error) = self.materialize_project_operational_entries(&project.metadata.name, None).await {
+                self.patch_project_operational_entries(
+                    &namespace,
+                    &project.metadata.name,
+                    false,
+                    error.entry_path.as_deref(),
+                    &error.message,
+                )
+                .await?;
+                self.record_project_operational_refusal(&namespace, &project.metadata.name, &error.message).await;
+            }
+        }
+        Ok(())
+    }
+
     async fn materialize_project_operational_entries(
         &self,
         project_name: &str,
-        bootstrap: &ProjectDeclarationInspection,
+        bootstrap: Option<&ProjectDeclarationInspection>,
     ) -> Result<(Vec<String>, Vec<String>), OperationalEntryRefusal> {
         let mut entry_path = None;
-        self.materialize_project_operational_entries_inner(project_name, bootstrap, &mut entry_path)
+        self.reconcile_operational_stores(project_name, bootstrap, &mut entry_path)
             .await
             .map_err(|message| OperationalEntryRefusal { entry_path, message })
+    }
+
+    async fn reconcile_operational_stores(
+        &self,
+        project_name: &str,
+        bootstrap: Option<&ProjectDeclarationInspection>,
+        entry_path: &mut Option<String>,
+    ) -> Result<(Vec<String>, Vec<String>), String> {
+        use flotilla_resources::{CharterSource, ManifestRoot, ManifestRootSpec};
+        let namespace = self.provisioning_namespace();
+        let lock = crate::charter_store::reconciliation_lock(&format!("ops:{}/{namespace}/{project_name}", self.repository_index.host));
+        let _guard = lock.lock().await;
+        let project =
+            self.resource_backend.definitions::<Project>(&namespace).get(project_name).await.map_err(|error| error.to_string())?;
+        let roots = self.resource_backend.using::<ManifestRoot>(&namespace);
+        let mut names = Vec::new();
+        for member in &project.spec.repositories {
+            let Some(binding) = &member.charter_store else {
+                continue;
+            };
+            if binding.host != self.repository_index.host {
+                continue;
+            }
+            let name = crate::charter_store::ops_root_name(project_name, member, &binding.host);
+            let (source, path) = match &binding.source {
+                CharterSource::Repository { repo, path, .. } => (repo.clone(), path.clone()),
+                CharterSource::LocalDirectory { directory } => ("local".into(), directory.clone()),
+            };
+            let current = match roots.get(&name).await {
+                Ok(root) => Some(root),
+                Err(ResourceError::NotFound { .. }) => None,
+                Err(error) => return Err(error.to_string()),
+            };
+            let mut spec = current.as_ref().map(|root| root.spec.clone()).unwrap_or_else(|| {
+                ManifestRootSpec::builder().host(binding.host.clone()).path(path.clone()).source(source.clone()).build()
+            });
+            spec.binding = Some(binding.source.clone());
+            spec.host.clone_from(&binding.host);
+            spec.path = path;
+            spec.source = source;
+            match current {
+                Some(root) if root.spec != spec => {
+                    roots
+                        .update(&InputMeta::from(&root.metadata), &root.metadata.resource_version, &spec)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                None => {
+                    roots
+                        .create(
+                            &InputMeta::builder()
+                                .name(name.clone())
+                                .labels(BTreeMap::from([(MANAGED_BY_LABEL.into(), "ops-charter".into())]))
+                                .build(),
+                            &spec,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                _ => {}
+            }
+            names.push(name);
+        }
+        let mut revisions = BTreeMap::new();
+        let result = self.materialize_project_operational_entries_inner(project_name, bootstrap, entry_path, &mut revisions).await;
+        for name in names {
+            let root = roots.get(&name).await.map_err(|error| error.to_string())?;
+            let status = crate::charter_store::source_status(
+                root.status.clone().unwrap_or_default(),
+                revisions.remove(&name),
+                result.as_ref().err().map(String::as_str),
+                &name,
+            );
+            if root.status.as_ref() != Some(&status) {
+                roots.update_status(&name, &root.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
+            }
+        }
+        result
     }
 
     async fn materialize_project_operational_entries_inner(
         &self,
         project_name: &str,
-        bootstrap: &ProjectDeclarationInspection,
+        bootstrap: Option<&ProjectDeclarationInspection>,
         refused_entry_path: &mut Option<String>,
+        bound_revisions: &mut BTreeMap<String, String>,
     ) -> Result<(Vec<String>, Vec<String>), String> {
         let namespace = self.provisioning_namespace();
         let project =
@@ -580,7 +710,43 @@ impl ProjectService<'_> {
         let mut sources = Vec::new();
         let mut unavailable_source = false;
         for member in project.spec.repositories.iter().filter(|member| member.roles.contains(&ProjectRepositoryRole::Ops)) {
-            let repository = if member.repo == bootstrap.repository.key() {
+            if let Some(binding) = &member.charter_store {
+                if binding.host != self.repository_index.host {
+                    unavailable_source = true;
+                    continue;
+                }
+                let snapshot = inspector.charter_snapshot(&binding.source).await?;
+                let spec = self
+                    .resource_backend
+                    .including_replicas::<Repository>(&namespace)
+                    .get(&member.repo.to_string())
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .object
+                    .spec;
+                let source_root = crate::charter_store::ops_root_name(project_name, member, &binding.host);
+                bound_revisions.insert(source_root.clone(), snapshot.revision.clone());
+                let files =
+                    snapshot.files.into_iter().map(|(path, contents)| crate::ops_entry::OperationalEntryFile { path, contents }).collect();
+                sources.push(OperationalEntriesInspection {
+                    source_root: Some(source_root),
+                    repository: RepositoryInspection {
+                        spec,
+                        checkout: LocalCheckoutInspection::builder()
+                            .path(PathBuf::from("/"))
+                            .host_ref(binding.host.clone())
+                            .git_ref(snapshot.revision.clone())
+                            .is_main(true)
+                            .build(),
+                        transport_url: None,
+                        replaces_prior_repository: false,
+                    },
+                    commit: snapshot.revision,
+                    files,
+                });
+                continue;
+            }
+            let repository = if let Some(bootstrap) = bootstrap.filter(|bootstrap| member.repo == bootstrap.repository.key()) {
                 bootstrap.repository.clone()
             } else {
                 let checkout = match self.repository_index.select_checkout(&member.repo).await? {
@@ -607,10 +773,10 @@ impl ProjectService<'_> {
                 RepositoryInspection { spec, checkout, transport_url: None, replaces_prior_repository: false }
             };
             let (mut commit, files) = inspector.operational_entry_files_at(&repository.checkout.path).await?;
-            if member.repo == bootstrap.repository.key() {
+            if let Some(bootstrap) = bootstrap.filter(|bootstrap| member.repo == bootstrap.repository.key()) {
                 commit.clone_from(&bootstrap.commit);
             }
-            let source = OperationalEntriesInspection { repository, commit, files };
+            let source = OperationalEntriesInspection { source_root: None, repository, commit, files };
             sources.push(source);
         }
         // Registration remains possible from a bootstrap repository that does
@@ -620,6 +786,9 @@ impl ProjectService<'_> {
         if unavailable_source {
             let message = "operational entries refused: an ops member has no local checkout on this host".to_string();
             self.patch_project_operational_entries(&namespace, project_name, false, None, &message).await?;
+            if !bound_revisions.is_empty() {
+                return Err(message);
+            }
             return Ok((Vec::new(), vec![message]));
         }
 
@@ -740,7 +909,7 @@ impl ProjectService<'_> {
             changes.push(format!("deleted ConvoyEnsure/{}", stale.metadata.name));
         }
 
-        let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
+        let repositories = self.resource_backend.using::<Repository>(&namespace);
         let current_code_members = project
             .spec
             .repositories
@@ -749,7 +918,22 @@ impl ProjectService<'_> {
             .map(|member| member.repo.clone())
             .collect::<BTreeSet<_>>();
         for member in project.spec.repositories.iter().filter(|member| member.roles.contains(&ProjectRepositoryRole::Code)) {
-            let current = repositories.get(&member.repo.to_string()).await.map_err(|error| error.to_string())?;
+            let current = match repositories.get(&member.repo.to_string()).await {
+                Ok(current) => current,
+                Err(ResourceError::NotFound { .. }) => {
+                    let remote = self
+                        .resource_backend
+                        .including_replicas::<Repository>(&namespace)
+                        .get(&member.repo.to_string())
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .object;
+                    // Repository is a convergent fact, not a Definition. The
+                    // source home authors its local record before adding ops data.
+                    repositories.create(&InputMeta::from(&remote.metadata), &remote.spec).await.map_err(|error| error.to_string())?
+                }
+                Err(error) => return Err(error.to_string()),
+            };
             let desired_commands = commands.remove(&member.repo).unwrap_or_default();
             let owner = current.metadata.annotations.get(VERIFICATION_PROJECT_ANNOTATION).map(String::as_str);
             match owner {
@@ -811,7 +995,13 @@ impl ProjectService<'_> {
         message: &str,
     ) -> Result<(), String> {
         let projects = self.resource_backend.using::<Project>(namespace);
-        let project = projects.get(project_name).await.map_err(|error| error.to_string())?;
+        let project = match projects.get(project_name).await {
+            Ok(project) => project,
+            // A bound ops store may live away from the Project's author. Its
+            // own ManifestRoot carries health; never write another home's status.
+            Err(ResourceError::NotFound { .. }) => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
         let now = self.clock.now();
         let condition = (!ready).then(|| DeclarationRefusedCondition {
             // Source-level refusals have no entry; never manufacture a path from prose.
@@ -927,11 +1117,14 @@ impl ProjectService<'_> {
             if targets.is_empty() {
                 return Err(format!("{} has no code-role repositories to target", file.path));
             }
-            let provenance = serde_json::json!({
+            let mut provenance = serde_json::json!({
                 "sourceRepository": source_repository,
                 "sourceCommit": source.commit,
                 "entryPath": file.path,
             });
+            if let Some(root) = &source.source_root {
+                provenance["manifestRoot"] = serde_json::json!(root);
+            }
             match entry.definition {
                 OperationalEntryDefinition::WorkflowTemplate(mut spec) => {
                     outcomes.push(format!("{}: WorkflowTemplate/{} accepted", file.path, entry.name));
@@ -945,12 +1138,17 @@ impl ProjectService<'_> {
                     })?;
                     let meta = InputMeta::builder()
                         .name(entry.name.clone())
-                        .annotations(BTreeMap::from([
-                            (MATERIALIZED_PROJECT_ANNOTATION.to_string(), project_name.to_string()),
-                            (SOURCE_REPOSITORY_ANNOTATION.to_string(), source_repository.to_string()),
-                            (SOURCE_COMMIT_ANNOTATION.to_string(), source.commit.clone()),
-                            (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), file.path.clone()),
-                        ]))
+                        .annotations(
+                            BTreeMap::from([
+                                (MATERIALIZED_PROJECT_ANNOTATION.to_string(), project_name.to_string()),
+                                (SOURCE_REPOSITORY_ANNOTATION.to_string(), source_repository.to_string()),
+                                (SOURCE_COMMIT_ANNOTATION.to_string(), source.commit.clone()),
+                                (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), file.path.clone()),
+                            ])
+                            .into_iter()
+                            .chain(source.source_root.as_ref().map(|root| ("flotilla.work/manifest-reconciler-root".into(), root.clone())))
+                            .collect(),
+                        )
                         .build();
                     if workflows.insert(entry.name.clone(), (meta, *spec)).is_some() {
                         return Err(format!("duplicate materialized WorkflowTemplate `{}`", entry.name));
@@ -971,12 +1169,17 @@ impl ProjectService<'_> {
                     outcomes.push(format!("{}: ConvoyEnsure/{} accepted", file.path, ensure_name));
                     let mut meta = InputMeta::builder()
                         .name(ensure_name.clone())
-                        .annotations(BTreeMap::from([
-                            (MATERIALIZED_PROJECT_ANNOTATION.to_string(), project_name.to_string()),
-                            (SOURCE_REPOSITORY_ANNOTATION.to_string(), source_repository.to_string()),
-                            (SOURCE_COMMIT_ANNOTATION.to_string(), source.commit.clone()),
-                            (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), file.path.clone()),
-                        ]))
+                        .annotations(
+                            BTreeMap::from([
+                                (MATERIALIZED_PROJECT_ANNOTATION.to_string(), project_name.to_string()),
+                                (SOURCE_REPOSITORY_ANNOTATION.to_string(), source_repository.to_string()),
+                                (SOURCE_COMMIT_ANNOTATION.to_string(), source.commit.clone()),
+                                (SOURCE_ENTRY_PATH_ANNOTATION.to_string(), file.path.clone()),
+                            ])
+                            .into_iter()
+                            .chain(source.source_root.as_ref().map(|root| ("flotilla.work/manifest-reconciler-root".into(), root.clone())))
+                            .collect(),
+                        )
                         .build();
                     if let Some(presents_as) = &ensure.presents_as {
                         meta.annotations.insert(PRESENTS_AS_ANNOTATION.to_string(), presents_as.clone());
@@ -1346,6 +1549,142 @@ mod tests {
         }
     }
 
+    // #2720: both store adapters feed the same operational materializer, without
+    // checkout facts. A bad revision cannot replace its last-good workflow.
+    #[tokio::test]
+    async fn bound_ops_sources_apply_without_checkouts_and_preserve_last_good() {
+        use flotilla_resources::{CharterSource, CharterStoreBinding, ManifestRoot};
+
+        use crate::{
+            providers::{discovery::test_support::test_vcs_resolver, ProcessCommandRunner},
+            repository_inspection::GitRepositoryInspector,
+        };
+        for local in [false, true] {
+            let source_dir = tempfile::tempdir().expect("source");
+            let cache = tempfile::tempdir().expect("cache");
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("git").args(args).current_dir(source_dir.path()).output().expect("fixture git");
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            };
+            let entry =
+                |vessel: &str| format!("---\nkind: workflow_template\nname: review\n---\nvessels:\n  - name: {vessel}\n    crew: []\n");
+            std::fs::write(source_dir.path().join("review.md"), entry("first")).expect("entry");
+            if !local {
+                git(&["init", "-b", "main"]);
+                git(&["config", "user.name", "Test"]);
+                git(&["config", "user.email", "test@example.com"]);
+                git(&["add", "."]);
+                git(&["commit", "-m", "initial"]);
+            }
+            let source = if local {
+                CharterSource::LocalDirectory { directory: source_dir.path().to_string_lossy().into_owned() }
+            } else {
+                CharterSource::Repository {
+                    repo: source_dir.path().to_string_lossy().into_owned(),
+                    branch: "main".into(),
+                    path: String::new(),
+                }
+            };
+            let runner: Arc<dyn crate::providers::CommandRunner> = Arc::new(ProcessCommandRunner);
+            let inspector = Arc::new(
+                GitRepositoryInspector::new(runner.clone(), test_vcs_resolver(runner), "local-host")
+                    .with_charter_cache(cache.path().to_path_buf()),
+            );
+            let operations = FakeProjectOperations { inspector: inspector.clone(), identity_resolutions: AtomicUsize::new(0) };
+            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let namespace = std::sync::RwLock::new("flotilla".to_string());
+            let service = ProjectService {
+                resource_backend: &backend,
+                observed_resource_backend: &observed,
+                clock: &clock,
+                namespace: &namespace,
+                repository_index: RepositoryIndex { backend: &backend, observed: &observed, namespace: &namespace, host: "local-host" },
+                operations: &operations,
+            };
+            let repository = RepositorySpec::remote("https://github.com/example/ops").expect("repository");
+            backend
+                .using::<Repository>("flotilla")
+                .create(&InputMeta::builder().name(repository.key().0.clone()).build(), &repository)
+                .await
+                .expect("repository record");
+            let mut spec = whole_repository_project_spec(repository.key(), "app".into()).expect("project spec");
+            spec.repositories[0].roles.extend([ProjectRepositoryRole::Ops, ProjectRepositoryRole::Code]);
+            spec.repositories[0].charter_store = Some(CharterStoreBinding { host: "local-host".into(), source });
+            let project_author = if local { ResourceBackend::InMemory(InMemoryBackend::default()) } else { backend.clone() };
+            project_author
+                .using::<Project>("flotilla")
+                .create(&InputMeta::builder().name("app".into()).build(), &spec)
+                .await
+                .expect("project");
+            if local {
+                // The source home can receive its Project from the fleet store;
+                // it owns the source status, not that Project's status.
+                let snapshot = project_author.using::<Project>("flotilla").list().await.expect("fleet project");
+                backend
+                    .replica_writer::<Project>(flotilla_protocol::NodeId::new("fleet-store"), "flotilla")
+                    .replace(&snapshot, chrono::Utc::now())
+                    .await
+                    .expect("federate project");
+            }
+            service.reconcile_bound_charters().await.expect("first pass");
+            let root_name = crate::charter_store::ops_root_name("app", &spec.repositories[0], "local-host");
+            let roots = backend.using::<ManifestRoot>("flotilla");
+            let first_status = roots.get(&root_name).await.expect("root").status.expect("status");
+            assert!(first_status.source_error.is_none(), "{first_status:?}");
+            let first = first_status.applied_revision.expect("revision");
+            let workflows = backend.using::<WorkflowTemplate>("flotilla");
+            let workflow = workflows.get("app--review").await.expect("workflow");
+            assert_eq!(workflow.spec.vessels[0].name, "first");
+            assert_eq!(workflow.metadata.annotations[SOURCE_COMMIT_ANNOTATION], first);
+            // Re-reading an identical revision must not publish another source
+            // status or rewrite its authored definitions.
+            let settled_root = roots.get(&root_name).await.expect("settled source");
+            service.reconcile_bound_charters().await.expect("unchanged pass");
+            assert_eq!(roots.get(&root_name).await.expect("source").metadata.resource_version, settled_root.metadata.resource_version);
+            assert_eq!(workflows.get("app--review").await.expect("workflow").metadata.resource_version, workflow.metadata.resource_version);
+            // Candidate inventory reads the same bound head, despite no checkout.
+            let projects = backend.definitions::<Project>("flotilla").list().await.expect("projects");
+            let inventory = crate::repository_inspection::inspect_project_ops_entries(&projects, &BTreeMap::new(), &*inspector)
+                .await
+                .expect("inventory");
+            assert!(inventory.entries.iter().any(|file| file.contents == entry("first")));
+            std::fs::write(source_dir.path().join("review.md"), entry("second")).expect("edit");
+            std::fs::write(source_dir.path().join("bad.md"), "---\nkind: workflow_template\nname: bad\n---\nvessels: [")
+                .expect("bad entry");
+            if !local {
+                git(&["add", "."]);
+                git(&["commit", "-m", "bad revision"]);
+            }
+            service.reconcile_bound_charters().await.expect("refusal published");
+            let status = roots.get(&root_name).await.expect("root").status.expect("status");
+            assert_eq!(status.applied_revision.as_deref(), Some(first.as_str()));
+            assert!(status.source_error.as_deref().expect("reason").contains("bad.md"));
+            assert!(status.stalled.is_some());
+            assert_eq!(workflows.get("app--review").await.expect("last live").spec, workflow.spec);
+            std::fs::remove_file(source_dir.path().join("bad.md")).expect("repair");
+            if !local {
+                git(&["add", "."]);
+                git(&["commit", "-m", "repair"]);
+            }
+            service.reconcile_bound_charters().await.expect("recovery");
+            let status = roots.get(&root_name).await.expect("root").status.expect("status");
+            assert!(status.source_error.is_none());
+            assert!(status.stalled.is_none());
+            assert_ne!(status.applied_revision.as_deref(), Some(first.as_str()));
+            assert_eq!(workflows.get("app--review").await.expect("updated").spec.vessels[0].name, "second");
+            let projects = backend.definitions::<Project>("flotilla");
+            let project = projects.get("app").await.expect("project definition");
+            let mut spec = project.spec.clone();
+            spec.repositories[0].charter_store = None;
+            projects.apply(&InputMeta::from(&project.metadata), &spec).await.expect("remove binding");
+            service.reconcile_bound_charters().await.expect("retire source");
+            assert!(matches!(roots.get(&root_name).await, Err(ResourceError::NotFound { .. })));
+            assert_eq!(workflows.get("app--review").await.expect("retained authored record").spec.vessels[0].name, "second");
+        }
+    }
+
     #[tokio::test]
     async fn project_registration_uses_injected_inspection_and_identity_resolution() {
         let temp = tempfile::tempdir().expect("checkout directory");
@@ -1487,6 +1826,7 @@ mod tests {
         let first = RepositorySpec::remote("https://github.com/example/app").expect("first code repository").key();
         let second = RepositorySpec::remote("https://github.com/example/lib").expect("second code repository").key();
         let source = OperationalEntriesInspection {
+            source_root: None,
             repository: RepositoryInspection {
                 spec: source_spec,
                 checkout: crate::repository_inspection::LocalCheckoutInspection::builder()

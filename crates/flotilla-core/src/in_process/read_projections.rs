@@ -391,6 +391,9 @@ impl ReadProjections<'_> {
         let mut statuses = HashMap::<HostName, ResourceHostStatus>::new();
         let mut host_syncs = HashMap::<HostName, DateTime<Utc>>::new();
         let mut host_refs = HashMap::<String, HostName>::new();
+        if let Some(host_id) = &local_host_id {
+            host_refs.insert(host_id.clone(), self.host_name.clone());
+        }
         let resource_hosts =
             self.backend.clone().including_replicas::<ResourceHost>(namespace).list().await.map_err(|error| error.to_string())?;
         for source in &resource_hosts.items {
@@ -413,10 +416,17 @@ impl ReadProjections<'_> {
         }
 
         let mut manifest_needs_by_host = HashMap::<HostName, usize>::new();
+        let mut manifest_reasons_by_host = HashMap::<HostName, Vec<String>>::new();
         let manifest_roots =
             self.backend.clone().including_replicas::<ManifestRoot>(namespace).list().await.map_err(|error| error.to_string())?;
         for root in manifest_roots.items {
             let Some(host) = host_refs.get(&root.object.spec.host) else { continue };
+            if let Some(stall) = root.object.status.as_ref().and_then(|status| status.stalled.as_ref()) {
+                manifest_reasons_by_host
+                    .entry(host.clone())
+                    .or_default()
+                    .push(format!("ManifestRoot/{}: {}", root.object.metadata.name, stall.evidence));
+            }
             if root
                 .object
                 .status
@@ -493,12 +503,13 @@ impl ReadProjections<'_> {
                         .count()
                         + manifest_needs_by_host.get(&host).copied().unwrap_or_default(),
                 };
-                let degraded_conditions = status
+                let mut degraded_conditions: Vec<String> = status
                     .into_iter()
                     .flat_map(|status| status.conditions.iter())
                     .filter(|condition| condition.value == ConditionValue::False)
                     .map(|condition| format!("{}: {}", condition.condition_type, condition.message))
                     .collect();
+                degraded_conditions.extend(manifest_reasons_by_host.remove(&host).unwrap_or_default());
                 let credential_attention =
                     status.map(|status| host_credential_attention(status, now, credential_warning_window)).unwrap_or_default();
 

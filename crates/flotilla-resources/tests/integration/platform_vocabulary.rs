@@ -12,6 +12,7 @@ fn project_with_matrix(platforms: &[&str]) -> ProjectSpec {
         supervision: None,
         issue_source_bindings: Vec::new(),
         repositories: vec![ProjectRepositorySpec {
+            charter_store: None,
             repo: RepositoryKey("acme/widgets".to_string()),
             alias: None,
             roles: BTreeSet::new(),

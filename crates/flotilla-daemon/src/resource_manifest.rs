@@ -12,12 +12,12 @@ use std::{
     time::Duration,
 };
 
-use flotilla_core::vcs::Vcs;
+use flotilla_core::{charter_store::read_charter_source, vcs::Vcs};
 use flotilla_resources::{
-    apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, ControllerRetry, DocumentKey, DocumentPhase,
-    DocumentState, EventRecorder, EventRegarding, InputMeta, LeafMaker, ManifestRoot, ManifestRootSpec, ManifestRootStatus, ObjectEvent,
-    ResolutionAction, ResolutionOutcome, ResourceBackend, ResourceError, RetryCeiling, StallEvidenceSource, StallRung, StalledCondition,
-    MANAGED_BY_LABEL,
+    apply_manifest_resource_document, get_resource_kind, resource_document_spec_hash, validate_resource_document, CharterSource,
+    ControllerRetry, DocumentKey, DocumentPhase, DocumentState, EventRecorder, EventRegarding, InputMeta, LeafMaker, ManifestRoot,
+    ManifestRootSpec, ManifestRootStatus, ObjectEvent, ResolutionAction, ResolutionOutcome, ResourceBackend, ResourceError, RetryCeiling,
+    StallEvidenceSource, StallRung, StalledCondition, MANAGED_BY_LABEL,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -91,6 +91,7 @@ pub struct ResourceManifestReconciler {
     root: PathBuf,
     source: String,
     reconciler_root: String,
+    binding: Option<CharterSource>,
     fixed_revision: Option<String>,
     vcs: Option<Arc<dyn Vcs>>,
     warned_unmanaged: HashSet<ObjectIdentity>,
@@ -130,6 +131,7 @@ pub(crate) async fn materialize_manifest_root(
         }
         Err(ResourceError::NotFound { .. }) => {
             let spec = ManifestRootSpec {
+                binding: None,
                 host: host.to_string(),
                 path: path.to_string_lossy().into_owned(),
                 source: source.to_string(),
@@ -145,6 +147,27 @@ pub(crate) async fn materialize_manifest_root(
     }
 }
 
+pub(crate) async fn materialize_bound_manifest_root(
+    backend: &ResourceBackend,
+    namespace: &str,
+    config: &flotilla_core::config::ResourceManifestsConfig,
+) -> Result<(), String> {
+    if let Some(binding) = &config.binding {
+        binding.validate()?;
+    }
+    let root = materialize_manifest_root(backend, namespace, &config.dir, &config.source, &config.reconciler_root).await?;
+    if root.spec.binding != config.binding {
+        let mut spec = root.spec.clone();
+        spec.binding.clone_from(&config.binding);
+        backend
+            .using::<ManifestRoot>(namespace)
+            .update(&InputMeta::from(&root.metadata), &root.metadata.resource_version, &spec)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 impl ResourceManifestReconciler {
     pub(crate) fn new(backend: ResourceBackend, default_namespace: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         Self {
@@ -154,6 +177,7 @@ impl ResourceManifestReconciler {
             root: root.into(),
             source: "local".to_string(),
             reconciler_root: "local".to_string(),
+            binding: None,
             fixed_revision: Some("unversioned".to_string()),
             vcs: None,
             warned_unmanaged: HashSet::new(),
@@ -169,6 +193,11 @@ impl ResourceManifestReconciler {
         self.source = source.into();
         self.reconciler_root = reconciler_root.into();
         self.fixed_revision = None;
+        self
+    }
+
+    pub fn with_binding(mut self, binding: Option<CharterSource>) -> Self {
+        self.binding = binding;
         self
     }
 
@@ -226,7 +255,13 @@ impl ResourceManifestReconciler {
 
     #[cfg(test)]
     async fn reconcile_once_for_test(&mut self) -> Result<ManifestPassReport, String> {
-        materialize_manifest_root(&self.backend, &self.default_namespace, &self.root, &self.source, &self.reconciler_root).await?;
+        materialize_bound_manifest_root(&self.backend, &self.default_namespace, &flotilla_core::config::ResourceManifestsConfig {
+            binding: self.binding.clone(),
+            dir: self.root.clone(),
+            source: self.source.clone(),
+            reconciler_root: self.reconciler_root.clone(),
+        })
+        .await?;
         self.reconcile_once().await
     }
 
@@ -293,20 +328,41 @@ impl ResourceManifestReconciler {
     }
 
     pub async fn reconcile_once(&mut self) -> Result<ManifestPassReport, String> {
+        let lock = flotilla_core::charter_store::reconciliation_lock(&format!("manifest:{}/{}", self.default_namespace, self.root_name()));
+        let _guard = lock.lock().await;
         let root_resource = self
             .backend
             .using::<ManifestRoot>(&self.default_namespace)
             .get(&self.root_name())
             .await
             .map_err(|error| format!("read ManifestRoot: {error}"))?;
-        let revision = match &self.fixed_revision {
-            Some(revision) => revision.clone(),
-            None => self.vcs.as_ref().ok_or("manifest VCS provider unavailable")?.clean_revision().await?,
+        let inputs = self.load_inputs().await;
+        let (revision, files) = match inputs {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                self.publish_source_failure(&root_resource, &error).await?;
+                return Err(error);
+            }
         };
-        let root = self.root.clone();
-        let files = tokio::task::spawn_blocking(move || load_manifest_files(&root))
-            .await
-            .map_err(|error| format!("manifest file loading task failed: {error}"))??;
+        // A bound revision is accepted as a whole. Validate all documents before
+        // any resource writes, including typed specs and duplicate identities.
+        if self.binding.is_some() {
+            let mut identities = HashSet::new();
+            let validation = files.iter().try_for_each(|(path, parsed)| {
+                for document in parsed.as_ref().map_err(|error| format!("{}: {error}", path.display()))? {
+                    validate_resource_document(document).map_err(|error| format!("{}: {error}", path.display()))?;
+                    let identity = document_identity(document, &self.default_namespace)?;
+                    if !identities.insert(identity.clone()) {
+                        return Err(format!("duplicate charter document {identity}"));
+                    }
+                }
+                Ok::<_, String>(())
+            });
+            if let Err(error) = validation {
+                self.publish_source_failure(&root_resource, &error).await?;
+                return Err(error);
+            }
+        }
         let mut report = ManifestPassReport::default();
         let mut status = root_resource.status.clone().unwrap_or_default();
         let previous = status.documents.clone();
@@ -372,6 +428,10 @@ impl ResourceManifestReconciler {
             }
         }
         status.documents = documents;
+        status.source_error = None;
+        if report.errors.is_empty() && status.documents.values().all(|state| state.phase == DocumentPhase::Applied) {
+            status.applied_revision = Some(revision);
+        }
         let refusals = status
             .documents
             .iter()
@@ -412,6 +472,45 @@ impl ResourceManifestReconciler {
         }
         self.publish_status(status).await?;
         Ok(report)
+    }
+
+    async fn load_inputs(&self) -> Result<(String, Vec<LoadedManifestFile>), String> {
+        if let Some(binding) = &self.binding {
+            let snapshot = read_charter_source(binding, &self.root, self.vcs.as_deref()).await?;
+            let files = snapshot
+                .files
+                .into_iter()
+                .filter(|(path, _)| {
+                    Path::new(path)
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| matches!(extension, "json" | "yaml" | "yml"))
+                })
+                .map(|(path, contents)| {
+                    let path = self.root.join(path);
+                    let parsed = parse_document_contents(&path, &contents);
+                    (path, parsed)
+                })
+                .collect();
+            return Ok((snapshot.revision, files));
+        }
+        // ADR 0047: previous-generation clean-checkout configuration remains
+        // readable for one roll. New installations declare an explicit binding.
+        let revision = match &self.fixed_revision {
+            Some(revision) => revision.clone(),
+            None => self.vcs.as_ref().ok_or("manifest VCS provider unavailable")?.clean_revision().await?,
+        };
+        let root = self.root.clone();
+        let files = tokio::task::spawn_blocking(move || load_manifest_files(&root))
+            .await
+            .map_err(|error| format!("manifest file loading task failed: {error}"))??;
+        Ok((revision, files))
+    }
+
+    async fn publish_source_failure(&self, root: &flotilla_resources::ResourceObject<ManifestRoot>, error: &str) -> Result<(), String> {
+        let status =
+            flotilla_core::charter_store::source_status(root.status.clone().unwrap_or_default(), None, Some(error), &self.root_name());
+        self.publish_status(status).await
     }
 
     async fn reconcile_document(
@@ -547,6 +646,7 @@ impl ResourceManifestReconciler {
                 && annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str) == Some(self.source.as_str())
                 && annotations.get(MANIFEST_PATH_ANNOTATION).map(String::as_str) == Some(path.to_string_lossy().as_ref())
                 && annotations.contains_key(MANIFEST_REVISION_ANNOTATION)
+                && (self.binding.is_none() || annotations.get(MANIFEST_REVISION_ANNOTATION).map(String::as_str) == Some(revision))
                 && annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION).map(String::as_str) == Some(self.root_name().as_str())
                 && LEGACY_STATE_ANNOTATIONS.iter().all(|key| !annotations.contains_key(*key));
             if settled {
@@ -644,7 +744,14 @@ impl ResourceManifestReconciler {
     }
 
     async fn adopt_live_spec(&self, source: &Path, identity: &ObjectIdentity, existing: &Value) -> Result<(), String> {
-        let path = self.root.join(source);
+        if matches!(self.binding, Some(CharterSource::Repository { .. })) {
+            return Err("adoption cannot write a repository-bound charter; commit the desired change to its branch".into());
+        }
+        let root = match &self.binding {
+            Some(CharterSource::LocalDirectory { directory }) => Path::new(directory),
+            _ => &self.root,
+        };
+        let path = root.join(source);
         let source = source.to_path_buf();
         let identity = identity.clone();
         let task_identity = identity.clone();
@@ -796,12 +903,16 @@ fn load_manifest_files(root: &Path) -> Result<Vec<LoadedManifestFile>, String> {
 
 fn parse_documents(path: &Path) -> Result<Vec<Value>, String> {
     let content = std::fs::read_to_string(path).map_err(|error| format!("read file: {error}"))?;
+    parse_document_contents(path, &content)
+}
+
+fn parse_document_contents(path: &Path, content: &str) -> Result<Vec<Value>, String> {
     if path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("json")) {
-        return serde_json::from_str(&content).map(|document| vec![document]).map_err(|error| format!("parse JSON: {error}"));
+        return serde_json::from_str(content).map(|document| vec![document]).map_err(|error| format!("parse JSON: {error}"));
     }
 
     let mut documents = Vec::new();
-    for document in serde_yml::Deserializer::from_str(&content) {
+    for document in serde_yml::Deserializer::from_str(content) {
         let value = Value::deserialize(document).map_err(|error| format!("parse YAML: {error}"))?;
         if !value.is_null() {
             documents.push(value);
@@ -912,6 +1023,131 @@ mod tests {
     use super::*;
 
     const NAMESPACE: &str = "flotilla";
+
+    // #2720: branch-head changes apply without updating a working tree. Invalid
+    // heads and fetch failures retain every last-applied record and its revision.
+    #[tokio::test]
+    async fn bound_branch_heads_preserve_last_good_revision() {
+        let repo = committed_manifest_repo();
+        git(repo.path(), &["branch", "-M", "main"]);
+        std::fs::create_dir(repo.path().join("charters")).expect("charter path");
+        git(repo.path(), &["mv", "policy.yaml", "charters/policy.yaml"]);
+        write(&repo.path().join("unrelated.yaml"), "invalid: [");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "charter subtree"]);
+        let cache = tempfile::tempdir().expect("charter cache");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let source = CharterSource::Repository {
+            repo: repo.path().to_string_lossy().into_owned(),
+            branch: "main".into(),
+            path: "./charters".into(),
+        };
+        let mut reconciler = versioned_reconciler(repo.path(), backend.clone()).await;
+        reconciler.root = cache.path().to_path_buf();
+        reconciler = reconciler.with_binding(Some(source));
+        reconciler.reconcile_once_for_test().await.expect("apply first head");
+        let first = test_root(&backend).await.status.expect("source status").applied_revision.expect("first revision");
+        git(repo.path(), &["switch", "-c", "edit"]);
+        write(&repo.path().join("charters/policy.yaml"), &manifest("versioned", "merged"));
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "change"]);
+        git(repo.path(), &["switch", "main"]);
+        git(repo.path(), &["merge", "--ff-only", "edit"]);
+        // Leave the source checkout on a different, dirty branch. Only main's
+        // committed objects can affect the bound store.
+        git(repo.path(), &["switch", "edit"]);
+        write(&repo.path().join("charters/policy.yaml"), &manifest("versioned", "dirty"));
+        reconciler.reconcile_once().await.expect("apply merged head");
+        let merged = test_root(&backend).await.status.expect("status").applied_revision.expect("merged revision");
+        assert_ne!(first, merged);
+        let live = backend.using::<PlacementPolicy>(NAMESPACE).get("versioned").await.expect("policy");
+        assert_eq!(live.spec.pool, "merged");
+        assert_eq!(live.metadata.annotations[MANIFEST_REVISION_ANNOTATION], merged);
+        git(repo.path(), &["restore", "charters/policy.yaml"]);
+        git(repo.path(), &["switch", "main"]);
+        write(&repo.path().join("charters/policy.yaml"), &manifest("versioned", "must-not-apply"));
+        write(&repo.path().join("charters/z-bad.yaml"), "invalid: [");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "bad head"]);
+        assert!(reconciler.reconcile_once().await.is_err());
+        let status = test_root(&backend).await.status.expect("refusal status");
+        assert_eq!(status.applied_revision.as_deref(), Some(merged.as_str()));
+        assert!(status.source_error.as_deref().expect("parse reason").contains("z-bad.yaml"));
+        assert!(status.stalled.is_some());
+        assert_eq!(backend.using::<PlacementPolicy>(NAMESPACE).get("versioned").await.expect("live policy").spec, live.spec);
+        git(repo.path(), &["rm", "charters/z-bad.yaml"]);
+        git(repo.path(), &["commit", "-m", "repair"]);
+        reconciler.reconcile_once().await.expect("recover");
+        let repaired = test_root(&backend).await.status.expect("recovered status");
+        assert!(repaired.source_error.is_none());
+        assert!(repaired.stalled.is_none());
+        assert_ne!(repaired.applied_revision.as_deref(), Some(merged.as_str()));
+        reconciler.binding = Some(CharterSource::Repository {
+            repo: repo.path().to_string_lossy().into_owned(),
+            branch: "missing".into(),
+            path: "./charters".into(),
+        });
+        assert!(reconciler.reconcile_once().await.is_err());
+        let failed = test_root(&backend).await.status.expect("fetch status");
+        assert_eq!(failed.applied_revision, repaired.applied_revision);
+        assert!(failed.source_error.expect("fetch reason").contains("missing"));
+    }
+
+    // #2720: laptop stores apply the exact files hashed into a local revision,
+    // retain the previous revision on parse refusal, and recover after repair.
+    #[tokio::test]
+    async fn bound_local_directory_applies_and_recovers() {
+        let dir = tempfile::tempdir().expect("local source");
+        let cache = tempfile::tempdir().expect("unused cache");
+        write(&dir.path().join("policy.yaml"), &manifest("laptop", "local"));
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, cache.path())
+            .with_binding(Some(CharterSource::LocalDirectory { directory: dir.path().to_string_lossy().into_owned() }));
+        reconciler.reconcile_once_for_test().await.expect("apply directory");
+        let first = test_root(&backend).await.status.expect("status").applied_revision.expect("revision");
+        assert!(first.starts_with("local:"));
+        let live = backend.using::<PlacementPolicy>(NAMESPACE).get("laptop").await.expect("policy");
+        assert_eq!(live.metadata.annotations[MANIFEST_REVISION_ANNOTATION], first);
+        write(&dir.path().join("policy.yaml"), "broken: [");
+        assert!(reconciler.reconcile_once().await.is_err());
+        assert_eq!(test_root(&backend).await.status.expect("status").applied_revision.as_deref(), Some(first.as_str()));
+        write(&dir.path().join("policy.yaml"), &manifest("laptop", "repaired"));
+        reconciler.reconcile_once().await.expect("repair");
+        let status = test_root(&backend).await.status.expect("recovery");
+        assert!(status.source_error.is_none());
+        assert_ne!(status.applied_revision.as_deref(), Some(first.as_str()));
+    }
+
+    // #2720: source-level failures expose their reason in fleet health even
+    // before any charter document or host heartbeat has been applied.
+    #[tokio::test]
+    async fn bound_source_failure_reason_reaches_fleet_health() {
+        let source = tempfile::tempdir().expect("source");
+        let config = tempfile::tempdir().expect("config");
+        write(&config.path().join("daemon.toml"), "machine_id = \"charter-health\"\n");
+        let daemon = InProcessDaemon::new(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(config.path())),
+            fake_discovery_with_provider_set(FakeDiscoveryProviders::new()),
+            HostName::new("laptop"),
+        )
+        .await;
+        let backend = daemon.resource_backend();
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), NAMESPACE, source.path())
+            .with_declared_source("laptop-charter", daemon.local_host_id().expect("host").to_string())
+            .with_binding(Some(CharterSource::LocalDirectory { directory: source.path().to_string_lossy().into_owned() }));
+        write(&source.path().join("policy.yaml"), "bad: [");
+        assert!(reconciler.reconcile_once_for_test().await.is_err());
+        let health = daemon.fleet_health_internal().await.expect("fleet health");
+        let host = health.hosts.iter().find(|host| host.host == HostName::new("laptop")).expect("local host");
+        assert!(host.surface_states.needs_you > 0);
+        assert!(host.degraded_conditions.iter().any(|reason| reason.contains("policy.yaml")), "{host:?}");
+        write(&source.path().join("policy.yaml"), &manifest("healthy", "default"));
+        reconciler.reconcile_once().await.expect("source recovers");
+        let health = daemon.fleet_health_internal().await.expect("fleet health");
+        let host = health.hosts.iter().find(|host| host.host == HostName::new("laptop")).expect("local host");
+        assert!(!host.degraded_conditions.iter().any(|reason| reason.contains("ManifestRoot/")));
+    }
 
     async fn test_root(backend: &ResourceBackend) -> flotilla_resources::ResourceObject<ManifestRoot> {
         backend.using::<ManifestRoot>(NAMESPACE).list().await.expect("list roots").items.into_iter().next().expect("root")

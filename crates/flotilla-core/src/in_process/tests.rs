@@ -4384,6 +4384,7 @@ async fn standing_ensure_fixture_for(
                     .display_name("Standing Project".to_string())
                     .default_workflow_ref("quartermaster".to_string())
                     .repositories(vec![ProjectRepositorySpec {
+                        charter_store: None,
                         repo: repository_key.clone(),
                         alias: Some("app".to_string()),
                         roles: BTreeSet::from([ProjectRepositoryRole::Code]),
@@ -5640,6 +5641,7 @@ async fn standing_ensure_admission_uses_default_branch_observed_only_on_non_driv
                 .display_name("Cross Root Project".to_string())
                 .default_workflow_ref("cross-root-workflow".to_string())
                 .repositories(vec![ProjectRepositorySpec {
+                    charter_store: None,
                     repo: repository_key.clone(),
                     alias: None,
                     roles: BTreeSet::from([ProjectRepositoryRole::Code]),

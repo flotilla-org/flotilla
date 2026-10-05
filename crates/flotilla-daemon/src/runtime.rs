@@ -75,6 +75,8 @@ use tokio::{
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, warn};
 
+#[cfg(test)]
+use crate::resource_manifest::materialize_manifest_root;
 use crate::{
     agent_material::AgentMaterialRegistry,
     blob_store::{BlobDigest, BlobStore, TieredBlobStore},
@@ -86,7 +88,7 @@ use crate::{
     },
     issue_materializer::IssuePollingHealth,
     resource_limits::file_descriptor_pressure_condition,
-    resource_manifest::{manifest_root_name, materialize_manifest_root, ResourceManifestReconciler},
+    resource_manifest::{manifest_root_name, materialize_bound_manifest_root, ResourceManifestReconciler},
     sleep_inhibitor,
     startup::phase,
     supervisor::{supervise, ControllerSupervision, RestartBudgetExhausted},
@@ -192,13 +194,15 @@ impl OperatorReconciler for RuntimeOperatorReconciler {
                     return Err(format!("manifest root `{name}` is owned by another host; route reconcile-now to that host"));
                 }
                 let manifests = self.manifests.as_ref().ok_or_else(|| "manifest reconciliation is not configured".to_string())?;
-                if root.spec.path != manifests.dir.to_string_lossy() || root.spec.source != manifests.source {
+                if root.spec.path != manifests.dir.to_string_lossy() || root.spec.source != manifests.source || root.spec.binding != manifests.binding {
                     return Err(format!("manifest root `{name}` does not match the declared source"));
                 }
                 let mut reconciler =
                     ResourceManifestReconciler::new(self.state.daemon.resource_backend(), namespace, manifests.dir.clone())
                         .with_declared_source(manifests.source.clone(), manifests.reconciler_root.clone())
-                        .with_vcs(self.state.daemon.local_vcs_for_checkout(&manifests.dir).await?);
+                        .with_binding(manifests.binding.clone())
+                        .with_vcs(if manifests.binding.is_some() { self.state.daemon.local_charter_vcs()? }
+                            else { self.state.daemon.local_vcs_for_checkout(&manifests.dir).await? });
                 let report = reconciler.reconcile_once().await?;
                 Ok(format!(
                     "manifest root {name}: {} created, {} updated, {} unchanged, {} errors",
@@ -779,10 +783,22 @@ impl DaemonRuntime {
             .map(|declared| manifest_root_name(&declared.reconciler_root, &declared.dir, &declared.source));
         let roots = daemon.resource_backend().using::<ManifestRoot>(&options.namespace);
         for root in phase("list_manifest_roots", roots.list()).await.map_err(|error| error.to_string())?.items {
-            if root.spec.host == profile.host_id && desired_manifest_root.as_deref() != Some(root.metadata.name.as_str()) {
+            if root.metadata.name.starts_with("manifest-")
+                && root.spec.host == profile.host_id
+                && desired_manifest_root.as_deref() != Some(root.metadata.name.as_str())
+            {
                 phase("delete_stale_manifest_root", roots.delete(&root.metadata.name)).await.map_err(|error| error.to_string())?;
             }
         }
+        let charter_daemon = Arc::clone(&daemon);
+        tasks.push(spawn_periodic_task(MANIFEST_RECONCILE_INTERVAL, PeriodicTaskStart::Immediate, move || {
+            let daemon = Arc::clone(&charter_daemon);
+            async move {
+                if let Err(error) = daemon.reconcile_bound_project_charters().await {
+                    warn!(%error, "bound project charter reconciliation failed");
+                }
+            }
+        }));
         if let Some(manifests) = manifests.clone() {
             if manifest_reconciler_enabled(&manifests.reconciler_root, &profile.host_id) {
                 tasks.push(spawn_manifest_reconciler_task(
@@ -1152,18 +1168,16 @@ fn spawn_manifest_reconciler_task(
             let namespace = namespace.clone();
             let manifests = manifests.clone();
             async move {
-                materialize_manifest_root(
-                    &daemon.resource_backend(),
-                    &namespace,
-                    &manifests.dir,
-                    &manifests.source,
-                    &manifests.reconciler_root,
-                )
-                .await
+                materialize_bound_manifest_root(&daemon.resource_backend(), &namespace, &manifests).await.map_err(ResourceError::other)?;
+                let vcs = if manifests.binding.is_some() {
+                    daemon.local_charter_vcs()
+                } else {
+                    daemon.local_vcs_for_checkout(&manifests.dir).await
+                }
                 .map_err(ResourceError::other)?;
-                let vcs = daemon.local_vcs_for_checkout(&manifests.dir).await.map_err(ResourceError::other)?;
                 ResourceManifestReconciler::new(daemon.resource_backend(), namespace, manifests.dir)
                     .with_declared_source(manifests.source, manifests.reconciler_root)
+                    .with_binding(manifests.binding)
                     .with_vcs(vcs)
                     .run(interval)
                     .await

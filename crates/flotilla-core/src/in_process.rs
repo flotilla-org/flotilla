@@ -134,6 +134,7 @@ use crate::{
         registry::ProviderRegistry,
         ssh_runner::SshCommandRunner,
         types::RepoCriteria,
+        vcs::git_worktree::GitWorktreeStrategy,
         ChannelLabel, CommandRunner,
     },
     regard_lifecycle::{RegardLifecycle, SurfaceGestureOutcome, DEFAULT_REGARD_DECAY_SECONDS, DEFAULT_REGARD_REFRESH_SECONDS},
@@ -2117,7 +2118,8 @@ impl InProcessDaemon {
                 self.self_weak.upgrade().ok_or("repository inspector daemon unavailable")? as Arc<dyn crate::vcs::CheckoutVcsResolver>,
                 host_ref.to_string(),
             )
-            .with_forges(forges.into_iter().map(|forge| forge.spec).collect()),
+            .with_forges(forges.into_iter().map(|forge| forge.spec).collect())
+            .with_charter_cache(self.config.state_dir().join("charter-stores").into_path_buf()),
         ))
     }
 
@@ -2570,6 +2572,17 @@ impl InProcessDaemon {
     /// Resolve once when a caller needs both the runner and its registered identity.
     pub fn resolve_environment_ref(&self, env_ref: &str) -> Option<ResolvedEnvironment> {
         self.environment_manager.resolve_environment_ref(env_ref)
+    }
+
+    /// VCS operations for a private charter object cache do not require a
+    /// discovered checkout or a worktree registration.
+    pub fn local_charter_vcs(&self) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
+        let runner = self.local_command_runner().ok_or("local charter runner unavailable")?;
+        Ok(Arc::new(crate::vcs::FlotillaVcs::new(
+            ExecutionEnvironmentPath::new("/"),
+            runner.clone(),
+            crate::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), runner))),
+        )))
     }
 
     pub async fn local_vcs_for_checkout(&self, checkout: &Path) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
@@ -4198,6 +4211,10 @@ impl InProcessDaemon {
         self.project_service().project_register(target).await
     }
 
+    pub async fn reconcile_bound_project_charters(&self) -> Result<(), String> {
+        self.project_service().reconcile_bound_charters().await
+    }
+
     async fn project_refresh(&self, name: &str) -> Result<(usize, bool, Vec<String>, Vec<String>), String> {
         self.project_service().project_refresh(name).await
     }
@@ -4808,6 +4825,36 @@ impl InProcessDaemon {
         let host_list = self.list_hosts_internal().await?;
         let rows = self.fleet.rows(&namespace, &self.host_registry).await?;
         self.read_projections().fleet_health(&namespace, host_list, rows, self.local_host_id().map(|id| id.to_string()), now).await
+    }
+
+    /// Raw bound fleet manifests at the current source head, for candidate-side
+    /// validation. Returning raw text lets the candidate use its own decoder.
+    pub async fn charter_input_inventory(&self, namespace: &str) -> Result<Vec<crate::ops_entry::OperationalEntryFile>, String> {
+        let roots = self.resource_backend.using::<ManifestRoot>(namespace).list().await.map_err(|error| error.to_string())?;
+        let vcs = self.local_charter_vcs()?;
+        let mut files = Vec::new();
+        for root in roots.items {
+            if root.spec.host != self.environment_manager.local_host_id().as_str() || root.metadata.name.starts_with("ops-") {
+                continue;
+            }
+            let Some(source) = root.spec.binding else {
+                continue;
+            };
+            let snapshot = crate::charter_store::read_charter_source(&source, Path::new(&root.spec.path), Some(&*vcs)).await?;
+            files.extend(
+                snapshot
+                    .files
+                    .into_iter()
+                    .filter(|(path, _)| {
+                        Path::new(path).extension().and_then(|ext| ext.to_str()).is_some_and(|ext| matches!(ext, "yaml" | "yml" | "json"))
+                    })
+                    .map(|(path, contents)| crate::ops_entry::OperationalEntryFile {
+                        path: format!("{}/{path}", root.metadata.name),
+                        contents,
+                    }),
+            );
+        }
+        Ok(files)
     }
 
     /// Raw ops declarations for candidate-side pre-roll validation.

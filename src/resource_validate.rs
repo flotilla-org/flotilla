@@ -76,6 +76,7 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
     let mut failed = false;
     let mut count = 0;
     let mut projects = BTreeMap::<String, Vec<ResourceObject<Project>>>::new();
+    let mut charter_namespaces = std::collections::BTreeSet::new();
     for (store_base, kind, namespaces) in collections {
         let replication = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.plural == kind).map(|entry| entry.replication_class);
         let query = if replication.is_some_and(|class| class != ReplicationClass::None) { "?replicaSources=true" } else { "" };
@@ -106,6 +107,9 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
             for item in items {
                 count += 1;
                 let name = item.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("<unnamed>");
+                if store_base == base && kind == "manifestroots" && item["spec"].get("binding").is_some_and(|binding| !binding.is_null()) {
+                    charter_namespaces.insert(namespace.clone());
+                }
                 if store_base == base && kind == "projects" {
                     match serde_json::from_value::<K8sResourceObject<Project>>(item.clone())
                         .map_err(|error| error.to_string())
@@ -141,6 +145,27 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
                         .iter()
                         .cloned(),
                 );
+            }
+        }
+    }
+    for namespace in charter_namespaces {
+        let response = client.get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/charterinputs")).send().await?;
+        if !response.status().is_success() {
+            eprintln!("{namespace}: bound charter inventory refused: {}", response.text().await?);
+            failed = true;
+            continue;
+        }
+        let inputs: Vec<OperationalEntryFile> = response.json().await?;
+        for input in inputs {
+            let result = parse_documents(Path::new(&input.path), &input.contents).and_then(|documents| {
+                for document in documents {
+                    validate_resource_document(&document)?;
+                }
+                Ok(())
+            });
+            if let Err(error) = result {
+                eprintln!("{}: {error}", input.path);
+                failed = true;
             }
         }
     }
@@ -673,6 +698,26 @@ mod tests {
             .await
             .expect("write replica source");
         replicas.delete("replica-only").await.expect("remove local replica source");
+        let charter_dir = tempfile::tempdir().expect("local bound charter");
+        let charter_file = charter_dir.path().join("policy.yaml");
+        let charter_text =
+            "apiVersion: flotilla.work/v1\nkind: PlacementPolicy\nmetadata:\n  name: candidate-policy\nspec:\n  pool: default\n";
+        std::fs::write(&charter_file, charter_text).expect("charter document");
+        backend
+            .using::<flotilla_resources::ManifestRoot>("flotilla")
+            .create(
+                &InputMeta::builder().name("candidate-charter".to_string()).build(),
+                &flotilla_resources::ManifestRootSpec::builder()
+                    .host(server.daemon().local_host_id().expect("host identity").to_string())
+                    .path(charter_dir.path().to_string_lossy().into_owned())
+                    .source("local".into())
+                    .binding(flotilla_resources::CharterSource::LocalDirectory {
+                        directory: charter_dir.path().to_string_lossy().into_owned(),
+                    })
+                    .build(),
+            )
+            .await
+            .expect("bound root");
         let observed = server.daemon().observed_resource_backend();
         let task = tokio::spawn(async move { server.run().await });
         for _ in 0..100 {
@@ -690,6 +735,20 @@ mod tests {
         assert_eq!(inventory.status(), reqwest::StatusCode::OK);
         assert_eq!(inventory.json::<serde_json::Value>().await.expect("inventory")["entries"], serde_json::json!([]));
         let primary_count = validate_daemon(&socket, Some(&[]), None).await.expect("validate primary store");
+        // #2720: the candidate parses the current bound inputs, even before a
+        // daemon applies them. A malformed new head must refuse the roll.
+        let inputs = client
+            .get("http://flotilla.local/apis/flotilla.work/v1/namespaces/flotilla/charterinputs")
+            .send()
+            .await
+            .expect("charter inventory");
+        assert_eq!(inputs.status(), reqwest::StatusCode::OK);
+        let inputs: Vec<flotilla_core::ops_entry::OperationalEntryFile> = inputs.json().await.expect("raw charter inputs");
+        assert!(inputs.iter().any(|input| input.contents == charter_text));
+        std::fs::write(&charter_file, "bad: [").expect("bad charter revision");
+        assert!(validate_daemon(&socket, Some(&[]), None).await.is_err());
+        std::fs::write(&charter_file, charter_text).expect("restore charter");
+
         // Persisted observations in a replica-only namespace must participate
         // in the candidate pre-roll gate alongside primary-store records.
         let checkouts = observed.using::<flotilla_resources::Checkout>("observed-only");
@@ -730,6 +789,7 @@ mod tests {
                     .display_name("Unavailable".to_string())
                     .default_workflow_ref("default".to_string())
                     .repositories(vec![flotilla_resources::ProjectRepositorySpec {
+                        charter_store: None,
                         repo: flotilla_resources::RepositoryKey("unavailable-ops".into()),
                         alias: None,
                         roles: std::collections::BTreeSet::from([flotilla_resources::ProjectRepositoryRole::Ops]),
@@ -812,6 +872,7 @@ mod tests {
                     .display_name("Demo".to_string())
                     .default_workflow_ref("govern".to_string())
                     .repositories(vec![ProjectRepositorySpec {
+                        charter_store: None,
                         repo: spec.key(),
                         alias: Some("ops".into()),
                         roles: std::collections::BTreeSet::from([ProjectRepositoryRole::Ops]),
@@ -890,6 +951,7 @@ mod tests {
                     .display_name("Demo".to_string())
                     .default_workflow_ref("govern".to_string())
                     .repositories(vec![ProjectRepositorySpec {
+                        charter_store: None,
                         repo: spec.key(),
                         alias: Some("ops".into()),
                         roles: std::collections::BTreeSet::from([ProjectRepositoryRole::Ops]),
@@ -1046,6 +1108,7 @@ mod tests {
                     .display_name("Demo".to_string())
                     .default_workflow_ref("default".to_string())
                     .repositories(vec![ProjectRepositorySpec {
+                        charter_store: None,
                         repo: RepositoryKey("ops-elsewhere".into()),
                         alias: None,
                         roles: BTreeSet::from([ProjectRepositoryRole::Ops]),

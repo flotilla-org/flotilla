@@ -70,6 +70,27 @@ spec:
                           enum: [code, ops, knowledge]
                       subpath:
                         type: string
+                      charter_store:
+                        type: object
+                        required: [host, source]
+                        properties:
+                          host:
+                            type: string
+                          source:
+                            type: object
+                            required: [kind]
+                            properties:
+                              kind:
+                                type: string
+                                enum: [repository, local_directory]
+                              repo:
+                                type: string
+                              branch:
+                                type: string
+                              path:
+                                type: string
+                              directory:
+                                type: string
                       default_branch:
                         type: string
             status:

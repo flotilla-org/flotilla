@@ -544,6 +544,8 @@ enum ResourceSubCommand {
     PatchStatus(ResourceStatusPatchArgs),
     /// Get one resource by name
     Get(ResourceGetArgs),
+    /// Explain the charter source and applied revision that authored a record
+    Explain(ResourceGetArgs),
     /// Delete exactly one raw resource object, bypassing lifecycle gates
     Delete(ResourceDeleteArgs),
     /// Remove a declared transport remote from a Repository
@@ -1881,6 +1883,17 @@ async fn run_manifest_command(cli: &Cli, command: ManifestSubCommand, format: Ou
             .transpose()
             .map_err(|error| color_eyre::eyre::eyre!("decode ManifestRoot status: {error}"))?
             .unwrap_or_default();
+        rows.push((
+            serde_json::json!({
+                "root": name, "binding": spec.binding, "applied_revision": status.applied_revision,
+                "document": {"path": "<source>"},
+                "state": {
+                    "phase": if status.stalled.is_some() { "refused" } else if status.applied_revision.is_some() { "applied" } else { "pending" },
+                    "reason": status.source_error.as_deref().or_else(|| status.stalled.as_ref().map(|stall| stall.evidence.as_str())),
+                },
+            }),
+            None,
+        ));
         for (key, state) in status.documents {
             let pending_resolution =
                 spec.resolutions.get(&key).filter(|resolution| state.resolved_token.as_deref() != Some(resolution.token.as_str()));
@@ -1917,13 +1930,15 @@ fn format_manifest_status_row(row: &serde_json::Value, resolution_action: Option
     let key = &row["document"];
     let phase = row["state"]["phase"].as_str().unwrap_or("unknown");
     let reason = row["state"]["reason"].as_str().unwrap_or("");
+    let reason =
+        row["applied_revision"].as_str().map(|revision| format!("{reason} (applied {revision})")).unwrap_or_else(|| reason.to_string());
     let pending = row["pending_resolution"].as_str().map(|action| format!("pending {action}")).unwrap_or_default();
     let reason = if resolution_action == Some(flotilla_resources::ResolutionAction::Adopt)
         && row["state"]["resolution_outcome"].get("failed").is_some()
     {
         format!("{reason}; adoption may have rewritten the source file; inspect it before retrying with a new token")
     } else {
-        reason.to_string()
+        reason
     };
     format!(
         "{}\t{}\t{}/{}/{}\t{}\t{}\t{}",
@@ -2005,8 +2020,27 @@ async fn run_ensure_command(cli: &Cli, command: EnsureSubCommand, format: Output
     }
 }
 
+fn charter_record_explanation(object: &serde_json::Value) -> serde_json::Value {
+    let annotations = &object["metadata"]["annotations"];
+    serde_json::json!({
+        "kind": object["kind"], "namespace": object["metadata"]["namespace"], "name": object["metadata"]["name"],
+        "charter": {
+            "source": annotations["flotilla.work/manifest-source"].as_str()
+                .or_else(|| annotations["flotilla.work/source-repository"].as_str()),
+            "path": annotations["flotilla.work/manifest-path"].as_str()
+                .or_else(|| annotations["flotilla.work/source-entry-path"].as_str()),
+            "revision": annotations["flotilla.work/manifest-revision"].as_str()
+                .or_else(|| annotations["flotilla.work/source-commit"].as_str()),
+            "root": annotations["flotilla.work/manifest-reconciler-root"],
+            "verification_inputs": annotations[flotilla_core::ops_entry::VERIFICATION_PROVENANCE_ANNOTATION].as_str()
+                .and_then(|encoded| serde_json::from_str::<serde_json::Value>(encoded).ok()),
+        },
+    })
+}
+
 async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: OutputFormat) -> Result<()> {
     reset_sigpipe();
+    let explain = matches!(&command, ResourceSubCommand::Explain(_));
     match command {
         ResourceSubCommand::Validate { path, from_daemon, host, skill_catalog } => {
             if from_daemon {
@@ -2094,7 +2128,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
             }
             print_resource_read(daemon.as_ref(), node_id, response, format).await
         }
-        ResourceSubCommand::Get(args) => {
+        ResourceSubCommand::Get(args) | ResourceSubCommand::Explain(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
             let daemon = connect_daemon(cli).await?;
             let response = flotilla_client::resource::ResourceClient::new(Arc::clone(&daemon))
@@ -2108,7 +2142,20 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 )
                 .await
                 .map_err(|e| color_eyre::eyre::eyre!(e))?;
-            print_resource_read(daemon.as_ref(), node_id, response, format).await
+            if explain {
+                let explanations: Vec<_> =
+                    response.records.iter().filter_map(|record| record.object.as_ref()).map(charter_record_explanation).collect();
+                if format == OutputFormat::Json {
+                    println!("{}", flotilla_protocol::output::json_pretty(&explanations));
+                } else {
+                    for explanation in explanations {
+                        println!("{}", flotilla_protocol::output::json_pretty(&explanation));
+                    }
+                }
+                Ok(())
+            } else {
+                print_resource_read(daemon.as_ref(), node_id, response, format).await
+            }
         }
         ResourceSubCommand::ReconcileNow(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
@@ -3751,6 +3798,25 @@ mod tests {
                 })
             }) if kind == "terminalsessions" && name == "session-a" && namespace == "flotilla"
         ));
+    }
+
+    // Glue: resource explain projects applier-owned provenance from both
+    // authored record formats and parses with the same addressing as get.
+    #[test]
+    fn resource_explain_reports_charter_revision() {
+        let cli = Cli::try_parse_from(["flotilla", "resource", "explain", "projects", "app"]).expect("explain parses");
+        assert!(matches!(cli.command, Some(SubCommand::Resource { command: ResourceSubCommand::Explain(_) })));
+        for (source, path, revision) in
+            [("manifest-source", "manifest-path", "manifest-revision"), ("source-repository", "source-entry-path", "source-commit")]
+        {
+            let annotations = serde_json::json!({ format!("flotilla.work/{source}"): "repo", format!("flotilla.work/{path}"): "input.yaml", format!("flotilla.work/{revision}"): "commit-123" });
+            let explanation = super::charter_record_explanation(
+                &serde_json::json!({ "kind": "Project", "metadata": { "name": "app", "namespace": "flotilla", "annotations": annotations }}),
+            );
+            assert_eq!(explanation["charter"]["revision"], "commit-123");
+            assert_eq!(explanation["charter"]["path"], "input.yaml");
+            assert_eq!(explanation["charter"]["source"], "repo");
+        }
     }
 
     #[test]

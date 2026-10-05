@@ -65,6 +65,7 @@ async fn declared_issue_source_does_not_hide_an_unavailable_member_repository() 
         issue_source_bindings: vec![IssueSourceBindingSpec::builder().source(override_source.clone()).alias("widgets".to_string()).build()],
         dispatch_policy: None,
         repositories: vec![ProjectRepositorySpec {
+            charter_store: None,
             repo: RepositoryKey("repository-not-present-on-this-host".into()),
             alias: None,
             roles: Default::default(),
@@ -193,6 +194,7 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
         dispatch_policy: None,
         repositories: vec![
             ProjectRepositorySpec {
+                charter_store: None,
                 repo: first.key(),
                 alias: Some("core".into()),
                 roles: [ProjectRepositoryRole::Code].into(),
@@ -200,6 +202,7 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
                 default_branch: None,
             },
             ProjectRepositorySpec {
+                charter_store: None,
                 repo: second.key(),
                 alias: Some("api".into()),
                 roles: [ProjectRepositoryRole::Code].into(),
@@ -207,6 +210,7 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
                 default_branch: None,
             },
             ProjectRepositorySpec {
+                charter_store: None,
                 repo: first.key(),
                 alias: None,
                 roles: Default::default(),
@@ -276,6 +280,7 @@ async fn project_issue_source_resolution_reports_typed_unavailability() {
         issue_source_bindings: Vec::new(),
         dispatch_policy: None,
         repositories: vec![ProjectRepositorySpec {
+            charter_store: None,
             repo: local.key(),
             alias: None,
             roles: Default::default(),
@@ -292,6 +297,7 @@ async fn project_issue_source_resolution_reports_typed_unavailability() {
     let unresolved = ProjectSpec {
         platform_matrix: Vec::new(),
         repositories: vec![ProjectRepositorySpec {
+            charter_store: None,
             repo: missing.clone(),
             alias: None,
             roles: Default::default(),
@@ -477,13 +483,21 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
         dispatch_policy: None,
         repositories: vec![
             ProjectRepositorySpec {
+                charter_store: None,
                 repo: repo_b.clone(),
                 alias: None,
                 roles: Default::default(),
                 subpath: Some("./apps/api".to_string()),
                 default_branch: None,
             },
-            ProjectRepositorySpec { repo: repo_a.clone(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
+            ProjectRepositorySpec {
+                charter_store: None,
+                repo: repo_a.clone(),
+                alias: None,
+                roles: Default::default(),
+                subpath: None,
+                default_branch: None,
+            },
         ],
     })
     .expect("project should normalize");
@@ -504,8 +518,22 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
         issue_source_bindings: Vec::new(),
         dispatch_policy: None,
         repositories: vec![
-            ProjectRepositorySpec { repo: repo_b.clone(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
-            ProjectRepositorySpec { repo: repo_b, alias: None, roles: Default::default(), subpath: None, default_branch: None },
+            ProjectRepositorySpec {
+                charter_store: None,
+                repo: repo_b.clone(),
+                alias: None,
+                roles: Default::default(),
+                subpath: None,
+                default_branch: None,
+            },
+            ProjectRepositorySpec {
+                charter_store: None,
+                repo: repo_b,
+                alias: None,
+                roles: Default::default(),
+                subpath: None,
+                default_branch: None,
+            },
         ],
     };
     assert!(normalize_project_spec(duplicate).expect_err("duplicates should fail").contains("duplicate"));
@@ -528,6 +556,7 @@ fn project_subpaths_reject_absolute_and_parent_traversal() {
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
+                charter_store: None,
                 repo: RepositoryKey("repo".to_string()),
                 alias: None,
                 roles: Default::default(),
