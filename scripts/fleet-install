@@ -49,6 +49,11 @@ die() {
   exit 1
 }
 
+require_generation_validator() {
+  [[ -f "$GENERATION_VALIDATOR" && -r "$GENERATION_VALIDATOR" ]] \
+    || die "generation validator is missing or unreadable: $GENERATION_VALIDATOR; sync fleet-install and generation_validation.py together"
+}
+
 cleanup() {
   local status=$?
   # Before the generation flip there is no health watchdog to restore launchd.
@@ -914,6 +919,7 @@ require_handoff_lock() {
 install_generation() {
   local generation="$1"
   require_generation "$generation"
+  require_generation_validator
   acquire_install_lock
   mkdir -p "$RELEASES_DIR"
   local old rollback_generation confirmation_token
@@ -996,6 +1002,7 @@ show_status() {
 }
 
 rollback() {
+  require_generation_validator
   acquire_install_lock
   [[ -L "$CURRENT_LINK" ]] || die 'no current generation to roll back'
   [[ -L "$PREVIOUS_LINK" ]] || die 'no previous generation to roll back to'
@@ -1159,6 +1166,7 @@ usage() {
 main() {
   if [[ "${1:-}" == __validate_fixture ]]; then
     [[ $# -eq 2 ]] || usage
+    require_generation_validator
     python3 "$GENERATION_VALIDATOR" fixture "$2"
     return
   fi
@@ -1189,6 +1197,7 @@ main() {
       show_status
       ;;
     latest)
+      require_generation_validator
       local generation
       # Allocate in the parent shell so cleanup and the activation handoff
       # retain ownership when latest_generation runs in command substitution.

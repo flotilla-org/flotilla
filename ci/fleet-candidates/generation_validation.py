@@ -12,8 +12,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-from xml.parsers.expat import ExpatError
 from pathlib import Path, PurePosixPath
+from xml.parsers.expat import ExpatError
 
 PLATFORMS = ("linux-x86_64-gnu2.36", "darwin-aarch64")
 SOURCE_NAMES = ("flotilla", "cleat", "mattpocock-skills", "rjw-skills")
@@ -462,7 +462,7 @@ def validate_entitlements(path, relative):
     try:
         entitlements = plistlib.loads(content) if content.strip() else {}
     except (plistlib.InvalidFileException, ExpatError) as error:
-        raise ValidationError(f"signed Darwin payload has unreadable entitlements: {relative}: {error}")
+        raise ValidationError(f"signed Darwin payload has unreadable entitlements: {relative}: {error}") from error
     if entitlements != {}:
         raise ValidationError(f"signed Darwin payload has unexpected entitlements: {relative}")
 
