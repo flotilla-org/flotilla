@@ -375,6 +375,13 @@ pub struct ExplainedCrewDelivery {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ExplainedDecisionLedger {
+    /// The durable ledger evidence; the PR comment is only a projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_address: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub projection_missing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_error: Option<String>,
     pub vessel: String,
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -838,12 +838,18 @@ impl CrewService {
             .map_err(|error| error.to_string())?;
         }
         let ledger_name = flotilla_resources::artifact_record_name(convoy_name, &context.caller_role, "decision-ledger", convoy_name);
-        let projected_ledger_ref =
+        let ledger_artifact =
             match self.resource_backend.including_replicas::<flotilla_resources::Artifact>(namespace).get(&ledger_name).await {
-                Ok(record) => record.object.spec.summary.get("comment_url").and_then(serde_json::Value::as_str).map(str::to_string),
+                Ok(record) => Some(record.object),
                 Err(flotilla_resources::ResourceError::NotFound { .. }) => None,
                 Err(error) => return Err(error.to_string()),
             };
+        let decision_ledger_digest = ledger_artifact.as_ref().map(|artifact| artifact.spec.digest.clone());
+        let projected_ledger_ref = ledger_artifact
+            .as_ref()
+            .and_then(|artifact| artifact.spec.summary.get("comment_url"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         let decision_ledger_ref = projected_ledger_ref.or(decision_ledger_ref);
         // This records the principal declared by the connected surface. Stronger
         // authentication and operator/agent separation belongs to the caller-
@@ -856,7 +862,12 @@ impl CrewService {
             .and_then(|status| status.crew_work.get(&context.vessel))
             .and_then(|crew| crew.get(&context.caller_role))
             .is_some_and(|claim| {
-                claim.phase == CrewWorkPhase::Done && (claim.decision_ledger_ref.is_some() || claim.completion_override.is_some())
+                // Admission survives artifact retention, but a legacy Done status without
+                // artifact evidence, a projection pointer, or an operator override must revalidate.
+                claim.phase == CrewWorkPhase::Done
+                    && (claim.decision_ledger_digest.is_some()
+                        || claim.decision_ledger_ref.is_some()
+                        || claim.completion_override.is_some())
             });
         if decision_ledger_ref.is_none() && forced_by.is_none() && existing_claim_is_admitted {
             return Ok(flotilla_protocol::CommandValue::Ok);
@@ -1013,6 +1024,7 @@ impl CrewService {
                     message,
                     disposition,
                     decision_ledger_ref,
+                    decision_ledger_digest,
                     completed_while_crew_active,
                     forced_by,
                 ),
@@ -1032,6 +1044,7 @@ impl CrewService {
                 message,
                 disposition,
                 decision_ledger_ref,
+                decision_ledger_digest,
                 completed_while_crew_active,
                 forced_by,
             ),

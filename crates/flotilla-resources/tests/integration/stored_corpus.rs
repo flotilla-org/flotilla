@@ -123,3 +123,16 @@ fn prior_generation_label_spellings_remain_selectable() {
         assert!(flotilla_resources::labels_match(&labels, &BTreeMap::from([(key.to_string(), value.clone())])));
     }
 }
+
+// #2681 review: prior-generation claims omit artifact admission digests. The optional
+// status field must decode without rewriting the deployed golden corpus.
+#[test]
+fn previous_generation_crew_claims_decode_without_ledger_digest() {
+    let state: flotilla_resources::CrewWorkState = serde_json::from_value(serde_json::json!({
+        "phase": "Done",
+        "superseded_claims": [{ "claimed_at": "2026-10-05T12:00:00Z", "completed_while_crew_active": false }],
+    }))
+    .expect("previous crew state and superseded claim");
+    assert!(state.decision_ledger_digest.is_none());
+    assert!(state.superseded_claims[0].decision_ledger_digest.is_none());
+}

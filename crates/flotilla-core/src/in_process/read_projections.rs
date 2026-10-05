@@ -977,6 +977,7 @@ impl ReadProjections<'_> {
             .collect::<BTreeSet<_>>();
         let bound_name = bound_change_request_record_name(&convoy).map_err(|error| format!("derive bound change request: {error}"))?;
         let mut observation_errors = BTreeMap::new();
+        let projection_expected = !expected_change_request_leaves.is_empty();
         for leaf in expected_change_request_leaves {
             if let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = leaf.address {
                 let subject = crate::change_request_observer::ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
@@ -1115,7 +1116,6 @@ impl ReadProjections<'_> {
             }
         };
 
-        let decision_ledgers = explained_decision_ledgers(convoy.status.as_ref());
         let lifecycle_mutations = convoy
             .status
             .as_ref()
@@ -1138,7 +1138,7 @@ impl ReadProjections<'_> {
             .unwrap_or_default();
 
         let stores = self.config.load_daemon_config()?.blob_stores;
-        let mut artifacts = self
+        let artifact_sources = self
             .backend
             .including_replicas::<flotilla_resources::Artifact>(namespace)
             .list()
@@ -1147,6 +1147,11 @@ impl ReadProjections<'_> {
             .items
             .into_iter()
             .filter(|item| item.object.spec.convoy == convoy.metadata.name)
+            .collect::<Vec<_>>();
+        let decision_ledgers =
+            explained_decision_ledgers(&convoy.metadata.name, convoy.status.as_ref(), &artifact_sources, projection_expected);
+        let mut artifacts = artifact_sources
+            .into_iter()
             .map(|item| ExplainedArtifact {
                 kind: item.object.spec.kind.clone(),
                 address: format!("artifact/{}", item.object.metadata.name),
@@ -1283,7 +1288,12 @@ fn explained_unclaimed_work(
         .collect()
 }
 
-fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDecisionLedger> {
+fn explained_decision_ledgers(
+    convoy_name: &str,
+    status: Option<&ConvoyStatus>,
+    artifacts: &[ReadResourceObject<flotilla_resources::Artifact>],
+    projection_expected: bool,
+) -> Vec<ExplainedDecisionLedger> {
     status
         .into_iter()
         .flat_map(|status| &status.crew_work)
@@ -1296,6 +1306,10 @@ fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDec
                         vessel: vessel.clone(),
                         role: role.clone(),
                         claimed_at: Some(superseded.claimed_at.to_rfc3339()),
+                        // The mutable artifact key describes the current turn, not this historical claim.
+                        artifact_address: None,
+                        projection_missing: false,
+                        projection_error: None,
                         comment_url: superseded.decision_ledger_ref.clone(),
                         missing: superseded.decision_ledger_ref.is_none(),
                         override_principal: superseded.completion_override.as_ref().map(|override_| override_.principal.clone()),
@@ -1305,12 +1319,42 @@ fn explained_decision_ledgers(status: Option<&ConvoyStatus>) -> Vec<ExplainedDec
                     })
                     .collect::<Vec<_>>();
                 if matches!(claim.phase, CrewWorkPhase::Done | CrewWorkPhase::HandedBack) {
+                    let name = flotilla_resources::artifact_record_name(convoy_name, role, "decision-ledger", convoy_name);
+                    let artifact = artifacts
+                        .iter()
+                        .filter(|source| source.object.metadata.name == name)
+                        .min_by_key(|source| !matches!(source.provenance, ResourceProvenance::Local))
+                        .filter(|source| {
+                            let artifact = &source.object.spec;
+                            match claim.decision_ledger_digest.as_deref() {
+                                Some(digest) => artifact.digest == digest,
+                                // Legacy claims have no admitted digest. When a hand-back has dated
+                                // evidence, exclude bodies recorded after its claim; undated records
+                                // remain readable under the previous-generation compatibility contract.
+                                None => {
+                                    claim.phase != CrewWorkPhase::HandedBack
+                                        || artifact.recorded_at.zip(claim.finished_at).is_none_or(|(recorded, claimed)| recorded <= claimed)
+                                }
+                            }
+                        });
+                    let comment_url = artifact
+                        .and_then(|source| source.object.spec.summary.get("comment_url"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| claim.decision_ledger_ref.clone());
+                    let projection_error = artifact
+                        .and_then(|source| source.object.spec.summary.get("projection_error"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
                     ledgers.push(ExplainedDecisionLedger {
                         vessel: vessel.clone(),
                         role: role.clone(),
                         claimed_at: claim.finished_at.map(|at| at.to_rfc3339()),
-                        comment_url: claim.decision_ledger_ref.clone(),
-                        missing: claim.decision_ledger_ref.is_none(),
+                        artifact_address: artifact.map(|source| format!("artifact/{}", source.object.metadata.name)),
+                        projection_missing: projection_expected && (comment_url.is_none() || projection_error.is_some()),
+                        projection_error,
+                        comment_url,
+                        missing: artifact.is_none(),
                         override_principal: claim.completion_override.as_ref().map(|override_| override_.principal.clone()),
                         completed_while_crew_active: claim.completed_while_crew_active,
                         message: claim.message.clone(),
@@ -2260,8 +2304,161 @@ mod tests {
         assert!(explanation.crew_deliveries[0].terminal_condition.is_none());
     }
 
+    // #2677: a ledger artifact attributed to the claiming crew is evidence even without a PR comment.
+    #[tokio::test]
+    async fn prless_decision_ledger_artifact_explains_as_present() {
+        decision_ledger_explanation_case(false, false, false).await;
+    }
+
+    // #2677: a bound PR with a failed projection reports the artifact as present and flags the projection.
+    #[tokio::test]
+    async fn bound_decision_ledger_artifact_flags_failed_projection() {
+        decision_ledger_explanation_case(true, true, false).await;
+    }
+
+    // Generate PR binding, projection failures, and successful comment projections independently.
+    // Every scenario also checks absent and misattributed evidence before publishing the claiming crew's ledger.
+    #[hegel::test]
+    fn decision_ledger_evidence_is_independent_of_pr_projection(tc: hegel::TestCase) {
+        let pr_bound = tc.draw(gs::booleans());
+        let projection_failure = tc.draw(gs::booleans());
+        let comment = tc.draw(gs::booleans());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(decision_ledger_explanation_case(pr_bound, projection_failure, comment));
+    }
+
+    async fn decision_ledger_explanation_case(pr_bound: bool, projection_failure: bool, comment: bool) {
+        let fixture = ProjectionFixture::new();
+        let convoys = fixture.backend.using::<ResourceConvoy>("flotilla");
+        let created = convoys
+            .create(
+                &InputMeta::builder().name("ledger-artifact".into()).build(),
+                &ConvoySpec::builder()
+                    .workflow_ref("review".into())
+                    .subjects(if pr_bound {
+                        vec![flotilla_resources::DeclaredSubject {
+                            subject: Subject {
+                                kind: SubjectKind::ChangeRequest,
+                                source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "owner/repo".into() },
+                                id: "42".into(),
+                            },
+                            relationship: flotilla_protocol::Relationship::Produces,
+                            issue: None,
+                            change_request: None,
+                        }]
+                    } else {
+                        Vec::new()
+                    })
+                    .build(),
+            )
+            .await
+            .expect("convoy");
+        convoys
+            .update_status("ledger-artifact", &created.metadata.resource_version, &ConvoyStatus {
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Done).finished_at(Utc::now()).build())]),
+                )]),
+                ..Default::default()
+            })
+            .await
+            .expect("claim");
+        let mut summary = BTreeMap::new();
+        if projection_failure {
+            summary.insert("projection_error".into(), serde_json::json!("forge unavailable"));
+        }
+        if comment {
+            summary.insert("comment_url".into(), serde_json::json!("https://example.test/comment"));
+        }
+        for (producer, subject) in [("reviewer", "ledger-artifact"), ("coder", "other-subject"), ("coder", "ledger-artifact")] {
+            let explanation = fixture.projections().explain_convoy("flotilla", "ledger-artifact").await.expect("explanation");
+            assert!(explanation.decision_ledgers[0].missing, "another crew or subject cannot supply this claim's evidence");
+            let name = flotilla_resources::artifact_record_name("ledger-artifact", producer, "decision-ledger", subject);
+            fixture
+                .backend
+                .using::<flotilla_resources::Artifact>("flotilla")
+                .create(
+                    &InputMeta::builder().name(name).build(),
+                    &flotilla_resources::ArtifactSpec::builder()
+                        .convoy("ledger-artifact".into())
+                        .producer(producer.into())
+                        .kind("decision-ledger".into())
+                        .subject(subject.into())
+                        .summary(summary.clone())
+                        .digest("ledger".into())
+                        .size(1)
+                        .media_type("text/markdown".into())
+                        .expires_at(Utc::now() + ChronoDuration::days(1))
+                        .build(),
+                )
+                .await
+                .expect("ledger artifact");
+        }
+        let explanation = fixture.projections().explain_convoy("flotilla", "ledger-artifact").await.expect("explanation");
+        let ledger = &explanation.decision_ledgers[0];
+        assert!(!ledger.missing, "artifact must satisfy the ledger expectation");
+        assert!(ledger.artifact_address.is_some());
+        assert_eq!(ledger.comment_url.is_some(), comment);
+        assert_eq!(ledger.projection_missing, pr_bound && (projection_failure || !comment));
+        assert_eq!(ledger.projection_error.as_deref(), projection_failure.then_some("forge unavailable"));
+    }
+
+    // Review #2681: HandedBack claims must not borrow a later turn's body; local evidence
+    // wins over a replica regardless of list order. Generate known/legacy claim identity,
+    // matching/different bodies, before/after recording times, and both source orderings.
+    #[hegel::test]
+    fn ledger_artifact_selection_respects_claim_identity_and_local_authority(tc: hegel::TestCase) {
+        let known_digest = tc.draw(gs::booleans());
+        let matching = tc.draw(gs::booleans());
+        let later = tc.draw(gs::booleans());
+        let replica_first = tc.draw(gs::booleans());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let at = Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).single().expect("timestamp");
+            let name = flotilla_resources::artifact_record_name("claimed", "coder", "decision-ledger", "claimed");
+            let mut spec = flotilla_resources::ArtifactSpec::builder()
+                .convoy("claimed".into())
+                .producer("coder".into())
+                .kind("decision-ledger".into())
+                .subject("claimed".into())
+                .digest(if matching { "admitted" } else { "later-body" }.into())
+                .size(1)
+                .media_type("text/markdown".into())
+                .expires_at(at + ChronoDuration::days(1))
+                .build();
+            spec.recorded_at = Some(at + ChronoDuration::seconds(if later { 1 } else { -1 }));
+            spec.summary.insert("comment_url".into(), serde_json::json!("https://example.test/local"));
+            let object = backend
+                .using::<flotilla_resources::Artifact>("flotilla")
+                .create(&InputMeta::builder().name(name).build(), &spec)
+                .await
+                .expect("artifact");
+            let local = ReadResourceObject { object: object.clone(), provenance: ResourceProvenance::Local };
+            let mut replica = ReadResourceObject {
+                object,
+                provenance: ResourceProvenance::Replica { origin_root: NodeId::new("other"), last_synced_at: at },
+            };
+            replica.object.spec.summary.insert("comment_url".into(), serde_json::json!("https://example.test/replica"));
+            let artifacts = if replica_first { vec![replica, local] } else { vec![local, replica] };
+            let mut claim = CrewWorkState::builder().phase(CrewWorkPhase::HandedBack).finished_at(at).build();
+            claim.decision_ledger_digest = known_digest.then(|| "admitted".into());
+            let status = ConvoyStatus {
+                crew_work: BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), claim)]))]),
+                ..Default::default()
+            };
+            let ledgers = explained_decision_ledgers("claimed", Some(&status), &artifacts, true);
+            let present = if known_digest { matching } else { !later };
+            assert_eq!(ledgers[0].missing, !present);
+            assert_eq!(ledgers[0].artifact_address.is_some(), present);
+            assert_eq!(ledgers[0].comment_url.as_deref(), present.then_some("https://example.test/local"));
+        });
+    }
+
+    // A legacy PR projection can outlive its retained artifact. Report the surviving
+    // comment independently; it cannot satisfy the artifact expectation.
     #[test]
-    fn completed_claims_without_a_decision_ledger_are_visible_in_explanations() {
+    fn comment_projection_without_artifact_remains_missing_in_explanations() {
         let claimed_at = chrono::Utc.with_ymd_and_hms(2026, 8, 21, 12, 0, 0).single().expect("timestamp");
         let status = ConvoyStatus {
             crew_work: BTreeMap::from([(
@@ -2281,11 +2478,11 @@ mod tests {
             ..Default::default()
         };
 
-        let ledgers = explained_decision_ledgers(Some(&status));
+        let ledgers = explained_decision_ledgers("test", Some(&status), &[], true);
         assert_eq!(ledgers.len(), 2);
         assert!(ledgers.iter().any(|ledger| ledger.role == "coder" && ledger.missing && ledger.comment_url.is_none()));
         assert!(ledgers.iter().any(|ledger| {
-            ledger.role == "reviewer" && !ledger.missing && ledger.comment_url.as_deref() == Some("https://example.test/pull/1#comment-2")
+            ledger.role == "reviewer" && ledger.missing && ledger.comment_url.as_deref() == Some("https://example.test/pull/1#comment-2")
         }));
     }
 
