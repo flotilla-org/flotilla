@@ -1015,6 +1015,11 @@ impl HandledRung {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct ConvoyRow {
+    /// Controller-owned admission holds, including capacity waits before a
+    /// workflow snapshot or concrete Vessel exists.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub admission_blockers: Vec<ReadinessBlocker>,
     /// Row identity and merge key across hosts.
     pub resource: ResourceRef,
     /// Stable role identity when this record participates in role addressing.
@@ -1096,10 +1101,106 @@ pub struct ConvoyChangeRequest {
     pub repository_key: RepositoryKey,
 }
 
+/// Readiness is independent of workflow lifecycle and attachment capability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessState {
+    Ready,
+    #[default]
+    Unknown,
+    Provisioning,
+    Blocked,
+    Failed,
+}
+
+impl ReadinessState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Provisioning => "provisioning",
+            Self::Unknown => "unknown",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Current evidence explaining an unavailable vessel. Resource identities and
+/// phases are retained so surfaces need not parse controller message prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadinessBlocker {
+    pub resource: ResourceRef,
+    pub phase: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Readiness {
+    pub state: ReadinessState,
+    pub blockers: Vec<ReadinessBlocker>,
+}
+
+impl Readiness {
+    pub fn aggregate<'a>(values: impl IntoIterator<Item = &'a Self>) -> Self {
+        let mut result = Self { state: ReadinessState::Ready, blockers: Vec::new() };
+        let mut any = false;
+        for value in values {
+            any = true;
+            result.state = result.state.max(value.state);
+            for blocker in &value.blockers {
+                if !result.blockers.contains(blocker) {
+                    result.blockers.push(blocker.clone());
+                }
+            }
+        }
+        if !any {
+            result.state = ReadinessState::Unknown;
+        }
+        result
+    }
+
+    pub fn explanation(&self) -> String {
+        self.blockers
+            .iter()
+            .map(|blocker| format!("{} {} ({}): {}", blocker.resource.kind, blocker.resource.name, blocker.phase, blocker.reason))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+impl ConvoyRow {
+    pub fn readiness(&self) -> Readiness {
+        if !self.phase.is_terminal() && !self.admission_blockers.is_empty() {
+            let mut readiness = Readiness::aggregate(self.vessels.iter().map(|vessel| &vessel.readiness));
+            readiness.state = readiness.state.max(ReadinessState::Blocked);
+            for blocker in &self.admission_blockers {
+                if !readiness.blockers.contains(blocker) {
+                    readiness.blockers.push(blocker.clone());
+                }
+            }
+            return readiness;
+        }
+        if self.initializing && !self.phase.is_terminal() {
+            return Readiness {
+                state: ReadinessState::Provisioning,
+                blockers: vec![ReadinessBlocker {
+                    resource: self.resource.clone(),
+                    phase: "Admission".into(),
+                    reason: self.message.clone().unwrap_or_else(|| "awaiting workflow admission".into()),
+                }],
+            };
+        }
+        Readiness::aggregate(self.vessels.iter().map(|vessel| &vessel.readiness))
+    }
+}
+
 /// One vessel within a [`ConvoyRow`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct VesselRow {
+    #[builder(default)]
+    #[serde(default)]
+    pub readiness: Readiness,
     /// `convoy_ref.subresource("vessels/{name}")`.
     pub resource: ResourceRef,
     /// Concrete Vessel resource realizing this workflow requirement, when it

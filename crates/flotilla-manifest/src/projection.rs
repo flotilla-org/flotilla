@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_protocol::{
     result_set::{
         AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, CleatEndpoint, ConvoyPhase,
-        ConvoyRow, IndependentRow, ProjectRepositoriesRow, SessionPhase, StandingRoleHold, StandingRoleRow, SurfaceState, Timestamp,
-        VesselRow, WorkPhase,
+        ConvoyRow, IndependentRow, ProjectRepositoriesRow, Readiness, ReadinessState, SessionPhase, StandingRoleHold, StandingRoleRow,
+        SurfaceState, Timestamp, VesselRow, WorkPhase,
     },
     HostName, ReferenceContext, ViewAddress, AWARENESS_REL_FOR_CONVOY,
 };
@@ -356,6 +356,7 @@ pub fn project_catalog_without_warnings(input: &CatalogInput<'_>, mint: &dyn Rec
         for node in nodes {
             project_awareness_node(&mut catalog, node, input.convoys, mint);
         }
+        project_readiness(&mut catalog, input.convoys);
         mark_superseded_convoys(&mut catalog, input.convoys);
         project_standing_roles(&mut catalog, input.standing_roles, input.convoys, mint);
         project_repository_memberships(&mut catalog, input.project_repositories);
@@ -367,6 +368,7 @@ pub fn project_catalog_without_warnings(input: &CatalogInput<'_>, mint: &dyn Rec
     for convoy in input.convoys {
         project_convoy(&mut catalog, convoy, mint);
     }
+    project_readiness(&mut catalog, input.convoys);
     for independent in input.independents {
         project_independent(&mut catalog, independent, mint);
     }
@@ -492,7 +494,7 @@ fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys:
         // Presentations may show the role in place of its attempt, so the
         // attempt's own attention (e.g. a vessel waiting for input) surfaces here.
         (None, Some(convoy)) => {
-            let badge = convoy_badge(convoy.phase, convoy.initializing);
+            let badge = readiness_badge(convoy_badge(convoy.phase, convoy.initializing), &convoy.readiness());
             let vessel_attention = convoy.vessels.iter().any(|vessel| vessel.surface_state.needs_attention());
             Badge { attention: convoy.surface_state.needs_attention() || vessel_attention, ..badge }
         }
@@ -523,6 +525,7 @@ fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys:
     if let Some(convoy) = live {
         facts.push((KEY_CONVOY_PHASE, MetadataValue::text(convoy.phase.as_str())));
         facts.extend(surface_facts(convoy.surface_state));
+        facts.extend(readiness_facts(&convoy.readiness(), attach.is_some()));
     }
     if badge.attention {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
@@ -904,6 +907,69 @@ fn convoy_identity_facts(convoy: &ConvoyRow) -> Vec<(&'static str, MetadataValue
     ];
     facts.extend(label_tier_facts(&convoy.name));
     facts
+}
+
+/// Apply readiness identically to raw-row and awareness catalogs, without
+/// creating entities that the chosen catalog view did not include.
+fn project_readiness(catalog: &mut Catalog, convoys: &[ConvoyRow]) {
+    fn apply(catalog: &mut Catalog, entity: EntityRef, readiness: &Readiness, attach: bool) {
+        let Some(facts) = catalog.facts.get_mut(&MetadataTarget::Entity(entity)) else {
+            return;
+        };
+        if let Some(status) = facts.get_mut(KEY_STATUS_STATE) {
+            if status.value == MetadataValue::text(BadgeState::Active.as_str()) {
+                let badge = readiness_badge(Badge { state: BadgeState::Active, attention: false }, readiness);
+                status.value = MetadataValue::text(badge.state.as_str());
+            }
+        }
+        for (key, value) in readiness_facts(readiness, attach) {
+            facts.insert(key.into(), MetadataValueUpdate::new(value, Some(CATALOG_TTL_MS)));
+        }
+    }
+    for convoy in convoys {
+        let origin = entity::resource_origin(&convoy.resource);
+        apply(
+            catalog,
+            entity::convoy(&convoy.resource.namespace, &convoy.resource.name, &origin),
+            &convoy.readiness(),
+            matches!(convoy.vessels.as_slice(), [vessel] if vessel.materialize.is_some()),
+        );
+        for vessel in &convoy.vessels {
+            apply(
+                catalog,
+                entity::vessel(&convoy.resource.namespace, &convoy.resource.name, &vessel.name, vessel.host.as_str()),
+                &vessel.readiness,
+                vessel.materialize.is_some(),
+            );
+        }
+    }
+}
+
+fn readiness_facts(readiness: &Readiness, attach_available: bool) -> Vec<(&'static str, MetadataValue)> {
+    use crate::keys::{KEY_READINESS_ATTACH_AVAILABLE, KEY_READINESS_BLOCKERS, KEY_READINESS_STATE};
+    vec![
+        (KEY_READINESS_STATE, MetadataValue::text(readiness.state.as_str())),
+        (
+            KEY_READINESS_BLOCKERS,
+            MetadataValue::StringList(
+                readiness.blockers.iter().map(|blocker| serde_json::to_string(blocker).expect("readiness blocker serializes")).collect(),
+            ),
+        ),
+        (KEY_READINESS_ATTACH_AVAILABLE, MetadataValue::Bool(attach_available)),
+    ]
+}
+
+fn readiness_badge(badge: Badge, readiness: &Readiness) -> Badge {
+    if badge.state != BadgeState::Active {
+        return badge;
+    }
+    match readiness.state {
+        ReadinessState::Provisioning | ReadinessState::Blocked | ReadinessState::Unknown => {
+            Badge { state: BadgeState::Waiting, attention: badge.attention }
+        }
+        ReadinessState::Failed => Badge { state: BadgeState::Failed, attention: true },
+        ReadinessState::Ready => badge,
+    }
 }
 
 fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMint) {

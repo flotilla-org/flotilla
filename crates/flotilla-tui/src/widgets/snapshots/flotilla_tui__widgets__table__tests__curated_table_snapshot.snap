@@ -1,15 +1,16 @@
 ---
 source: crates/flotilla-tui/src/widgets/table.rs
+assertion_line: 732
 expression: terminal.backend()
 ---
 "┌ Convoys · dev ───────────────────────────────────────────────────────────────────────────────────────────────────────┐"
 "│convoys/dev                                                                                                           │"
-"│CONVOY                WORKFLOW       PHASE        PR               VESSELS PROJECT / REPO   MESSAGE                   │"
-"│tables @ flotilla     implement-revi pending                           0/2 flotilla         waiting for workflow stat │"
-"│release @ flotilla    implement-revi active       !815                 1/3 flotilla         review is running         │"
-"│docs @ flotilla       implement-revi landed       !812                 2/2 flotilla                                   │"
-"│deploy @ flotilla     implement-revi failed                            1/2 flotilla         workspace launch failed   │"
-"│                                                                                                                      │"
+"│CONVOY           WORKFLOW     PHASE        READINESS    PR               VESSELS PROJECT / REPO MESSAGE               │"
+"│tables @ flotill implement-re pending      provisioning                      0/2 flotilla       waiting for workflow  │"
+"│release @ flotil implement-re active       provisioning !815                 1/3 flotilla       review is running     │"
+"│docs @ flotilla  implement-re landed       ready        !812                 2/2 flotilla                             │"
+"│deploy @ flotill implement-re failed       failed                            1/2 flotilla       workspace launch fai  │"
+"│governor @ floti implement-re active       blocked                           0/1 flotilla       Forgejo authenticati  │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"
 "│                                                                                                                      │"

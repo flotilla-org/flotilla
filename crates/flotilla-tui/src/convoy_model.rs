@@ -145,6 +145,8 @@ pub struct WorkCompletionTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct VesselSummary {
+    #[builder(default)]
+    pub readiness: wire::Readiness,
     pub name: String,
     #[builder(default)]
     pub surface_state: SurfaceState,
@@ -166,6 +168,8 @@ pub struct VesselSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct ConvoySummary {
+    #[builder(default)]
+    pub readiness: wire::Readiness,
     pub id: ConvoyId,
     pub namespace: String,
     /// Unique resource identity (`Convoy.metadata.name`), distinct from the display role in `name`.
@@ -200,6 +204,7 @@ pub struct ConvoySummary {
 impl From<&wire::ConvoyRow> for ConvoySummary {
     fn from(row: &wire::ConvoyRow) -> Self {
         Self {
+            readiness: row.readiness(),
             id: ConvoyId::for_resource(&row.resource),
             namespace: row.resource.namespace.clone(),
             resource_name: row.resource.name.clone(),
@@ -243,6 +248,7 @@ fn vessel_summary(row: &wire::ConvoyRow, vessel: &wire::VesselRow) -> VesselSumm
         .map(|member| ProcessSummary { role: member.role.clone(), command_preview: member.command_preview.clone() })
         .collect();
     VesselSummary {
+        readiness: vessel.readiness.clone(),
         name: vessel.name.clone(),
         surface_state: vessel.surface_state,
         depends_on: vessel.depends_on.clone(),

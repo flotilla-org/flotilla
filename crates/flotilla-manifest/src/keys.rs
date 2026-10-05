@@ -269,3 +269,12 @@ pub const KEY_ISSUE_ASSIGNEES_OBSERVED_AT: &str = "flotilla.issue.assignees.obse
 /// Observed value; absent when Unknown. Its companion time is RFC 3339.
 pub const KEY_ISSUE_UPDATED_AT: &str = "flotilla.issue.updated_at";
 pub const KEY_ISSUE_UPDATED_AT_OBSERVED_AT: &str = "flotilla.issue.updated_at.observed_at";
+
+/// Current readiness, separate from convoy/work lifecycle and surface attention.
+pub const KEY_READINESS_STATE: &str = "flotilla.readiness.state";
+/// JSON-encoded ReadinessBlocker records, preserving resource, phase and reason.
+pub const KEY_READINESS_BLOCKERS: &str = "flotilla.readiness.blockers";
+/// Whether this entity has a direct terminal materialization action.
+/// A convoy or standing role requires exactly one vessel with a terminal;
+/// multi-vessel convoys expose attachment on each vessel instead.
+pub const KEY_READINESS_ATTACH_AVAILABLE: &str = "flotilla.readiness.attach_available";

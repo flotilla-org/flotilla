@@ -21,20 +21,20 @@ use flotilla_core::{
 use flotilla_protocol::{
     result_set::{
         CheckoutRow, ConvoyChangeRequest, ConvoyPhase, ConvoyRow, CrewMemberSummary, IndependentRow, ProjectRepositoriesRow,
-        ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ResultDelta, SessionPhase, StandingRoleHold, StandingRoleRow,
-        SurfaceState, VesselRow, WorkPhase,
+        ProjectRepositoryMembership, QueryChanges, QueryId, QueryScope, ReadinessBlocker, ReadinessState, ResultDelta, SessionPhase,
+        StandingRoleHold, StandingRoleRow, SurfaceState, VesselRow, WorkPhase,
     },
     AttachableId, Change, DaemonEvent, EntryOp, HostName, LifecycleAuthority, ManagedTerminal, PaneExitAttention, RepoDelta, RepoIdentity,
     RepositoryKey, ResourceRef, UNKNOWN_REPOSITORY_LABEL,
 };
 use flotilla_resources::{
-    api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec, Convoy,
-    ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource, Demand, DemandAddressee,
-    DemandState, Environment, Presentation, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard, RegardExpiryPolicy,
-    ReplicaReadResolver, Repository, RepositoryIdentity as ResourceRepositoryIdentity, Resource, ResourceError, ResourceList,
-    ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState, TerminalSession,
-    TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent, WatchStart, WatchStream, WorkPhase as ResourceWorkPhase,
-    WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    api_version, convoy_subject_rows, repository_display_labels, subject_relationship_conflicts, Checkout, CheckoutSpec,
+    Clone as CloneResource, Convoy, ConvoyEnsure, ConvoyEnsureHoldReason, ConvoyPhase as ResourceConvoyPhase, ConvoyStatus, CrewSource,
+    Demand, DemandAddressee, DemandState, Environment, Presentation, Project, ReadResourceList, ReadResourceObject, ReadWatchEvent, Regard,
+    RegardExpiryPolicy, ReplicaReadResolver, Repository, RepositoryIdentity as ResourceRepositoryIdentity, Resource, ResourceError,
+    ResourceList, ResourceObject, ResourceProvenance, StallRung, StalledCondition, TerminalAttention, TerminalAttentionState,
+    TerminalSession, TerminalSessionPhase, TypedResolver, Vessel, VesselRequirement, WatchEvent, WatchStart, WatchStream,
+    WorkPhase as ResourceWorkPhase, WorkState, CONVOY_LABEL, REPO_KEY_LABEL, REPO_LABEL, ROLE_LABEL, VESSEL_LABEL,
 };
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use tokio::{
@@ -44,6 +44,9 @@ use tokio::{
 use tracing::debug;
 
 use crate::issue_materializer::{IssueMaterializationResolver, IssueMaterializer, IssuePollingHealth};
+
+mod readiness;
+use readiness::{apply_readiness_event, readiness_resources};
 
 type RepositorySourceKey = (String, String, Option<flotilla_protocol::NodeId>);
 
@@ -66,6 +69,9 @@ pub struct AggregatorResolvers {
     durable_projects: ReplicaReadResolver<Project>,
     durable_repositories: ReplicaReadResolver<Repository>,
     durable_regards: TypedResolver<Regard>,
+    durable_vessels: ReplicaReadResolver<Vessel>,
+    durable_checkouts: ReplicaReadResolver<Checkout>,
+    durable_clones: TypedResolver<CloneResource>,
     observed_convoys: TypedResolver<Convoy>,
     observed_presentations: TypedResolver<Presentation>,
     observed_sessions: ReplicaReadResolver<TerminalSession>,
@@ -84,6 +90,9 @@ struct AggregatorSourceRefs<'a> {
     durable_projects: &'a dyn AggregatorReplicaWatchSource<Project>,
     durable_repositories: &'a dyn AggregatorReplicaWatchSource<Repository>,
     durable_regards: &'a dyn AggregatorWatchSource<Regard>,
+    durable_vessels: &'a dyn AggregatorReplicaWatchSource<Vessel>,
+    durable_checkouts: &'a dyn AggregatorReplicaWatchSource<Checkout>,
+    durable_clones: &'a dyn AggregatorWatchSource<CloneResource>,
     observed_convoys: &'a dyn AggregatorWatchSource<Convoy>,
     observed_presentations: &'a dyn AggregatorWatchSource<Presentation>,
     observed_sessions: &'a dyn AggregatorReplicaWatchSource<TerminalSession>,
@@ -227,6 +236,12 @@ pub struct Aggregator {
     attention_expired_through: Option<chrono::DateTime<chrono::Utc>>,
     observed_checkouts: HashMap<ResourceRef, ResourceObject<Checkout>>,
     #[builder(skip)]
+    readiness_vessels: BTreeMap<RepositorySourceKey, ReadResourceObject<Vessel>>,
+    #[builder(skip)]
+    readiness_checkouts: BTreeMap<RepositorySourceKey, ReadResourceObject<Checkout>>,
+    #[builder(skip)]
+    readiness_clones: BTreeMap<RepositorySourceKey, ReadResourceObject<CloneResource>>,
+    #[builder(skip)]
     checkout_replicas: HashMap<(String, String, flotilla_protocol::NodeId), ReadResourceObject<Checkout>>,
     bootstrapping: bool,
     emitted_queries: HashSet<QueryId>,
@@ -313,6 +328,9 @@ impl Aggregator {
             regards: HashMap::new(),
             attention_expired_through: None,
             observed_checkouts: HashMap::new(),
+            readiness_vessels: BTreeMap::new(),
+            readiness_checkouts: BTreeMap::new(),
+            readiness_clones: BTreeMap::new(),
             checkout_replicas: HashMap::new(),
             bootstrapping: false,
             emitted_queries: HashSet::new(),
@@ -373,6 +391,9 @@ impl Aggregator {
             durable_projects,
             durable_repositories,
             durable_regards,
+            durable_vessels,
+            durable_checkouts,
+            durable_clones,
             observed_convoys,
             observed_presentations,
             observed_sessions,
@@ -389,6 +410,9 @@ impl Aggregator {
             .durable_projects(&durable_projects)
             .durable_repositories(&durable_repositories)
             .durable_regards(&durable_regards)
+            .durable_vessels(&durable_vessels)
+            .durable_checkouts(&durable_checkouts)
+            .durable_clones(&durable_clones)
             .observed_convoys(&observed_convoys)
             .observed_presentations(&observed_presentations)
             .observed_sessions(&observed_sessions)
@@ -409,6 +433,9 @@ impl Aggregator {
             durable_projects,
             durable_repositories,
             durable_regards,
+            durable_vessels,
+            durable_checkouts,
+            durable_clones,
             observed_convoys,
             observed_presentations,
             observed_sessions,
@@ -449,6 +476,13 @@ impl Aggregator {
         let mut observed_session_stream = self.recover_observed_session_watch(observed_sessions).await?;
         let mut observed_checkout_stream = self.recover_checkout_watch(observed_checkouts).await?;
         let mut checkout_replica_stream = self.recover_checkout_replica_watch(observed_checkout_replicas).await?;
+        let (items, mut vessel_stream) = Self::recover_replica_watch(durable_vessels).await?;
+        self.readiness_vessels = readiness_resources(items);
+        let (items, mut readiness_checkout_stream) = Self::recover_replica_watch(durable_checkouts).await?;
+        self.readiness_checkouts = readiness_resources(items);
+        let mut readiness_clone_stream = self.recover_clone_readiness_watch(durable_clones).await?;
+        self.refresh_origin_hosts().await;
+        self.rebuild_local_projection().await;
         self.bootstrapping = false;
         self.emitted_queries.extend(QueryId::ALWAYS_MATERIALIZED.iter().cloned());
         self.event_sink.emit(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
@@ -545,6 +579,46 @@ impl Aggregator {
                         self.apply_change_request_resolution(resolution).await;
                     }
                 },
+                event = readiness_clone_stream.next() => {
+                    match event {
+                        Some(Ok(event)) => apply_readiness_event(&mut self.readiness_clones, local_read_event(event)),
+                        Some(Err(ResourceError::WatchExpired { .. })) => {
+                            readiness_clone_stream = self.recover_clone_readiness_watch(durable_clones).await?;
+                        }
+                        Some(Err(error)) => return Err(error),
+                        None => return Err(ResourceError::other("aggregator clone readiness watch ended")),
+                    }
+                    self.refresh_origin_hosts().await;
+                    self.rebuild_local_projection().await;
+                }
+                event = vessel_stream.next() => {
+                    match event {
+                        Some(Ok(event)) => apply_readiness_event(&mut self.readiness_vessels, event),
+                        Some(Err(ResourceError::WatchExpired { .. })) => {
+                            let (items, watch) = Self::recover_replica_watch(durable_vessels).await?;
+                            self.readiness_vessels = readiness_resources(items);
+                            vessel_stream = watch;
+                        }
+                        Some(Err(error)) => return Err(error),
+                        None => return Err(ResourceError::other("aggregator vessel readiness watch ended")),
+                    }
+                    self.refresh_origin_hosts().await;
+                    self.rebuild_local_projection().await;
+                }
+                event = readiness_checkout_stream.next() => {
+                    match event {
+                        Some(Ok(event)) => apply_readiness_event(&mut self.readiness_checkouts, event),
+                        Some(Err(ResourceError::WatchExpired { .. })) => {
+                            let (items, watch) = Self::recover_replica_watch(durable_checkouts).await?;
+                            self.readiness_checkouts = readiness_resources(items);
+                            readiness_checkout_stream = watch;
+                        }
+                        Some(Err(error)) => return Err(error),
+                        None => return Err(ResourceError::other("aggregator checkout readiness watch ended")),
+                    }
+                    self.refresh_origin_hosts().await;
+                    self.rebuild_local_projection().await;
+                }
                 event = durable_convoy_stream.next() => match event {
                     Some(Ok(event)) => self.apply_replica_convoy_event(event).await,
                     Some(Err(ResourceError::WatchExpired { .. })) => {
@@ -2053,6 +2127,9 @@ impl Aggregator {
             .flat_map(|convoys| convoys.values())
             .map(|convoy| &convoy.provenance)
             .chain(self.sessions_by_source.values().flat_map(|sessions| sessions.values()).map(|session| &session.provenance))
+            .chain(self.readiness_vessels.values().map(|source| &source.provenance))
+            .chain(self.readiness_clones.values().map(|source| &source.provenance))
+            .chain(self.readiness_checkouts.values().map(|source| &source.provenance))
             .chain(self.checkout_replicas.values().map(|checkout| &checkout.provenance))
             .filter_map(|provenance| match provenance {
                 ResourceProvenance::Local => None,
@@ -2221,6 +2298,7 @@ impl Aggregator {
                             definition,
                             status.and_then(|status| status.work.get(&definition.name)),
                             status.and_then(|status| status.stalled.as_ref()),
+                            status.and_then(|status| status.crew_work.get(&definition.name)),
                         )
                     })
                     .collect()
@@ -2262,6 +2340,15 @@ impl Aggregator {
             SurfaceState::Working
         };
         ConvoyRow::builder()
+            .admission_blockers(
+                status
+                    .and_then(|status| status.stalled.as_ref())
+                    .filter(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Controller { .. })))
+                    .map(|stalled| {
+                        vec![ReadinessBlocker { resource: resource.clone(), phase: "Admission".into(), reason: stalled.evidence.clone() }]
+                    })
+                    .unwrap_or_default(),
+            )
             .resource(resource.clone())
             .maybe_address_role(convoy.metadata.labels.get(ROLE_LABEL).cloned())
             .maybe_ensured_from(convoy.metadata.annotations.get(ENSURED_FROM_ANNOTATION).cloned())
@@ -2360,6 +2447,7 @@ impl Aggregator {
         definition: &VesselRequirement,
         state: Option<&WorkState>,
         stalled: Option<&StalledCondition>,
+        crew_work: Option<&BTreeMap<String, flotilla_resources::CrewWorkState>>,
     ) -> VesselRow {
         let placement = state.and_then(|state| state.placement.as_ref());
         let requested_stance = placement
@@ -2461,7 +2549,20 @@ impl Aggregator {
                 })
                 .unwrap_or_default()
         };
+        let mut readiness = self.vessel_readiness(convoy_ref, definition, state, crew_work, &vessel_host);
+        if readiness.state == ReadinessState::Provisioning {
+            if let Some(stalled) = stalled.filter(|stalled| matches!(stalled.maker, Some(flotilla_resources::LeafMaker::Controller { .. })))
+            {
+                readiness.state = ReadinessState::Blocked;
+                readiness.blockers.push(ReadinessBlocker {
+                    resource: convoy_ref.clone(),
+                    phase: "Admission".into(),
+                    reason: stalled.evidence.clone(),
+                });
+            }
+        }
         VesselRow::builder()
+            .readiness(readiness)
             .resource(convoy_ref.subresource(format!("vessels/{}", definition.name)))
             .maybe_vessel_resource(vessel_resource)
             .name(&definition.name)
@@ -3512,6 +3613,9 @@ mod tests {
                         .durable_projects(durable.including_replicas::<Project>("flotilla"))
                         .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
                         .durable_regards(durable.using::<Regard>("flotilla"))
+                        .durable_vessels(durable.including_replicas::<Vessel>("flotilla"))
+                        .durable_checkouts(durable.including_replicas::<Checkout>("flotilla"))
+                        .durable_clones(durable.using::<CloneResource>("flotilla"))
                         .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
                         .observed_presentations(observed.clone().using::<Presentation>("flotilla"))
                         .observed_sessions(observed.including_replicas::<TerminalSession>("flotilla"))
@@ -4152,6 +4256,9 @@ mod tests {
         let durable_convoy_ensures = ScriptedSource::<ConvoyEnsure>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_repositories = ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_regards = ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_clones = ScriptedSource::<CloneResource>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_checkout_replicas = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -4165,6 +4272,9 @@ mod tests {
             .durable_convoy_ensures(&durable_convoy_ensures)
             .durable_repositories(&durable_repositories)
             .durable_regards(&durable_regards)
+            .durable_vessels(&durable_vessels)
+            .durable_checkouts(&durable_checkouts)
+            .durable_clones(&durable_clones)
             .observed_convoys(observed_convoys)
             .observed_presentations(observed_presentations)
             .observed_sessions(&observed_sessions)
@@ -4895,6 +5005,9 @@ mod tests {
         let durable_regards = ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_presentations = ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_clones = ScriptedSource::<CloneResource>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_sessions = ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_checkout_replicas = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -4908,6 +5021,9 @@ mod tests {
             .durable_convoy_ensures(&durable_convoy_ensures)
             .durable_repositories(&durable_repositories)
             .durable_regards(&durable_regards)
+            .durable_vessels(&durable_vessels)
+            .durable_checkouts(&durable_checkouts)
+            .durable_clones(&durable_clones)
             .observed_convoys(&observed_convoys)
             .observed_presentations(&observed_presentations)
             .observed_sessions(&observed_sessions)
@@ -5548,6 +5664,198 @@ mod tests {
         convoy.vessels.first().expect("vessel row").clone()
     }
 
+    // #1961: live checkout evidence distinguishes waiting, blocked retries and
+    // confirmed failure. Recovery and replayed updates must clear old reasons.
+    #[hegel::test]
+    fn provisioning_readiness_tracks_current_checkout_evidence(tc: hegel::TestCase) {
+        use flotilla_protocol::result_set::ReadinessState;
+        use flotilla_resources::{
+            CheckoutPhase, CheckoutStatus, ControllerRetry, ControllerRetryDisposition, VesselPhase, VesselSpec, VesselStatus,
+        };
+        use hegel::generators as gs;
+        // Includes ordinary tasks and standing governors, repeats, failure,
+        // retry, success, empty status and deletion, in arbitrary order.
+        let governor = tc.draw(gs::booleans());
+        let remote = tc.draw(gs::booleans());
+        // Clone is local-only; replicated checkouts retain their own retry evidence.
+        let shared_clone = tc.draw(gs::booleans()) && !remote;
+        let operations = (0..tc.draw(gs::integers::<usize>().min_value(1).max_value(10)))
+            .map(|_| tc.draw(gs::integers::<usize>().min_value(0).max_value(6)))
+            .collect::<Vec<_>>();
+        tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Ready).call();
+            if governor {
+                convoy.spec.role = "governor".into();
+            }
+            let (events, _) = broadcast::channel(128);
+            let mut aggregator = Aggregator::new(AggregatorProjectionState::new(), HostName::new("kiwi"), events);
+            let host = HostName::new(if remote { "feta" } else { "kiwi" });
+            let provenance = if remote {
+                let origin = flotilla_protocol::NodeId::new("remote-origin");
+                aggregator.origin_hosts.insert(origin.clone(), host.clone());
+                ResourceProvenance::Replica { origin_root: origin, last_synced_at: Utc::now() }
+            } else {
+                ResourceProvenance::Local
+            };
+            convoy.status.as_mut().expect("status").work.get_mut("implement").expect("work").placement =
+                Some(PlacementStatus { fields: BTreeMap::from([("host".into(), serde_json::json!(host.as_str()))]) });
+            let mut vessel = backend
+                .using::<Vessel>("flotilla")
+                .create(&InputMeta::builder().name("vessel-a".into()).build(), &VesselSpec {
+                    convoy_ref: convoy.metadata.name.clone(),
+                    vessel_name: "implement".into(),
+                    placement_policy_ref: "local".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                })
+                .await
+                .expect("vessel");
+            vessel.status = Some(VesselStatus { phase: VesselPhase::Provisioning, checkout_refs: BTreeMap::new(), ..Default::default() });
+            apply_readiness_event(
+                &mut aggregator.readiness_vessels,
+                ReadWatchEvent::Added(ReadResourceObject { object: vessel.clone(), provenance: provenance.clone() }),
+            );
+            let mut checkout = checkout_object("checkout-a", "/work/repo", RepositoryKey("repo".into())).await;
+            checkout.metadata.labels.insert(CONVOY_LABEL.into(), convoy.metadata.name.clone());
+            let mut clone = backend
+                .using::<CloneResource>("flotilla")
+                .create(
+                    &InputMeta::builder().name("ops-clone".into()).build(),
+                    &flotilla_resources::CloneSpec::builder()
+                        .repo_ref(RepositoryKey("repo".into()))
+                        .url("https://forgejo.test/ops".into())
+                        .env_ref("local".into())
+                        .path("/work/ops".into())
+                        .build(),
+                )
+                .await
+                .expect("clone");
+            if shared_clone {
+                checkout.spec = CheckoutSpec::Worktree(
+                    flotilla_resources::CheckoutWorktreeSpec::builder()
+                        .repo_ref(RepositoryKey("repo".into()))
+                        .env_ref("local".into())
+                        .r#ref("main".into())
+                        .target_path("/work/ops".into())
+                        .clone_ref("ops-clone".into())
+                        .build(),
+                );
+            }
+            let reference =
+                ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", &convoy.metadata.name).on_host(HostName::new("kiwi"));
+            let mut terminal = session_object("terminal-ops-coder").await;
+            terminal.metadata.labels.insert(CONVOY_LABEL.into(), convoy.metadata.name.clone());
+            terminal.metadata.labels.insert(VESSEL_LABEL.into(), "implement".into());
+            for op in operations.into_iter().chain([1, 3, 6]) {
+                let expected = match op {
+                    0 => ReadinessState::Provisioning,
+                    1 => ReadinessState::Blocked,
+                    2 => ReadinessState::Failed,
+                    3 | 6 => ReadinessState::Ready,
+                    _ => ReadinessState::Provisioning,
+                };
+                checkout.status = (op != 4).then(|| CheckoutStatus {
+                    phase: match op {
+                        2 => CheckoutPhase::Failed,
+                        3 | 6 => CheckoutPhase::Ready,
+                        _ => CheckoutPhase::Preparing,
+                    },
+                    message: (op != 3).then(|| "Forgejo authentication refused".into()),
+                    clone_retry: (op == 1 || op == 6).then(|| ControllerRetry {
+                        attempts: 1,
+                        first_failure_at: Utc::now(),
+                        disposition: ControllerRetryDisposition::Retryable { next_attempt_at: Utc::now() },
+                    }),
+                    ..Default::default()
+                });
+                if shared_clone {
+                    clone.status = (op != 4).then(|| flotilla_resources::CloneStatus {
+                        phase: match op {
+                            2 => flotilla_resources::ClonePhase::Failed,
+                            3 => flotilla_resources::ClonePhase::Ready,
+                            _ => flotilla_resources::ClonePhase::Cloning,
+                        },
+                        message: (op != 3).then(|| "Forgejo authentication refused".into()),
+                        retry: checkout.status.as_ref().and_then(|status| status.clone_retry.clone()),
+                        failure_policy: (op == 2).then_some(flotilla_resources::CloneFailurePolicy::Terminal),
+                        ..Default::default()
+                    });
+                    if op != 2 {
+                        if let Some(status) = checkout.status.as_mut() {
+                            status.message = None;
+                            status.clone_retry = None;
+                        }
+                    }
+                    apply_readiness_event(
+                        &mut aggregator.readiness_clones,
+                        ReadWatchEvent::Modified(ReadResourceObject { object: clone.clone(), provenance: provenance.clone() }),
+                    );
+                }
+                vessel.status.as_mut().expect("status").phase =
+                    if op == 3 || op == 6 { VesselPhase::Ready } else { VesselPhase::Provisioning };
+                apply_readiness_event(
+                    &mut aggregator.readiness_vessels,
+                    ReadWatchEvent::Modified(ReadResourceObject { object: vessel.clone(), provenance: provenance.clone() }),
+                );
+                let source = ReadResourceObject { object: checkout.clone(), provenance: provenance.clone() };
+                apply_readiness_event(
+                    &mut aggregator.readiness_checkouts,
+                    if op == 5 { ReadWatchEvent::Deleted(source) } else { ReadWatchEvent::Modified(source) },
+                );
+                aggregator.terminal_sessions.clear();
+                aggregator.attachable_sessions.clear();
+                if op == 3 || op == 6 {
+                    let source = ReadResourceObject { object: terminal.clone(), provenance: provenance.clone() };
+                    aggregator.attachable_sessions.insert(session_key(&source));
+                    aggregator.terminal_sessions.insert(session_key(&source), source);
+                }
+                let row = aggregator.summarize(&reference, &convoy);
+                assert_eq!(row.phase, ConvoyPhase::Active, "readiness must not rewrite lifecycle");
+                assert_eq!(row.readiness().state, expected, "operation {op}");
+                if op == 1 || op == 2 {
+                    assert!(row.readiness().explanation().contains("Forgejo authentication refused"));
+                    assert!(row.vessels[0].attach.is_none());
+                    assert!(row.vessels[0].materialize.is_none());
+                }
+                if op == 3 || op == 6 {
+                    assert!(row.readiness().blockers.is_empty(), "recovery clears all blockers");
+                    assert_eq!(row.vessels[0].materialize.as_deref(), Some("terminal-ops-coder"));
+                }
+            }
+        });
+    }
+
+    // #1961: Active plus pending agent work must remain provisioning, even
+    // when the workflow has reached Running. Dormant handoff roles are excluded.
+    #[tokio::test]
+    async fn pending_agent_readiness_clears_when_crew_starts() {
+        use flotilla_protocol::result_set::ReadinessState;
+        use flotilla_resources::{CrewWorkPhase, CrewWorkState, Selector};
+        let mut convoy = convoy_with_work().convoy_phase(ResourceConvoyPhase::Active).work_phase(ResourceWorkPhase::Running).call();
+        let status = convoy.status.as_mut().expect("status");
+        for role in ["coder", "reviewer"] {
+            status.workflow_snapshot.as_mut().expect("snapshot").vessels[0].crew.push(
+                CrewSpec::builder()
+                    .role(role.into())
+                    .source(CrewSource::Agent { selector: Selector::for_capability("code"), prompt: None, brief_template: None })
+                    .build(),
+            );
+        }
+        let row = emitted_vessel(convoy.clone()).await;
+        assert_eq!(row.readiness.state, ReadinessState::Provisioning);
+        assert!(row.readiness.explanation().contains("coder has not started"));
+        assert!(!row.readiness.explanation().contains("reviewer"));
+        convoy
+            .status
+            .as_mut()
+            .expect("status")
+            .crew_work
+            .insert("implement".into(), BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]));
+        let row = emitted_vessel(convoy).await;
+        assert_eq!(row.readiness.state, ReadinessState::Ready);
+        assert!(row.readiness.blockers.is_empty());
+    }
+
     #[tokio::test]
     async fn terminal_work_is_not_completable() {
         for phase in [ResourceWorkPhase::Complete, ResourceWorkPhase::Failed, ResourceWorkPhase::Cancelled] {
@@ -5705,6 +6013,9 @@ mod tests {
                     .durable_projects(durable.including_replicas::<Project>("flotilla"))
                     .durable_repositories(durable.including_replicas::<Repository>("flotilla"))
                     .durable_regards(durable.using::<Regard>("flotilla"))
+                    .durable_vessels(durable.including_replicas::<Vessel>("flotilla"))
+                    .durable_checkouts(durable.including_replicas::<Checkout>("flotilla"))
+                    .durable_clones(durable.using::<CloneResource>("flotilla"))
                     .observed_convoys(observed.clone().using::<Convoy>("flotilla"))
                     .observed_presentations(observed.clone().using::<Presentation>("flotilla"))
                     .observed_sessions(observed.including_replicas::<TerminalSession>("flotilla"))
@@ -5791,6 +6102,9 @@ mod tests {
         let durable_regards = Arc::new(ScriptedSource::<Regard>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_convoys = Arc::new(ScriptedSource::<Convoy>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_presentations = Arc::new(ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]));
+        let durable_vessels = ScriptedSource::<Vessel>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_clones = ScriptedSource::<CloneResource>::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let durable_checkouts = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_sessions = Arc::new(ScriptedSource::<TerminalSession>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_checkouts = Arc::new(ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]));
         let observed_checkout_replicas = ScriptedSource::<Checkout>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -5810,6 +6124,9 @@ mod tests {
                 .durable_convoy_ensures(durable_convoy_ensures.as_ref())
                 .durable_repositories(durable_repositories.as_ref())
                 .durable_regards(durable_regards.as_ref())
+                .durable_vessels(&durable_vessels)
+                .durable_checkouts(&durable_checkouts)
+                .durable_clones(&durable_clones)
                 .observed_convoys(observed_convoys.as_ref())
                 .observed_presentations(observed_presentations.as_ref())
                 .observed_sessions(observed_sessions.as_ref())
