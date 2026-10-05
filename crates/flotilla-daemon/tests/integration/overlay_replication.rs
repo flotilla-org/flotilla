@@ -1366,43 +1366,40 @@ async fn reconnect_uses_log_until_horizon_or_quarantine_requires_one_snapshot() 
     }
 }
 
-async fn await_digest_names(daemon: &InProcessDaemon, expected: &[&str]) {
-    for _ in 0..100_000 {
-        let mut names = daemon
-            .resource_backend()
-            .including_replicas::<Convoy>("flotilla")
-            .list()
-            .await
-            .expect("replicas")
-            .items
-            .into_iter()
-            .map(|item| item.object.metadata.name)
-            .collect::<Vec<_>>();
-        names.sort();
-        if names == expected {
-            return;
-        }
-        tokio::task::yield_now().await;
-    }
-    panic!("digest replicas did not converge to {expected:?}");
+async fn assert_digest_names(daemon: &InProcessDaemon, expected: &[&str]) {
+    let mut names = daemon
+        .resource_backend()
+        .including_replicas::<Convoy>("flotilla")
+        .list()
+        .await
+        .expect("replicas")
+        .items
+        .into_iter()
+        .map(|item| item.object.metadata.name)
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, expected, "completed digest round has the expected replicas");
 }
 
 // #2638: periodic digests repair a dropped final delete through the real
 // replicator over in-memory sessions. A match sends no bodies or writes.
 async fn digest_session_scenario(sqlite: bool, fail_snapshot: bool, advanced_prefix: bool) {
+    tokio::time::timeout(Duration::from_secs(30), run_digest_session_scenario(sqlite, fail_snapshot, advanced_prefix))
+        .await
+        .expect("digest session scenario timed out");
+}
+
+async fn run_digest_session_scenario(sqlite: bool, fail_snapshot: bool, advanced_prefix: bool) {
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex,
     };
 
-    use flotilla_daemon::server::test_support::spawn_in_memory_request_mesh_with_filter;
+    use flotilla_daemon::server::test_support::spawn_in_memory_request_mesh_with_digest_driver;
     use flotilla_protocol::{
         CommandAction, CommandPeerEvent, CommandValue, PeerWireMessage, ResourceRecordType, RoutedPeerMessage, StepStatus,
     };
     use flotilla_resources::{digest_bucket, DigestQuery};
-    // SQLite initialization and mesh readiness use worker threads and real
-    // deadlines; pause only after the initial replication is established.
-    tokio::time::resume();
     let temp = tempfile::tempdir().expect("tempdir");
     let kiwi = if sqlite {
         sqlite_daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await
@@ -1425,7 +1422,7 @@ async fn digest_session_scenario(sqlite: bool, fail_snapshot: bool, advanced_pre
     let children = Arc::new(AtomicUsize::new(0));
     let snapshots = Arc::new(Mutex::new(Vec::new()));
     let whole_snapshots = Arc::new(AtomicUsize::new(0));
-    let dropped = Arc::new(AtomicUsize::new(0));
+    let (dropped, mut dropped_events) = tokio::sync::watch::channel(0usize);
     let failing = Arc::new(AtomicBool::new(false));
     // This is the network boundary: drop only delete events, or refuse a bucket
     // read at the real command dispatcher. No storage collaborator is mocked.
@@ -1435,7 +1432,7 @@ async fn digest_session_scenario(sqlite: bool, fail_snapshot: bool, advanced_pre
             Arc::clone(&children),
             Arc::clone(&snapshots),
             Arc::clone(&whole_snapshots),
-            Arc::clone(&dropped),
+            dropped.clone(),
             Arc::clone(&failing),
         );
         let resumed = Arc::clone(&resumed);
@@ -1474,7 +1471,7 @@ async fn digest_session_scenario(sqlite: bool, fail_snapshot: bool, advanced_pre
                         if response.resource_kind == "Convoy"
                             && response.records.iter().any(|record| record.record_type == ResourceRecordType::Deleted)
                         {
-                            dropped.fetch_add(1, Ordering::SeqCst);
+                            dropped.send_modify(|count| *count += 1);
                             return None;
                         }
                     }
@@ -1483,31 +1480,19 @@ async fn digest_session_scenario(sqlite: bool, fail_snapshot: bool, advanced_pre
             Some(message)
         })
     };
-    let mesh = spawn_in_memory_request_mesh_with_filter(vec![Arc::clone(&kiwi), Arc::clone(&feta)], Some(&["Convoy"]), filter)
+    let mesh = spawn_in_memory_request_mesh_with_digest_driver(vec![Arc::clone(&kiwi), Arc::clone(&feta)], Some(&["Convoy"]), filter)
         .await
         .expect("mesh");
-    await_digest_names(&kiwi, &["gone", "retained"]).await;
-    tokio::time::pause();
-    // Prevent virtual time from auto-advancing past worker-thread deadlines.
-    let clock_guard = tokio::spawn(async {
-        loop {
-            tokio::task::yield_now().await;
-        }
-    });
+    let driver = mesh.digest_driver.as_ref().expect("explicit digest driver");
+    driver.watch_ready(kiwi.node_id(), feta.node_id(), "convoys").await.expect("initial watch ready");
+    assert_digest_names(&kiwi, &["gone", "retained"]).await;
 
     let full = whole_snapshots.load(Ordering::SeqCst);
     let before = kiwi.resource_backend().including_replicas::<Convoy>("flotilla").list().await.expect("replicas");
-    tokio::time::advance(Duration::from_secs(61)).await;
-    for _ in 0..20000 {
-        if roots.load(Ordering::SeqCst) > 0 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    for _ in 0..1000 {
-        tokio::task::yield_now().await;
-    }
-    assert!(roots.load(Ordering::SeqCst) > 0, "periodic root exchange ran");
+    assert!(!driver.round(kiwi.node_id(), feta.node_id(), "convoys").await.expect("matching round"));
+    // The driver disables this mesh's periodic ticks; watch restarts only issue
+    // ResourceWatch, so this explicit round is the sole root-fetch trigger.
+    assert_eq!(roots.load(Ordering::SeqCst), 1, "explicit root exchange completed");
     assert_eq!(children.load(Ordering::SeqCst), 0, "a matching digest never drills down");
     assert!(snapshots.lock().expect("snapshots").is_empty(), "a match transfers no resource bodies");
     let after = kiwi.resource_backend().including_replicas::<Convoy>("flotilla").list().await.expect("replicas");
@@ -1516,13 +1501,7 @@ async fn digest_session_scenario(sqlite: bool, fail_snapshot: bool, advanced_pre
     assert_eq!(timestamps(before), timestamps(after), "matching digests do not write replicas");
     failing.store(fail_snapshot, Ordering::SeqCst);
     authority.delete("gone").await.expect("final delete");
-    for _ in 0..20000 {
-        if dropped.load(Ordering::SeqCst) > 0 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(dropped.load(Ordering::SeqCst) > 0, "final deletion actually dropped");
+    dropped_events.wait_for(|count| *count > 0).await.expect("final deletion actually dropped");
     if advanced_prefix {
         // Reproduce an older holder's relay-advanced cursor: its supposedly
         // complete prefix includes a deletion that its object set still lacks.
@@ -1550,42 +1529,32 @@ async fn digest_session_scenario(sqlite: bool, fail_snapshot: bool, advanced_pre
             .await
             .expect("seed legacy advanced prefix");
     }
-    tokio::time::advance(Duration::from_secs(61)).await;
+    let writer = kiwi.resource_backend().replica_writer::<Convoy>(feta.node_id().clone(), "flotilla");
+    let previous_cursor = writer.cursor().await.expect("cursor before proof");
+    let result = driver.round(kiwi.node_id(), feta.node_id(), "convoys").await;
     if fail_snapshot {
-        for _ in 0..20000 {
-            if !snapshots.lock().expect("snapshots").is_empty() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        for _ in 0..1000 {
-            tokio::task::yield_now().await;
-        }
-        await_digest_names(&kiwi, &["gone", "retained"]).await;
+        assert!(result.is_err(), "failed proof reports completion without repair");
+        assert_digest_names(&kiwi, &["gone", "retained"]).await;
+        assert_eq!(writer.cursor().await.expect("cursor after failed proof"), previous_cursor, "failed proof preserves cursor");
         assert!(!snapshots.lock().expect("snapshots").is_empty(), "failed snapshot attempted");
         failing.store(false, Ordering::SeqCst);
         snapshots.lock().expect("snapshots").clear();
-        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(driver.round(kiwi.node_id(), feta.node_id(), "convoys").await.expect("retry repair"));
+    } else {
+        assert!(result.expect("repair round"));
     }
-    await_digest_names(&kiwi, &["retained"]).await;
+    assert_digest_names(&kiwi, &["retained"]).await;
     assert_eq!(*snapshots.lock().expect("snapshots"), vec![digest_bucket("gone")], "only the diverged partition is re-snapshotted");
     assert_eq!(whole_snapshots.load(Ordering::SeqCst), full, "periodic safety net never requests a full snapshot");
     // Repair proves the origin's cut and resumes log sync without a full list.
-    for _ in 0..10 {
-        tokio::time::advance(Duration::from_millis(100)).await;
-        for _ in 0..2000 {
-            tokio::task::yield_now().await;
-        }
-        if resumed.load(Ordering::SeqCst) > 0 {
-            break;
-        }
-    }
+    driver.watch_ready(kiwi.node_id(), feta.node_id(), "convoys").await.expect("repaired watch ready");
     assert!(resumed.load(Ordering::SeqCst) > 0, "repair resumes the primary log from its proven cut");
     let writer = kiwi.resource_backend().replica_writer::<Convoy>(feta.node_id().clone(), "flotilla");
     assert_eq!(
         writer.cursor().await.expect("cursor").expect("complete prefix").resource_version,
         authority.current_position().await.expect("authority position").resource_version
     );
+    let mut live = kiwi.resource_backend().including_replicas::<Convoy>("flotilla").watch().await.expect("replica watch");
     let current = authority.get("retained").await.expect("retained");
     authority
         .update(
@@ -1595,13 +1564,11 @@ async fn digest_session_scenario(sqlite: bool, fail_snapshot: bool, advanced_pre
         )
         .await
         .expect("next live event");
-    for _ in 0..100_000 {
-        if kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get("retained").await.expect("replica").object.spec.workflow_ref
-            == "after-repair"
+    while let Some(event) = live.next().await {
+        if matches!(event.expect("live event"), flotilla_resources::ReadWatchEvent::Modified(item) if item.object.spec.workflow_ref == "after-repair")
         {
             break;
         }
-        tokio::task::yield_now().await;
     }
     assert_eq!(
         kiwi.resource_backend().including_replicas::<Convoy>("flotilla").get("retained").await.expect("replica").object.spec.workflow_ref,
@@ -1610,26 +1577,24 @@ async fn digest_session_scenario(sqlite: bool, fail_snapshot: bool, advanced_pre
     assert_eq!(whole_snapshots.load(Ordering::SeqCst), full, "next live event needs no redundant full snapshot");
     // Empty partitions also converge by a bucket snapshot.
     snapshots.lock().expect("snapshots").clear();
+    let previous_drops = *dropped_events.borrow_and_update();
     authority.delete("retained").await.expect("delete last key");
-    for _ in 0..1000 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::advance(Duration::from_secs(61)).await;
-    await_digest_names(&kiwi, &[]).await;
+    dropped_events.wait_for(|count| *count > previous_drops).await.expect("last deletion dropped");
+    assert!(driver.round(kiwi.node_id(), feta.node_id(), "convoys").await.expect("empty partition repair"));
+    assert_digest_names(&kiwi, &[]).await;
     assert_eq!(*snapshots.lock().expect("snapshots"), vec![digest_bucket("retained")]);
     drop(mesh);
-    clock_guard.abort();
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn in_memory_digest_match_and_partition_repair() {
     digest_session_scenario(false, false, false).await;
 }
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn sqlite_digest_match_and_partition_repair() {
     digest_session_scenario(true, false, false).await;
 }
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn failed_digest_snapshot_preserves_replicas() {
     digest_session_scenario(false, true, false).await;
 }
@@ -1641,17 +1606,16 @@ fn generated_digest_session_repair(tc: hegel::TestCase) {
     let sqlite = tc.draw(hegel::generators::booleans());
     let failure = tc.draw(hegel::generators::booleans());
     let advanced_prefix = tc.draw(hegel::generators::booleans());
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .start_paused(true)
-        .build()
-        .expect("runtime")
-        .block_on(digest_session_scenario(sqlite, failure, advanced_prefix));
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(digest_session_scenario(
+        sqlite,
+        failure,
+        advanced_prefix,
+    ));
 }
 
 // A falsely advanced legacy prefix cannot hide a missing final tombstone from
 // the digest safety net, even though reconnect can legitimately log-resume.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn digest_repairs_a_relay_advanced_prefix() {
     digest_session_scenario(false, false, true).await;
 }

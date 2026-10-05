@@ -4,7 +4,7 @@ use flotilla_client::SocketDaemon;
 use flotilla_core::{daemon::DaemonHandle, in_process::InProcessDaemon};
 use flotilla_protocol::{
     result_set::{ConvoyPhase, ConvoyRow},
-    CommandCaller, GoodbyeReason, HostName, NodeInfo, PeerWireMessage, ResourceRef, SurfaceDeclaration,
+    CommandCaller, GoodbyeReason, HostName, NodeId, NodeInfo, PeerWireMessage, ResourceRef, SurfaceDeclaration,
 };
 use flotilla_resources::{api_version, Convoy, InputMeta, Project, ProjectSpec, Resource, WorkflowTemplate};
 use tokio::sync::{mpsc, watch, Mutex, Notify};
@@ -69,6 +69,7 @@ impl Drop for InMemoryRequestTopology {
 /// The clients exercise the same request dispatcher and remote router as a
 /// socket client, while tests may inspect each host's authoritative store.
 pub struct InMemoryRequestMesh {
+    pub digest_driver: Option<DigestDriver>,
     pub hosts: Vec<Arc<InProcessDaemon>>,
     pub clients: Vec<Arc<SocketDaemon>>,
     pub shutdown_txs: Vec<watch::Sender<bool>>,
@@ -80,6 +81,55 @@ impl Drop for InMemoryRequestMesh {
         for task in &self._tasks {
             task.abort();
         }
+    }
+}
+
+type DigestControls = HashMap<(NodeId, NodeId, String), Arc<DigestControl>>;
+
+/// Explicit digest rounds for routed test sessions. Production keeps its periodic timer.
+#[derive(Clone, Default)]
+pub struct DigestDriver {
+    controls: Arc<std::sync::Mutex<DigestControls>>,
+}
+
+pub(super) struct DigestControl {
+    sender: mpsc::UnboundedSender<tokio::sync::oneshot::Sender<Result<bool, String>>>,
+    pub(super) requests: Mutex<mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<Result<bool, String>>>>,
+    pub(super) ready: watch::Sender<bool>,
+}
+
+impl DigestDriver {
+    pub(super) fn control(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Arc<DigestControl> {
+        self.controls
+            .lock()
+            .expect("digest controls")
+            .entry((holder.clone(), origin.clone(), kind.to_string()))
+            .or_insert_with(|| {
+                let (sender, requests) = mpsc::unbounded_channel();
+                let (ready, _) = watch::channel(false);
+                Arc::new(DigestControl { sender, requests: Mutex::new(requests), ready })
+            })
+            .clone()
+    }
+
+    /// Wait until the current primary watch has applied a bookmark.
+    /// Readiness resets when it restarts; later bookmarks keep it ready.
+    pub async fn watch_ready(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Result<(), String> {
+        let control = self.control(holder, origin, kind);
+        let mut ready = control.ready.subscribe();
+        ready.wait_for(|ready| *ready).await.map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Returns after reconciliation, including persisted cursor confirmation.
+    /// Queued requests survive unrelated watch errors and run on its replacement.
+    /// `true` means repair; errors preserve the previous replica set and cursor.
+    pub async fn round(&self, holder: &NodeId, origin: &NodeId, kind: &str) -> Result<bool, String> {
+        self.watch_ready(holder, origin, kind).await?;
+        let control = self.control(holder, origin, kind);
+        let (completion, result) = tokio::sync::oneshot::channel();
+        control.sender.send(completion).map_err(|error| error.to_string())?;
+        result.await.map_err(|error| error.to_string())?
     }
 }
 
@@ -103,6 +153,24 @@ pub async fn spawn_in_memory_request_mesh_with_filter(
     hosts: Vec<Arc<InProcessDaemon>>,
     replication_kinds: Option<&'static [&'static str]>,
     filter: EnvelopeFilter,
+) -> Result<InMemoryRequestMesh, String> {
+    spawn_request_mesh(hosts, replication_kinds, filter, None).await
+}
+
+/// Like the filtered mesh, with explicit digest rounds replacing test-only timers.
+pub async fn spawn_in_memory_request_mesh_with_digest_driver(
+    hosts: Vec<Arc<InProcessDaemon>>,
+    replication_kinds: Option<&'static [&'static str]>,
+    filter: EnvelopeFilter,
+) -> Result<InMemoryRequestMesh, String> {
+    spawn_request_mesh(hosts, replication_kinds, filter, Some(DigestDriver::default())).await
+}
+
+async fn spawn_request_mesh(
+    hosts: Vec<Arc<InProcessDaemon>>,
+    replication_kinds: Option<&'static [&'static str]>,
+    filter: EnvelopeFilter,
+    digest_driver: Option<DigestDriver>,
 ) -> Result<InMemoryRequestMesh, String> {
     if hosts.is_empty() {
         return Err("request mesh needs at least one host".into());
@@ -151,6 +219,7 @@ pub async fn spawn_in_memory_request_mesh_with_filter(
             None,
         )
         .with_replication_kinds(replication_kinds)
+        .with_digest_driver(digest_driver.clone())
         .spawn();
         tasks.push(runtime);
 
@@ -200,7 +269,7 @@ pub async fn spawn_in_memory_request_mesh_with_filter(
     .await
     .map_err(|_| "timed out waiting for in-memory request mesh to connect".to_string())??;
 
-    Ok(InMemoryRequestMesh { hosts, clients, shutdown_txs, _tasks: tasks })
+    Ok(InMemoryRequestMesh { digest_driver, hosts, clients, shutdown_txs, _tasks: tasks })
 }
 
 pub async fn spawn_in_memory_request_topology(
