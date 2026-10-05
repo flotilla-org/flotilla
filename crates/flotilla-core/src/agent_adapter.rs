@@ -741,7 +741,7 @@ impl AgentAdapter for CliAgentAdapter {
         if !matches!(self.flavor, AdapterFlavor::Codex { .. }) || exit_code != 2 {
             return None;
         }
-        // Exit 2 alone can also mean an interruption later in the session.
+        // Capture is the current terminal screen and can include output from before the exit.
         let diagnostic = screen.lines().map(str::trim).find(|line| line.starts_with("error:"))?;
         Some(format!("Codex launch usage error (exit 2): {diagnostic}"))
     }
@@ -2267,6 +2267,7 @@ mod tests {
             .expect("launch");
         assert_eq!(plan.command.matches("-c 'notify=[\"flotilla\",\"hook\",\"codex\",\"notify\"]'").count(), 1);
         assert!(plan.command.contains("--no-daemon"));
+        assert_eq!(super::minimum_harness_version("codex"), Some("0.160.0"));
     }
 
     #[tokio::test]

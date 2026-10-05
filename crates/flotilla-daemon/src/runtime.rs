@@ -6176,8 +6176,17 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .get(&requirement.adapter)
             .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
         let screen = match self.pool_for_spec(spec) {
-            Ok(pool) => pool.capture_screen(session_id).await.ok().flatten().unwrap_or_default(),
-            Err(_) => String::new(),
+            Ok(pool) => match pool.capture_screen(session_id).await {
+                Ok(screen) => screen.unwrap_or_default(),
+                Err(error) => {
+                    debug!(%error, %session_id, exit_code, "cannot capture exited agent diagnostic");
+                    String::new()
+                }
+            },
+            Err(error) => {
+                debug!(%error, %session_id, exit_code, "cannot resolve exited agent terminal pool");
+                String::new()
+            }
         };
         Ok(adapter.classify_exit_failure(exit_code, &screen))
     }
