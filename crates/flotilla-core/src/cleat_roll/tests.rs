@@ -424,8 +424,16 @@ async fn retained_report_is_immediately_readable() {
 // generations must not turn an empty target into a waiting target.
 #[tokio::test]
 async fn absent_current_reports_waiting_for_live_generations() {
-    for state in ["serving", "draining"] {
+    // Pin the CLI's two supported absent/unserved socket error strings. The
+    // current generation is default@27 (dead); @26 and @25 are older and live.
+    for (state, stderr) in [
+        ("serving", "connect daemon: No such file or directory (os error 2)\n"),
+        ("draining", "connect daemon: No such file or directory (os error 2)\n"),
+        ("serving", "connect daemon: Connection refused (os error 111)\n"),
+        ("draining", "connect daemon: Connection refused (os error 111)\n"),
+    ] {
         let listing = serde_json::json!([
+            {"name":"default@27", "runtime_root":"/state/crew cleat", "alive":false},
             {"name":"default@26", "runtime_root":"/state/crew cleat", "alive":true, "drain_state":state},
             {"name":"default@25", "runtime_root":"/state/crew cleat", "alive":true, "drain_state":"draining"},
             {"name":"default@24", "runtime_root":"/state/crew cleat", "alive":false},
@@ -433,7 +441,7 @@ async fn absent_current_reports_waiting_for_live_generations() {
             {"name":"default@26", "runtime_root":"/another/root", "alive":true}
         ]);
         let runner = Arc::new(MockRunner::with_outputs(vec![
-            Ok(recorded("nonzero")),
+            Ok(CommandOutput { stdout: String::new(), stderr: stderr.into(), success: false }),
             Ok(CommandOutput { stdout: listing.to_string(), stderr: String::new(), success: true }),
         ]));
         let report =
@@ -441,8 +449,8 @@ async fn absent_current_reports_waiting_for_live_generations() {
         assert!(!report.failed(), "{report:?}");
         assert!(assess_drain(&report).actionable.is_empty());
         assert_eq!(report.information.len(), 2);
-        for (message, name) in report.information.iter().zip(["default@26", "default@25"]) {
-            assert!(message.contains(name), "{message}");
+        for name in ["default@26", "default@25"] {
+            let message = report.information.iter().find(|message| message.contains(name)).expect("live generation waiting state");
             assert!(message.contains("waiting for sessions to end"), "{message}");
         }
         assert!(!report.attempts[0].success, "retain the actual CLI exit status");
