@@ -268,7 +268,11 @@ fn generations() -> RecordedGenerations {
 }
 
 fn output(record: RecordedOutput) -> CommandOutput {
-    CommandOutput { stdout: record.stdout.replace("{root}", "/state/crew cleat"), stderr: record.stderr, exit_code: Some(if record.success { 0 } else { 1 }) }
+    CommandOutput {
+        stdout: record.stdout.replace("{root}", "/state/crew cleat"),
+        stderr: record.stderr,
+        exit_code: Some(if record.success { 0 } else { 1 }),
+    }
 }
 
 // #2671: the real CLI's alias and listing recordings reproduce the r531 shape:
@@ -441,8 +445,8 @@ async fn absent_current_reports_waiting_for_live_generations() {
             {"name":"default@26", "runtime_root":"/another/root", "alive":true}
         ]);
         let runner = Arc::new(MockRunner::with_outputs(vec![
-            Ok(CommandOutput { stdout: String::new(), stderr: stderr.into(), success: false }),
-            Ok(CommandOutput { stdout: listing.to_string(), stderr: String::new(), success: true }),
+            Ok(CommandOutput { stdout: String::new(), stderr: stderr.into(), exit_code: Some(1) }),
+            Ok(CommandOutput { stdout: listing.to_string(), stderr: String::new(), exit_code: Some(0) }),
         ]));
         let report =
             drain("host".into(), "gen".into(), Path::new("/incoming/cleat"), &[target(runner.clone(), "default", false)], vec![]).await;
@@ -467,7 +471,7 @@ async fn inaccessible_current_socket_remains_actionable() {
     let runner = Arc::new(MockRunner::with_outputs(vec![Ok(CommandOutput {
         stdout: String::new(),
         stderr: "connect daemon: Permission denied (os error 13)".into(),
-        success: false,
+        exit_code: Some(1),
     })]));
     let report =
         drain("host".into(), "gen".into(), Path::new("/incoming/cleat"), &[target(runner.clone(), "default", false)], vec![]).await;

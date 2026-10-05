@@ -2422,7 +2422,7 @@ mod tests {
                     return if self.transport {
                         Err("removal transport unavailable".into())
                     } else {
-                        Ok(CommandOutput { stdout: String::new(), stderr: "suppression refusée".into(), success: false })
+                        Ok(CommandOutput { stdout: String::new(), stderr: "suppression refusée".into(), exit_code: Some(1) })
                     };
                 }
                 let mut output = crate::providers::ProcessCommandRunner.run_output(cmd, args, cwd, label).await?;
