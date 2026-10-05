@@ -586,6 +586,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
                 role: "coder".to_string(),
                 source: TerminalSessionSource::Tool { command: "bash".to_string() },
                 cwd: "/repo".to_string(),
+                env: Default::default(),
                 pool: "fake-terminals".to_string(),
             },
         )
@@ -622,6 +623,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
             role: "observer".to_string(),
             source: TerminalSessionSource::Tool { command: "bash".to_string() },
             cwd: "/repo".to_string(),
+            env: Default::default(),
             pool: "fake".to_string(),
         })
         .await
@@ -657,6 +659,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
                 role: "yeoman".to_string(),
                 source: TerminalSessionSource::Tool { command: "bash".to_string() },
                 cwd: "/repo".to_string(),
+                env: Default::default(),
                 pool: "fake-terminals".to_string(),
             },
         )

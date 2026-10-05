@@ -113,6 +113,7 @@ async fn terminal_actuator_uses_literal_command_and_cwd() {
         role: "coder".to_string(),
         source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
         cwd: "/workspace".to_string(),
+        env: Default::default(),
         pool: "cleat".to_string(),
     };
 

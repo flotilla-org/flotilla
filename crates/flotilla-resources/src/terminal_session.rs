@@ -100,6 +100,11 @@ pub struct TerminalSessionSpec {
     pub source: TerminalSessionSource,
     pub cwd: String,
     pub pool: String,
+    /// Declared launch values; credentials and adapter requirements take precedence.
+    /// Default decodes the previous generation's sessions; remove after one roll.
+    #[serde(default)]
+    #[builder(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

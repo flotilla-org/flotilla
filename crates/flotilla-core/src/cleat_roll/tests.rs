@@ -479,3 +479,34 @@ async fn inaccessible_current_socket_remains_actionable() {
     assert!(report.information.is_empty());
     assert_eq!(runner.remaining(), 0);
 }
+
+// #2706: daemon turnover must use the same controlled startup environment as
+// ordinary terminal-pool calls, even if discovery contains agent contamination.
+#[tokio::test]
+async fn discovered_roll_targets_start_replacements_with_a_controlled_environment() {
+    let runner = Arc::new(MockRunner::with_outputs(vec![Ok(recorded("success"))]));
+    let bag = EnvironmentBag::new()
+        .with(EnvironmentAssertion::binary("cleat", "/tools/cleat"))
+        .with(EnvironmentAssertion::env_var("HOME", "/execution/home"))
+        .with(EnvironmentAssertion::env_var("PATH", "/execution/bin:/usr/bin:/bin"))
+        .with(EnvironmentAssertion::env_var("NO_COLOR", "1"))
+        .with(EnvironmentAssertion::env_var("CLAUDE_CODE_MESSAGING_TOKEN", "fake-unrelated-token"));
+    let environment =
+        CleatEnvironment::builder().id(EnvironmentId::new("host-direct")).bag(bag).runner(runner.clone()).contained(false).build();
+    let targets = crew_targets(&environment, &[]).expect("registered roll target");
+    let report = drain("host".into(), "generation-2".into(), Path::new("/incoming/bin/cleat"), &targets, vec![]).await;
+    assert!(!report.failed(), "{report:?}");
+    assert_eq!(runner.calls(), vec![("/usr/bin/env".into(), vec![
+        "-i".into(),
+        "HOME=/execution/home".into(),
+        "PATH=/execution/bin:/usr/bin:/bin".into(),
+        "/incoming/bin/cleat".into(),
+        "--runtime-root".into(),
+        "/execution/home/.local/state/cleat".into(),
+        "--server".into(),
+        "default".into(),
+        "server".into(),
+        "drain".into(),
+        "--json".into(),
+    ])]);
+}

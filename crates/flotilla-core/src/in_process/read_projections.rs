@@ -2314,6 +2314,7 @@ mod tests {
                     env_ref: "env".into(),
                     role: "coder".into(),
                     cwd: "/work".into(),
+                    env: Default::default(),
                     pool: "cleat".into(),
                     source: TerminalSessionSource::Tool { command: "sh".into() },
                 },

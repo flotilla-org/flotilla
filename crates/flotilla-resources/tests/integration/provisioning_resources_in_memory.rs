@@ -174,11 +174,14 @@ async fn agent_terminal_session_preserves_structured_launch_and_canonical_brief(
             message: None,
         },
         cwd: "/workspace".into(),
+        env: [("DECLARED_VALUE".into(), "hello declared crew".into())].into_iter().collect(),
         pool: "cleat".into(),
     };
 
     let created = resolver.create(&resource_meta().name("demo-implement-coder").call(), &spec).await.expect("create session");
     assert_eq!(created.spec.source, spec.source);
+    // #2706: the declared session environment persists independently of host facts.
+    assert_eq!(created.spec.env, spec.env);
 }
 
 #[test]
@@ -212,4 +215,16 @@ fn docker_per_vessel_policy_uses_vessel_spelling_in_serialized_resources() {
             }
         })
     );
+}
+
+// #2706 / ADR 0047: previous-generation terminal specs without an environment
+// remain decodable. New writes carry the declaration explicitly.
+#[test]
+fn previous_terminal_spec_defaults_to_an_empty_declared_environment() {
+    let spec: TerminalSessionSpec = serde_json::from_value(serde_json::json!({
+        "env_ref": "host-direct-test", "role": "shell", "source": {"kind": "tool", "command": "sh"}, "cwd": "/repo", "pool": "cleat"
+    }))
+    .expect("previous generation terminal spec");
+    assert!(spec.env.is_empty());
+    assert_eq!(serde_json::to_value(&spec).expect("new terminal spec")["env"], serde_json::json!({}));
 }

@@ -664,6 +664,7 @@ async fn convoy_finalizer_deletes_orphaned_terminal_sessions() {
                 role: "coder".to_string(),
                 source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
                 cwd: "/workspace".to_string(),
+                env: Default::default(),
                 pool: "cleat".to_string(),
             },
         )
@@ -2990,6 +2991,7 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
                     role: "coder".to_string(),
                     source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
                     cwd: "/workspace".to_string(),
+                    env: Default::default(),
                     pool: "cleat".to_string(),
                 },
             )
@@ -3092,6 +3094,7 @@ fn terminal_session_cleanup_respects_reclaim_and_authority(tc: hegel::TestCase) 
                     role: "coder".to_string(),
                     source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
                     cwd: "/workspace".to_string(),
+                    env: Default::default(),
                     pool: "cleat".to_string(),
                 },
             )

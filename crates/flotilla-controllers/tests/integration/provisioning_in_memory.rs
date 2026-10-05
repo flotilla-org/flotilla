@@ -764,6 +764,7 @@ async fn terminal_session_controller_marks_session_running() {
             role: "coder".to_string(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "cleat".to_string(),
         })
         .await
@@ -823,6 +824,7 @@ async fn presentation_controller_marks_presentation_active_for_live_convoy_sessi
                 role: "coder".to_string(),
                 source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
                 cwd: "/Users/alice/dev/flotilla-repos/convoy-a".to_string(),
+                env: Default::default(),
                 pool: "cleat".to_string(),
             },
         )
@@ -983,6 +985,7 @@ async fn vessel_controller_finalizer_deletes_vessel_owned_children_but_preserves
                 role: "coder".to_string(),
                 source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
                 cwd: "/Users/alice/dev/flotilla-repos/workspace-delete".to_string(),
+                env: Default::default(),
                 pool: "cleat".to_string(),
             },
         )

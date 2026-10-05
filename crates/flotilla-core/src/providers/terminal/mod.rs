@@ -1,4 +1,5 @@
 pub mod cleat;
+pub(crate) mod environment;
 pub mod passthrough;
 pub mod shpool;
 

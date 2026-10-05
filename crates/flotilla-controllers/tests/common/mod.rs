@@ -361,6 +361,7 @@ pub async fn create_stopped_terminal(
             role: fixture.role,
             source: flotilla_resources::TerminalSessionSource::Tool { command: fixture.command.clone() },
             cwd: fixture.cwd,
+            env: Default::default(),
             pool: fixture.pool,
         })
         .await

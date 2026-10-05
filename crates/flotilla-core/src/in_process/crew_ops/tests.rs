@@ -150,6 +150,7 @@ async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Ar
                     message: None,
                 },
                 cwd: "/repo".into(),
+                env: Default::default(),
                 pool: "passthrough".into(),
             },
         )

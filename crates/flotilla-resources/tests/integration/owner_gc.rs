@@ -274,6 +274,7 @@ async fn vessel_finalizer_contract(backend: ResourceBackend) {
             role: "coder".to_string(),
             source: TerminalSessionSource::Tool { command: "true".to_string() },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "test".to_string(),
         })
         .await

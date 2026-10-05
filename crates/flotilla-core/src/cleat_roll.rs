@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
-use crate::providers::{discovery::EnvironmentBag, ChannelLabel, CommandOutput, CommandRunner};
+use crate::providers::{
+    discovery::EnvironmentBag, terminal::environment::ControlledTerminalEnvironment, ChannelLabel, CommandOutput, CommandRunner,
+};
 
 #[derive(bon::Builder)]
 pub struct CleatEnvironment {
@@ -68,7 +70,7 @@ pub fn crew_targets(environment: &CleatEnvironment, endpoints: &[CleatEndpoint])
                 .runtime_root(runtime_root)
                 .name(name)
                 .binary(binary.clone())
-                .runner(Arc::clone(&environment.runner))
+                .runner(ControlledTerminalEnvironment::from_bag(&environment.bag).runner(Arc::clone(&environment.runner)))
                 .contained(environment.contained)
                 .build())
         })

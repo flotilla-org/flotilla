@@ -334,19 +334,89 @@ mod tests {
     // serving SHAs. A later matching observation clears it without blocking crews.
     #[tokio::test]
     async fn host_skew_condition_is_advisory_and_clears_when_serving_matches() {
-        let version_args = ["--runtime-root", "/crew/cleat", "--server", "default", "version", "--daemon", "--json"];
+        let version_args = [
+            "-i",
+            "PATH=/usr/local/bin:/usr/bin:/bin",
+            "CLEAT_RUNTIME_DIR=/crew/cleat",
+            "/installed/cleat",
+            "--runtime-root",
+            "/crew/cleat",
+            "--server",
+            "default",
+            "version",
+            "--daemon",
+            "--json",
+        ];
         let runner = Arc::new(
             DiscoveryMockRunner::builder()
                 .on_run("/installed/cleat", &["version", "--json"], Ok(r#"{"client":{"git_sha":"new"}}"#.into()))
                 .on_run("/installed/cleat", &["version", "--json"], Ok(r#"{"client":{"git_sha":"new"}}"#.into()))
-                .on_run("/installed/cleat", &version_args, Ok(r#"{"daemon":{"git_sha":"old"}}"#.into()))
-                .on_run("/installed/cleat", &version_args, Ok(r#"{"daemon":{"git_sha":"new"}}"#.into()))
-                .on_run("readlink", &["/crew/cleat/.default.current"], Err("no sidecar".into()))
-                .on_run("readlink", &["/crew/cleat/.default.current"], Err("no sidecar".into()))
-                .on_run("readlink", &["/crew/cleat/default"], Err("legacy".into()))
-                .on_run("readlink", &["/crew/cleat/default"], Err("legacy".into()))
-                .on_run("/installed/cleat", &["--runtime-root", "/crew/cleat", "--server", "default", "daemons", "--json"], Ok("[]".into()))
-                .on_run("/installed/cleat", &["--runtime-root", "/crew/cleat", "--server", "default", "daemons", "--json"], Ok("[]".into()))
+                .on_run("/usr/bin/env", &version_args, Ok(r#"{"daemon":{"git_sha":"old"}}"#.into()))
+                .on_run("/usr/bin/env", &version_args, Ok(r#"{"daemon":{"git_sha":"new"}}"#.into()))
+                .on_run(
+                    "/usr/bin/env",
+                    &[
+                        "-i",
+                        "PATH=/usr/local/bin:/usr/bin:/bin",
+                        "CLEAT_RUNTIME_DIR=/crew/cleat",
+                        "readlink",
+                        "/crew/cleat/.default.current",
+                    ],
+                    Err("no sidecar".into()),
+                )
+                .on_run(
+                    "/usr/bin/env",
+                    &[
+                        "-i",
+                        "PATH=/usr/local/bin:/usr/bin:/bin",
+                        "CLEAT_RUNTIME_DIR=/crew/cleat",
+                        "readlink",
+                        "/crew/cleat/.default.current",
+                    ],
+                    Err("no sidecar".into()),
+                )
+                .on_run(
+                    "/usr/bin/env",
+                    &["-i", "PATH=/usr/local/bin:/usr/bin:/bin", "CLEAT_RUNTIME_DIR=/crew/cleat", "readlink", "/crew/cleat/default"],
+                    Err("legacy".into()),
+                )
+                .on_run(
+                    "/usr/bin/env",
+                    &["-i", "PATH=/usr/local/bin:/usr/bin:/bin", "CLEAT_RUNTIME_DIR=/crew/cleat", "readlink", "/crew/cleat/default"],
+                    Err("legacy".into()),
+                )
+                .on_run(
+                    "/usr/bin/env",
+                    &[
+                        "-i",
+                        "PATH=/usr/local/bin:/usr/bin:/bin",
+                        "CLEAT_RUNTIME_DIR=/crew/cleat",
+                        "/installed/cleat",
+                        "--runtime-root",
+                        "/crew/cleat",
+                        "--server",
+                        "default",
+                        "daemons",
+                        "--json",
+                    ],
+                    Ok("[]".into()),
+                )
+                .on_run(
+                    "/usr/bin/env",
+                    &[
+                        "-i",
+                        "PATH=/usr/local/bin:/usr/bin:/bin",
+                        "CLEAT_RUNTIME_DIR=/crew/cleat",
+                        "/installed/cleat",
+                        "--runtime-root",
+                        "/crew/cleat",
+                        "--server",
+                        "default",
+                        "daemons",
+                        "--json",
+                    ],
+                    Ok("[]".into()),
+                )
                 .build(),
         );
         let directory = tempfile::tempdir().expect("config");

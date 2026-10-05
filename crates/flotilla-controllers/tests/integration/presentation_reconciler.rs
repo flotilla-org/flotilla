@@ -946,6 +946,7 @@ async fn create_running_terminal(backend: &ResourceBackend, name: &str, env_ref:
             role: "main".to_string(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: "bash".to_string() },
             cwd: "/workspace/repo".to_string(),
+            env: Default::default(),
             pool: "fake".to_string(),
         })
         .await

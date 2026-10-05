@@ -1191,7 +1191,7 @@ async fn docker_cleat_launch_does_not_forward_outer_terminal_identity() {
         },
     };
 
-    let inner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("{}".into())]));
+    let inner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("--env-clear --env".into()), Ok("{}".into())]));
     let env_runner = Arc::new(DockerEnvironmentRunner::new("test-container".to_string(), inner.clone()));
     let bag = EnvironmentBag::new()
         .with(EnvironmentAssertion::binary("cleat", "/usr/local/bin/cleat"))
@@ -1206,13 +1206,17 @@ async fn docker_cleat_launch_does_not_forward_outer_terminal_identity() {
     let pool = CleatTerminalPoolFactory.probe(&bag, &config, &repo_root, env_runner).await.expect("cleat pool in Docker");
     pool.ensure_session("session", "codex", &repo_root, &vec![], &[]).await.expect("launch in Docker");
 
-    assert_eq!(inner.calls()[1].1, vec![
+    assert_eq!(inner.calls()[2].1, vec![
         "exec",
         "-w",
         "/",
         "test-container",
+        "/usr/bin/env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
         "/usr/local/bin/cleat",
         "launch",
+        "--env-clear",
         "--json",
         "--record",
         "session",
@@ -1220,6 +1224,8 @@ async fn docker_cleat_launch_does_not_forward_outer_terminal_identity() {
         "/repo",
         "--cmd",
         "codex",
+        "--env",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
     ]);
 }
 

@@ -1157,6 +1157,7 @@ async fn managed_claude_permission_prompt_marks_terminal_as_needing_input() {
             role: "coder".into(),
             source: TerminalSessionSource::Tool { command: "claude".into() },
             cwd: "/repo".into(),
+            env: Default::default(),
             pool: "cleat".into(),
         })
         .await
@@ -1270,6 +1271,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                     role: "coder".into(),
                     source: TerminalSessionSource::Tool { command: harness_name.into() },
                     cwd: "/repo".into(),
+                    env: Default::default(),
                     pool: "cleat".into(),
                 },
             )
@@ -1689,6 +1691,7 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
                 message: None,
             },
             cwd: "/repo".into(),
+            env: Default::default(),
             pool: "cleat".into(),
         })
         .await
@@ -5113,6 +5116,7 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
             env_ref,
             role: "coder".into(),
             cwd: "/workspace".into(),
+            env: Default::default(),
             pool: "passthrough".into(),
             source: TerminalSessionSource::Agent {
                 selector: Selector { capability: "code".into(), adapter: None, model: None },

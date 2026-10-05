@@ -1789,6 +1789,7 @@ impl CrewService {
                                 message: Some(pending_crew_message(sender.clone(), message)),
                             },
                             cwd: anchor.spec.cwd,
+                            env: anchor.spec.env,
                             pool: anchor.spec.pool,
                         })
                         .await
