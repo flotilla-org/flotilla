@@ -349,7 +349,7 @@ fn stock_workflows_transcribe_the_standard_exit_table() {
 }
 
 #[test]
-fn stock_landing_workflows_validate_with_checks_review_and_conflicting_turn_delivery() {
+fn stock_landing_workflows_validate_with_checks_review_conflicting_and_merged_turn_delivery() {
     for (name, spec, role) in [
         ("single-agent-shepherd", single_agent_shepherd_workflow_spec(), "shepherd"),
         ("single-agent", single_agent_workflow_spec(), "coder"),
@@ -358,6 +358,7 @@ fn stock_landing_workflows_validate_with_checks_review_and_conflicting_turn_deli
         validate(&spec).unwrap_or_else(|errors| panic!("stock workflow {name} must validate: {errors:?}"));
         assert_eq!(spec.turn_delivery.keys().filter(|source| !source.starts_with("reviewer-")).map(String::as_str).collect::<Vec<_>>(), [
             "checks-settled",
+            "merged-unclaimed",
             "actionable-review",
             "conflicting"
         ]);
@@ -366,15 +367,17 @@ fn stock_landing_workflows_validate_with_checks_review_and_conflicting_turn_deli
             assert_eq!(rule.to.role, if source.starts_with("reviewer-") { "reviewer" } else { role }, "wrong role in {name}");
         }
         if name == "implement-review" {
-            assert_eq!(spec.turn_delivery.len(), 5);
+            assert_eq!(spec.turn_delivery.len(), 6);
             assert_eq!(spec.turn_delivery["reviewer-checks-settled"].on.to_string(), "$cr.checks != pending");
             assert_eq!(spec.turn_delivery["reviewer-actionable-review"].on.to_string(), "$cr.review.actionable-at-head == true");
         } else {
-            assert_eq!(spec.turn_delivery.len(), 3);
+            assert_eq!(spec.turn_delivery.len(), 4);
         }
         // #2596: stock delivery wakes the crew for either settled checks outcome.
         assert_eq!(spec.turn_delivery["checks-settled"].on.to_string(), "$cr.checks != pending");
         assert_eq!(spec.turn_delivery["conflicting"].on.to_string(), "$cr.mergeable == conflicting");
+        // #2701: admission must accept the stock merged settlement wake too.
+        assert_eq!(spec.turn_delivery["merged-unclaimed"].on.to_string(), "$cr.state == merged");
     }
 }
 

@@ -664,7 +664,7 @@ impl ConvoyAdmission {
         intent: &flotilla_protocol::ConvoyStartIntent,
         purpose: PlacementPurpose,
     ) -> Result<(String, WorkflowTemplateSpec), String> {
-        let workflow_ref = match intent.workflow_ref.as_deref() {
+        let mut workflow_ref = match intent.workflow_ref.as_deref() {
             Some(workflow_ref) => required_admission_value(workflow_ref, "workflow")?.to_string(),
             None if intent.change_request.is_some() => "single-agent-shepherd".to_string(),
             None => project.default_workflow_ref.clone(),
@@ -673,10 +673,13 @@ impl ConvoyAdmission {
         let scoped_workflow_ref = crate::ops_entry::materialized_workflow_name(project_ref, &workflow_ref);
         let mut workflow = match templates.get(&scoped_workflow_ref).await {
             Ok(workflow) => workflow,
-            Err(ResourceError::NotFound { .. }) => templates
-                .get(&workflow_ref)
-                .await
-                .map_err(|error| format!("workflow template {workflow_ref} for project {project_ref}: {error}"))?,
+            Err(ResourceError::NotFound { .. }) => {
+                workflow_ref = flotilla_resources::current_builtin_workflow_name(&workflow_ref).to_string();
+                templates
+                    .get(&workflow_ref)
+                    .await
+                    .map_err(|error| format!("workflow template {workflow_ref} for project {project_ref}: {error}"))?
+            }
             Err(error) => return Err(format!("workflow template {workflow_ref} for project {project_ref}: {error}")),
         };
         if workflow.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).is_some_and(|owner| owner != project_ref) {
@@ -3497,6 +3500,40 @@ mod tests {
         discovery::test_support::{fake_discovery, FakeChangeRequest},
         types::ChangeRequest,
     };
+
+    // #2701: Projects with either retired builtin reference admit using the
+    // current rules even when the stale builtin still exists, or has been deleted.
+    #[tokio::test]
+    async fn retired_project_workflow_admits_current_turn_rules() {
+        let temp = tempfile::tempdir().expect("config");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"retired-workflow-test\"\n").expect("machine identity");
+        let daemon =
+            InProcessDaemon::new(Vec::new(), Arc::new(ConfigStore::with_base(temp.path())), fake_discovery(false), HostName::local()).await;
+        let templates = daemon.resource_backend().definitions::<WorkflowTemplate>("flotilla");
+        let current = flotilla_resources::single_agent_workflow_spec();
+        templates.create(&InputMeta::builder().name("single-agent".into()).build(), &current).await.expect("current workflow");
+        for retired in ["single-agent-contained", "single-agent-trusted"] {
+            let mut stale = current.clone();
+            stale.turn_delivery.shift_remove("checks-settled");
+            templates.create(&InputMeta::builder().name(retired.into()).build(), &stale).await.expect("stale workflow");
+            let project = ProjectSpec::builder().display_name("Flotilla".into()).default_workflow_ref(retired.into()).build();
+            let intent = flotilla_protocol::ConvoyStartIntent::builder().project_ref("flotilla".into()).build();
+            for deleted in [false, true] {
+                if deleted {
+                    templates.delete(retired).await.expect("retire stored builtin");
+                }
+                let (name, frozen) = daemon
+                    .convoy_admission
+                    .resolve_convoy_admission_workflow("flotilla", "flotilla", &project, &[], &intent)
+                    .await
+                    .expect("admit retired Project reference");
+                flotilla_resources::validate(&frozen).expect("admitted workflow must remain valid after resolution");
+                assert_eq!(name, "single-agent");
+                assert!(frozen.turn_delivery.contains_key("checks-settled"));
+                assert!(frozen.turn_delivery.contains_key("merged-unclaimed"));
+            }
+        }
+    }
 
     #[test]
     fn role_refresh_preserves_composed_needs_and_refuses_missing_crew() {
