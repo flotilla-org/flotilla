@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
 };
 
@@ -50,9 +50,66 @@ pub struct CrewListResponse {
     pub vessel_ref: String,
     pub vessel: String,
     pub members: Vec<CrewListMember>,
+    /// Charter resolved from the live Project on every crew query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<CrewProject>,
+    /// An unavailable live charter, kept separate from process state and alerts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub credential_alerts: Vec<String>,
+}
+
+/// Current island membership, independent of the convoy's admission snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct CrewProject {
+    pub namespace: String,
+    pub name: String,
+    pub display_name: String,
+    pub repositories: Vec<CrewProjectRepository>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct CrewProjectRepository {
+    pub key: RepositoryKey,
+    pub alias: Option<String>,
+    pub roles: BTreeSet<ProjectRepositoryRole>,
+    pub subpath: Option<String>,
+    pub default_branch: Option<String>,
+    /// Live repository remotes; empty when the Repository is unavailable.
+    pub remotes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectRepositoryRole {
+    Code,
+    Ops,
+    Knowledge,
+}
+
+impl std::fmt::Display for ProjectRepositoryRole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Code => "code",
+            Self::Ops => "ops",
+            Self::Knowledge => "knowledge",
+        })
+    }
+}
+
+#[cfg(test)]
+mod project_repository_role_tests {
+    use super::ProjectRepositoryRole;
+
+    // Human-readable roles use the same names as the serialized charter.
+    #[test]
+    fn display_matches_serialized_role_names() {
+        for role in [ProjectRepositoryRole::Code, ProjectRepositoryRole::Ops, ProjectRepositoryRole::Knowledge] {
+            assert_eq!(serde_json::to_value(role).expect("role serializes"), role.to_string());
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]

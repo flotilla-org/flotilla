@@ -40,6 +40,15 @@ practice teaches). If you cannot tell whether something can spiral, it can.
 
 ## Observing your island
 
+Begin every orientation sweep with `flotilla crew list` (`--json` for structured
+output). Its `project` field resolves your convoy’s Project live and lists each
+repository’s key, alias, roles, subpath, default branch, and remotes. Use this
+charter for triage, bootstrap, and tracking throughout the sweep. Membership and
+role edits take effect on the next query in the same running crew. Credential
+reach follows the credential refresh policy (#1985). An unavailable charter
+appears as `project_error` alongside crew state and credential alerts; resolve
+charter availability before repository-specific work.
+
 ```sh
 flotilla ls --project <proj>                       # island convoys, vessels, crews, staleness
 flotilla resource list convoys --project <proj>     # raw island convoys

@@ -790,8 +790,28 @@ fn format_crew_list_human(response: &CrewListResponse) -> String {
             Cell::new(member.stance.as_deref().unwrap_or("-")),
         ]);
     }
+    let mut charter = String::new();
+    if let Some(error) = &response.project_error {
+        let _ = writeln!(charter, "Live Project unavailable: {error}");
+    }
+    if let Some(project) = &response.project {
+        let _ = writeln!(charter, "Live Project: {}/{} ({})", project.namespace, project.name, project.display_name);
+        for repository in &project.repositories {
+            let roles = repository.roles.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+            let _ = writeln!(
+                charter,
+                "  {}  alias={}  roles=[{}]  subpath={}  branch={}  remotes=[{}]",
+                repository.key,
+                repository.alias.as_deref().unwrap_or("-"),
+                roles,
+                repository.subpath.as_deref().unwrap_or("-"),
+                repository.default_branch.as_deref().unwrap_or("-"),
+                repository.remotes.join(", ")
+            );
+        }
+    }
     let alerts = response.credential_alerts.iter().map(|alert| format!("Credential attention: {alert}\n")).collect::<String>();
-    format!("Convoy: {}  Vessel: {} ({})\n{}\n{alerts}", response.convoy, response.vessel, response.vessel_ref, table)
+    format!("Convoy: {}  Vessel: {} ({})\n{}\n{alerts}{charter}", response.convoy, response.vessel, response.vessel_ref, table)
 }
 
 fn explained_condition_label(condition: Option<&flotilla_protocol::ExplainedCondition>) -> String {

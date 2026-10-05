@@ -313,9 +313,16 @@ pub fn append_convoy_work_context(
     if let Some(branch) = &convoy.spec.r#ref {
         content.push_str(&format!("- Branch: `{branch}`\n"));
     }
-    content.push_str("- Repositories:\n");
-    for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
-        content.push_str(&format!("  - `{}` — {} (target `{}`)\n", repository.repo_ref, repository.url, repository.target_ref));
+    if let Some(project_ref) = &convoy.spec.project_ref {
+        content.push_str(&format!("- Island Project: `{project_ref}` — resolve current repositories and roles with `flotilla crew list` on each orientation sweep.\n"));
+    }
+    // Project-scoped governors orient against live membership. Delivery crews
+    // retain admitted repository URLs and target refs as their delivery contract.
+    if convoy.spec.role != "governor" || convoy.spec.project_ref.is_none() {
+        content.push_str("- Repositories:\n");
+        for repository in convoy.spec.repositories.iter().filter(|repository| repository_refs.contains(&repository.repo_ref)) {
+            content.push_str(&format!("  - `{}` — {} (target `{}`)\n", repository.repo_ref, repository.url, repository.target_ref));
+        }
     }
     if !credential_scopes.is_empty() {
         content.push_str("- Minted credential repository scope:\n");
@@ -1243,6 +1250,19 @@ mod tests {
         insta::assert_snapshot!("dispatched_crew_brief", content);
     }
 
+    // #1986: the governor brief identifies its island through a live resource reference.
+    #[test]
+    fn governor_work_context_references_live_island() {
+        let (mut convoy, repository_key) = convoy_brief_fixture();
+        convoy.spec.role = "governor".into();
+        convoy.spec.project_ref = Some("porthole".into());
+        let mut content = String::new();
+        append_convoy_work_context(&mut content, &convoy, &[repository_key], &BTreeMap::new());
+        assert!(content.contains("Island Project: `porthole`"));
+        assert!(content.contains("resolve current repositories and roles with `flotilla crew list` on each orientation sweep"));
+        assert!(!content.contains("- Repositories:"));
+    }
+
     #[test]
     fn standing_brief_keeps_the_convoy_active_across_tasks() {
         let (mut convoy, _) = convoy_brief_fixture();
@@ -1271,6 +1291,8 @@ mod tests {
         assert!(content.contains("yield at the turn boundary"));
         assert!(content.contains("Rebase only when the forge reports a conflict with the target branch"));
         assert!(!content.contains("three rebase attempts"));
+        assert!(content.contains("Governors begin every orientation sweep with this command"));
+        assert!(content.contains("The Project is the current island charter"));
         insta::assert_snapshot!("standing_crew_brief", content);
     }
 
