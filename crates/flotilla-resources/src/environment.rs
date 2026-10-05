@@ -98,7 +98,9 @@ pub struct EnvironmentStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentStatusPatch {
-    ObserveRuntime { observation: flotilla_protocol::EnvironmentRuntimeObservation },
+    ObserveRuntime {
+        observation: flotilla_protocol::EnvironmentRuntimeObservation,
+    },
     MarkReady {
         configured_limits: Option<ConfiguredResourceLimits>,
         docker_container_id: Option<String>,

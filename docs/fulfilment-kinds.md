@@ -70,12 +70,15 @@ Environment and Vessel status carry `runtime_observation`; Convoy status and
 configured limits, last successful cgroup RAM usage with its timestamp, and exit
 code, inferred signal, Docker `OOMKilled`, cause and supporting journal evidence.
 On Linux with the systemd cgroup v2 driver, RAM usage is sampled from
-`memory.current`. Unavailable cgroups preserve the previous sample; missing
+`memory.current`. Unchanged usage retains its original sample timestamp and does
+not trigger status writes; changed usage or other evidence does. Unavailable
+cgroups preserve the previous sample; missing
 samples stay unknown. Exit 137 alone proves neither a kernel OOM nor an oomd
 kill. Host attribution requires a full container ID match in the kill record,
 inside the container's start-to-finish journal window. Journal access is best
 effort; unavailable evidence leaves the kill cause unknown. Conventional exit
-143 is classified as a normal SIGTERM stop, but a stop of backing that should be
+143 is classified as a normal SIGTERM stop (including external SIGTERM; inspect
+cannot identify who sent it), but a stop of backing that should be
 Ready still fails the vessel. Dirty work remains protected by existing reclaim
 checks, and the failure message lists retained checkout paths for recovery.
 

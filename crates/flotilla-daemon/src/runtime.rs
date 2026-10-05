@@ -1889,10 +1889,18 @@ async fn reconcile_provisioned_environment(
         return fail_unavailable_environment(state, namespace, &env_id, &format!("Docker container {container_id} is not running")).await;
     };
     let status = handle.status().await;
-    let observation = handle
-        .runtime_observation()
-        .await
-        .map_err(|error| format!("Docker container {container_id} observation failed: {error}; will retry"))?;
+    let observation = match handle.runtime_observation().await {
+        Ok(observation) => observation,
+        Err(error)
+            if matches!(status, Ok(flotilla_protocol::EnvironmentStatus::Stopped | flotilla_protocol::EnvironmentStatus::Failed(_))) =>
+        {
+            // Richer evidence is best effort once liveness establishes death.
+            // Keep existing samples and fail backing rather than retry forever.
+            warn!(container = %container_id, %error, "terminal backing observation unavailable");
+            None
+        }
+        Err(error) => return Err(format!("Docker container {container_id} observation failed: {error}; will retry")),
+    };
     if let Some(observation) = &observation {
         record_environment_observation(state, namespace, &env_id, observation).await?;
     }
@@ -2325,21 +2333,52 @@ async fn record_environment_observation(
 ) -> Result<(), String> {
     use flotilla_resources::apply_status_patch;
     let backend = state.daemon.resource_backend();
-    apply_status_patch(&backend.using::<Environment>(namespace), env_id.as_str(), &EnvironmentStatusPatch::ObserveRuntime {
-        observation: observation.clone(),
-    })
-    .await
-    .map_err(|error| error.to_string())?;
+    let environments = backend.using::<Environment>(namespace);
+    let environment = environments.get(env_id.as_str()).await.map_err(|error| error.to_string())?;
+    if let Some(observation) =
+        changed_runtime_observation(environment.status.as_ref().and_then(|status| status.runtime_observation.as_ref()), observation)
+    {
+        apply_status_patch(&environments, env_id.as_str(), &EnvironmentStatusPatch::ObserveRuntime { observation })
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     let vessels = backend.using::<Vessel>(namespace);
     for vessel in vessels.list().await.map_err(|error| error.to_string())?.items {
         if vessel.status.as_ref().and_then(|status| status.environment_ref.as_deref()) != Some(env_id.as_str()) {
             continue;
         }
-        apply_status_patch(&vessels, &vessel.metadata.name, &VesselStatusPatch::ObserveRuntime { observation: observation.clone() })
-            .await
-            .map_err(|error| error.to_string())?;
+        if let Some(observation) =
+            changed_runtime_observation(vessel.status.as_ref().and_then(|status| status.runtime_observation.as_ref()), observation)
+        {
+            apply_status_patch(&vessels, &vessel.metadata.name, &VesselStatusPatch::ObserveRuntime { observation })
+                .await
+                .map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
+}
+
+/// Keep a sample's original timestamp while its value is unchanged. Compare
+/// each dependent independently so newly attached vessels still get their first
+/// observation even when the Environment already has the same evidence.
+fn changed_runtime_observation(
+    current: Option<&flotilla_protocol::EnvironmentRuntimeObservation>,
+    incoming: &flotilla_protocol::EnvironmentRuntimeObservation,
+) -> Option<flotilla_protocol::EnvironmentRuntimeObservation> {
+    let mut merged = current.cloned().unwrap_or_default();
+    merged.merge(incoming);
+    if let Some(current) = current {
+        if merged.container_id == current.container_id
+            && merged.started_at == current.started_at
+            && merged.memory_usage_bytes == current.memory_usage_bytes
+        {
+            merged.memory_observed_at.clone_from(&current.memory_observed_at);
+        }
+        if &merged == current {
+            return None;
+        }
+    }
+    Some(merged)
 }
 
 async fn fail_unavailable_environment(
