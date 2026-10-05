@@ -34,7 +34,7 @@ impl Factory for CleatTerminalPoolFactory {
     ) -> Result<Arc<dyn TerminalPool>, Vec<UnmetRequirement>> {
         if let Some(binary) = env.find_binary("cleat") {
             // Cleat's VT engine chooses the child's terminal identity at launch.
-            Ok(Arc::new(CleatTerminalPool::new(runner, binary.as_path().display().to_string())))
+            Ok(Arc::new(CleatTerminalPool::new(runner, binary.as_path().display().to_string(), env)))
         } else {
             Err(vec![UnmetRequirement::MissingBinary("cleat".into())])
         }
@@ -52,10 +52,19 @@ mod tests {
         providers::discovery::{test_support::DiscoveryMockRunner, EnvironmentAssertion, EnvironmentBag, Factory, UnmetRequirement},
     };
 
+    // #2706: factory discovery supplies the execution host baseline, while
+    // Cleat owns terminal identity and ambient harness values never transfer.
     #[tokio::test]
-    async fn session_factory_leaves_terminal_identity_to_cleat() {
+    async fn session_factory_uses_declared_host_baseline_and_leaves_vt_identity_to_cleat() {
+        use crate::providers::{testing::MockRunner, CommandRunner};
+
         for outer_identity in [None, Some(("screen-256color", "truecolor"))] {
-            let mut bag = EnvironmentBag::new().with(EnvironmentAssertion::binary("cleat", "/usr/local/bin/cleat"));
+            let mut bag = EnvironmentBag::new()
+                .with(EnvironmentAssertion::binary("cleat", "/usr/local/bin/cleat"))
+                .with(EnvironmentAssertion::env_var("HOME", "/execution/home"))
+                .with(EnvironmentAssertion::env_var("PATH", "/execution/bin:/usr/bin:/bin"))
+                .with(EnvironmentAssertion::env_var("NO_COLOR", "1"))
+                .with(EnvironmentAssertion::env_var("CLAUDE_CODE_MESSAGING_TOKEN", "fake-unrelated-token"));
             if let Some((term, colorterm)) = outer_identity {
                 bag = bag
                     .with(EnvironmentAssertion::env_var("TERM", term))
@@ -65,21 +74,26 @@ mod tests {
             }
             let dir = tempfile::tempdir().expect("tempdir");
             let config = ConfigStore::with_base(dir.path());
-            let runner = Arc::new(
-                DiscoveryMockRunner::builder()
-                    .on_run("/usr/local/bin/cleat", &["list", "--json"], Ok("[]".into()))
-                    .on_run(
-                        "/usr/local/bin/cleat",
-                        &["launch", "--json", "--record", "session", "--cwd", "/repo", "--cmd", "codex"],
-                        Ok("{}".into()),
-                    )
-                    .build(),
-            );
-            let pool =
-                CleatTerminalPoolFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await.expect("cleat pool");
+            let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("--env-clear --env".into()), Ok("{}".into())]));
+            let pool = CleatTerminalPoolFactory
+                .probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner.clone() as Arc<dyn CommandRunner>)
+                .await
+                .expect("cleat pool");
             pool.ensure_session("session", "codex", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[])
                 .await
-                .expect("launch without discovery terminal identity");
+                .expect("launch with declared environment");
+            let calls = runner.calls();
+            assert_eq!(calls.len(), 3);
+            for (cmd, args) in &calls {
+                assert_eq!(cmd, "/usr/bin/env");
+                assert_eq!(&args[..4], &["-i", "HOME=/execution/home", "PATH=/execution/bin:/usr/bin:/bin", "/usr/local/bin/cleat"]);
+                assert!(!args
+                    .iter()
+                    .any(|arg| arg.starts_with("NO_COLOR=") || arg.starts_with("CLAUDE_CODE_") || arg.starts_with("TERM=")));
+            }
+            assert!(calls[2].1.iter().any(|arg| arg == "--env-clear"));
+            let env = calls[2].1.windows(2).filter(|args| args[0] == "--env").map(|args| args[1].as_str()).collect::<Vec<_>>();
+            assert_eq!(env, vec!["HOME=/execution/home", "PATH=/execution/bin:/usr/bin:/bin"]);
         }
     }
 

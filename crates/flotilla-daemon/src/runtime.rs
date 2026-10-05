@@ -6035,6 +6035,14 @@ impl TerminalRuntime for TerminalControllerRuntime {
             None if credential_refs.is_empty() => Vec::new(),
             None => return Err("host-local credential store unavailable".to_string()),
         };
+        let mut declared_env = spec.env.clone();
+        declared_env.extend(credential_env);
+        if spec.env_ref == self.state.host_direct_environment_name {
+            if let Some(socket) = self.state.daemon.daemon_socket_path().await {
+                declared_env.insert("FLOTILLA_DAEMON_SOCKET".into(), socket.display().to_string());
+            }
+        }
+        credential_env = declared_env.into_iter().collect();
         let (command, mut env, crew) = match &spec.source {
             TerminalSessionSource::Tool { command } => (command.clone(), credential_env.clone(), None),
             TerminalSessionSource::Agent { selector, brief, context, .. } => {
@@ -11785,6 +11793,7 @@ mod tests {
                     message: None,
                 },
                 cwd: "/workspace".to_string(),
+                env: Default::default(),
                 pool: "test".to_string(),
             })
             .await
@@ -12567,6 +12576,7 @@ mod tests {
             role: "coder".to_string(),
             source: TerminalSessionSource::Tool { command: "sleep infinity".to_string() },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "cleat".to_string(),
         };
 
@@ -14293,6 +14303,7 @@ mod tests {
                     role: "coder".to_string(),
                     source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
                     cwd: "/workspace".to_string(),
+                    env: Default::default(),
                     pool: profile.host_direct_pool.clone(),
                 },
             )
@@ -14391,6 +14402,7 @@ mod tests {
                     role: "coder".to_string(),
                     source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
                     cwd: "/workspace".to_string(),
+                    env: Default::default(),
                     pool: profile.host_direct_pool.clone(),
                 },
             )
@@ -15921,6 +15933,10 @@ mod tests {
                 message: None,
             },
             cwd: workspace.display().to_string(),
+            env: BTreeMap::from([
+                ("DECLARED_VALUE".into(), "hello declared crew".into()),
+                ("CLAUDE_CODE_OAUTH_TOKEN".into(), "superseded-spec-token".into()),
+            ]),
             pool: "fake-terminals".to_string(),
         };
         let tags = [flotilla_resources::TerminalSessionTag::new(CREDENTIAL_REF_SESSION_TAG, "claude-max")];
@@ -15934,6 +15950,9 @@ mod tests {
         let [launch] = ensured.as_slice() else {
             panic!("expected exactly one contained Claude launch");
         };
+        // #2706: session declarations survive, and granted credentials override conflicts.
+        assert!(launch.env_vars.iter().any(|(name, value)| name == "DECLARED_VALUE" && value == "hello declared crew"));
+        assert!(!launch.env_vars.iter().any(|(_, value)| value == "superseded-spec-token"));
         assert!(
             launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CODE_OAUTH_TOKEN" && value == "oauth-secret-material"),
             "the contained Claude process must receive its OAuth token"
@@ -15975,6 +15994,8 @@ mod tests {
         std::fs::write(config_path.join("daemon.toml"), "machine_id = \"dinghy-test\"\n").expect("daemon config");
         let config = Arc::new(ConfigStore::with_base(config_path));
         let (daemon, pool) = crew_daemon_with_process_runner(Arc::clone(&config)).await;
+        let current_socket = temp.path().join("current-daemon.sock");
+        daemon.set_daemon_socket_path(current_socket.clone()).await;
         let local_registry = probe_local_provider_registry(&daemon, &config).await.expect("crew provider registry");
         let profile = build_local_profile(&daemon, &local_registry).expect("local profile");
         let state = Arc::new(ControllerRuntimeState::new(
@@ -16024,6 +16045,10 @@ mod tests {
                 message: None,
             },
             cwd: session_cwd.display().to_string(),
+            env: BTreeMap::from([
+                ("FLOTILLA_DAEMON_SOCKET".into(), "/unrelated-daemon.sock".into()),
+                ("DECLARED_VALUE".into(), "hello declared crew".into()),
+            ]),
             pool: "fake-terminals".to_string(),
         };
 
@@ -16032,6 +16057,16 @@ mod tests {
         assert_eq!(pool.killed.lock().await.as_slice(), &[session_name.to_string()]);
         assert_eq!(pool.ensured.lock().await.len(), 1, "the fresh agent command must actually be launched");
         assert!(launched.crew.is_some(), "the replacement gets a fresh crew identity");
+        // #2706: restored crews get the current daemon's declared socket and
+        // session values, regardless of a stale inherited or supplied socket.
+        let ensured = pool.ensured.lock().await;
+        assert!(ensured[0]
+            .env_vars
+            .iter()
+            .any(|(key, value)| key == "FLOTILLA_DAEMON_SOCKET" && value == &current_socket.display().to_string()));
+        assert!(ensured[0].env_vars.iter().any(|(key, value)| key == "DECLARED_VALUE" && value == "hello declared crew"));
+        assert!(!ensured[0].env_vars.iter().any(|(_, value)| value == "/unrelated-daemon.sock"));
+        drop(ensured);
         assert_eq!(
             std::fs::read_to_string(durable_checkout.join(".flotilla/briefs/coder.md")).expect("durable brief copy"),
             "Implement the issue."
@@ -16070,6 +16105,7 @@ mod tests {
             role: "coder".to_string(),
             source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
             cwd: "/repo".to_string(),
+            env: Default::default(),
             pool: "fake-terminals".to_string(),
         };
         pool.add_sessions(vec![flotilla_core::providers::terminal::TerminalSession::builder()
@@ -16156,6 +16192,7 @@ mod tests {
                 message: None,
             },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "fake-terminals".to_string(),
         };
 
@@ -16222,6 +16259,7 @@ mod tests {
             role: "coder".to_string(),
             source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
             cwd: "/repo".to_string(),
+            env: Default::default(),
             pool: "fake-terminals".to_string(),
         };
 

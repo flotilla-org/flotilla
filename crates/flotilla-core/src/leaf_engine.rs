@@ -3969,6 +3969,7 @@ mod tests {
                         message: None,
                     },
                     cwd: "/workspace".into(),
+                    env: Default::default(),
                     pool: "cleat".into(),
                 },
             )
@@ -4346,6 +4347,7 @@ mod tests {
                         }),
                     },
                     cwd: "/workspace".into(),
+                    env: Default::default(),
                     pool: "cleat".into(),
                 },
             )
@@ -5287,6 +5289,7 @@ mod tests {
                     role: "coder".into(),
                     source: TerminalSessionSource::Tool { command: "codex".into() },
                     cwd: "/workspace".into(),
+                    env: Default::default(),
                     pool: "cleat".into(),
                 },
             )

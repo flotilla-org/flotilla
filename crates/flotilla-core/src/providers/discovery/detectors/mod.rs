@@ -7,20 +7,18 @@ pub mod git;
 use generic::{parse_first_dotted_version, CommandDetector, EnvVarDetector};
 
 use super::{HostDetector, RepoDetector};
+use crate::providers::terminal::environment::HOST_ENVIRONMENT_KEYS;
 
 pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
-    vec![
+    let mut detectors: Vec<Box<dyn HostDetector>> = vec![
         Box::new(crate::providers::vcs::detection::git_binary_detector()),
         Box::new(CommandDetector::new("curl", &["--version"], parse_first_dotted_version)),
         Box::new(CommandDetector::new("gh", &["--version"], parse_first_dotted_version)),
         Box::new(claude::ClaudeDetector),
         Box::new(codex::CodexAuthDetector),
         Box::new(CommandDetector::new("codex", &["--version"], parse_first_dotted_version).with_resolved_path()),
-        Box::new(EnvVarDetector::new("HOME")),
-        Box::new(EnvVarDetector::new("XDG_STATE_HOME")),
         Box::new(EnvVarDetector::new("CLEAT_RUNTIME_DIR")),
         Box::new(EnvVarDetector::new("CLEAT_DAEMON")),
-        Box::new(EnvVarDetector::new("SHELL")),
         Box::new(EnvVarDetector::new("CODEX_HOME")),
         Box::new(EnvVarDetector::new("ANTHROPIC_API_KEY")),
         Box::new(EnvVarDetector::new("CURSOR_API_KEY")),
@@ -35,7 +33,9 @@ pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
         Box::new(CommandDetector::new("gemini", &["--version"], parse_first_dotted_version)),
         Box::new(EnvVarDetector::new("TERM")),
         Box::new(EnvVarDetector::new("COLORTERM")),
-    ]
+    ];
+    detectors.extend(HOST_ENVIRONMENT_KEYS.iter().map(|&key| Box::new(EnvVarDetector::new(key)) as Box<dyn HostDetector>));
+    detectors
 }
 
 pub fn default_repo_detectors() -> Vec<Box<dyn RepoDetector>> {

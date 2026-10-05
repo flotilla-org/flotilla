@@ -9,10 +9,13 @@ use async_trait::async_trait;
 use flotilla_protocol::{arg::Arg, commands::AttachMode, result_set::CleatEndpoint};
 use serde::Deserialize;
 
-use super::{ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness, TerminalSessionTag, TerminalSize};
+use super::{
+    environment::ControlledTerminalEnvironment, ScreenActivity, TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionLiveness,
+    TerminalSessionTag, TerminalSize,
+};
 use crate::{
     path_context::ExecutionEnvironmentPath,
-    providers::{run, ChannelLabel, CommandRunner},
+    providers::{discovery::EnvironmentBag, run, ChannelLabel, CommandRunner},
 };
 
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
@@ -71,6 +74,8 @@ enum ScreenActivityWire {
 pub struct CleatTerminalPool {
     runner: Arc<dyn CommandRunner>,
     binary: String,
+    environment: ControlledTerminalEnvironment,
+    launch_capability: tokio::sync::OnceCell<()>,
     attach_capability: tokio::sync::OnceCell<()>,
     endpoint_cache: tokio::sync::Mutex<Option<EndpointCache>>,
     last_recording_prune: tokio::sync::Mutex<Instant>,
@@ -82,10 +87,13 @@ struct EndpointCache {
 }
 
 impl CleatTerminalPool {
-    pub fn new(runner: Arc<dyn CommandRunner>, binary: impl Into<String>) -> Self {
+    pub fn new(runner: Arc<dyn CommandRunner>, binary: impl Into<String>, bag: &EnvironmentBag) -> Self {
+        let environment = ControlledTerminalEnvironment::from_bag(bag);
         Self {
-            runner,
+            runner: environment.runner(runner),
             binary: binary.into(),
+            environment,
+            launch_capability: tokio::sync::OnceCell::new(),
             attach_capability: tokio::sync::OnceCell::new(),
             endpoint_cache: tokio::sync::Mutex::new(None),
             last_recording_prune: tokio::sync::Mutex::new(Instant::now()),
@@ -164,13 +172,28 @@ impl CleatTerminalPool {
             return Ok(());
         }
 
+        self.launch_capability
+            .get_or_try_init(|| async {
+                let help = run!(self.runner, &self.binary, &["launch", "--help"], Path::new("/"))
+                    .map_err(|_| format!("cleat '{}' cannot verify declared environment support (--env-clear)", self.binary))?;
+                if !help.split_whitespace().any(|word| word == "--env-clear") {
+                    return Err(format!(
+                        "cleat '{}' lacks declared environment support (--env-clear); upgrade cleat before launching sessions (cleat#318)",
+                        self.binary
+                    ));
+                }
+                Ok(())
+            })
+            .await?;
+
         let cwd = cwd.as_path().display().to_string();
-        let mut args = vec!["launch", "--json", "--record", session_name, "--cwd", &cwd, "--cmd", command];
+        let mut args = vec!["launch", "--env-clear", "--json", "--record", session_name, "--cwd", &cwd, "--cmd", command];
         let encoded_size = initial_size.map(|size| size.to_string());
         if let Some(size) = &encoded_size {
             args.extend(["--size", size]);
         }
-        let encoded_env = env_vars.iter().map(|(key, value)| format!("{key}={value}")).collect::<Vec<_>>();
+        let encoded_env =
+            self.environment.session_environment(env_vars).iter().map(|(key, value)| format!("{key}={value}")).collect::<Vec<_>>();
         for variable in &encoded_env {
             args.extend(["--env", variable]);
         }
@@ -378,6 +401,42 @@ mod tests {
         providers::{testing::MockRunner, CommandRunner},
     };
 
+    // Existing command-layout tests exercise their operation after the launch
+    // capability has been established. environment_tests covers the real probe.
+    fn test_pool(runner: Arc<dyn CommandRunner>, binary: &str) -> CleatTerminalPool {
+        let pool = CleatTerminalPool::new(runner, binary, &EnvironmentBag::new());
+        pool.launch_capability.set(()).expect("known launch capability");
+        pool
+    }
+
+    // Check the controlled client envelope, then inspect the logical Cleat
+    // operation. The baseline PATH is tested at the environment seam.
+    fn logical_calls(runner: &MockRunner) -> Vec<(String, Vec<String>)> {
+        runner
+            .calls()
+            .into_iter()
+            .map(|(cmd, args)| {
+                assert_eq!(cmd, "/usr/bin/env");
+                assert_eq!(&args[..2], &["-i", "PATH=/usr/local/bin:/usr/bin:/bin"]);
+                let binary = args[2].clone();
+                let mut logical = Vec::new();
+                let mut rest = args[3..].iter();
+                while let Some(arg) = rest.next() {
+                    if arg == "--env" {
+                        let value = rest.next().expect("env value");
+                        if value == "PATH=/usr/local/bin:/usr/bin:/bin" {
+                            continue;
+                        }
+                        logical.extend([arg.clone(), value.clone()]);
+                    } else {
+                        logical.push(arg.clone());
+                    }
+                }
+                (binary, logical)
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn recording_prune_never_targets_a_live_daemon_generation() {
         let inventory = r#"[
@@ -385,9 +444,9 @@ mod tests {
             {"name":"work@3","runtime_root":"/state/cleat","alive":true}
         ]"#;
         let runner = Arc::new(MockRunner::new(vec![Ok(inventory.into()), Ok(String::new())]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
         pool.prune_retained_recordings().await.expect("prune retained recordings");
-        let calls = runner.calls();
+        let calls = logical_calls(&runner);
         assert_eq!(calls.len(), 2, "only the dead generation receives cleanup");
         assert_eq!(calls[0].1, vec!["daemons", "--json"]);
         assert_eq!(calls[1].0, "sh");
@@ -442,12 +501,12 @@ mod tests {
             Ok("[]".into()),
             Ok(r#"[{"id":"session-42","cwd":null,"cmd":null,"status":"Detached"}]"#.into()),
         ]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
         let endpoint = pool.cleat_endpoint("session-42").await.expect("endpoint").expect("physical daemon");
         assert_eq!(endpoint.runtime_root, "/state/cleat");
         assert_eq!(endpoint.daemon, "work@3");
         assert_eq!(endpoint.session, "session-42");
-        assert_eq!(runner.calls()[2].1, vec!["--runtime-root", "/state/cleat", "--server", "work@3", "list", "--json"]);
+        assert_eq!(logical_calls(&runner)[2].1, vec!["--runtime-root", "/state/cleat", "--server", "work@3", "list", "--json"]);
     }
 
     #[tokio::test]
@@ -457,11 +516,11 @@ mod tests {
             Ok(r#"[{"id":"first","cwd":null,"cmd":null,"status":"Detached"},{"id":"second","cwd":null,"cmd":null,"status":"Detached"}]"#
                 .into()),
         ]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
 
         assert_eq!(pool.cleat_endpoint("first").await.expect("first").expect("endpoint").session, "first");
         assert_eq!(pool.cleat_endpoint("second").await.expect("second").expect("endpoint").session, "second");
-        assert_eq!(runner.calls().len(), 2);
+        assert_eq!(logical_calls(&runner).len(), 2);
     }
 
     #[tokio::test]
@@ -470,7 +529,7 @@ mod tests {
             {"id":"sess-1","cwd":"/repo","cmd":"bash","status":"Attached","screen_activity":"active"},
             {"id":"sess-2","cwd":"/other","cmd":null,"status":"Detached","screen_activity":"stable"}
         ]"#;
-        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![Ok(json.into())])), "cleat");
+        let pool = test_pool(Arc::new(MockRunner::new(vec![Ok(json.into())])), "cleat");
 
         let sessions = pool.list_sessions().await.expect("list sessions");
 
@@ -490,7 +549,7 @@ mod tests {
     #[tokio::test]
     async fn dead_daemon_generation_is_not_a_live_session() {
         let json = r#"[{"id":"sess-1","cwd":"/repo","cmd":"codex","status":"Detached","error":"daemon generation is dead; session is recreatable"}]"#;
-        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![Ok(json.into()), Ok(json.into())])), "cleat");
+        let pool = test_pool(Arc::new(MockRunner::new(vec![Ok(json.into()), Ok(json.into())])), "cleat");
 
         assert_eq!(
             pool.session_liveness("sess-1").await.expect("liveness"),
@@ -502,13 +561,13 @@ mod tests {
     #[tokio::test]
     async fn capture_screen_reads_the_rendered_terminal() {
         let runner = Arc::new(MockRunner::new(vec![Ok("Do you trust the contents of this directory?\n".into())]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
 
         assert_eq!(
             pool.capture_screen("terminal-demo-work-coder").await.expect("capture screen").as_deref(),
             Some("Do you trust the contents of this directory?\n")
         );
-        assert_eq!(runner.calls()[0], ("cleat".to_string(), vec!["capture".to_string(), "terminal-demo-work-coder".to_string()]));
+        assert_eq!(logical_calls(&runner)[0], ("cleat".to_string(), vec!["capture".to_string(), "terminal-demo-work-coder".to_string()]));
     }
 
     #[tokio::test]
@@ -518,20 +577,20 @@ mod tests {
             Ok("[]".into()),        // list_sessions: empty (session doesn't exist)
             Ok(create_json.into()), // launch response
         ]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
 
         pool.ensure_session("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[]).await.expect("ensure session");
 
-        let calls = runner.calls();
+        let calls = logical_calls(&runner);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].0, "cleat");
-        assert_eq!(calls[1].1, vec!["launch", "--json", "--record", "my-session", "--cwd", "/repo", "--cmd", "bash"]);
+        assert_eq!(calls[1].1, vec!["launch", "--env-clear", "--json", "--record", "my-session", "--cwd", "/repo", "--cmd", "bash"]);
     }
 
     #[tokio::test]
     async fn ensure_launches_session_with_requested_initial_size() {
         let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("{}".into())]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
 
         pool.ensure_session_with_size(
             "my-session",
@@ -544,8 +603,9 @@ mod tests {
         .await
         .expect("ensure sized session");
 
-        assert_eq!(runner.calls()[1].1, vec![
+        assert_eq!(logical_calls(&runner)[1].1, vec![
             "launch",
+            "--env-clear",
             "--json",
             "--record",
             "my-session",
@@ -565,7 +625,7 @@ mod tests {
             Ok("[]".into()),        // list_sessions: empty
             Ok(create_json.into()), // launch response
         ]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
         let env = vec![
             ("FOO".to_string(), "bar baz".to_string()),
             ("FLOTILLA_CREW_ID".to_string(), "crew-123".to_string()),
@@ -575,7 +635,7 @@ mod tests {
 
         pool.ensure_session("my-session", "claude", &ExecutionEnvironmentPath::new("/repo"), &env, &[]).await.expect("ensure session");
 
-        let calls = runner.calls();
+        let calls = logical_calls(&runner);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].0, "cleat");
         let cmd_idx = calls[1].1.iter().position(|a| a == "--cmd").expect("--cmd present");
@@ -589,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_session_tags_convoy_and_vessel() {
         let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("{}".into())]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
 
         pool.ensure_session("terminal-demo-coder", "codex", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[
             TerminalSessionTag::new("convoy", "demo"),
@@ -598,8 +658,9 @@ mod tests {
         .await
         .expect("ensure tagged session");
 
-        assert_eq!(runner.calls()[1].1, vec![
+        assert_eq!(logical_calls(&runner)[1].1, vec![
             "launch",
+            "--env-clear",
             "--json",
             "--record",
             "terminal-demo-coder",
@@ -620,7 +681,7 @@ mod tests {
         let runner = Arc::new(MockRunner::new(vec![
             Ok(list_json.into()), // list_sessions: session exists
         ]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
         let env = vec![("FOO".to_string(), "bar".to_string())];
 
         pool.ensure_session_with_size(
@@ -634,14 +695,14 @@ mod tests {
         .await
         .expect("ensure session");
 
-        let calls = runner.calls();
+        let calls = logical_calls(&runner);
         assert_eq!(calls.len(), 1, "should only call list, not launch: {calls:?}");
         assert!(calls[0].1.contains(&"list".to_string()), "should be a list call: {:?}", calls[0].1);
     }
 
     #[tokio::test]
     async fn attach_wraps_command() {
-        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
 
         let cmd =
             pool.attach_command("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).await.expect("attach command");
@@ -653,11 +714,11 @@ mod tests {
     #[tokio::test]
     async fn kill_calls_cli() {
         let runner = Arc::new(MockRunner::new(vec![Ok(String::new())]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
 
         pool.kill_session("my-session").await.expect("kill session");
 
-        let calls = runner.calls();
+        let calls = logical_calls(&runner);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "cleat");
         assert_eq!(calls[0].1, vec!["kill", "my-session"]);
@@ -666,7 +727,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn delivery_writes_bracketed_paste_then_enter_for_single_and_multiline_messages() {
         let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok(String::new()), Ok(String::new()), Ok(String::new())]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
 
         let single_started = tokio::time::Instant::now();
         pool.deliver("reviewer-session", "Please review commit abc123").await.expect("deliver single-line message");
@@ -677,7 +738,7 @@ mod tests {
             .expect("deliver multiline message");
         assert_eq!(multiline_started.elapsed(), DELIVERY_ENTER_DELAY);
 
-        let calls = runner.calls();
+        let calls = logical_calls(&runner);
         assert_eq!(calls[0].0, "cleat");
         assert_eq!(calls[0].1, vec!["send", "reviewer-session", "\x1b[200~Please review commit abc123\x1b[201~", "--no-enter"]);
         assert_eq!(calls[1].1, vec!["send-keys", "reviewer-session", "Enter"]);
@@ -694,7 +755,7 @@ mod tests {
 
     #[test]
     fn attach_args_with_command_no_env() {
-        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
         let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).expect("attach_args");
 
         assert_eq!(args, vec![
@@ -707,7 +768,7 @@ mod tests {
 
     #[test]
     fn attach_args_flatten_with_command_no_env() {
-        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
         let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
 
@@ -716,7 +777,7 @@ mod tests {
 
     #[test]
     fn human_take_attach_adds_take_while_watch_omits_it() {
-        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
         let take = pool
             .attach_args_for_mode("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![], AttachMode::PreferTake)
             .expect("take attach args");
@@ -731,18 +792,18 @@ mod tests {
     #[tokio::test]
     async fn attach_preflight_accepts_controller_seat_capabilities() {
         let runner = Arc::new(MockRunner::new(vec![Ok("Options:\n  --strict\n  --take\n".into())]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "/pool/bin/cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "/pool/bin/cleat");
 
         pool.preflight_attach(AttachMode::Default).await.expect("modern cleat should pass preflight");
         pool.preflight_attach(AttachMode::Take).await.expect("capability result should be cached");
 
-        assert_eq!(runner.calls(), [("/pool/bin/cleat".to_string(), vec!["attach".to_string(), "--help".to_string()])]);
+        assert_eq!(logical_calls(&runner), [("/pool/bin/cleat".to_string(), vec!["attach".to_string(), "--help".to_string()])]);
     }
 
     #[tokio::test]
     async fn attach_preflight_names_a_stale_pool_binary_and_version() {
         let runner = Arc::new(MockRunner::new(vec![Ok("Options:\n  --no-create\n".into()), Ok("cleat 0.5.0".into())]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "/pool/bin/cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "/pool/bin/cleat");
 
         let error = pool.preflight_attach(AttachMode::Default).await.expect_err("stale cleat should fail preflight");
 
@@ -758,17 +819,17 @@ mod tests {
             Ok("cleat 0.5.0".into()),
             Ok("Options:\n  --strict\n  --take\n".into()),
         ]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "/pool/bin/cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "/pool/bin/cleat");
 
         pool.preflight_attach(AttachMode::Default).await.expect_err("stale cleat should fail preflight");
         pool.preflight_attach(AttachMode::Default).await.expect("upgraded cleat should pass without restarting the daemon");
 
-        assert_eq!(runner.calls().len(), 3, "failed capability probes must not be cached");
+        assert_eq!(logical_calls(&runner).len(), 3, "failed capability probes must not be cached");
     }
 
     #[test]
     fn attach_args_empty_command_no_env() {
-        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
         let args = pool.attach_args("sess-1", "", &ExecutionEnvironmentPath::new("/home/dev"), &vec![]).expect("attach_args");
 
         // Same structure regardless of command
@@ -782,7 +843,7 @@ mod tests {
 
     #[test]
     fn attach_args_with_env_vars() {
-        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
         let env = vec![("FOO".to_string(), "bar".to_string()), ("BAZ".to_string(), "qu'x".to_string())];
         let args = pool.attach_args("sess", "cmd", &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
 
@@ -797,7 +858,7 @@ mod tests {
 
     #[test]
     fn attach_args_with_env_vars_empty_command() {
-        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
         let env = vec![("KEY".to_string(), "val".to_string())];
         let args = pool.attach_args("sess", "", &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
 
@@ -811,7 +872,7 @@ mod tests {
 
     #[test]
     fn attach_args_flatten_roundtrip_env_vars() {
-        let pool = CleatTerminalPool::new(Arc::new(MockRunner::new(vec![])), "cleat");
+        let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
         let env = vec![("FOO".to_string(), "bar".to_string())];
         let args = pool.attach_args("sess", "bash", &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
         let flat = flotilla_protocol::arg::flatten(&args, 0);
@@ -823,7 +884,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_session_preserves_explicit_terminal_identity_and_unrelated_env() {
         let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("{}".into())]));
-        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
+        let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
         let caller_env = vec![
             ("TERM".to_string(), "screen-256color".to_string()),
             ("TERM_PROGRAM".to_string(), "my-terminal".to_string()),
@@ -834,23 +895,28 @@ mod tests {
 
         pool.ensure_session("sess", "claude", &ExecutionEnvironmentPath::new("/repo"), &caller_env, &[]).await.expect("ensure session");
 
-        let calls = runner.calls();
+        let calls = logical_calls(&runner);
         let cmd_idx = calls[1].1.iter().position(|a| a == "--cmd").expect("--cmd present");
         assert_eq!(calls[1].1[cmd_idx + 1], "claude");
         let launch_env = calls[1].1.windows(2).filter(|args| args[0] == "--env").map(|args| args[1].clone()).collect::<Vec<_>>();
-        assert_eq!(launch_env, caller_env.iter().map(|(name, value)| format!("{name}={value}")).collect::<Vec<_>>());
+        let expected_env = caller_env.iter().map(|(name, value)| format!("{name}={value}")).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(launch_env.into_iter().collect::<std::collections::BTreeSet<_>>(), expected_env);
     }
 
     #[tokio::test]
     async fn retry_delivery_clears_a_stuck_composer_before_resubmitting() {
         let runner = Arc::new(MockRunner::new(vec![Ok(String::new()), Ok(String::new()), Ok(String::new())]));
-        let pool = CleatTerminalPool::new(runner.clone(), "cleat");
+        let pool = test_pool(runner.clone(), "cleat");
 
         pool.retry_delivery("reviewer-session", "Please review commit abc123").await.expect("retry delivery");
 
-        let calls = runner.calls();
+        let calls = logical_calls(&runner);
         assert_eq!(calls[0].1, vec!["send-keys", "reviewer-session", "C-c"]);
         assert_eq!(calls[1].1, vec!["send", "reviewer-session", "\x1b[200~Please review commit abc123\x1b[201~", "--no-enter"]);
         assert_eq!(calls[2].1, vec!["send-keys", "reviewer-session", "Enter"]);
     }
 }
+
+#[cfg(test)]
+#[path = "cleat/environment_tests.rs"]
+mod environment_tests;

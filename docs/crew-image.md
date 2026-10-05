@@ -44,6 +44,28 @@ Cleat chooses the identity for each new session, and environments without this
 entry can still use `xterm-256color`. Update the recorded Ghostty commit when
 changing `CLEAT_REF`.
 
+Cleat crew launches use a declared environment. Flotilla clears the client
+process environment before invoking cleat, including during daemon turnover,
+so on-demand daemons do not inherit an interactive agent's messaging channel
+or `NO_COLOR`. The execution-host baseline consists of `PATH`, `HOME`, `USER`,
+`LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_ALL`, `LC_CTYPE`, XDG directories,
+and the native library search paths `LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH`.
+`PATH` falls back to `/usr/local/bin:/usr/bin:/bin` when discovery has no value.
+
+Children also receive the provisioned Flotilla socket/contained-daemon marker,
+environment identity and Rust tool requirements. `TerminalSession.spec.env`
+overrides baseline values; minted credentials and adapter requirements override
+session declarations. Cleat runtime-directory and daemon selectors are client
+routing inputs, while Cleat supplies fresh child coordinates and VT identity.
+Ambient agent variables and colour-disable flags are absent unless explicitly
+declared for the launch.
+
+New launches require Cleat's `--env-clear` capability, tracked in
+[cleat#318](https://github.com/flotilla-org/cleat/issues/318). It clears before
+shell startup. Ship that Cleat capability before rolling this Flotilla change;
+older binaries refuse new launches with an upgrade error. Existing sessions
+remain discoverable and attachable.
+
 The image also supplies checksum-verified Zig at the version pinned by
 `ZIG_VERSION`. Its builder uses that same Zig version to generate terminfo and
 checks it against `CLEAT_REF`'s `tools/ghostty-toolchain.toml`. The image does

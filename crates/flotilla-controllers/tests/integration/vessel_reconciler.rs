@@ -1915,6 +1915,7 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
                 message: None,
             },
             cwd: checkout_path.to_string(),
+            env: Default::default(),
             pool: "cleat".to_string(),
         })
         .await
@@ -2778,6 +2779,7 @@ async fn create_running_terminal(
             role: role.to_string(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: command.to_string() },
             cwd: cwd.to_string(),
+            env: Default::default(),
             pool: pool.to_string(),
         })
         .await
@@ -2929,6 +2931,7 @@ async fn create_labeled_terminal(backend: &ResourceBackend, namespace: &str, nam
             role: "coder".to_string(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
             cwd: format!("/Users/alice/dev/flotilla-repos/{workspace_name}"),
+            env: Default::default(),
             pool: "cleat".to_string(),
         })
         .await

@@ -977,6 +977,7 @@ fn restart_terminal_session_spec() -> TerminalSessionSpec {
         role: "coder".to_string(),
         source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
         cwd: "/workspace".to_string(),
+        env: Default::default(),
         pool: "cleat".to_string(),
     }
 }

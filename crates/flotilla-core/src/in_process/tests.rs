@@ -449,6 +449,7 @@ async fn operator_brief_survives_a_racing_nudge_until_delivery() {
                 message: None,
             },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "cleat".to_string(),
         })
         .await
@@ -545,6 +546,7 @@ fn supervisor_turn_reconciliation_noop_contract(tc: hegel::TestCase) {
                     message: Some(head),
                 },
                 cwd: "/workspace".to_string(),
+                env: Default::default(),
                 pool: "cleat".to_string(),
             };
             sessions.create(&test_meta("unrelated"), &spec).await.expect("unrelated terminal");
@@ -733,6 +735,7 @@ async fn standing_governor_on_another_host_receives_a_stalled_crew_turn() {
                     message: None,
                 },
                 cwd: "/workspace".to_string(),
+                env: Default::default(),
                 pool: "cleat".to_string(),
             },
         )
@@ -1054,6 +1057,7 @@ async fn resume_staging_fixture_with_clock(
                     message: None,
                 },
                 cwd: "/repo".to_string(),
+                env: Default::default(),
                 pool: "passthrough".to_string(),
             },
         )
@@ -1729,6 +1733,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
                         message: None,
                     },
                     cwd: "/repo".to_string(),
+                    env: Default::default(),
                     pool: "passthrough".to_string(),
                 },
             )
@@ -3269,6 +3274,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
                     message: None,
                 },
                 cwd: "/repo".to_string(),
+                env: Default::default(),
                 pool: "passthrough".to_string(),
             },
         )
@@ -3602,6 +3608,7 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
                 message: None,
             },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "contained".to_string(),
         })
         .await
@@ -3944,6 +3951,7 @@ async fn refused_convoy_reclaim_leaves_runtime_children_untouched() {
                 role: "coder".to_string(),
                 source: TerminalSessionSource::Tool { command: "cargo test".to_string() },
                 cwd: "/workspace".to_string(),
+                env: Default::default(),
                 pool: "cleat".to_string(),
             },
         )
@@ -7091,6 +7099,7 @@ pub(super) async fn create_running_session(daemon: &InProcessDaemon, env_ref: &s
                 role: role.to_string(),
                 source: TerminalSessionSource::Tool { command: "bash".to_string() },
                 cwd: "/repo".to_string(),
+                env: Default::default(),
                 pool: "passthrough".to_string(),
             },
         )
@@ -7185,6 +7194,7 @@ async fn fleet_list_scopes_rows_to_the_live_convoy_project() {
                             message: None,
                         },
                         cwd: "/repo".to_string(),
+                        env: Default::default(),
                         pool: "passthrough".to_string(),
                     },
                 )
@@ -8112,6 +8122,7 @@ async fn stall_test_session(backend: &ResourceBackend, convoy: &str, name: &str,
                 role: role.into(),
                 source: TerminalSessionSource::Tool { command: "test".into() },
                 cwd: "/tmp".into(),
+                env: Default::default(),
                 pool: "test".into(),
             },
         )
@@ -8173,6 +8184,7 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
                 role: "coder".into(),
                 source: TerminalSessionSource::Tool { command: "test".into() },
                 cwd: "/tmp".into(),
+                env: Default::default(),
                 pool: "test".into(),
             },
         )
@@ -8494,6 +8506,7 @@ async fn idle_standing_role_without_obligation_never_stalls_convoy() {
                     role: role.into(),
                     source: TerminalSessionSource::Tool { command: "test".into() },
                     cwd: "/tmp".into(),
+                    env: Default::default(),
                     pool: "test".into(),
                 },
             )

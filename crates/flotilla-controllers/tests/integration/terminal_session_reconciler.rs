@@ -125,6 +125,7 @@ async fn dead_generation_is_lost_then_recreated() {
                 }),
             },
             cwd: "/workspace".into(),
+            env: Default::default(),
             pool: "cleat".into(),
         })
         .await
@@ -214,6 +215,7 @@ async fn a_briefly_missing_live_session_recovers_without_a_second_launch() {
             role: "coder".into(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".into() },
             cwd: "/workspace".into(),
+            env: Default::default(),
             pool: "cleat".into(),
         })
         .await
@@ -277,6 +279,7 @@ async fn terminal_session_failure_uses_injected_now_for_stopped_at() {
             role: "coder".to_string(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "cleat".to_string(),
         })
         .await
@@ -322,6 +325,7 @@ async fn terminal_session_is_reclaimed_when_its_environment_is_gone() {
             role: "coder".to_string(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "cleat".to_string(),
         })
         .await
@@ -376,6 +380,7 @@ async fn terminal_finalizer_drains_after_its_environment_is_deleted() {
                 role: "governor".to_string(),
                 source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
                 cwd: "/workspace".to_string(),
+                env: Default::default(),
                 pool: "cleat".to_string(),
             },
         )
@@ -447,6 +452,7 @@ async fn vessel_owned_session(backend: &ResourceBackend, session_name: &str, ves
                 role: "governor".to_string(),
                 source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
                 cwd: "/workspace".to_string(),
+                env: Default::default(),
                 pool: "cleat".to_string(),
             },
         )
@@ -519,6 +525,7 @@ async fn abandoned_convoy_reaps_terminal_without_calling_its_runtime() {
                 role: "coder".to_string(),
                 source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
                 cwd: "/workspace".to_string(),
+                env: Default::default(),
                 pool: "cleat".to_string(),
             },
         )
@@ -561,6 +568,7 @@ async fn failed_convoy_terminal_stops_without_probing_its_gone_environment_runti
                 role: "coder".to_string(),
                 source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
                 cwd: "/workspace".to_string(),
+                env: Default::default(),
                 pool: "cleat".to_string(),
             },
         )
@@ -607,6 +615,7 @@ async fn failed_environment_terminal_stops_without_probing_its_runtime() {
             role: "coder".to_string(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "cleat".to_string(),
         })
         .await
@@ -671,6 +680,7 @@ async fn transient_runtime_probe_failure_holds_and_recovers_automatically() {
                 role: "coder".to_string(),
                 source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
                 cwd: "/workspace".to_string(),
+                env: Default::default(),
                 pool: "cleat".to_string(),
             },
         )
@@ -791,6 +801,7 @@ async fn foreign_actuator_runtime_failure_is_skipped_and_convoy_stays_active() {
                 role: "coder".to_string(),
                 source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
                 cwd: "/workspace".to_string(),
+                env: Default::default(),
                 pool: "cleat".to_string(),
             },
         )
@@ -900,6 +911,7 @@ impl WorldBuilder for GhostRecoveryWorldBuilder {
                         message: None,
                     },
                     cwd: "/workspace".to_string(),
+                    env: Default::default(),
                     pool: "cleat".to_string(),
                 },
             )
@@ -1060,6 +1072,7 @@ async fn terminal_finalizer_kills_the_persisted_session_using_its_spec() {
         role: "coder".to_string(),
         source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
         cwd: "/workspace".to_string(),
+        env: Default::default(),
         pool: "cleat".to_string(),
     };
     let created = sessions.create(&meta("terminal-convoy-work-coder"), &spec).await.expect("session create");
@@ -1152,6 +1165,7 @@ async fn session_provisioning_passes_convoy_and_vessel_tags_to_runtime() {
             role: "watcher".into(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: "tail -f log".into() },
             cwd: "/workspace".into(),
+            env: Default::default(),
             pool: "cleat".into(),
         })
         .await
@@ -1240,6 +1254,7 @@ async fn digest_backed_session_waits_for_blob_then_launches() {
                     message: None,
                 },
                 cwd: "/workspace".into(),
+                env: Default::default(),
                 pool: "cleat".into(),
             },
         )
@@ -1314,6 +1329,7 @@ async fn a_disappeared_running_session_is_observed_as_stopped() {
                 message: None,
             },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "cleat".to_string(),
         })
         .await
@@ -1380,6 +1396,7 @@ async fn a_fresh_turn_launched_as_the_brief_is_not_delivered_again() {
                 }),
             },
             cwd: "/workspace".into(),
+            env: Default::default(),
             pool: "cleat".into(),
         })
         .await
@@ -1474,6 +1491,7 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
                 }),
             },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "cleat".to_string(),
         })
         .await
@@ -1607,6 +1625,7 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
                 }),
             },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "cleat".to_string(),
         })
         .await
@@ -1703,6 +1722,7 @@ async fn meaningful_output_progress_survives_coalesced_attention() {
             role: "coder".into(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: "test".into() },
             cwd: "/workspace".into(),
+            env: Default::default(),
             pool: "cleat".into(),
         })
         .await
@@ -1740,6 +1760,7 @@ async fn attached_session_suppresses_input_demand_and_detach_surfaces_it_while_s
             role: "coder".to_string(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "cleat".to_string(),
         })
         .await
@@ -1808,6 +1829,7 @@ async fn terminal_finalizer_cleans_agent_artifacts() {
                 message: None,
             },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "cleat".to_string(),
         })
         .await
@@ -1948,6 +1970,7 @@ async fn stale_attention_decays_to_unobservable_without_losing_a_live_session() 
                 role: "coder".to_string(),
                 source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
                 cwd: "/workspace".to_string(),
+                env: Default::default(),
                 pool: "hookless".to_string(),
             })
             .await
@@ -2034,6 +2057,7 @@ async fn fatal_runtime_observation_fails_a_running_terminal_naming_its_credentia
             role: "coder".to_string(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: "codex".to_string() },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "cleat".to_string(),
         })
         .await
@@ -2087,6 +2111,7 @@ async fn controller_loop_prunes_acknowledged_message_payloads() {
             env_ref: "env-a".into(),
             role: "coder".into(),
             cwd: "/workspace".into(),
+            env: Default::default(),
             pool: "cleat".into(),
             source: flotilla_resources::TerminalSessionSource::Agent {
                 selector: flotilla_resources::Selector::for_capability("coding"),
@@ -2237,6 +2262,7 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
                 env_ref: "env-a".into(),
                 role: "coder".into(),
                 cwd: "/workspace".into(),
+                env: Default::default(),
                 pool: "cleat".into(),
                 source: flotilla_resources::TerminalSessionSource::Agent {
                     selector: flotilla_resources::Selector::for_capability("coding"),
@@ -2303,6 +2329,7 @@ async fn typed_unavailability_preserves_lost_session_until_provider_recovers() {
         role: "shell".into(),
         source: flotilla_resources::TerminalSessionSource::Tool { command: "sh".into() },
         cwd: "/workspace".into(),
+        env: Default::default(),
         pool: "cleat".into(),
     };
     let created = sessions.create(&meta("lost-unavailable"), &spec).await.expect("terminal");
@@ -2429,6 +2456,7 @@ async fn receipt_lifecycle_survives_failed_relaunch_cleanup_outage_and_restart()
             env_ref: "env-a".into(),
             role: "coder".into(),
             cwd: cwd.path().display().to_string(),
+            env: Default::default(),
             pool: "cleat".into(),
             source: flotilla_resources::TerminalSessionSource::Agent {
                 selector: flotilla_resources::Selector::for_capability("coding"),
@@ -2585,6 +2613,7 @@ async fn retained_terminal_convoy_orphans_follow_reclaim_matrix(
                 role: "coder".into(),
                 source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".into() },
                 cwd: "/workspace".into(),
+                env: Default::default(),
                 pool: "cleat".into(),
             },
         )
@@ -2699,6 +2728,7 @@ async fn convoy_reclaim_logs_distinguish_gate_from_session_disposition(
                 role: "coder".to_string(),
                 source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
                 cwd: "/workspace".to_string(),
+                env: Default::default(),
                 pool: "cleat".to_string(),
             },
         )
@@ -2751,6 +2781,7 @@ async fn independent_owner_absence_log_does_not_claim_gate_approval() {
             role: "shell".to_string(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: "bash".to_string() },
             cwd: "/workspace".to_string(),
+            env: Default::default(),
             pool: "cleat".to_string(),
         })
         .await
@@ -2782,6 +2813,7 @@ async fn unchanged_attention_decisions_log_once() {
             role: "coder".into(),
             source: flotilla_resources::TerminalSessionSource::Tool { command: "test".into() },
             cwd: "/workspace".into(),
+            env: Default::default(),
             pool: "cleat".into(),
         })
         .await

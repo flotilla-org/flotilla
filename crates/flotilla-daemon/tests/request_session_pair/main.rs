@@ -3579,6 +3579,7 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
                     env_ref: "test-env".into(),
                     role: role.into(),
                     cwd: "/workspace".into(),
+                    env: Default::default(),
                     pool: "cleat".into(),
                     source: TerminalSessionSource::Agent {
                         selector: Selector::for_capability("coding"),
@@ -3887,6 +3888,7 @@ async fn exited_crew_resume_scenario(remote_home: bool, interrupted: bool) {
                 env_ref: "warm-env".into(),
                 role: "coder".into(),
                 cwd: "/warm/checkout".into(),
+                env: Default::default(),
                 pool: "cleat".into(),
                 source: TerminalSessionSource::Agent {
                     selector: Selector::for_capability("coding"),

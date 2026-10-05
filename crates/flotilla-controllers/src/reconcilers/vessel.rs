@@ -1182,6 +1182,7 @@ impl Reconciler for VesselReconciler {
                             role: process.role.clone(),
                             source,
                             cwd: terminal_cwd.clone(),
+                            env: Default::default(),
                             pool: strategy.pool().to_string(),
                         },
                     });
