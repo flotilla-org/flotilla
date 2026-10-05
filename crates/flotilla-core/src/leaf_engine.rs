@@ -4657,7 +4657,7 @@ mod tests {
                         Some(Utc::now() - chrono::Duration::seconds(2));
                     let target_crew = status.crew_work["work"]["coder"].clone();
                     if kind == 4 {
-                        status.crew_work.get_mut("work").unwrap().remove("coder");
+                        status.crew_work.get_mut("work").expect("delivery retry fixture").remove("coder");
                     }
                     convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.expect("tracing scenario");
                     let rule = TurnDeliveryRule::builder()
@@ -4745,13 +4745,20 @@ mod tests {
                         // its own deadline must re-evaluate this level-triggered leaf.
                         let current = convoys.get("stalled-work").await.expect("convoy");
                         let mut status = current.status.expect("status");
-                        status.turn_deliveries.get_mut("checks").unwrap().failure.as_mut().unwrap().retry_at =
-                            Utc::now() + chrono::Duration::milliseconds(30);
+                        status
+                            .turn_deliveries
+                            .get_mut("checks")
+                            .expect("delivery retry fixture")
+                            .failure
+                            .as_mut()
+                            .expect("delivery retry fixture")
+                            .retry_at = Utc::now() + chrono::Duration::milliseconds(30);
                         convoys.update_status("stalled-work", &current.metadata.resource_version, &status).await.expect("deadline");
                         let row = wake.subscriptions.rows().await.into_iter().next().expect("row");
                         let _ = tokio::time::timeout(Duration::from_millis(150), wake.subscriptions.watch_row_once(row)).await;
-                        let status = convoys.get("stalled-work").await.unwrap().status.unwrap();
-                        assert_eq!(status.turn_deliveries["checks"].failure.as_ref().unwrap().attempts, 2);
+                        let status =
+                            convoys.get("stalled-work").await.expect("delivery retry fixture").status.expect("delivery retry fixture");
+                        assert_eq!(status.turn_deliveries["checks"].failure.as_ref().expect("delivery retry fixture").attempts, 2);
                         return;
                     }
                     // Advance the durable deadline without a wall-clock sleep.
@@ -4788,17 +4795,28 @@ mod tests {
                         assert_eq!(failure.retry_at.signed_duration_since(failure.failed_at), chrono::Duration::seconds(10));
                     }
                     if kind == 0 || kind == 4 {
-                        let current = convoys.get("stalled-work").await.unwrap();
-                        let mut status = current.status.unwrap();
+                        let current = convoys.get("stalled-work").await.expect("delivery retry fixture");
+                        let mut status = current.status.expect("delivery retry fixture");
                         status.phase = ConvoyPhase::Landing;
-                        status.crew_work.get_mut("work").unwrap().insert("coder".into(), target_crew);
-                        status.turn_deliveries.get_mut("checks").unwrap().failure.as_mut().unwrap().retry_at = Utc::now();
-                        convoys.update_status("stalled-work", &current.metadata.resource_version, &status).await.unwrap();
+                        status.crew_work.get_mut("work").expect("delivery retry fixture").insert("coder".into(), target_crew);
+                        status
+                            .turn_deliveries
+                            .get_mut("checks")
+                            .expect("delivery retry fixture")
+                            .failure
+                            .as_mut()
+                            .expect("delivery retry fixture")
+                            .retry_at = Utc::now();
+                        convoys
+                            .update_status("stalled-work", &current.metadata.resource_version, &status)
+                            .await
+                            .expect("delivery retry fixture");
                         wake.subscriptions
                             .fire(row.id, LeafFire { subscription_id: row.id, watcher_id: uuid::Uuid::nil(), leaf, value: "fail".into() })
                             .await;
-                        let status = convoys.get("stalled-work").await.unwrap().status.unwrap();
-                        let failure = status.turn_deliveries["checks"].failure.as_ref().unwrap();
+                        let status =
+                            convoys.get("stalled-work").await.expect("delivery retry fixture").status.expect("delivery retry fixture");
+                        let failure = status.turn_deliveries["checks"].failure.as_ref().expect("delivery retry fixture");
                         assert_eq!(failure.attempts, 3);
                         assert!(
                             !failure.reason.contains("phase") && !failure.reason.contains("crew is absent"),

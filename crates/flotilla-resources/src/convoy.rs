@@ -2685,7 +2685,7 @@ mod subject_tests {
         let retry = TurnDeliveryFailure { attempts: 2, failed_at: now + chrono::Duration::seconds(5), ..failure.clone() };
         ConvoyStatusPatch::FailTurnDelivery { source: "checks".into(), failure: retry.clone() }.apply(&mut status);
         assert_eq!(status.attention, original);
-        assert_eq!(status.turn_deliveries["checks"].failure.as_ref().unwrap().attempts, 2);
+        assert_eq!(status.turn_deliveries["checks"].failure.as_ref().expect("delivery retry fixture").attempts, 2);
         let unrelated = ConvoyAttention { source: "settlement".into(), reason: "operator decision".into(), raised_at: now };
         status.attention = Some(unrelated.clone());
         ConvoyStatusPatch::FailTurnDelivery {
