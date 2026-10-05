@@ -274,5 +274,7 @@ pub const KEY_ISSUE_UPDATED_AT_OBSERVED_AT: &str = "flotilla.issue.updated_at.ob
 pub const KEY_READINESS_STATE: &str = "flotilla.readiness.state";
 /// JSON-encoded ReadinessBlocker records, preserving resource, phase and reason.
 pub const KEY_READINESS_BLOCKERS: &str = "flotilla.readiness.blockers";
-/// Whether terminal materialization is currently available.
+/// Whether this entity has a direct terminal materialization action.
+/// A convoy or standing role requires exactly one vessel with a terminal;
+/// multi-vessel convoys expose attachment on each vessel instead.
 pub const KEY_READINESS_ATTACH_AVAILABLE: &str = "flotilla.readiness.attach_available";

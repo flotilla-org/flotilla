@@ -4354,6 +4354,7 @@ fn spawn_aggregator_task(
                             .durable_regards(durable.using::<Regard>(&namespace))
                             .durable_vessels(durable.including_replicas::<flotilla_resources::Vessel>(&namespace))
                             .durable_checkouts(durable.including_replicas::<Checkout>(&namespace))
+                            // Clone has no replication contract; remote failures arrive through Checkout status.
                             .durable_clones(durable.using::<flotilla_resources::Clone>(&namespace))
                             .observed_convoys(observed.clone().using::<Convoy>(&namespace))
                             .observed_presentations(observed.using::<Presentation>(&namespace))

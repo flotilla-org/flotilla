@@ -33,12 +33,8 @@ fn convoy_ref(namespace: &str, name: &str) -> ResourceRef {
 #[bon::builder]
 fn vessel(convoy: &ResourceRef, name: &str, phase: WorkPhase, materialize: Option<&str>) -> VesselRow {
     VesselRow::builder()
-        .readiness(flotilla_protocol::result_set::Readiness {
-            state: if materialize.is_some() {
-                flotilla_protocol::result_set::ReadinessState::Ready
-            } else {
-                flotilla_protocol::result_set::ReadinessState::Unknown
-            },
+        .readiness(Readiness {
+            state: if materialize.is_some() { ReadinessState::Ready } else { ReadinessState::Unknown },
             blockers: Vec::new(),
         })
         .resource(convoy.subresource(format!("vessels/{name}")))
@@ -2471,7 +2467,7 @@ fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
 // capability independent; a recovery diff replaces the blocked explanation.
 #[hegel::test]
 fn catalog_readiness_explains_unavailable_attachment_and_clears_on_recovery(tc: hegel::TestCase) {
-    use flotilla_protocol::result_set::{Readiness, ReadinessBlocker, ReadinessState};
+    use flotilla_protocol::result_set::ReadinessBlocker;
     use hegel::generators as gs;
 
     use crate::keys::{KEY_READINESS_ATTACH_AVAILABLE, KEY_READINESS_BLOCKERS, KEY_READINESS_STATE};
@@ -2547,6 +2543,43 @@ fn catalog_readiness_explains_unavailable_attachment_and_clears_on_recovery(tc: 
         let facts = find_entity(&patches, entity);
         assert_eq!(text(facts, KEY_READINESS_STATE), "ready");
         assert_eq!(facts.set[KEY_READINESS_BLOCKERS].value, MetadataValue::StringList(Vec::new()));
+        assert_eq!(facts.set[KEY_READINESS_ATTACH_AVAILABLE].value, MetadataValue::Bool(true));
+        assert!(facts.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
+    }
+}
+
+#[test]
+fn catalog_readiness_multi_vessel_attachment_and_unknown_evidence() {
+    use crate::keys::{KEY_READINESS_ATTACH_AVAILABLE, KEY_READINESS_BLOCKERS, KEY_READINESS_STATE};
+    let reference = convoy_ref("dev", "provisioning");
+    let mut work = vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).call();
+    work.readiness = Readiness::default();
+    let mut convoy = ConvoyRow::builder()
+        .resource(reference)
+        .name("governor")
+        .workflow_ref("governor")
+        .phase(ConvoyPhase::Active)
+        .vessels(vec![work])
+        .build();
+    let patches = project_catalog(&catalog_input(std::slice::from_ref(&convoy)), &mint()).reassert_patches();
+    let facts = find_entity(&patches, &entity::convoy("dev", "provisioning", "kiwi"));
+    assert_eq!(text(facts, KEY_CONVOY_PHASE), "active");
+    assert_eq!(text(facts, KEY_READINESS_STATE), "unknown");
+    assert_eq!(text(facts, KEY_STATUS_STATE), "waiting");
+    assert_eq!(facts.set[KEY_READINESS_BLOCKERS].value, MetadataValue::StringList(Vec::new()));
+    convoy.vessels[0].readiness.state = ReadinessState::Ready;
+    convoy.vessels[0].materialize = Some("terminal-coder".into());
+    let mut second = convoy.vessels[0].clone();
+    second.name = "reviewer".into();
+    second.materialize = Some("terminal-reviewer".into());
+    convoy.vessels.push(second);
+    let patches = project_catalog(&catalog_input(&[convoy]), &mint()).reassert_patches();
+    let facts = find_entity(&patches, &entity::convoy("dev", "provisioning", "kiwi"));
+    assert_eq!(text(facts, KEY_READINESS_STATE), "ready");
+    assert_eq!(facts.set[KEY_READINESS_ATTACH_AVAILABLE].value, MetadataValue::Bool(false));
+    assert!(!facts.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
+    for name in ["coder", "reviewer"] {
+        let facts = find_entity(&patches, &entity::vessel("dev", "provisioning", name, "feta"));
         assert_eq!(facts.set[KEY_READINESS_ATTACH_AVAILABLE].value, MetadataValue::Bool(true));
         assert!(facts.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
     }

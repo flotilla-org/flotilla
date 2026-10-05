@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_protocol::{
     result_set::{
         AwarenessCounts, AwarenessEntry, AwarenessKind, AwarenessNode, AwarenessPhase, AwarenessState, CleatEndpoint, ConvoyPhase,
-        ConvoyRow, IndependentRow, ProjectRepositoriesRow, SessionPhase, StandingRoleHold, StandingRoleRow, SurfaceState, Timestamp,
-        VesselRow, WorkPhase,
+        ConvoyRow, IndependentRow, ProjectRepositoriesRow, Readiness, ReadinessState, SessionPhase, StandingRoleHold, StandingRoleRow,
+        SurfaceState, Timestamp, VesselRow, WorkPhase,
     },
     HostName, ReferenceContext, ViewAddress, AWARENESS_REL_FOR_CONVOY,
 };
@@ -912,12 +912,12 @@ fn convoy_identity_facts(convoy: &ConvoyRow) -> Vec<(&'static str, MetadataValue
 /// Apply readiness identically to raw-row and awareness catalogs, without
 /// creating entities that the chosen catalog view did not include.
 fn project_readiness(catalog: &mut Catalog, convoys: &[ConvoyRow]) {
-    fn apply(catalog: &mut Catalog, entity: EntityRef, readiness: &flotilla_protocol::result_set::Readiness, attach: bool) {
+    fn apply(catalog: &mut Catalog, entity: EntityRef, readiness: &Readiness, attach: bool) {
         let Some(facts) = catalog.facts.get_mut(&MetadataTarget::Entity(entity)) else {
             return;
         };
         if let Some(status) = facts.get_mut(KEY_STATUS_STATE) {
-            if status.value == MetadataValue::text("active") {
+            if status.value == MetadataValue::text(BadgeState::Active.as_str()) {
                 let badge = readiness_badge(Badge { state: BadgeState::Active, attention: false }, readiness);
                 status.value = MetadataValue::text(badge.state.as_str());
             }
@@ -945,7 +945,7 @@ fn project_readiness(catalog: &mut Catalog, convoys: &[ConvoyRow]) {
     }
 }
 
-fn readiness_facts(readiness: &flotilla_protocol::result_set::Readiness, attach_available: bool) -> Vec<(&'static str, MetadataValue)> {
+fn readiness_facts(readiness: &Readiness, attach_available: bool) -> Vec<(&'static str, MetadataValue)> {
     use crate::keys::{KEY_READINESS_ATTACH_AVAILABLE, KEY_READINESS_BLOCKERS, KEY_READINESS_STATE};
     vec![
         (KEY_READINESS_STATE, MetadataValue::text(readiness.state.as_str())),
@@ -959,8 +959,7 @@ fn readiness_facts(readiness: &flotilla_protocol::result_set::Readiness, attach_
     ]
 }
 
-fn readiness_badge(badge: Badge, readiness: &flotilla_protocol::result_set::Readiness) -> Badge {
-    use flotilla_protocol::result_set::ReadinessState;
+fn readiness_badge(badge: Badge, readiness: &Readiness) -> Badge {
     if badge.state != BadgeState::Active {
         return badge;
     }
