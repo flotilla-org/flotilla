@@ -99,6 +99,19 @@ impl std::fmt::Display for ProjectRepositoryRole {
     }
 }
 
+#[cfg(test)]
+mod project_repository_role_tests {
+    use super::ProjectRepositoryRole;
+
+    // Human-readable roles use the same names as the serialized charter.
+    #[test]
+    fn display_matches_serialized_role_names() {
+        for role in [ProjectRepositoryRole::Code, ProjectRepositoryRole::Ops, ProjectRepositoryRole::Knowledge] {
+            assert_eq!(serde_json::to_value(role).expect("role serializes"), role.to_string());
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewListMember {
     pub role: String,
