@@ -114,6 +114,28 @@ fn compose_agent_environment(fragments: impl IntoIterator<Item = Fragment>) -> R
     compose(TargetId::AgentEnvironment, fragments).map_err(|error| format!("compose shared agent environment: {error}"))
 }
 
+/// Staging and launch resolve the same adapter defaults, delivered values, and
+/// explicit home overrides. Selection metadata is carried only for staging.
+fn agent_material_environment(
+    material: &AgentMaterialRegistry,
+    required_adapters: &BTreeSet<String>,
+    declared: &BTreeMap<String, String>,
+    delivered: impl IntoIterator<Item = (String, String)>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut environment = compose_agent_environment(material.fragments(required_adapters, declared))?.environment;
+    for (key, value) in delivered {
+        environment.retain(|(existing, _)| existing != &key);
+        environment.push((key, value));
+    }
+    for key in ["CODEX_HOME", "CLAUDE_CONFIG_DIR"] {
+        if let Some(value) = declared.get(key) {
+            environment.retain(|(existing, _)| existing != key);
+            environment.push((key.into(), value.clone()));
+        }
+    }
+    Ok(environment)
+}
+
 async fn stage_agent_environment(runner: &dyn CommandRunner, fallback: &Path, contents: &str) -> Result<PathBuf, String> {
     let config_base =
         runner.writable_config_base(None, fallback).await.map_err(|error| format!("resolve agent environment path: {error}"))?;
@@ -4732,11 +4754,29 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .await);
         }
         if let Some(agent_material) = &self.state.agent_material {
-            let mut environment = resolved_agent_environment.environment.clone();
-            environment.extend(delivered_credential_environment.iter().cloned());
+            let mut environment = match agent_material_environment(
+                agent_material,
+                &spec.required_agent_adapters,
+                &spec.env,
+                resolved_agent_environment.environment.iter().chain(&delivered_credential_environment).cloned(),
+            ) {
+                Ok(environment) => environment,
+                Err(error) => {
+                    return Err(discard_failed_environment(
+                        &handle,
+                        self.state.credential_store.as_deref(),
+                        self.state.agent_material.as_deref(),
+                        name,
+                        error,
+                    )
+                    .await)
+                }
+            };
+            // ADR 0047: remove forwarding of the legacy selection key one roll
+            // after #2673, once stored environments are rewritten or reaped.
             for key in ["FLOTILLA_CREW_SKILLS", "FLOTILLA_RESOLVED_SKILLS"] {
                 if let Some(selection) = spec.env.get(key) {
-                    environment.push((key.to_string(), selection.clone()));
+                    environment.push((key.into(), selection.clone()));
                 }
             }
             let mut source_token_files = BTreeMap::new();
@@ -5919,20 +5959,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     };
                     if let Some(docker) = docker.filter(|docker| docker.env.contains_key("FLOTILLA_CREW_SKILLS")) {
                         let required = BTreeSet::from([requirement.adapter.clone()]);
-                        let mut environment = credential_env.clone();
-                        for fragment in material.fragments(&required, &docker.env) {
-                            for (key, value) in compose_agent_environment([fragment])?.environment {
-                                if !environment.iter().any(|(existing, _)| existing == &key) {
-                                    environment.push((key, value));
-                                }
-                            }
-                        }
-                        for key in ["CODEX_HOME", "CLAUDE_CONFIG_DIR"] {
-                            if let Some(value) = docker.env.get(key) {
-                                environment.retain(|(existing, _)| existing != key);
-                                environment.push((key.into(), value.clone()));
-                            }
-                        }
+                        let environment = agent_material_environment(material, &required, &docker.env, credential_env.iter().cloned())?;
                         let runner = self.runner_for_env(&spec.env_ref)?;
                         credential_env = material.crew_environment(&spec.role, &required, &environment, &*runner).await?;
                     }

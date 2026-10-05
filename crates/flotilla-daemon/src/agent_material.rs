@@ -204,7 +204,8 @@ impl AgentMaterialRegistry {
                 }
                 Ok(())
             } else {
-                // N→N+1: running environments retain their old frozen selection.
+                // ADR 0047: remove this legacy branch one fleet roll after #2673,
+                // once stored environments have been rewritten or reaped.
                 self.skills.stage(environment_ref, &adapters, environment, source_token_files, runner, true).await
             }
         }
@@ -243,7 +244,7 @@ impl AgentMaterialRegistry {
         environment: &[(String, String)],
         runner: &dyn CommandRunner,
     ) -> Result<Vec<(String, String)>, String> {
-        if role.is_empty() || role == "." || role == ".." || role.contains('/') || role.contains('\\') {
+        if role.is_empty() || role == "." || role == ".." || role.contains('/') || role.contains('\\') || role.contains('\0') {
             return Err(format!("invalid crew home role {role:?}"));
         }
         let config_base = runner.writable_config_base(None, Path::new(CONTAINED_WRITABLE_CONFIG_BASE)).await?;
@@ -252,8 +253,9 @@ impl AgentMaterialRegistry {
             let Some(destination) = adapter.skill_destination(environment, &config_base)? else { continue };
             let base = destination.parent().expect("skill directory has a parent");
             let home = base.join("crews").join(role);
-            // Static config seeds scratch once; auth follows atomic rotations in
-            // the delivered base. Never copy skills or another crew's state.
+            // Static config seeds scratch once: later base edits intentionally do
+            // not overwrite crew-owned config or state. Auth follows atomic
+            // rotations in the delivered base. Never copy skills or other crews' state.
             runner
                 .run(
                     "sh",
@@ -512,6 +514,8 @@ fn decode_selected_skills(environment: &[(String, String)]) -> Result<Vec<flotil
     if let Some(crews) = decode_crew_skills(environment)? {
         return Ok(crews.into_values().flatten().collect());
     }
+    // ADR 0047: remove the old selection decoder one fleet roll after #2673,
+    // once stored environments have been rewritten or reaped.
     match environment.iter().find(|(key, _)| key == "FLOTILLA_RESOLVED_SKILLS") {
         Some((_, value)) => serde_json::from_str(value).map_err(|error| format!("decode frozen skill selection: {error}")),
         None => {
@@ -2255,6 +2259,17 @@ esac
             assert_eq!(names, [std::ffi::OsString::from("private-source")], "{adapter} installs only the frozen selection");
         }
     }
+
+    fn crew_skill(name: &str, path: &str) -> flotilla_resources::SkillCatalogEntry {
+        flotilla_resources::SkillCatalogEntry {
+            source: "private-skills".into(),
+            repository: "example/private-skills".into(),
+            revision: "1".repeat(40),
+            name: name.into(),
+            path: path.into(),
+        }
+    }
+
     #[tokio::test]
     async fn crews_in_one_environment_see_only_their_own_skills() {
         // Issue #2672: crews sharing an adapter and vessel must have disjoint
@@ -2273,23 +2288,14 @@ esac
             let virtual_base = if adapter == CODEX_ADAPTER_ID { CONTAINER_CODEX_HOME.into() } else { base.display().to_string() };
             let token = temp.path().join("token");
             std::fs::write(&token, "test-token").expect("token");
-            let selected = vec![flotilla_resources::SkillCatalogEntry {
-                source: "private-skills".into(),
-                repository: "example/private-skills".into(),
-                revision: "1".repeat(40),
-                name: "private-source".into(),
-                path: "skills/private-folder".into(),
-            }];
+            let crews = BTreeMap::from([
+                ("coder", vec![crew_skill("private-source", "skills/private-folder")]),
+                ("reviewer", vec![crew_skill("unselected", "skills/unselected")]),
+                ("observer", Vec::new()),
+            ]);
             let environment = vec![
                 (variable.into(), virtual_base.clone()),
-                (
-                    "FLOTILLA_CREW_SKILLS".into(),
-                    serde_json::json!({"coder": selected, "reviewer": [flotilla_resources::SkillCatalogEntry {
-                    source: "private-skills".into(), repository: "example/private-skills".into(), revision: "1".repeat(40),
-                    name: "unselected".into(), path: "skills/unselected".into(),
-                }], "observer": []})
-                    .to_string(),
-                ),
+                ("FLOTILLA_CREW_SKILLS".into(), serde_json::to_string(&crews).expect("crew selections")),
             ];
             registry
                 .stage_skills(
@@ -2321,6 +2327,19 @@ esac
                 assert_eq!(std::fs::read_to_string(base.join(format!("crews/{role}/settings.json"))).expect("settings"), "{}");
                 assert_eq!(std::fs::read_to_string(base.join(format!("crews/{role}/auth.json"))).expect("linked auth"), "first-token");
             }
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("fetches")).expect("fetch log").lines().count(),
+                1,
+                "crews reuse the pinned source cache"
+            );
+            std::fs::write(base.join("settings.json"), "base changed").expect("base update");
+            std::fs::write(base.join("crews/coder/settings.json"), "crew edited").expect("crew edit");
+            registry.crew_environment("coder", &BTreeSet::from([adapter.into()]), &environment, &runner).await.expect("resume crew");
+            assert_eq!(
+                std::fs::read_to_string(base.join("crews/coder/settings.json")).expect("crew settings"),
+                "crew edited",
+                "base changes never overwrite crew scratch"
+            );
             let replacement = base.join("auth.new");
             std::fs::write(&replacement, "refreshed-token").expect("new auth");
             std::fs::rename(replacement, base.join("auth.json")).expect("atomic refresh");
@@ -2330,6 +2349,57 @@ esac
                     "refreshed-token"
                 );
             }
+        }
+    }
+    #[tokio::test]
+    async fn partial_crew_staging_failure_removes_source_tokens() {
+        // Review #2673: a failure after the first crew stages must still remove
+        // source tokens even though the last crew never reaches skill staging.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let runner = promisor_runner(temp.path());
+        let token = temp.path().join("token");
+        std::fs::write(&token, "test-token").expect("token");
+        let environment = vec![
+            ("CLAUDE_CONFIG_DIR".into(), runner.config_base.join("claude").display().to_string()),
+            ("FLOTILLA_CREW_SKILLS".into(), serde_json::json!({"coder": [], "reviewer/invalid": []}).to_string()),
+        ];
+        let error = registry
+            .stage_skills(
+                "partial",
+                &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.into()]),
+                &environment,
+                &BTreeMap::from([("mattpocock-skills".into(), token.clone())]),
+                &runner,
+            )
+            .await
+            .expect_err("second crew fails");
+        assert!(error.contains("invalid crew home role"), "{error}");
+        assert!(runner.config_base.join("claude/crews/coder/skills").is_dir(), "first crew staged");
+        assert!(!token.exists(), "outer error path removes tokens after partial staging");
+    }
+    #[tokio::test]
+    async fn crew_home_validation_preserves_custom_role_strings() {
+        // Custom roles are data: allow spaces, punctuation, Unicode and leading
+        // dashes, while rejecting path traversal, separators and NUL.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let runner = promisor_runner(temp.path());
+        let base = runner.config_base.join("claude");
+        let environment = vec![("CLAUDE_CONFIG_DIR".into(), base.display().to_string())];
+        let required = BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.into()]);
+        for role in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
+            assert!(registry
+                .crew_environment(role, &required, &environment, &runner)
+                .await
+                .expect_err("invalid role")
+                .contains("invalid crew home role"));
+        }
+        for role in ["-custom reviewer", "build.qa", "猫"] {
+            let env = registry.crew_environment(role, &required, &environment, &runner).await.expect("custom role");
+            let home = base.join("crews").join(role);
+            assert!(home.is_dir());
+            assert!(env.contains(&("CLAUDE_CONFIG_DIR".into(), home.display().to_string())));
         }
     }
 }
