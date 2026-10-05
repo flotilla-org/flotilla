@@ -842,16 +842,14 @@ fn codex_composer_visible(screen: &str) -> bool {
         return false;
     }
     let trailing = &lines[index + 1..];
-    // Only the last nonblank row can delimit the composer; a draft can itself
-    // contain footer-like text before more draft rows or the actual footer.
-    // Codex renders a `? for shortcuts` hint below the model footer, so it is
-    // chrome rather than the last composer row.
+    // The model footer (`model · /path …` or `model · ~/path …`) delimits the
+    // composer. Rows below it are chrome: wrapped status items, the
+    // `? for shortcuts` hint, and right-aligned warnings. Only rows between the
+    // composer row and the footer can hold wrapped or multiline draft text.
     let footer = trailing
         .iter()
-        .rposition(|line| !line.is_empty() && !codex_shortcuts_hint(line))
+        .rposition(|line| !line.is_empty() && !codex_footer_chrome(line))
         .filter(|&index| trailing[index].contains(" · /") || trailing[index].contains(" · ~"));
-    // Wrapped or multiline draft text is still part of the composer. A known
-    // placeholder on its first row must not hide a typed continuation.
     if trailing[..footer.unwrap_or(trailing.len())].iter().any(|line| !line.is_empty() && !codex_background_terminal_footer(line)) {
         return false;
     }
@@ -864,9 +862,10 @@ fn codex_composer_visible(screen: &str) -> bool {
     idle
 }
 
-fn codex_shortcuts_hint(line: &str) -> bool {
-    // rust-v0.160.0: bottom_pane footer hint shown beneath the model footer.
-    line == "? for shortcuts"
+fn codex_footer_chrome(line: &str) -> bool {
+    // rust-v0.160.0 rows beneath the model footer: the shortcuts hint, which may
+    // share its row with a right-aligned warning, and wrapped warning rows.
+    line.starts_with("? for shortcuts") || line.starts_with('⚠')
 }
 
 fn codex_background_terminal_footer(line: &str) -> bool {
@@ -2339,6 +2338,15 @@ mod tests {
         assert_eq!(codex.classify_screen_attention(&blank), Some(TerminalAttentionState::Idle), "{blank}");
         let draft = format!("› fix the flaky test{footer}");
         assert_ne!(codex.classify_screen_attention(&draft), Some(TerminalAttentionState::Idle), "{draft}");
+        // Live host-direct screens (kiwi): a wide status footer, and the hint
+        // sharing its row with a right-aligned warning.
+        let host_footer = "\n\n  GPT-6.1-Sol high · ~/dev/flotilla-repos/convoy-9f0a/issue-13-snapshot-arena · Read and follow crew brief · kiwi · Ready · Context 80% left · weekly 88% left · 421K used\n  ? for shortcuts                                                       ⚠ 1 warning · f2 to view";
+        let host_idle = format!("› Ask Codex to do anything{host_footer}");
+        assert_eq!(codex.classify_screen_attention(&host_idle), Some(TerminalAttentionState::Idle), "{host_idle}");
+        let wrapped = "› Ask Codex to do anything\n\n  GPT-6.1-Sol high · ~/dev/flotilla-repos/convoy-5015/166-hover-card-detach · Read the coder brief · kiwi · Ready · Context 69% left · weekly…\n                                                                 ⚠ 1 warning · f2 to view";
+        assert_eq!(codex.classify_screen_attention(wrapped), Some(TerminalAttentionState::Idle), "{wrapped}");
+        let host_draft = format!("› i think{host_footer}");
+        assert_ne!(codex.classify_screen_attention(&host_draft), Some(TerminalAttentionState::Idle), "{host_draft}");
     }
 
     #[test]
