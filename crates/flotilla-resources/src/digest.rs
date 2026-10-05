@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{Resource, ResourceError};
 
+// The first SHA-256 byte selects the bucket. Fanout, root bucket framing,
+// and the protocol/HTTP u8 bucket identity must change together if widened.
 pub const DIGEST_FANOUT: usize = 256;
 
 pub use flotilla_protocol::ResourceDigestQuery as DigestQuery;

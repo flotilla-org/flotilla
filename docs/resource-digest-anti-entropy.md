@@ -92,3 +92,11 @@ log-gap/horizon repair path can be substantially more expensive than the sizing
 microbenchmark suggests. Periodic matching roots do not pay that cost. Deferring
 leaf refresh to once per touched bucket during full replacement is a separate
 optimization; the current transaction/lock still preserves digest correctness.
+
+At 1m uniformly distributed keys, an individual write hashes about 3,900
+key/version entries in its bucket. Write-heavy kinds therefore need separate
+commit-throughput measurements; the batched benchmark does not predict them.
+An XOR or sum of entry hashes could make leaf updates constant time, but would
+replace the ordered, length-framed SHA-256 commitment with a commutative
+accumulator and require a separate collision/cancellation analysis and a
+versioned digest contract. The current scheme chooses the simpler commitment.
