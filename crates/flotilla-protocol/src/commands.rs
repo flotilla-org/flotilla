@@ -993,6 +993,11 @@ pub enum CommandAction {
         target_environment_id: crate::EnvironmentId,
     },
     QueryFleetHealth {},
+    FleetPostInstall {
+        cleat_bin: PathBuf,
+        generation: String,
+        diagnostics_dir: PathBuf,
+    },
     QueryFulfilmentList {},
     QueryFleetList {
         project: Option<String>,
@@ -1162,6 +1167,7 @@ impl Command {
             CommandAction::QueryHostStatus { .. } => "query host status",
             CommandAction::QueryHostProviders { .. } => "query host providers",
             CommandAction::QueryFleetHealth {} => "query fleet health",
+            CommandAction::FleetPostInstall { .. } => "fleet post-install",
             CommandAction::QueryFulfilmentList {} => "query fulfilment list",
             CommandAction::QueryFleetList { .. } => "query fleet list",
             CommandAction::QueryCrewStalls { .. } => "query crew stalls",
@@ -1318,6 +1324,10 @@ pub enum CommandValue {
     HostStatus(Box<HostStatusResponse>),
     HostProviders(Box<HostProvidersResponse>),
     FleetHealth(Box<FleetHealthResponse>),
+    FleetPostInstall {
+        failed: bool,
+        report: serde_json::Value,
+    },
     FulfilmentList(Box<FulfilmentListResponse>),
     FleetList(Box<FleetListResponse>),
     CrewStalls(Box<CrewStallsResponse>),

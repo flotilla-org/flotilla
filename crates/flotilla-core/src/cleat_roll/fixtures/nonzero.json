@@ -1,0 +1,5 @@
+{
+  "stdout": "",
+  "stderr": "connect daemon: No such file or directory (os error 2)\n",
+  "success": false
+}

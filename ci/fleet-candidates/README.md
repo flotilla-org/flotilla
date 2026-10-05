@@ -243,34 +243,56 @@ by launchd, verify `cleat` appears in provider discovery, then exercise both
 dev-mode transitions and confirm the socket remains free after a daemon exit
 while dev mode is enabled.
 
-After flotillad health confirmation (or preserved dev mode), the incoming
-installer runs the installed `cleat server drain --json` for `default`, the
-ambient `CLEAT_DAEMON` logical name, and every live logical daemon discovered by
-`cleat daemons --json`, deduplicated by runtime root and name. Generation names
-such as `work@3` are addressed as `work`. Cleat discovers the ambient
-`CLEAT_RUNTIME_DIR`, XDG state root, and host default state root; run the installer
-in the crew daemon's environment so private roots are discoverable. Independent
-container runtimes must be checked from their own environment after deployment.
+After flotillad health confirmation, the incoming installer calls the **incoming**
+generation's CLI:
 
-Each attempt retains inventory, command arguments, stdout, stderr, exit status,
-and the complete drain reports (`changed`, `installed`, `old`, `current`,
-`warning`) in `~/.local/opt/flotilla-fleet/diagnostics/cleat-drain-*.json` (or the
-configured `FLEET_INSTALL_ROOT`). A nonzero exit, malformed report, discovery
-failure, or drain warning makes installation return nonzero after attempting the
-remaining daemons. The confirmed generation and cleat aliases stay selected;
-there is no rollback for drain failures. Correct the cause and retry the same
-generation; drain is idempotent. SHA metadata is required by cleat itself.
+```bash
+flotilla --socket <host-socket> --json fleet post-install \
+  --cleat-bin <incoming-release>/bin/cleat --generation <generation> \
+  --diagnostics-dir <fleet-root>/diagnostics
+```
 
-As the host-local equivalent of the fleet skew view, run `fleet-install status`
-on each host: it labels the host, prints the installed cleat SHA, and lists all
-live generations with their serving/draining state, SHA, and `SKEW`, `current`,
-or `unknown` comparison. Old draining generations can legitimately show skew
-until their sessions finish; a serving generation with skew needs attention.
-Status only queries inventory/build information and never starts or drains a
-daemon. `scripts/test-fleet-install.sh` exercises this through the existing
-process fixture boundary on Linux and Darwin. Live drains, attachment of fresh
-crews, and continued service of existing sessions are operator checks after
-deployment.
+The preceding generation need not have this subcommand. Activation restarts the
+incoming daemon before confirmation; its registered execution environments and
+native crew-session records supply the targets. The command addresses `default`,
+the environment's `CLEAT_DAEMON`, and recorded named crew endpoints across local
+resource namespaces. Roots follow injected `CLEAT_RUNTIME_DIR`, absolute
+`XDG_STATE_HOME`, then `HOME`; generation-qualified endpoints such as `work@3`
+are addressed by their logical name `work`. It excludes other hosts' environments
+and deduplicates root/name pairs within each execution environment.
+
+Contained-cleat runtimes use their registered container runners, rather than
+starting a host process against container state. Their existing CLI mount is
+pinned read-only, so the incoming cleat binary is delivered to
+`<runtime-root>/.fleet-bin/<generation>/bin/cleat` alongside the incoming
+`lib/libghostty-vt.so.0` inside that environment before starting a successor.
+The command selects that library directory instead of the old mounted library.
+Fresh crews receive the incoming generation through normal tool provisioning.
+
+Rust records complete drain reports (`changed`, `installed`, `old`, `current`,
+`warning`), raw stdout/stderr, unsuccessful exit classification, target identities,
+and errors in unique mode-0600 `cleat-drain-*.json` files under the diagnostics
+directory. The JSON command response includes the diagnostic path. Command,
+warning, JSON, inventory, or diagnostic-write failures make the subcommand and
+installer fail after attempting the remaining targets. The installed generation
+and moved cleat aliases are retained; drain failures never trigger rollback.
+Correct the cause and retry the same generation; drain is idempotent. If dev mode
+keeps a daemon from another generation active, post-install must be retried once
+a compatible daemon is running; its failure also leaves the installation active.
+
+Host heartbeats publish an advisory `CleatBuildSkew` condition when the installed
+host SHA differs from a crew runtime's current serving SHA, or serving metadata
+is unavailable. It includes environment/root/name and installed-versus-serving
+SHAs, propagates through Host replication, and is visible in `flotilla fleet`.
+A later matching observation clears the condition. It does not block crew
+placement, and observing skew never drains or starts a daemon.
+
+Rust tests use an injected runner and recorded outputs from pinned cleat
+`00c072b2` for success, unchanged, warning, and nonzero exit, plus inventory,
+contained delivery, diagnostics, and skew cases. The shell fixture suite checks
+only incoming-subcommand invocation after confirmation, report visibility, and
+failure without rollback. Live drains, attachment of fresh crews, and continued
+service of old sessions remain operator checks after deployment.
 
 The consumer verifies the outer size and digest, safely extracts the archive,
 and verifies every inner file against its manifest before atomically selecting

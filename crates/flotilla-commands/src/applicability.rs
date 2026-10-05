@@ -37,6 +37,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::QueryHostStatus { .. }
         | CommandAction::QueryHostProviders { .. }
         | CommandAction::QueryFleetHealth {}
+        | CommandAction::FleetPostInstall { .. }
         | CommandAction::QueryFulfilmentList {}
         | CommandAction::QueryFleetList { .. }
         | CommandAction::QueryCrewStalls { .. }
