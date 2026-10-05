@@ -1215,7 +1215,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     .await;
     probe.fail_next.store(false, std::sync::atomic::Ordering::SeqCst);
     let supervision = Arc::new(AcceptSupervision::default());
-    daemon.crew_ops.leaf_subscriptions.set_turn_delivery_actuator(supervision.clone()).await;
+    daemon.crew_ops.set_turn_delivery_actuator(supervision.clone()).await;
     backend
         .clone()
         .using::<flotilla_resources::Project>("flotilla")
@@ -1358,7 +1358,7 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     }
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if daemon.crew_ops.leaf_subscriptions.rows().await.iter().any(|row| {
+            if daemon.crew_ops.subscription_rows().await.iter().any(|row| {
                 matches!(&row.maker,
                 flotilla_resources::LeafMaker::Supervisor { convoy, role, .. } if convoy == "governor" && role == "governor")
             }) {
@@ -1388,12 +1388,12 @@ async fn declared_access_stall_routes_to_project_governor_and_resumes() {
     )
     .await;
     daemon.set_work_credential_reconciler(probe.clone()).await;
-    daemon.crew_ops.leaf_subscriptions.set_turn_delivery_actuator(supervision.clone()).await;
+    daemon.crew_ops.set_turn_delivery_actuator(supervision.clone()).await;
     let (tx, _rx) = flotilla_resources::controller::WorkQueueSender::channel();
     task = tokio::spawn(daemon.reconciler_wake_watch().spawn(backend.clone(), "flotilla".to_string(), tx));
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if daemon.crew_ops.leaf_subscriptions.rows().await.iter().any(|row| {
+            if daemon.crew_ops.subscription_rows().await.iter().any(|row| {
                 matches!(&row.maker, flotilla_resources::LeafMaker::Supervisor { convoy, role, .. }
                     if convoy == "governor" && role == "governor")
             }) {
@@ -3138,7 +3138,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         .replace_local_environment_bag_for_test(EnvironmentBag::new().with(EnvironmentAssertion::binary("gh", "/usr/bin/gh")))
         .expect("gh discovery");
     let turns = Arc::new(DeliveredTurns::default());
-    daemon.crew_ops.leaf_subscriptions.set_turn_delivery_actuator(turns.clone()).await;
+    daemon.crew_ops.set_turn_delivery_actuator(turns.clone()).await;
     let repository = RepositorySpec::remote("https://github.com/flotilla-org/flotilla").expect("repository");
     let repository_key = repository.key();
     backend.using::<Repository>("flotilla").create(&test_meta(&repository_key.to_string()), &repository).await.expect("repository");
@@ -3348,7 +3348,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
                 number,
             };
             assert!(
-                daemon.crew_ops.leaf_subscriptions.change_request_observation_error(&subject).await.is_none(),
+                daemon.crew_ops.subscription_diagnostics().change_request_observation_error(&subject).await.is_none(),
                 "recovery clears subject errors"
             );
         }
@@ -8140,7 +8140,6 @@ async fn active_idle_crew_stalls_and_working_crew_clears() {
     let mut events = daemon.subscribe();
     let subscription = daemon
         .crew_ops
-        .leaf_subscriptions
         .subscribe_wait(uuid::Uuid::new_v4(), flotilla_protocol::WaitSubscriptionRequest {
             namespace: "flotilla".into(),
             leaves: vec!["convoy/idle-crew .status.stalled == true".parse().expect("stall leaf")],
@@ -8245,8 +8244,7 @@ async fn landing_done_crew_with_idle_session_has_no_actor_stall() {
         loop {
             if daemon
                 .crew_ops
-                .leaf_subscriptions
-                .rows()
+                .subscription_rows()
                 .await
                 .iter()
                 .any(|row| matches!(&row.watcher, crate::leaf_engine::LeafWatcher::ReconcilerWake { convoy } if convoy == "landed-claim"))

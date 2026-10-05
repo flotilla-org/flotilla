@@ -53,6 +53,7 @@ pub(super) struct CheckoutProviders {
     environment_manager: Arc<crate::environment_manager::EnvironmentManager>,
     local_environment_id: EnvironmentId,
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
+    #[builder(default)]
     checkout_vcs: tokio::sync::Mutex<CheckoutVcsCache>,
 }
 

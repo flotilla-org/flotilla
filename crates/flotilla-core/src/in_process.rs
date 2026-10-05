@@ -11,7 +11,7 @@ pub(crate) use crew_ops::convoy_message_address;
 #[cfg(test)]
 use crew_ops::{convoy_sender_address, frame_crew_message, queue_pending_crew_message, terminal_meta_with_vessel_credentials};
 pub use crew_ops::{ConvoyResumeOutcome, CrewRoutingContext};
-use crew_ops::{CrewService, CrewSupervisionRequest, DaemonTurnDeliveryActuator};
+use crew_ops::{CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator};
 // Exercise the real controller in the existing private daemon scenario harness
 // without adding a production dependency from core back to controllers.
 #[path = "in_process/convoy_admission.rs"]
@@ -20,7 +20,7 @@ mod convoy_admission;
 #[path = "../../flotilla-controllers/src/reconcilers/convoy_ensure.rs"]
 mod ensure_controller_under_test;
 mod project_ops;
-use checkout_providers::{CheckoutProvider, CheckoutProviders, CheckoutVcsCache};
+use checkout_providers::{CheckoutProvider, CheckoutProviders};
 mod repository_operations;
 use std::{
     cmp::Reverse,
@@ -1610,7 +1610,6 @@ impl InProcessDaemon {
             )
             .await;
         let agent_state_store = crate::agents::shared_file_backed_agent_state_store(config.base_path());
-        let checkout_vcs = CheckoutVcsCache::new();
         for path in repo_paths {
             let path = canonical_or_original(&path);
             if repos.values().any(|state| state.contains_path(&path)) {
@@ -1822,16 +1821,12 @@ impl InProcessDaemon {
                 .environment_manager(Arc::clone(&environment_manager))
                 .local_environment_id(local_environment_id.clone())
                 .provisioning_namespace(Arc::clone(&provisioning_namespace))
-                .checkout_vcs(Mutex::new(checkout_vcs))
                 .build(),
         );
         let crew_ops = Arc::new(
             CrewService::builder()
                 .resource_backend(resource_backend.clone())
                 .leaf_subscriptions(leaf_subscriptions.clone())
-                .convoy_message_locks(Mutex::new(HashMap::new()))
-                .work_credential_reconciler(RwLock::new(None))
-                .remote_turn_delivery(std::sync::RwLock::new(None))
                 .clock(Arc::clone(&clock))
                 .provisioning_namespace(Arc::clone(&provisioning_namespace))
                 .config(Arc::clone(&config))
@@ -1912,7 +1907,7 @@ impl InProcessDaemon {
             local_placement_provider_statuses: RwLock::new(Vec::new()),
             managed_terminals_by_repo: RwLock::new(HashMap::new()),
         });
-        leaf_subscriptions.set_turn_delivery_actuator(Arc::new(DaemonTurnDeliveryActuator { crew: Arc::downgrade(&crew_ops) })).await;
+        crew_ops.set_turn_delivery_actuator(Arc::new(CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew_ops) })).await;
 
         daemon.spawn_checkout_provider_retirement();
 
@@ -2708,23 +2703,23 @@ impl InProcessDaemon {
         connection_id: uuid::Uuid,
         request: flotilla_protocol::WaitSubscriptionRequest,
     ) -> Result<uuid::Uuid, String> {
-        self.crew_ops.leaf_subscriptions.subscribe_wait(connection_id, request).await
+        self.crew_ops.subscribe_wait(connection_id, request).await
     }
 
     pub async fn unsubscribe_waits(&self, connection_id: uuid::Uuid) {
-        self.crew_ops.leaf_subscriptions.unsubscribe_connection(connection_id).await;
+        self.crew_ops.unsubscribe_waits(connection_id).await;
     }
 
     pub fn reconciler_wake_watch(&self) -> Box<dyn flotilla_resources::controller::SecondaryWatch<Primary = flotilla_resources::Convoy>> {
-        self.crew_ops.leaf_subscriptions.reconciler_wake_watch()
+        self.crew_ops.reconciler_wake_watch()
     }
 
     pub fn change_request_stale_after(&self) -> Duration {
-        self.crew_ops.leaf_subscriptions.change_request_stale_after()
+        self.crew_ops.change_request_stale_after()
     }
 
     pub async fn refresh_change_request_hint(&self, hint: &flotilla_relay_protocol::Subject) -> Result<(), String> {
-        self.crew_ops.leaf_subscriptions.refresh_change_request_hint(hint).await?;
+        self.crew_ops.refresh_change_request_hint(hint).await?;
         if hint.kind != flotilla_relay_protocol::SubjectKind::ChangeRequest {
             return Ok(());
         }
@@ -2785,11 +2780,11 @@ impl InProcessDaemon {
     }
 
     pub async fn refresh_demanded_owned_change_requests(&self) -> Result<(), String> {
-        self.crew_ops.leaf_subscriptions.refresh_demanded_owned_change_requests().await
+        self.crew_ops.refresh_demanded_owned_change_requests().await
     }
 
     pub fn set_change_request_relay_healthy(&self, healthy: bool) {
-        self.crew_ops.leaf_subscriptions.set_change_request_relay_healthy(healthy);
+        self.crew_ops.set_change_request_relay_healthy(healthy);
     }
 
     pub fn connect_surface(&self, surface_id: uuid::Uuid, declaration: SurfaceDeclaration) {
@@ -4781,7 +4776,7 @@ impl InProcessDaemon {
             host_name: &self.host_name,
             node_id: &self.node_id,
             clock: &self.clock,
-            leaf_subscriptions: &self.crew_ops.leaf_subscriptions,
+            leaf_subscriptions: self.crew_ops.subscription_diagnostics(),
             fleet: &self.fleet,
         }
     }

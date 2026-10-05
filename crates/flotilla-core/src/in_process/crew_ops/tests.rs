@@ -64,7 +64,6 @@ async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Ar
             .environment_manager(environment_manager.clone())
             .local_environment_id(environment.clone())
             .provisioning_namespace(namespace.clone())
-            .checkout_vcs(Mutex::new(HashMap::new()))
             .build(),
     );
     let refresher = ChangeRequestRefresher::new(
@@ -81,9 +80,7 @@ async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Ar
         CrewService::builder()
             .resource_backend(backend.clone())
             .leaf_subscriptions(subscriptions)
-            .convoy_message_locks(Mutex::new(HashMap::new()))
             .work_credential_reconciler(RwLock::new(Some(reconciler)))
-            .remote_turn_delivery(std::sync::RwLock::new(None))
             .clock(Arc::new(SystemClock))
             .provisioning_namespace(namespace)
             .config(config)
@@ -252,4 +249,31 @@ fn crew_message_header_escapes_sender_supplied_delimiters() {
     };
     assert_eq!(crew_message_header(&sender), "operator robert) (flotilla - nudge · via convoy resume");
     assert_eq!(crew_message_header(&CrewMessageSender::Unknown), "unknown sender · message");
+}
+
+// The delivery port must refuse both operations after its owning service stops;
+// retaining the actuator cannot keep the service alive (#2221).
+#[tokio::test]
+async fn actuator_refuses_delivery_and_hold_after_service_stops() {
+    use crate::leaf_engine::{TurnDeliveryActuator, TurnDeliveryRequest};
+    let (crew, _backend, _probe, _config) = fixture(CrewWorkPhase::Done).await;
+    let actuator = Arc::new(CrewTurnDeliveryActuator { crew: Arc::downgrade(&crew) });
+    crew.set_turn_delivery_actuator(actuator.clone()).await;
+    drop(crew);
+    assert!(actuator.crew.upgrade().is_none(), "subscriptions and actuator must not form a strong cycle");
+    let request = TurnDeliveryRequest {
+        namespace: "flotilla".into(),
+        convoy: "crew".into(),
+        source: "rule".into(),
+        vessel: "work".into(),
+        role: "coder".into(),
+        brief: "continue".into(),
+        subject_revision: "head".into(),
+        sender: CrewMessageSender::FlotillaNudge,
+    };
+    assert_eq!(actuator.deliver(&request).await.expect_err("stopped delivery"), "daemon stopped before turn delivery");
+    assert_eq!(
+        actuator.hold(&request, &HoldAct::ChangeRequestComment { body: "hold".into() }, "stopped").await.expect_err("stopped hold"),
+        "daemon stopped before turn-delivery hold"
+    );
 }

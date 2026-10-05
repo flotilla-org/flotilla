@@ -5,6 +5,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::{Arc, Weak},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -31,8 +32,12 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, warn};
 
 use super::{
-    checkout_path, checkout_providers::CheckoutProviders, convoy_admission::convoy_address, input_meta_from_resource,
-    read_projections::credential_refresh_alert_for_vessel, BriefArtifactWriter, WorkCredentialReconciler,
+    checkout_path,
+    checkout_providers::CheckoutProviders,
+    convoy_admission::convoy_address,
+    input_meta_from_resource,
+    read_projections::{credential_refresh_alert_for_vessel, LeafSubscriptionRead},
+    BriefArtifactWriter, WorkCredentialReconciler,
 };
 use crate::{
     agent_adapter::{CrewAssignment, CrewBriefTemplateResolver},
@@ -41,7 +46,7 @@ use crate::{
     config::ConfigStore,
     environment_manager::EnvironmentManager,
     fleet::crew_attention,
-    leaf_engine::LeafSubscriptionTable,
+    leaf_engine::{LeafSubscriptionTable, TurnDeliveryActuator},
     providers::{ChannelLabel, CommandRunner},
     resource_explain::explain_unmet_expectation,
 };
@@ -53,12 +58,15 @@ use crate::{
 #[derive(bon::Builder)]
 pub(super) struct CrewService {
     resource_backend: ResourceBackend,
-    pub(super) leaf_subscriptions: LeafSubscriptionTable,
+    leaf_subscriptions: LeafSubscriptionTable,
     /// Serializes pending-brief state with its terminal-session delivery side effect.
+    #[builder(default)]
     convoy_message_locks: Mutex<HashMap<ConvoyMessageKey, WeakConvoyMessageLock>>,
+    #[builder(default)]
     work_credential_reconciler: RwLock<Option<Arc<dyn WorkCredentialReconciler>>>,
     // Networking can restart against the same module, replacing a dead router.
     // This lock protects only Weak pointer copies/swaps, never async work.
+    #[builder(default)]
     remote_turn_delivery: std::sync::RwLock<Option<Weak<dyn crate::leaf_engine::RemoteTurnDelivery>>>,
     clock: Arc<dyn Clock>,
     provisioning_namespace: Arc<std::sync::RwLock<String>>,
@@ -92,7 +100,7 @@ pub(super) struct CrewSupervisionRequest<'a> {
     pub(super) principal: Option<&'a PrincipalRef>,
 }
 
-pub(super) struct DaemonTurnDeliveryActuator {
+pub(super) struct CrewTurnDeliveryActuator {
     pub(super) crew: Weak<CrewService>,
 }
 
@@ -119,7 +127,7 @@ fn turn_delivery_session_plan(
 }
 
 #[async_trait]
-impl crate::leaf_engine::TurnDeliveryActuator for DaemonTurnDeliveryActuator {
+impl crate::leaf_engine::TurnDeliveryActuator for CrewTurnDeliveryActuator {
     async fn deliver(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
         self.crew.upgrade().ok_or_else(|| "daemon stopped before turn delivery".to_string())?.deliver_turn(request).await
     }
@@ -395,6 +403,51 @@ async fn queue_crew_message_object(
 }
 
 impl CrewService {
+    pub(super) async fn subscribe_wait(
+        &self,
+        connection_id: uuid::Uuid,
+        request: flotilla_protocol::WaitSubscriptionRequest,
+    ) -> Result<uuid::Uuid, String> {
+        self.leaf_subscriptions.subscribe_wait(connection_id, request).await
+    }
+
+    pub(super) async fn unsubscribe_waits(&self, connection_id: uuid::Uuid) {
+        self.leaf_subscriptions.unsubscribe_connection(connection_id).await;
+    }
+
+    pub(super) fn reconciler_wake_watch(&self) -> Box<dyn flotilla_resources::controller::SecondaryWatch<Primary = ResourceConvoy>> {
+        self.leaf_subscriptions.reconciler_wake_watch()
+    }
+
+    pub(super) fn change_request_stale_after(&self) -> Duration {
+        self.leaf_subscriptions.change_request_stale_after()
+    }
+
+    pub(super) async fn refresh_change_request_hint(&self, hint: &flotilla_relay_protocol::Subject) -> Result<(), String> {
+        self.leaf_subscriptions.refresh_change_request_hint(hint).await
+    }
+
+    pub(super) async fn refresh_demanded_owned_change_requests(&self) -> Result<(), String> {
+        self.leaf_subscriptions.refresh_demanded_owned_change_requests().await
+    }
+
+    pub(super) fn set_change_request_relay_healthy(&self, healthy: bool) {
+        self.leaf_subscriptions.set_change_request_relay_healthy(healthy);
+    }
+
+    pub(super) async fn set_turn_delivery_actuator(&self, actuator: Arc<dyn TurnDeliveryActuator>) {
+        self.leaf_subscriptions.set_turn_delivery_actuator(actuator).await;
+    }
+
+    pub(super) fn subscription_diagnostics(&self) -> &dyn LeafSubscriptionRead {
+        &self.leaf_subscriptions
+    }
+
+    #[cfg(test)]
+    pub(super) async fn subscription_rows(&self) -> Vec<crate::leaf_engine::LeafSubscriptionRow> {
+        self.leaf_subscriptions.rows().await
+    }
+
     pub(super) async fn set_work_credential_reconciler(&self, reconciler: Arc<dyn WorkCredentialReconciler>) {
         *self.work_credential_reconciler.write().await = Some(reconciler);
     }
