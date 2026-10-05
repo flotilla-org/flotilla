@@ -53,6 +53,9 @@ pub struct CrewListResponse {
     /// Charter resolved from the live Project on every crew query.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<CrewProject>,
+    /// An unavailable live charter, kept separate from process state and alerts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub credential_alerts: Vec<String>,

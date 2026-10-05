@@ -688,3 +688,27 @@ fn crew_list_renders_live_repository_roles() {
     let json = serde_json::to_value(response).expect("JSON");
     assert_eq!(json["project"]["repositories"][0]["roles"], serde_json::json!(["code", "ops"]));
 }
+
+// A missing live charter preserves process state and credential alerts (#2643 review).
+#[test]
+fn crew_list_renders_charter_error_alongside_state_and_alerts() {
+    let response = flotilla_protocol::CrewListResponse::builder()
+        .convoy("governor".into())
+        .vessel("work".into())
+        .vessel_ref("vessel".into())
+        .members(vec![flotilla_protocol::CrewListMember::builder()
+            .role("governor".into())
+            .kind("agent".into())
+            .state("active".into())
+            .build()])
+        .project_error("live Project `island` unavailable".into())
+        .credential_alerts(vec!["refresh delayed".into()])
+        .build();
+    let output = super::format_crew_list_human(&response);
+    assert!(output.contains("active"));
+    assert!(output.contains("Credential attention: refresh delayed"));
+    assert!(output.contains("Live Project unavailable: live Project `island` unavailable"));
+    let json = serde_json::to_value(response).expect("JSON");
+    assert_eq!(json["project_error"], "live Project `island` unavailable");
+    assert!(json.get("project").is_none());
+}

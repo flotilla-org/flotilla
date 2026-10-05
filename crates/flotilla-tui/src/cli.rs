@@ -791,6 +791,9 @@ fn format_crew_list_human(response: &CrewListResponse) -> String {
         ]);
     }
     let mut charter = String::new();
+    if let Some(error) = &response.project_error {
+        let _ = writeln!(charter, "Live Project unavailable: {error}");
+    }
     if let Some(project) = &response.project {
         let _ = writeln!(charter, "Live Project: {}/{} ({})", project.namespace, project.name, project.display_name);
         for repository in &project.repositories {

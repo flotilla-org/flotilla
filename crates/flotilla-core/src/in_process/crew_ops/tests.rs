@@ -341,7 +341,10 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
         let projects = origin.using::<Project>("flotilla");
         let writer = backend.replica_writer::<Project>(origin_root, "flotilla");
         let context = CrewCommandContext::builder().convoy("crew".into()).vessel_ref("vessel".into()).role("coder".into()).build();
-        assert!(crew.crew_list_internal(&context).await.expect_err("missing live project").contains("live Project"));
+        let unavailable = crew.crew_list_internal(&context).await.expect("crew state with missing Project");
+        assert!(unavailable.project.is_none());
+        assert!(unavailable.project_error.as_deref().expect("explicit charter error").contains("live Project"));
+        assert_eq!(unavailable.members[0].role, "coder");
         let mut spec = ProjectSpec::builder().display_name("Island".into()).default_workflow_ref("workflow".into()).build();
         let mut project = projects.create(&InputMeta::builder().name("island".into()).build(), &spec).await.expect("project");
         for (count, role_bits) in operations {
@@ -372,6 +375,7 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
             let ambient = CrewCommandContext::builder().crew_id("governor-id".into()).build();
             let result = crew.crew_list_internal(&ambient).await.expect("orientation through crew identity");
             assert_eq!(result, crew.crew_list_internal(&context).await.expect("explicit orientation"));
+            assert!(result.project_error.is_none(), "successful orientation clears the charter error");
             let charter = result.project.expect("live charter");
             assert_eq!((charter.namespace.as_str(), charter.name.as_str()), ("flotilla", "island"));
             assert_eq!(charter.repositories.len(), spec.repositories.len());
@@ -396,13 +400,18 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
         if replicated {
             writer.replace(&projects.list().await.expect("source projects"), Utc::now()).await.expect("replicate removal");
         }
-        assert!(crew.crew_list_internal(&context).await.is_err(), "a removed charter must not fall back to admission");
+        let removed = crew.crew_list_internal(&context).await.expect("crew state after Project removal");
+        assert!(removed.project.is_none(), "a removed charter must not fall back to admission");
+        assert!(removed.project_error.is_some());
+        assert_eq!(removed.members, unavailable.members);
         let mut current = convoys.get("crew").await.expect("convoy");
         current.spec.project_ref = None;
         convoys
             .update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &current.spec)
             .await
             .expect("unscoped convoy");
-        assert!(crew.crew_list_internal(&context).await.expect("unscoped query").project.is_none());
+        let unscoped = crew.crew_list_internal(&context).await.expect("unscoped query");
+        assert!(unscoped.project.is_none());
+        assert!(unscoped.project_error.is_none());
     });
 }

@@ -648,46 +648,57 @@ impl CrewService {
         let context = self.resolve_crew_context(requested).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
         let convoy = convoys.get(&context.convoy).await.map_err(|err| err.to_string())?;
-        let project = if let Some(project_ref) = &convoy.spec.project_ref {
-            let project = self
-                .resource_backend
-                .definitions::<Project>(&context.namespace)
-                .get(project_ref)
-                .await
-                .map_err(|error| format!("live Project `{project_ref}` unavailable: {error}"))?;
-            let repositories = self.resource_backend.including_replicas::<Repository>(&context.namespace);
-            let mut members = Vec::new();
-            for member in project.spec.repositories {
+        let mut response = self.crew_state(&context, &convoy).await?;
+        if let Some(project_ref) = &convoy.spec.project_ref {
+            // Orientation reports an unavailable charter without hiding crew state
+            // or substituting admission-time membership.
+            match self.live_project_charter(&context, project_ref).await {
+                Ok(project) => response.project = Some(project),
+                Err(error) => response.project_error = Some(error),
+            }
+        }
+        Ok(response)
+    }
+
+    async fn live_project_charter(&self, context: &ResolvedCrewContext, project_ref: &str) -> Result<CrewProject, String> {
+        let project = self
+            .resource_backend
+            .definitions::<Project>(&context.namespace)
+            .get(project_ref)
+            .await
+            .map_err(|error| format!("live Project `{project_ref}` unavailable: {error}"))?;
+        let mut remotes_by_key = HashMap::<RepositoryKey, Vec<String>>::new();
+        let repositories = self.resource_backend.including_replicas::<Repository>(&context.namespace);
+        let mut members = Vec::new();
+        for member in project.spec.repositories {
+            let remotes = if let Some(remotes) = remotes_by_key.get(&member.repo) {
+                remotes.clone()
+            } else {
                 let remotes = match repositories.get(member.repo.0.as_str()).await {
                     Ok(repository) => repository.object.spec.remotes().to_vec(),
                     Err(ResourceError::NotFound { .. }) => Vec::new(),
                     Err(error) => return Err(error.to_string()),
                 };
-                members.push(
-                    CrewProjectRepository::builder()
-                        .key(member.repo)
-                        .maybe_alias(member.alias)
-                        .roles(member.roles)
-                        .maybe_subpath(member.subpath)
-                        .maybe_default_branch(member.default_branch)
-                        .remotes(remotes)
-                        .build(),
-                );
-            }
-            Some(
-                CrewProject::builder()
-                    .namespace(context.namespace.clone())
-                    .name(project_ref.clone())
-                    .display_name(project.spec.display_name)
-                    .repositories(members)
+                remotes_by_key.insert(member.repo.clone(), remotes.clone());
+                remotes
+            };
+            members.push(
+                CrewProjectRepository::builder()
+                    .key(member.repo)
+                    .maybe_alias(member.alias)
+                    .roles(member.roles)
+                    .maybe_subpath(member.subpath)
+                    .maybe_default_branch(member.default_branch)
+                    .remotes(remotes)
                     .build(),
-            )
-        } else {
-            None
-        };
-        let mut response = self.crew_state(&context, &convoy).await?;
-        response.project = project;
-        Ok(response)
+            );
+        }
+        Ok(CrewProject::builder()
+            .namespace(context.namespace.clone())
+            .name(project_ref.to_string())
+            .display_name(project.spec.display_name)
+            .repositories(members)
+            .build())
     }
 
     // Crew handoff consumes process state independently of the live island charter.
