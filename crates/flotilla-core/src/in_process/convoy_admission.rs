@@ -1114,8 +1114,6 @@ impl ConvoyAdmission {
                     .to_string(),
             });
         }
-        // Capability pruning is part of the frozen explanation even when
-        // another kind succeeds; operators need to see version gaps.
         selected.placement.refused_candidates.extend(rejected);
         selected.placement.allocation = Some(allocation);
         Ok((selected.placement, alternatives))
@@ -3731,8 +3729,6 @@ mod tests {
         assert_eq!(needs, BTreeSet::from([CapabilityNeed::Platform("linux".to_string()), CapabilityNeed::GuiSession]));
         assert_eq!(workflow.vessels[0].crew[0].needs, needs);
     }
-    // Issue #2694: a capability-only Codex selector must carry the launch
-    // flag floor even without a model override or any observed model facts.
     #[tokio::test]
     async fn codex_adapter_floor_is_composed_without_a_model() {
         let temp = tempfile::tempdir().expect("tempdir");

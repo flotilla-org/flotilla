@@ -2111,7 +2111,6 @@ async fn controller_loop_prunes_acknowledged_message_payloads() {
     );
 }
 
-// Discovery from asserted binaries and exit classification must not spawn.
 struct UnusedCommandRunner;
 
 #[async_trait]
@@ -2153,7 +2152,6 @@ impl TerminalRuntime for ExitedAgentRuntime {
     async fn agent_exit_code(&self, _: &TerminalSessionSpec, _: &flotilla_resources::CrewSessionStatus) -> Result<Option<i32>, String> {
         Ok(Some(self.0))
     }
-    // Use the real adapter contract behind the injected process boundary.
     async fn agent_exit_failure(&self, _: &str, _: &TerminalSessionSpec, code: i32) -> Result<Option<String>, String> {
         use flotilla_core::{
             agent_adapter::AgentAdapterRegistry,
@@ -2233,8 +2231,6 @@ async fn agent_exit_is_observed_even_while_its_terminal_shell_is_running() {
         let mut status = running.status.clone().expect("status");
         outcome.patch.expect("exit patch").apply(&mut status);
         if code == 2 && !screen.is_empty() {
-            // Issue #2694: an immediate usage error is terminal failure,
-            // never interruption followed by automatic relaunch.
             assert_eq!(status.phase, TerminalSessionPhase::Failed);
             assert!(status.message.as_ref().expect("usage error").contains("unexpected argument '--no-daemon'"));
             let mut failed = running.clone();

@@ -108,8 +108,6 @@ pub trait TerminalRuntime: Send + Sync {
     ) -> Result<Option<i32>, String> {
         Ok(None)
     }
-    /// Classify a positively observed exit through the selected harness adapter.
-    /// A launch-contract error is terminal, rather than a resumable interruption.
     async fn agent_exit_failure(
         &self,
         _session_id: &str,
@@ -410,8 +408,7 @@ where
             self.runtime.cleanup_failed_session(&obj.spec).await.map_err(ResourceError::other)?;
             return Ok(TerminalPrepared::None);
         }
-        // Read the launch receipt before liveness: the shell can disappear
-        // after a usage error, and Lost recovery must not relaunch that command.
+        // Observe usage exits before liveness so Lost recovery cannot relaunch them.
         if matches!(phase, TerminalSessionPhase::Running | TerminalSessionPhase::Lost)
             && matches!(obj.spec.source, TerminalSessionSource::Agent { .. })
         {

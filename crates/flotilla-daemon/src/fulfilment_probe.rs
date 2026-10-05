@@ -291,9 +291,6 @@ mod tests {
 
     use super::*;
 
-    // Issue #2694: version facts from the host probe must reject the old
-    // harness, accept the exact adapter floor and newer versions, and fail
-    // closed for absent/malformed versions. No model probe is needed for Codex.
     #[hegel::test]
     fn probed_codex_versions_cover_only_compatible_launches(tc: hegel::TestCase) {
         let minor = tc.draw(hegel::generators::integers::<u32>().min_value(150).max_value(170));

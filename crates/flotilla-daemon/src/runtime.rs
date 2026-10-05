@@ -6175,8 +6175,6 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .agent_adapters
             .get(&requirement.adapter)
             .ok_or_else(|| format!("agent adapter {} unavailable for environment {}", requirement.adapter, spec.env_ref))?;
-        // A receipt proves an exit, but only captured evidence distinguishes
-        // a launch failure from an interruption. Missing capture stays resumable.
         let screen = match self.pool_for_spec(spec) {
             Ok(pool) => pool.capture_screen(session_id).await.ok().flatten().unwrap_or_default(),
             Err(_) => String::new(),

@@ -1866,8 +1866,6 @@ async fn create_test_contained_policy(backend: &flotilla_resources::ResourceBack
     let mut status = host.status.unwrap_or_default();
     status.ready = true;
     status.heartbeat_at = Some(chrono::Utc::now());
-    // The test image contains a current harness; unknown facts are tested
-    // explicitly by removing this observation in those scenarios.
     status.fulfilment_facts.insert("docker-test".into(), FulfilmentFacts {
         harnesses: agent_adapters
             .iter()
@@ -2995,8 +2993,6 @@ async fn conflicting_role_platform_needs_split_and_name_uncovered_role() {
     );
 }
 
-// Issue #2694: observed host versions, not adapter availability, decide
-// whether a Codex crew can run. Explain must retain the rejected version gap.
 #[tokio::test]
 async fn codex_admission_refuses_old_host_and_explains_version_gap() {
     let (_temp, _repo, daemon) = daemon_for_plain_dir_with_discovery(fake_discovery(false)).await;
@@ -3301,7 +3297,6 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
     let decision =
         convoy.status.and_then(|status| status.placement_decision).expect("admission should persist the complete placement decision");
     assert_eq!(decision.policy_name, "host-direct-b-remote");
-    // Capability-pruned hosts remain in explain even when another host wins.
     assert_eq!(decision.refused_candidates.len(), 1);
     assert_eq!(decision.refused_candidates[0].policy_name, "host-direct-a-empty");
     assert!(decision.refused_candidates[0].reason.contains("harness:codex>=0.160.0"));
@@ -3392,8 +3387,6 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
     .await
     .expect("start command should finish");
 
-    // Capability admission now names the missing harness need before adapter
-    // preparation; it must still refuse without writing a Convoy.
     assert!(
         matches!(&result, CommandValue::Error { message } if message.contains("harness:codex>=0.160.0")
         && message.contains("observed codex unknown")),

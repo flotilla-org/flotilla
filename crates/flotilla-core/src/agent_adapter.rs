@@ -522,9 +522,7 @@ impl Default for CapabilityTable {
     }
 }
 
-/// Minimum CLI version required by our invocation, independent of discovery
-/// or model acceptance. Admission must use this even on hosts where the
-/// adapter is not locally installed. Keep the floor beside the launch flags.
+/// Minimum CLI version required by the launch flags, available without local discovery.
 pub fn minimum_harness_version(adapter: &str) -> Option<&'static str> {
     match adapter {
         // --no-daemon is part of every managed Codex invocation.
@@ -536,8 +534,7 @@ pub fn minimum_harness_version(adapter: &str) -> Option<&'static str> {
 #[async_trait]
 pub trait AgentAdapter: Send + Sync {
     fn id(&self) -> &'static str;
-    /// Classify a positive process exit using captured diagnostics. An exit
-    /// code alone need not distinguish launch failure from interruption.
+    /// Return a fatal launch diagnostic; ambiguous exits remain resumable.
     fn classify_exit_failure(&self, _exit_code: i32, _screen: &str) -> Option<String> {
         None
     }
@@ -744,8 +741,7 @@ impl AgentAdapter for CliAgentAdapter {
         if !matches!(self.flavor, AdapterFlavor::Codex { .. }) || exit_code != 2 {
             return None;
         }
-        // Exit 2 without a diagnostic may be a later agent interruption.
-        // Require evidence before making the session irrecoverably Failed.
+        // Exit 2 alone can also mean an interruption later in the session.
         let diagnostic = screen.lines().map(str::trim).find(|line| line.starts_with("error:"))?;
         Some(format!("Codex launch usage error (exit 2): {diagnostic}"))
     }
@@ -1179,9 +1175,6 @@ mod tests {
         )
     }
 
-    // Issue #2694: every Codex launch needs the declared --no-daemon floor.
-    // Exit 2 needs a diagnostic; empty capture remains resumable. Other
-    // exit codes and a live screen containing quoted errors do not prove it.
     #[hegel::test]
     fn codex_launch_contract_classifies_only_usage_exits(tc: hegel::TestCase) {
         let registry = discovered_registry();

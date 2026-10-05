@@ -255,8 +255,6 @@ async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Op
     daemon
 }
 
-// Shared routing fixtures represent a compatible installed Codex. Version
-// refusal rows publish their own observations instead of weakening coverage.
 fn compatible_codex_facts() -> flotilla_resources::FulfilmentFacts {
     flotilla_resources::FulfilmentFacts {
         harnesses: BTreeMap::from([("codex".into(), flotilla_resources::HarnessFacts {
@@ -1086,8 +1084,6 @@ async fn forced_convoy_teardown_cascades_to_checkout_on_another_host() {
     convoy_task.abort();
 }
 
-// Issue #2694: destination admission must enforce its probed adapter floor
-// for both local and routed dispatch, including an explicit placement pin.
 async fn codex_version_admission_row(issuer_index: usize, minor: u32) {
     let hosts = vec![empty_daemon_named("codex-home").await, empty_daemon_named("codex-issuer").await];
     let home = Arc::clone(&hosts[0]);
@@ -1190,8 +1186,6 @@ async fn codex_version_admission_pinned_rows() {
     }
 }
 
-// Explicit generator covers local/remote issuance and versions on both sides
-// of the launch floor. Each run asserts the destination's durable admission.
 #[hegel::test]
 fn generated_codex_version_admission(tc: hegel::TestCase) {
     let issuer = tc.draw(gs::integers::<usize>().min_value(0).max_value(1));
