@@ -1563,8 +1563,19 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
     assert!(matches!(deps, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
 }
 
+// #2705: uncertain writes hold once; attempts that sent no bytes back off and
+// exhaust a three-attempt budget. A fresh reconciler must respect stored state.
 #[tokio::test]
 async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
+    delivery_failure_scenario(false).await;
+}
+
+#[tokio::test]
+async fn submissions_that_sent_no_bytes_back_off_and_stop_at_the_bound() {
+    delivery_failure_scenario(true).await;
+}
+
+async fn delivery_failure_scenario(startup_not_ready: bool) {
     let backend = ResourceBackend::InMemory(Default::default());
     create_ready_environment(&backend, "env-a").await;
     create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
@@ -1616,11 +1627,12 @@ async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
         DeliveringTerminalRuntime::builder()
             .delivered(Mutex::default())
             .unconfirmed(true)
+            .startup_not_ready(startup_not_ready)
             .pending(AtomicBool::new(false))
             .observation_failed(AtomicBool::new(false))
             .build(),
     );
-    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+    let reconciler = TerminalSessionReconciler::new(Arc::clone(&runtime), backend.clone(), "flotilla");
 
     let pending = reconciler.reconcile(
         &session,
@@ -1635,18 +1647,48 @@ async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
     let outcome = reconciler.reconcile(&session, &prepared, Utc::now());
     let mut flagged_status = session.status.clone().expect("status");
     outcome.patch.expect("delivery condition patch").apply(&mut flagged_status);
-    assert_eq!(flagged_status.degraded.as_ref().map(|condition| condition.reason.as_str()), Some("DeliveryUnconfirmed"));
+    let reason = if startup_not_ready { "DeliveryNotSubmitted" } else { "DeliveryUnconfirmed" };
+    assert_eq!(flagged_status.degraded.as_ref().map(|condition| condition.reason.as_str()), Some(reason));
     assert_eq!(flagged_status.degraded.as_ref().and_then(|condition| condition.message_id.as_deref()), Some("message-new"));
-    assert_eq!(
-        flagged_status.degraded.as_ref().map(|condition| condition.message.as_str()),
-        Some("agent session remained idle after submit and one retry")
-    );
-    let flagged = sessions.update_status("term-a", &session.metadata.resource_version, &flagged_status).await.expect("flag session");
+    assert_eq!(flagged_status.degraded.as_ref().expect("condition").consecutive_failures, 1);
+    let mut flagged = sessions.update_status("term-a", &session.metadata.resource_version, &flagged_status).await.expect("flag session");
 
-    let prepared = reconciler.prepare(&flagged).await.expect("observe flag");
+    for attempt in 1..=3 {
+        // Resyncs before the backoff expires cannot submit another copy.
+        let prepared = reconciler.prepare(&flagged).await.expect("observe flag");
+        assert!(matches!(prepared, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::None));
+        assert!(reconciler.reconcile(&flagged, &prepared, Utc::now()).patch.is_none());
+        assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), attempt);
+        // A different failed observation cannot clear a possibly accepted write.
+        let failure = flotilla_resources::controller::ReconcileFailure { message: "pool unreachable".into(), consecutive_failures: 5 };
+        assert!(reconciler.reconcile_degraded_patch(&flagged, &failure).is_none());
+        if !startup_not_ready || attempt == 3 {
+            break;
+        }
+        let mut status = flagged.status.clone().expect("status");
+        status.degraded.as_mut().expect("condition").observed_at -= chrono::Duration::minutes(10);
+        flagged = sessions.update_status("term-a", &flagged.metadata.resource_version, &status).await.expect("backoff elapsed");
+        let prepared = reconciler.prepare(&flagged).await.expect("safe retry");
+        let outcome = reconciler.reconcile(&flagged, &prepared, Utc::now());
+        assert_eq!(outcome.requeue_after, (attempt < 2).then_some(Duration::from_secs(120)));
+        outcome.patch.expect("failure patch").apply(&mut status);
+        assert_eq!(status.degraded.as_ref().expect("condition").consecutive_failures, (attempt + 1) as u32);
+        flagged = sessions.update_status("term-a", &flagged.metadata.resource_version, &status).await.expect("next failure");
+    }
+    if startup_not_ready {
+        let diagnostic = &flagged.status.as_ref().expect("status").degraded.as_ref().expect("condition").message;
+        assert!(diagnostic.contains("attempt 3/3"));
+        assert!(diagnostic.contains("retry budget exhausted; delivery held for explicit intervention"));
+    }
+    // Even an expired deadline and a reconstructed reconciler do not release
+    // uncertain or exhausted delivery. This is a durable, visible hold.
+    let mut status = flagged.status.clone().expect("status");
+    status.degraded.as_mut().expect("condition").observed_at -= chrono::Duration::hours(1);
+    flagged = sessions.update_status("term-a", &flagged.metadata.resource_version, &status).await.expect("late resync");
+    let fresh = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+    let prepared = fresh.prepare(&flagged).await.expect("hold survives restart");
     assert!(matches!(prepared, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::None));
-    assert!(reconciler.reconcile(&flagged, &prepared, Utc::now()).patch.is_none());
-    assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), 1);
+    assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), if startup_not_ready { 3 } else { 1 });
 }
 
 // #2560: output progress is persisted even when attention is coalesced;
@@ -1797,6 +1839,8 @@ async fn terminal_finalizer_cleans_agent_artifacts() {
 struct DeliveringTerminalRuntime {
     delivered: Mutex<Vec<(String, String, TerminalDeliveryReadiness)>>,
     unconfirmed: bool,
+    #[builder(default)]
+    startup_not_ready: bool,
     pending: AtomicBool,
     observation_failed: AtomicBool,
 }
@@ -1863,7 +1907,9 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
             return Ok(TerminalDeliveryOutcome::Pending);
         }
         self.delivered.lock().expect("delivered mutex").push((session_id.to_string(), message.to_string(), readiness));
-        Ok(if self.unconfirmed {
+        Ok(if self.startup_not_ready {
+            TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady)
+        } else if self.unconfirmed {
             TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)
         } else {
             TerminalDeliveryOutcome::Confirmed

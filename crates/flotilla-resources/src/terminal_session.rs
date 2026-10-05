@@ -12,6 +12,8 @@ use crate::{
 
 /// Stored degradation reason shared by writers, controllers and surfaces.
 pub const TERMINAL_DELIVERY_UNCONFIRMED_REASON: &str = "DeliveryUnconfirmed";
+/// An attempt known to have sent no input; safe to retry within its budget.
+pub const TERMINAL_DELIVERY_NOT_SUBMITTED_REASON: &str = "DeliveryNotSubmitted";
 
 define_resource!(
     TerminalSession,
@@ -362,6 +364,14 @@ pub struct TerminalSessionDegradedCondition {
     pub observed_at: DateTime<Utc>,
 }
 
+impl TerminalSessionDegradedCondition {
+    /// Delivery evidence is cleared only by an explicit delivery or lifecycle
+    /// transition, never by an unrelated observation or provider recovery.
+    pub fn is_delivery(&self) -> bool {
+        matches!(self.reason.as_str(), TERMINAL_DELIVERY_UNCONFIRMED_REASON | TERMINAL_DELIVERY_NOT_SUBMITTED_REASON)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalAttentionState {
@@ -476,6 +486,11 @@ pub enum TerminalSessionStatusPatch {
     MarkMessageDelivered {
         message_id: String,
     },
+    MarkDeliveryNotSubmitted {
+        message_id: String,
+        message: String,
+        observed_at: DateTime<Utc>,
+    },
     MarkDeliveryUnconfirmed {
         message_id: String,
         message: String,
@@ -554,13 +569,24 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 // supervision treats the agent as having finished this turn.
                 status.attention = None;
             }
-            Self::MarkDeliveryUnconfirmed { message_id, message, observed_at } => {
+            Self::MarkDeliveryUnconfirmed { message_id, message, observed_at }
+            | Self::MarkDeliveryNotSubmitted { message_id, message, observed_at } => {
+                let consecutive_failures = status
+                    .degraded
+                    .as_ref()
+                    .filter(|condition| condition.message_id.as_ref() == Some(message_id))
+                    .map_or(1, |condition| condition.consecutive_failures.saturating_add(1));
                 status.message = Some(message.clone());
                 status.degraded = Some(TerminalSessionDegradedCondition {
-                    reason: TERMINAL_DELIVERY_UNCONFIRMED_REASON.to_string(),
+                    reason: if matches!(self, Self::MarkDeliveryNotSubmitted { .. }) {
+                        TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
+                    } else {
+                        TERMINAL_DELIVERY_UNCONFIRMED_REASON
+                    }
+                    .to_string(),
                     message: message.clone(),
                     message_id: Some(message_id.clone()),
-                    consecutive_failures: 1,
+                    consecutive_failures,
                     observed_at: *observed_at,
                 });
             }
@@ -610,6 +636,9 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 }
             }
             Self::MarkReconcileDegraded { message, consecutive_failures, observed_at } => {
+                if status.degraded.as_ref().is_some_and(TerminalSessionDegradedCondition::is_delivery) {
+                    return;
+                }
                 status.message = Some(format!("reconcile backing off after {consecutive_failures} consecutive failures: {message}"));
                 status.degraded = Some(TerminalSessionDegradedCondition {
                     reason: "ReconcileBackoff".to_string(),
@@ -624,8 +653,10 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 }
             }
             Self::ClearReconcileDegraded => {
-                status.message = None;
-                status.degraded = None;
+                if !status.degraded.as_ref().is_some_and(TerminalSessionDegradedCondition::is_delivery) {
+                    status.message = None;
+                    status.degraded = None;
+                }
             }
             Self::ObserveToolActivity { attention } => {
                 status.last_tool_activity_at = Some(attention.as_of);
@@ -636,8 +667,10 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 if replace {
                     status.attention = Some(attention.clone());
                 }
-                status.message = None;
-                status.degraded = None;
+                if !status.degraded.as_ref().is_some_and(TerminalSessionDegradedCondition::is_delivery) {
+                    status.message = None;
+                    status.degraded = None;
+                }
             }
             Self::Observe { attention, occupancy, output_digest, observed_at } => {
                 status.occupancy = *occupancy;
@@ -653,8 +686,10 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                         status.attention = Some(attention.clone());
                     }
                 }
-                status.message = None;
-                status.degraded = None;
+                if !status.degraded.as_ref().is_some_and(TerminalSessionDegradedCondition::is_delivery) {
+                    status.message = None;
+                    status.degraded = None;
+                }
             }
             Self::MarkCompletionPending { pending } => status.completion_pending = Some(pending.clone()),
             Self::ClearCompletionPending => status.completion_pending = None,
@@ -815,6 +850,63 @@ mod tests {
         assert_eq!(condition.reason, "DeliveryUnconfirmed");
         assert_eq!(condition.message, message);
         assert_eq!(condition.message_id.as_deref(), Some("handoff-1"));
+    }
+
+    // #2705: hook/screen observations and provider recovery cannot erase a
+    // delivery hold or its retry budget. Generate both delivery outcomes and
+    // arbitrary observation/recovery sequences, checking after every patch.
+    #[hegel::test]
+    fn delivery_conditions_survive_unrelated_status_updates(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let unsent = tc.draw(gs::booleans());
+        let attempts = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
+        let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
+        let observed_at = Utc::now();
+        let mut status = TerminalSessionStatus::default();
+        for attempt in 1..=attempts {
+            let patch = if unsent {
+                TerminalSessionStatusPatch::MarkDeliveryNotSubmitted {
+                    message_id: "message".into(),
+                    message: "not sent".into(),
+                    observed_at,
+                }
+            } else {
+                TerminalSessionStatusPatch::MarkDeliveryUnconfirmed {
+                    message_id: "message".into(),
+                    message: "uncertain".into(),
+                    observed_at,
+                }
+            };
+            patch.apply(&mut status);
+            assert_eq!(status.degraded.as_ref().expect("condition").consecutive_failures, attempt as u32);
+        }
+        let held = status.degraded.clone();
+        let diagnostic = status.message.clone();
+        for _ in 0..steps {
+            let attention =
+                TerminalAttention { state: TerminalAttentionState::Working, as_of: observed_at, source: TerminalAttentionSource::Hook };
+            let patch = match tc.draw(gs::integers::<usize>().min_value(0).max_value(4)) {
+                0 => TerminalSessionStatusPatch::ObserveAttention { attention },
+                1 => TerminalSessionStatusPatch::Observe {
+                    attention: Some(attention),
+                    occupancy: TerminalOccupancy::Occupied,
+                    output_digest: Some("output".into()),
+                    observed_at,
+                },
+                2 => TerminalSessionStatusPatch::ObserveToolActivity { attention },
+                3 => TerminalSessionStatusPatch::MarkReconcileDegraded {
+                    message: "provider outage".into(),
+                    consecutive_failures: 5,
+                    observed_at,
+                },
+                _ => TerminalSessionStatusPatch::ClearReconcileDegraded,
+            };
+            patch.apply(&mut status);
+            assert_eq!(status.degraded, held);
+            assert_eq!(status.message, diagnostic);
+        }
+        TerminalSessionStatusPatch::MarkMessageDelivered { message_id: "message".into() }.apply(&mut status);
+        assert!(status.degraded.is_none());
     }
 
     #[test]

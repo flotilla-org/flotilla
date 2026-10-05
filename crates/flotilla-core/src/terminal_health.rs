@@ -1,7 +1,7 @@
 //! Shared terminal-condition projection for convoy explanations and surfaces.
 
 use flotilla_protocol::ExplainedTerminalCondition;
-use flotilla_resources::{InnerCommandStatus, TerminalSessionPhase, TerminalSessionStatus, TERMINAL_DELIVERY_UNCONFIRMED_REASON};
+use flotilla_resources::{InnerCommandStatus, TerminalSessionPhase, TerminalSessionStatus};
 
 pub fn condition(status: &TerminalSessionStatus) -> Option<ExplainedTerminalCondition> {
     match status.phase {
@@ -12,7 +12,7 @@ pub fn condition(status: &TerminalSessionStatus) -> Option<ExplainedTerminalCond
             Some(ExplainedTerminalCondition::ProcessExited { exit_code: status.inner_exit_code })
         }
         _ => status.degraded.as_ref().map(|condition| {
-            if condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON {
+            if condition.is_delivery() {
                 ExplainedTerminalCondition::DeliveryUnconfirmed { message: condition.message.clone() }
             } else {
                 ExplainedTerminalCondition::ProviderUnavailable { message: condition.message.clone() }

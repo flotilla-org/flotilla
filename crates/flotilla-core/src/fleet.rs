@@ -314,7 +314,7 @@ pub(crate) fn session_status_label(phase: Option<ResourceTerminalSessionPhase>) 
 
 pub(crate) fn crew_attention(status: Option<&TerminalSessionStatus>, now: DateTime<Utc>) -> Option<CrewAttention> {
     let status = status.filter(|status| status.phase == ResourceTerminalSessionPhase::Running)?;
-    if status.degraded.as_ref().is_some_and(|condition| condition.reason == "DeliveryUnconfirmed") {
+    if status.degraded.as_ref().is_some_and(|condition| condition.is_delivery()) {
         return Some(CrewAttention::DeliveryUnconfirmed);
     }
     let attention = status.attention.as_ref()?;
@@ -504,6 +504,8 @@ mod tests {
             consecutive_failures: 1,
             observed_at: now,
         });
+        assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::DeliveryUnconfirmed));
+        status.degraded.as_mut().expect("condition").reason = "DeliveryNotSubmitted".into();
         assert_eq!(crew_attention(Some(&status), now), Some(CrewAttention::DeliveryUnconfirmed));
         status.degraded = None;
 

@@ -5746,7 +5746,7 @@ struct TerminalControllerRuntime {
 }
 
 const DELIVERY_CONFIRMATION_POLL: Duration = Duration::from_millis(200);
-const DELIVERY_CONFIRMATION_GRACE: Duration = Duration::from_secs(2);
+const DELIVERY_CONFIRMATION_GRACE: Duration = Duration::from_secs(4);
 const DELIVERY_READY_POLLS: usize = 150;
 
 // Screen classification is the same evidence for observation, turn release, and
@@ -5819,14 +5819,34 @@ async fn session_busy_after_delivery_grace(
     adapter: Option<&dyn AgentAdapter>,
     session_id: &str,
 ) -> Result<bool, String> {
-    tokio::time::sleep(DELIVERY_CONFIRMATION_GRACE).await;
-    let observation = observe_terminal_screen(pool, adapter, session_id, Utc::now())
-        .await?
-        .ok_or_else(|| format!("terminal session {session_id} disappeared after message delivery"))?;
-    // Missing evidence preserves best-effort confirmation for legacy pools.
-    Ok(observation
-        .attention
-        .is_none_or(|attention| matches!(attention.state, TerminalAttentionState::Working | TerminalAttentionState::NeedsInput)))
+    // Require one second of consecutive positive observations within the
+    // confirmation window. A redraw's isolated Working/Idle sample cannot
+    // establish whether the harness accepted a queued turn.
+    let mut positive_since = None;
+    let deadline = tokio::time::Instant::now() + DELIVERY_CONFIRMATION_GRACE;
+    loop {
+        let observation = observe_terminal_screen(pool, adapter, session_id, Utc::now())
+            .await?
+            .ok_or_else(|| format!("terminal session {session_id} disappeared after message delivery"))?;
+        // Pools without attention evidence retain legacy best-effort behavior,
+        // but only after the same stability window.
+        let positive = observation
+            .attention
+            .is_none_or(|attention| matches!(attention.state, TerminalAttentionState::Working | TerminalAttentionState::NeedsInput));
+        let now = tokio::time::Instant::now();
+        if positive {
+            let since = positive_since.get_or_insert(now);
+            if now.duration_since(*since) >= Duration::from_secs(1) {
+                return Ok(true);
+            }
+        } else {
+            positive_since = None;
+        }
+        if now >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(DELIVERY_CONFIRMATION_POLL).await;
+    }
 }
 
 async fn deliver_and_confirm(
@@ -5840,25 +5860,27 @@ async fn deliver_and_confirm(
     // PTY input sent during agent startup can be consumed before the TUI has
     // enabled its composer input modes. A newly launched agent reports active,
     // so wait for its first idle observation before sending delivery bytes.
-    if !wait_for_delivery_ready(pool, adapter, session_id, readiness).await? {
-        warn!(%session_id, "agent session did not become idle before message delivery deadline");
-        return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
+    match wait_for_delivery_ready(pool, adapter, session_id, readiness).await {
+        Ok(true) => {}
+        result => {
+            warn!(%session_id, ?result, "agent session readiness failed before any message input was sent");
+            return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady));
+        }
     }
-    if clear_before_delivery {
-        pool.retry_delivery(session_id, message).await?;
-    } else {
-        pool.deliver(session_id, message).await?;
+    let submission =
+        if clear_before_delivery { pool.retry_delivery(session_id, message).await } else { pool.deliver(session_id, message).await };
+    // A transport error may occur after a partial write, or after acceptance
+    // with the reply lost. It does not prove that retyping is safe.
+    if let Err(error) = submission {
+        warn!(%session_id, %error, "message write has an ambiguous outcome; holding without resending");
+        return Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
     }
-    if session_busy_after_delivery_grace(pool, adapter, session_id).await? {
-        return Ok(TerminalDeliveryOutcome::Confirmed);
-    }
-    warn!(%session_id, "agent session remained idle after message delivery; retrying submission once");
-    pool.retry_delivery(session_id, message).await?;
-    if session_busy_after_delivery_grace(pool, adapter, session_id).await? {
-        Ok(TerminalDeliveryOutcome::Confirmed)
-    } else {
-        warn!(%session_id, "agent session remained idle after message delivery retry");
-        Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed))
+    match session_busy_after_delivery_grace(pool, adapter, session_id).await {
+        Ok(true) => Ok(TerminalDeliveryOutcome::Confirmed),
+        result => {
+            warn!(%session_id, ?result, "message submission lacks stable evidence; holding without resending");
+            Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed))
+        }
     }
 }
 
@@ -6212,7 +6234,13 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let clear_before_delivery = match lookup_terminal_delivery(&self.state.terminal_deliveries, session_id, message) {
             TerminalDeliveryLookup::InFlight => return Ok(TerminalDeliveryOutcome::Pending),
             TerminalDeliveryLookup::Taken(delivery) if delivery.message == message => {
-                return delivery.task.await.map_err(|error| format!("delivery confirmation task failed: {error}"))?
+                return match delivery.task.await {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        warn!(%session_id, %error, "delivery task failed with an ambiguous submission outcome");
+                        Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed))
+                    }
+                }
             }
             TerminalDeliveryLookup::Taken(delivery) => {
                 delivery.task.abort();
@@ -13429,12 +13457,21 @@ mod tests {
         observations: AtomicUsize,
         deliveries: AtomicUsize,
         retries: AtomicUsize,
+        screens: Vec<String>,
+        submission_error: bool,
     }
 
     impl DeliveryProbePool {
         fn new(activities: Vec<ScreenActivity>) -> Self {
             assert!(!activities.is_empty(), "delivery probe needs at least one activity state");
-            Self { activities, observations: AtomicUsize::new(0), deliveries: AtomicUsize::new(0), retries: AtomicUsize::new(0) }
+            Self {
+                activities,
+                observations: AtomicUsize::new(0),
+                deliveries: AtomicUsize::new(0),
+                retries: AtomicUsize::new(0),
+                screens: Vec::new(),
+                submission_error: false,
+            }
         }
     }
 
@@ -13482,9 +13519,18 @@ mod tests {
             Ok(())
         }
 
+        async fn capture_screen(&self, _: &str) -> Result<Option<String>, String> {
+            let index = self.observations.load(Ordering::SeqCst).saturating_sub(1);
+            Ok(self.screens.get(index).or_else(|| self.screens.last()).cloned())
+        }
+
         async fn deliver(&self, _session_name: &str, _text: &str) -> Result<(), String> {
             self.deliveries.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            if self.submission_error {
+                Err("reply lost after PTY accepted input".into())
+            } else {
+                Ok(())
+            }
         }
 
         async fn retry_delivery(&self, _session_name: &str, _text: &str) -> Result<(), String> {
@@ -13782,8 +13828,50 @@ mod tests {
         assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
     }
 
+    // #2705: generate isolated redraws and short Working/Idle runs through
+    // the real Codex adapter and terminal-pool boundary. No flicker permits a
+    // second write; only a full stable second confirms the queued submission.
+    #[hegel::test]
+    fn flickering_codex_confirmation_never_resends(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let run_length = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
+        let accepted_then_error = tc.draw(gs::booleans());
+        let mut pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
+        pool.submission_error = accepted_then_error;
+        pool.screens.push("› Ask Codex to do anything".into());
+        for index in 0..24 {
+            pool.screens.push(if (index / run_length).is_multiple_of(2) {
+                "• Working (10m • esc to interrupt)\n› Ask Codex to do anything".into()
+            } else {
+                "› Ask Codex to do anything".into()
+            });
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("runtime");
+        runtime.block_on(async {
+            let adapters = AgentAdapterRegistry::discover(
+                &EnvironmentBag::new().with(EnvironmentAssertion::binary("codex", "/tools/codex")),
+                Arc::new(DiscoveryMockRunner::builder().build()),
+            );
+            let outcome = deliver_and_confirm(
+                &pool,
+                adapters.get("codex").map(|adapter| &**adapter),
+                "agent",
+                "wake",
+                TerminalDeliveryReadiness::Startup,
+                false,
+            )
+            .await
+            .expect("uncertain submission");
+            assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
+            assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
+            assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    // #2705: a successful pool write may already be queued by the agent even
+    // when screen attention never confirms submission. Do not type it again.
     #[tokio::test(start_paused = true)]
-    async fn delivery_confirmation_retries_once_then_flags_a_session_that_stays_idle() {
+    async fn accepted_but_unconfirmed_delivery_is_never_retyped() {
         let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
 
         let outcome = deliver_and_confirm(&pool, None, "agent", "stuck handoff", TerminalDeliveryReadiness::Startup, false)
@@ -13792,7 +13880,7 @@ mod tests {
 
         assert_eq!(outcome, TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed));
         assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
-        assert_eq!(pool.retries.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]
