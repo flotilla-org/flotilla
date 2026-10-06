@@ -435,3 +435,24 @@ fn digest_case_and_adoption_fields_are_strict() {
     )
     .is_err());
 }
+
+#[test]
+fn relevant_layer_limit_has_an_atomic_boundary() {
+    for count in [64, 65] {
+        let mut catalogue = catalogue();
+        for index in 0..count {
+            catalogue.insert(format!("cover-{index:02}"), layer(ImageLayerStage::Capability, &["goal:one"]));
+        }
+        let mut frozen = FrozenImageLayers::default();
+        let result = compose_image(&selection(), &BTreeSet::from(["goal:one".into()]), &catalogue, &mut frozen);
+        if count == 64 {
+            let composition = result.expect("64 relevant layers remain supported");
+            assert_eq!(composition.layers.iter().filter(|layer| layer.spec.stage == ImageLayerStage::Capability).count(), 1);
+        } else {
+            let error = result.expect_err("65 relevant layers exceed the supported limit");
+            assert!(error.contains("65 relevant capability layers"), "{error}");
+            assert!(error.contains("goal:one"));
+            assert!(frozen.layers.is_empty());
+        }
+    }
+}

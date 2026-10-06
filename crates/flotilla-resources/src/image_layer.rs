@@ -314,6 +314,10 @@ pub fn compose_image(
     if optional.len() > 64 {
         return Err(format!("image composition search limit: {} relevant capability layers for needs {:?}", optional.len(), needs));
     }
+    // A conservative first-release ceiling: at most 10,000 nodes, each with
+    // at most 64 optional layers. Count work, not time, so identical catalogues
+    // refuse identically on different hosts. Tune from fleet measurements;
+    // this is a safety bound, not a measured wall-time guarantee.
     let mut search_budget = 10_000;
     for need in needs {
         validate_capability(need)?;
