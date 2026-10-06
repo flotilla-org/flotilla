@@ -53,6 +53,7 @@ mod labels;
 mod landing_gate;
 mod leaf;
 mod manifest_root;
+mod message;
 mod owner_gc;
 mod placement_policy;
 mod platform;
@@ -279,6 +280,10 @@ macro_rules! for_each_registered_resource {
     }};
 }
 pub use fulfilment_kind::{effective_grants, version_at_least, CapabilityNeed};
+pub use message::{
+    Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation, MessageSpec, MessageStatus, MessageStatusPatch,
+    MessageSubmission, ResolvedMessageReceiver,
+};
 pub use workflow_template::{
     current_builtin_workflow_name, implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_shepherd_workflow_spec,
     single_agent_workflow_spec, validate, AllocationDecision, ArtifactSubjectBinding, ClaimExit, CompletionCondition,
