@@ -9803,3 +9803,21 @@ async fn standing_presence_inherits_role_shape_and_delivers_charter_artifact() {
         "Govern the child project from this delivered charter."
     );
 }
+
+// Admission's artifact address is convoy/role/subject, so duplicate agent roles
+// across vessels must refuse before any write can replace another vessel's brief.
+#[tokio::test]
+async fn admission_refuses_same_role_briefs_before_writing_any_artifact() {
+    let (daemon, _, _, _temp) = standing_ensure_fixture().await;
+    let writer = Arc::new(RecordingBriefArtifacts::default());
+    daemon.set_brief_artifact_writer(writer.clone()).await;
+    let mut workflow = flotilla_resources::single_agent_workflow_spec();
+    let mut second = workflow.vessels[0].clone();
+    second.name = "second".into();
+    workflow.vessels.push(second);
+    let spec = ConvoySpec::builder().workflow_ref("same-role".into()).build();
+    let error =
+        daemon.convoy_admission.write_admission_briefs("flotilla", "same-role", &spec, &workflow).await.expect_err("collision refused");
+    assert!(error.contains("convoy-wide unique roles"));
+    assert!(writer.writes.lock().await.is_empty(), "refusal is before all artifact writes");
+}

@@ -125,9 +125,25 @@ impl ResolvedCascade {
         project_name: &str,
         project: &ProjectSpec,
     ) -> Result<Self, ResourceError> {
-        let hierarchy = ProjectHierarchy::load_for_inspection(backend, namespace).await?;
-        let projects = backend.definitions::<Project>(namespace);
-        let specs = projects.list().await?.into_iter().map(|project| (project.metadata.name, project.spec)).collect();
+        let objects = backend.definitions::<Project>(namespace).list().await?;
+        // Freeze local content and its revision from the same definition read.
+        let charter_commit = objects.iter().find(|object| object.metadata.name == project_name).and_then(|object| {
+            object
+                .metadata
+                .annotations
+                .get("flotilla.work/source-commit")
+                .or_else(|| object.metadata.annotations.get("flotilla.work/project-bootstrap-commit"))
+                .or_else(|| object.metadata.annotations.get("flotilla.work/manifest-revision"))
+                .cloned()
+        });
+        let fleet = match backend.definitions::<crate::FleetDesignation>(namespace).get(crate::FLEET_DESIGNATION_NAME).await {
+            Ok(designation) => Some(designation.spec.project),
+            Err(ResourceError::NotFound { .. }) => None,
+            Err(error) => return Err(error),
+        };
+        let specs: BTreeMap<_, _> = objects.into_iter().map(|object| (object.metadata.name, object.spec)).collect();
+        let hierarchy =
+            ProjectHierarchy::from_declared(specs.iter().map(|(name, spec)| (name.clone(), spec.parent.clone())).collect(), fleet);
         let defaults = backend
             .definitions::<CrewDefaults>(namespace)
             .list()
@@ -135,18 +151,9 @@ impl ResolvedCascade {
             .into_iter()
             .map(|defaults| (defaults.metadata.name, defaults.spec))
             .collect::<Vec<_>>();
-        let mut resolved = Self::from_specs(&hierarchy, &specs, &defaults, project_name, project)?;
-        resolved.charter_commit = match projects.get(project_name).await {
-            Ok(object) => object
-                .metadata
-                .annotations
-                .get("flotilla.work/source-commit")
-                .or_else(|| object.metadata.annotations.get("flotilla.work/project-bootstrap-commit"))
-                .or_else(|| object.metadata.annotations.get("flotilla.work/manifest-revision"))
-                .cloned(),
-            Err(ResourceError::NotFound { .. }) => None,
-            Err(error) => return Err(error),
-        };
+        let local = specs.get(project_name).unwrap_or(project);
+        let mut resolved = Self::from_specs(&hierarchy, &specs, &defaults, project_name, local)?;
+        resolved.charter_commit = charter_commit;
         Ok(resolved)
     }
     /// The offline pre-roll gate uses exactly the same resolution as admission.
@@ -168,8 +175,10 @@ impl ResolvedCascade {
         let mut by_project = BTreeMap::new();
         for (name, defaults) in defaults {
             let key = defaults.project_ref.clone();
-            if key.as_ref().is_some_and(|bound| bound != project_name && !projects.contains_key(bound)) {
-                return Err(ResourceError::invalid(format!("CrewDefaults/{name} references an undeclared Project {key:?}")));
+            // Unrelated defaults cannot break admission on this chain. The
+            // candidate gate separately validates every declared binding.
+            if key.as_ref().is_some_and(|bound| !chain.contains(bound)) {
+                continue;
             }
             if by_project.insert(key.clone(), (name.clone(), defaults.clone())).is_some() {
                 return Err(ResourceError::invalid(format!("at most one CrewDefaults is allowed for cascade layer {key:?}")));
@@ -218,6 +227,11 @@ pub fn validate_cascade_skills(
     defaults: &[(String, CrewDefaultsSpec)],
     fleet: Option<String>,
 ) -> Result<(), String> {
+    for (name, defaults) in defaults {
+        if defaults.project_ref.as_ref().is_some_and(|bound| !projects.contains_key(bound)) {
+            return Err(format!("CrewDefaults/{name} references an undeclared Project {:?}", defaults.project_ref));
+        }
+    }
     let hierarchy = ProjectHierarchy::new(projects.iter().map(|(name, project)| (name.clone(), project.parent.clone())).collect(), fleet)
         .map_err(|error| error.to_string())?;
     let fallback = BTreeMap::from([("pre-roll".to_string(), ProjectSpec::builder().display_name("pre-roll".into()).build())]);
@@ -324,7 +338,8 @@ mod tests {
             .annotations(BTreeMap::from([("flotilla.work/project-bootstrap-commit".into(), "abc123".into())]))
             .build();
         projects.apply(&meta, &child).await.expect("parented child");
-        let inherited = ResolvedCascade::load(&backend, "test", "child", &child).await.expect("cascade");
+        let stale = ProjectSpec::builder().display_name("Stale child".into()).build();
+        let inherited = ResolvedCascade::load(&backend, "test", "child", &stale).await.expect("cascade");
         assert_eq!(inherited.roles["governor"].model.as_deref(), Some("parent"));
         assert_eq!(inherited.settings["roles.governor.model"].layer, "project:parent");
         assert_eq!(inherited.charter["governor"], "Child charter");
@@ -394,6 +409,38 @@ mod tests {
         let mut valid = projects;
         valid.get_mut("parent").expect("parent").skills.clear();
         validate_cascade_skills(&[], &valid, &defaults, Some("fleet".into())).expect("distinct layers");
+    }
+
+    // Runtime isolates unrelated layers; candidate validation still checks all
+    // bindings and duplicates, including a sibling not in the admitted chain.
+    #[test]
+    fn unrelated_defaults_do_not_block_admission_but_candidate_refuses_them() {
+        let project = ProjectSpec::builder().display_name("Child".into()).build();
+        let projects = BTreeMap::from([("child".into(), project.clone()), ("sibling".into(), project.clone())]);
+        let hierarchy = ProjectHierarchy::new(BTreeMap::from([("child".into(), None), ("sibling".into(), None)]), None).unwrap();
+        let mut defaults = vec![
+            (
+                "sibling-one".into(),
+                CrewDefaultsSpec::builder().project_ref("sibling".into()).default_workflow_ref("sibling-work".into()).build(),
+            ),
+            ("sibling-two".into(), CrewDefaultsSpec::builder().project_ref("sibling".into()).build()),
+        ];
+        let resolved =
+            ResolvedCascade::from_specs(&hierarchy, &projects, &defaults, "child", &project).expect("unrelated duplicates ignored");
+        assert_eq!(resolved.workflow(None).value, "single-agent");
+        assert!(validate_cascade_skills(&[], &projects, &defaults, None).unwrap_err().contains("at most one CrewDefaults"));
+        defaults.pop();
+        defaults.push(("stray".into(), CrewDefaultsSpec::builder().project_ref("undeclared".into()).build()));
+        ResolvedCascade::from_specs(&hierarchy, &projects, &defaults, "child", &project).expect("stray outside chain ignored");
+        assert!(validate_cascade_skills(&[], &projects, &defaults, None).unwrap_err().contains("undeclared Project"));
+    }
+
+    // A fleet designation cannot validate without its declared fleet Project;
+    // empty pre-bootstrap input without a designation remains valid.
+    #[test]
+    fn candidate_empty_projects_with_fleet_refuses_missing_root() {
+        validate_cascade_skills(&[], &BTreeMap::new(), &[], None).expect("pre-bootstrap");
+        assert!(validate_cascade_skills(&[], &BTreeMap::new(), &[], Some("fleet".into())).unwrap_err().contains("not declared"));
     }
 
     // Empty and duplicate layers: builtin workflow is usable before bootstrap;

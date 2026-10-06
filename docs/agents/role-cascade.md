@@ -29,7 +29,19 @@ built-in crew brief; a complete source may extend `builtin/crew.md` explicitly.
 `charter_prose` and `charter_commit` are also template inputs. Rendering always
 includes the local wildcard and role charter prose and the applied charter
 commit. The revision comes from the Project's source-commit, bootstrap-commit,
-or manifest-revision annotation. Charter contents do not cascade. An agent
+or manifest-revision annotation. The revision stamp is resolved in that order:
+
+| Annotation | Writer and meaning |
+|---|---|
+| `flotilla.work/source-commit` | Operational-entry materialization in `project_ops` stamps the inspected ops source commit on ensures/workflows. For a Project, this key can be explicitly source-authored to declare its provenance. |
+| `flotilla.work/project-bootstrap-commit` | Project declaration bootstrap in `project_ops` stamps the inspected `project.yaml` repository commit. |
+| `flotilla.work/manifest-revision` | The daemon's resource manifest reconciler stamps the applied source revision. Bound Git sources resolve the branch-head commit; legacy/fixed sources can use an opaque revision such as `unversioned`. |
+
+`charter_commit` is the compatibility name of this revision stamp in the
+rendered brief and artifact summary; the manifest fallback is not guaranteed
+to be a Git hash. Missing provenance leaves the stamp absent. Admission takes
+local prose and annotations from one listed Project definition, so the two
+cannot come from separate Project reads. Charter contents do not cascade. An agent
 receives the rendered artifact through the existing first-turn delivery path;
 it does not need to read the ops repository. Latent handoffs use the admitted
 snapshot rather than a later charter revision. Brief artifact summaries carry
@@ -40,7 +52,11 @@ CrewDefaults may bind `spec.project_ref` to an ancestor Project. Its `roles`
 map uses the same partial role definition shape, `default_workflow_ref` supplies
 a workflow default, and `skills` supplies ordered imports/removals. At each
 Project, CrewDefaults applies before the Project's own fields. At most one
-CrewDefaults may bind each position. The wildcard skill list applies before the
+CrewDefaults may bind each applicable position. Runtime admission ignores
+CrewDefaults outside its resolved chain, including malformed bindings and
+sibling duplicates; the candidate pre-roll gate checks every binding and every
+Project, refusing missing owners and duplicate layers. An empty candidate with
+a FleetDesignation also refuses until its fleet Project is declared. The wildcard skill list applies before the
 named role list at every position; ancestor removals and descendant additions
 retain their named-layer provenance.
 
@@ -53,7 +69,10 @@ role: governor
 ---
 ```
 
-It selects the inherited `roles.governor.workflow`. Explicit `workflow`,
+It selects the inherited `roles.governor.workflow`. For a standing role, a
+role-specific workflow wins over the generic `default_workflow_ref` even when
+that role setting comes from a more distant ancestor; each is a separate field.
+Explicit ensure `workflow` still overrides both. Explicit `workflow`,
 `agents`, placement, driver, repository scope and presentation settings still
 work. Project-scoped workflow definitions can be found on ancestors, nearest
 first, without admitting a definition owned by an unrelated Project.
@@ -62,6 +81,10 @@ first, without admitting a definition owned by an unrelated Project.
 `flotilla convoy NAME explain` shows the frozen admission settings, skills and
 charter revision. Later edits do not rewrite an admitted convoy's explanation.
 Candidate skill validation uses the same parent-chain cascade as admission.
+Admission brief artifact identities use `(convoy, role, "brief", convoy)`.
+Agent roles must be unique across allocated vessels; admission refuses repeated
+roles before any brief write rather than allowing one vessel's body to replace
+another's. Handoffs use a separate unique subject.
 Bound-store authority, charter delegation, subscriptions, address books and
 superseding-charter messages belong to #2720, #2721 and #2722 respectively.
 
