@@ -10,6 +10,14 @@ use sha2::{Digest, Sha256};
 
 use crate::vcs::Vcs;
 
+/// Bound source I/O while namespace authoring is excluded. This applies to
+/// injected inspectors too, rather than relying on a particular VCS timeout.
+pub async fn source_read<T>(read: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+    tokio::time::timeout(std::time::Duration::from_secs(30), read)
+        .await
+        .map_err(|_| "charter source read exceeded 30 seconds".to_string())?
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CharterSnapshot {
     pub revision: String,
@@ -30,20 +38,29 @@ pub fn reconciliation_lock(identity: &str) -> Arc<tokio::sync::Mutex<()>> {
     lock
 }
 
+/// Fleet and legacy project writers share one exclusion during pointer cut-over.
+/// Release this guard before entering another charter-authoring operation.
+pub fn authoring_lock(namespace: &str) -> Arc<tokio::sync::Mutex<()>> {
+    reconciliation_lock(&format!("charter-authoring:{namespace}"))
+}
+
 /// The cache holds Git objects only. No checkout, reset, or fast-forward step
 /// occurs, and all blobs are read at one fetched commit.
 pub async fn read_charter_source(source: &CharterSource, cache: &Path, vcs: Option<&dyn Vcs>) -> Result<CharterSnapshot, String> {
     source.validate()?;
-    match source {
-        CharterSource::Repository { repo, branch, path } => {
-            let vcs = vcs.ok_or("charter VCS provider unavailable")?;
-            vcs.charter_snapshot(cache, repo, branch, path).await
+    source_read(async {
+        match source {
+            CharterSource::Repository { repo, branch, path } => {
+                let vcs = vcs.ok_or("charter VCS provider unavailable")?;
+                vcs.charter_snapshot(cache, repo, branch, path).await
+            }
+            CharterSource::LocalDirectory { directory } => {
+                let directory = PathBuf::from(directory);
+                tokio::task::spawn_blocking(move || local_snapshot(&directory)).await.map_err(|error| error.to_string())?
+            }
         }
-        CharterSource::LocalDirectory { directory } => {
-            let directory = PathBuf::from(directory);
-            tokio::task::spawn_blocking(move || local_snapshot(&directory)).await.map_err(|error| error.to_string())?
-        }
-    }
+    })
+    .await
 }
 
 pub fn is_charter_file(path: &Path) -> bool {
@@ -134,6 +151,17 @@ pub fn ops_root_name(project: &str, member: &flotilla_resources::ProjectReposito
 
 #[cfg(test)]
 mod tests {
+    // #2777 review: a hung source must relinquish namespace authoring rather
+    // than block unrelated Projects indefinitely.
+    #[tokio::test(start_paused = true)]
+    async fn source_read_deadline_releases_authoring_lock() {
+        let lock = super::authoring_lock("deadline-test");
+        let guard = lock.lock().await;
+        let error = super::source_read(std::future::pending::<Result<(), String>>()).await.expect_err("deadline");
+        assert!(error.contains("30 seconds"));
+        drop(guard);
+        assert!(lock.try_lock().is_ok());
+    }
     use hegel::generators as gs;
 
     use super::*;

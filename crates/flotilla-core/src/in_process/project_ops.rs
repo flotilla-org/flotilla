@@ -76,6 +76,7 @@ fn normalize_project_name(name: &str) -> Result<String, String> {
 
 fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: String) -> Result<ProjectSpec, String> {
     normalize_project_spec(ProjectSpec {
+        charter: None,
         parent: None,
         platform_matrix: Vec::new(),
         display_name,
@@ -401,6 +402,8 @@ impl ProjectService<'_> {
         validate_project_name(&declaration.name)?;
         inspection.repository.spec = self.operations.resolve_forge_identity(inspection.repository.spec).await?;
         let namespace = self.provisioning_namespace();
+        let authoring_lock = crate::charter_store::authoring_lock(&namespace);
+        let authoring_guard = authoring_lock.lock().await;
         let projects = self.resource_backend.clone().definitions::<Project>(&namespace);
         let repositories = self.resource_backend.clone().using::<Repository>(&namespace);
         let existing_project = match projects.get(&declaration.name).await {
@@ -408,6 +411,10 @@ impl ProjectService<'_> {
             Err(ResourceError::NotFound { .. }) => None,
             Err(error) => return Err(error.to_string()),
         };
+        if existing_project.as_ref().is_some_and(|project| project.spec.charter.is_some()) {
+            debug!(project = %declaration.name, "leaving registered charter authoritative during legacy bootstrap refresh");
+            return Ok((Vec::new(), vec!["project managed by registered charter".into()]));
+        }
         let locally_homed = match self.resource_backend.clone().using::<Project>(&namespace).get(&declaration.name).await {
             Ok(_) => true,
             Err(ResourceError::NotFound { .. }) => false,
@@ -491,6 +498,7 @@ impl ProjectService<'_> {
             });
         }
         let spec = normalize_project_spec(ProjectSpec {
+            charter: None,
             parent: declaration.parent.clone(),
             display_name: declaration.name.clone(),
             default_workflow_ref: declaration.default_workflow.unwrap_or_else(|| "single-agent".to_string()),
@@ -518,6 +526,7 @@ impl ProjectService<'_> {
             .await
             .map_err(|error| error.to_string())?;
         let mut changes = if converged { vec![format!("Project/{}", declaration.name)] } else { Vec::new() };
+        drop(authoring_guard);
         let (operational_changes, operational_entries) = match self
             .materialize_project_operational_entries(&declaration.name, Some(&bootstrap_inspection))
             .await
@@ -552,6 +561,7 @@ impl ProjectService<'_> {
         let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
         let desired = projects
             .iter()
+            .filter(|project| project.spec.charter.is_none())
             .flat_map(|project| {
                 project.spec.repositories.iter().filter_map(|member| {
                     member
@@ -573,6 +583,17 @@ impl ProjectService<'_> {
             }
         }
         for project in projects {
+            if project.spec.charter.is_some() {
+                self.patch_project_operational_entries(
+                    &namespace,
+                    &project.metadata.name,
+                    true,
+                    None,
+                    "operational entries managed by registered charter",
+                )
+                .await?;
+                continue;
+            }
             if !project
                 .spec
                 .repositories
@@ -615,10 +636,15 @@ impl ProjectService<'_> {
     ) -> Result<(Vec<String>, Vec<String>), String> {
         use flotilla_resources::{CharterSource, ManifestRoot, ManifestRootSpec};
         let namespace = self.provisioning_namespace();
-        let lock = crate::charter_store::reconciliation_lock(&format!("ops:{}/{namespace}/{project_name}", self.repository_index.host));
+        let lock = crate::charter_store::authoring_lock(&namespace);
         let _guard = lock.lock().await;
         let project =
             self.resource_backend.definitions::<Project>(&namespace).get(project_name).await.map_err(|error| error.to_string())?;
+        if project.spec.charter.is_some() {
+            // Registration delegates reconciliation to the fleet store. Do not
+            // continue authoring or pruning through previous ops member bindings.
+            return Ok((Vec::new(), vec!["operational entries managed by registered charter".into()]));
+        }
         let roots = self.resource_backend.using::<ManifestRoot>(&namespace);
         let mut names = Vec::new();
         for member in &project.spec.repositories {
@@ -721,7 +747,7 @@ impl ProjectService<'_> {
                     unavailable_source = true;
                     continue;
                 }
-                let snapshot = inspector.charter_snapshot(&binding.source).await?;
+                let snapshot = crate::charter_store::source_read(inspector.charter_snapshot(&binding.source)).await?;
                 let spec = self
                     .resource_backend
                     .including_replicas::<Repository>(&namespace)
@@ -780,7 +806,8 @@ impl ProjectService<'_> {
                     .spec;
                 RepositoryInspection { spec, checkout, transport_url: None, replaces_prior_repository: false }
             };
-            let (mut commit, files) = inspector.operational_entry_files_at(&repository.checkout.path).await?;
+            let (mut commit, files) =
+                crate::charter_store::source_read(inspector.operational_entry_files_at(&repository.checkout.path)).await?;
             if let Some(bootstrap) = bootstrap.filter(|bootstrap| member.repo == bootstrap.repository.key()) {
                 commit.clone_from(&bootstrap.commit);
             }
@@ -1695,7 +1722,23 @@ mod tests {
             assert_eq!(refused.applied_revision, status.applied_revision);
             assert!(refused.source_error.expect("missing source reason").contains("no local checkout"));
             assert_eq!(workflows.get("app--review").await.expect("retained workflow").spec.vessels[0].name, "second");
+            // #2721: declaring a registration pointer retires old-source health
+            // and stops its reads/pruning while preserving materialized records.
             spec.repositories.pop();
+            spec.charter = Some(flotilla_resources::CharterPointer::Inline { documents: Vec::new(), files: BTreeMap::new() });
+            projects.apply(&InputMeta::from(&project.metadata), &spec).await.expect("declare pointer");
+            service.reconcile_bound_charters().await.expect("registered charter supersedes legacy ops");
+            assert!(matches!(roots.get(&root_name).await, Err(ResourceError::NotFound { .. })));
+            let registered = projects.get("app").await.expect("registered Project");
+            if local {
+                assert!(registered.status.is_none(), "replicated Project status remains owned by the fleet home");
+            } else {
+                let status = registered.status.expect("Project status");
+                assert!(status.declaration_refused.is_none());
+                assert!(status.operational_entries.expect("operational health").ready);
+            }
+            assert_eq!(workflows.get("app--review").await.expect("charter transition retains workflow").spec.vessels[0].name, "second");
+            spec.charter = None;
             spec.repositories[0].charter_store = None;
             projects.apply(&InputMeta::from(&project.metadata), &spec).await.expect("remove binding");
             service.reconcile_bound_charters().await.expect("retire source");
@@ -1742,10 +1785,20 @@ mod tests {
             operations: &operations,
         };
 
-        assert_eq!(
-            service.project_register(temp.path().to_str().expect("UTF-8 checkout path")).await.expect("register"),
-            ("app".into(), 1)
-        );
+        // #2777 review: exercise bootstrap's handoff to ops materialization
+        // while the fleet writer's namespace critical section contends. A
+        // retained non-reentrant guard must fail this deadline, not hang CI.
+        let fleet_lock = crate::charter_store::authoring_lock("flotilla");
+        let fleet_guard = fleet_lock.lock().await;
+        let (registration, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(service.project_register(temp.path().to_str().expect("UTF-8 checkout path")), async {
+                tokio::task::yield_now().await;
+                drop(fleet_guard);
+            })
+        })
+        .await
+        .expect("bootstrap and fleet authoring must not deadlock");
+        assert_eq!(registration.expect("register"), ("app".into(), 1));
         assert_eq!(operations.identity_resolutions.load(Ordering::SeqCst), 1);
         let project = backend.definitions::<Project>("flotilla").get("app").await.expect("registered project");
         assert_eq!(project.spec.repositories[0].repo, repository_spec.key());

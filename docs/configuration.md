@@ -419,6 +419,11 @@ project-map and ops configurations when rolling this change; the new reader
 then removes the manual working-tree update step. Omit `[manifests]` to disable
 the fleet store.
 
+See [bounded charter registration and additive rollout](charter-delegation.md)
+for optional Project charter pointers, scope refusals, inline inputs and the
+post-roll fleet-ops/project-map/wheelhouse companion sequence. Existing stores
+and local placement policies can remain unchanged while this support rolls.
+
 ## Credential grant permissions
 
 For each credential on a vessel, matching `CredentialGrant` resources must all

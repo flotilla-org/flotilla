@@ -67,3 +67,41 @@ mod tests {
         }
     }
 }
+
+/// Opt-in registration pointer. Inline inputs travel with their registration;
+/// repository inputs are fetched at one immutable branch head on the fleet home.
+/// Contents use ordinary resource documents or existing ops Markdown entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CharterPointer {
+    Inline {
+        #[serde(default)]
+        documents: Vec<serde_json::Value>,
+        #[serde(default)]
+        files: std::collections::BTreeMap<String, String>,
+    },
+    Repository {
+        repo: String,
+        branch: String,
+        #[serde(default)]
+        path: String,
+    },
+}
+
+impl CharterPointer {
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Repository { repo, branch, path } => {
+                CharterSource::Repository { repo: repo.clone(), branch: branch.clone(), path: path.clone() }.validate()
+            }
+            Self::Inline { files, .. } => {
+                for path in files.keys() {
+                    if path.is_empty() || Path::new(path).components().any(|part| !matches!(part, Component::Normal(_))) {
+                        return Err("inline charter file path must stay within the charter".into());
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}

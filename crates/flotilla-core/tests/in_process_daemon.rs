@@ -923,6 +923,7 @@ async fn resource_list_and_get_queries_return_wire_json() {
         .resource_backend()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("missing-repository".to_string()).build(), &ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -1930,6 +1931,7 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -2011,6 +2013,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("zellij".to_string()).build(), &ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -2146,6 +2149,7 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -3208,6 +3212,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -3339,6 +3344,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -3472,6 +3478,7 @@ async fn convoy_start_accepts_project_list_identifier() {
         .clone()
         .definitions::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -3628,6 +3635,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -3959,6 +3967,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("explicit-workflow".to_string()).build(), &ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -4154,6 +4163,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
         .clone()
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -6082,6 +6092,7 @@ async fn tracking_does_not_materialize_when_project_name_is_occupied() {
     let projects = daemon.resource_backend().using::<Project>("flotilla");
     projects
         .create(&InputMeta::builder().name("repo".to_string()).build(), &ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -6336,6 +6347,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     let projects = daemon.resource_backend().definitions::<Project>("flotilla");
     projects
         .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -6581,6 +6593,7 @@ async fn forge_identity_sweep_reports_conflicting_aliases_before_changing_reposi
         .resource_backend()
         .definitions::<Project>("flotilla")
         .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),

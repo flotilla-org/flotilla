@@ -477,6 +477,7 @@ mod tests {
             .clone()
             .using::<Project>(NAMESPACE)
             .create(&InputMeta::builder().name("widgets".to_string()).build(), &ProjectSpec {
+                charter: None,
                 parent: None,
                 platform_matrix: Vec::new(),
                 role_needs: Default::default(),
