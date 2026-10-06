@@ -344,13 +344,18 @@ the repo. (ADR 0034.)
 _Avoid_: Audit (that is the future independent completeness check),
 decision log (too close to ADR), changelog.
 
+**Terminal Pool**:
+The provider of persistent terminals that survive viewer disconnection. Cleat
+provides persistence; passthrough runs commands directly when persistence is
+unavailable.
+
 **Independent**:
 A terminal session with no **Convoy** association — sailing alone, per the
 convoy-era term. Adopted attachables, persistent agents, loose work sessions.
 Appears in the `independents` query and nowhere else; joining a Convoy removes
 it there (convoy-bound sessions surface on vessel rows instead), so nothing is
 ever double-listed.
-_Avoid_: Session (maximally overloaded — cloud agents, cleat, tmux, zellij all
+_Avoid_: Session (maximally overloaded — cloud agents, cleat, zellij all
 claim it), free-floating session, loose session. Do not use for ensure-declared
 services — that is a **Standing Convoy**.
 

@@ -1,7 +1,7 @@
 # --- Install Rust tools via cargo-binstall ---
 FROM rust:slim-bookworm AS cargo-installer
 RUN cargo install cargo-binstall
-RUN cargo binstall --no-confirm zellij shpool
+RUN cargo binstall --no-confirm zellij
 
 # --- Install Node tools ---
 FROM node:20-slim AS npm-installer
@@ -10,9 +10,8 @@ RUN npm install -g @anthropic-ai/claude-code
 # --- Runtime: layer on flotilla-base ---
 FROM flotilla-base
 
-# tmux + gh dependencies via apt
+# gh dependencies via apt
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tmux \
     curl \
     gnupg \
     && rm -rf /var/lib/apt/lists/*
@@ -31,6 +30,5 @@ COPY --from=npm-installer /usr/local/lib/node_modules /usr/local/lib/node_module
 COPY --from=npm-installer /usr/local/bin/node /usr/local/bin/node
 RUN ln -s ../lib/node_modules/@anthropic-ai/claude-code/cli.js /usr/local/bin/claude
 
-# zellij + shpool from cargo-installer stage
+# zellij from cargo-installer stage
 COPY --from=cargo-installer /usr/local/cargo/bin/zellij /usr/local/bin/zellij
-COPY --from=cargo-installer /usr/local/cargo/bin/shpool /usr/local/bin/shpool

@@ -34,9 +34,6 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Terminal session managers
-RUN cargo install shpool@0.9.5 --locked
-
 # --- Agent CLIs ---
 # Claude and Cursor use curl|bash installers that aren't version-pinned.
 # Neither offers versioned install URLs yet — rebuilds may pick up new versions.

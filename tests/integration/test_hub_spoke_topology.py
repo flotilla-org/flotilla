@@ -1,7 +1,7 @@
 """Three-node hub-spoke topology coverage for the compose harness.
 
 The workstation peers directly with two heterogeneous followers:
-homelab-1 has codex and shpool, while homelab-2 has gemini and uses the
+homelab-1 has codex, while homelab-2 has gemini and uses the
 passthrough terminal pool. Commands run through the real CLI/daemon/SSH
 boundary and assertions use the current JSON protocol.
 """
@@ -13,6 +13,7 @@ import pytest
 
 from conftest import (
     compose,
+    create_headless_checkout,
     daemon_log,
     docker_exec,
     flotilla_json,
@@ -185,10 +186,6 @@ def hub_spoke_topology():
             )
 
         for node in NODES:
-            result = hub_exec(node, "tmux new-session -d -s integration")
-            assert result.returncode == 0, (
-                f"tmux start failed on {node}: {result.stderr}"
-            )
             hub_start_daemon(node)
 
         def daemon_ready(node):
@@ -272,9 +269,7 @@ def test_provider_heterogeneity(hub_spoke_topology):
         binary["name"] for binary in homelab_2["summary"]["inventory"]["binaries"]
     }
     assert "codex" in binaries_1
-    assert "shpool" in binaries_1
     assert "codex" not in binaries_2
-    assert "shpool" not in binaries_2
     assert binaries_1 != binaries_2
 
     gemini = hub_exec("homelab-2", "command -v gemini")
@@ -283,64 +278,15 @@ def test_provider_heterogeneity(hub_spoke_topology):
     assert no_gemini.returncode != 0
 
 
-def test_shpool_attachable_set_survives_daemon_restart(
-    hub_spoke_topology,
-):
-    """A shpool-backed terminal keeps its durable set across restart."""
-    checkout = hub_json(
-        "homelab-1",
-        f"repo {hub_spoke_topology['homelab-1']} checkout --fresh feat-shpool-persist",
-    )
-    assert checkout["kind"] == "checkout_created"
-    checkout_path = checkout["path"]["path"]
-    # The executor plans in the coordinator context before dispatching the remote step.
-    # #2500 owns retiring this bridge, as in test_minimal_topology.
-    planning_repository_key = hub_spoke_topology["workstation"]
-    prepared = hub_json(
-        "workstation",
-        f"host homelab-1 repo {planning_repository_key} prepare-terminal {checkout_path}",
-        timeout=60,
-    )
-    assert prepared["kind"] == "terminal_prepared"
-    assert prepared["attachable_set_id"]
-
-    assert any(
-        arg.get("value", "").startswith("shpool ")
-        for command in prepared["commands"]
-        for arg in command["args"]
-    )
-
-    def attachable_registry():
-        registry = hub_exec(
-            "homelab-1",
-            "cat ~/.config/flotilla/attachables/registry.json",
-        )
-        assert registry.returncode == 0, registry.stderr
-        return json.loads(registry.stdout)
-
-    attachable_set_id = prepared["attachable_set_id"]
-    assert attachable_set_id in attachable_registry()["sets"]
-
-    hub_stop_daemon("homelab-1")
-    hub_start_daemon("homelab-1")
-    wait_for(
-        lambda: hub_exec("homelab-1", "flotilla status --json").returncode == 0,
-        "homelab-1 daemon restarted",
-        timeout=30,
-        interval=0.5,
-    )
-    wait_for_follower("homelab-1")
-    assert attachable_set_id in attachable_registry()["sets"]
-
-
-def test_terminal_without_shpool_uses_passthrough(hub_spoke_topology):
-    """The follower without shpool returns executable fallback commands."""
-    checkout = hub_json(
+def test_terminal_without_persistent_pool_uses_passthrough(hub_spoke_topology):
+    """The follower without a persistent pool returns executable fallback commands."""
+    checkout_path = create_headless_checkout(
         "homelab-2",
-        f"repo {hub_spoke_topology['homelab-2']} checkout --fresh feat-no-shpool",
+        REPO_PATH,
+        hub_spoke_topology["homelab-2"],
+        "feat-passthrough",
+        compose_file=HUB_SPOKE_COMPOSE,
     )
-    assert checkout["kind"] == "checkout_created"
-    checkout_path = checkout["path"]["path"]
     # The executor plans in the coordinator context before dispatching the remote step.
     # #2500 owns retiring this bridge, as in test_minimal_topology.
     planning_repository_key = hub_spoke_topology["workstation"]
@@ -352,21 +298,18 @@ def test_terminal_without_shpool_uses_passthrough(hub_spoke_topology):
     assert prepared["kind"] == "terminal_prepared"
     assert prepared["attachable_set_id"]
     assert prepared["commands"]
-    assert all(
-        "shpool" not in arg.get("value", "")
-        for command in prepared["commands"]
-        for arg in command["args"]
-    )
+
 
 
 def test_reprepare_reuses_attachable_identity(hub_spoke_topology):
     """Repeated preparation keeps the checkout's attachable-set identity."""
-    checkout = hub_json(
+    checkout_path = create_headless_checkout(
         "homelab-1",
-        f"repo {hub_spoke_topology['homelab-1']} checkout --fresh feat-workspace-reprepare",
+        REPO_PATH,
+        hub_spoke_topology["homelab-1"],
+        "feat-workspace-reprepare",
+        compose_file=HUB_SPOKE_COMPOSE,
     )
-    assert checkout["kind"] == "checkout_created"
-    checkout_path = checkout["path"]["path"]
     # #2500 owns the coordinator-local planning context for remote terminal steps.
     planning_repository_key = hub_spoke_topology["workstation"]
     command = (

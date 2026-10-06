@@ -2,9 +2,9 @@
 //!
 //! Two factories implement the old priority chain:
 //! - `CmuxInsideFactory` — requires `CMUX_SOCKET_PATH` env var, proving we're
-//!   running inside cmux. Registered before zellij/tmux so it wins when active.
+//!   running inside cmux. Registered before zellij so it wins when active.
 //! - `CmuxBinaryFallbackFactory` — requires only the cmux binary. Registered
-//!   *after* zellij/tmux so env-var-detected multiplexers take priority.
+//!   *after* zellij so env-var-detected multiplexers take priority.
 
 use std::sync::Arc;
 
@@ -52,7 +52,7 @@ impl Factory for CmuxInsideFactory {
 }
 
 /// Matches when the cmux binary is available but we're not necessarily inside
-/// cmux. Registered after zellij/tmux so they win when their env var is set.
+/// cmux. Registered after zellij so they win when their env var is set.
 pub struct CmuxBinaryFallbackFactory;
 
 #[async_trait]

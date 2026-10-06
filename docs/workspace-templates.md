@@ -47,7 +47,7 @@ layout:
 
 ## Terminal Pool Integration
 
-When a terminal pool (e.g. shpool) is available, content entries are resolved through it. Each role becomes a persistent terminal session that survives workspace disconnects. The session name follows the pattern `flotilla/{branch}/{role}/{index}`.
+When the cleat terminal pool is available, content entries are resolved through it. Each role becomes a persistent terminal session that survives workspace disconnects. The session name follows the pattern `flotilla/{branch}/{role}/{index}`.
 
 ## Default
 

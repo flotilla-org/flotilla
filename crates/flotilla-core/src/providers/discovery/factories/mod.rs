@@ -7,41 +7,16 @@ pub mod docker;
 pub mod git;
 pub mod github;
 pub mod passthrough;
-pub mod shpool;
-pub mod tmux;
 pub mod zellij;
 
-use super::{EnvironmentBag, FactoryRegistry};
-use crate::providers::terminal::TerminalEnvVars;
-
-/// Extract TERM/COLORTERM defaults from discovery for shpool session creation.
-/// When the daemon runs without a TTY (e.g. remote SSH), these provide fallback values
-/// so sessions get color support. Uses xterm-256color as the safe universal default.
-pub(super) fn terminal_env_defaults_from_bag(env: &EnvironmentBag) -> TerminalEnvVars {
-    let mut defaults = Vec::new();
-    let term = env.find_env_var("TERM").unwrap_or("xterm-256color");
-    defaults.push(("TERM".to_string(), term.to_string()));
-    if let Some(colorterm) = env.find_env_var("COLORTERM") {
-        defaults.push(("COLORTERM".to_string(), colorterm.to_string()));
-    }
-    defaults
-}
+use super::FactoryRegistry;
 
 fn presentation_factories() -> Vec<Box<super::PresentationManagerFactory>> {
-    vec![
-        Box::new(cmux::CmuxInsideFactory),
-        Box::new(zellij::ZellijPresentationManagerFactory),
-        Box::new(tmux::TmuxPresentationManagerFactory),
-        Box::new(cmux::CmuxBinaryFallbackFactory),
-    ]
+    vec![Box::new(cmux::CmuxInsideFactory), Box::new(zellij::ZellijPresentationManagerFactory), Box::new(cmux::CmuxBinaryFallbackFactory)]
 }
 
 fn terminal_pool_factories() -> Vec<Box<super::TerminalPoolFactory>> {
-    vec![
-        Box::new(cleat::CleatTerminalPoolFactory),
-        Box::new(shpool::ShpoolTerminalPoolFactory),
-        Box::new(passthrough::PassthroughTerminalPoolFactory),
-    ]
+    vec![Box::new(cleat::CleatTerminalPoolFactory), Box::new(passthrough::PassthroughTerminalPoolFactory)]
 }
 
 fn vcs_factories() -> Vec<Box<super::VcsFactory>> {
@@ -60,7 +35,7 @@ impl FactoryRegistry {
                 Box::new(codex::CodexCodingAgentFactory),
             ],
             ai_utilities: vec![Box::new(claude::ClaudeApiAiUtilityFactory), Box::new(claude::ClaudeCliAiUtilityFactory)],
-            // Priority: inside-cmux > inside-zellij > inside-tmux > cmux-binary-fallback
+            // Priority: inside-cmux > inside-zellij > cmux-binary-fallback
             presentation_managers: presentation_factories(),
             terminal_pools: terminal_pool_factories(),
             environment_providers: vec![Box::new(docker::DockerEnvironmentFactory)],

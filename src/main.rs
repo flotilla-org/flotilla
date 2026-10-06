@@ -1,5 +1,4 @@
 use std::{
-    future::Future,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
     time::Duration,
@@ -1112,17 +1111,6 @@ async fn startup_repo_roots(cli_roots: &[PathBuf]) -> Vec<PathBuf> {
     select_startup_repo_roots(cli_roots, cwd_repo_root)
 }
 
-async fn show_startup_splash<F, Fut>(scoped_view: Option<&flotilla_protocol::ViewAddress>, show_splash: F) -> Result<()>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Result<()>>,
-{
-    if scoped_view.is_none() {
-        show_splash().await?;
-    }
-    Ok(())
-}
-
 fn default_project_landing(
     repos: &[RepoInfo],
     startup_repo_roots: &[PathBuf],
@@ -1155,21 +1143,13 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
     let resolved_config_dir = paths.config_dir;
     let config = Arc::new(ConfigStore::new(DaemonHostPath::new(&resolved_config_dir), resolved_state_dir.clone()));
 
-    // Initialize the terminal immediately. Full-app mode shows the splash for
-    // fast visual feedback; scoped mode opens directly into its target view.
-    let mut terminal = ratatui::init();
-    flotilla_tui::terminal::install_panic_hook();
-    #[cfg(unix)]
-    flotilla_tui::terminal::install_sigterm_handler();
-
     let startup_repo_roots = startup_repo_roots(&cli.repo_root).await;
     let cli_theme = cli.theme.clone();
     let socket_path = paths.socket_path;
     let require_host_daemon =
         host_daemon_socket_required(std::env::var_os(flotilla_core::providers::environment::CONTAINED_DAEMON_REQUIRED_ENV).as_deref());
 
-    // Spawn daemon init on a separate task so full-app startup can run it
-    // concurrently with the splash (which uses blocking event polling).
+    // Connect to the daemon concurrently with terminal initialization.
     let daemon_log_path =
         resolved_state_dir.as_path().join(flotilla_core::log_file::DAEMON_LOG_DIRECTORY).join(flotilla_core::log_file::DAEMON_LOG_FILE);
     let daemon_panic_log_path = resolved_config_dir.join("daemon-panic.log");
@@ -1190,7 +1170,10 @@ async fn run_tui(cli: Cli, scoped_view: Option<flotilla_protocol::ViewAddress>) 
         .map(|d| d as Arc<dyn DaemonHandle>)
     });
 
-    show_startup_splash(scoped_view.as_ref(), || flotilla_tui::splash::show_splash(&mut terminal)).await?;
+    let mut terminal = ratatui::init();
+    flotilla_tui::terminal::install_panic_hook();
+    #[cfg(unix)]
+    flotilla_tui::terminal::install_sigterm_handler();
     let daemon = match daemon_task.await {
         Ok(Ok(daemon)) => {
             std::env::remove_var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV);
@@ -3151,11 +3134,10 @@ mod tests {
         attach_mode, cli_surface_from, client_dirs_from, confirm_command, daemon_paths_from, default_project_landing,
         host_daemon_socket_required, incompatible_daemon_reexec_failure, install_codex_hook, provisioning_target_for_environment,
         remote_daemon_from, resolve_pm_flotilla_bin, select_host_target, select_startup_repo_roots, should_exec_convoy_attach,
-        should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, topology_output_format, uninstall_codex_hook,
-        ArtifactSubCommand, AttachArgs, Cli, CliPaths, CommandValue, DaemonArgs, DaemonSubCommand, DevModeSubCommand, DomainCommand,
-        EventsArgs, LogsArgs, LsArgs, PmSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs,
-        ResourceManifestResolutionArgs, ResourceReconcileNowArgs, ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs,
-        SubCommand, TopologyArgs, WaitArgs,
+        should_reexec_for_incompatible_daemon, socket_path_from, topology_output_format, uninstall_codex_hook, ArtifactSubCommand,
+        AttachArgs, Cli, CliPaths, CommandValue, DaemonArgs, DaemonSubCommand, DevModeSubCommand, DomainCommand, EventsArgs, LogsArgs,
+        LsArgs, PmSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs,
+        ResourceReconcileNowArgs, ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand, TopologyArgs, WaitArgs,
     };
 
     // CLI endpoint selection must choose a viewer SSH hop only for remote
@@ -3586,31 +3568,6 @@ mod tests {
         let roots = select_startup_repo_roots(&[], Some(PathBuf::from("/repos/current")));
 
         assert_eq!(roots, vec![PathBuf::from("/repos/current")]);
-    }
-
-    #[tokio::test]
-    async fn scoped_tui_skips_splash_while_full_tui_shows_it() {
-        use std::cell::Cell;
-
-        let scoped_view = "convoys/flotilla".parse().expect("valid scoped view");
-        let scoped_splash_shown = Cell::new(false);
-        show_startup_splash(Some(&scoped_view), || async {
-            scoped_splash_shown.set(true);
-            Ok(())
-        })
-        .await
-        .expect("scoped startup");
-
-        let full_splash_shown = Cell::new(false);
-        show_startup_splash(None, || async {
-            full_splash_shown.set(true);
-            Ok(())
-        })
-        .await
-        .expect("full startup");
-
-        assert!(!scoped_splash_shown.get());
-        assert!(full_splash_shown.get());
     }
 
     #[test]

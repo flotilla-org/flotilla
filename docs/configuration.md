@@ -107,7 +107,7 @@ agentless_ssh = true
 ```
 
 The `user` is the SSH login account and the account in which the crew runs.
-The remote account needs a writable `HOME`, Git, and either `cleat` or `shpool`
+The remote account needs a writable `HOME`, Git, and `cleat`
 plus the selected agent adapter. SSH access must work in batch mode. The
 owning daemon probes the host, publishes its stable Host identity and a
 `host-direct-<host-id>` PlacementPolicy, and provisions the checkout and

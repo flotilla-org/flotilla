@@ -59,7 +59,7 @@ Provider detection is environment-first. The pipeline runs in a fixed order:
    PATH or at `~/.claude/local/claude`.
 5. **Workspace manager**: detected from environment variables that prove the
    process is running inside a terminal multiplexer, in priority order:
-   `CMUX_SOCKET_PATH` > `ZELLIJ` (requires >= 0.40) > `TMUX`. If no env var
+   `CMUX_SOCKET_PATH` > `ZELLIJ` (requires >= 0.40). If no env var
    matches, a cmux binary-existence check is tried as a fallback.
 
 Each step degrades gracefully — missing binaries or failed probes skip the

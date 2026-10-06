@@ -27,7 +27,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-server \
     openssh-client \
     git \
-    tmux \
     ca-certificates \
     libssl3t64 \
     gosu \

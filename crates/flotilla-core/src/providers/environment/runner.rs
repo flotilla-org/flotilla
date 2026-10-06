@@ -368,7 +368,7 @@ mod tests {
             Arc::new(MockRunner::new(vec![Ok("/remote/state/flotilla/helpers/helper-hash/flotilla-helper\n".into()), Ok(String::new())]));
         let runner = DockerEnvironmentRunner::new("my-container".into(), inner.clone());
 
-        let content = runner.ensure_file(Path::new("/app/config/shpool.toml"), "key = true\n").await.expect("ensure_file");
+        let content = runner.ensure_file(Path::new("/app/config/cleat.toml"), "key = true\n").await.expect("ensure_file");
         assert_eq!(content, String::new());
 
         let calls = inner.calls();
@@ -395,7 +395,7 @@ mod tests {
         let script = args.get(4).expect("docker helper script");
         assert!(script.contains("PATH='/remote/state/flotilla/helpers/helper-hash':\"$PATH\""));
         assert!(script.contains("exec 'flotilla-helper' 'ensure-file-if-absent'"));
-        assert!(script.contains("'/app/config/shpool.toml'"));
+        assert!(script.contains("'/app/config/cleat.toml'"));
         assert!(script.contains("'key = true\n'"));
     }
 
