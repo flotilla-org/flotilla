@@ -1768,19 +1768,30 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
             }
             assert_eq!(checked.delivered_message_id.is_some(), elapsed >= 5);
         }
-        for baseline in [None, Some("old"), Some("new")] {
-            let mut output = flagged.clone();
-            output.status.as_mut().expect("status").last_output_digest = baseline.map(str::to_string);
-            let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
-                output_digest: Some("new".into()),
-                attention: None,
-                occupancy: TerminalOccupancy::Vacant,
-            });
-            let mut checked = output.status.clone().expect("status");
-            if let Some(patch) = reconciler.reconcile(&output, &prepared, held_at + chrono::Duration::seconds(2)).patch {
-                patch.apply(&mut checked);
+        // Idle redraws and unknown attention cannot prove consumption, even
+        // with changed output. Fresh Working plus a known changed baseline can.
+        for state in [None, Some(TerminalAttentionState::Idle), Some(TerminalAttentionState::Working)] {
+            for baseline in [None, Some("old"), Some("new")] {
+                let mut output = flagged.clone();
+                output.status.as_mut().expect("status").last_output_digest = baseline.map(str::to_string);
+                let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                    output_digest: Some("new".into()),
+                    attention: state.map(|state| TerminalAttention {
+                        state,
+                        source: TerminalAttentionSource::Screen,
+                        as_of: held_at + chrono::Duration::seconds(2),
+                    }),
+                    occupancy: TerminalOccupancy::Vacant,
+                });
+                let mut checked = output.status.clone().expect("status");
+                if let Some(patch) = reconciler.reconcile(&output, &prepared, held_at + chrono::Duration::seconds(2)).patch {
+                    patch.apply(&mut checked);
+                }
+                assert_eq!(
+                    checked.delivered_message_id.is_some(),
+                    baseline == Some("old") && state == Some(TerminalAttentionState::Working)
+                );
             }
-            assert_eq!(checked.delivered_message_id.is_some(), baseline == Some("old"));
         }
         for elapsed in [299, 300, 301] {
             let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryPending;

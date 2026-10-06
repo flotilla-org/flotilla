@@ -419,20 +419,6 @@ where
             condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
                 && Utc::now().signed_duration_since(condition.observed_at) >= DELIVERY_HOLD_FOR
         });
-        // An unavailable observer cannot keep an unresolved hold alive forever.
-        // Before its deadline retain the ordinary provider-error retry policy.
-        macro_rules! observe {
-            ($future:expr) => {
-                match $future.await {
-                    Ok(value) => value,
-                    Err(error) if hold_overdue => {
-                        tracing::warn!(%error, session = %obj.metadata.name, "delivery confirmation deadline elapsed while observer unavailable");
-                        return Ok(TerminalPrepared::MessageDeliveryPending);
-                    }
-                    Err(error) => return Err(ResourceError::other(error)),
-                }
-            };
-        }
         if retirement_pending(obj) {
             let status = obj.status.as_ref().expect("retirement requires status");
             let mut retired = true;
@@ -457,9 +443,16 @@ where
             && matches!(obj.spec.source, TerminalSessionSource::Agent { .. })
         {
             if let Some(crew) = obj.status.as_ref().and_then(|status| status.crew.as_ref()) {
-                if let Some(code) = observe!(self.runtime.agent_exit_code(&obj.spec, crew)) {
+                let Some(exit_code) = held_observation(self.runtime.agent_exit_code(&obj.spec, crew).await, hold_overdue)? else {
+                    return Ok(TerminalPrepared::MessageDeliveryPending);
+                };
+                if let Some(code) = exit_code {
                     let session_id = obj.status.as_ref().and_then(|status| status.session_id.as_deref()).unwrap_or_default();
-                    if let Some(message) = observe!(self.runtime.agent_exit_failure(session_id, &obj.spec, code)) {
+                    let Some(failure) = held_observation(self.runtime.agent_exit_failure(session_id, &obj.spec, code).await, hold_overdue)?
+                    else {
+                        return Ok(TerminalPrepared::MessageDeliveryPending);
+                    };
+                    if let Some(message) = failure {
                         return Ok(TerminalPrepared::Failed(message));
                     }
                     if phase == TerminalSessionPhase::Running {
@@ -474,14 +467,20 @@ where
                 .as_ref()
                 .and_then(|status| status.session_id.as_deref())
                 .ok_or_else(|| ResourceError::other("running terminal session has no session id"))?;
-            match observe!(self.runtime.session_liveness(session_id, &obj.spec)) {
+            let Some(liveness) = held_observation(self.runtime.session_liveness(session_id, &obj.spec).await, hold_overdue)? else {
+                return Ok(TerminalPrepared::MessageDeliveryPending);
+            };
+            match liveness {
                 TerminalLiveness::Running => {}
                 TerminalLiveness::Stopped => return Ok(TerminalPrepared::Stopped),
                 TerminalLiveness::Lost(reason) => return Ok(TerminalPrepared::Lost(reason)),
                 TerminalLiveness::Unavailable(_) if hold_overdue => return Ok(TerminalPrepared::MessageDeliveryPending),
                 TerminalLiveness::Unavailable(message) => return Err(ResourceError::other(message)),
             }
-            if let Some(message) = observe!(self.runtime.observe_failure(session_id, &obj.spec)) {
+            let Some(failure) = held_observation(self.runtime.observe_failure(session_id, &obj.spec).await, hold_overdue)? else {
+                return Ok(TerminalPrepared::MessageDeliveryPending);
+            };
+            if let Some(message) = failure {
                 return Ok(TerminalPrepared::Failed(message));
             }
             if let flotilla_resources::TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
@@ -1002,6 +1001,19 @@ where
     }
 }
 
+// Once overdue, observer errors must yield to durable expiry. Before then,
+// preserve ordinary provider-error retries. Callers keep terminal evidence first.
+fn held_observation<T>(result: Result<T, String>, hold_overdue: bool) -> Result<Option<T>, ResourceError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if hold_overdue => {
+            tracing::warn!(%error, "delivery confirmation deadline elapsed while observer unavailable");
+            Ok(None)
+        }
+        Err(error) => Err(ResourceError::other(error)),
+    }
+}
+
 fn held_delivery_consumed(
     status: &flotilla_resources::TerminalSessionStatus,
     prepared: &TerminalPrepared,
@@ -1032,7 +1044,9 @@ fn held_delivery_consumed(
         .output_digest
         .as_ref()
         .is_some_and(|digest| status.last_output_digest.as_ref().is_some_and(|previous| previous != digest));
-    observed_working || changed_output
+    // A digest also changes on idle prompt/status redraws. Only combine it
+    // with fresh Working evidence; otherwise wait for hooks or stable Working.
+    observed_working || (changed_output && observation.attention.as_ref().is_some_and(working))
 }
 
 fn attention_demand_actuation(session: &ResourceObject<TerminalSession>, observation: &TerminalObservation) -> Actuation {

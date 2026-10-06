@@ -10,7 +10,8 @@ use crate::{
     Vessel, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
-/// An ambiguous write whose confirmation deadline elapsed; never safe to resend.
+/// An ambiguous write whose confirmation deadline elapsed; never retried.
+/// Later consumption evidence can still acknowledge the held message.
 pub const TERMINAL_DELIVERY_EXPIRED_REASON: &str = "DeliveryExpired";
 /// Stored degradation reason shared by writers, controllers and surfaces.
 pub const TERMINAL_DELIVERY_UNCONFIRMED_REASON: &str = "DeliveryUnconfirmed";
