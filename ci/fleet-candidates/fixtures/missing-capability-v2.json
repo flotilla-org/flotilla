@@ -1,0 +1,101 @@
+{
+  "generation": "20261006T120000Z-r545-faaaaaaaaaaaa-cbbbbbbbbbbbb",
+  "manifest": {
+    "schema_version": 2,
+    "kind": "internal-promoted-fleet-generation",
+    "generation": "20261006T120000Z-r545-faaaaaaaaaaaa-cbbbbbbbbbbbb",
+    "peer_protocol_version": 20,
+    "signing": {
+      "scheme": "cms-detached",
+      "signature": "generation.json.cms"
+    },
+    "platform_independent": [
+      {
+        "schema_version": 1,
+        "kind": "fleet-component",
+        "component": "skills",
+        "source_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "platform": "platform-independent",
+        "recipe_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "archive_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "provides": [
+          "skills:tree:rjw-sdlc"
+        ],
+        "requires": []
+      }
+    ],
+    "platforms": {
+      "linux-x86_64-gnu2.36": {
+        "state": "installable-internal",
+        "components": [
+          {
+            "schema_version": 1,
+            "kind": "fleet-component",
+            "component": "flotilla",
+            "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "platform": "linux-x86_64-gnu2.36",
+            "recipe_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "archive_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "provides": [
+              "flotilla:protocol=20"
+            ],
+            "requires": [
+              "cleat:capability:env-clear",
+              "cleat:protocol>=12",
+              "skills:tree:rjw-sdlc"
+            ]
+          },
+          {
+            "schema_version": 1,
+            "kind": "fleet-component",
+            "component": "cleat",
+            "source_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "platform": "linux-x86_64-gnu2.36",
+            "recipe_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "archive_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "provides": [
+              "cleat:capability:env-clear",
+              "cleat:protocol=12"
+            ],
+            "requires": []
+          }
+        ]
+      },
+      "darwin-aarch64": {
+        "state": "installable-internal",
+        "components": [
+          {
+            "schema_version": 1,
+            "kind": "fleet-component",
+            "component": "flotilla",
+            "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "platform": "darwin-aarch64",
+            "recipe_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "archive_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "provides": [
+              "flotilla:protocol=20"
+            ],
+            "requires": [
+              "cleat:capability:env-clear",
+              "cleat:protocol>=12",
+              "skills:tree:rjw-sdlc"
+            ]
+          },
+          {
+            "schema_version": 1,
+            "kind": "fleet-component",
+            "component": "cleat",
+            "source_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "platform": "darwin-aarch64",
+            "recipe_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "archive_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "provides": [
+              "cleat:protocol=12"
+            ],
+            "requires": []
+          }
+        ]
+      }
+    }
+  }
+}

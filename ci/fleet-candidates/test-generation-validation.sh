@@ -11,6 +11,11 @@ tools=(
 )
 for tool in "${tools[@]}"; do
   python3 "$tool" --validate-fixture "$fixtures/valid.json"
+  python3 "$tool" --validate-fixture "$fixtures/valid-v2.json"
+  if python3 "$tool" --validate-fixture "$fixtures/missing-capability-v2.json" >/dev/null 2>&1; then
+    echo "$(basename "$tool") accepted a v2 composition with an unmet requirement" >&2
+    exit 1
+  fi
   # A generation predating the CODEX_HOME template stays valid, so a failed
   # health check can still roll back onto one.
   python3 "$tool" --validate-fixture "$fixtures/pre-codex-home.json"
@@ -30,6 +35,12 @@ for fixture in bad-pin bad-skill-path traversing-skill-path unexpected-payload s
     exit 1
   fi
 done
+
+FLEET_GENERATION_VALIDATOR="$root/generation_validation.py" "$root/../../scripts/fleet-install" __validate_fixture "$fixtures/valid-v2.json"
+if FLEET_GENERATION_VALIDATOR="$root/generation_validation.py" "$root/../../scripts/fleet-install" __validate_fixture "$fixtures/missing-capability-v2.json" >/dev/null 2>&1; then
+  echo "fleet-install accepted a v2 composition with an unmet requirement" >&2
+  exit 1
+fi
 
 # The build-time gate on the assembled CODEX_HOME template: the directory is
 # copied into every crew's writable CODEX_HOME, so a credential, a missing

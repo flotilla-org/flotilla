@@ -102,6 +102,14 @@ Pruning performs no separate sweep of orphan sidecars: it only removes files
 attributed to a release being pruned. Unmatched files remain for manual inspection.
 Live pruning on fleet hosts is an operator check after deployment.
 
+## Component format transition
+
+The shared validator reads v1 and v2 generation manifests and validates component
+identities and per-platform requires/provides composition. See the
+[component and signed pin-list contract](component-manifests.md). Current build,
+promotion and install paths still produce/consume v1 bundles; #2763 and #2764
+introduce component builds and the dual-published v2 installer transition.
+
 ## Promoted generation consumer contract
 
 `scripts/fleet-install` consumes immutable versions of the Forgejo Generic
