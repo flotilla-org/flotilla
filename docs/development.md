@@ -242,6 +242,28 @@ host config guard continues to reject `extensions.worktreeConfig` and executable
 configuration. Branches created manually after provisioning can be published with
 an explicit branch.
 
+The shared Git metadata remains writable for objects and refs, while `config`,
+`hooks`, and the entire `worktrees` parent are mounted read-only. Writable
+submounts expose only the vessel's own administration directories, resolved by
+Git through the typed VCS boundary. Siblings registered after container startup
+inherit the same read-only parent. Metadata mounts use the same absolute host
+paths inside the container, preserving `.git` pointers and host backlinks.
+
+Docker cannot update these bind mounts in place. When checkout membership or
+resolved administration paths change, vessel reconciliation holds provisioning
+and requests environment recreation before launching crews. A Ready vessel
+keeps its phase and existing terminal sessions while showing the recreation
+message. Stop existing crews, remove the vessel environment with
+`flotilla resource delete Environment <environment-name>`, and let reconciliation
+recreate it with the new mount set; it does not automatically interrupt running work. Environments created
+before these protection mounts also require recreation.
+
+Managed creation uses `git worktree add --lock --reason` so a later protection
+failure cannot leave a newly created registration exposed to prune. Transient
+registration-protection failures retry the same Pending Checkout; its bootstrap
+ref preserves branch provenance. Failed protection does not delete the target.
+Normal teardown preserves dirty reused checkouts and pre-existing branches.
+
 Queued-turn diagnostics use the `crew turn delivery decision`,
 `pending crew turn delivery decision`, and `terminal crew turn delivery decision`
 events. They record convoy and sender, current attention state, source and

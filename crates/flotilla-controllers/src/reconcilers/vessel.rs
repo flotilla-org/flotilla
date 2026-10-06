@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
     path::PathBuf,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -42,6 +42,40 @@ const VESSEL_INTERRUPTED_REQUEUE_AFTER: Duration = Duration::from_millis(250);
 const VESSEL_PROVISIONING_STUCK_SECONDS: i64 = 2 * 60;
 const CHECKOUT_RECREATE_BACKOFF: Duration = Duration::from_secs(60);
 
+// Compare the grants we own, independent of serialization order and unrelated
+// policy mounts. Legacy config/hooks overlays identify old shared roots too, so
+// removing an entire repository still detects its stale writable grants.
+fn git_mounts_match(existing: &[EnvironmentMount], desired: &[EnvironmentMount]) -> bool {
+    let roots = existing
+        .iter()
+        .chain(desired)
+        .filter(|mount| {
+            mount.mode == EnvironmentMountMode::Ro
+                && mount.source_path == mount.target_path
+                && PathBuf::from(&mount.source_path).file_name().is_some_and(|name| name == "config" || name == "hooks")
+        })
+        .filter_map(|mount| PathBuf::from(&mount.source_path).parent().map(PathBuf::from))
+        .collect::<BTreeSet<_>>();
+    let grants = |mounts: &[EnvironmentMount]| {
+        mounts
+            .iter()
+            .filter(|mount| {
+                roots
+                    .iter()
+                    .any(|root| PathBuf::from(&mount.source_path).starts_with(root) || PathBuf::from(&mount.target_path).starts_with(root))
+            })
+            .map(|mount| (mount.source_path.clone(), mount.target_path.clone(), mount.mode == EnvironmentMountMode::Rw))
+            .collect::<BTreeSet<_>>()
+    };
+    grants(existing) == grants(desired)
+}
+
+/// Environment-scoped VCS inspection used to plan contained Git mounts.
+#[async_trait::async_trait]
+pub trait WorktreeMetadataResolver: Send + Sync {
+    async fn worktree_metadata(&self, env_ref: &str, target: &str) -> Result<flotilla_core::vcs::WorktreeMetadata, String>;
+}
+
 #[derive(bon::Builder)]
 pub struct VesselReconciler {
     convoys: TypedResolver<Convoy>,
@@ -58,6 +92,7 @@ pub struct VesselReconciler {
     local_host_ref: Option<CanonicalHostId>,
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
     namespace: String,
+    worktree_metadata: Option<Arc<dyn WorktreeMetadataResolver>>,
     brief_templates: CrewBriefTemplateResolver,
     #[builder(default)]
     // A local backstop for rapid create/delete fights; it resets on restart.
@@ -81,6 +116,7 @@ impl VesselReconciler {
             local_host_ref: None,
             additional_host_refs: Default::default(),
             namespace: namespace.to_string(),
+            worktree_metadata: None,
             brief_templates: CrewBriefTemplateResolver::default(),
             recent_checkout_create_attempts: Mutex::new(BTreeMap::new()),
         }
@@ -88,6 +124,59 @@ impl VesselReconciler {
 
     pub fn new_with_config_dir(backend: ResourceBackend, namespace: &str, config_dir: impl Into<PathBuf>) -> Self {
         Self { brief_templates: CrewBriefTemplateResolver::with_config_dir(config_dir), ..Self::new(backend, namespace) }
+    }
+
+    pub fn with_worktree_metadata(mut self, resolver: Arc<dyn WorktreeMetadataResolver>) -> Self {
+        self.worktree_metadata = Some(resolver);
+        self
+    }
+
+    async fn contained_git_mounts(&self, checkouts: &[(String, Option<String>)]) -> Result<Vec<EnvironmentMount>, ResourceError> {
+        let mut directories = BTreeMap::<PathBuf, BTreeSet<PathBuf>>::new();
+        for (checkout_name, clone_ref) in checkouts {
+            let clone_ref = clone_ref.as_ref().ok_or_else(|| {
+                ResourceError::invalid(format!("contained worktree placement requires checkout {checkout_name} to be a managed worktree"))
+            })?;
+            match self.clones.get(clone_ref).await {
+                Ok(_) => {}
+                Err(ResourceError::NotFound { .. }) => {
+                    return Err(ResourceError::invalid(format!(
+                        "contained worktree checkout {checkout_name} refers to missing clone {clone_ref}"
+                    )))
+                }
+                Err(error) => return Err(error),
+            }
+            let checkout = self.checkouts.get(checkout_name).await?;
+            let CheckoutSpec::Worktree(spec) = &checkout.spec else {
+                return Err(ResourceError::invalid(format!("checkout {checkout_name} is no longer a managed worktree")));
+            };
+            let resolver = self.worktree_metadata.as_ref().ok_or_else(|| ResourceError::other("worktree metadata resolver unavailable"))?;
+            let metadata = resolver.worktree_metadata(&spec.env_ref, &spec.target_path).await.map_err(ResourceError::other)?;
+            // Only direct registration children may override the read-only parent.
+            // Reject unrelated paths rather than granting a broader writable mount.
+            if !metadata.common_dir.is_absolute()
+                || !metadata.admin_dir.is_absolute()
+                || metadata.admin_dir.parent() != Some(metadata.common_dir.join("worktrees").as_path())
+            {
+                return Err(ResourceError::invalid(format!("checkout {checkout_name} has an invalid Git administration directory")));
+            }
+            directories.entry(metadata.common_dir).or_default().insert(metadata.admin_dir);
+        }
+        let mut mounts = Vec::new();
+        for (common, admins) in directories {
+            let mount = |path: PathBuf, mode| {
+                let path = path.to_string_lossy().into_owned();
+                EnvironmentMount { source_path: path.clone(), target_path: path, mode }
+            };
+            mounts.push(mount(common.clone(), EnvironmentMountMode::Rw));
+            for protected in ["config", "hooks", "worktrees"] {
+                mounts.push(mount(common.join(protected), EnvironmentMountMode::Ro));
+            }
+            for admin in admins {
+                mounts.push(mount(admin, EnvironmentMountMode::Rw));
+            }
+        }
+        Ok(mounts)
     }
 
     pub fn with_federated_dependencies(mut self, backend: &ResourceBackend, local_host_ref: CanonicalHostId) -> Self {
@@ -218,6 +307,12 @@ enum PlannedPatch {
         observed_policy_version: String,
         placement_decision: Option<PlacementDecision>,
         waiting_for: String,
+    },
+    EnvironmentRecreation {
+        observed_policy_ref: String,
+        observed_policy_version: String,
+        placement_decision: Option<PlacementDecision>,
+        message: String,
     },
     CheckoutChurn {
         observed_policy_ref: String,
@@ -843,9 +938,39 @@ impl Reconciler for VesselReconciler {
                 (env_name, None)
             }
             PlacementStrategy::DockerWorktreeOnHostAndMount { host_ref, image, pull_policy, env, mount_path, .. } => {
+                let git_mounts = match self.contained_git_mounts(&contained_worktree_checkouts).await {
+                    Ok(mounts) => mounts,
+                    Err(ResourceError::Invalid { message }) => return Ok(VesselPrepared::failed(message)),
+                    Err(error) => return Err(error),
+                };
                 let env_name = environment_name(&obj.metadata.name);
                 let image = match self.environments.get(&env_name).await {
                     Ok(existing) => {
+                        // Docker bind mounts cannot change in place. Refuse a stale
+                        // grant set until the environment is explicitly recreated.
+                        let existing_git_mounts = existing
+                            .spec
+                            .docker
+                            .as_ref()
+                            .map(|docker| {
+                                docker.mounts.iter().filter(|mount| mount.target_path != *mount_path).cloned().collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        if !git_mounts_match(&existing_git_mounts, &git_mounts) {
+                            return Ok(VesselPrepared {
+                                patch: PlannedPatch::EnvironmentRecreation {
+                                    observed_policy_ref: placement_policy.metadata.name.clone(),
+                                    observed_policy_version: placement_policy.metadata.resource_version.clone(),
+                                    placement_decision: placement_decision.clone(),
+                                    message: format!(
+                                        "environment {env_name} Git checkout membership or protection mounts changed; \
+                                         stop crews and recreate the environment before launching crews"
+                                    ),
+                                },
+                                actuations,
+                            });
+                        }
+
                         if existing.status.as_ref().map(|status| status.phase) == Some(EnvironmentPhase::Failed) {
                             let message = existing
                                 .status
@@ -882,47 +1007,9 @@ impl Reconciler for VesselReconciler {
                             })
                             .into_iter()
                             .collect::<Vec<_>>();
-                        // A linked worktree's `.git` file names its administrative
-                        // directory beneath the shared clone with an absolute host
-                        // path. Expose the clone metadata at that same path so Git
-                        // can follow the pointer from the differently-mounted
-                        // workspace. Keeping the shared clone authoritative also
-                        // preserves its remotes and host worktree registrations.
-                        let mut mounted_common_dirs = BTreeSet::new();
-                        for (checkout_name, clone_ref) in &contained_worktree_checkouts {
-                            let Some(clone_ref) = clone_ref else {
-                                return Ok(VesselPrepared::failed(format!(
-                                    "contained worktree placement requires checkout {checkout_name} to be a managed worktree"
-                                )));
-                            };
-                            let clone = match self.clones.get(clone_ref).await {
-                                Ok(clone) => clone,
-                                Err(ResourceError::NotFound { .. }) => {
-                                    return Ok(VesselPrepared::failed(format!(
-                                        "contained worktree checkout {checkout_name} refers to missing clone {clone_ref}"
-                                    )))
-                                }
-                                Err(error) => return Err(error),
-                            };
-                            mounted_common_dirs.insert(format!("{}/.git", clone.spec.path.trim_end_matches('/')));
-                        }
-                        for git_common_dir in mounted_common_dirs {
-                            mounts.push(EnvironmentMount {
-                                source_path: git_common_dir.clone(),
-                                target_path: git_common_dir.clone(),
-                                mode: EnvironmentMountMode::Rw,
-                            });
-                            // Git needs writable refs, objects, and worktree metadata. Keep
-                            // the host-owned config and hooks immutable inside the vessel.
-                            for protected in ["config", "hooks"] {
-                                let path = format!("{git_common_dir}/{protected}");
-                                mounts.push(EnvironmentMount {
-                                    source_path: path.clone(),
-                                    target_path: path,
-                                    mode: EnvironmentMountMode::Ro,
-                                });
-                            }
-                        }
+                        // Preserve absolute host paths in both mount domains so
+                        // .git pointers and host registration backlinks remain valid.
+                        mounts.extend(git_mounts);
                         let mut env = env.clone();
                         if let Err(message) = configure_contained_tracking(&mut env, &contained_branches) {
                             return Ok(VesselPrepared::failed(message));
@@ -1240,7 +1327,14 @@ impl Reconciler for VesselReconciler {
                     message: provisioning_stuck_message(obj, waiting_for, now),
                 })
             }
-            PlannedPatch::CheckoutChurn { observed_policy_ref, observed_policy_version, placement_decision, message } => {
+            PlannedPatch::EnvironmentRecreation { message, .. }
+                if obj.status.as_ref().is_some_and(|status| status.phase == VesselPhase::Ready) =>
+            {
+                (obj.status.as_ref().and_then(|status| status.message.as_deref()) != Some(message))
+                    .then(|| VesselStatusPatch::RequireEnvironmentRecreation { message: message.clone() })
+            }
+            PlannedPatch::CheckoutChurn { observed_policy_ref, observed_policy_version, placement_decision, message }
+            | PlannedPatch::EnvironmentRecreation { observed_policy_ref, observed_policy_version, placement_decision, message } => {
                 if obj
                     .status
                     .as_ref()
@@ -1295,7 +1389,7 @@ impl Reconciler for VesselReconciler {
         let mut outcome = ReconcileOutcome::with_actuations(patch, prepared.actuations.clone());
         if matches!(&prepared.patch, PlannedPatch::CheckoutChurn { .. }) {
             outcome.requeue_after = Some(CHECKOUT_RECREATE_BACKOFF);
-        } else if matches!(&prepared.patch, PlannedPatch::Provisioning { .. }) {
+        } else if matches!(&prepared.patch, PlannedPatch::Provisioning { .. } | PlannedPatch::EnvironmentRecreation { .. }) {
             outcome.requeue_after = Some(VESSEL_PROVISIONING_REQUEUE_AFTER);
         } else if matches!(&prepared.patch, PlannedPatch::Interrupted { .. }) {
             outcome.requeue_after = Some(VESSEL_INTERRUPTED_REQUEUE_AFTER);
@@ -1590,6 +1684,79 @@ mod tests {
         checkout_name, checkout_placement_scope, configure_contained_tracking, environment_with_credentials, legible_waiting_for,
         placement_strategy, PlacementStrategy, VesselReconciler,
     };
+
+    // #2682: deduplicate shared parents, retain every own-admin overlay, and
+    // refuse invalid/unavailable metadata instead of granting writable siblings.
+    #[tokio::test]
+    async fn contained_mounts_cover_empty_duplicate_and_invalid_metadata() {
+        use flotilla_core::vcs::WorktreeMetadata;
+        use flotilla_resources::{Checkout, CheckoutSpec, CheckoutWorktreeSpec, Clone, CloneSpec, EnvironmentMountMode, RepositoryKey};
+        struct Metadata(Result<WorktreeMetadata, String>);
+        // VCS process boundary fake; stores and mount planning are real.
+        #[async_trait::async_trait]
+        impl super::WorktreeMetadataResolver for Metadata {
+            async fn worktree_metadata(&self, _env_ref: &str, _target: &str) -> Result<WorktreeMetadata, String> {
+                self.0.clone()
+            }
+        }
+        let backend = ResourceBackend::InMemory(Default::default());
+        let namespace = "test-mounts";
+        let repo_ref = RepositoryKey("test-repo".into());
+        backend
+            .clone()
+            .using::<Clone>(namespace)
+            .create(&InputMeta::builder().name("clone".to_string()).build(), &CloneSpec {
+                repo_ref: repo_ref.clone(),
+                url: "https://example.com/repo".into(),
+                env_ref: "host".into(),
+                path: "/clone".into(),
+            })
+            .await
+            .expect("clone");
+        backend
+            .clone()
+            .using::<Checkout>(namespace)
+            .create(
+                &InputMeta::builder().name("own".to_string()).build(),
+                &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                    repo_ref,
+                    env_ref: "host".into(),
+                    r#ref: "branch".into(),
+                    base_ref: None,
+                    target_path: "/own".into(),
+                    clone_ref: "clone".into(),
+                }),
+            )
+            .await
+            .expect("checkout");
+        let valid = WorktreeMetadata { common_dir: "/clone/.git".into(), admin_dir: "/clone/.git/worktrees/actual".into() };
+        let reconciler = VesselReconciler::new(backend.clone(), namespace).with_worktree_metadata(Arc::new(Metadata(Ok(valid.clone()))));
+        assert!(reconciler.contained_git_mounts(&[]).await.expect("empty").is_empty());
+        let own = ("own".into(), Some("clone".into()));
+        let one = reconciler.contained_git_mounts(std::slice::from_ref(&own)).await.expect("own mounts");
+        let repeated = reconciler.contained_git_mounts(&[own.clone(), own.clone()]).await.expect("duplicate");
+        assert_eq!(one, repeated, "duplicate checkout membership must not duplicate grants");
+        assert_eq!(one.len(), 5);
+        assert_eq!(one[3].source_path, "/clone/.git/worktrees");
+        assert_eq!(one[3].mode, EnvironmentMountMode::Ro);
+        assert_eq!(one[4].source_path, "/clone/.git/worktrees/actual");
+        assert_eq!(one[4].mode, EnvironmentMountMode::Rw);
+        for metadata in [
+            Err("transport unavailable".into()),
+            Ok(WorktreeMetadata { common_dir: "relative/.git".into(), ..valid.clone() }),
+            Ok(WorktreeMetadata { admin_dir: "/clone/.git".into(), ..valid.clone() }),
+            Ok(WorktreeMetadata { admin_dir: "/sibling".into(), ..valid.clone() }),
+            Ok(WorktreeMetadata { admin_dir: "/clone/.git/worktrees/own/nested".into(), ..valid.clone() }),
+        ] {
+            let refusing = VesselReconciler::new(backend.clone(), namespace).with_worktree_metadata(Arc::new(Metadata(metadata)));
+            assert!(refusing.contained_git_mounts(std::slice::from_ref(&own)).await.is_err(), "invalid metadata must fail closed");
+        }
+        let unavailable = VesselReconciler::new(backend, namespace);
+        assert!(
+            matches!(unavailable.contained_git_mounts(&[own]).await, Err(ResourceError::Other { .. })),
+            "missing resolver must retry without guessing paths or failing the vessel"
+        );
+    }
 
     // Glue: append Git's fixed settings without replacing policy or credential environment.
     #[test]

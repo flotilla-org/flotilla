@@ -13,12 +13,12 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use flotilla_controllers::reconcilers::{
-    checkout::managed_checkout_reason, checkout_path_component, convoy_ensure::EnsureReconciler, BranchPreservationReason,
-    CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime, DockerEnvironmentRuntime,
-    DockerProvisioning, EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PreparedCheckout, PresentationPolicyRegistry,
-    PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalDeliveryFailure, TerminalDeliveryOutcome,
-    TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime, TerminalRuntimeState, TerminalSessionReconciler,
-    VesselPlacementProjector, VesselReconciler,
+    checkout::managed_checkout_reason, checkout_path_component, convoy_ensure::EnsureReconciler, vessel::WorktreeMetadataResolver,
+    BranchPreservationReason, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, CloneReconciler, CloneRuntime,
+    DockerEnvironmentRuntime, DockerProvisioning, EnvironmentReconciler, ForgeDefaultBranchResolver, HopChainContext, PreparedCheckout,
+    PresentationPolicyRegistry, PresentationReconciler, ProviderPresentationRuntime, RepositoryReconciler, TerminalDeliveryFailure,
+    TerminalDeliveryOutcome, TerminalDeliveryReadiness, TerminalLiveness, TerminalObservation, TerminalRuntime, TerminalRuntimeState,
+    TerminalSessionReconciler, VesselPlacementProjector, VesselReconciler,
 };
 use flotilla_core::{
     agent_adapter::{AgentAdapter, AgentLaunchRequest, CapabilityTable},
@@ -41,7 +41,7 @@ use flotilla_core::{
         terminal::{ScreenActivity, TerminalPool, TerminalSessionLiveness, TerminalSize},
         ChannelLabel, CommandRunner,
     },
-    vcs::{CheckoutRegistration, REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT},
+    vcs::{CheckoutMaterialisationError, CheckoutRegistration, WorktreeMetadata, REMOTE_CHECKOUT_ARCHIVE_SWEEP_TIMEOUT},
 };
 use flotilla_protocol::{
     CanonicalHostId, ConfiguredResourceLimits, EnvironmentId, HostSummary, ImageId, NodeId, RepoSelector, Rows, TerminalStatus,
@@ -4367,6 +4367,7 @@ fn spawn_controller_loops(
             }
         }),
         controller!(Vessel, {
+            let state = Arc::clone(&state);
             let config_dir = state.config.base_path().as_path().to_path_buf();
             let local_host_ref = state.local_host_ref.clone();
             let additional_host_refs = state.agentless_host_refs();
@@ -4377,6 +4378,7 @@ fn spawn_controller_loops(
                 (
                     VesselReconciler::secondary_watches(),
                     VesselReconciler::new_with_config_dir(backend.clone(), &namespace_string, config_dir)
+                        .with_worktree_metadata(Arc::new(RoutingCheckoutRuntime { state: Arc::clone(&state), change_requests: None }))
                         .with_federated_dependencies(&backend, CanonicalHostId::resolved(local_host_ref))
                         .with_additional_host_refs(additional_host_refs),
                 )
@@ -5300,6 +5302,14 @@ struct RoutingCheckoutRuntime {
     change_requests: Option<ReplicaReadResolver<ChangeRequest>>,
 }
 
+#[async_trait]
+impl WorktreeMetadataResolver for RoutingCheckoutRuntime {
+    async fn worktree_metadata(&self, env_ref: &str, target: &str) -> Result<WorktreeMetadata, String> {
+        let runtime = self.runtime_for(env_ref, target).await?;
+        controller_vcs(&runtime.vcs, &runtime.runner, target)?.worktree_metadata(Path::new(target)).await
+    }
+}
+
 impl RoutingCheckoutRuntime {
     async fn runtime_for(&self, env_ref: &str, checkout: &str) -> Result<CheckoutControllerRuntime, String> {
         let environment = self
@@ -5411,7 +5421,7 @@ impl CheckoutRuntime for RoutingCheckoutRuntime {
         base_ref: Option<&str>,
         target_path: &str,
         registration_reason: &str,
-    ) -> Result<PreparedCheckout, String> {
+    ) -> Result<PreparedCheckout, CheckoutMaterialisationError> {
         let runtime = self.runtime_for(env_ref, clone_path).await?;
         let vcs = controller_vcs(&runtime.vcs, &runtime.runner, clone_path)?;
         let materialisation = vcs.materialise_checkout(branch, base_ref, target_path, registration_reason).await?;
@@ -5511,7 +5521,8 @@ impl CheckoutRuntime for CheckoutControllerRuntime {
                 target_path,
                 &managed_checkout_reason(None, Path::new(target_path).file_name().unwrap_or_default().to_string_lossy().as_ref()),
             )
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(PreparedCheckout { commit: materialisation.commit, branch_provenance: materialisation.provenance })
     }
 

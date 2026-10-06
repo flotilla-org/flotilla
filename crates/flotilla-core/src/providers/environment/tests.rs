@@ -833,49 +833,67 @@ async fn create_mounts_the_flotilla_binary_directory_so_atomic_replacements_stay
     );
 }
 
-#[tokio::test]
-async fn create_uses_requested_mount_modes_in_docker_arguments() {
-    use flotilla_protocol::ImageId;
+// Glue contract: requested parent/child access modes survive Docker serialization.
+// Generate zero through three own admins, including the empty and multi-checkout cases.
+#[hegel::test]
+fn create_uses_requested_mount_modes_in_docker_arguments(tc: hegel::TestCase) {
+    let own_count = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3));
+    // Shared metadata can have a nonstandard name (for example separate-git-dir).
+    let common = if tc.draw(hegel::generators::booleans()) { "/host/clone/.git" } else { "/host/metadata" };
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        use flotilla_protocol::ImageId;
 
-    let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
-    let image = ImageId::new("ubuntu:22.04");
-    let opts = CreateOpts {
-        tokens: vec![],
-        tools: vec![test_daemon_tool("/run/flotilla.sock")],
-        working_directory: None,
-        provisioned_mounts: vec![
-            ProvisionedMount::new("/host/workspace", "/workspace", ProvisionedMountMode::Rw),
-            ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro),
-            ProvisionedMount::new("/host/clone/.git", "/host/clone/.git", ProvisionedMountMode::Rw),
-            ProvisionedMount::new("/host/clone/.git/config", "/host/clone/.git/config", ProvisionedMountMode::Ro),
-            ProvisionedMount::new("/host/clone/.git/hooks", "/host/clone/.git/hooks", ProvisionedMountMode::Ro),
-        ],
-        image_pull_policy: ImagePullPolicy::IfNotPresent,
-        prepared_auth: Default::default(),
-        cpu_limit: None,
-        memory_policy: Default::default(),
-    };
+        let runner = Arc::new(RecordingRunner::new_ok("container-id-123"));
+        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let image = ImageId::new("ubuntu:22.04");
+        let mut opts = CreateOpts {
+            tokens: vec![],
+            tools: vec![test_daemon_tool("/run/flotilla.sock")],
+            working_directory: None,
+            provisioned_mounts: vec![
+                ProvisionedMount::new("/host/workspace", "/workspace", ProvisionedMountMode::Rw),
+                ProvisionedMount::new("/host/reference-repo", "/ref/repo", ProvisionedMountMode::Ro),
+                ProvisionedMount::new(common, common, ProvisionedMountMode::Rw),
+                ProvisionedMount::new(format!("{common}/config"), format!("{common}/config"), ProvisionedMountMode::Ro),
+                ProvisionedMount::new(format!("{common}/hooks"), format!("{common}/hooks"), ProvisionedMountMode::Ro),
+                ProvisionedMount::new(format!("{common}/worktrees"), format!("{common}/worktrees"), ProvisionedMountMode::Ro),
+            ],
+            image_pull_policy: ImagePullPolicy::IfNotPresent,
+            prepared_auth: Default::default(),
+            cpu_limit: None,
+            memory_policy: Default::default(),
+        };
 
-    provider.create(EnvironmentId::new("test-env-mount-modes"), &image, opts).await.expect("create");
+        for own in 0..own_count {
+            let path = format!("{common}/worktrees/own-{own}");
+            opts.provisioned_mounts.push(ProvisionedMount::new(&path, &path, ProvisionedMountMode::Rw));
+        }
 
-    let calls = runner.calls();
-    let (_, args, _) = &calls[0];
-    assert!(
-        args.windows(2).any(|pair| pair == ["-v", "/host/workspace:/workspace:rw"]),
-        "writable workspace mount should be passed to docker as :rw; args: {args:?}",
-    );
-    assert!(
-        args.windows(2).any(|pair| pair == ["-v", "/host/reference-repo:/ref/repo:ro"]),
-        "read-only reference mount should be passed to docker as :ro; args: {args:?}",
-    );
-    for protected in ["config", "hooks"] {
-        let expected = format!("type=bind,source=/host/clone/.git/{protected},target=/host/clone/.git/{protected},readonly");
+        provider.create(EnvironmentId::new("test-env-mount-modes"), &image, opts).await.expect("create");
+
+        let calls = runner.calls();
+        let (_, args, _) = &calls[0];
         assert!(
-            args.windows(2).any(|pair| pair == ["--mount", expected.as_str()]),
-            "protected Git mount must reject a missing source: {args:?}"
+            args.windows(2).any(|pair| pair == ["-v", "/host/workspace:/workspace:rw"]),
+            "writable workspace mount should be passed to docker as :rw; args: {args:?}",
         );
-    }
+        assert!(
+            args.windows(2).any(|pair| pair == ["-v", "/host/reference-repo:/ref/repo:ro"]),
+            "read-only reference mount should be passed to docker as :ro; args: {args:?}",
+        );
+        // #2682: the parent protects all siblings, including registrations created later.
+        for protected in ["config", "hooks", "worktrees"] {
+            let expected = format!("type=bind,source={common}/{protected},target={common}/{protected},readonly");
+            assert!(
+                args.windows(2).any(|pair| pair == ["--mount", expected.as_str()]),
+                "protected Git metadata must be a strict read-only bind: {args:?}"
+            );
+        }
+        for own in 0..own_count {
+            let expected = format!("{common}/worktrees/own-{own}:{common}/worktrees/own-{own}:rw");
+            assert!(args.windows(2).any(|pair| pair == ["-v", expected.as_str()]), "own admin stays writable: {args:?}");
+        }
+    });
 }
 
 #[tokio::test]

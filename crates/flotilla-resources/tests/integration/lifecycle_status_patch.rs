@@ -126,6 +126,7 @@ define_patch_kinds! {
     TerminalMarkReconcileDegraded => NONE,
     TerminalClearReconcileDegraded => NONE,
     VesselObserveRuntime => NONE,
+    VesselRequireEnvironmentRecreation => NONE,
     VesselMarkProvisioning => DUPLICATE,
     VesselMarkReady => DUPLICATE,
     VesselStageLandingCredentials => DUPLICATE,
@@ -216,6 +217,7 @@ fn vessel_patch_kind(patch: &VesselStatusPatch) -> PatchKind {
             panic!("credential status patches are outside this lifecycle contract")
         }
         VesselStatusPatch::ObserveRuntime { .. } => PatchKind::VesselObserveRuntime,
+        VesselStatusPatch::RequireEnvironmentRecreation { .. } => PatchKind::VesselRequireEnvironmentRecreation,
         VesselStatusPatch::MarkProvisioning { .. } => PatchKind::VesselMarkProvisioning,
         VesselStatusPatch::MarkReady { .. } => PatchKind::VesselMarkReady,
         VesselStatusPatch::MarkInterrupted { .. } => PatchKind::VesselMarkInterrupted,
