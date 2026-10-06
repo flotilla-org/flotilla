@@ -2759,6 +2759,8 @@ mod tests {
         }
         #[cfg(unix)]
         {
+            // Intentionally alias the parent of a checkout whose fixture root
+            // is already physical, independently of the temp root spelling.
             let alias = root.join("alias");
             std::os::unix::fs::symlink(&root, &alias).expect("parent alias");
             let aliased_target = alias.join("managed");
