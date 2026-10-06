@@ -634,8 +634,8 @@ async fn delivery_batches_fifo_and_held_batches_resolve_without_retyping() {
     restarted.reconcile_delivery(&transport, at(21)).await.expect("held observation");
     assert_eq!(transport.submissions.lock().expect("submissions").len(), 1);
     let text = transport.submissions.lock().expect("submissions")[0].clone();
-    assert!(text.find("body-0").unwrap() < text.find("body-1").unwrap());
-    assert!(text.find("body-1").unwrap() < text.find("body-2").unwrap());
+    assert!(text.find("body-0").expect("find expected body in batch") < text.find("body-1").expect("find expected body in batch"));
+    assert!(text.find("body-1").expect("find expected body in batch") < text.find("body-2").expect("find expected body in batch"));
     assert_eq!(backend.using::<flotilla_resources::Demand>("flotilla").list().await.expect("demands").items.len(), 1);
     transport.accepted.store(true, Ordering::SeqCst);
     restarted.reconcile_delivery(&transport, at(22)).await.expect("later evidence");
@@ -672,11 +672,18 @@ async fn genuinely_unsent_batches_back_off_and_stop_after_three_attempts() {
         assert_eq!(retry.attempts, 3);
         assert!(matches!(retry.disposition, flotilla_resources::ControllerRetryDisposition::Terminal { .. }));
     }
-    inbox.accept(&InputMeta::builder().name("later".into()).build(), &spec(None, MessageExpectation::None), at(101)).await.unwrap();
-    inbox.reconcile_delivery(&transport, at(102)).await.unwrap();
-    assert_eq!(transport.submissions.lock().unwrap().len(), 3, "later intent cannot bypass exhausted FIFO head");
-    let later = backend.using::<Message>("flotilla").get("later").await.unwrap();
-    assert!(later.status.unwrap().submission.is_none());
+    inbox
+        .accept(&InputMeta::builder().name("later".into()).build(), &spec(None, MessageExpectation::None), at(101))
+        .await
+        .expect("admit Message fixture");
+    inbox.reconcile_delivery(&transport, at(102)).await.expect("reconcile receiver delivery");
+    assert_eq!(
+        transport.submissions.lock().expect("lock captured transport evidence").len(),
+        3,
+        "later intent cannot bypass exhausted FIFO head"
+    );
+    let later = backend.using::<Message>("flotilla").get("later").await.expect("read Message fixture");
+    assert!(later.status.expect("Message fixture has durable status").submission.is_none());
     assert_eq!(transport.observations.load(std::sync::atomic::Ordering::SeqCst), 7, "held attention refreshes");
 }
 
@@ -822,17 +829,17 @@ async fn delivery_repairs_interrupted_admission_before_transport() {
     use flotilla_resources::{MessageInbox, MessageTransportOutcome};
     let (backend, inbox) = delivery_inbox().await;
     let messages = backend.using::<Message>("flotilla");
-    for message in messages.list().await.unwrap().items {
-        messages.delete(&message.metadata.name).await.unwrap();
+    for message in messages.list().await.expect("list Message fixtures").items {
+        messages.delete(&message.metadata.name).await.expect("remove Message fixture");
     }
     let mut original = spec(
         Some(MessageReference::ChangeRequest { service: "github".into(), scope: "owner/repo".into(), number: 1, revision: "head".into() }),
         MessageExpectation::None,
     );
     original.body = "older payload".into();
-    inbox.accept(&InputMeta::builder().name("old".into()).build(), &original, at(10)).await.unwrap();
+    inbox.accept(&InputMeta::builder().name("old".into()).build(), &original, at(10)).await.expect("admit Message fixture");
     original.body = "recovered payload".into();
-    messages.create(&InputMeta::builder().name("partial".into()).build(), &original).await.unwrap();
+    messages.create(&InputMeta::builder().name("partial".into()).build(), &original).await.expect("create Message fixture");
     let restarted = MessageInbox::new(backend, "flotilla");
     let transport = FakeMessageTransport {
         submissions: Default::default(),
@@ -841,15 +848,21 @@ async fn delivery_repairs_interrupted_admission_before_transport() {
         accepted: Default::default(),
         working: Default::default(),
     };
-    restarted.reconcile_delivery(&transport, at(20)).await.unwrap();
+    restarted.reconcile_delivery(&transport, at(20)).await.expect("reconcile receiver delivery");
     {
-        let inputs = transport.submissions.lock().unwrap();
+        let inputs = transport.submissions.lock().expect("lock captured transport evidence");
         assert_eq!(inputs.len(), 1);
         assert!(inputs[0].contains("recovered payload"));
         assert!(!inputs[0].contains("older payload"));
     }
-    assert_eq!(messages.get("old").await.unwrap().status.unwrap().phase, MessagePhase::Superseded);
-    assert_eq!(messages.get("partial").await.unwrap().status.unwrap().phase, MessagePhase::Delivered);
+    assert_eq!(
+        messages.get("old").await.expect("read Message fixture").status.expect("Message fixture has durable status").phase,
+        MessagePhase::Superseded
+    );
+    assert_eq!(
+        messages.get("partial").await.expect("read Message fixture").status.expect("Message fixture has durable status").phase,
+        MessagePhase::Delivered
+    );
 }
 
 // A deadline can close an unanswered known delivery, but cannot erase possible
@@ -864,8 +877,8 @@ async fn deadlines_preserve_acceptance_and_unresolved_submission() {
     ] {
         let (backend, inbox) = delivery_inbox().await;
         let messages = backend.using::<Message>("flotilla");
-        for record in messages.list().await.unwrap().items {
-            messages.delete(&record.metadata.name).await.unwrap();
+        for record in messages.list().await.expect("list Message fixtures").items {
+            messages.delete(&record.metadata.name).await.expect("remove Message fixture");
         }
         let transport = FakeMessageTransport {
             submissions: Default::default(),
@@ -876,8 +889,8 @@ async fn deadlines_preserve_acceptance_and_unresolved_submission() {
         };
         let mut intent = spec(None, expectation);
         intent.deadline = Some(at(25));
-        inbox.accept(&InputMeta::builder().name(name.into()).build(), &intent, at(10)).await.unwrap();
-        inbox.reconcile_delivery(&transport, at(20)).await.unwrap();
+        inbox.accept(&InputMeta::builder().name(name.into()).build(), &intent, at(10)).await.expect("admit Message fixture");
+        inbox.reconcile_delivery(&transport, at(20)).await.expect("reconcile receiver delivery");
         if name != "uncertain" {
             apply_status_patch(&messages, name, &MessageStatusPatch::Delivered {
                 receiver: ResolvedMessageReceiver::builder()
@@ -889,14 +902,14 @@ async fn deadlines_preserve_acceptance_and_unresolved_submission() {
                 at: at(21),
             })
             .await
-            .unwrap();
+            .expect("apply fixture status transition");
         }
-        inbox.reconcile_delivery(&transport, at(30)).await.unwrap();
-        let status = messages.get(name).await.unwrap().status.unwrap();
+        inbox.reconcile_delivery(&transport, at(30)).await.expect("reconcile receiver delivery");
+        let status = messages.get(name).await.expect("read Message fixture").status.expect("Message fixture has durable status");
         assert_eq!(status.phase, expected);
         assert_eq!(status.resolved_receiver.is_some(), name != "uncertain");
         assert!(status.submission.is_some(), "the original batch identity survives deadline handling");
-        assert_eq!(transport.submissions.lock().unwrap().len(), 1);
+        assert_eq!(transport.submissions.lock().expect("lock captured transport evidence").len(), 1);
     }
 }
 
@@ -906,12 +919,12 @@ async fn deadlines_preserve_acceptance_and_unresolved_submission() {
 async fn older_admissions_without_sequence_keep_creation_order() {
     let (backend, inbox) = delivery_inbox().await;
     let messages = backend.using::<Message>("flotilla");
-    for record in messages.list().await.unwrap().items {
-        messages.delete(&record.metadata.name).await.unwrap();
+    for record in messages.list().await.expect("list Message fixtures").items {
+        messages.delete(&record.metadata.name).await.expect("remove Message fixture");
     }
     let mut intent = spec(None, MessageExpectation::None);
     intent.body = "body-0".into();
-    let older = messages.create(&InputMeta::builder().name("older".into()).build(), &intent).await.unwrap();
+    let older = messages.create(&InputMeta::builder().name("older".into()).build(), &intent).await.expect("create Message fixture");
     // This is A's stored accepted shape, not a mutation of B's immutable sequence.
     messages
         .update_status(
@@ -924,10 +937,10 @@ async fn older_admissions_without_sequence_keep_creation_order() {
                 .build(),
         )
         .await
-        .unwrap();
+        .expect("persist fixture status");
     for index in 1..3 {
         intent.body = format!("body-{index}");
-        inbox.accept(&InputMeta::builder().name(format!("newer-{index}")).build(), &intent, at(10)).await.unwrap();
+        inbox.accept(&InputMeta::builder().name(format!("newer-{index}")).build(), &intent, at(10)).await.expect("admit Message fixture");
     }
     let transport = FakeMessageTransport {
         submissions: Default::default(),
@@ -936,11 +949,15 @@ async fn older_admissions_without_sequence_keep_creation_order() {
         accepted: Default::default(),
         working: Default::default(),
     };
-    inbox.reconcile_delivery(&transport, at(20)).await.unwrap();
-    let inputs = transport.submissions.lock().unwrap();
+    inbox.reconcile_delivery(&transport, at(20)).await.expect("reconcile receiver delivery");
+    let inputs = transport.submissions.lock().expect("lock captured transport evidence");
     assert_eq!(inputs.len(), 1);
-    assert!(inputs[0].find("body-0").unwrap() < inputs[0].find("body-1").unwrap());
-    assert!(inputs[0].find("body-1").unwrap() < inputs[0].find("body-2").unwrap());
+    assert!(
+        inputs[0].find("body-0").expect("find expected body in batch") < inputs[0].find("body-1").expect("find expected body in batch")
+    );
+    assert!(
+        inputs[0].find("body-1").expect("find expected body in batch") < inputs[0].find("body-2").expect("find expected body in batch")
+    );
 }
 
 // A hung adapter must release admission within a bounded interval. A timeout
@@ -1000,19 +1017,25 @@ async fn transport_timeouts_release_admission_without_retyping_uncertain_input()
             },
         };
         let started = tokio::time::Instant::now();
-        inbox.reconcile_delivery(&transport, at(20)).await.unwrap();
+        inbox.reconcile_delivery(&transport, at(20)).await.expect("reconcile receiver delivery");
         if stage == "poll" {
-            inbox.reconcile_delivery(&transport, at(21)).await.unwrap();
+            inbox.reconcile_delivery(&transport, at(21)).await.expect("reconcile receiver delivery");
         }
         assert!(started.elapsed() >= std::time::Duration::from_secs(30), "{stage} is bounded");
         inbox
             .accept(&InputMeta::builder().name("after-timeout".into()).build(), &spec(None, MessageExpectation::None), at(22))
             .await
-            .unwrap();
-        let status = backend.using::<Message>("flotilla").get("message-0").await.unwrap().status.unwrap();
+            .expect("admit Message fixture");
+        let status = backend
+            .using::<Message>("flotilla")
+            .get("message-0")
+            .await
+            .expect("read Message fixture")
+            .status
+            .expect("Message fixture has durable status");
         assert_eq!(status.submission.is_some(), stage != "observe");
         assert_eq!(status.resolved_receiver.is_some(), stage == "release");
-        assert_eq!(transport.inner.submissions.lock().unwrap().len(), usize::from(stage != "observe"));
+        assert_eq!(transport.inner.submissions.lock().expect("lock captured transport evidence").len(), usize::from(stage != "observe"));
     }
 }
 
@@ -1029,7 +1052,7 @@ async fn partial_receipt_recovery_keeps_terminal_members_closed() {
         accepted: Default::default(),
         working: Default::default(),
     };
-    inbox.reconcile_delivery(&transport, at(20)).await.unwrap();
+    inbox.reconcile_delivery(&transport, at(20)).await.expect("reconcile receiver delivery");
     let messages = backend.using::<Message>("flotilla");
     let receipt = ResolvedMessageReceiver::builder()
         .crew_id("crew".into())
@@ -1037,21 +1060,23 @@ async fn partial_receipt_recovery_keeps_terminal_members_closed() {
         .delivered_at(at(21))
         .evidence("receipt before crash".into())
         .build();
-    apply_status_patch(&messages, "message-0", &MessageStatusPatch::Delivered { receiver: receipt.clone(), at: at(21) }).await.unwrap();
+    apply_status_patch(&messages, "message-0", &MessageStatusPatch::Delivered { receiver: receipt.clone(), at: at(21) })
+        .await
+        .expect("apply fixture status transition");
     apply_status_patch(&messages, "message-0", &MessageStatusPatch::Finish {
         phase: MessagePhase::Satisfied,
         reason: "notification accepted".into(),
         at: at(21),
     })
     .await
-    .unwrap();
-    let settled = messages.get("message-0").await.unwrap();
-    MessageInbox::new(backend.clone(), "flotilla").reconcile_delivery(&transport, at(22)).await.unwrap();
-    assert_eq!(messages.get("message-0").await.unwrap().status, settled.status, "terminal receipt is immutable");
+    .expect("apply fixture status transition");
+    let settled = messages.get("message-0").await.expect("read Message fixture");
+    MessageInbox::new(backend.clone(), "flotilla").reconcile_delivery(&transport, at(22)).await.expect("reconcile receiver delivery");
+    assert_eq!(messages.get("message-0").await.expect("read Message fixture").status, settled.status, "terminal receipt is immutable");
     for name in ["message-1", "message-2"] {
-        let status = messages.get(name).await.unwrap().status.unwrap();
+        let status = messages.get(name).await.expect("read Message fixture").status.expect("Message fixture has durable status");
         assert_eq!(status.phase, MessagePhase::Delivered);
         assert_eq!(status.resolved_receiver, Some(receipt.clone()));
     }
-    assert_eq!(transport.submissions.lock().unwrap().len(), 1);
+    assert_eq!(transport.submissions.lock().expect("lock captured transport evidence").len(), 1);
 }

@@ -14979,8 +14979,9 @@ mod tests {
         use flotilla_resources::{Message, MessageExpectation, MessagePhase, MessageRelation, MessageSpec, ROLE_LABEL, VESSEL_LABEL};
 
         use crate::server::test_support::spawn_in_memory_request_topology_stateful;
-        let temp = TempDir::new().unwrap();
-        fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-pool-test\"\n").unwrap();
+        let temp = TempDir::new().expect("cross-host Message fixture operation succeeds");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-pool-test\"\n")
+            .expect("cross-host Message fixture operation succeeds");
         let config = Arc::new(ConfigStore::with_base(temp.path()));
         let (daemon, _) = crew_daemon(config.clone()).await;
         let backend = daemon.resource_backend();
@@ -14989,23 +14990,23 @@ mod tests {
         probe.screens = vec!["› Ask Codex to do anything".into(); 1000];
         probe.screens.push("new tool output\n• Working (1s • esc to interrupt)\n› Ask Codex to do anything".into());
         let pool = Arc::new(probe);
-        let mut registry = probe_local_provider_registry(&daemon, &config).await.unwrap();
-        Arc::get_mut(&mut registry).unwrap().terminal_pools.insert(
+        let mut registry = probe_local_provider_registry(&daemon, &config).await.expect("cross-host Message fixture operation succeeds");
+        Arc::get_mut(&mut registry).expect("cross-host Message fixture operation succeeds").terminal_pools.insert(
             "message-probe",
             ProviderDescriptor::named(ProviderCategory::TerminalPool, "message-probe"),
             pool.clone(),
         );
-        let profile = build_local_profile(&daemon, &registry).unwrap();
-        ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.unwrap();
+        let profile = build_local_profile(&daemon, &registry).expect("cross-host Message fixture operation succeeds");
+        ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("cross-host Message fixture operation succeeds");
         backend
             .using::<Convoy>(NAMESPACE)
             .create(&empty_meta("message-pool"), &ConvoySpec::builder().workflow_ref("test".into()).project_ref(NAMESPACE.into()).build())
             .await
-            .unwrap();
+            .expect("cross-host Message fixture operation succeeds");
         create_credential_test_session(&backend, "agent", "message-pool", "message-pool-work", &profile.host_direct_environment_name())
             .await;
         let sessions = backend.using::<TerminalSession>(NAMESPACE);
-        let terminal = sessions.get("agent").await.unwrap();
+        let terminal = sessions.get("agent").await.expect("cross-host Message fixture operation succeeds");
         let mut spec = terminal.spec.clone();
         spec.pool = "message-probe".into();
         let TerminalSessionSource::Agent { selector, .. } = &mut spec.source else { unreachable!() };
@@ -15014,8 +15015,11 @@ mod tests {
         metadata.labels.insert(CONVOY_LABEL.into(), "message-pool".into());
         metadata.labels.insert(VESSEL_LABEL.into(), "work".into());
         metadata.labels.insert(ROLE_LABEL.into(), "coder".into());
-        let terminal = sessions.update(&metadata, &terminal.metadata.resource_version, &spec).await.unwrap();
-        let mut status = terminal.status.clone().unwrap();
+        let terminal = sessions
+            .update(&metadata, &terminal.metadata.resource_version, &spec)
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        let mut status = terminal.status.clone().expect("cross-host Message fixture operation succeeds");
         status.session_id = Some("agent".into());
         status.crew = Some(flotilla_resources::CrewSessionStatus {
             id: "original-crew".into(),
@@ -15023,7 +15027,10 @@ mod tests {
             model: None,
             stance: "trusted-implicit".into(),
         });
-        sessions.update_status("agent", &terminal.metadata.resource_version, &status).await.unwrap();
+        sessions
+            .update_status("agent", &terminal.metadata.resource_version, &status)
+            .await
+            .expect("cross-host Message fixture operation succeeds");
         let runtime = TerminalControllerRuntime {
             state: Arc::new(ControllerRuntimeState::new(
                 daemon.clone(),
@@ -15037,8 +15044,9 @@ mod tests {
         };
         // The sender learns the receiver from replicated resources, then uses
         // ordinary ResourceApply across the real in-memory request router.
-        let sender_temp = TempDir::new().unwrap();
-        fs::write(sender_temp.path().join("daemon.toml"), "machine_id = \"message-sender-test\"\n").unwrap();
+        let sender_temp = TempDir::new().expect("cross-host Message fixture operation succeeds");
+        fs::write(sender_temp.path().join("daemon.toml"), "machine_id = \"message-sender-test\"\n")
+            .expect("cross-host Message fixture operation succeeds");
         let sender = InProcessDaemon::new_with_resource_backend(
             Vec::new(),
             Arc::new(ConfigStore::with_base(sender_temp.path())),
@@ -15047,13 +15055,23 @@ mod tests {
             ResourceBackend::InMemory(Default::default()),
         )
         .await;
-        let topology = spawn_in_memory_request_topology_stateful(sender.clone(), daemon.clone()).await.unwrap();
+        let topology = spawn_in_memory_request_topology_stateful(sender.clone(), daemon.clone())
+            .await
+            .expect("cross-host Message fixture operation succeeds");
         let sender_backend = sender.resource_backend();
         let now = Utc::now();
-        let convoys = backend.using::<Convoy>(NAMESPACE).list().await.unwrap();
-        sender_backend.replica_writer::<Convoy>(daemon.node_id().clone(), NAMESPACE).replace(&convoys, now).await.unwrap();
-        let terminals = sessions.list().await.unwrap();
-        sender_backend.replica_writer::<TerminalSession>(daemon.node_id().clone(), NAMESPACE).replace(&terminals, now).await.unwrap();
+        let convoys = backend.using::<Convoy>(NAMESPACE).list().await.expect("cross-host Message fixture operation succeeds");
+        sender_backend
+            .replica_writer::<Convoy>(daemon.node_id().clone(), NAMESPACE)
+            .replace(&convoys, now)
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        let terminals = sessions.list().await.expect("cross-host Message fixture operation succeeds");
+        sender_backend
+            .replica_writer::<TerminalSession>(daemon.node_id().clone(), NAMESPACE)
+            .replace(&terminals, now)
+            .await
+            .expect("cross-host Message fixture operation succeeds");
         let inbox = daemon.message_inbox(NAMESPACE).await;
         for index in 0..3 {
             let intent = MessageSpec::builder()
@@ -15076,33 +15094,68 @@ mod tests {
                         .build(),
                 )
                 .await
-                .unwrap();
+                .expect("cross-host Message fixture operation succeeds");
             let result = wait_for_command_result(&mut events, command).await;
             assert!(matches!(result, CommandValue::ResourceObject(..)), "receiver admission failed: {result:?}");
         }
-        assert!(sender_backend.using::<Message>(NAMESPACE).list().await.unwrap().items.is_empty(), "intent is homed only at the receiver");
-        assert_eq!(backend.using::<Message>(NAMESPACE).list().await.unwrap().items.len(), 3);
-        inbox.reconcile_delivery(&runtime, now).await.unwrap();
+        assert!(
+            sender_backend
+                .using::<Message>(NAMESPACE)
+                .list()
+                .await
+                .expect("cross-host Message fixture operation succeeds")
+                .items
+                .is_empty(),
+            "intent is homed only at the receiver"
+        );
+        assert_eq!(backend.using::<Message>(NAMESPACE).list().await.expect("cross-host Message fixture operation succeeds").items.len(), 3);
+        inbox.reconcile_delivery(&runtime, now).await.expect("cross-host Message fixture operation succeeds");
         tokio::time::sleep(Duration::from_secs(6)).await;
-        inbox.reconcile_delivery(&runtime, now + chrono::Duration::seconds(1)).await.unwrap();
+        inbox
+            .reconcile_delivery(&runtime, now + chrono::Duration::seconds(1))
+            .await
+            .expect("cross-host Message fixture operation succeeds");
         assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
         assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
         {
-            let inputs = pool.inputs.lock().unwrap();
+            let inputs = pool.inputs.lock().expect("cross-host Message fixture operation succeeds");
             assert_eq!(inputs.len(), 1);
-            assert!(inputs[0].find("payload-0").unwrap() < inputs[0].find("payload-1").unwrap());
-            assert!(inputs[0].find("payload-1").unwrap() < inputs[0].find("payload-2").unwrap());
+            assert!(
+                inputs[0].find("payload-0").expect("cross-host Message fixture operation succeeds")
+                    < inputs[0].find("payload-1").expect("cross-host Message fixture operation succeeds")
+            );
+            assert!(
+                inputs[0].find("payload-1").expect("cross-host Message fixture operation succeeds")
+                    < inputs[0].find("payload-2").expect("cross-host Message fixture operation succeeds")
+            );
         }
-        assert_eq!(sessions.get("agent").await.unwrap().status.unwrap().attention.unwrap().state, TerminalAttentionState::Idle);
+        assert_eq!(
+            sessions
+                .get("agent")
+                .await
+                .expect("cross-host Message fixture operation succeeds")
+                .status
+                .expect("cross-host Message fixture operation succeeds")
+                .attention
+                .expect("cross-host Message fixture operation succeeds")
+                .state,
+            TerminalAttentionState::Idle
+        );
         pool.observations.store(1000, Ordering::SeqCst);
-        inbox.reconcile_delivery(&runtime, now + chrono::Duration::seconds(2)).await.unwrap();
-        inbox.reconcile_delivery(&runtime, now + chrono::Duration::seconds(4)).await.unwrap();
-        for message in backend.using::<Message>(NAMESPACE).list().await.unwrap().items {
-            let status = message.status.unwrap();
+        inbox
+            .reconcile_delivery(&runtime, now + chrono::Duration::seconds(2))
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        inbox
+            .reconcile_delivery(&runtime, now + chrono::Duration::seconds(4))
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        for message in backend.using::<Message>(NAMESPACE).list().await.expect("cross-host Message fixture operation succeeds").items {
+            let status = message.status.expect("cross-host Message fixture operation succeeds");
             assert_eq!(status.phase, MessagePhase::Delivered);
-            assert_eq!(status.resolved_receiver.unwrap().crew_id, "original-crew");
+            assert_eq!(status.resolved_receiver.expect("cross-host Message fixture operation succeeds").crew_id, "original-crew");
         }
-        assert!(runtime.state.terminal_deliveries.lock().unwrap().is_empty());
+        assert!(runtime.state.terminal_deliveries.lock().expect("cross-host Message fixture operation succeeds").is_empty());
         assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
     }
 
