@@ -184,6 +184,8 @@ impl CleatTerminalPool {
                     // client itself runs under the controlled envelope, so a daemon it starts is
                     // clean; only a daemon started elsewhere can leak ambient variables.
                     // Remove this fallback once fleet cleat supports --env-clear (flotilla#2756).
+                    // The probe result is cached for the pool's lifetime, so this warns once per
+                    // pool and an upgraded cleat is only picked up after a daemon restart.
                     tracing::warn!(binary = %self.binary, "cleat lacks --env-clear; launching without clearing inherited environment (cleat#318)");
                 }
                 Ok::<bool, String>(supported)
@@ -597,6 +599,8 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_launches_without_env_clear_when_cleat_lacks_it() {
+        // `--env` in the stub help is deliberately a prefix of `--env-clear`: the probe must match
+        // whole words, not substrings.
         let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("Usage: cleat launch [OPTIONS] --env".into()), Ok("{}".into())]));
         let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat", &EnvironmentBag::new());
 
