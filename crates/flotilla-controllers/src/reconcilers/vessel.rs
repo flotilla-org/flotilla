@@ -247,7 +247,8 @@ enum PlannedPatch {
 #[derive(Debug, Clone)]
 struct ImageStamp {
     image_ref: String,
-    image_digest: String,
+    local_image_id: String,
+    registry_digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1270,7 +1271,8 @@ impl Reconciler for VesselReconciler {
                 placement_decision: placement_decision.clone(),
                 environment_ref: Some(environment_ref.clone()),
                 image_ref: image.as_ref().map(|image| image.image_ref.clone()),
-                image_digest: image.as_ref().map(|image| image.image_digest.clone()),
+                local_image_id: image.as_ref().map(|image| image.local_image_id.clone()),
+                registry_digest: image.as_ref().and_then(|image| image.registry_digest.clone()),
                 checkout_refs: checkout_refs.clone(),
                 terminal_session_refs: terminal_session_refs.clone(),
                 requested_stance: *requested_stance,
@@ -1321,9 +1323,9 @@ fn image_stamp(environment: &ResourceObject<Environment>) -> Result<ImageStamp, 
     let status = environment.status.as_ref().expect("ready environment has status");
     let image_ref =
         status.image_ref.clone().ok_or_else(|| format!("environment {} is missing its image ref", environment.metadata.name))?;
-    let image_digest =
-        status.image_digest.clone().ok_or_else(|| format!("environment {} is missing its image digest", environment.metadata.name))?;
-    Ok(ImageStamp { image_ref, image_digest })
+    let local_image_id =
+        status.local_image_id.clone().ok_or_else(|| format!("environment {} is missing its image digest", environment.metadata.name))?;
+    Ok(ImageStamp { image_ref, local_image_id, registry_digest: status.registry_digest.clone() })
 }
 
 /// Git's ordinary upstream writes target the common config, even with

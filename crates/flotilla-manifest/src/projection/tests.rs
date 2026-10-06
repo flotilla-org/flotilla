@@ -2649,7 +2649,7 @@ fn placement_catalog_preserves_raw_facts(tc: hegel::TestCase) {
     row.configured_limits =
         Some(ConfiguredResourceLimits { cpus: contained.then_some(jobs), build_jobs: Some(jobs), linker_threads: Some(jobs) });
     row.image_ref = contained.then(|| "crew:latest".into());
-    row.image_digest = contained.then(|| "sha256:abcdef1234567890".into());
+    row.local_image_id = contained.then(|| "sha256:abcdef1234567890".into());
     row.crew = vec![CrewMemberSummary {
         role: "coder".into(),
         command_preview: "codex".into(),

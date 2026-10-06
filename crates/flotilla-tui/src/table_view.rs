@@ -1402,7 +1402,8 @@ fn vessel_description(row: &VesselProjection) -> Vec<DetailField> {
         DetailField { label: "Crew", value: vessel_crew(row).text },
         DetailField { label: "Host", value: row.vessel.host.as_ref().map(ToString::to_string).unwrap_or_default() },
         DetailField { label: "Image ref", value: row.vessel.image_ref.clone().unwrap_or_default() },
-        DetailField { label: "Image digest", value: row.vessel.image_digest.clone().unwrap_or_default() },
+        DetailField { label: "Local image ID", value: row.vessel.local_image_id.clone().unwrap_or_default() },
+        DetailField { label: "Registry digest", value: row.vessel.registry_digest.clone().unwrap_or_default() },
         DetailField { label: "Message", value: row.vessel.message.clone().unwrap_or_default() },
     ];
     fields.extend(readiness_details(&row.vessel.readiness));
@@ -1523,7 +1524,8 @@ mod tests {
             finished_at: None,
             message: None,
             image_ref: None,
-            image_digest: None,
+            local_image_id: None,
+            registry_digest: None,
         }
     }
 
@@ -1897,7 +1899,7 @@ mod tests {
     fn vessel_address_scopes_rows_without_changing_the_widget_contract() {
         let mut implement = vessel("implement", &[], WorkPhase::Running);
         implement.image_ref = Some("registry.example/crew:latest".to_string());
-        implement.image_digest = Some("sha256:test-image".to_string());
+        implement.local_image_id = Some("sha256:test-image".to_string());
         let in_project = convoy(vec![implement, vessel("review", &["implement"], WorkPhase::Pending)]);
         let mut elsewhere = convoy(vec![]);
         elsewhere.id = ConvoyId::new("dev", "elsewhere");
@@ -1912,7 +1914,7 @@ mod tests {
         assert!(implement.rows[0]
             .describe
             .contains(&DetailField { label: "Image ref", value: "registry.example/crew:latest".to_string() }));
-        assert!(implement.rows[0].describe.contains(&DetailField { label: "Image digest", value: "sha256:test-image".to_string() }));
+        assert!(implement.rows[0].describe.contains(&DetailField { label: "Local image ID", value: "sha256:test-image".to_string() }));
     }
 
     #[test]

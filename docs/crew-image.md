@@ -84,11 +84,42 @@ prevents the CLI from trying to spawn a local daemon if the host socket is
 unreachable; host-side managed terminals retain their normal self-healing
 spawn behavior.
 
-This document is curation advice for the Flotilla project. It is not a schema
-or a contract that Flotilla validates. Flotilla's contract stays deliberately
-narrow: a placement resolves an image and declares the adapters it promises,
-admission checks those declarations, and provisioning records the named image
-reference together with the immutable digest actually run.
+## Layer composition (generation 1)
+
+[ADR 0053](adr/0053-crew-images-compose-from-declared-layers-and-freeze-in-stages.md)
+records the replacement model. `ImageLayer` manifests declare a Dockerfile
+fragment by repository and full pinned commit, args, pins, `provides` and
+`requires`. Base/toolchain and utility layers have fixed parents; capability,
+harness and project fragments use `FROM ${BASE}`. Admission composes the
+minimum covering capability set in canonical order and refuses missing needs.
+
+The cut-over starts by authoring layers alongside the existing baseline.
+An optional selection on the baseline connects them to admission:
+
+```yaml
+spec:
+  image: <the current explicit baseline release tag>
+  layers:
+    base: fleet-base
+    utilities: fleet-utilities
+    harness: fleet-harness
+    project: flotilla-project
+```
+
+Each selected name must resolve to an `ImageLayer` Definition. Utilities,
+harness and project selections may be omitted. The baseline remains the
+running image in generation 1; layers add frozen composition metadata to
+placement snapshots and the convoy's `flotilla.work/frozen-image-layers`
+annotation. Existing baselines without `layers` and arbitrary literal images
+retain their existing behavior. This does not start image builds or retire the
+CI recipe; those transitions follow in #2728–#2731.
+
+Frozen revisions identify the source intent. A separate Merkle recipe key
+uses resolved parent identity, input-file content hashes, normalised args/pins
+and architecture, excluding host and checkout identity. Unpinned resolved
+inputs cannot receive a shareable key. Placement records `local_image_id`
+and, when available, `registry_digest` under their distinct names. The old
+`image_digest` status field still decodes for the one-generation window.
 
 ## Why these layers pay here
 

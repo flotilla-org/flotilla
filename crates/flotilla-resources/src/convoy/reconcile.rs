@@ -2074,7 +2074,8 @@ fn placement_status(workspace: &ResourceObject<Vessel>) -> PlacementStatus {
         }
         insert_optional_field(&mut fields, "environment_ref", status.environment_ref.clone());
         insert_optional_field(&mut fields, "image_ref", status.image_ref.clone());
-        insert_optional_field(&mut fields, "image_digest", status.image_digest.clone());
+        insert_optional_field(&mut fields, "local_image_id", status.local_image_id.clone());
+        insert_optional_field(&mut fields, "registry_digest", status.registry_digest.clone());
         if !status.checkout_refs.is_empty() {
             fields.insert("checkout_refs".to_string(), json!(status.checkout_refs));
         }

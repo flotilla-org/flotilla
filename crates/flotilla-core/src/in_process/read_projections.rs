@@ -32,7 +32,7 @@ use flotilla_resources::{
     bound_change_request_record_name, convoy_subject_rows, evaluate_landing_settlement, expected_change_request_leaves,
     expected_checkout_refs, repository_display_labels, resolve_project_issue_sources, ChangeRequestStatus, Checkout as ResourceCheckout,
     Clock, ConditionValue, Convoy as ResourceConvoy, ConvoyStatus, CrewMessageSender, CrewWorkPhase, Demand as ResourceDemand, DemandState,
-    EventRecorder, Forge, FulfilmentGrant, FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus,
+    EventRecorder, Forge, FulfilmentKind, FulfilmentRealisation, Host as ResourceHost, HostStatus as ResourceHostStatus,
     IssueSourceResolution, IssueSourceUnavailable, ManifestRoot, Project, ReadResourceObject, Repository, RepositoryKey, ResourceBackend,
     ResourceObject, ResourceProvenance, SettlementMode, TerminalAttentionState, TerminalSession as ResourceTerminalSession,
     TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource, Vessel, WorkPhase as ResourceWorkPhase, WorkflowTemplate,
@@ -288,21 +288,7 @@ impl ReadProjections<'_> {
                 continue;
             }
             let facts = facts_by_host.get(&kind.spec.host_ref).and_then(|status| status.fulfilment_facts.get(&kind.metadata.name));
-            let grants = kind
-                .spec
-                .grants
-                .iter()
-                .map(|grant| match grant {
-                    FulfilmentGrant::Platform(value) => format!("platform:{value}"),
-                    FulfilmentGrant::GuiSession => "gui_session".to_string(),
-                    FulfilmentGrant::Gpu => "gpu".to_string(),
-                    FulfilmentGrant::HostDevices => "host_devices".to_string(),
-                    FulfilmentGrant::Network(value) => format!("network:{value}"),
-                    FulfilmentGrant::HostAccountReach => "host_account_reach".to_string(),
-                    FulfilmentGrant::ContainerRuntime => "container_runtime".to_string(),
-                    FulfilmentGrant::Toolchain(value) => format!("toolchain:{value}"),
-                })
-                .collect();
+            let grants = kind.spec.grants.iter().map(|grant| grant.0.clone()).collect();
             let harnesses = facts
                 .map(|facts| {
                     facts
@@ -342,7 +328,7 @@ impl ReadProjections<'_> {
                 toolchains: facts.map(|facts| facts.toolchains.clone()).unwrap_or_default(),
                 gui_session_logged_in: facts.map(|facts| facts.gui_session_logged_in),
                 free_vessel_slots: facts.and_then(|facts| facts.free_vessel_slots),
-                image: facts.and_then(|facts| facts.image.clone()),
+                image: facts.and_then(|facts| facts.image.as_ref().map(|image| image.image_ref.clone())),
             };
             rows.insert((row.host_ref.clone(), row.name.clone()), row);
         }
@@ -1753,7 +1739,7 @@ mod tests {
                 &FulfilmentKindSpec::builder()
                     .host_ref("local-id".to_string())
                     .pool("cleat".to_string())
-                    .grants(BTreeSet::from([FulfilmentGrant::Platform("linux".to_string())]))
+                    .grants(BTreeSet::from([flotilla_resources::FulfilmentGrant::platform("linux".to_string())]))
                     .realisation(FulfilmentRealisation::HostDirect)
                     .build(),
             )

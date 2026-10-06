@@ -4270,3 +4270,5 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
     assert_eq!(response.rows[0].rung, Some(flotilla_protocol::StallRung::Operator));
     assert_eq!(response.rows[0].evidence, "GitHub rate limit");
 }
+
+mod image_layers;

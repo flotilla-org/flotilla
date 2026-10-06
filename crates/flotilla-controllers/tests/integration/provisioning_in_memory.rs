@@ -58,7 +58,8 @@ impl DockerEnvironmentRuntime for FakeDockerRuntime {
             configured_limits: Some(ConfiguredResourceLimits { cpus: Some(4), build_jobs: Some(4), linker_threads: Some(4) }),
             container_id: format!("container-{name}"),
             image_ref: spec.image.clone(),
-            image_digest: "sha256:test-image".to_string(),
+            local_image_id: "sha256:test-image".to_string(),
+            registry_digest: None,
         })
     }
 
@@ -628,7 +629,7 @@ async fn environment_controller_marks_docker_environment_ready() {
                         if status.phase == EnvironmentPhase::Ready
                             && status.docker_container_id.as_deref() == Some("container-docker-env")
                             && status.image_ref.as_deref() == Some("ghcr.io/flotilla/dev:latest")
-                            && status.image_digest.as_deref() == Some("sha256:test-image")
+                            && status.local_image_id.as_deref() == Some("sha256:test-image")
                 )
             }
         })

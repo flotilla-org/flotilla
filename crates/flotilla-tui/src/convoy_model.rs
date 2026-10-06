@@ -163,7 +163,8 @@ pub struct VesselSummary {
     pub finished_at: Option<Timestamp>,
     pub message: Option<String>,
     pub image_ref: Option<String>,
-    pub image_digest: Option<String>,
+    pub local_image_id: Option<String>,
+    pub registry_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -268,7 +269,8 @@ fn vessel_summary(row: &wire::ConvoyRow, vessel: &wire::VesselRow) -> VesselSumm
         finished_at: vessel.finished_at,
         message: vessel.message.clone(),
         image_ref: vessel.image_ref.clone(),
-        image_digest: vessel.image_digest.clone(),
+        local_image_id: vessel.local_image_id.clone(),
+        registry_digest: vessel.registry_digest.clone(),
     }
 }
 

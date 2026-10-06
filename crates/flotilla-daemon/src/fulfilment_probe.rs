@@ -149,7 +149,8 @@ pub(crate) async fn probe_kind(
     scratch: &Path,
     model_probes: &mut ModelProbeState,
 ) -> Result<FulfilmentFacts, String> {
-    let mut facts = FulfilmentFacts { image: image.map(ToString::to_string), observed_at: Utc::now(), ..FulfilmentFacts::default() };
+    let mut facts =
+        FulfilmentFacts { image: image.map(|image| image.to_string().into()), observed_at: Utc::now(), ..FulfilmentFacts::default() };
     // This daemon-owned directory has no checkout. Never let a harness
     // discover a project from the root or the operator's home directory.
     let scratch_name = scratch.to_string_lossy();
@@ -162,7 +163,7 @@ pub(crate) async fn probe_kind(
     if !runner.run_output("mkdir", &["-p", &scratch_name], parent, &ChannelLabel::Default).await.is_ok_and(|output| output.success()) {
         return Err(format!("cannot create probe scratch directory {} from parent {}", scratch.display(), parent.display()));
     }
-    let mut image_digest = None;
+    let mut local_image_id = None;
     if matches!(spec.realisation, FulfilmentRealisation::DockerPerVessel { .. }) {
         let Some(image) = image else { return Ok(facts) };
         let inspected = tokio::time::timeout(
@@ -173,16 +174,28 @@ pub(crate) async fn probe_kind(
         .ok()
         .and_then(Result::ok);
         facts.image_present = inspected.as_ref().map(|output| output.success());
-        image_digest = inspected.as_ref().and_then(|output| {
+        local_image_id = inspected.as_ref().and_then(|output| {
             serde_json::from_str::<serde_json::Value>(&output.stdout).ok()?.get(0)?.get("Id")?.as_str().map(ToString::to_string)
         });
+        if let Some(image) = facts.image.as_mut() {
+            image.local_image_id = local_image_id.clone();
+            image.registry_digest = inspected.as_ref().and_then(|output| {
+                serde_json::from_str::<serde_json::Value>(&output.stdout)
+                    .ok()?
+                    .get(0)?
+                    .get("RepoDigests")?
+                    .get(0)?
+                    .as_str()
+                    .map(str::to_owned)
+            });
+        }
         if facts.image_present != Some(true) {
             return Ok(facts);
         }
     }
     if matches!(spec.realisation, FulfilmentRealisation::HostDirect) {
         facts.gui_session_logged_in = env.get("DISPLAY").is_some() || env.get("WAYLAND_DISPLAY").is_some();
-        if !facts.gui_session_logged_in && spec.grants.contains(&FulfilmentGrant::Platform(Platform::Macos.to_string())) {
+        if !facts.gui_session_logged_in && spec.grants.contains(&FulfilmentGrant::platform(Platform::Macos.to_string())) {
             // Aqua does not advertise a display variable. A logged-in user's
             // launchd GUI domain is the host-native signal for that session.
             if let Ok(output) = run_in_realisation(runner, &spec.realisation, image, "id", &["-u"], scratch).await {
@@ -231,8 +244,11 @@ pub(crate) async fn probe_kind(
                 FulfilmentRealisation::DockerPerVessel { .. } => "image-contained".to_string(),
             };
             for model in declared_models(env) {
-                let key =
-                    format!("{harness}:{}:{}:{credential}:{model}", observed.version, image_digest.as_deref().or(image).unwrap_or("host"));
+                let key = format!(
+                    "{harness}:{}:{}:{credential}:{model}",
+                    observed.version,
+                    local_image_id.as_deref().or(image).unwrap_or("host")
+                );
                 if let Some(cached) = cached_or_budgeted_model(model_probes, &key, Utc::now()) {
                     if let Some(fact) = cached {
                         observed.models.insert(model, fact);
@@ -328,7 +344,7 @@ mod tests {
         FulfilmentKindSpec::builder()
             .host_ref("feta".to_string())
             .pool("cleat".to_string())
-            .grants(BTreeSet::from([FulfilmentGrant::Platform("linux".to_string())]))
+            .grants(BTreeSet::from([FulfilmentGrant::platform("linux".to_string())]))
             .realisation(FulfilmentRealisation::DockerPerVessel { image: "crew:test".into() })
             .build()
     }
@@ -348,7 +364,7 @@ mod tests {
         )
         .await
         .expect("probe succeeds");
-        assert_eq!(facts.image.as_deref(), Some("crew:missing"));
+        assert_eq!(facts.image.as_ref().map(|image| image.image_ref.as_str()), Some("crew:missing"));
         assert_eq!(facts.image_present, Some(false));
         assert!(facts.harnesses.is_empty());
     }
@@ -430,7 +446,7 @@ mod tests {
         let spec = FulfilmentKindSpec::builder()
             .host_ref("kiwi".to_string())
             .pool("cleat".to_string())
-            .grants(BTreeSet::from([FulfilmentGrant::Platform("macos".to_string())]))
+            .grants(BTreeSet::from([FulfilmentGrant::platform("macos".to_string())]))
             .realisation(FulfilmentRealisation::HostDirect)
             .build();
         let env = TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]);

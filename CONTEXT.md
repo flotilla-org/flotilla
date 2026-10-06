@@ -184,9 +184,9 @@ _Avoid_: Permission mode, sandbox flag (those are harness spellings),
 trusted/contained as workflow words.
 
 **Capability Need**:
-A capability a role's work requires, such as `platform: windows`,
-`gui_session`, `gpu`, `harness: claude-code >= X` or `toolchain: <name>`
-(ADR 0046). Needs attach to roles and compose by union across layers that
+A namespaced capability a role's work requires, such as `platform:linux`,
+`display:headless-x11`, `harness:codex>=0.160.0` or `toolchain:rust`
+(ADRs 0046 and 0053). Needs attach to roles and compose by union across layers that
 only add: template role, project, issue, derived, dispatch. The result is
 frozen at admission. An uncovered need refuses admission by name.
 _Avoid_: Stance, trust level (provenance proves little; the principle is
@@ -726,3 +726,18 @@ HTTP-over-UDS (and, for cleat, a C ABI for native embedding):
   surfaces.
 - **uishell** — native UI shell (RAD-derived) that composes Panels/Views and
   embeds cleat; the intended premier interface to Flotilla.
+
+**Image Layer**:
+An independently versioned contribution to a crew image. It declares the
+capabilities it provides and what must be available beneath it (ADR 0053).
+_Avoid_: composed image definition (compositions are computed).
+
+**Image Composition**:
+The base, utilities, needed capabilities, harness and project layers selected
+for a vessel's need-set, in canonical order. Convoy members share the frozen
+base and harness; newly needed capabilities extend the frozen selection.
+
+**Recipe Key**:
+The identity of resolved build inputs and their parent chain for one target
+architecture. Equal pinned inputs share a key across hosts; the key is distinct
+from the actual built image identity.

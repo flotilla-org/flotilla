@@ -56,7 +56,11 @@ pub struct VesselStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_digest: Option<String>,
+    // ADR 0047: remove image_digest alias one roll after generation 1.
+    #[serde(alias = "image_digest")]
+    pub local_image_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_digest: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checkout_refs: BTreeMap<RepositoryKey, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -104,7 +108,8 @@ pub enum VesselStatusPatch {
         placement_decision: Option<PlacementDecision>,
         environment_ref: Option<String>,
         image_ref: Option<String>,
-        image_digest: Option<String>,
+        local_image_id: Option<String>,
+        registry_digest: Option<String>,
         checkout_refs: BTreeMap<RepositoryKey, String>,
         terminal_session_refs: Vec<String>,
         requested_stance: Stance,
@@ -145,7 +150,8 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 placement_decision,
                 environment_ref,
                 image_ref,
-                image_digest,
+                local_image_id,
+                registry_digest,
                 checkout_refs,
                 terminal_session_refs,
                 requested_stance,
@@ -159,7 +165,8 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
                 }
                 status.environment_ref = environment_ref.clone();
                 status.image_ref = image_ref.clone();
-                status.image_digest = image_digest.clone();
+                status.local_image_id = local_image_id.clone();
+                status.registry_digest = registry_digest.clone();
                 status.checkout_refs = checkout_refs.clone();
                 status.terminal_session_refs = terminal_session_refs.clone();
                 status.interrupted_roles.clear();

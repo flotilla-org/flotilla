@@ -11,7 +11,7 @@ async fn contract(backend: ResourceBackend) {
     let spec = FulfilmentKindSpec::builder()
         .host_ref("feta".to_string())
         .pool("cleat".to_string())
-        .grants(BTreeSet::from([FulfilmentGrant::Platform("linux".to_string()), FulfilmentGrant::Network("scoped".to_string())]))
+        .grants(BTreeSet::from([FulfilmentGrant::platform("linux".to_string()), FulfilmentGrant::network("scoped".to_string())]))
         .realisation(FulfilmentRealisation::DockerPerVessel { image: "crew:v1".into() })
         .build();
     let created = kinds.create(&InputMeta::builder().name("docker-crew-image-feta".to_string()).build(), &spec).await.expect("create kind");
@@ -56,14 +56,14 @@ fn live_policy_set_migrates_to_kinds() {
     for name in ["docker-crew-image-feta", "docker-on-feta"] {
         let kind = FulfilmentKindSpec::from_policy(&docker, "macos").expect(name);
         assert_eq!(kind.realisation, FulfilmentRealisation::DockerPerVessel { image: "crew:v1".into() });
-        assert!(kind.grants.contains(&FulfilmentGrant::Platform("linux".to_string())));
-        assert!(kind.grants.contains(&FulfilmentGrant::Network("scoped".to_string())));
+        assert!(kind.grants.contains(&FulfilmentGrant::platform("linux".to_string())));
+        assert!(kind.grants.contains(&FulfilmentGrant::network("scoped".to_string())));
     }
     let kind = FulfilmentKindSpec::from_policy(&direct, "macos").expect("host-direct-kiwi");
     assert_eq!(kind.realisation, FulfilmentRealisation::HostDirect);
-    assert!(kind.grants.contains(&FulfilmentGrant::HostAccountReach));
-    assert!(kind.grants.contains(&FulfilmentGrant::Platform("macos".to_string())));
-    assert!(kind.grants.contains(&FulfilmentGrant::GuiSession));
+    assert!(kind.grants.contains(&FulfilmentGrant::host_account_reach()));
+    assert!(kind.grants.contains(&FulfilmentGrant::platform("macos".to_string())));
+    assert!(kind.grants.contains(&FulfilmentGrant::gui_session()));
 }
 
 #[test]

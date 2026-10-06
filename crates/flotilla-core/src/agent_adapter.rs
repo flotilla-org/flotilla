@@ -616,7 +616,7 @@ impl AdapterFlavor {
 
     fn autonomy_args(&self, grants: Option<&BTreeSet<FulfilmentGrant>>) -> &'static [&'static str] {
         let may_run_unattended = grants.is_none_or(|grants| {
-            grants.contains(&FulfilmentGrant::HostAccountReach) || grants.contains(&FulfilmentGrant::Network("scoped".to_string()))
+            grants.contains(&FulfilmentGrant::host_account_reach()) || grants.contains(&FulfilmentGrant::network("scoped".to_string()))
         });
         if !may_run_unattended {
             return &[];
@@ -1883,7 +1883,7 @@ mod tests {
         assert_eq!(plan.stance, "trusted-implicit");
         let restricted = codex
             .launch(&AgentLaunchRequest {
-                fulfilment_grants: Some(BTreeSet::from([flotilla_resources::FulfilmentGrant::Platform("linux".to_string())])),
+                fulfilment_grants: Some(BTreeSet::from([flotilla_resources::FulfilmentGrant::platform("linux".to_string())])),
                 role: "coder".into(),
                 model: None,
                 brief: brief.clone(),

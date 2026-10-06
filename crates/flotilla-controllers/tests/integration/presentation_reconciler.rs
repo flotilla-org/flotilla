@@ -904,8 +904,14 @@ async fn create_ready_host_direct_env(backend: &ResourceBackend, name: &str) {
         .await
         .expect("env create should succeed");
     let mut status = EnvironmentStatus::default();
-    EnvironmentStatusPatch::MarkReady { configured_limits: None, docker_container_id: None, image_ref: None, image_digest: None }
-        .apply(&mut status);
+    EnvironmentStatusPatch::MarkReady {
+        configured_limits: None,
+        docker_container_id: None,
+        image_ref: None,
+        local_image_id: None,
+        registry_digest: None,
+    }
+    .apply(&mut status);
     environments.update_status(name, &created.metadata.resource_version, &status).await.expect("env status update should succeed");
 }
 
@@ -932,7 +938,8 @@ async fn create_ready_docker_env(backend: &ResourceBackend, name: &str) {
         configured_limits: None,
         docker_container_id: Some("container-docker-env".to_string()),
         image_ref: Some("ubuntu:24.04".to_string()),
-        image_digest: Some("sha256:test-image".to_string()),
+        local_image_id: Some("sha256:test-image".to_string()),
+        registry_digest: None,
     }
     .apply(&mut status);
     environments.update_status(name, &created.metadata.resource_version, &status).await.expect("env status update should succeed");

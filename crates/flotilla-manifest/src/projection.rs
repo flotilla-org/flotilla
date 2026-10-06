@@ -1066,13 +1066,13 @@ fn project_vessel(
         (KEY_VESSEL_ENV, vessel.environment_ref.as_ref()),
         (KEY_VESSEL_STANCE, vessel.effective_stance.as_ref()),
         (KEY_VESSEL_IMAGE_REF, vessel.image_ref.as_ref()),
-        (KEY_VESSEL_IMAGE_DIGEST, vessel.image_digest.as_ref()),
+        (KEY_VESSEL_IMAGE_DIGEST, vessel.local_image_id.as_ref()),
     ] {
         if let Some(value) = value {
             facts.push((key, MetadataValue::text(value)));
         }
     }
-    if let Some(digest) = &vessel.image_digest {
+    if let Some(digest) = &vessel.local_image_id {
         let digest = digest.split_once(':').map_or(digest.as_str(), |(_, value)| value);
         facts.push((KEY_VESSEL_IMAGE_SHORT_DIGEST, MetadataValue::text(digest.chars().take(12).collect::<String>())));
     }

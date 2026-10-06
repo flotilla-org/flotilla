@@ -8,6 +8,8 @@ Accepted
 
 Grilled 2026-09-27 on #2075 (rulings recorded there). Amends ADR 0007, ADR 0010 and one clause of ADR 0044 §2. Builds on ADR 0044 (grants select on the work; delivery follows fulfilment).
 
+Amended by [ADR 0053](0053-crew-images-compose-from-declared-layers-and-freeze-in-stages.md): grants use open namespaced capabilities, admission composes and freezes image layers from declared needs, and builds run outside step plans. Generation 1 keeps the selected crew-image baseline authoritative.
+
 ## Context
 
 A workflow's **shape** (its roles, handoffs, and what counts as done) is fused with its **fulfilment** (how and where each vessel runs):

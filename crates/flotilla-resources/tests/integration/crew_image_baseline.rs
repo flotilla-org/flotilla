@@ -43,10 +43,10 @@ async fn crew_image_baseline_merged_resolution_contract(#[case] backend: Resourc
 
     // Concurrent incompatible edits must not silently select a merge winner.
     let meta = InputMeta::builder().name("fleet-crew".to_string()).build();
-    definitions.apply(&meta, &CrewImageBaselineSpec { image: "crew:v2-a".to_string() }).await.expect("local bump");
+    definitions.apply(&meta, &CrewImageBaselineSpec { image: "crew:v2-a".to_string(), layers: None }).await.expect("local bump");
     remote
         .definitions::<CrewImageBaseline>("flotilla")
-        .apply(&meta, &CrewImageBaselineSpec { image: "crew:v2-b".to_string() })
+        .apply(&meta, &CrewImageBaselineSpec { image: "crew:v2-b".to_string(), layers: None })
         .await
         .expect("remote bump");
     replicas
@@ -54,10 +54,10 @@ async fn crew_image_baseline_merged_resolution_contract(#[case] backend: Resourc
         .await
         .expect("replicate conflict");
     assert!(reference.resolve(&definitions).await.expect_err("conflict").contains("image-baseline `fleet-crew` missing/unresolved"));
-    definitions.apply(&meta, &CrewImageBaselineSpec { image: "crew:v3".to_string() }).await.expect("resolve conflict");
+    definitions.apply(&meta, &CrewImageBaselineSpec { image: "crew:v3".to_string(), layers: None }).await.expect("resolve conflict");
     assert_eq!(reference.resolve(&definitions).await.expect("resolved baseline"), "crew:v3");
 
-    definitions.apply(&meta, &CrewImageBaselineSpec { image: "  ".to_string() }).await.expect("empty image");
+    definitions.apply(&meta, &CrewImageBaselineSpec { image: "  ".to_string(), layers: None }).await.expect("empty image");
     assert!(reference.resolve(&definitions).await.expect_err("empty").contains("missing/unresolved"));
     definitions.delete("fleet-crew").await.expect("delete baseline");
     assert!(reference.resolve(&definitions).await.expect_err("deleted").contains("missing/unresolved"));

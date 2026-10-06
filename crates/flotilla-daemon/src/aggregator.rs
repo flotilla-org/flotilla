@@ -2469,8 +2469,8 @@ impl Aggregator {
             .map(str::to_string);
         let image_ref =
             placement.and_then(|placement| placement.fields.get("image_ref")).and_then(serde_json::Value::as_str).map(str::to_string);
-        let image_digest =
-            placement.and_then(|placement| placement.fields.get("image_digest")).and_then(serde_json::Value::as_str).map(str::to_string);
+        let local_image_id =
+            placement.and_then(|placement| placement.fields.get("local_image_id")).and_then(serde_json::Value::as_str).map(str::to_string);
         let crew = definition
             .crew
             .iter()
@@ -2616,7 +2616,13 @@ impl Aggregator {
             .maybe_requested_stance(requested_stance)
             .maybe_effective_stance(effective_stance)
             .maybe_image_ref(image_ref)
-            .maybe_image_digest(image_digest)
+            .maybe_local_image_id(local_image_id)
+            .maybe_registry_digest(
+                placement
+                    .and_then(|placement| placement.fields.get("registry_digest"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            )
             .depends_on(definition.depends_on.clone())
             .host(vessel_host.clone())
             .maybe_attach(self.vessel_attach(&convoy_ref.namespace, &convoy_ref.name, &definition.name))
@@ -5916,7 +5922,7 @@ mod tests {
                 ("requested_stance".to_string(), serde_json::json!("workspace-write")),
                 ("effective_stance".to_string(), serde_json::json!("contained")),
                 ("image_ref".to_string(), serde_json::json!("registry.example/crew:latest")),
-                ("image_digest".to_string(), serde_json::json!("sha256:test-image")),
+                ("local_image_id".to_string(), serde_json::json!("sha256:test-image")),
                 ("environment_ref".to_string(), serde_json::json!("env-work")),
                 ("configured_limits".to_string(), serde_json::json!({"cpus": 4, "build_jobs": 4, "linker_threads": 4})),
             ]),
@@ -5927,7 +5933,7 @@ mod tests {
         assert_eq!(vessel.requested_stance.as_deref(), Some("workspace-write"));
         assert_eq!(vessel.effective_stance.as_deref(), Some("contained"));
         assert_eq!(vessel.image_ref.as_deref(), Some("registry.example/crew:latest"));
-        assert_eq!(vessel.image_digest.as_deref(), Some("sha256:test-image"));
+        assert_eq!(vessel.local_image_id.as_deref(), Some("sha256:test-image"));
         // #2650: frozen placement facts remain visible even when the terminal
         // replica has not arrived; unknown launch adapter/model stay absent.
         assert_eq!(vessel.environment_ref.as_deref(), Some("env-work"));

@@ -1297,9 +1297,9 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
             requested_stance: Stance::Contained,
             effective_stance: Stance::Contained,
             image_ref: Some(ref image_ref),
-            image_digest: Some(ref image_digest),
+            local_image_id: Some(ref local_image_id),
             ..
-        }) if image_ref == "ghcr.io/flotilla/dev:latest" && image_digest == "sha256:test-image"
+        }) if image_ref == "ghcr.io/flotilla/dev:latest" && local_image_id == "sha256:test-image"
     ));
 }
 
@@ -2993,7 +2993,7 @@ async fn fleet_image_baseline_bump_provisions_on_three_hosts_without_policy_edit
         hosts[0]
             .0
             .definitions::<CrewImageBaseline>(NAMESPACE)
-            .apply(&meta("fleet-crew"), &CrewImageBaselineSpec { image: image.to_string() })
+            .apply(&meta("fleet-crew"), &CrewImageBaselineSpec { image: image.to_string(), layers: None })
             .await
             .expect("single fleet edit");
         let listed = hosts[0].0.using::<CrewImageBaseline>(NAMESPACE).list().await.expect("authored definitions");
@@ -3034,7 +3034,7 @@ async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: 
 
     let backend = ResourceBackend::InMemory(Default::default());
     let baselines = backend.definitions::<CrewImageBaseline>(NAMESPACE);
-    baselines.apply(&meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v1".to_string() }).await.expect("baseline");
+    baselines.apply(&meta("fleet-crew"), &CrewImageBaselineSpec { image: "crew:v1".to_string(), layers: None }).await.expect("baseline");
     let mut convoy = create_convoy_with_single_task(&backend, NAMESPACE, "convoy", "implement", REPO_URL, GIT_REF).await;
     convoy.spec.repositories.clear();
     let convoy = backend
