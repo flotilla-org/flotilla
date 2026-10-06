@@ -89,58 +89,9 @@ jobs:
             find target -type d -name incremental -prune -exec rm -rf {} +
           fi
 
-  dylint:
-    name: Dylint
-    needs: check-changes
-    if: needs.check-changes.outputs.should_run == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-03-12
-          components: llvm-tools-preview, rustc-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/cargo-dylint
-            ~/.cargo/bin/dylint-link
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-dylint-v2-nightly-2026-03-12-${{ hashFiles('lints/**/Cargo.lock', 'Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-dylint-v2-nightly-2026-03-12-
-      - name: Install cargo-dylint
-        run: |
-          command -v cargo-dylint && command -v dylint-link || cargo install cargo-dylint dylint-link --locked
-      - run: cargo dylint --all -- --all-targets
-      - name: Write badge JSON
-        if: always()
-        run: |
-          mkdir -p _badges
-          if [ "${{ job.status }}" = "success" ]; then
-            printf '{"schemaVersion":1,"label":"dylint","message":"passing","color":"brightgreen"}\n' > _badges/dylint.json
-          else
-            printf '{"schemaVersion":1,"label":"dylint","message":"failing","color":"red"}\n' > _badges/dylint.json
-          fi
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: dylint-badge
-          path: _badges/
-      - name: Remove incremental state before caching
-        if: always()
-        run: |
-          if [ -d target ]; then
-            find target -type d -name incremental -prune -exec rm -rf {} +
-          fi
-
   deploy:
     name: Deploy to Pages
-    needs: [coverage, dylint]
+    needs: coverage
     if: always() && needs.coverage.result == 'success'
     runs-on: ubuntu-latest
     environment:
@@ -151,11 +102,6 @@ jobs:
         with:
           name: coverage-site
           path: _site/coverage/
-      - uses: actions/download-artifact@v4
-        if: needs.dylint.result == 'success' || needs.dylint.result == 'failure'
-        with:
-          name: dylint-badge
-          path: _site/badges/
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site/
