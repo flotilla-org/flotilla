@@ -12,7 +12,7 @@ use flotilla_resources::{
     TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, Vessel, ACTUATOR_HOST_REF_ANNOTATION,
     ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG,
     CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
-    TERMINAL_DELIVERY_NOT_SUBMITTED_REASON, TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
+    TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON, TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -344,6 +344,23 @@ pub enum TerminalPrepared {
 }
 
 const DELIVERY_MAX_ATTEMPTS: u32 = 3;
+// Ambiguous writes are never retried. Allow late evidence for five minutes,
+// then surface a durable failure for explicit intervention.
+const DELIVERY_HOLD_FOR: chrono::Duration = chrono::Duration::minutes(5);
+
+fn pending_delivery_hold(session: &ResourceObject<TerminalSession>) -> Option<&flotilla_resources::TerminalSessionDegradedCondition> {
+    let status = session.status.as_ref()?;
+    let condition = status.degraded.as_ref()?;
+    if status.phase != TerminalSessionPhase::Running
+        || !matches!(condition.reason.as_str(), TERMINAL_DELIVERY_UNCONFIRMED_REASON | TERMINAL_DELIVERY_EXPIRED_REASON)
+    {
+        return None;
+    }
+    let TerminalSessionSource::Agent { message: Some(head), .. } = &session.spec.source else { return None };
+    head.next_after(status.delivered_message_id.as_deref())
+        .filter(|message| condition.message_id.as_deref() == Some(message.id.as_str()))
+        .map(|_| condition)
+}
 
 fn delivery_retry_delay(failures: u32) -> Duration {
     Duration::from_secs(60 * (1_u64 << failures.saturating_sub(1).min(2)))
@@ -398,6 +415,24 @@ where
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
+        let hold_overdue = pending_delivery_hold(obj).is_some_and(|condition| {
+            condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
+                && Utc::now().signed_duration_since(condition.observed_at) >= DELIVERY_HOLD_FOR
+        });
+        // An unavailable observer cannot keep an unresolved hold alive forever.
+        // Before its deadline retain the ordinary provider-error retry policy.
+        macro_rules! observe {
+            ($future:expr) => {
+                match $future.await {
+                    Ok(value) => value,
+                    Err(error) if hold_overdue => {
+                        tracing::warn!(%error, session = %obj.metadata.name, "delivery confirmation deadline elapsed while observer unavailable");
+                        return Ok(TerminalPrepared::MessageDeliveryPending);
+                    }
+                    Err(error) => return Err(ResourceError::other(error)),
+                }
+            };
+        }
         if retirement_pending(obj) {
             let status = obj.status.as_ref().expect("retirement requires status");
             let mut retired = true;
@@ -422,11 +457,9 @@ where
             && matches!(obj.spec.source, TerminalSessionSource::Agent { .. })
         {
             if let Some(crew) = obj.status.as_ref().and_then(|status| status.crew.as_ref()) {
-                if let Some(code) = self.runtime.agent_exit_code(&obj.spec, crew).await.map_err(ResourceError::other)? {
+                if let Some(code) = observe!(self.runtime.agent_exit_code(&obj.spec, crew)) {
                     let session_id = obj.status.as_ref().and_then(|status| status.session_id.as_deref()).unwrap_or_default();
-                    if let Some(message) =
-                        self.runtime.agent_exit_failure(session_id, &obj.spec, code).await.map_err(ResourceError::other)?
-                    {
+                    if let Some(message) = observe!(self.runtime.agent_exit_failure(session_id, &obj.spec, code)) {
                         return Ok(TerminalPrepared::Failed(message));
                     }
                     if phase == TerminalSessionPhase::Running {
@@ -441,13 +474,14 @@ where
                 .as_ref()
                 .and_then(|status| status.session_id.as_deref())
                 .ok_or_else(|| ResourceError::other("running terminal session has no session id"))?;
-            match self.runtime.session_liveness(session_id, &obj.spec).await.map_err(ResourceError::other)? {
+            match observe!(self.runtime.session_liveness(session_id, &obj.spec)) {
                 TerminalLiveness::Running => {}
                 TerminalLiveness::Stopped => return Ok(TerminalPrepared::Stopped),
                 TerminalLiveness::Lost(reason) => return Ok(TerminalPrepared::Lost(reason)),
+                TerminalLiveness::Unavailable(_) if hold_overdue => return Ok(TerminalPrepared::MessageDeliveryPending),
                 TerminalLiveness::Unavailable(message) => return Err(ResourceError::other(message)),
             }
-            if let Some(message) = self.runtime.observe_failure(session_id, &obj.spec).await.map_err(ResourceError::other)? {
+            if let Some(message) = observe!(self.runtime.observe_failure(session_id, &obj.spec)) {
                 return Ok(TerminalPrepared::Failed(message));
             }
             if let flotilla_resources::TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
@@ -455,20 +489,36 @@ where
                     if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
                         condition.message_id.as_deref() == Some(message.id.as_str())
                             && (condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
+                                || condition.reason == TERMINAL_DELIVERY_EXPIRED_REASON
                                 || (condition.reason == TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
                                     && (condition.consecutive_failures >= DELIVERY_MAX_ATTEMPTS
                                         || Utc::now().signed_duration_since(condition.observed_at)
                                             < chrono::Duration::from_std(delivery_retry_delay(condition.consecutive_failures))
                                                 .unwrap_or(chrono::Duration::MAX))))
                     }) {
-                        return Ok(TerminalPrepared::None);
+                        return Ok(match self.runtime.observe_attention(session_id, &obj.spec).await {
+                            Ok(Some(observation)) => TerminalPrepared::Attention(observation),
+                            Ok(None) => TerminalPrepared::MessageDeliveryPending,
+                            Err(error) => {
+                                tracing::warn!(%session_id, %error, "attention observation failed during held delivery");
+                                TerminalPrepared::MessageDeliveryPending
+                            }
+                        });
                     }
                     // A continuous attention signal must not starve a queued handoff.
                     // Delivery is deliberately at-least-once. A crash after the pool accepts the
                     // message but before MarkMessageDelivered is persisted may redeliver it; losing
                     // a handoff is worse, and exactly-once requires acknowledgement by the agent.
-                    let is_first_unobserved_delivery =
-                        obj.status.as_ref().is_none_or(|status| status.delivered_message_id.is_none() && status.attention.is_none());
+                    // Attention collected during a known-unsent startup retry
+                    // must not turn its bounded deadline into an unlimited wait.
+                    let is_first_unobserved_delivery = obj.status.as_ref().is_none_or(|status| {
+                        status.delivered_message_id.is_none()
+                            && (status.attention.is_none()
+                                || status.degraded.as_ref().is_some_and(|condition| {
+                                    condition.reason == TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
+                                        && condition.message_id.as_deref() == Some(message.id.as_str())
+                                }))
+                    });
                     let readiness = if is_first_unobserved_delivery {
                         TerminalDeliveryReadiness::Startup
                     } else {
@@ -616,7 +666,22 @@ where
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);
+        // Delivery bookkeeping must never override liveness or owner teardown.
+        let held = pending_delivery_hold(obj).filter(|_| {
+            matches!(prepared, TerminalPrepared::Attention(_) | TerminalPrepared::MessageDeliveryPending | TerminalPrepared::None)
+        });
+        let consumed = held.is_some_and(|condition| {
+            held_delivery_consumed(obj.status.as_ref().expect("held status"), prepared, condition.observed_at, now)
+        });
+        let expired = held.is_some_and(|condition| {
+            condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
+                && now.signed_duration_since(condition.observed_at) >= DELIVERY_HOLD_FOR
+        });
         let patch = match phase {
+            TerminalSessionPhase::Running if consumed => Some(TerminalSessionStatusPatch::MarkMessageDelivered {
+                message_id: held.and_then(|condition| condition.message_id.clone()).expect("held delivery message"),
+            }),
+            TerminalSessionPhase::Running if expired => Some(TerminalSessionStatusPatch::MarkDeliveryExpired),
             _ if matches!(prepared, TerminalPrepared::ReceiptsRetired) => Some(TerminalSessionStatusPatch::ClearRetiredLaunches),
             TerminalSessionPhase::Starting | TerminalSessionPhase::Running if matches!(prepared, TerminalPrepared::OwnerTerminal) => {
                 Some(TerminalSessionStatusPatch::MarkFailed {
@@ -779,9 +844,7 @@ where
             obj.status
                 .as_ref()
                 .and_then(|status| status.degraded.as_ref())
-                .is_some_and(|condition| {
-                    condition.reason != TERMINAL_DELIVERY_UNCONFIRMED_REASON && condition.reason != TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
-                })
+                .is_some_and(|condition| !condition.is_delivery())
                 .then_some(TerminalSessionStatusPatch::ClearReconcileDegraded)
         });
 
@@ -798,6 +861,28 @@ where
             }
             _ => Vec::new(),
         };
+        let delivery_failure_visible = obj
+            .status
+            .as_ref()
+            .and_then(|status| status.degraded.as_ref())
+            .is_some_and(|condition| condition.reason == TERMINAL_DELIVERY_EXPIRED_REASON);
+        if delivery_failure_visible
+            && (consumed
+                || matches!(
+                    prepared,
+                    TerminalPrepared::MessageDelivered(_)
+                        | TerminalPrepared::Stopped
+                        | TerminalPrepared::AgentExited(_)
+                        | TerminalPrepared::Lost(_)
+                        | TerminalPrepared::OwnerTerminal
+                        | TerminalPrepared::Failed(_)
+                )
+                || matches!(phase, TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed | TerminalSessionPhase::Lost))
+        {
+            actuations.push(Actuation::DeleteDemand { name: delivery_demand_name(obj) });
+        } else if expired {
+            actuations.push(terminal_demand_actuation(obj, delivery_demand_name(obj)));
+        }
         if let TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
             let delivered = obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
             if delivered.is_some_and(|id| head.contains_id(id) && !head.acknowledged.contains(id)) {
@@ -808,7 +893,9 @@ where
         let observing_pending_delivery = matches!(prepared, TerminalPrepared::Attention(_))
             && matches!(&obj.spec.source, TerminalSessionSource::Agent { message: Some(head), .. }
                 if head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())).is_some());
-        if matches!(prepared, TerminalPrepared::MessageDeliveryPending) || observing_pending_delivery {
+        if matches!(prepared, TerminalPrepared::MessageDeliveryUnconfirmed { .. }) {
+            outcome.requeue_after = Some(Duration::from_secs(1));
+        } else if matches!(prepared, TerminalPrepared::MessageDeliveryPending) || observing_pending_delivery {
             outcome.requeue_after = Some(Duration::from_millis(200));
         } else if (phase == TerminalSessionPhase::Lost && matches!(prepared, TerminalPrepared::None))
             || matches!(prepared, TerminalPrepared::BriefWaiting)
@@ -862,14 +949,16 @@ where
                 errors.push(error);
             }
         }
-        match self.demands.get(&attention_demand_name(obj)).await {
-            Ok(demand) if demand.metadata.lifecycle_authority()? == Some(LifecycleAuthority::Managed) => {
-                if let Err(error) = self.demands.delete(&demand.metadata.name).await {
-                    errors.push(error.to_string());
+        for name in [attention_demand_name(obj), delivery_demand_name(obj)] {
+            match self.demands.get(&name).await {
+                Ok(demand) if demand.metadata.lifecycle_authority()? == Some(LifecycleAuthority::Managed) => {
+                    if let Err(error) = self.demands.delete(&demand.metadata.name).await {
+                        errors.push(error.to_string());
+                    }
                 }
+                Ok(_) | Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => errors.push(error.to_string()),
             }
-            Ok(_) | Err(ResourceError::NotFound { .. }) => {}
-            Err(error) => errors.push(error.to_string()),
         }
         if errors.is_empty() {
             Ok(())
@@ -913,6 +1002,39 @@ where
     }
 }
 
+fn held_delivery_consumed(
+    status: &flotilla_resources::TerminalSessionStatus,
+    prepared: &TerminalPrepared,
+    held_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    let working = |attention: &TerminalAttention| {
+        attention.state == TerminalAttentionState::Working && attention.as_of > held_at && !attention.is_stale_at(now)
+    };
+    let stored_hook =
+        status.attention.as_ref().is_some_and(|attention| working(attention) && attention.source == TerminalAttentionSource::Hook);
+    // Tool hooks retain positive evidence after the turn ends and a Stop hook
+    // replaces Working with Idle, including holds recovered after an upgrade.
+    if stored_hook || status.last_tool_activity_at.is_some_and(|at| at > held_at) {
+        return true;
+    }
+    let TerminalPrepared::Attention(observation) = prepared else { return false };
+    // Hooks are authoritative. Screen Working must survive a debounce window,
+    // rather than acknowledging one flickering classifier sample.
+    let observed_working = observation.attention.as_ref().is_some_and(|attention| {
+        working(attention)
+            && (attention.source == TerminalAttentionSource::Hook
+                || status.attention.as_ref().is_some_and(|previous| {
+                    working(previous) && attention.as_of.signed_duration_since(previous.as_of) >= TerminalAttention::DEBOUNCE_FOR
+                }))
+    });
+    let changed_output = observation
+        .output_digest
+        .as_ref()
+        .is_some_and(|digest| status.last_output_digest.as_ref().is_some_and(|previous| previous != digest));
+    observed_working || changed_output
+}
+
 fn attention_demand_actuation(session: &ResourceObject<TerminalSession>, observation: &TerminalObservation) -> Actuation {
     let name = attention_demand_name(session);
     let demands_attention = observation.occupancy == TerminalOccupancy::Vacant
@@ -921,6 +1043,14 @@ fn attention_demand_actuation(session: &ResourceObject<TerminalSession>, observa
         return Actuation::DeleteDemand { name };
     }
 
+    terminal_demand_actuation(session, name)
+}
+
+fn delivery_demand_name(session: &ResourceObject<TerminalSession>) -> String {
+    format!("terminal-delivery-{}", session.metadata.name)
+}
+
+fn terminal_demand_actuation(session: &ResourceObject<TerminalSession>, name: String) -> Actuation {
     let target = ResourceRef::new(
         api_version(TerminalSession::API_PATHS),
         TerminalSession::API_PATHS.kind,

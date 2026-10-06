@@ -14063,6 +14063,100 @@ mod tests {
 
     // #2705: a successful pool write may already be queued by the agent even
     // when screen attention never confirms submission. Do not type it again.
+    // #2755: the real terminal-pool/adapter and reconciler seams continue
+    // observing a held write, acknowledge later output, and never retype it.
+    #[tokio::test(start_paused = true)]
+    async fn held_pool_delivery_observes_late_consumption_without_resending() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"held-pool-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let (daemon, _) = crew_daemon(config.clone()).await;
+        let backend = daemon.resource_backend();
+        let mut probe = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
+        probe.submission_error = true; // External PTY accepts input but loses its reply.
+        probe.screens = vec!["› Ask Codex to do anything".into(); 100];
+        probe.screens.push("new tool output\n• Working (1s • esc to interrupt)\n› Ask Codex to do anything".into());
+        let pool = Arc::new(probe);
+        let mut registry = probe_local_provider_registry(&daemon, &config).await.expect("registry");
+        Arc::get_mut(&mut registry).expect("exclusive registry").terminal_pools.insert(
+            "held-probe",
+            ProviderDescriptor::named(ProviderCategory::TerminalPool, "held-probe"),
+            pool.clone(),
+        );
+        let profile = build_local_profile(&daemon, &registry).expect("profile");
+        ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("environment");
+        backend
+            .using::<Convoy>(NAMESPACE)
+            .create(&empty_meta("held-pool"), &ConvoySpec::builder().workflow_ref("test".into()).build())
+            .await
+            .expect("convoy");
+        create_credential_test_session(&backend, "agent", "held-pool", "held-pool-work", &profile.host_direct_environment_name()).await;
+        let sessions = backend.using::<TerminalSession>(NAMESPACE);
+        let mut session = sessions.get("agent").await.expect("session");
+        let mut spec = session.spec.clone();
+        spec.pool = "held-probe".into();
+        let TerminalSessionSource::Agent { message, selector, .. } = &mut spec.source else { unreachable!() };
+        selector.adapter = Some("codex".into());
+        *message = Some(flotilla_resources::TerminalCrewMessage {
+            id: "held-turn".into(),
+            text: "wake".into(),
+            sender: Default::default(),
+            delivery: Default::default(),
+            acknowledged: Default::default(),
+            following: Vec::new(),
+        });
+        session = sessions.update(&empty_meta("agent"), &session.metadata.resource_version, &spec).await.expect("queue turn");
+        let mut status = session.status.clone().expect("status");
+        status.session_id = Some("agent".into());
+        session = sessions.update_status("agent", &session.metadata.resource_version, &status).await.expect("running session");
+        let runtime = Arc::new(TerminalControllerRuntime {
+            state: Arc::new(ControllerRuntimeState::new(
+                daemon,
+                config,
+                registry,
+                None,
+                profile.host_id.clone(),
+                None,
+                profile.host_direct_environment_name(),
+            )),
+        });
+        let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend.clone(), NAMESPACE);
+        assert_eq!(
+            runtime.deliver_message("agent", &spec, "wake", TerminalDeliveryReadiness::Startup).await.expect("begin write"),
+            TerminalDeliveryOutcome::Pending
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            runtime.deliver_message("agent", &spec, "wake", TerminalDeliveryReadiness::Startup).await.expect("ambiguous result"),
+            TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)
+        );
+        let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryUnconfirmed {
+            message_id: "held-turn".into(),
+            message: "accepted but reply lost".into(),
+        };
+        reconciler.reconcile(&session, &prepared, Utc::now()).patch.expect("hold").apply(&mut status);
+        session = sessions.update_status("agent", &session.metadata.resource_version, &status).await.expect("persist hold");
+        let prepared = reconciler.prepare(&session).await.expect("observe idle while held");
+        reconciler.reconcile(&session, &prepared, Utc::now()).patch.expect("idle attention").apply(&mut status);
+        assert_eq!(status.attention.as_ref().expect("attention").state, TerminalAttentionState::Idle);
+        assert!(status.degraded.is_some());
+        session = sessions.update_status("agent", &session.metadata.resource_version, &status).await.expect("persist observation");
+        // Capturing the first baseline is not evidence that input was consumed.
+        let prepared = reconciler.prepare(&session).await.expect("observe unchanged idle output");
+        if let Some(patch) = reconciler.reconcile(&session, &prepared, Utc::now()).patch {
+            patch.apply(&mut status);
+        }
+        assert!(status.delivered_message_id.is_none());
+        assert!(status.degraded.is_some());
+        pool.observations.store(100, Ordering::SeqCst);
+        let prepared = reconciler.prepare(&session).await.expect("observe late output");
+        reconciler.reconcile(&session, &prepared, Utc::now()).patch.expect("late acknowledgement").apply(&mut status);
+        assert_eq!(status.delivered_message_id.as_deref(), Some("held-turn"));
+        assert!(status.degraded.is_none());
+        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn accepted_but_unconfirmed_delivery_is_never_retyped() {
         let pool = DeliveryProbePool::new(vec![ScreenActivity::Stable]);

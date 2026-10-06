@@ -8297,12 +8297,11 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     .await
     .expect("observe idle crew session");
 
-    let outcome = daemon
-        .convoy_resume_internal("flotilla", "idle-convoy", "Start the next turn", Some("work"), Some("coder"))
-        .await
-        .expect("deliver brief to idle crew");
+    // #2755: a fresh idle observation from before queuing is sufficient when
+    // there is no terminal turn in flight; an idle transition is unnecessary.
+    daemon.reconcile_pending_supervisor_turns_once("flotilla").await.expect("release already idle crew");
+    assert!(convoys.get("idle-convoy").await.expect("convoy").status.expect("status").pending_brief().is_none());
 
-    assert_eq!(outcome, flotilla_core::in_process::ConvoyResumeOutcome::Queued { displaced: Some("Finish the current turn".to_string()) });
     assert!(terminal_pool.delivered.lock().await.is_empty(), "agent messages should await reconciled delivery confirmation");
     let review_session = sessions.get("idle-review-session").await.expect("read queued review session");
     let TerminalSessionSource::Agent { message: review_message, .. } = review_session.spec.source else {
@@ -8315,11 +8314,14 @@ async fn convoy_resume_queues_confirmed_delivery_when_working_crew_is_already_id
     let TerminalSessionSource::Agent { message: coder_message, .. } = coder_session.spec.source else {
         panic!("coder session should remain agent-backed")
     };
-    assert_eq!(coder_message.expect("queued coder delivery").text, "[operator (unattributed) · via convoy resume]\n\nStart the next turn");
+    assert_eq!(
+        coder_message.expect("queued coder delivery").text,
+        "[operator (unattributed) · via convoy resume]\n\nFinish the current turn"
+    );
     let status = convoys.get("idle-convoy").await.expect("read resumed convoy").status.expect("convoy status");
     assert!(status.pending_brief().is_none());
     assert_eq!(status.crew_work["work"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
-    assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("Start the next turn"));
+    assert_eq!(status.crew_work["work"]["coder"].message.as_deref(), Some("Finish the current turn"));
 }
 
 #[tokio::test]

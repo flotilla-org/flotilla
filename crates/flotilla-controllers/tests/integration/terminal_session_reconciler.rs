@@ -1608,6 +1608,7 @@ async fn a_message_queued_during_startup_is_delivered_before_attention_observati
 // #2705: uncertain writes hold once; attempts that sent no bytes back off and
 // exhaust a three-attempt budget. A fresh reconciler must respect stored state.
 #[tokio::test]
+// #2755: holds observe fresh attention, resolve on activity, and surface once at the bound.
 async fn unconfirmed_delivery_is_named_and_not_repeated_by_reconciliation() {
     delivery_failure_scenario(false).await;
 }
@@ -1696,12 +1697,227 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
     assert_eq!(flagged_status.degraded.as_ref().expect("condition").consecutive_failures, 1);
     let mut flagged = sessions.update_status("term-a", &session.metadata.resource_version, &flagged_status).await.expect("flag session");
 
+    if !startup_not_ready {
+        *runtime.observation.lock().expect("observation mutex") = Some(TerminalObservation {
+            output_digest: None,
+            attention: Some(TerminalAttention {
+                state: TerminalAttentionState::Idle,
+                as_of: Utc::now(),
+                source: TerminalAttentionSource::Hook,
+            }),
+            occupancy: TerminalOccupancy::Vacant,
+        });
+        let prepared = reconciler.prepare(&flagged).await.expect("observe while held");
+        assert!(matches!(prepared, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
+        let mut status = flagged.status.clone().expect("status");
+        reconciler.reconcile(&flagged, &prepared, Utc::now()).patch.expect("fresh attention patch").apply(&mut status);
+        assert_eq!(status.attention.as_ref().expect("fresh attention").state, TerminalAttentionState::Idle);
+        assert!(status.degraded.is_some());
+        flagged = sessions.update_status("term-a", &flagged.metadata.resource_version, &status).await.expect("persist observation");
+
+        // Evidence must postdate this write. One flickering screen sample,
+        // stale hooks, NeedsInput, and unknown output baselines do not prove consumption.
+        let held_at = status.degraded.as_ref().expect("hold").observed_at;
+        for state in [
+            TerminalAttentionState::Idle,
+            TerminalAttentionState::Working,
+            TerminalAttentionState::NeedsInput,
+            TerminalAttentionState::Unobservable,
+        ] {
+            for source in [TerminalAttentionSource::Hook, TerminalAttentionSource::Screen] {
+                for offset in [-1, 0, 1] {
+                    let at = held_at + chrono::Duration::seconds(offset);
+                    let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                        output_digest: None,
+                        attention: Some(TerminalAttention { state, source, as_of: at }),
+                        occupancy: TerminalOccupancy::Vacant,
+                    });
+                    let mut checked = status.clone();
+                    if let Some(patch) = reconciler.reconcile(&flagged, &prepared, held_at + chrono::Duration::seconds(2)).patch {
+                        patch.apply(&mut checked);
+                    }
+                    assert_eq!(
+                        checked.delivered_message_id.is_some(),
+                        state == TerminalAttentionState::Working && source == TerminalAttentionSource::Hook && offset > 0
+                    );
+                }
+            }
+        }
+        // Stable screen evidence crosses the debounce boundary, and output
+        // changes count only with a known baseline. Neither path resends.
+        for elapsed in [4, 5, 6] {
+            let mut screened = flagged.clone();
+            screened.status.as_mut().expect("status").attention = Some(TerminalAttention {
+                state: TerminalAttentionState::Working,
+                source: TerminalAttentionSource::Screen,
+                as_of: held_at + chrono::Duration::seconds(1),
+            });
+            let at = held_at + chrono::Duration::seconds(1 + elapsed);
+            let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                output_digest: None,
+                attention: Some(TerminalAttention {
+                    state: TerminalAttentionState::Working,
+                    source: TerminalAttentionSource::Screen,
+                    as_of: at,
+                }),
+                occupancy: TerminalOccupancy::Vacant,
+            });
+            let mut checked = screened.status.clone().expect("status");
+            if let Some(patch) = reconciler.reconcile(&screened, &prepared, at).patch {
+                patch.apply(&mut checked);
+            }
+            assert_eq!(checked.delivered_message_id.is_some(), elapsed >= 5);
+        }
+        for baseline in [None, Some("old"), Some("new")] {
+            let mut output = flagged.clone();
+            output.status.as_mut().expect("status").last_output_digest = baseline.map(str::to_string);
+            let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+                output_digest: Some("new".into()),
+                attention: None,
+                occupancy: TerminalOccupancy::Vacant,
+            });
+            let mut checked = output.status.clone().expect("status");
+            if let Some(patch) = reconciler.reconcile(&output, &prepared, held_at + chrono::Duration::seconds(2)).patch {
+                patch.apply(&mut checked);
+            }
+            assert_eq!(checked.delivered_message_id.is_some(), baseline == Some("old"));
+        }
+        for elapsed in [299, 300, 301] {
+            let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryPending;
+            let outcome = reconciler.reconcile(&flagged, &prepared, held_at + chrono::Duration::seconds(elapsed));
+            assert_eq!(outcome.actuations.iter().any(|a| matches!(a, Actuation::CreateDemand { .. })), elapsed >= 300);
+        }
+
+        // A post-hold tool hook proves consumption even if the crew has
+        // already returned to Idle by the time the held delivery is revisited.
+        for offset in [-1, 0, 1] {
+            let mut historical = flagged.clone();
+            let mut checked = status.clone();
+            TerminalSessionStatusPatch::ObserveToolActivity {
+                attention: TerminalAttention {
+                    state: TerminalAttentionState::Working,
+                    source: TerminalAttentionSource::Hook,
+                    as_of: held_at + chrono::Duration::seconds(offset),
+                },
+            }
+            .apply(&mut checked);
+            TerminalSessionStatusPatch::ObserveAttention {
+                attention: TerminalAttention {
+                    state: TerminalAttentionState::Idle,
+                    source: TerminalAttentionSource::Hook,
+                    as_of: held_at + chrono::Duration::seconds(2),
+                },
+            }
+            .apply(&mut checked);
+            historical.status = Some(checked.clone());
+            let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::MessageDeliveryPending;
+            if let Some(patch) = reconciler.reconcile(&historical, &prepared, held_at + chrono::Duration::seconds(3)).patch {
+                patch.apply(&mut checked);
+            }
+            assert_eq!(checked.delivered_message_id.is_some(), offset > 0);
+        }
+
+        // Ordinary observer errors remain retryable before the deadline.
+        for failure in 1..=3 {
+            runtime.pool_failure.store(failure, Ordering::SeqCst);
+            assert!(reconciler.prepare(&flagged).await.is_err());
+        }
+        runtime.pool_failure.store(0, Ordering::SeqCst);
+
+        // Positive activity after the ambiguous write acknowledges it without a resend.
+        *runtime.observation.lock().expect("observation mutex") = Some(TerminalObservation {
+            output_digest: None,
+            attention: Some(TerminalAttention {
+                state: TerminalAttentionState::Working,
+                as_of: Utc::now(),
+                source: TerminalAttentionSource::Hook,
+            }),
+            occupancy: TerminalOccupancy::Vacant,
+        });
+        let prepared = reconciler.prepare(&flagged).await.expect("observe consumption");
+        let mut resolved = status.clone();
+        reconciler.reconcile(&flagged, &prepared, Utc::now()).patch.expect("acknowledge held delivery").apply(&mut resolved);
+        assert_eq!(resolved.delivered_message_id.as_deref(), Some("message-new"));
+        assert!(resolved.degraded.is_none());
+        assert_eq!(runtime.delivered.lock().expect("delivery log").len(), 1);
+
+        // Unresolved holds surface a single durable demand, including after restart.
+        *runtime.observation.lock().expect("observation mutex") = Some(TerminalObservation {
+            output_digest: None,
+            attention: Some(TerminalAttention {
+                state: TerminalAttentionState::Idle,
+                as_of: Utc::now(),
+                source: TerminalAttentionSource::Hook,
+            }),
+            occupancy: TerminalOccupancy::Vacant,
+        });
+        status.degraded.as_mut().expect("hold").observed_at -= chrono::Duration::hours(1);
+        flagged = sessions.update_status("term-a", &flagged.metadata.resource_version, &status).await.expect("expire hold");
+        // A temporarily unavailable provider cannot extend the confirmation
+        // deadline indefinitely. Each boundary failure must still surface it.
+        for failure in 1..=3 {
+            runtime.pool_failure.store(failure, Ordering::SeqCst);
+            let prepared = reconciler.prepare(&flagged).await.expect("expired hold despite unavailable pool");
+            let outcome = reconciler.reconcile(&flagged, &prepared, Utc::now());
+            assert!(outcome.actuations.iter().any(|a| matches!(a, Actuation::CreateDemand { .. })));
+        }
+        runtime.pool_failure.store(0, Ordering::SeqCst);
+        let prepared = reconciler.prepare(&flagged).await.expect("expired observation");
+        let outcome = reconciler.reconcile(&flagged, &prepared, Utc::now());
+        assert!(outcome.actuations.iter().any(|a| matches!(a, Actuation::CreateDemand { .. })));
+        outcome.patch.expect("visible timeout").apply(&mut status);
+        assert!(status.degraded.as_ref().expect("timeout").message.contains("deadline"));
+        flagged = sessions.update_status("term-a", &flagged.metadata.resource_version, &status).await.expect("persist timeout");
+        let fresh = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
+        let prepared = fresh.prepare(&flagged).await.expect("observe expired hold after restart");
+        let outcome = fresh.reconcile(&flagged, &prepared, Utc::now());
+        assert!(!outcome.actuations.iter().any(|a| matches!(a, Actuation::CreateDemand { .. })));
+        assert_eq!(runtime.delivered.lock().expect("delivery log").len(), 1);
+        // A fresh Idle observation refreshes as_of even after expiry.
+        let refresh_at = status.attention.as_ref().expect("attention").as_of + chrono::Duration::seconds(6);
+        let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+            output_digest: None,
+            attention: Some(TerminalAttention {
+                state: TerminalAttentionState::Idle,
+                as_of: refresh_at,
+                source: TerminalAttentionSource::Hook,
+            }),
+            occupancy: TerminalOccupancy::Vacant,
+        });
+        fresh.reconcile(&flagged, &prepared, refresh_at).patch.expect("refresh while expired").apply(&mut status);
+        assert_eq!(status.attention.as_ref().expect("attention").as_of, refresh_at);
+        assert_eq!(status.degraded.as_ref().expect("failure").reason, "DeliveryExpired");
+        // Late consumption still resolves an expired hold and clears its demand.
+        let prepared = flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(TerminalObservation {
+            output_digest: None,
+            attention: Some(TerminalAttention {
+                state: TerminalAttentionState::Working,
+                as_of: refresh_at,
+                source: TerminalAttentionSource::Hook,
+            }),
+            occupancy: TerminalOccupancy::Vacant,
+        });
+        let outcome = fresh.reconcile(&flagged, &prepared, refresh_at);
+        assert!(outcome.actuations.iter().any(|a| matches!(a, Actuation::DeleteDemand { name } if name == "terminal-delivery-term-a")));
+        outcome.patch.expect("late acknowledgement").apply(&mut status);
+        assert_eq!(status.delivered_message_id.as_deref(), Some("message-new"));
+        assert!(status.degraded.is_none());
+        return;
+    }
     for attempt in 1..=3 {
         // Resyncs before the backoff expires cannot submit another copy.
         let prepared = reconciler.prepare(&flagged).await.expect("observe flag");
-        assert!(matches!(prepared, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::None));
-        assert!(reconciler.reconcile(&flagged, &prepared, Utc::now()).patch.is_none());
+        assert!(matches!(prepared, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
+        let mut status = flagged.status.clone().expect("status");
+        if let Some(patch) = reconciler.reconcile(&flagged, &prepared, Utc::now()).patch {
+            patch.apply(&mut status);
+            assert!(status.degraded.is_some(), "observation must preserve unsent failure");
+            flagged = sessions.update_status("term-a", &flagged.metadata.resource_version, &status).await.expect("persist attention");
+        }
         assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), attempt);
+        // Observing attention during no-input backoff must not change a bounded
+        // startup retry into an unbounded established-turn wait.
+        assert_eq!(runtime.delivered.lock().expect("delivered mutex")[attempt - 1].2, TerminalDeliveryReadiness::Startup);
         // A different failed observation cannot clear a possibly accepted write.
         let failure = flotilla_resources::controller::ReconcileFailure { message: "pool unreachable".into(), consecutive_failures: 5 };
         assert!(reconciler.reconcile_degraded_patch(&flagged, &failure).is_none());
@@ -1723,15 +1939,15 @@ async fn delivery_failure_scenario(startup_not_ready: bool) {
         assert!(diagnostic.contains("attempt 3/3"));
         assert!(diagnostic.contains("retry budget exhausted; delivery held for explicit intervention"));
     }
-    // Even an expired deadline and a reconstructed reconciler do not release
-    // uncertain or exhausted delivery. This is a durable, visible hold.
+    // Exhausted unsent retries remain stopped across reconstruction, while
+    // observations continue refreshing their attention.
     let mut status = flagged.status.clone().expect("status");
     status.degraded.as_mut().expect("condition").observed_at -= chrono::Duration::hours(1);
     flagged = sessions.update_status("term-a", &flagged.metadata.resource_version, &status).await.expect("late resync");
     let fresh = TerminalSessionReconciler::new(Arc::clone(&runtime), backend, "flotilla");
     let prepared = fresh.prepare(&flagged).await.expect("hold survives restart");
-    assert!(matches!(prepared, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::None));
-    assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), if startup_not_ready { 3 } else { 1 });
+    assert!(matches!(prepared, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
+    assert_eq!(runtime.delivered.lock().expect("delivered mutex").len(), 3);
 }
 
 // #2560: output progress is persisted even when attention is coalesced;
@@ -1886,9 +2102,13 @@ struct DeliveringTerminalRuntime {
     delivered: Mutex<Vec<(String, String, TerminalDeliveryReadiness)>>,
     unconfirmed: bool,
     #[builder(default)]
+    observation: Mutex<Option<TerminalObservation>>,
+    #[builder(default)]
     startup_not_ready: bool,
     pending: AtomicBool,
     observation_failed: AtomicBool,
+    #[builder(default)]
+    pool_failure: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -1942,6 +2162,22 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
         panic!("running sessions should not be ensured")
     }
 
+    async fn session_liveness(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<TerminalLiveness, String> {
+        match self.pool_failure.load(Ordering::SeqCst) {
+            1 => Ok(TerminalLiveness::Unavailable("pool unavailable".into())),
+            2 => Err("pool lookup unavailable".into()),
+            _ => Ok(TerminalLiveness::Running),
+        }
+    }
+
+    async fn observe_failure(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<String>, String> {
+        if self.pool_failure.load(Ordering::SeqCst) == 3 {
+            Err("screen capture unavailable".into())
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn deliver_message(
         &self,
         session_id: &str,
@@ -1965,6 +2201,9 @@ impl TerminalRuntime for DeliveringTerminalRuntime {
     async fn observe_attention(&self, _session_id: &str, _spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {
         if self.observation_failed.load(Ordering::SeqCst) {
             return Err("attention observation unavailable".into());
+        }
+        if let Some(observation) = self.observation.lock().expect("observation mutex").clone() {
+            return Ok(Some(observation));
         }
         Ok(Some(TerminalObservation {
             output_digest: None,
