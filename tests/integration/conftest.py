@@ -1,6 +1,7 @@
 """Shared fixtures and helpers for flotilla integration tests."""
 
 import json
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -10,6 +11,26 @@ import pytest
 COMPOSE_DIR = Path(__file__).parent
 COMPOSE_FILE = str(COMPOSE_DIR / "docker-compose.yml")
 DAEMON_LOG = "~/.local/state/flotilla/log/flotillad.jsonl"
+
+
+def create_headless_checkout(
+    service: str,
+    repo_path: str,
+    repository_key: str,
+    branch: str,
+    compose_file: str = COMPOSE_FILE,
+) -> str:
+    """Create and observe a Git worktree without requiring a presentation manager."""
+    checkout_path = f"{repo_path}-{branch}"
+    result = docker_exec(
+        service,
+        f"git -C {shlex.quote(repo_path)} worktree add "
+        f"-b {shlex.quote(branch)} {shlex.quote(checkout_path)}",
+        compose_file=compose_file,
+    )
+    assert result.returncode == 0, f"checkout setup failed on {service}: {result.stderr}"
+    flotilla_json(service, f"repo {shlex.quote(repository_key)} refresh", compose_file=compose_file)
+    return checkout_path
 
 
 def docker_exec(
@@ -108,9 +129,7 @@ def start_daemon(service: str, compose_file: str = COMPOSE_FILE):
     result = docker_exec(
         service,
         "mkdir -p ~/.config/flotilla ~/.local/state/flotilla; "
-        "tmux_env=$(tmux display-message -t integration -p "
-        "'#{socket_path},#{pid},#{window_index}'); "
-        'nohup env TMUX="$tmux_env" '
+        "nohup env "
         "RUST_LOG=flotilla_daemon=debug flotillad --timeout 0 "
         ">~/.config/flotilla/daemon-stdio.log 2>&1 & "
         "echo $! > ~/.config/flotilla/flotillad.pid",
@@ -219,13 +238,8 @@ def topology():
         )
         assert result.returncode == 0, f"daemon.toml write failed: {result.stderr}"
 
-        # Give discovery a real presentation surface, then start the current
-        # standalone daemon binary on both nodes.
+        # Topology tests exercise daemon routing without a presentation manager.
         for node in ("node-a", "node-b"):
-            result = docker_exec(node, "tmux new-session -d -s integration")
-            assert result.returncode == 0, (
-                f"tmux start failed on {node}: {result.stderr}"
-            )
             start_daemon(node)
 
         def daemon_ready(node):

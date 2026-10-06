@@ -1,3 +1,6 @@
+// Legacy shpool/tmux provider names are intentional: existing stored bindings
+// must remain decodable after adapter retirement (ADR 0047). Keep this coverage.
+
 use flotilla_protocol::HostPath;
 
 use super::*;

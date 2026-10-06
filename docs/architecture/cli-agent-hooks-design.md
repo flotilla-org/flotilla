@@ -47,8 +47,9 @@ When flotilla launches a managed terminal, it injects:
 - `FLOTILLA_ATTACHABLE_ID` — the terminal's stable UUID identity from the AttachableStore
 - `FLOTILLA_DAEMON_SOCKET` — path to the running daemon's socket
 
-Set in `TerminalPool::ensure_running()` / `attach_command()`. Shpool extends its `forward_env`;
-passthrough sets them in the command environment directly.
+Set in `TerminalPool::ensure_running()` / `attach_command()`. Cleat passes these
+variables when launching a session; passthrough sets them in the command
+environment directly.
 
 ### Hook Command and Event Flow
 

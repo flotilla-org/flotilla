@@ -10,9 +10,8 @@ RUN npm install -g @anthropic-ai/claude-code
 # --- Runtime: layer on flotilla-base ---
 FROM flotilla-base
 
-# tmux + gh dependencies via apt
+# gh dependencies via apt
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tmux \
     curl \
     gnupg \
     && rm -rf /var/lib/apt/lists/*

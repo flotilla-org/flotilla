@@ -13,4 +13,3 @@ RUN ln -s ../lib/node_modules/@openai/codex/bin/codex.js /usr/local/bin/codex
 RUN mkdir -p /home/flotilla/.codex \
     && echo '{"auth_mode":"placeholder"}' > /home/flotilla/.codex/auth.json \
     && chown -R flotilla:flotilla /home/flotilla/.codex
-

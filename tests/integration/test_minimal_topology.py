@@ -4,7 +4,7 @@ All tests run commands on node-a (the "user's desktop") and validate
 that multi-host peering with node-b works via the CLI JSON output.
 """
 
-from conftest import docker_exec, flotilla_json, wait_for
+from conftest import create_headless_checkout, docker_exec, flotilla_json, wait_for
 
 
 def test_both_daemons_running(topology):
@@ -133,12 +133,12 @@ def test_remote_prepare_terminal_returns_attachable_set_id(topology):
     # still belong to their respective hosts.
     assert repository_keys[0] == repository_keys[1]
     repository_key = repository_keys[0]
-    checkout = flotilla_json(
+    checkout_path = create_headless_checkout(
         topology["node-b"],
-        f"repo {repository_key} checkout --fresh feat-prepare",
+        "/home/flotilla/prepare-repo",
+        repository_key,
+        "feat-prepare",
     )
-    assert checkout["kind"] == "checkout_created"
-    checkout_path = checkout["path"]["path"]
 
     prepared = flotilla_json(
         topology["node-a"],
@@ -157,4 +157,39 @@ def test_remote_prepare_terminal_returns_attachable_set_id(topology):
     assert registry.returncode == 0, (
         "remote prepare-terminal should create attachables registry\n"
         f"stdout: {registry.stdout}\nstderr: {registry.stderr}"
+    )
+
+
+def test_daemon_launcher_executes_binary_with_log_environment(tmp_path, monkeypatch):
+    """The topology launcher starts flotillad with its logging environment and arguments."""
+    import os
+    import subprocess
+
+    import conftest
+
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir()
+    daemon = tools_dir / "flotillad"
+    # Stand in only for the daemon process boundary; execute the real launcher shell.
+    daemon.write_text(
+        '#!/bin/sh\nprintf "%s\\n%s\\n" "$RUST_LOG" "$*" > "$HOME/daemon-started"\n'
+    )
+    daemon.chmod(0o755)
+    child_env = dict(os.environ, HOME=str(tmp_path), PATH=f"{tools_dir}:{os.environ['PATH']}")
+    child_env.pop("RUST_LOG", None)
+
+    # Docker is the environment boundary; run the exact generated command locally.
+    def local_exec(service, cmd, timeout=30, compose_file=None):
+        return subprocess.run(
+            ["bash", "-c", cmd], env=child_env, capture_output=True, text=True, timeout=timeout
+        )
+
+    monkeypatch.setattr(conftest, "docker_exec", local_exec)
+    conftest.start_daemon("local-test")
+    started = tmp_path / "daemon-started"
+    conftest.wait_for(
+        lambda: started.exists() and started.read_text() == "flotilla_daemon=debug\n--timeout 0\n",
+        "launcher executes daemon with RUST_LOG and timeout arguments",
+        timeout=3,
+        interval=0.01,
     )

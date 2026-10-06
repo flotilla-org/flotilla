@@ -19,7 +19,6 @@ pub use flotilla_client as socket;
 pub mod segment_bar;
 pub mod shared;
 mod shimmer;
-pub mod splash;
 pub mod status_bar;
 pub mod table_view;
 pub mod terminal;

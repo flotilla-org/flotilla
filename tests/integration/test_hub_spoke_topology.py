@@ -13,6 +13,7 @@ import pytest
 
 from conftest import (
     compose,
+    create_headless_checkout,
     daemon_log,
     docker_exec,
     flotilla_json,
@@ -185,10 +186,6 @@ def hub_spoke_topology():
             )
 
         for node in NODES:
-            result = hub_exec(node, "tmux new-session -d -s integration")
-            assert result.returncode == 0, (
-                f"tmux start failed on {node}: {result.stderr}"
-            )
             hub_start_daemon(node)
 
         def daemon_ready(node):
@@ -272,9 +269,7 @@ def test_provider_heterogeneity(hub_spoke_topology):
         binary["name"] for binary in homelab_2["summary"]["inventory"]["binaries"]
     }
     assert "codex" in binaries_1
-    assert "shpool" not in binaries_1
     assert "codex" not in binaries_2
-    assert "shpool" not in binaries_2
     assert binaries_1 != binaries_2
 
     gemini = hub_exec("homelab-2", "command -v gemini")
@@ -285,12 +280,13 @@ def test_provider_heterogeneity(hub_spoke_topology):
 
 def test_terminal_without_persistent_pool_uses_passthrough(hub_spoke_topology):
     """The follower without a persistent pool returns executable fallback commands."""
-    checkout = hub_json(
+    checkout_path = create_headless_checkout(
         "homelab-2",
-        f"repo {hub_spoke_topology['homelab-2']} checkout --fresh feat-passthrough",
+        REPO_PATH,
+        hub_spoke_topology["homelab-2"],
+        "feat-passthrough",
+        compose_file=HUB_SPOKE_COMPOSE,
     )
-    assert checkout["kind"] == "checkout_created"
-    checkout_path = checkout["path"]["path"]
     # The executor plans in the coordinator context before dispatching the remote step.
     # #2500 owns retiring this bridge, as in test_minimal_topology.
     planning_repository_key = hub_spoke_topology["workstation"]
@@ -302,21 +298,18 @@ def test_terminal_without_persistent_pool_uses_passthrough(hub_spoke_topology):
     assert prepared["kind"] == "terminal_prepared"
     assert prepared["attachable_set_id"]
     assert prepared["commands"]
-    assert all(
-        "shpool" not in arg.get("value", "")
-        for command in prepared["commands"]
-        for arg in command["args"]
-    )
+
 
 
 def test_reprepare_reuses_attachable_identity(hub_spoke_topology):
     """Repeated preparation keeps the checkout's attachable-set identity."""
-    checkout = hub_json(
+    checkout_path = create_headless_checkout(
         "homelab-1",
-        f"repo {hub_spoke_topology['homelab-1']} checkout --fresh feat-workspace-reprepare",
+        REPO_PATH,
+        hub_spoke_topology["homelab-1"],
+        "feat-workspace-reprepare",
+        compose_file=HUB_SPOKE_COMPOSE,
     )
-    assert checkout["kind"] == "checkout_created"
-    checkout_path = checkout["path"]["path"]
     # #2500 owns the coordinator-local planning context for remote terminal steps.
     planning_repository_key = hub_spoke_topology["workstation"]
     command = (
