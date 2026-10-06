@@ -52,6 +52,8 @@ Each run sweeps:
 - every immediate directory under `~/dev/` that has its own `target/`; and
 - every checkout with a `target/` beneath `~/dev/flotilla-repos`, covering that convoy root until lifecycle teardown owns checkout removal under #1113.
 
+The schedule explicitly operates on each discovered checkout's `target/`, overriding any custom `build.target-dir` setting; custom target locations are outside its discovery scope.
+
 The runner records reclaimed bytes separately for the mtime and size-cap steps for every root, plus their combined total for the whole run, in:
 
 ```text
