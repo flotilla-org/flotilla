@@ -9693,7 +9693,7 @@ fn convoy_address_prefers_live_over_two_terminal_namesakes() {
     // Exhaustive finite contract: both project-scoped/projectless addresses and
     // all six input orders. Terminal phases share this boolean resolver input.
     for project in [None, Some("p")] {
-        let address = format!("governor@{}", project.unwrap_or_default());
+        let scoped_address = format!("governor@{}", project.unwrap_or_default());
         for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
             let names = ["old-a", "old-b", "live"];
             let identities = order.map(|index| ConvoyAddressIdentity {
@@ -9702,7 +9702,7 @@ fn convoy_address_prefers_live_over_two_terminal_namesakes() {
                 project,
                 terminal: index < 2,
             });
-            for address in [address.as_str(), "governor"] {
+            for address in [scoped_address.as_str(), "governor"] {
                 let indices = resolve_convoy_candidate_indices(&identities, address).expect("unique live governor");
                 assert_eq!(indices.iter().map(|index| identities[*index].record_name).collect::<Vec<_>>(), ["live"]);
             }
@@ -9712,7 +9712,7 @@ fn convoy_address_prefers_live_over_two_terminal_namesakes() {
             // A second live match must refuse and name both resource IDs.
             let mut ambiguous = Vec::from(identities);
             ambiguous.push(ConvoyAddressIdentity { record_name: "another-live", role: Some("governor"), project, terminal: false });
-            let error = resolve_convoy_candidate_indices(&ambiguous, &address).expect_err("ambiguous live address");
+            let error = resolve_convoy_candidate_indices(&ambiguous, &scoped_address).expect_err("ambiguous live address");
             // Refusal must identify the live candidates, without pinning its prose.
             let named_records = error.split(|c: char| !c.is_ascii_alphanumeric() && c != '-').collect::<BTreeSet<_>>();
             for record in ["another-live", "live"] {
