@@ -1,14 +1,9 @@
-//! Recipe minting — commands and viewer-specific direct transport reachability.
-//!
-//! The formatter is pluggable so v0 can ship attach-only: entities with a
-//! live session get a host-qualified `flotilla attach`; everything else truthfully
-//! lists without a recipe until `flotilla view <address>` (ADR 0013,
-//! flotilla-org/flotilla#589) gives scoped views a command. The connector
-//! owns the entity-facts → action-address mapping.
+//! Platform-independent action addresses and viewer-specific direct transport reachability.
+//! Viewers resolve addresses on their own platform; only genuine commands carry argv.
 
 use std::collections::BTreeMap;
 
-use flotilla_protocol::{arg::shell_quote, HostName};
+use flotilla_protocol::{HostName, ViewAddress};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectTransport {
@@ -16,20 +11,55 @@ pub enum DirectTransport {
     Ssh(String),
 }
 
-/// A command materialisation recipe. Direct Cleat endpoints are published as
-/// separate facts alongside this fallback command. The Leg-1 freeze is asked
-/// to bless a `{kind: command | layout}` shape (gap report §9.1) since
-/// andamento's factory tabs use layout paths.
+/// A structured action recipe. Kind is an open vocabulary; argv is present
+/// only for genuine commands. The target is also the viewer's focus-if-live key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Recipe {
-    Command(String),
+pub struct Recipe {
+    shape: RecipeShape,
+    // Compatibility for recipe-shape v1 (#2818): remove after the next fleet roll.
+    pub(crate) legacy: LegacyRecipe,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecipeShape {
+    Address { kind: String, target: String },
+    Command { target: String, argv: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LegacyRecipe {
+    Address(Vec<String>),
+    Command(Vec<String>),
+    Checkout(Vec<String>),
 }
 
 impl Recipe {
-    pub fn command(&self) -> &str {
-        match self {
-            Recipe::Command(command) => command,
+    pub fn kind(&self) -> &str {
+        match &self.shape {
+            RecipeShape::Address { kind, .. } => kind,
+            RecipeShape::Command { .. } => "command",
         }
+    }
+
+    pub fn target(&self) -> &str {
+        match &self.shape {
+            RecipeShape::Address { target, .. } | RecipeShape::Command { target, .. } => target,
+        }
+    }
+
+    pub fn argv(&self) -> Option<&[String]> {
+        match &self.shape {
+            RecipeShape::Address { .. } => None,
+            RecipeShape::Command { argv, .. } => Some(argv),
+        }
+    }
+
+    pub fn command(target: impl Into<String>, argv: Vec<String>) -> Self {
+        Self { legacy: LegacyRecipe::Command(argv.clone()), shape: RecipeShape::Command { target: target.into(), argv } }
+    }
+
+    fn address(kind: &str, target: String, legacy_argv: Vec<String>) -> Self {
+        Self { shape: RecipeShape::Address { kind: kind.to_owned(), target }, legacy: LegacyRecipe::Address(legacy_argv) }
     }
 }
 
@@ -80,67 +110,31 @@ impl RecipeMint for FlotillaRecipes {
     }
 
     fn attach(&self, attach_ref: &str, host: &HostName) -> Option<Recipe> {
-        Some(Recipe::Command(format!(
-            "{} attach --host {} {}",
-            shell_quote(&self.flotilla_bin),
-            shell_quote(host.as_str()),
-            shell_quote(attach_ref)
-        )))
+        Some(Recipe::address("attach", format!("session:{host}/{attach_ref}"), vec![
+            self.flotilla_bin.clone(),
+            "attach".to_owned(),
+            "--host".to_owned(),
+            host.to_string(),
+            attach_ref.to_owned(),
+        ]))
     }
 
     fn checkout_terminal(&self, path: &str, host: &HostName) -> Option<Recipe> {
-        Some(Recipe::Command(format!(
-            "{} attach --transient --host {} {}",
-            shell_quote(&self.flotilla_bin),
-            shell_quote(host.as_str()),
-            shell_quote(path)
-        )))
-    }
-
-    fn scoped_view(&self, target: &flotilla_protocol::ViewAddress) -> Option<Recipe> {
-        Some(Recipe::Command(format!("{} view {}", shell_quote(&self.flotilla_bin), shell_quote(&target.to_string()))))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn flotilla_mint_formats_attach_and_scoped_view_recipes() {
-        let mint = FlotillaRecipes::new("flotilla");
-        assert_eq!(
-            mint.attach("implement", &HostName::new("feta")),
-            Some(Recipe::Command("'flotilla' attach --host 'feta' 'implement'".to_owned()))
-        );
-        assert_eq!(
-            mint.scoped_view(&flotilla_protocol::ViewAddress::Vessel {
-                namespace: "dev".to_owned(),
-                convoy: "manifest-extraction".to_owned(),
-                vessel: "implement".to_owned(),
-            }),
-            Some(Recipe::Command("'flotilla' view 'vessel/dev/manifest-extraction/implement'".to_owned()))
-        );
-        assert_eq!(
-            mint.checkout_terminal("/work/flotilla's checkout", &HostName::new("kiwi")),
-            Some(Recipe::Command("'flotilla' attach --transient --host 'kiwi' '/work/flotilla'\\''s checkout'".to_owned()))
-        );
-    }
-
-    #[test]
-    fn flotilla_mint_quotes_executable_for_every_recipe() {
-        let mint = FlotillaRecipes::new("/opt/Flotilla builds/$current;version's/flotilla");
-        let executable = "'/opt/Flotilla builds/$current;version'\\''s/flotilla'";
-
-        let recipes = [
-            mint.attach("session", &HostName::new("local")).expect("attach recipe"),
-            mint.checkout_terminal("/work/repo", &HostName::new("local")).expect("checkout recipe"),
-            mint.scoped_view(&flotilla_protocol::ViewAddress::Project { namespace: "dev".to_owned(), name: "flotilla".to_owned() })
-                .expect("view recipe"),
+        // Transient checkout terminals are genuine CLI commands, not live sessions.
+        let argv = vec![
+            self.flotilla_bin.clone(),
+            "attach".to_owned(),
+            "--transient".to_owned(),
+            "--host".to_owned(),
+            host.to_string(),
+            path.to_owned(),
         ];
+        let mut recipe = Recipe::command(format!("checkout:{host}/{path}"), argv.clone());
+        recipe.legacy = LegacyRecipe::Checkout(argv);
+        Some(recipe)
+    }
 
-        for recipe in recipes {
-            assert!(recipe.command().starts_with(executable), "recipe did not preserve executable as one shell argument: {recipe:?}");
-        }
+    fn scoped_view(&self, target: &ViewAddress) -> Option<Recipe> {
+        Some(Recipe::address("view", format!("view:{target}"), vec![self.flotilla_bin.clone(), "view".to_owned(), target.to_string()]))
     }
 }

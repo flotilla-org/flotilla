@@ -29,17 +29,18 @@ use crate::{
         KEY_COUNT_VESSELS, KEY_CREW_ADAPTER, KEY_CREW_MODEL, KEY_CREW_ROLES, KEY_DISPLAY_LABEL, KEY_DISPLAY_LABEL_MEDIUM,
         KEY_DISPLAY_LABEL_SHORT, KEY_ENTITY_ID, KEY_ENTITY_KIND, KEY_INDEPENDENT_HOST, KEY_MEMBERSHIP_PROJECT,
         KEY_MEMBERSHIP_REPOSITORY_KEY, KEY_MEMBERSHIP_REPOSITORY_SLUG, KEY_MEMBERSHIP_SUBPATH, KEY_PRIMARY_ACTION_KEY,
-        KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET, KEY_PRIMARY_ACTION_VEHICLE,
-        KEY_PRIMARY_DIRECT_DAEMON, KEY_PRIMARY_DIRECT_HOST, KEY_PRIMARY_DIRECT_REASON, KEY_PRIMARY_DIRECT_RUNTIME_ROOT,
-        KEY_PRIMARY_DIRECT_SESSION, KEY_PRIMARY_DIRECT_TRANSPORT, KEY_PROJECT_NAME, KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE,
-        KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE, KEY_STATUS_ATTENTION, KEY_STATUS_STATE,
-        KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG, KEY_SURFACE_STATE, KEY_VESSEL, KEY_VESSEL_ALTERNATIVES, KEY_VESSEL_BUILD_JOBS,
-        KEY_VESSEL_COST_CLASS, KEY_VESSEL_CPUS, KEY_VESSEL_ENV, KEY_VESSEL_HOST, KEY_VESSEL_HOST_NAME, KEY_VESSEL_HOST_REF,
-        KEY_VESSEL_IMAGE_DIGEST, KEY_VESSEL_IMAGE_REF, KEY_VESSEL_IMAGE_SHORT_DIGEST, KEY_VESSEL_KIND, KEY_VESSEL_LINKER_THREADS,
-        KEY_VESSEL_MINIMAL, KEY_VESSEL_MINIMAL_ALTERNATIVES, KEY_VESSEL_NAME, KEY_VESSEL_POLICY, KEY_VESSEL_STANCE,
-        KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE, SEGMENT_PROJECT,
-        SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
+        KEY_PRIMARY_ACTION_KIND, KEY_PRIMARY_ACTION_LABEL, KEY_PRIMARY_ACTION_RECIPE, KEY_PRIMARY_ACTION_TARGET,
+        KEY_PRIMARY_ACTION_VEHICLE, KEY_PRIMARY_DIRECT_DAEMON, KEY_PRIMARY_DIRECT_HOST, KEY_PRIMARY_DIRECT_REASON,
+        KEY_PRIMARY_DIRECT_RUNTIME_ROOT, KEY_PRIMARY_DIRECT_SESSION, KEY_PRIMARY_DIRECT_TRANSPORT, KEY_PROJECT_NAME,
+        KEY_PROJECT_REPOSITORY_COUNT, KEY_REPO_NAME, KEY_ROLE, KEY_ROLE_HOLD, KEY_ROLE_NAME, KEY_ROLE_PRESENTS_AS, KEY_SESSION, KEY_SOURCE,
+        KEY_STATUS_ATTENTION, KEY_STATUS_STATE, KEY_SUMMARY_TEXT, KEY_SURFACE_RUNG, KEY_SURFACE_STATE, KEY_VESSEL, KEY_VESSEL_ALTERNATIVES,
+        KEY_VESSEL_BUILD_JOBS, KEY_VESSEL_COST_CLASS, KEY_VESSEL_CPUS, KEY_VESSEL_ENV, KEY_VESSEL_HOST, KEY_VESSEL_HOST_NAME,
+        KEY_VESSEL_HOST_REF, KEY_VESSEL_IMAGE_DIGEST, KEY_VESSEL_IMAGE_REF, KEY_VESSEL_IMAGE_SHORT_DIGEST, KEY_VESSEL_KIND,
+        KEY_VESSEL_LINKER_THREADS, KEY_VESSEL_MINIMAL, KEY_VESSEL_MINIMAL_ALTERNATIVES, KEY_VESSEL_NAME, KEY_VESSEL_POLICY,
+        KEY_VESSEL_STANCE, KEY_WORKSPACE_PRIMARY_STATE, KEY_WORKSPACE_PRIMARY_TARGET, KEY_WORK_PHASE, SEGMENT_CHECKOUT, SEGMENT_ISSUE,
+        SEGMENT_PROJECT, SEGMENT_REPO, SOURCE_CONNECTOR, SOURCE_FLOTILLA,
     },
+    legacy_recipe,
     recipe::{DirectTransport, Recipe, RecipeMint},
     wire::{MetadataPatch, MetadataTarget, MetadataValue, MetadataValueUpdate},
 };
@@ -325,7 +326,12 @@ impl Catalog {
         patches
     }
 
-    fn assert_entity(&mut self, entity: EntityRef, facts: Vec<(&str, MetadataValue)>, ordinal: Option<i64>) {
+    fn assert_entity<K: AsRef<str>>(
+        &mut self,
+        entity: EntityRef,
+        facts: impl IntoIterator<Item = (K, MetadataValue)>,
+        ordinal: Option<i64>,
+    ) {
         let target = MetadataTarget::Entity(entity.clone());
         let entry = self.facts.entry(target).or_default();
         let base = [
@@ -333,10 +339,14 @@ impl Catalog {
             (KEY_ENTITY_ID, MetadataValue::text(entity.id)),
             (KEY_SOURCE, MetadataValue::text(SOURCE_FLOTILLA)),
         ];
-        for (key, value) in base.into_iter().chain(facts) {
+        for (key, value) in base
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .chain(facts.into_iter().map(|(key, value)| (key.as_ref().to_owned(), value)))
+        {
             let mut update = MetadataValueUpdate::new(value, Some(CATALOG_TTL_MS));
             update.ordinal = ordinal;
-            entry.insert(key.to_owned(), update);
+            entry.insert(key, update);
         }
     }
 }
@@ -541,7 +551,7 @@ fn project_standing_role(catalog: &mut Catalog, role: &StandingRoleRow, convoys:
     }
     match attach {
         Some((target, recipe)) if role.hold.is_none() => {
-            facts.extend(action_facts(&entity, &recipe, "workspace"));
+            catalog.assert_entity(entity.clone(), action_facts(&recipe, "workspace"), None);
             if let Some(vessel) = live.and_then(|convoy| (convoy.vessels.len() == 1).then(|| &convoy.vessels[0])) {
                 facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), &vessel.host, mint));
             }
@@ -593,7 +603,7 @@ fn project_awareness_node(catalog: &mut Catalog, node: &AwarenessNode, convoys: 
     if let Some((entity, mut facts)) = awareness_node_entity(node, convoys) {
         facts.extend(status_and_counts(node.state, &node.counts, node.entries.len()));
         if let Some(recipe) = awareness_project_recipe(node, mint) {
-            facts.extend(action_facts(&entity, &recipe, "workspace"));
+            catalog.assert_entity(entity.clone(), action_facts(&recipe, "workspace"), None);
         }
         catalog.assert_entity(entity, facts, None);
     }
@@ -711,8 +721,8 @@ fn project_awareness_entry(
     {
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
     }
-    if let Some((recipe, target)) = awareness_entry_recipe(entry, convoys, mint) {
-        facts.extend(action_facts(&target, &recipe, "workspace"));
+    if let Some(recipe) = awareness_entry_recipe(entry, convoys, mint) {
+        catalog.assert_entity(entity.clone(), action_facts(&recipe, "workspace"), None);
         if let Some(vessel) = match entry.id.parse() {
             Ok(ViewAddress::Vessel { namespace, convoy, vessel }) => find_vessel(convoys, &namespace, &convoy, &vessel),
             Ok(ViewAddress::Convoy { namespace, name }) => {
@@ -824,7 +834,7 @@ fn awareness_project_recipe(node: &AwarenessNode, mint: &dyn RecipeMint) -> Opti
     mint.scoped_view(&address)
 }
 
-fn awareness_entry_recipe(entry: &AwarenessEntry, convoys: &[ConvoyRow], mint: &dyn RecipeMint) -> Option<(Recipe, EntityRef)> {
+fn awareness_entry_recipe(entry: &AwarenessEntry, convoys: &[ConvoyRow], mint: &dyn RecipeMint) -> Option<Recipe> {
     if matches!(entry.kind, AwarenessKind::Issue) {
         return None;
     }
@@ -834,29 +844,18 @@ fn awareness_entry_recipe(entry: &AwarenessEntry, convoys: &[ConvoyRow], mint: &
         }
         let path = entry.annotations.get(KEY_CHECKOUT_PATH)?;
         let host = entry.refs.iter().find_map(|reference| reference.host.as_ref())?;
-        let target = entity::checkout(&entry.id);
-        return mint.checkout_terminal(path, host).map(|recipe| (recipe, target));
+        return mint.checkout_terminal(path, host);
     }
     match entry.id.parse().ok()? {
-        ViewAddress::Project { namespace, name } => {
-            let target = entity::project(&namespace, &name, "fleet");
-            mint.scoped_view(&ViewAddress::Project { namespace, name }).map(|recipe| (recipe, target))
-        }
-        ViewAddress::Vessel { namespace, convoy, vessel } => find_vessel(convoys, &namespace, &convoy, &vessel).and_then(|vessel_row| {
-            let target = entity::vessel(&namespace, &convoy, &vessel, vessel_row.host.as_str());
-            vessel_row
-                .materialize
-                .as_deref()
-                .and_then(|attach_ref| mint.attach(attach_ref, &vessel_row.host))
-                .map(|recipe| (recipe, target))
-        }),
+        address @ ViewAddress::Project { .. } => mint.scoped_view(&address),
+        ViewAddress::Vessel { namespace, convoy, vessel } => find_vessel(convoys, &namespace, &convoy, &vessel)
+            .and_then(|row| row.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &row.host))),
         ViewAddress::Convoy { namespace, name } => {
             let convoy = find_convoy(convoys, &namespace, &name)?;
             let [vessel] = convoy.vessels.as_slice() else {
                 return None;
             };
-            let target = entity::vessel(&namespace, &name, &vessel.name, vessel.host.as_str());
-            vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host)).map(|recipe| (recipe, target))
+            vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host))
         }
         _ => None,
     }
@@ -1017,8 +1016,7 @@ fn project_convoy(catalog: &mut Catalog, convoy: &ConvoyRow, mint: &dyn RecipeMi
     }
     if let [vessel] = convoy.vessels.as_slice() {
         if let Some(recipe) = vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host)) {
-            let target = entity::vessel(namespace, &convoy.resource.name, &vessel.name, vessel.host.as_str());
-            facts.extend(action_facts(&target, &recipe, "workspace"));
+            catalog.assert_entity(convoy_entity.clone(), action_facts(&recipe, "workspace"), ordinal);
             facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), &vessel.host, mint));
         }
     }
@@ -1113,7 +1111,7 @@ fn project_vessel(
         facts.push((KEY_SUMMARY_TEXT, MetadataValue::text(message.clone())));
     }
     if let Some(recipe) = vessel.materialize.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &vessel.host)) {
-        facts.extend(action_facts(&entity, &recipe, "workspace"));
+        catalog.assert_entity(entity.clone(), action_facts(&recipe, "workspace"), ordinal);
         facts.extend(direct_facts(vessel.cleat_endpoint.as_ref(), &vessel.host, mint));
     }
     catalog.assert_entity(entity, facts, ordinal);
@@ -1144,7 +1142,7 @@ fn project_independent(catalog: &mut Catalog, independent: &IndependentRow, mint
         facts.push((KEY_STATUS_ATTENTION, MetadataValue::Bool(true)));
     }
     if let Some(recipe) = independent.attach.as_deref().and_then(|attach_ref| mint.attach(attach_ref, &independent.host)) {
-        facts.extend(action_facts(&entity, &recipe, "pane"));
+        catalog.assert_entity(entity.clone(), action_facts(&recipe, "pane"), ordinal);
         facts.extend(direct_facts(independent.cleat_endpoint.as_ref(), &independent.host, mint));
     }
     catalog.assert_entity(entity, facts, ordinal);
@@ -1219,14 +1217,26 @@ fn repo_label(value: &str) -> String {
         .to_owned()
 }
 
-fn action_facts(target: &EntityRef, recipe: &Recipe, vehicle: &'static str) -> Vec<(&'static str, MetadataValue)> {
-    vec![
+fn action_facts(recipe: &Recipe, vehicle: &'static str) -> Vec<(String, MetadataValue)> {
+    let mut facts: Vec<_> = [
         (KEY_PRIMARY_ACTION_KEY, MetadataValue::text("materialize")),
         (KEY_PRIMARY_ACTION_LABEL, MetadataValue::text("Open")),
         (KEY_PRIMARY_ACTION_VEHICLE, MetadataValue::text(vehicle)),
-        (KEY_PRIMARY_ACTION_TARGET, MetadataValue::text(target.action_target())),
-        (KEY_PRIMARY_ACTION_RECIPE, MetadataValue::text(recipe.command())),
+        (KEY_PRIMARY_ACTION_KIND, MetadataValue::text(recipe.kind())),
+        (KEY_PRIMARY_ACTION_TARGET, MetadataValue::text(recipe.target())),
+        (KEY_PRIMARY_ACTION_RECIPE, MetadataValue::text(legacy_recipe::command(recipe))),
     ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value))
+    .collect();
+    if recipe.kind() == "command" {
+        if let Some(argv) = recipe.argv() {
+            facts.extend(
+                argv.iter().enumerate().map(|(index, argument)| (format!("action.primary.argv.{index}"), MetadataValue::text(argument))),
+            );
+        }
+    }
+    facts
 }
 
 fn direct_facts(endpoint: Option<&CleatEndpoint>, host: &HostName, mint: &dyn RecipeMint) -> Vec<(&'static str, MetadataValue)> {

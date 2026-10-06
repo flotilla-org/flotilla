@@ -61,8 +61,10 @@
 //! | `action.primary.key` | Stable verb for the primary action. |
 //! | `action.primary.label` | Human label for the primary action. |
 //! | `action.primary.vehicle` | Execution vehicle for the action. |
-//! | `action.primary.target` | Stable focus/deduplication target. |
-//! | `action.primary.recipe` | Command address used to materialize an entry, when known. |
+//! | `action.primary.kind` | Open recipe kind (`attach`, `view`, `command`, …). |
+//! | `action.primary.target` | Canonical recipe address and focus-if-live key. |
+//! | `action.primary.argv.<n>` | Raw command arguments, zero-based and contiguous; command kinds only. |
+//! | `action.primary.recipe` | Legacy POSIX command; removed after the recipe-shape v1 fleet roll. |
 //! | `action.primary.direct.transport` | `local` or `ssh` packet transport for the same live terminal. |
 //! | `action.primary.direct.host` | Local host name or the viewer's SSH destination alias. |
 //! | `action.primary.direct.runtime_root` | Cleat runtime root on the hosting machine. |
