@@ -296,7 +296,8 @@ by any runtime UID. Containers are per vessel, so a crew's writes stay in its
 own container layer. A checkout's `rust-toolchain.toml` therefore takes
 effect for `cargo` without per-crew workarounds. The image copies Flotilla's
 `rust-toolchain.toml`, reads its channel with `ci/toolchain/pin.sh`, and bakes
-that stable compiler with rustfmt, Clippy, and llvm-tools. It also retains a
+that stable compiler with the components and WebAssembly target declared in
+the file. It also retains a
 temporary nightly formatter until #2794 lands.
 Other repositories' pins install on demand into the writable vessel layer.
 The recipe checks the baked pin as a non-root UID:

@@ -7,7 +7,7 @@ read_rust_pin() {
         section && /^channel = "/ { sub(/^channel = "/, ""); sub(/"$/, ""); print }
     ' "$1") || return 1
     if ! printf '%s\n' "$pin" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || [ "$(printf '%s\n' "$pin" | wc -l)" -ne 1 ]; then
-        echo "expected one exact stable channel in $1" >&2
+        echo "expected one exact stable channel in $1 (use channel = \"X.Y.Z\" in [toolchain], without an inline comment)" >&2
         return 1
     fi
     printf '%s\n' "$pin"

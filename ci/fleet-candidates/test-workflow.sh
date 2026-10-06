@@ -9,6 +9,7 @@ toolchain="$repo_root/ci/fleet-candidates/cleat-toolchain.sh"
 
 bash -n "$builder" "$setup" "$toolchain"
 "$repo_root/ci/toolchain/test-pin.sh"
+"$repo_root/ci/toolchain/test-target.sh"
 if grep -Fq '0.16.0' "$builder"; then
   echo 'candidate builder must derive the Zig version from the Cleat toolchain pin' >&2
   exit 1

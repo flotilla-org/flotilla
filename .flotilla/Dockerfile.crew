@@ -109,7 +109,7 @@ RUN apt-get update \
     && RUST_VERSION="$(read_rust_pin /opt/flotilla/rust-toolchain.toml)" \
     && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
         | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}" \
-    && rustup component add rustfmt clippy llvm-tools-preview \
+    && (cd /opt/flotilla && rustup show active-toolchain) \
     && rustup toolchain install "${RUST_NIGHTLY}" --profile minimal \
         --component rustfmt \
     && rm -rf "${RUSTUP_HOME}/downloads" "${RUSTUP_HOME}/tmp" \

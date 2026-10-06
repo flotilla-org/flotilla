@@ -36,6 +36,12 @@ printf '[toolchain]\nchannel = "1.2.3"\nchannel = "1.2.4"\n' > "$work/pin.toml"
 if read_rust_pin "$work/pin.toml" >/dev/null 2>&1; then
     echo 'accepted duplicate pins' >&2; exit 1
 fi
+# Canonical formatting refusals must explain how to write the supported pin.
+printf '[toolchain]\nchannel = "1.99.0" # bump\n' > "$work/pin.toml"
+if read_rust_pin "$work/pin.toml" >"$work/out" 2>&1; then
+    echo 'accepted a commented channel' >&2; exit 1
+fi
+grep -Fq 'use channel = "X.Y.Z" in [toolchain], without an inline comment' "$work/out"
 # A missing pin must fail closed rather than selecting rustup's default.
 if read_rust_pin "$work/missing.toml" >/dev/null 2>&1; then
     echo 'accepted a missing pin file' >&2; exit 1
