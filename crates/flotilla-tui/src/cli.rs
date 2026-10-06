@@ -1263,6 +1263,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         CommandValue::HostList(hosts) => format_host_list_human(hosts),
         CommandValue::ProjectList(projects) => format_project_list_human(projects),
         CommandValue::CliList(items) => format_cli_list_human(items),
+        CommandValue::DispatchBoard(board) => serde_json::to_string_pretty(board).expect("board serializes"),
         CommandValue::DispatchQueue(queue) => format_dispatch_queue_human(queue),
         CommandValue::HostStatus(status) => format_host_status_human(status),
         CommandValue::HostProviders(providers) => format_host_providers_human(providers),

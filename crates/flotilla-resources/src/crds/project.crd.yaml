@@ -172,6 +172,8 @@ spec:
                         format: date-time
                       provenance:
                         type: string
+                dispatch_queue_error:
+                  type: string
                 dispatch_queue_attention:
                   type: object
                   required: [count, oldest_ready_observed_at, stale_since, observed_at]

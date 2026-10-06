@@ -30,6 +30,59 @@ pub struct DispatchQueueRow {
     pub provenance: String,
 }
 
+/// Tracker facts for a board, obtained through the daemon's source adapters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchBoardResponse {
+    pub readiness: DispatchQueueResponse,
+    pub repositories: Vec<DispatchBoardRepository>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchBoardRepository {
+    pub source: IssueSource,
+    pub issues: Vec<DispatchBoardIssue>,
+    pub pull_requests: Vec<DispatchBoardPullRequest>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct DispatchBoardIssue {
+    pub id: String,
+    pub title: String,
+    pub state: crate::IssueState,
+    pub url: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub labels: Vec<String>,
+    pub blocked_by: Vec<DispatchBoardDependency>,
+    pub pull_requests: Vec<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchBoardDependency {
+    pub url: String,
+    pub state: crate::IssueState,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct DispatchBoardPullRequest {
+    pub id: String,
+    pub url: String,
+    pub state: String,
+    pub merged_at: Option<String>,
+    pub merge_state: Option<String>,
+    pub ci: String,
+}
+
+/// A result-row identity must retain Project scope even when two Projects
+/// contain the same external issue.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DispatchReadyKey {
+    pub namespace: String,
+    pub project: String,
+    pub issue: crate::IssueRef,
+}
+impl DispatchQueueRow {
+    pub fn key(&self) -> DispatchReadyKey {
+        DispatchReadyKey { namespace: self.namespace.clone(), project: self.project.clone(), issue: self.issue.clone() }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewCommandContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]

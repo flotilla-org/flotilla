@@ -20,9 +20,7 @@ class DagFetchTest(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
 
-        self._write_command(
-            "gh",
-            {
+        tracker = {
                 "issue flotilla-org/flotilla": [
                     {
                         "number": 12,
@@ -91,11 +89,9 @@ class DagFetchTest(unittest.TestCase):
                     }
                 ],
                 "pr flotilla-org/andamento": [],
-            },
-        )
-        self._write_command(
-            "flotilla",
-            {
+        }
+        fleet = {
+                "dispatch": {"entries": []},
                 "resource": {
                     "records": [
                         {
@@ -156,27 +152,57 @@ class DagFetchTest(unittest.TestCase):
                         {"convoy": "exact-association", "host": "zzz", "staleness": {"kind": "current"}},
                     ]
                 },
-            },
-        )
+        }
+
+        boards = {}
+        for slug in ("flotilla-org/flotilla", "flotilla-org/andamento"):
+            boards[slug.split("/")[1]] = {"repositories": [{
+                "source": {"service": "https://github.com", "scope": slug},
+                "issues": [{"id": str(issue["number"]), "title": issue["title"], "state": issue["state"].lower(),
+                    "url": issue["url"], "updated_at": issue["updatedAt"], "closed_at": issue["closedAt"],
+                    "labels": [label["name"] for label in issue["labels"]], "blocked_by": issue["blockedBy"]["nodes"],
+                    "pull_requests": [pr["url"] for pr in issue["closedByPullRequestsReferences"]]}
+                    for issue in tracker["issue " + slug]],
+                "pull_requests": [{"id": str(pr["number"]), "url": pr["url"], "state": pr["state"].lower(),
+                    "merge_state": pr["mergeStateStatus"].lower(), "ci": "success"}
+                    for pr in tracker["pr " + slug]],
+            }]}
+        self.fleet = fleet
+        self.boards = boards
+        self._write_command("flotilla", {"fleet": fleet, "boards": boards})
+        path = self.bin / "gh"
+        path.write_text("#!/bin/sh\nexit 99\n")
+        path.chmod(0o755)
 
     def _write_command(self, name, payload):
         path = self.bin / name
-        if name == "gh":
-            body = f"""#!/usr/bin/env python3
+        # Process-boundary double: enforces that the board consumes daemon facts.
+        body = f"""#!/usr/bin/env python3
 import json, sys
 data = json.loads({json.dumps(payload)!r})
-kind = sys.argv[1]
-repo = sys.argv[sys.argv.index('-R') + 1]
-print(json.dumps(data[kind + ' ' + repo]))
-"""
-        else:
-            body = f"""#!/usr/bin/env python3
-import json, sys
-data = json.loads({json.dumps(payload)!r})
-print(json.dumps(data['resource' if sys.argv[1] == 'resource' else 'ls']))
+if sys.argv[1:3] == ['dispatch', 'board']:
+    result = data['boards'][sys.argv[sys.argv.index('--project') + 1]]
+else:
+    result = data['fleet'][sys.argv[1] if sys.argv[1] in {{'resource', 'dispatch'}} else 'ls']
+print(json.dumps(result))
 """
         path.write_text(body)
         path.chmod(0o755)
+
+    def test_dispatchability_is_owned_by_the_daemon(self):
+        # No native blocker does not imply readiness. Conversely, the client's
+        # tracker snapshot cannot override the daemon's maintained ready set.
+        self.fleet["resource"]["records"] = []
+        self.fleet["ls"]["entries"] = []
+        output = self.root / "ready.json"
+        env = os.environ | {"PATH": f"{self.bin}:{os.environ['PATH']}"}
+        for proposed in [False, True]:
+            self.fleet["dispatch"]["entries"] = [{"issue": {"source": {"service": "https://github.com", "scope": "flotilla-org/flotilla"}, "id": "12"}}] if proposed else []
+            self._write_command("flotilla", {"fleet": self.fleet, "boards": self.boards})
+            subprocess.run([FETCH, "--output", output], check=True, env=env)
+            tickets = {ticket["ref"]: ticket for ticket in json.loads(output.read_text())["tickets"]}
+            self.assertEqual(tickets["flotilla-org/andamento#3"]["status"], "blocked")
+            self.assertEqual(tickets["flotilla-org/flotilla#12"]["status"], "ready" if proposed else "blocked")
 
     def test_fetch_joins_generated_facts_and_is_byte_stable(self):
         output = self.root / "generated.json"

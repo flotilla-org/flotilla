@@ -15,11 +15,11 @@ use crate::{
     host::HostStatus,
     replica::{LAST_SYNCED_AT_ANNOTATION, ORIGIN_ROOT_ANNOTATION},
     Artifact, ChangeRequest, Checkout, Clone as CloneResource, Convoy, ConvoyEnsure, CredentialGrant, CredentialSpec, CrewDefaults,
-    CrewImageBaseline, Demand, DispatchObservation, Environment, Event, FieldOwnedResource, FleetDesignation, Forge, FulfilmentKind, Host,
-    ImageBuild, ImageLayer, InputMeta, Issue, ManifestRoot, ObjectMeta, OwnerReference, PlacementPolicy, Presentation, Project,
-    ReadResourceList, ReadWatchEvent, Regard, ReplicaCursor, ReplicationClass, Repository, Resource, ResourceBackend, ResourceError,
-    ResourceList, ResourceObject, ResourceProvenance, TerminalSession, Usage, Vessel, WatchEvent, WatchStart, WorkflowTemplate,
-    WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    CrewImageBaseline, Demand, DispatchDeployment, DispatchHold, DispatchObservation, Environment, Event, FieldOwnedResource,
+    FleetDesignation, Forge, FulfilmentKind, Host, ImageBuild, ImageLayer, InputMeta, Issue, ManifestRoot, ObjectMeta, OwnerReference,
+    PlacementPolicy, Presentation, Project, ReadResourceList, ReadWatchEvent, Regard, ReplicaCursor, ReplicationClass, Repository,
+    Resource, ResourceBackend, ResourceError, ResourceList, ResourceObject, ResourceProvenance, TerminalSession, Usage, Vessel, WatchEvent,
+    WatchStart, WorkflowTemplate, WriterIdentity, ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
 
 pub const MANIFEST_WRITER_SOURCE: &str = "resource-manifest";
@@ -49,6 +49,8 @@ enum RegisteredResource {
     ImageBuild,
     ImageLayer,
     Demand,
+    DispatchHold,
+    DispatchDeployment,
     DispatchObservation,
     Environment,
     Event,
@@ -137,6 +139,8 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<ImageBuild>(RegisteredResource::ImageBuild, &["image-build"]),
     kind::<ImageLayer>(RegisteredResource::ImageLayer, &["image-layer"]),
     kind::<Demand>(RegisteredResource::Demand, &[]),
+    kind::<DispatchHold>(RegisteredResource::DispatchHold, &["dispatch-hold"]),
+    kind::<DispatchDeployment>(RegisteredResource::DispatchDeployment, &["dispatch-deployment"]),
     kind::<DispatchObservation>(RegisteredResource::DispatchObservation, &[
         "dispatchobservation",
         "dispatch_observation",
@@ -196,40 +200,50 @@ const fn kind<T: Resource>(resource: RegisteredResource, aliases: &'static [&'st
     }
 }
 
+macro_rules! poll_typed_resource {
+    ($future:expr) => {
+        Box::pin(async { Box::pin($future).await }).await
+    };
+}
+
+// Isolate each typed future’s construction and poll frame. Resource additions
+// must not accumulate large debug frames on cross-host request stacks.
 macro_rules! dispatch_resource_kind {
     ($resource:expr, $body:ident($($arg:expr),*).await) => {
         match $resource {
-            RegisteredResource::Artifact => $body::<Artifact>($($arg),*).await,
-            RegisteredResource::ChangeRequest => $body::<ChangeRequest>($($arg),*).await,
-            RegisteredResource::Issue => $body::<Issue>($($arg),*).await,
-            RegisteredResource::Checkout => $body::<Checkout>($($arg),*).await,
-            RegisteredResource::Clone => $body::<CloneResource>($($arg),*).await,
-            RegisteredResource::Convoy => $body::<Convoy>($($arg),*).await,
-            RegisteredResource::ConvoyEnsure => $body::<ConvoyEnsure>($($arg),*).await,
-            RegisteredResource::CredentialGrant => $body::<CredentialGrant>($($arg),*).await,
-            RegisteredResource::CredentialSpec => $body::<CredentialSpec>($($arg),*).await,
-            RegisteredResource::CrewDefaults => $body::<CrewDefaults>($($arg),*).await,
-            RegisteredResource::CrewImageBaseline => $body::<CrewImageBaseline>($($arg),*).await,
-            RegisteredResource::ImageBuild => $body::<ImageBuild>($($arg),*).await,
-            RegisteredResource::ImageLayer => $body::<ImageLayer>($($arg),*).await,
-            RegisteredResource::Demand => $body::<Demand>($($arg),*).await,
-            RegisteredResource::DispatchObservation => $body::<DispatchObservation>($($arg),*).await,
-            RegisteredResource::Environment => $body::<Environment>($($arg),*).await,
-            RegisteredResource::Event => $body::<Event>($($arg),*).await,
-            RegisteredResource::FleetDesignation => $body::<FleetDesignation>($($arg),*).await,
-            RegisteredResource::Forge => $body::<Forge>($($arg),*).await,
-            RegisteredResource::ManifestRoot => $body::<ManifestRoot>($($arg),*).await,
-            RegisteredResource::Host => $body::<Host>($($arg),*).await,
-            RegisteredResource::PlacementPolicy => $body::<PlacementPolicy>($($arg),*).await,
-            RegisteredResource::FulfilmentKind => $body::<FulfilmentKind>($($arg),*).await,
-            RegisteredResource::Presentation => $body::<Presentation>($($arg),*).await,
-            RegisteredResource::Project => $body::<Project>($($arg),*).await,
-            RegisteredResource::Regard => $body::<Regard>($($arg),*).await,
-            RegisteredResource::Repository => $body::<Repository>($($arg),*).await,
-            RegisteredResource::TerminalSession => $body::<TerminalSession>($($arg),*).await,
-            RegisteredResource::Usage => $body::<Usage>($($arg),*).await,
-            RegisteredResource::Vessel => $body::<Vessel>($($arg),*).await,
-            RegisteredResource::WorkflowTemplate => $body::<WorkflowTemplate>($($arg),*).await,
+            RegisteredResource::Artifact => poll_typed_resource!($body::<Artifact>($($arg),*)),
+            RegisteredResource::ChangeRequest => poll_typed_resource!($body::<ChangeRequest>($($arg),*)),
+            RegisteredResource::Issue => poll_typed_resource!($body::<Issue>($($arg),*)),
+            RegisteredResource::Checkout => poll_typed_resource!($body::<Checkout>($($arg),*)),
+            RegisteredResource::Clone => poll_typed_resource!($body::<CloneResource>($($arg),*)),
+            RegisteredResource::Convoy => poll_typed_resource!($body::<Convoy>($($arg),*)),
+            RegisteredResource::ConvoyEnsure => poll_typed_resource!($body::<ConvoyEnsure>($($arg),*)),
+            RegisteredResource::CredentialGrant => poll_typed_resource!($body::<CredentialGrant>($($arg),*)),
+            RegisteredResource::CredentialSpec => poll_typed_resource!($body::<CredentialSpec>($($arg),*)),
+            RegisteredResource::CrewDefaults => poll_typed_resource!($body::<CrewDefaults>($($arg),*)),
+            RegisteredResource::CrewImageBaseline => poll_typed_resource!($body::<CrewImageBaseline>($($arg),*)),
+            RegisteredResource::ImageBuild => poll_typed_resource!($body::<ImageBuild>($($arg),*)),
+            RegisteredResource::ImageLayer => poll_typed_resource!($body::<ImageLayer>($($arg),*)),
+            RegisteredResource::Demand => poll_typed_resource!($body::<Demand>($($arg),*)),
+            RegisteredResource::DispatchHold => poll_typed_resource!($body::<DispatchHold>($($arg),*)),
+            RegisteredResource::DispatchDeployment => poll_typed_resource!($body::<DispatchDeployment>($($arg),*)),
+            RegisteredResource::DispatchObservation => poll_typed_resource!($body::<DispatchObservation>($($arg),*)),
+            RegisteredResource::Environment => poll_typed_resource!($body::<Environment>($($arg),*)),
+            RegisteredResource::Event => poll_typed_resource!($body::<Event>($($arg),*)),
+            RegisteredResource::FleetDesignation => poll_typed_resource!($body::<FleetDesignation>($($arg),*)),
+            RegisteredResource::Forge => poll_typed_resource!($body::<Forge>($($arg),*)),
+            RegisteredResource::ManifestRoot => poll_typed_resource!($body::<ManifestRoot>($($arg),*)),
+            RegisteredResource::Host => poll_typed_resource!($body::<Host>($($arg),*)),
+            RegisteredResource::PlacementPolicy => poll_typed_resource!($body::<PlacementPolicy>($($arg),*)),
+            RegisteredResource::FulfilmentKind => poll_typed_resource!($body::<FulfilmentKind>($($arg),*)),
+            RegisteredResource::Presentation => poll_typed_resource!($body::<Presentation>($($arg),*)),
+            RegisteredResource::Project => poll_typed_resource!($body::<Project>($($arg),*)),
+            RegisteredResource::Regard => poll_typed_resource!($body::<Regard>($($arg),*)),
+            RegisteredResource::Repository => poll_typed_resource!($body::<Repository>($($arg),*)),
+            RegisteredResource::TerminalSession => poll_typed_resource!($body::<TerminalSession>($($arg),*)),
+            RegisteredResource::Usage => poll_typed_resource!($body::<Usage>($($arg),*)),
+            RegisteredResource::Vessel => poll_typed_resource!($body::<Vessel>($($arg),*)),
+            RegisteredResource::WorkflowTemplate => poll_typed_resource!($body::<WorkflowTemplate>($($arg),*)),
         }
     };
     ($resource:expr, $body:ident()) => {
@@ -248,6 +262,8 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::ImageBuild => $body::<ImageBuild>(),
             RegisteredResource::ImageLayer => $body::<ImageLayer>(),
             RegisteredResource::Demand => $body::<Demand>(),
+            RegisteredResource::DispatchHold => $body::<DispatchHold>(),
+            RegisteredResource::DispatchDeployment => $body::<DispatchDeployment>(),
             RegisteredResource::DispatchObservation => $body::<DispatchObservation>(),
             RegisteredResource::Environment => $body::<Environment>(),
             RegisteredResource::Event => $body::<Event>(),
@@ -283,6 +299,8 @@ macro_rules! dispatch_resource_kind {
             RegisteredResource::ImageBuild => $body::<ImageBuild>($($arg),*),
             RegisteredResource::ImageLayer => $body::<ImageLayer>($($arg),*),
             RegisteredResource::Demand => $body::<Demand>($($arg),*),
+            RegisteredResource::DispatchHold => $body::<DispatchHold>($($arg),*),
+            RegisteredResource::DispatchDeployment => $body::<DispatchDeployment>($($arg),*),
             RegisteredResource::DispatchObservation => $body::<DispatchObservation>($($arg),*),
             RegisteredResource::Environment => $body::<Environment>($($arg),*),
             RegisteredResource::Event => $body::<Event>($($arg),*),

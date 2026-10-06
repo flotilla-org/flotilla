@@ -15,11 +15,6 @@ from urllib.parse import urlparse
 
 
 REPOSITORIES = ("flotilla-org/andamento", "flotilla-org/flotilla")
-ISSUE_FIELDS = (
-    "number,title,state,url,updatedAt,closedAt,labels,blockedBy,"
-    "closedByPullRequestsReferences"
-)
-PR_FIELDS = "number,state,url,mergedAt,mergeStateStatus,statusCheckRollup"
 
 
 def command_json(arguments: list[str]) -> Any:
@@ -42,20 +37,6 @@ def github_ref(url: str) -> str | None:
     if len(parts) >= 4 and parts[2] in {"issues", "pull"}:
         return f"{parts[0]}/{parts[1]}#{parts[3]}"
     return None
-
-
-def check_state(checks: list[dict[str, Any]]) -> str:
-    if not checks:
-        return "none"
-    pending = {"EXPECTED", "IN_PROGRESS", "PENDING", "QUEUED", "REQUESTED", "WAITING"}
-    acceptable = {"NEUTRAL", "SKIPPED", "SUCCESS"}
-    states = [str(check.get("status") or check.get("state") or "").upper() for check in checks]
-    if any(state in pending for state in states):
-        return "pending"
-    conclusions = [str(check.get("conclusion") or check.get("state") or "").upper() for check in checks]
-    if any(conclusion and conclusion not in acceptable for conclusion in conclusions):
-        return "failure"
-    return "success" if all(conclusion in acceptable for conclusion in conclusions) else "unknown"
 
 
 def resource_version_rank(value: Any) -> tuple[bool, int, str]:
@@ -131,37 +112,51 @@ def convoy_facts() -> dict[str, list[dict[str, Any]]]:
     return {ref: sorted(facts, key=lambda fact: fact["name"]) for ref, facts in sorted(by_issue.items())}
 
 
-def fetch_repository(repository: str) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]]]:
-    issues = command_json(
-        ["gh", "issue", "list", "-R", repository, "--state", "all", "--limit", "10000", "--json", ISSUE_FIELDS]
-    )
-    pull_requests = command_json(
-        ["gh", "pr", "list", "-R", repository, "--state", "all", "--limit", "10000", "--json", PR_FIELDS]
-    )
-    return issues, {pull_request["number"]: pull_request for pull_request in pull_requests}
+def board_facts() -> dict[str, dict[str, Any]]:
+    repositories = {}
+    for project in ("flotilla", "andamento"):
+        board = command_json(["flotilla", "dispatch", "board", "--project", project, "--json"])
+        for repository in board["repositories"]:
+            source = repository["source"]
+            if source["service"].rstrip("/") == "https://github.com":
+                repositories[source["scope"]] = repository
+    return repositories
 
 
 def generated_layer() -> dict[str, Any]:
+    # The daemon owns dispatchability; no tracker/body fallback is allowed.
+    ready_rows = command_json(["flotilla", "dispatch", "ready", "--json"])["entries"]
+    ready = {f"{row['issue']['source']['scope']}#{row['issue']['id']}" for row in ready_rows
+             if row['issue']['source']['service'].rstrip('/') == "https://github.com"}
     convoys = convoy_facts()
     tickets: list[dict[str, Any]] = []
     edges: set[tuple[str, str]] = set()
     groups: dict[str, list[str]] = defaultdict(list)
     timestamps: list[str] = []
 
-    for repository in REPOSITORIES:
-        issues, pull_requests = fetch_repository(repository)
-        for issue in issues:
+    boards = board_facts()
+    for repository, board in sorted(boards.items()):
+        pull_requests = {pr["url"]: pr for pr in board["pull_requests"]}
+        for issue in board["issues"]:
+            # This adapter only maps the daemon's typed facts to the historical
+            # generated-board format. It makes no dispatch decisions.
+            issue = {
+                "number": int(issue["id"]), "title": issue["title"], "state": issue["state"].upper(),
+                "url": issue["url"], "updatedAt": issue["updated_at"], "closedAt": issue["closed_at"],
+                "labels": [{"name": label} for label in issue["labels"]],
+                "blockedBy": {"nodes": issue["blocked_by"]},
+                "closedByPullRequestsReferences": [{"url": url} for url in issue["pull_requests"]],
+            }
             ref = f"{repository}#{issue['number']}"
             carried_by = convoys.get(ref, [])
-            open_blockers = [node for node in issue.get("blockedBy", {}).get("nodes", []) if node.get("state") == "OPEN"]
             if issue["state"] == "CLOSED":
                 status = "landed"
             elif any(convoy["phase"].lower() == "active" for convoy in carried_by):
                 status = "at-sea"
-            elif carried_by or open_blockers:
-                status = "blocked"
-            else:
+            elif ref in ready:
                 status = "ready"
+            else:
+                status = "blocked"
 
             labels = sorted(label["name"] for label in issue.get("labels", []))
             for label in labels:
@@ -173,17 +168,15 @@ def generated_layer() -> dict[str, Any]:
 
             prs = []
             for closing_ref in issue.get("closedByPullRequestsReferences", []):
-                pr_repository = closing_ref.get("repository", {})
-                slug = f"{pr_repository.get('owner', {}).get('login')}/{pr_repository.get('name')}"
-                details = pull_requests.get(closing_ref.get("number")) if slug == repository else None
+                details = pull_requests.get(closing_ref["url"])
                 pr = {
                     "ref": github_ref(closing_ref["url"]),
                     "url": closing_ref["url"],
                     "state": str(details.get("state", "unknown")).lower() if details else "unknown",
-                    "ci": check_state(details.get("statusCheckRollup", [])) if details else "unknown",
+                    "ci": details["ci"] if details else "unknown",
                 }
-                if details and details.get("mergeStateStatus"):
-                    pr["mergeState"] = details["mergeStateStatus"].lower()
+                if details and details.get("merge_state"):
+                    pr["mergeState"] = details["merge_state"].lower()
                 prs.append(pr)
 
             timestamps.extend(value for value in (issue.get("updatedAt"), issue.get("closedAt")) if value)
@@ -209,7 +202,7 @@ def generated_layer() -> dict[str, Any]:
     return {
         "schemaVersion": 1,
         "asOf": max(timestamps, default=None),
-        "repositories": list(REPOSITORIES),
+        "repositories": sorted(boards),
         "tickets": sorted(tickets, key=lambda ticket: (ticket["repository"], ticket["number"])),
         "dependencyEdges": [{"from": source, "to": target} for source, target in sorted(edges)],
         "groups": {label: sorted(refs) for label, refs in sorted(groups.items())},

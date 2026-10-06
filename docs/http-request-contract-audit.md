@@ -6,6 +6,7 @@ I searched all Rust sources for `tls::client`, `client_builder`, `reqwest`, requ
 
 | Boundary / call sites | Coverage or justification |
 | --- | --- |
+| Dispatch native dependencies, closing PRs and board metadata (`issue_tracker/github.rs`) | Authenticated live record/replay fixtures `github_dispatch_facts.yaml` and `github_dispatch_board.yaml` cover paginated native blocked-by REST requests, issue type, closing PR merge state and gh board JSON fields. Client tests prohibit direct gh access. |
 | GitHub App installation discovery and token mint (`credential.rs`) | New loopback HTTP stand-in runs the real minter and HTTP executor, checks routing, required headers, RS256 signature with the existing test key, issuer and timing claims, repositories and permissions. Negative cases prove the stand-in refuses malformed requests. No live recording or real App material. |
 | Forgejo issues and pull requests (`providers/issue_tracker/forgejo.rs`, `providers/change_request/forgejo.rs`) | Existing recorded HTTP fixtures: `forgejo_issues.yaml`, `forgejo_pulls.yaml`, `forgejo_ghostty_governor.yaml`, `forgejo_head_filter_capability.yaml`. |
 | Claude cloud sessions (`providers/coding_agent/claude.rs`) | Exemption beside the Claude factory tests: unpublished `ccr-byoc` consumer-session contract and keychain OAuth material. Legacy `claude_*.yaml` files have no active test references and are not claimed as current coverage. This remains a coverage gap. |

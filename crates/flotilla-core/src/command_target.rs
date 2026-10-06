@@ -108,6 +108,7 @@ impl InProcessDaemon {
             | A::QueryExplainProject { .. }
             | A::QueryProjectList { .. }
             | A::QueryCliList { .. }
+            | A::QueryDispatchBoard { .. }
             | A::QueryDispatchQueue { .. }
             | A::QueryHostStatus { .. }
             | A::QueryHostProviders { .. }

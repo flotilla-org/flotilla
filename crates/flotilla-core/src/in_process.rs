@@ -4908,6 +4908,25 @@ impl InProcessDaemon {
         self.read_projections().list_hosts(&self.local_host_counts().await).await
     }
 
+    pub async fn dispatch_board_internal(&self, project_filter: Option<&str>) -> Result<flotilla_protocol::DispatchBoardResponse, String> {
+        let readiness = self.dispatch_queue_internal(project_filter).await?;
+        let namespace = self.provisioning_namespace().await;
+        let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let mut sources = std::collections::BTreeSet::new();
+        for project in projects {
+            if project_filter.is_some_and(|name| name != project.metadata.name) {
+                continue;
+            }
+            let scope = flotilla_protocol::QueryScope::new(&project.metadata.namespace, &project.metadata.name);
+            sources.extend(self.resolve_issue_source_bindings(&scope).await?.into_iter().map(|binding| binding.source));
+        }
+        let mut repositories = Vec::new();
+        for source in sources {
+            repositories.push(self.issue_provider_for_source(&source).await?.dispatch_board(&source).await?);
+        }
+        Ok(flotilla_protocol::DispatchBoardResponse { readiness, repositories })
+    }
+
     pub async fn dispatch_queue_internal(&self, project_filter: Option<&str>) -> Result<DispatchQueueResponse, String> {
         let observed_at = Utc::now();
         read_projections::ReadProjections::dispatch_queue(
@@ -7394,6 +7413,10 @@ impl DaemonHandle for InProcessDaemon {
             CommandAction::QueryCliList { kind } => match self.list_cli_items_internal(*kind).await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::CliList(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+            },
+            CommandAction::QueryDispatchBoard { project } => match self.dispatch_board_internal(project.as_deref()).await {
+                Ok(board) => Ok(CommandValue::DispatchBoard(Box::new(board))),
+                Err(error) => Ok(CommandValue::Error { message: error }),
             },
             CommandAction::QueryDispatchQueue { project } => match self.dispatch_queue_internal(project.as_deref()).await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::DispatchQueue(Box::new(v))),

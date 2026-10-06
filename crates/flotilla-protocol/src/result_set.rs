@@ -61,6 +61,8 @@ pub enum QueryId {
     StandingRoles { scope: Option<QueryScope> },
     /// Authoritative Project repository definitions, including known-empty projects.
     ProjectRepositories { scope: Option<QueryScope> },
+    /// Contract-ready work maintained by the daemon.
+    DispatchReady { scope: Option<QueryScope> },
 }
 
 /// The Project scope owned by a curated query family. Repository membership
@@ -87,6 +89,7 @@ impl QueryId {
         QueryId::Checkouts { scope: None },
         QueryId::StandingRoles { scope: None },
         QueryId::ProjectRepositories { scope: None },
+        QueryId::DispatchReady { scope: None },
     ];
 
     pub fn family(&self) -> &'static str {
@@ -98,6 +101,7 @@ impl QueryId {
             Self::Awareness { .. } => "awareness",
             Self::StandingRoles { .. } => "standing_roles",
             Self::ProjectRepositories { .. } => "project_repositories",
+            Self::DispatchReady { .. } => "dispatch_ready",
         }
     }
 }
@@ -194,6 +198,11 @@ pub enum QueryChanges {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         removed: Vec<ResourceRef>,
     },
+    DispatchReady {
+        scope: Option<QueryScope>,
+        changed: Vec<crate::DispatchQueueRow>,
+        removed: Vec<crate::DispatchReadyKey>,
+    },
     ProjectRepositories {
         scope: Option<QueryScope>,
         changed: Vec<ProjectRepositoriesRow>,
@@ -216,6 +225,7 @@ impl QueryChanges {
             }
             Self::StandingRoles { scope, .. } => QueryId::StandingRoles { scope: scope.clone() },
             Self::ProjectRepositories { scope, .. } => QueryId::ProjectRepositories { scope: scope.clone() },
+            Self::DispatchReady { scope, .. } => QueryId::DispatchReady { scope: scope.clone() },
         }
     }
 
@@ -228,6 +238,7 @@ impl QueryChanges {
             Self::Awareness { changed, .. } => changed.len(),
             Self::StandingRoles { changed, .. } => changed.len(),
             Self::ProjectRepositories { changed, .. } => changed.len(),
+            Self::DispatchReady { changed, .. } => changed.len(),
         }
     }
 
@@ -239,6 +250,7 @@ impl QueryChanges {
             | Self::StandingRoles { removed, .. }
             | Self::ProjectRepositories { removed, .. } => removed.len(),
             Self::Issues { removed, .. } => removed.len(),
+            Self::DispatchReady { removed, .. } => removed.len(),
             Self::Awareness { removed, .. } => removed.len(),
         }
     }
@@ -303,13 +315,14 @@ impl QueryChanges {
             | Self::Checkouts { removed, .. }
             | Self::StandingRoles { removed, .. }
             | Self::ProjectRepositories { removed, .. } => Some(removed),
-            Self::Issues { .. } | Self::Awareness { .. } => None,
+            Self::Issues { .. } | Self::DispatchReady { .. } | Self::Awareness { .. } => None,
         }
     }
 
     pub fn removed_issues(&self) -> Option<&[IssueRef]> {
         match self {
             Self::Issues { removed, .. } => Some(removed),
+            Self::DispatchReady { .. } => None,
             Self::Convoys { .. }
             | Self::Independents { .. }
             | Self::Checkouts { .. }
@@ -399,6 +412,10 @@ pub enum Rows {
         scope: Option<QueryScope>,
         rows: Vec<StandingRoleRow>,
     },
+    DispatchReady {
+        scope: Option<QueryScope>,
+        rows: Vec<crate::DispatchQueueRow>,
+    },
     ProjectRepositories {
         scope: Option<QueryScope>,
         rows: Vec<ProjectRepositoriesRow>,
@@ -419,6 +436,7 @@ impl Rows {
             }
             Self::StandingRoles { scope, .. } => QueryId::StandingRoles { scope: scope.clone() },
             Self::ProjectRepositories { scope, .. } => QueryId::ProjectRepositories { scope: scope.clone() },
+            Self::DispatchReady { scope, .. } => QueryId::DispatchReady { scope: scope.clone() },
         }
     }
 
@@ -431,6 +449,7 @@ impl Rows {
             Self::Awareness { rows, .. } => rows.len(),
             Self::StandingRoles { rows, .. } => rows.len(),
             Self::ProjectRepositories { rows, .. } => rows.len(),
+            Self::DispatchReady { rows, .. } => rows.len(),
         }
     }
 

@@ -18,7 +18,7 @@ enum SubjectRecord {
     Issue(ResourceObject<Issue>),
     Forge(ResourceObject<Forge>),
     Repository(ResourceObject<Repository>),
-    Project(ResourceObject<Project>),
+    Project(Box<ResourceObject<Project>>),
 }
 impl SubjectRecord {
     fn observed_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -115,7 +115,7 @@ impl Records {
                 "issues" => decode::<Issue>(object).map(SubjectRecord::Issue),
                 "forges" => decode::<Forge>(object).map(SubjectRecord::Forge),
                 "repositories" => decode::<Repository>(object).map(SubjectRecord::Repository),
-                "projects" => decode::<Project>(object).map(SubjectRecord::Project),
+                "projects" => decode::<Project>(object).map(Box::new).map(SubjectRecord::Project),
                 _ => Err(format!("unexpected subject catalog resource {}", envelope.plural)),
             };
             match decoded {

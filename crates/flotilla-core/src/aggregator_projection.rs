@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::{
     awareness_projection::{project_awareness, AwarenessInput, ScopedIssueRow},
+    dispatch_ready::DispatchReadyProjection,
     project_repositories::ProjectRepositoryProjection,
     query_registry::QueryRegistry,
     salience::SalienceFacts,
@@ -135,6 +136,8 @@ pub struct AggregatorProjectionState {
     standing_roles: Arc<RwLock<StandingRoleProjection>>,
     #[builder(skip)]
     project_repositories: Arc<RwLock<ProjectRepositoryProjection>>,
+    #[builder(skip)]
+    dispatch_ready: Arc<RwLock<DispatchReadyProjection>>,
     #[builder(skip)]
     salience: Arc<RwLock<SalienceProjection>>,
     #[builder(skip)]
@@ -256,6 +259,14 @@ impl AggregatorProjectionState {
         self.standing_roles.write().await.replace_rows(rows)
     }
 
+    pub async fn replace_dispatch_ready_rows(
+        &self,
+        rows: Vec<flotilla_protocol::DispatchQueueRow>,
+        errors: Vec<(QueryScope, String)>,
+    ) -> Vec<ResultDelta> {
+        self.dispatch_ready.write().await.replace_rows(rows, errors)
+    }
+
     pub async fn replace_project_repository_rows(&self, rows: Vec<ProjectRepositoriesRow>) -> Vec<ResultDelta> {
         self.project_repositories.write().await.replace_rows(rows)
     }
@@ -349,6 +360,7 @@ impl AggregatorProjectionState {
             QueryId::Checkouts { scope } => Some(self.checkouts.write().await.result_set(scope)),
             QueryId::Awareness { scope, grouping, limit } => Some(self.awareness_result_set(scope, *grouping, *limit).await),
             QueryId::StandingRoles { scope } => Some(self.standing_roles.write().await.result_set(scope)),
+            QueryId::DispatchReady { scope } => Some(self.dispatch_ready.write().await.result_set(scope)),
             QueryId::ProjectRepositories { scope } => Some(self.project_repositories.write().await.result_set(scope)),
         };
         if let Some(result_set) = result_set.as_ref().filter(|result_set| matches!(result_set.query(), QueryId::Convoys { scope: Some(_) }))

@@ -193,7 +193,7 @@ impl ConnectorState {
             Rows::Awareness { rows, .. } => {
                 self.awareness = rows.clone();
             }
-            Rows::Issues { .. } | Rows::Checkouts { .. } => return Applied::Ignored,
+            Rows::DispatchReady { .. } | Rows::Issues { .. } | Rows::Checkouts { .. } => return Applied::Ignored,
         }
         self.seqs.insert(query, set.seq);
         Applied::Updated
@@ -258,7 +258,7 @@ impl ConnectorState {
                 }
                 self.awareness.sort_by(|left, right| (&left.label, &left.id).cmp(&(&right.label, &right.id)));
             }
-            QueryChanges::Issues { .. } | QueryChanges::Checkouts { .. } => {
+            QueryChanges::DispatchReady { .. } | QueryChanges::Issues { .. } | QueryChanges::Checkouts { .. } => {
                 return Applied::Gap(query);
             }
         }

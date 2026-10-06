@@ -37,6 +37,15 @@ pub trait IssueProvider: Send + Sync {
 
     async fn fetch_by_id(&self, reference: &IssueRef) -> Result<Issue, String>;
 
+    /// Native dependencies and serving PRs. Unsupported trackers fail closed.
+    async fn dispatch_board(&self, _source: &IssueSource) -> Result<flotilla_protocol::DispatchBoardRepository, String> {
+        Err("board facts unavailable for this issue provider".into())
+    }
+
+    async fn dispatch_facts(&self, _reference: &IssueRef) -> Result<flotilla_protocol::DispatchIssueFacts, String> {
+        Err("native dispatch facts unavailable for this issue provider".into())
+    }
+
     async fn fetch_by_ids(&self, source: &IssueSource, ids: &[String]) -> Result<Vec<Issue>, String> {
         let fetches = ids.iter().cloned().map(|id| {
             let reference = IssueRef { source: source.clone(), id };

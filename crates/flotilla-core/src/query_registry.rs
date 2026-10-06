@@ -240,6 +240,7 @@ fn issue_demand_query(query: &QueryId) -> Option<QueryId> {
         | QueryId::Checkouts { .. }
         | QueryId::StandingRoles { .. }
         | QueryId::ProjectRepositories { .. }
+        | QueryId::DispatchReady { .. }
         | QueryId::Awareness { scope: None, .. } => None,
     }
 }

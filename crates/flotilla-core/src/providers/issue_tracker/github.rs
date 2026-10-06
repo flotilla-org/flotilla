@@ -14,6 +14,7 @@ use crate::providers::{
 };
 
 const INCREMENTAL_PAGE_SIZE: usize = 100;
+const DISPATCH_BOARD_LIMIT: usize = 10_000;
 
 pub struct GitHubIssueProvider {
     api: Arc<dyn GhApi>,
@@ -67,6 +68,23 @@ fn parse_issue(source: &IssueSource, v: &serde_json::Value, fetched_at: DateTime
             .provider_display_name("GitHub".into())
             .build(),
     )
+}
+
+fn board_check_state(checks: &serde_json::Value) -> String {
+    let Some(checks) = checks.as_array().filter(|checks| !checks.is_empty()) else { return "none".into() };
+    let states = checks.iter().map(|check| check["status"].as_str().or_else(|| check["state"].as_str()).unwrap_or_default());
+    if states.clone().any(|state| matches!(state, "EXPECTED" | "IN_PROGRESS" | "PENDING" | "QUEUED" | "REQUESTED" | "WAITING")) {
+        return "pending".into();
+    }
+    let conclusions = checks.iter().map(|check| check["conclusion"].as_str().or_else(|| check["state"].as_str()).unwrap_or_default());
+    if conclusions.clone().any(|state| !state.is_empty() && !matches!(state, "NEUTRAL" | "SKIPPED" | "SUCCESS")) {
+        return "failure".into();
+    }
+    if conclusions.clone().all(|state| matches!(state, "NEUTRAL" | "SKIPPED" | "SUCCESS")) {
+        "success".into()
+    } else {
+        "unknown".into()
+    }
 }
 
 #[async_trait]
@@ -125,6 +143,179 @@ impl super::IssueProvider for GitHubIssueProvider {
         let body = gh_api_get!(self.api, &endpoint, &self.host_root)?;
         let value: serde_json::Value = serde_json::from_str(&body).map_err(|error| error.to_string())?;
         parse_issue(&reference.source, &value, Utc::now()).ok_or_else(|| format!("failed to parse issue {}", reference.id))
+    }
+
+    async fn dispatch_board(&self, source: &IssueSource) -> Result<flotilla_protocol::DispatchBoardRepository, String> {
+        use flotilla_protocol::{DispatchBoardDependency, DispatchBoardIssue, DispatchBoardPullRequest, DispatchBoardRepository};
+        let raw = run!(
+            self.runner,
+            "gh",
+            &[
+                "issue",
+                "list",
+                "--repo",
+                &source.scope,
+                "--state",
+                "all",
+                "--limit",
+                &DISPATCH_BOARD_LIMIT.to_string(),
+                "--json",
+                "number,title,state,url,updatedAt,closedAt,labels,blockedBy,closedByPullRequestsReferences"
+            ],
+            &self.host_root
+        )?;
+        let issues: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        if issues.len() >= DISPATCH_BOARD_LIMIT {
+            return Err("board issue window is truncated".into());
+        }
+        let issues = issues
+            .iter()
+            .map(|issue| {
+                let string = |field: &str| issue[field].as_str().map(str::to_string).ok_or_else(|| format!("board issue lacks {field}"));
+                let blockers = issue["blockedBy"]["nodes"].as_array().ok_or("board lacks native dependencies")?;
+                if issue["blockedBy"]["totalCount"].as_u64().is_none_or(|count| count != blockers.len() as u64) {
+                    return Err("board dependency window is truncated".into());
+                }
+                let blocked_by = blockers
+                    .iter()
+                    .map(|blocker| {
+                        Ok(DispatchBoardDependency {
+                            url: blocker["url"].as_str().ok_or("board blocker lacks URL")?.into(),
+                            state: match blocker["state"].as_str() {
+                                Some("OPEN") => IssueState::Open,
+                                Some("CLOSED") => IssueState::Closed,
+                                _ => return Err("board blocker lacks state".to_string()),
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let prs = issue["closedByPullRequestsReferences"].as_array().ok_or("board issue lacks PR references")?;
+                if prs.len() >= 100 {
+                    return Err("board PR references may be truncated".into());
+                }
+                let pull_requests = prs
+                    .iter()
+                    .map(|pr| pr["url"].as_str().map(str::to_string).ok_or("board PR lacks URL".to_string()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(DispatchBoardIssue::builder()
+                    .id(issue["number"].as_u64().ok_or("board issue lacks number")?.to_string())
+                    .title(string("title")?)
+                    .state(match string("state")?.as_str() {
+                        "OPEN" => IssueState::Open,
+                        "CLOSED" => IssueState::Closed,
+                        _ => return Err("unknown issue state".into()),
+                    })
+                    .url(string("url")?)
+                    .updated_at(string("updatedAt")?)
+                    .maybe_closed_at(issue["closedAt"].as_str().map(str::to_string))
+                    .labels(
+                        issue["labels"]
+                            .as_array()
+                            .ok_or("board issue lacks labels")?
+                            .iter()
+                            .filter_map(|label| label["name"].as_str().map(str::to_string))
+                            .collect(),
+                    )
+                    .blocked_by(blocked_by)
+                    .pull_requests(pull_requests)
+                    .build())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let raw = run!(
+            self.runner,
+            "gh",
+            &[
+                "pr",
+                "list",
+                "--repo",
+                &source.scope,
+                "--state",
+                "all",
+                "--limit",
+                &DISPATCH_BOARD_LIMIT.to_string(),
+                "--json",
+                "number,state,url,mergedAt,mergeStateStatus,statusCheckRollup"
+            ],
+            &self.host_root
+        )?;
+        let prs: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        if prs.len() >= DISPATCH_BOARD_LIMIT {
+            return Err("board PR window is truncated".into());
+        }
+        let pull_requests = prs
+            .iter()
+            .map(|pr| {
+                let string = |field: &str| pr[field].as_str().map(str::to_string).ok_or_else(|| format!("board PR lacks {field}"));
+                Ok(DispatchBoardPullRequest::builder()
+                    .id(pr["number"].as_u64().ok_or("board PR lacks number")?.to_string())
+                    .url(string("url")?)
+                    .state(string("state")?.to_ascii_lowercase())
+                    .maybe_merged_at(pr["mergedAt"].as_str().map(str::to_string))
+                    .maybe_merge_state(pr["mergeStateStatus"].as_str().map(str::to_ascii_lowercase))
+                    .ci(board_check_state(&pr["statusCheckRollup"]))
+                    .build())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(DispatchBoardRepository { source: source.clone(), issues, pull_requests })
+    }
+
+    async fn dispatch_facts(&self, reference: &IssueRef) -> Result<flotilla_protocol::DispatchIssueFacts, String> {
+        // Deliberately uncached until #2806 supplies bulk native facts with
+        // dependency/PR freshness guarantees; issue updatedAt alone is insufficient.
+        // Closing PR references use the injected gh runner. Native dependencies
+        // use the paginated REST seam, including cross-repository identities.
+        let raw = run!(
+            self.runner,
+            "gh",
+            &["issue", "view", &reference.id, "--repo", &reference.source.scope, "--json", "closedByPullRequestsReferences"],
+            &self.host_root
+        )?;
+        let relations: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        let endpoint = format!("repos/{}/issues/{}", reference.source.scope, reference.id);
+        let raw = gh_api_get!(self.api, &endpoint, &self.host_root)?;
+        let issue: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        let mut facts =
+            flotilla_protocol::DispatchIssueFacts { issue_type: issue["type"]["name"].as_str().map(str::to_string), ..Default::default() };
+        let mut page = 1;
+        loop {
+            let endpoint =
+                format!("repos/{}/issues/{}/dependencies/blocked_by?per_page=100&page={page}", reference.source.scope, reference.id);
+            let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
+            let blockers: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
+            for blocker in blockers {
+                let url = blocker["html_url"].as_str().ok_or("native blocker lacks URL")?;
+                let url = url::Url::parse(url).map_err(|error| error.to_string())?;
+                let parts = url.path_segments().ok_or("native blocker lacks path")?.collect::<Vec<_>>();
+                let [owner, repo, "issues", id] = parts.as_slice() else { return Err("invalid native blocker URL".into()) };
+                facts.blockers.push(IssueRef {
+                    source: IssueSource {
+                        service: format!("https://{}", url.host_str().ok_or("blocker lacks host")?),
+                        scope: format!("{owner}/{repo}"),
+                    },
+                    id: (*id).into(),
+                });
+            }
+            if !response.has_next_page {
+                break;
+            }
+            page += 1;
+        }
+        let prs = relations["closedByPullRequestsReferences"].as_array().ok_or("missing closing PR references")?;
+        if prs.len() >= 100 {
+            return Err("closing PR window may be truncated".into());
+        }
+        for pr in prs {
+            let raw = run!(
+                self.runner,
+                "gh",
+                &["pr", "view", pr["url"].as_str().ok_or("closing PR lacks URL")?, "--json", "state,mergedAt"],
+                &self.host_root
+            )?;
+            let pr: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+            facts.has_open_pull_request |= pr["state"] == "OPEN";
+            facts.landed |= pr["mergedAt"].as_str().is_some();
+        }
+        Ok(facts)
     }
 
     async fn list_changed_since(&self, source: &IssueSource, since: &str, _count: usize) -> Result<IssueChangeset, String> {
@@ -548,5 +739,37 @@ mod tests {
 
         assert_eq!(changeset.updated.len(), 1);
         assert!(changeset.has_more, "should escalate when page has issues and more pages exist");
+    }
+    // The request contract is captured from the authenticated tracker, including
+    // native dependencies and merge evidence. Fixtures are never hand-authored.
+    #[tokio::test]
+    async fn dispatch_facts_record_replay() {
+        let session = replay::test_session(&fixture("github_dispatch_facts.yaml"), Masks::new());
+        let (api, runner) = build_api_and_runner(&session);
+        let provider = GitHubIssueProvider::new(api, runner, Path::new("/"));
+        let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+        let dependent = provider.dispatch_facts(&IssueRef { source: source.clone(), id: "2783".into() }).await.expect("native facts");
+        assert!(dependent.blockers.contains(&IssueRef { source: source.clone(), id: "2782".into() }));
+        assert_eq!(dependent.issue_type.as_deref(), Some("Task"));
+        let landed = provider.dispatch_facts(&IssueRef { source, id: "1385".into() }).await.expect("landing facts");
+        assert!(landed.landed);
+        assert!(!landed.has_open_pull_request);
+        session.finish();
+    }
+    // Daemon board facts use the documented gh JSON fields through the same
+    // recorded process seam; clients need no tracker credentials of their own.
+    #[tokio::test]
+    async fn dispatch_board_record_replay() {
+        let session = replay::test_session(&fixture("github_dispatch_board.yaml"), Masks::new());
+        let (api, runner) = build_api_and_runner(&session);
+        let provider = GitHubIssueProvider::new(api, runner, Path::new("/"));
+        let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+        let board = provider.dispatch_board(&source).await.expect("board facts");
+        let dependent = board.issues.iter().find(|issue| issue.id == "2783").expect("dependent");
+        assert!(dependent.blocked_by.iter().any(|blocker| blocker.url.ends_with("/issues/2782")));
+        let landed = board.pull_requests.iter().find(|pr| pr.id == "1387").expect("landed PR");
+        assert_eq!(landed.state, "merged");
+        assert!(landed.merged_at.is_some());
+        session.finish();
     }
 }
