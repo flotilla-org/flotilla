@@ -15,6 +15,7 @@ use common::{create_ready_checkout, create_ready_clone, meta};
 use flotilla_controllers::reconcilers::{
     checkout::CheckoutPrepared, CheckoutReconciler, CheckoutRemoval, CheckoutRemovalOutcome, CheckoutRuntime, PreparedCheckout,
 };
+use flotilla_core::vcs::CheckoutMaterialisationError;
 use flotilla_protocol::NodeId;
 use flotilla_resources::{
     apply_status_patch,
@@ -40,6 +41,9 @@ struct RecordingCheckoutRuntime {
     removal_attempts: Mutex<Option<watch::Sender<usize>>>,
     inspections: Mutex<usize>,
     protections: Mutex<Vec<(String, String, String, String)>>,
+    allow_creation: bool,
+    creation_protection_failures: AtomicUsize,
+    creation_attempts: AtomicUsize,
     failed_removal_target: Option<String>,
     transient_removal_failures: AtomicUsize,
     blocked_removal_target: Option<String>,
@@ -83,6 +87,27 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         _target_path: &str,
     ) -> Result<PreparedCheckout, String> {
         Err("creation is outside this test's scope".to_string())
+    }
+
+    // VCS process boundary fake: creation succeeded, but protection is transient.
+    async fn create_worktree_in(
+        &self,
+        _env_ref: &str,
+        _clone_path: &str,
+        _branch: &str,
+        _base_ref: Option<&str>,
+        _target: &str,
+        _reason: &str,
+    ) -> Result<PreparedCheckout, CheckoutMaterialisationError> {
+        if !self.allow_creation {
+            return Err("creation is outside this test scope".to_string().into());
+        }
+        self.creation_attempts.fetch_add(1, Ordering::SeqCst);
+        if self.creation_protection_failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1)).is_ok()
+        {
+            return Err(CheckoutMaterialisationError::Protection("temporary protection failure".into()));
+        }
+        Ok(PreparedCheckout { commit: Some("base-commit".into()), branch_provenance: CheckoutBranchProvenance::CreatedForConvoy })
     }
 
     async fn create_fresh_clone(
@@ -150,6 +175,64 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         }
         Ok(CheckoutRemovalOutcome::Removed)
     }
+}
+
+// #2688: transient creation protection failure must recover automatically,
+// without a terminal Failed phase or losing the creation's branch provenance.
+#[tokio::test(start_paused = true)]
+async fn pending_checkout_recovers_creation_protection_through_controller_loop() {
+    let backend = ResourceBackend::InMemory(Default::default());
+    create_ready_clone(&backend, NAMESPACE, "clone-recovery", REPO_URL, "host-direct-a", "/checkouts/repo").await;
+    let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
+    let checkout = checkouts
+        .create(
+            &meta("checkout-recovery").with_lifecycle_authority(LifecycleAuthority::Managed),
+            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+                repo_ref: RepositoryKey(repo_key(REPO_URL)),
+                env_ref: "host-direct-a".into(),
+                r#ref: "recovery/work".into(),
+                base_ref: Some("main".into()),
+                target_path: "/checkouts/recovery".into(),
+                clone_ref: "clone-recovery".into(),
+            }),
+        )
+        .await
+        .expect("checkout");
+    let runtime = Arc::new(RecordingCheckoutRuntime {
+        allow_creation: true,
+        creation_protection_failures: AtomicUsize::new(2),
+        ..Default::default()
+    });
+    let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE);
+    assert!(reconciler.prepare(&checkout).await.is_err(), "protection failure must request controller retry");
+    assert_eq!(checkouts.get("checkout-recovery").await.expect("checkout").status.unwrap_or_default().phase, CheckoutPhase::Pending);
+    let controller = tokio::spawn(
+        ControllerLoop {
+            primary: checkouts.clone(),
+            secondaries: Vec::new(),
+            reconciler,
+            resync_interval: Duration::from_secs(3600),
+            backend,
+        }
+        .run(),
+    );
+    timeout(Duration::from_secs(4), async {
+        loop {
+            let status = checkouts.get("checkout-recovery").await.expect("checkout").status.unwrap_or_default();
+            assert_ne!(status.phase, CheckoutPhase::Failed, "protection failures are not terminal");
+            if status.phase == CheckoutPhase::Ready {
+                assert_eq!(status.branch_provenance, CheckoutBranchProvenance::CreatedForConvoy);
+                assert_eq!(status.commit.as_deref(), Some("base-commit"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("automatic recovery without operator reset");
+    assert!(runtime.creation_attempts.load(Ordering::SeqCst) >= 3);
+    controller.abort();
+    let _ = controller.await;
 }
 
 #[tokio::test]

@@ -5,10 +5,13 @@ use chrono::{DateTime, Utc};
 use flotilla_core::{
     checkout_integration::{checkout_observation_lacks_convoy_association, convoy_change_request_id_for_checkout, LANDING_EVIDENCE_TTL},
     config::DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY,
+    vcs::CheckoutMaterialisationError,
 };
 use flotilla_resources::{
     apply_status_patch,
-    controller::{Actuation, ReconcileOutcome, Reconciler, ReplicaConvoyCheckoutWatch, SecondaryWatch},
+    controller::{
+        Actuation, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileOutcome, Reconciler, ReplicaConvoyCheckoutWatch, SecondaryWatch,
+    },
     convoy_sanctions_checkout_reclaim, Checkout, CheckoutBranchProvenance, CheckoutIntegrationStatus, CheckoutPhase, CheckoutSpec,
     CheckoutStatus, CheckoutStatusPatch, Clock, Clone, CloneFailurePolicy, ClonePhase, Convoy, ConvoyPhase, EventRecorder, Forge,
     IntegrationCondition, LifecycleAuthority, ObjectEvent, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject,
@@ -94,8 +97,8 @@ pub trait CheckoutRuntime: Send + Sync {
         base_ref: Option<&str>,
         target_path: &str,
         _registration_reason: &str,
-    ) -> Result<PreparedCheckout, String> {
-        self.create_worktree(clone_path, branch, base_ref, target_path).await
+    ) -> Result<PreparedCheckout, CheckoutMaterialisationError> {
+        self.create_worktree(clone_path, branch, base_ref, target_path).await.map_err(Into::into)
     }
     async fn create_fresh_clone_in(
         &self,
@@ -445,7 +448,8 @@ where
                         .await
                     {
                         Ok(prepared) => CheckoutPrepared::Ready { prepared },
-                        Err(err) => CheckoutPrepared::Failed(err),
+                        Err(CheckoutMaterialisationError::Protection(error)) => return Err(ResourceError::other(error)),
+                        Err(CheckoutMaterialisationError::Creation(error)) => CheckoutPrepared::Failed(error),
                     },
                 )
             }
@@ -561,6 +565,17 @@ where
             outcome.requeue_after = Some(CHECKOUT_PROVISIONING_REQUEUE_AFTER);
         }
         outcome
+    }
+
+    // Protection and environment-inspection errors are transient. Keep the
+    // current lifecycle phase and retry independently of the full resync.
+    fn reconcile_error_policy(&self) -> Option<ReconcileErrorPolicy> {
+        Some(ReconcileErrorPolicy {
+            max_consecutive_failures: 5,
+            initial_backoff: CHECKOUT_PROVISIONING_REQUEUE_AFTER,
+            max_backoff: Duration::from_secs(30),
+            exhaustion: ReconcileErrorExhaustion::Retry,
+        })
     }
 
     async fn run_finalizer(&self, obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {

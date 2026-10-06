@@ -379,6 +379,36 @@ pub enum WorktreeAdd<'a> {
     Detached { target: &'a str, branch: &'a str },
 }
 
+/// Creation refusals are terminal; protection failures must retry the same target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckoutMaterialisationError {
+    Creation(String),
+    Protection(String),
+}
+
+impl fmt::Display for CheckoutMaterialisationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Creation(error) => write!(f, "{error}"),
+            Self::Protection(error) => write!(f, "checkout registration protection failed: {error}"),
+        }
+    }
+}
+impl std::error::Error for CheckoutMaterialisationError {}
+
+impl From<String> for CheckoutMaterialisationError {
+    fn from(error: String) -> Self {
+        Self::Creation(error)
+    }
+}
+
+/// Absolute Git paths resolved by Git, rather than inferred from worktree names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeMetadata {
+    pub common_dir: PathBuf,
+    pub admin_dir: PathBuf,
+}
+
 pub struct CheckoutMaterialisation {
     pub commit: Option<String>,
     pub provenance: CheckoutBranchProvenance,
@@ -619,7 +649,13 @@ pub trait VcsBackend: Send + Sync {
     async fn ref_exists(&self, reference: &str) -> bool;
     async fn fetch(&self, remote: &str, refspec: &str) -> Result<(), String>;
     async fn worktree_add(&self, add: WorktreeAdd<'_>) -> Result<(), String>;
-    async fn create_worktree(&self, branch: &str, base_ref: Option<&str>, target: &str) -> Result<CheckoutMaterialisation, String>;
+    async fn create_worktree(
+        &self,
+        branch: &str,
+        base_ref: Option<&str>,
+        target: &str,
+        registration_reason: &str,
+    ) -> Result<CheckoutMaterialisation, String>;
     async fn worktree_registration(&self, target: &str, operation: CheckoutRegistration<'_>) -> Result<(), String>;
     async fn worktree_remove(&self, target: &str) -> Result<CommandOutput, String>;
     async fn worktree_prune(&self) -> Result<(), String>;
@@ -673,14 +709,17 @@ pub trait Vcs: Send + Sync {
     async fn checkout_registration(&self, _target: &str, _operation: CheckoutRegistration<'_>) -> Result<(), String> {
         Ok(())
     }
+    async fn worktree_metadata(&self, _target: &Path) -> Result<WorktreeMetadata, String> {
+        Err("worktree metadata inspection is unavailable".into())
+    }
     async fn materialise_checkout(
         &self,
         _branch: &str,
         _base_ref: Option<&str>,
         _target: &str,
         _registration_reason: &str,
-    ) -> Result<CheckoutMaterialisation, String> {
-        Err("checkout materialisation is unavailable".into())
+    ) -> Result<CheckoutMaterialisation, CheckoutMaterialisationError> {
+        Err("checkout materialisation is unavailable".to_string().into())
     }
     async fn remove_materialised_checkout(&self, _branch: &str, _target: &str) -> Result<CheckoutRemoval, String> {
         Err("checkout removal is unavailable".into())
@@ -955,20 +994,34 @@ impl Vcs for FlotillaVcs {
         self.controller_cli().worktree_registration(target, operation).await
     }
 
+    async fn worktree_metadata(&self, target: &Path) -> Result<WorktreeMetadata, String> {
+        let backend = GitCliBackend::checkout_root(target, &*self.runner);
+        let common_dir = PathBuf::from(backend.common_dir().await?.trim());
+        let admin_dir = PathBuf::from(backend.run(&["rev-parse", "--path-format=absolute", "--git-dir"]).await?.trim());
+        if !common_dir.is_absolute() || !admin_dir.is_absolute() || admin_dir == common_dir {
+            return Err(format!("checkout {} is not a linked Git worktree with absolute metadata paths", target.display()));
+        }
+        Ok(WorktreeMetadata { common_dir, admin_dir })
+    }
+
     async fn materialise_checkout(
         &self,
         branch: &str,
         base_ref: Option<&str>,
         target: &str,
         registration_reason: &str,
-    ) -> Result<CheckoutMaterialisation, String> {
+    ) -> Result<CheckoutMaterialisation, CheckoutMaterialisationError> {
         match &self.strategy {
             GitCheckoutStrategy::Worktree(_) => {
-                let result = self.controller_cli().create_worktree(branch, base_ref, target).await?;
-                self.checkout_registration(target, CheckoutRegistration::Protect { reason: registration_reason }).await?;
+                let result = self.controller_cli().create_worktree(branch, base_ref, target, registration_reason).await?;
+                self.checkout_registration(target, CheckoutRegistration::Protect { reason: registration_reason })
+                    .await
+                    .map_err(CheckoutMaterialisationError::Protection)?;
                 Ok(result)
             }
-            GitCheckoutStrategy::ReferenceClone(strategy) => strategy.materialise_checkout(branch, base_ref, target).await,
+            GitCheckoutStrategy::ReferenceClone(strategy) => {
+                strategy.materialise_checkout(branch, base_ref, target).await.map_err(Into::into)
+            }
         }
     }
 
@@ -1660,7 +1713,13 @@ impl VcsBackend for GitCliBackend<'_> {
         self.run(&args).await.map(|_| ())
     }
 
-    async fn create_worktree(&self, branch: &str, base_ref: Option<&str>, target: &str) -> Result<CheckoutMaterialisation, String> {
+    async fn create_worktree(
+        &self,
+        branch: &str,
+        base_ref: Option<&str>,
+        target: &str,
+        registration_reason: &str,
+    ) -> Result<CheckoutMaterialisation, String> {
         if self.runner.path_exists(Path::new(target)).await? {
             let target_vcs = GitCliBackend::checkout_root(Path::new(target), self.runner);
             let target_common_dir = target_vcs
@@ -1725,9 +1784,9 @@ impl VcsBackend for GitCliBackend<'_> {
             }
             let resolved_base_ref =
                 if self.ref_exists(&remote_base_ref).await { format!("origin/{base_ref}") } else { base_ref.to_string() };
-            self.worktree_add(WorktreeAdd::NewBranch { target, branch, base: &resolved_base_ref }).await?;
+            self.run(&["worktree", "add", "--lock", "--reason", registration_reason, "-b", branch, target, &resolved_base_ref]).await?;
         } else {
-            self.worktree_add(WorktreeAdd::Detached { target, branch }).await?;
+            self.run(&["worktree", "add", "--lock", "--reason", registration_reason, "--detach", target, branch]).await?;
         }
 
         let commit = Some(GitCliBackend::checkout_root(Path::new(target), self.runner).head_commit_text().await?.trim().to_string());
@@ -1741,6 +1800,12 @@ impl VcsBackend for GitCliBackend<'_> {
     async fn worktree_registration(&self, target: &str, operation: CheckoutRegistration<'_>) -> Result<(), String> {
         match operation {
             CheckoutRegistration::Protect { reason } => {
+                // Lock a known registration before repairing backlinks. In
+                // particular, a transient repair failure must not expose a
+                // reusable checkout to sibling prune.
+                if matches!(self.registration_state(target).await?, RegistrationState::Unlocked) {
+                    self.run(&["worktree", "lock", "--reason", reason, target]).await?;
+                }
                 if self.runner.path_exists(Path::new(target)).await? {
                     self.run(&["worktree", "repair", target]).await?;
                 }
@@ -2059,7 +2124,7 @@ mod tests {
                 .await
                 .err()
                 .expect("existing branch must be refused");
-            assert!(error.contains("reused"), "conflict must name the branch: {error}");
+            assert!(error.to_string().contains("reused"), "conflict must name the branch: {error}");
             assert!(!target.exists(), "refusal must not create a checkout");
         }
     }
@@ -2488,6 +2553,124 @@ mod tests {
         );
         std::fs::remove_file(dirty_file).expect("remove dirty file");
         assert_eq!(vcs.remove_materialised_checkout("feature/new", target).await.expect("remove clean clone"), CheckoutRemoval::Removed);
+    }
+
+    // #2682: Git allocates distinct admin names for colliding target basenames.
+    // Mount planning must use those actual names and preserve host backlinks.
+    #[tokio::test]
+    async fn worktree_metadata_resolves_colliding_admin_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source).expect("source");
+        git(&source, &["init", "-b", "main"]);
+        git(&source, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+        let vcs = test_fl(&source, Arc::new(crate::providers::ProcessCommandRunner), true);
+        let mut admins = Vec::new();
+        for index in 0..2 {
+            let parent = dir.path().join(format!("vessel-{index}"));
+            std::fs::create_dir(&parent).expect("parent");
+            let target = parent.join("checkout");
+            vcs.materialise_checkout(&format!("branch-{index}"), Some("main"), target.to_str().expect("target"), "managed")
+                .await
+                .expect("create");
+            let metadata = vcs.worktree_metadata(&target).await.expect("typed metadata");
+            assert_eq!(metadata.common_dir, source.join(".git"));
+            assert_eq!(
+                std::fs::read_to_string(metadata.admin_dir.join("gitdir")).expect("backlink").trim(),
+                target.join(".git").to_str().expect("backlink path")
+            );
+            assert_eq!(
+                std::fs::read_to_string(target.join(".git")).expect("pointer").trim(),
+                format!("gitdir: {}", metadata.admin_dir.display())
+            );
+            admins.push(metadata.admin_dir);
+        }
+        assert_ne!(admins[0], admins[1], "same basename must not alias admin overlays");
+        assert!(vcs.worktree_metadata(&source).await.is_err(), "independent clone has no linked registration");
+        assert!(vcs.worktree_metadata(&dir.path().join("absent")).await.is_err(), "missing checkout fails closed");
+    }
+
+    // #2688: a post-add protection failure leaves a locked registration,
+    // and retry preserves both branch provenance and user work on reused targets.
+    #[tokio::test]
+    async fn creation_protection_failure_is_recoverable() {
+        // Process boundary fake: only registration repair fails; Git is real.
+        struct RefuseRepair {
+            before_lock: bool,
+        }
+        #[async_trait]
+        impl CommandRunner for RefuseRepair {
+            async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &crate::providers::ChannelLabel) -> Result<String, String> {
+                if args.windows(2).any(|pair| pair == if self.before_lock { ["worktree", "list"] } else { ["worktree", "repair"] }) {
+                    return Err("temporary repair failure".into());
+                }
+                crate::providers::ProcessCommandRunner.run(cmd, args, cwd, label).await
+            }
+            async fn run_output(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &crate::providers::ChannelLabel,
+            ) -> Result<CommandOutput, String> {
+                crate::providers::ProcessCommandRunner.run_output(cmd, args, cwd, label).await
+            }
+            async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+                crate::providers::ProcessCommandRunner.exists(cmd, args).await
+            }
+        }
+        // Inject both before protection can lock and during later repair.
+        // An already-unlocked reused checkout is covered at the repair seam;
+        // it had no pre-existing protection to preserve before locking.
+        for (reuse_protection, before_lock) in [(None, false), (None, true), (Some(false), false), (Some(true), false), (Some(true), true)]
+        {
+            let reused = reuse_protection.is_some();
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source = dir.path().join("source");
+            let target = dir.path().join("managed");
+            std::fs::create_dir(&source).expect("source");
+            git(&source, &["init", "-b", "main"]);
+            git(&source, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+            let target_str = target.to_str().expect("target");
+            if reused {
+                if reuse_protection == Some(true) {
+                    git(&source, &["worktree", "add", "--lock", "--reason", "existing protection", "-b", "convoy/work", target_str]);
+                } else {
+                    git(&source, &["worktree", "add", "-b", "convoy/work", target_str]);
+                }
+                std::fs::write(target.join("user-work"), "keep me").expect("user work");
+            }
+            let failing = test_fl(&source, Arc::new(RefuseRepair { before_lock }), true);
+            assert!(
+                matches!(
+                    failing.materialise_checkout("convoy/work", Some("main"), target_str, "managed").await,
+                    Err(CheckoutMaterialisationError::Protection(_))
+                ),
+                "protection errors must remain distinguishable for controller retry"
+            );
+            let admin = source.join(".git/worktrees/managed");
+            assert!(admin.join("locked").exists(), "failed creation must remain protected");
+            let hidden = dir.path().join("hidden");
+            std::fs::rename(&target, &hidden).expect("hide target");
+            git(&source, &["worktree", "prune", "--expire", "now"]);
+            assert!(admin.exists(), "sibling prune must preserve failed creation");
+            std::fs::rename(hidden, &target).expect("restore target");
+            let vcs = test_fl(&source, Arc::new(crate::providers::ProcessCommandRunner), true);
+            let recovered = vcs.materialise_checkout("convoy/work", Some("main"), target_str, "managed").await.expect("retry");
+            assert_eq!(
+                recovered.provenance,
+                if reused { CheckoutBranchProvenance::PreExisting } else { CheckoutBranchProvenance::CreatedForConvoy }
+            );
+            if reused {
+                assert_eq!(std::fs::read_to_string(target.join("user-work")).expect("user work survives"), "keep me");
+                assert!(matches!(
+                    vcs.remove_materialised_checkout("convoy/work", target_str).await.expect("cleanup"),
+                    CheckoutRemoval::PreservedCheckout { .. }
+                ));
+            } else {
+                assert_eq!(vcs.remove_materialised_checkout("convoy/work", target_str).await.expect("cleanup"), CheckoutRemoval::Removed);
+            }
+        }
     }
 
     // Issue #2675: managed registrations survive a sibling's prune, recover

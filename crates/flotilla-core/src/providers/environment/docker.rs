@@ -315,8 +315,7 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
 fn protected_git_mount(mount: &ProvisionedMount) -> bool {
     mount.mode == ProvisionedMountMode::Ro
         && mount.host_path.as_path() == mount.environment_path.as_path()
-        && mount.host_path.as_path().parent().is_some_and(|parent| parent.file_name().is_some_and(|name| name == ".git"))
-        && mount.host_path.as_path().file_name().is_some_and(|name| name == "config" || name == "hooks")
+        && mount.host_path.as_path().file_name().is_some_and(|name| name == "config" || name == "hooks" || name == "worktrees")
 }
 
 fn dockerfile_image_tag(spec_path: &Path, abs_path: &Path) -> Result<String, String> {

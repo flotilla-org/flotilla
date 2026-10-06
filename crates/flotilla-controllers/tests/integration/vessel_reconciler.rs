@@ -10,8 +10,8 @@ use common::{
     create_ready_clone, create_ready_docker_environment, create_ready_host_direct_environment, create_stopped_terminal, create_workspace,
     labeled_meta, meta, vessel_meta, work_state, DockerWorktreePolicyFixture, ReadyCheckoutFixture, StoppedTerminalFixture,
 };
-use flotilla_controllers::reconcilers::VesselReconciler;
-use flotilla_core::in_process::BRIEF_ARTIFACTS_ANNOTATION;
+use flotilla_controllers::reconcilers::{vessel::WorktreeMetadataResolver, VesselReconciler};
+use flotilla_core::{in_process::BRIEF_ARTIFACTS_ANNOTATION, vcs::WorktreeMetadata};
 use flotilla_protocol::{IssueRef, IssueSource, IssueState};
 use flotilla_resources::{
     artifact_record_name, canonicalize_repo_url, clone_key,
@@ -37,6 +37,36 @@ const REPO_URL: &str = "https://github.com/flotilla-org/flotilla.git";
 const GIT_REF: &str = "feat/task-provisioning";
 const HOST_REF: &str = "01HXYZ";
 
+// Process/VCS boundary fake: deliberately use a resolved admin name that is
+// different from the target basename; the controller must not guess Git names.
+struct TestWorktreeMetadata(ResourceBackend);
+#[async_trait]
+impl WorktreeMetadataResolver for TestWorktreeMetadata {
+    async fn worktree_metadata(&self, env_ref: &str, target: &str) -> Result<WorktreeMetadata, String> {
+        let checkout = self
+            .0
+            .clone()
+            .using::<Checkout>(NAMESPACE)
+            .list()
+            .await
+            .map_err(|e| e.to_string())?
+            .items
+            .into_iter()
+            .find(|checkout| checkout.spec.target_path() == Some(target) && checkout.spec.env_ref() == Some(env_ref))
+            .expect("fixture checkout");
+        let CheckoutSpec::Worktree(spec) = checkout.spec else { panic!("worktree fixture") };
+        let clone = self.0.clone().using::<flotilla_resources::Clone>(NAMESPACE).get(&spec.clone_ref).await.map_err(|e| e.to_string())?;
+        let common_dir = std::path::PathBuf::from(clone.spec.path).join(".git");
+        let name = std::path::Path::new(target).file_name().expect("target name").to_string_lossy();
+        let admin_dir = common_dir.join("worktrees").join(format!("resolved-{name}"));
+        Ok(WorktreeMetadata { common_dir, admin_dir })
+    }
+}
+
+fn test_vessel_reconciler(backend: ResourceBackend, namespace: &str) -> VesselReconciler {
+    VesselReconciler::new(backend.clone(), namespace).with_worktree_metadata(Arc::new(TestWorktreeMetadata(backend)))
+}
+
 #[tokio::test]
 async fn landed_convoy_does_not_recreate_a_missing_checkout() {
     let backend = ResourceBackend::InMemory(Default::default());
@@ -50,7 +80,7 @@ async fn landed_convoy_does_not_recreate_a_missing_checkout() {
     let vessel =
         create_workspace(&backend, NAMESPACE, "convoy-landed-implement", "convoy-landed", "implement", "policy-landed", REPO_URL).await;
 
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     let prepared = reconciler.prepare(&vessel).await.expect("landed vessel dependencies");
     let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
     assert!(outcome.actuations.is_empty(), "landed convoy still desires checkout provisioning");
@@ -61,7 +91,7 @@ async fn landed_convoy_does_not_recreate_a_missing_checkout() {
         ControllerLoop {
             primary: vessels,
             secondaries: VesselReconciler::secondary_watches(),
-            reconciler: VesselReconciler::new(backend.clone(), NAMESPACE),
+            reconciler: test_vessel_reconciler(backend.clone(), NAMESPACE),
             resync_interval: Duration::from_secs(60),
             backend: backend.clone(),
         }
@@ -87,7 +117,7 @@ async fn repeated_checkout_removal_backs_off_and_reports_the_conflict() {
         ControllerLoop {
             primary: vessels.clone(),
             secondaries: VesselReconciler::secondary_watches(),
-            reconciler: VesselReconciler::new(backend.clone(), NAMESPACE),
+            reconciler: test_vessel_reconciler(backend.clone(), NAMESPACE),
             resync_interval: Duration::from_secs(60),
             backend,
         }
@@ -235,7 +265,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
         .await
         .expect("vessel should create");
 
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
 
@@ -258,7 +288,7 @@ async fn host_direct_placement_is_not_refused_by_template_stance() {
     let workspace =
         create_workspace(&backend, NAMESPACE, "workspace-contained", "convoy-contained", "implement", "policy-host", REPO_URL).await;
 
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -301,7 +331,7 @@ async fn ready_vessel_records_requested_and_effective_stance() {
     let workspace =
         create_workspace(&backend, NAMESPACE, "workspace-stance", "convoy-stance", "implement", "policy-stance", REPO_URL).await;
 
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -355,7 +385,7 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
     let review =
         create_workspace(&backend, NAMESPACE, "workspace-shared-review", "convoy-shared", "review", "policy-shared", REPO_URL).await;
 
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     let implement_deps = reconciler.prepare(&implement).await.expect("implement dependencies");
     let implement_outcome = reconciler.reconcile(&implement, &implement_deps, Utc::now());
     let (checkout_meta, checkout_spec) = implement_outcome
@@ -424,7 +454,7 @@ async fn stuck_provisioning_vessel_surfaces_the_statusless_checkout_it_is_retryi
     create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/tmp/clone").await;
     let vessels = backend.clone().using::<Vessel>(NAMESPACE);
     let vessel = create_workspace(&backend, NAMESPACE, "workspace-stuck", "convoy-stuck", "implement", "policy-stuck", REPO_URL).await;
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     let deps = reconciler.prepare(&vessel).await.expect("initial dependencies");
     let initial = reconciler.reconcile(&vessel, &deps, Utc::now());
     let (checkout_meta, checkout_spec) = initial
@@ -480,7 +510,7 @@ async fn unrelated_convoys_with_the_same_branch_use_distinct_worktree_paths() {
     let first = create_workspace(&backend, NAMESPACE, "workspace-one", "convoy-one", "implement", "policy-shared-branch", REPO_URL).await;
     let second = create_workspace(&backend, NAMESPACE, "workspace-two", "convoy-two", "implement", "policy-shared-branch", REPO_URL).await;
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let first_deps = reconciler.prepare(&first).await.expect("first dependencies");
     let second_deps = reconciler.prepare(&second).await.expect("second dependencies");
     let first_outcome = reconciler.reconcile(&first, &first_deps, Utc::now());
@@ -644,7 +674,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         })
         .await
         .expect("vessel should create");
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
 
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
@@ -867,7 +897,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
         .await
         .expect("vessel should create");
 
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
     let mounts = outcome.actuations.iter().find_map(|actuation| match actuation {
@@ -875,21 +905,61 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
         _ => None,
     });
     let mounts = mounts.expect("docker environment should be created");
-    assert_eq!(mounts.len(), 7);
+    assert_eq!(mounts.len(), 11);
     assert_eq!(mounts[0].source_path, "/Users/alice/dev/flotilla-repos/convoy-multi-docker/feature-multi");
     assert_eq!(mounts[0].target_path, "/workspace");
     assert_eq!(mounts[1].source_path, "/Users/alice/dev/flotilla-repos/cleat/.git");
     assert_eq!(mounts[1].target_path, "/Users/alice/dev/flotilla-repos/cleat/.git");
-    for (clone, slice) in [("cleat", &mounts[1..4]), ("flotilla", &mounts[4..7])] {
+    for (clone, slice) in [("cleat", &mounts[1..6]), ("flotilla", &mounts[6..11])] {
         let common = format!("/Users/alice/dev/flotilla-repos/{clone}/.git");
         assert_eq!(slice[0].source_path, common);
         assert_eq!(slice[0].mode, flotilla_resources::EnvironmentMountMode::Rw);
-        for (mount, name) in slice[1..].iter().zip(["config", "hooks"]) {
+        for (mount, name) in slice[1..].iter().zip(["config", "hooks", "worktrees"]) {
             assert_eq!(mount.source_path, format!("{common}/{name}"));
             assert_eq!(mount.target_path, mount.source_path);
             assert_eq!(mount.mode, flotilla_resources::EnvironmentMountMode::Ro);
         }
     }
+
+    // #2682: writable exceptions are exactly the vessel's resolved admins;
+    // all current and future siblings inherit the read-only parent.
+    for slice in mounts[1..].chunks_exact(5) {
+        assert_eq!(slice[4].mode, flotilla_resources::EnvironmentMountMode::Rw);
+        assert!(slice[4].source_path.starts_with(&format!("{}/worktrees/resolved-", slice[0].source_path)));
+        assert_eq!(slice[4].target_path, slice[4].source_path);
+    }
+
+    // Removing or adding an own-admin overlay requires environment recreation;
+    // no crew may be launched using the stale membership's writable grants.
+    let docker = outcome
+        .actuations
+        .iter()
+        .find_map(|actuation| match actuation {
+            Actuation::CreateEnvironment { spec, .. } => spec.docker.clone(),
+            _ => None,
+        })
+        .expect("docker spec");
+    let mut stale = docker.clone();
+    stale.mounts.pop();
+    let environment = create_ready_docker_environment(&backend, NAMESPACE, "env-workspace-multi-docker", stale).await;
+    let deps = reconciler.prepare(&vessel).await.expect("stale environment");
+    let blocked = reconciler.reconcile(&vessel, &deps, Utc::now());
+    assert!(
+        blocked.actuations.iter().all(|actuation| !matches!(actuation, Actuation::CreateTerminalSession { .. })),
+        "stale overlays must not launch crews"
+    );
+    assert!(
+        matches!(blocked.patch, Some(flotilla_resources::VesselStatusPatch::MarkProvisioning { ref message, .. }) if message.as_deref().is_some_and(|message| message.contains("recreate the environment")))
+    );
+    let environments = backend.clone().using::<Environment>(NAMESPACE);
+    environments.delete(&environment.metadata.name).await.expect("remove stale environment");
+    create_ready_docker_environment(&backend, NAMESPACE, "env-workspace-multi-docker", docker).await;
+    let deps = reconciler.prepare(&vessel).await.expect("matching membership");
+    let unblocked = reconciler.reconcile(&vessel, &deps, Utc::now());
+    assert!(
+        unblocked.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateTerminalSession { .. })),
+        "matching overlays allow crew launch"
+    );
 
     let mixed = backend
         .clone()
@@ -1026,7 +1096,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
         .await
         .expect("vessel should create");
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
     let checkout_paths = outcome
@@ -1134,7 +1204,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         .await
         .expect("vessel should create");
 
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
     let clone = outcome
@@ -1287,7 +1357,7 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
     )
     .await;
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -1334,7 +1404,7 @@ async fn contained_docker_placement_propagates_never_pull_policy_to_environment(
         create_workspace(&backend, NAMESPACE, "workspace-local-image", "convoy-local-image", "implement", "policy-local-image", REPO_URL)
             .await;
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&vessel).await.expect("deps should load");
     let outcome = reconciler.reconcile(&vessel, &deps, Utc::now());
 
@@ -1360,7 +1430,7 @@ async fn missing_placement_policy_marks_workspace_failed() {
     create_convoy_with_single_task(&backend, NAMESPACE, "convoy-a", "implement", REPO_URL, GIT_REF).await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-a", "convoy-a", "implement", "policy-missing", REPO_URL).await;
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -1383,7 +1453,7 @@ async fn reuses_existing_clone_by_deterministic_name() {
     create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-b", "convoy-b", "implement", "policy-a", REPO_URL).await;
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -1425,7 +1495,7 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
     create_ready_clone(&backend, NAMESPACE, &clone_name, REPO_URL, &host_direct_env_name(), "/Users/alice/dev/flotilla-repos/clone").await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-c", "convoy-c", "implement", "policy-worktree", REPO_URL).await;
 
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
     assert!(outcome.actuations.iter().any(|actuation| matches!(actuation, Actuation::CreateCheckout { .. })));
@@ -1476,6 +1546,16 @@ async fn docker_worktree_waits_for_checkout_before_creating_environment() {
                         source_path: "/Users/alice/dev/flotilla-repos/clone/.git/hooks".to_string(),
                         target_path: "/Users/alice/dev/flotilla-repos/clone/.git/hooks".to_string(),
                         mode: flotilla_resources::EnvironmentMountMode::Ro,
+                    },
+                    flotilla_resources::EnvironmentMount {
+                        source_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees".to_string(),
+                        target_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees".to_string(),
+                        mode: flotilla_resources::EnvironmentMountMode::Ro,
+                    },
+                    flotilla_resources::EnvironmentMount {
+                        source_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees/resolved-github-com-flotilla-org-flotilla.workspace-c".to_string(),
+                        target_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees/resolved-github-com-flotilla-org-flotilla.workspace-c".to_string(),
+                        mode: flotilla_resources::EnvironmentMountMode::Rw,
                     },
                 ])
         )
@@ -1624,7 +1704,7 @@ async fn docker_worktree_rejects_an_adopted_checkout_without_shared_clone_metada
         .await
         .expect("workspace should create");
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("dependencies should resolve to a vessel failure");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -1680,7 +1760,7 @@ async fn docker_worktree_reports_missing_shared_clone_metadata_as_a_vessel_failu
     )
     .await;
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("dependencies should resolve to a vessel failure");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -1749,6 +1829,16 @@ memory_policy: Default::default(),
                 source_path: "/Users/alice/dev/flotilla-repos/clone/.git/hooks".to_string(),
                 target_path: "/Users/alice/dev/flotilla-repos/clone/.git/hooks".to_string(),
                 mode: flotilla_resources::EnvironmentMountMode::Ro,
+            },
+            flotilla_resources::EnvironmentMount {
+                source_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees".to_string(),
+                target_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees".to_string(),
+                mode: flotilla_resources::EnvironmentMountMode::Ro,
+            },
+            flotilla_resources::EnvironmentMount {
+                source_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees/resolved-github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
+                target_path: "/Users/alice/dev/flotilla-repos/clone/.git/worktrees/resolved-github-com-flotilla-org-flotilla.workspace-docker-worktree".to_string(),
+                mode: flotilla_resources::EnvironmentMountMode::Rw,
             },
         ],
         env: Default::default(),
@@ -1836,7 +1926,7 @@ async fn child_failure_propagates_to_workspace_failure() {
     .await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-f", "convoy-f", "implement", "policy-f", REPO_URL).await;
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -1930,7 +2020,7 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
         .await
         .expect("terminal stopped");
 
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -1989,7 +2079,7 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
         .await
         .expect("workspace create should succeed");
 
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -2068,7 +2158,7 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
         .await
         .expect("workspace create");
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -2134,7 +2224,7 @@ async fn vessel_waits_for_admission_brief_envelope_then_pins_its_digest() {
         })
         .await
         .expect("vessel");
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     let waiting = reconciler.prepare(&vessel).await.expect("wait for artifact");
     assert!(reconciler
         .reconcile(&vessel, &waiting, Utc::now())
@@ -2227,7 +2317,7 @@ async fn repo_level_brief_template_override_changes_one_block_for_that_repo_conv
         .await
         .expect("workspace create");
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -2319,7 +2409,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
         .await
         .expect("workspace create");
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -2350,7 +2440,7 @@ async fn observed_checkout_at_managed_name_marks_workspace_failed() {
     let workspace =
         create_workspace(&backend, NAMESPACE, "workspace-observed", "convoy-observed", "implement", "policy-observed", REPO_URL).await;
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -2374,7 +2464,7 @@ async fn run_finalizer_deletes_vessel_owned_children_but_preserves_checkout() {
     create_labeled_checkout(&backend, NAMESPACE, "checkout-workspace-finalize", "workspace-finalize").await;
     create_labeled_terminal(&backend, NAMESPACE, "terminal-workspace-finalize-coder", "workspace-finalize").await;
 
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     reconciler.run_finalizer(&workspace).await.expect("finalizer should succeed");
 
     assert!(matches!(
@@ -2447,7 +2537,7 @@ async fn completed_convoy_does_not_repeat_vessel_delete_while_its_finalizer_is_p
         "a vessel already awaiting finalization should not be deleted again"
     );
 
-    let vessel_reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let vessel_reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     vessel_reconciler.run_finalizer(&pending_vessel).await.expect("vessel finalizer should delete terminal children");
     let clear_finalizer = InputMeta::from(&pending_vessel.metadata).without_finalizer("flotilla.work/vessel-workspace-teardown");
     vessels
@@ -2468,7 +2558,7 @@ async fn run_finalizer_preserves_adopted_checkout() {
     create_labeled_adopted_checkout(&backend, NAMESPACE, "checkout-workspace-adopted", "workspace-adopted").await;
     create_labeled_terminal(&backend, NAMESPACE, "terminal-workspace-adopted-coder", "workspace-adopted").await;
 
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     reconciler.run_finalizer(&workspace).await.expect("finalizer should succeed");
 
     let checkout =
@@ -2487,7 +2577,7 @@ async fn run_finalizer_ignores_missing_children_and_cleans_partial_workspace() {
 
     create_labeled_environment(&backend, NAMESPACE, "env-workspace-partial", "workspace-partial").await;
 
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     reconciler.run_finalizer(&workspace).await.expect("finalizer should succeed");
 
     assert!(matches!(
@@ -2536,7 +2626,7 @@ async fn terminal_session_actuation_includes_system_and_user_labels() {
     .await;
     let workspace = create_workspace(&backend, NAMESPACE, "workspace-labels", "convoy-labels", "review", "policy-labels", REPO_URL).await;
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, Utc::now());
 
@@ -2620,7 +2710,7 @@ async fn assert_terminal_cwd_for_strategy(
     .await;
     let workspace = create_workspace(&backend, NAMESPACE, workspace_name, "convoy-cwd", "implement", "policy-cwd", REPO_URL).await;
 
-    let reconciler = VesselReconciler::new(backend, NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend, NAMESPACE);
     let deps = reconciler.prepare(&workspace).await.expect("deps should load");
     let outcome = reconciler.reconcile(&workspace, &deps, chrono::Utc::now());
 
@@ -2977,7 +3067,7 @@ async fn fleet_image_baseline_bump_provisions_on_three_hosts_without_policy_edit
         )
         .await;
         let vessel = create_workspace(&backend, NAMESPACE, "vessel", "convoy", "implement", "crew-policy", REPO_URL).await;
-        let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+        let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
         let prepared = reconciler.prepare(&vessel).await.expect("prepare missing reference");
         let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
         assert!(outcome.actuations.is_empty(), "missing reference cannot emit an Environment or any Docker pull");
@@ -3005,7 +3095,7 @@ async fn fleet_image_baseline_bump_provisions_on_three_hosts_without_policy_edit
                 .expect("federate image bump");
         }
         for (backend, vessel, policy_version) in &hosts {
-            let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+            let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
             let prepared = reconciler.prepare(vessel).await.expect("prepare");
             let outcome = reconciler.reconcile(vessel, &prepared, Utc::now());
             assert!(
@@ -3083,7 +3173,7 @@ async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: 
     })
     .await;
     let vessel = create_workspace(&backend, NAMESPACE, "vessel", "convoy", "implement", "crew-policy", REPO_URL).await;
-    let reconciler = VesselReconciler::new(backend.clone(), NAMESPACE);
+    let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
     let prepared = reconciler.prepare(&vessel).await.expect("initial prepare");
     let outcome = reconciler.reconcile(&vessel, &prepared, Utc::now());
     assert!(matches!(outcome.patch, Some(VesselStatusPatch::MarkReady { .. })), "{:?}", outcome.patch);

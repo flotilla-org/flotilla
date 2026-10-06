@@ -96,6 +96,9 @@ rounds:
     - '{root}/repo'
     - worktree
     - add
+    - '--lock'
+    - '--reason'
+    - 'flotilla-managed: convoy/new'
     - '-b'
     - convoy/new
     - '{root}/convoy-new'
@@ -103,7 +106,7 @@ rounds:
     cwd: /
     stdout: |
       branch 'convoy/new' set up to track 'origin/main'.
-      HEAD is now at 3480649 initial
+      HEAD is now at 885b93d initial
     exit_code: 0
   - channel: command
     cmd: git
@@ -115,7 +118,7 @@ rounds:
     - HEAD
     cwd: /
     stdout: |
-      34806497f311a359133b254d5e7ce42ed2b87e78
+      885b93deb9a32f734e5e4454d37b6a94d4fc1021
     exit_code: 0
   - channel: command
     cmd: git
@@ -124,9 +127,21 @@ rounds:
     - '{root}/repo'
     - update-ref
     - refs/flotilla/bootstrap/convoy/new
-    - '34806497f311a359133b254d5e7ce42ed2b87e78'
+    - '885b93deb9a32f734e5e4454d37b6a94d4fc1021'
     cwd: /
     stdout: ''
+    exit_code: 0
+  - channel: command
+    cmd: git
+    args:
+    - '-C'
+    - '{root}/repo'
+    - worktree
+    - list
+    - '--porcelain'
+    - '-z'
+    cwd: /
+    stdout: "worktree {root}/repo\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
     exit_code: 0
   - channel: command
     cmd: git
@@ -149,20 +164,7 @@ rounds:
     - '--porcelain'
     - '-z'
     cwd: /
-    stdout: "worktree {root}/repo\0HEAD 34806497f311a359133b254d5e7ce42ed2b87e78\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 34806497f311a359133b254d5e7ce42ed2b87e78\0branch refs/heads/convoy/new\0\0"
-    exit_code: 0
-  - channel: command
-    cmd: git
-    args:
-    - '-C'
-    - '{root}/repo'
-    - worktree
-    - lock
-    - '--reason'
-    - 'flotilla-managed: convoy/new'
-    - '{root}/convoy-new'
-    cwd: /
-    stdout: ''
+    stdout: "worktree {root}/repo\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
     exit_code: 0
   - channel: command
     cmd: git
@@ -240,7 +242,7 @@ rounds:
     - '--porcelain'
     - '-z'
     cwd: /
-    stdout: "worktree {root}/repo\0HEAD 34806497f311a359133b254d5e7ce42ed2b87e78\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 34806497f311a359133b254d5e7ce42ed2b87e78\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
+    stdout: "worktree {root}/repo\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
     exit_code: 0
   - channel: command
     cmd: git
@@ -252,7 +254,7 @@ rounds:
     - '--porcelain'
     - '-z'
     cwd: /
-    stdout: "worktree {root}/repo\0HEAD 34806497f311a359133b254d5e7ce42ed2b87e78\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 34806497f311a359133b254d5e7ce42ed2b87e78\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
+    stdout: "worktree {root}/repo\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/main\0\0worktree {root}/convoy-new\0HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021\0branch refs/heads/convoy/new\0locked flotilla-managed: convoy/new\0\0"
     exit_code: 0
   - channel: command
     cmd: git
@@ -298,7 +300,7 @@ rounds:
     - refs/heads/convoy/new
     cwd: /
     stdout: |
-      34806497f311a359133b254d5e7ce42ed2b87e78
+      885b93deb9a32f734e5e4454d37b6a94d4fc1021
     stderr: ''
     exit_code: 0
   - channel: command
@@ -311,7 +313,7 @@ rounds:
     - refs/flotilla/bootstrap/convoy/new
     cwd: /
     stdout: |
-      34806497f311a359133b254d5e7ce42ed2b87e78
+      885b93deb9a32f734e5e4454d37b6a94d4fc1021
     stderr: ''
     exit_code: 0
   - channel: command
@@ -325,7 +327,7 @@ rounds:
     cwd: /
     stdout: |+
       worktree {root}/repo
-      HEAD 34806497f311a359133b254d5e7ce42ed2b87e78
+      HEAD 885b93deb9a32f734e5e4454d37b6a94d4fc1021
       branch refs/heads/main
 
     exit_code: 0
@@ -340,7 +342,7 @@ rounds:
     - convoy/new
     cwd: /
     stdout: |
-      Deleted branch convoy/new (was 3480649).
+      Deleted branch convoy/new (was 885b93d).
     exit_code: 0
   - channel: command
     cmd: git
