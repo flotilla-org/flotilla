@@ -556,6 +556,11 @@ async fn connect_or_spawn_with_optional_surface(
         .await
 }
 
+// Keep the producer's actionable refusal shared with retry classification on
+// every platform, so Unix tests exercise the same error Windows returns.
+#[doc(hidden)]
+pub const UNSUPPORTED_LOCAL_DAEMON_ERROR: &str = "local Unix daemon sockets are unsupported on this platform; connect to a remote daemon with --daemon ssh://HOST or FLOTILLA_DAEMON (no local daemon will be spawned)";
+
 // Windows clients never acquire daemon lifecycle authority or spawn a daemon.
 #[cfg(not(unix))]
 async fn connect_or_spawn_with_optional_surface(
@@ -569,8 +574,7 @@ async fn connect_or_spawn_with_optional_surface(
 
 #[cfg(not(unix))]
 async fn connect_unix_message_session(_socket_path: &Path) -> Result<MessageSession, String> {
-    Err("local Unix daemon sockets are unsupported on this platform; connect to a remote daemon with --daemon ssh://HOST or FLOTILLA_DAEMON (no local daemon will be spawned)"
-        .to_string())
+    Err(UNSUPPORTED_LOCAL_DAEMON_ERROR.to_string())
 }
 
 #[cfg(unix)]
