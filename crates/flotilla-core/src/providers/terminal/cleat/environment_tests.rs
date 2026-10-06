@@ -247,6 +247,8 @@ fn docker_crew_preserves_vessel_environment(tc: hegel::TestCase) {
     // both bag merge orders, and empty, ordinary and shell-special values.
     // Sequential launches cover session overrides; no global environment is mutated.
     let supports_clear = tc.draw(gs::booleans());
+    // An empty explicitly configured PATH is still a declaration: importing
+    // host PATH here would change the contract. Executable selection is separate.
     let configured_path = tc.draw(gs::booleans());
     let empty_vessel = tc.draw(gs::booleans());
     let reverse_merge = tc.draw(gs::booleans());
@@ -261,6 +263,7 @@ fn docker_crew_preserves_vessel_environment(tc: hegel::TestCase) {
             child: Mutex::new(None),
         });
         let mut vessel: std::collections::HashMap<String, String> = [
+            ("HOME", "/home/crew"),
             ("RUSTUP_HOME", "/usr/local/rustup"),
             ("CARGO_HOME", "/tmp/flotilla-config/cargo"),
             ("GIT_CONFIG_COUNT", "3"),
@@ -300,7 +303,7 @@ fn docker_crew_preserves_vessel_environment(tc: hegel::TestCase) {
                 assert_eq!(child.get("RUSTUP_HOME").map(String::as_str), Some(value), "last session override wins");
             }
             assert!(!child.contains_key("ARBITRARY_AMBIENT"), "host ambient leaked");
-            assert!(!child.contains_key("HOME"), "host baseline leaked");
+            assert_eq!(child.get("HOME"), vessel.get("HOME"), "host HOME must not replace the vessel HOME");
             assert_eq!(child.get("PATH").map(String::as_str), Some(if configured_path { value } else { "/usr/local/bin:/usr/bin:/bin" }));
         }
         for client in runner.clients.lock().expect("clients").iter() {

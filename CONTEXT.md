@@ -489,6 +489,10 @@ _Avoid_: Setup, bootstrap.
 A provisioned execution context in which a **Vessel**'s **Processes** run —
 host-direct, a nested container/sandbox (docker, sandbox-exec, firecracker), or
 service-provided (runpod, modal, aws). Most resources live *in* an Environment.
+A nested Environment owns its crews' session baseline, including credentials
+declared for that Environment. Crew declarations override the baseline;
+ambient settings of the containing Host are not declarations for the nested
+Environment.
 A **Host** is/has a direct environment and may contain nested ones; the precise
 host/environment relationship is still being pinned down.
 _Avoid_: Sandbox (reserve for the future restricted-execution feature), VM.

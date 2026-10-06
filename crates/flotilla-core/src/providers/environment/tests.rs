@@ -1092,42 +1092,62 @@ async fn status_returns_running() {
 }
 
 // #2790: read the container configuration, without login-shell mutations or
-// truncating empty, multiline, or equals-containing values. One example
-// suffices for the Docker query and JSON decoding glue.
+// truncating empty, multiline, or equals-containing values. Docker's
+// runtime HOME fills an absent declaration, but never replaces explicit HOME.
+// Named examples suffice for this Docker query/JSON decoding glue.
 #[tokio::test]
 async fn env_vars_reads_configured_container_environment() {
     use flotilla_protocol::ImageId;
-    let runner = Arc::new(QueuedRunner::new([
-        Ok("container-id".into()), // docker run
-        Ok("sha256:test-image".into()),
-        Ok(r#"["FOO=bar", "BAZ=qux", "TEXT=line one\nline two=tail", "EMPTY="]"#.into()), // docker inspect Config.Env
-    ]));
-    let provider = DockerEnvironmentProvider::new(runner.clone());
-    let image = ImageId::new("ubuntu:22.04");
-    let opts = CreateOpts {
-        tokens: vec![],
-        tools: vec![test_daemon_tool("/run/flotilla.sock")],
-        working_directory: None,
-        provisioned_mounts: vec![],
-        image_pull_policy: ImagePullPolicy::IfNotPresent,
-        prepared_auth: Default::default(),
-        cpu_limit: None,
-        memory_policy: Default::default(),
-    };
+    // Cover absent, explicit, and explicitly empty HOME, plus null Config.Env.
+    for (configured_home, null_environment) in [(None, false), (Some("/configured-home"), false), (Some(""), false), (None, true)] {
+        let mut entries = vec!["FOO=bar", "BAZ=qux", "TEXT=line one\nline two=tail", "EMPTY=", "MALFORMED"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if let Some(home) = configured_home {
+            entries.push(format!("HOME={home}"));
+        }
+        let configured = if null_environment { "null".to_string() } else { serde_json::to_string(&entries).expect("JSON") };
+        let mut responses = vec![Ok("container-id".into()), Ok("sha256:test-image".into()), Ok(configured)];
+        if configured_home.is_none() {
+            responses.push(Ok("/home/crew".into()));
+        }
+        let runner = Arc::new(QueuedRunner::new(responses));
+        let provider = DockerEnvironmentProvider::new(runner.clone());
+        let image = ImageId::new("ubuntu:22.04");
+        let opts = CreateOpts {
+            tokens: vec![],
+            tools: vec![test_daemon_tool("/run/flotilla.sock")],
+            working_directory: None,
+            provisioned_mounts: vec![],
+            image_pull_policy: ImagePullPolicy::IfNotPresent,
+            prepared_auth: Default::default(),
+            cpu_limit: None,
+            memory_policy: Default::default(),
+        };
 
-    let id = EnvironmentId::new("test-env-vars");
-    let handle = provider.create(id, &image, opts).await.expect("create");
-    let vars = handle.env_vars().await.expect("env_vars");
+        let id = EnvironmentId::new("test-env-vars");
+        let handle = provider.create(id, &image, opts).await.expect("create");
+        let vars = handle.env_vars().await.expect("env_vars");
 
-    assert_eq!(vars.get("FOO"), Some(&"bar".to_string()));
-    assert_eq!(vars.get("BAZ"), Some(&"qux".to_string()));
-    assert_eq!(vars.get("TEXT").map(String::as_str), Some("line one\nline two=tail"));
-    assert_eq!(vars.get("EMPTY").map(String::as_str), Some(""));
+        if !null_environment {
+            assert_eq!(vars.get("FOO"), Some(&"bar".to_string()));
+            assert_eq!(vars.get("BAZ"), Some(&"qux".to_string()));
+            assert_eq!(vars.get("TEXT").map(String::as_str), Some("line one\nline two=tail"));
+            assert_eq!(vars.get("EMPTY").map(String::as_str), Some(""));
+        }
+        assert!(!vars.contains_key("MALFORMED"));
+        assert_eq!(vars.get("HOME").map(String::as_str), Some(configured_home.unwrap_or("/home/crew")));
 
-    let calls = runner.calls();
-    let (cmd, args, _) = &calls[2];
-    assert_eq!(cmd, "docker");
-    assert_eq!(args, &["inspect", "--format", "{{json .Config.Env}}", "flotilla-env-test-env-vars"]);
+        let calls = runner.calls();
+        let (cmd, args, _) = &calls[2];
+        assert_eq!(cmd, "docker");
+        assert_eq!(args, &["inspect", "--format", "{{json .Config.Env}}", "flotilla-env-test-env-vars"]);
+        assert_eq!(calls.len(), if configured_home.is_none() { 4 } else { 3 });
+        if configured_home.is_none() {
+            assert_eq!(calls[3].1, ["exec", "flotilla-env-test-env-vars", "sh", "-c", "printf %s \"${HOME-}\""]);
+        }
+    }
 }
 
 #[tokio::test]

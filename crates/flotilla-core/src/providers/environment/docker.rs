@@ -456,11 +456,28 @@ impl DockerEnvironmentProviderInner {
             .await?;
         let entries: Option<Vec<String>> = serde_json::from_str(output.trim())
             .map_err(|error| format!("docker returned invalid environment for container {container_name}: {error}"))?;
-        Ok(entries
-            .unwrap_or_default()
+        let entries = entries.unwrap_or_default();
+        if entries.is_empty() {
+            tracing::debug!(container = %container_name, "container has no configured environment; resolving runtime defaults");
+        }
+        // Docker entries are NAME=VALUE. Ignore malformed entries without '='.
+        let mut environment: HashMap<String, String> = entries
             .into_iter()
             .filter_map(|entry| entry.split_once('=').map(|(key, value)| (key.to_string(), value.to_string())))
-            .collect())
+            .collect();
+        if !environment.contains_key("HOME") {
+            // Docker supplies HOME for the container user at exec time even when
+            // Config.Env omits it. Read only that vessel-local default, without
+            // login-shell mutations; an explicitly configured HOME always wins.
+            let home = self
+                .runner
+                .run("docker", &["exec", container_name, "sh", "-c", "printf %s \"${HOME-}\""], Path::new("/"), &ChannelLabel::Default)
+                .await?;
+            if !home.is_empty() {
+                environment.insert("HOME".to_string(), home);
+            }
+        }
+        Ok(environment)
     }
 
     async fn destroy(&self, container_name: &str) -> Result<(), String> {
