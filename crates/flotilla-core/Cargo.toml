@@ -67,3 +67,6 @@ test = false
 [[example]]
 name = "list_sessions"
 test = false
+
+[lints]
+workspace = true

@@ -3,6 +3,7 @@ use flotilla_protocol::{CommandAction, ConvoyStartIntent, HostName, IssueSelecto
 
 use super::{ui_state::PendingActionContext, App};
 use crate::{
+    app::{ui_state::ProjectIssueStartContext, view_kind::binding_mode},
     binding_table::{BindingModeId, KeyBindingMode},
     interaction::InteractionContext,
     keymap::Action,
@@ -19,7 +20,7 @@ impl App {
     ///
     /// Called when the base layer widget (Normal mode_id) is on top.
     fn resolve_action(&self, key: KeyEvent) -> Option<Action> {
-        let mode = crate::app::view_kind::binding_mode(self.views.active_address(), self.views.is_scoped());
+        let mode = binding_mode(self.views.active_address(), self.views.is_scoped());
         self.keymap.resolve(&mode, crokey::KeyCombination::from(key)).filter(|action| {
             InteractionContext::for_active_view(self.views.active_address(), self.views.active_table_state().selected())
                 .is_available(*action)
@@ -291,12 +292,7 @@ impl App {
                         }),
                     });
                     let pending_ctx = PendingActionContext::project_issue_start(
-                        crate::app::ui_state::ProjectIssueStartContext {
-                            address: address.clone(),
-                            row_id: issue.row_id,
-                            issue: issue.issue,
-                            batch_id,
-                        },
+                        ProjectIssueStartContext { address: address.clone(), row_id: issue.row_id, issue: issue.issue, batch_id },
                         "Start convoy".into(),
                     );
                     self.proto_commands.push_with_context(command, Some(pending_ctx));

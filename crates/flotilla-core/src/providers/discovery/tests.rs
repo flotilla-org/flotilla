@@ -1,7 +1,13 @@
 use flotilla_resources::{ForgeKind, ForgeSpec};
 
 use super::*;
-use crate::path_context::{DaemonHostPath, ExecutionEnvironmentPath};
+use crate::{
+    path_context::{DaemonHostPath, ExecutionEnvironmentPath},
+    providers::{
+        issue_tracker::forge_issue_source,
+        types::{Workspace, WorkspaceAttachRequest},
+    },
+};
 
 fn sample_bag() -> EnvironmentBag {
     EnvironmentBag::new()
@@ -240,7 +246,7 @@ fn repo_identity_keeps_declared_forge_installation_paths_distinct() {
         assert_eq!(identity.authority, format!("forgejo.example.test/{prefix}"));
         assert_eq!(identity.path, "team/repo");
         assert_eq!(bag.repo_slug().as_deref(), Some("team/repo"));
-        let issue_source = crate::providers::issue_tracker::forge_issue_source(&identity);
+        let issue_source = forge_issue_source(&identity);
         assert_eq!(issue_source.service, format!("https://forgejo.example.test/{prefix}"));
         assert_eq!(issue_source.scope, "team/repo");
     }
@@ -272,15 +278,12 @@ struct CountingPresentationManager(Arc<std::sync::atomic::AtomicUsize>);
 
 #[async_trait]
 impl PresentationManager for CountingPresentationManager {
-    async fn list_workspaces(&self) -> Result<Vec<(String, crate::providers::types::Workspace)>, String> {
+    async fn list_workspaces(&self) -> Result<Vec<(String, Workspace)>, String> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(vec![])
     }
 
-    async fn create_workspace(
-        &self,
-        _config: &crate::providers::types::WorkspaceAttachRequest,
-    ) -> Result<(String, crate::providers::types::Workspace), String> {
+    async fn create_workspace(&self, _config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
         unreachable!("not used by this test")
     }
 

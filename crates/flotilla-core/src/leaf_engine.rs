@@ -3024,6 +3024,11 @@ fn evaluate_row(
 
 #[cfg(test)]
 mod tests {
+    use crate::providers::{
+        replay::{test_runner, Masks, Session},
+        testing::fixture_path,
+    };
+
     #[derive(Clone)]
     struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
     impl std::io::Write for Writer {
@@ -7022,11 +7027,9 @@ mod tests {
     async fn replayed_real_merge_observation_unblocks_wait_and_releases_demand() {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let (event_tx, _) = broadcast::channel(16);
-        let fixture = crate::providers::testing::fixture_path("change_request", "cr_observation_merge.yaml");
-        let session = crate::providers::replay::Session::replaying(fixture, crate::providers::replay::Masks::new());
-        let source = Arc::new(crate::change_request_observer::GhChangeRequestObservationSource::new(
-            crate::providers::replay::test_runner(&session),
-        ));
+        let fixture = fixture_path("change_request", "cr_observation_merge.yaml");
+        let session = Session::replaying(fixture, Masks::new());
+        let source = Arc::new(crate::change_request_observer::GhChangeRequestObservationSource::new(test_runner(&session)));
         let cadence = crate::change_request_observer::ChangeRequestRefreshCadence {
             state: Duration::from_secs(60),
             checks_pending: Duration::from_secs(5),

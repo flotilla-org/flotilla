@@ -29,8 +29,14 @@ use super::{
 };
 use crate::{
     admission::AvailableSpaceProbe,
-    providers::CommandOutput,
+    providers::{
+        discovery::{Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
+        types::ChangeRequest,
+        vcs::git_worktree::GitWorktreeStrategy,
+        CommandOutput,
+    },
     repository_inspection::{LocalCheckoutInspection, RepositoryContinuity, RepositoryInspection, RepositoryInspector},
+    vcs::GitCheckoutStrategy,
 };
 
 // #2597: failed reads retain the resource identity and emit scoped debug diagnostics;
@@ -1887,12 +1893,12 @@ async fn idle_crew_nudges_are_bounded_and_credential_staged() {
 struct ForgeAwareTestChangeRequestFactory(Arc<dyn ChangeRequestTracker>);
 
 #[async_trait]
-impl crate::providers::discovery::Factory for ForgeAwareTestChangeRequestFactory {
-    type Descriptor = crate::providers::discovery::ProviderDescriptor;
+impl Factory for ForgeAwareTestChangeRequestFactory {
+    type Descriptor = ProviderDescriptor;
     type Output = dyn ChangeRequestTracker;
 
     fn descriptor(&self) -> Self::Descriptor {
-        crate::providers::discovery::ProviderDescriptor::named(crate::providers::discovery::ProviderCategory::ChangeRequest, "test-forgejo")
+        ProviderDescriptor::named(ProviderCategory::ChangeRequest, "test-forgejo")
     }
 
     async fn probe(
@@ -1901,7 +1907,7 @@ impl crate::providers::discovery::Factory for ForgeAwareTestChangeRequestFactory
         _config: &ConfigStore,
         _repo_root: &ExecutionEnvironmentPath,
         _runner: Arc<dyn CommandRunner>,
-    ) -> Result<Arc<Self::Output>, Vec<crate::providers::discovery::UnmetRequirement>> {
+    ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
         assert_eq!(env.find_origin_forge().map(|forge| forge.kind), Some(flotilla_resources::ForgeKind::Forgejo));
         assert!(env.find_auth_path("forgejo").is_some());
         Ok(Arc::clone(&self.0))
@@ -1955,7 +1961,7 @@ async fn convoy_change_request_resolution_uses_forge_aware_factory_and_credentia
         .expect("credential");
     let provider = Arc::new(FakeChangeRequest::new());
     provider
-        .add_change_requests(vec![("17".to_string(), crate::providers::types::ChangeRequest {
+        .add_change_requests(vec![("17".to_string(), ChangeRequest {
             title: "Fix ghostty".to_string(),
             branch: "governor".to_string(),
             status: flotilla_protocol::ChangeRequestStatus::Open,
@@ -9346,7 +9352,7 @@ async fn branch_discovery_ignores_preexisting_terminal_request() {
         let fixture = rest_admission_fixture([RestAdmissionReply::Absent; 2], RestAdmissionLookup::Branch).await;
         let provider = Arc::new(FakeChangeRequest::new());
         provider
-            .add_change_requests(vec![("7".into(), crate::providers::types::ChangeRequest {
+            .add_change_requests(vec![("7".into(), ChangeRequest {
                 title: "Old work".into(),
                 branch: "reused".into(),
                 status: state,
@@ -9399,7 +9405,7 @@ async fn checkout_branch_switch_discovers_actual_request_and_unlink_wins() {
     let provider = Arc::new(FakeChangeRequest::new());
     provider
         .add_change_requests(vec![
-            ("7".into(), crate::providers::types::ChangeRequest {
+            ("7".into(), ChangeRequest {
                 title: "Old work".into(),
                 branch: "requested".into(),
                 status: flotilla_protocol::ChangeRequestStatus::Merged,
@@ -9407,7 +9413,7 @@ async fn checkout_branch_switch_discovers_actual_request_and_unlink_wins() {
                 provider_name: "github".into(),
                 provider_display_name: "GitHub".into(),
             }),
-            ("8".into(), crate::providers::types::ChangeRequest {
+            ("8".into(), ChangeRequest {
                 title: "Real work".into(),
                 branch: "actual".into(),
                 status: flotilla_protocol::ChangeRequestStatus::Open,
@@ -9464,10 +9470,7 @@ async fn checkout_branch_switch_discovers_actual_request_and_unlink_wins() {
     let vcs = crate::vcs::FlotillaVcs::new(
         ExecutionEnvironmentPath::new(root.path()),
         runner.clone(),
-        crate::vcs::GitCheckoutStrategy::Worktree(Box::new(crate::providers::vcs::git_worktree::GitWorktreeStrategy::new(
-            ".".into(),
-            runner,
-        ))),
+        GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), runner))),
     );
     assert!(fixture.daemon.resolve_live_checkout_change_request(&checkout, &vcs, root.path()).await.expect("old branch lookup").is_none());
     git(&["checkout", "--detach"]);
@@ -9552,7 +9555,7 @@ async fn checkout_creation_does_not_reuse_cached_branch_absence() {
         .expect("absence")
         .is_none());
     provider
-        .add_change_requests(vec![("7".into(), crate::providers::types::ChangeRequest {
+        .add_change_requests(vec![("7".into(), ChangeRequest {
             title: "Old work".into(),
             branch: "reused".into(),
             status: flotilla_protocol::ChangeRequestStatus::Closed,

@@ -485,6 +485,7 @@ impl GhApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::testing::MockRunner;
 
     #[test]
     fn parse_200_response_extracts_etag_and_body() {
@@ -613,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn low_remaining_budget_stops_further_requests_until_reset() {
         let reset = Utc::now().timestamp() + 3600;
-        let runner = Arc::new(crate::providers::testing::MockRunner::new(vec![
+        let runner = Arc::new(MockRunner::new(vec![
             Ok(format!("HTTP/2 200 OK\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Remaining: 75\r\nX-RateLimit-Reset: {reset}\r\n\r\n[]")),
             Ok("HTTP/2 200 OK\r\nX-RateLimit-Resource: core\r\nX-RateLimit-Remaining: 75\r\n\r\n[]".into()),
         ]));
@@ -636,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn search_rate_limit_does_not_suspend_core_issue_observation() {
         let reset = Utc::now().timestamp() + 60;
-        let runner = Arc::new(crate::providers::testing::MockRunner::new(vec![
+        let runner = Arc::new(MockRunner::new(vec![
             Ok(format!(
                 "HTTP/2 200 OK\r\nX-RateLimit-Resource: search\r\nX-RateLimit-Remaining: 20\r\nX-RateLimit-Reset: {reset}\r\n\r\n{{}}"
             )),

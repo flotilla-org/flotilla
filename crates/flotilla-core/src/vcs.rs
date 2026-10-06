@@ -2088,7 +2088,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::providers::{replay, testing::fixture_path};
+    use crate::providers::{
+        replay,
+        testing::{fixture_path, TimeoutOnlyRunner},
+    };
 
     fn git(cwd: &Path, args: &[&str]) {
         let output = std::process::Command::new("git").args(args).current_dir(cwd).output().expect("spawn git");
@@ -2943,7 +2946,7 @@ mod tests {
 
     #[tokio::test]
     async fn archive_retention_uses_a_remote_and_client_deadline() {
-        let runner = crate::providers::testing::TimeoutOnlyRunner::new(Ok(String::new()));
+        let runner = TimeoutOnlyRunner::new(Ok(String::new()));
         prune_remote_checkout_archives(&runner, Path::new("/archives"), 14, std::time::Duration::from_secs(300))
             .await
             .expect("bounded sweep");
@@ -2955,7 +2958,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_archive_retention_failure_names_the_required_supervisor() {
-        let runner = crate::providers::testing::TimeoutOnlyRunner::new(Err("timeout: not found".into()));
+        let runner = TimeoutOnlyRunner::new(Err("timeout: not found".into()));
         let error = prune_remote_checkout_archives(&runner, Path::new("/archives"), 14, std::time::Duration::from_secs(300))
             .await
             .expect_err("missing supervisor refuses an unbounded sweep");
@@ -2966,7 +2969,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_archive_retention_rejects_a_deadline_that_disables_the_supervisor() {
-        let runner = crate::providers::testing::TimeoutOnlyRunner::new(Ok(String::new()));
+        let runner = TimeoutOnlyRunner::new(Ok(String::new()));
         assert!(prune_remote_checkout_archives(&runner, Path::new("/archives"), 14, std::time::Duration::ZERO).await.is_err());
         assert!(runner.calls.lock().expect("calls").is_empty(), "GNU timeout treats zero as an unbounded operation");
     }

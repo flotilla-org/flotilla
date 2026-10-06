@@ -17,7 +17,10 @@ use tokio::sync::{broadcast, Semaphore};
 use tui_input::Input;
 
 use super::{App, CommandQueue, DirEntry, InFlightCommand, OpenViews, TuiHostState, TuiModel};
-use crate::{keymap::Keymap, widgets::WidgetContext};
+use crate::{
+    keymap::Keymap,
+    widgets::{file_picker::FilePickerWidget, WidgetContext},
+};
 
 type FocusObservations = Arc<Mutex<Vec<(uuid::Uuid, Vec<flotilla_protocol::ResourceRef>)>>>;
 pub(crate) type ExecuteCalls = Arc<Mutex<Vec<Command>>>;
@@ -151,7 +154,7 @@ pub(crate) fn key(code: KeyCode) -> KeyEvent {
 }
 
 pub(crate) fn enter_file_picker(app: &mut App, path: &str, entries: Vec<DirEntry>) {
-    app.screen.modal_stack.push(Box::new(crate::widgets::file_picker::FilePickerWidget::new(Input::from(path), entries)));
+    app.screen.modal_stack.push(Box::new(FilePickerWidget::new(Input::from(path), entries)));
 }
 
 pub(crate) fn dir_entry(name: &str, is_git_repo: bool, is_added: bool) -> DirEntry {

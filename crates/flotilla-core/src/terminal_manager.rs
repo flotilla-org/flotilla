@@ -15,7 +15,7 @@ use crate::{
         terminal::PoolTerminalHopResolver, ResolutionContext, ResolvedAction,
     },
     path_context::ExecutionEnvironmentPath,
-    providers::terminal::{parse_managed_session_name, ManagedSessionMetadata, TerminalEnvVars, TerminalPool},
+    providers::terminal::{parse_managed_session_name, ManagedSessionMetadata, TerminalEnvVars, TerminalPool, TerminalSession},
 };
 
 const MANAGED_TERMINAL_PROVIDER: &str = "terminal-manager";
@@ -238,11 +238,7 @@ impl TerminalManager {
         self.pool.kill_session(&session_name).await
     }
 
-    fn discover_sessions(
-        &self,
-        store: &mut dyn crate::attachable::AttachableStoreApi,
-        live_sessions: &[crate::providers::terminal::TerminalSession],
-    ) -> bool {
+    fn discover_sessions(&self, store: &mut dyn crate::attachable::AttachableStoreApi, live_sessions: &[TerminalSession]) -> bool {
         let mut changed = false;
         for session in live_sessions {
             let Some(metadata) = parse_managed_session_name(&session.session_name) else {

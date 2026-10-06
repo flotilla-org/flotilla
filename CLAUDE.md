@@ -33,18 +33,20 @@ cargo +nightly-2026-03-12 fmt --check          # CI format gate
 cargo clippy --workspace --all-targets --locked -- -D warnings  # CI clippy gate
 cargo test --workspace --locked                # CI test gate
 cargo +nightly-2026-03-12 fmt                  # apply pinned formatting
-cargo dylint --all -- --all-targets             # custom lints (requires cargo-dylint + dylint-link)
+python3 ci/git-boundary/check.py               # ast-grep Git boundary check (setup below)
 cargo run                                      # run, auto-detect repo from cwd
 scripts/prune-target.sh --dry-run              # preview the per-checkout target size-cap backstop
 scripts/prune-target.sh                        # apply the per-checkout target size-cap backstop
 scripts/install-cargo-sweep-schedule.sh        # install/verify the daily per-host mtime sweep
 ```
 
-Before pushing, run the exact CI commands: `cargo +nightly-2026-03-12 fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked`.
+Install the Git check dependency in a virtual environment with `python3 -m venv /tmp/flotilla-git-check` and `/tmp/flotilla-git-check/bin/pip install -r ci/git-boundary/requirements.txt`. Run `/tmp/flotilla-git-check/bin/python ci/git-boundary/check.py` and `/tmp/flotilla-git-check/bin/python -m unittest discover -s ci/git-boundary -p test_check.py`.
+
+Before pushing, run the Git check and its tests plus the exact CI commands: `cargo +nightly-2026-03-12 fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked`.
 
 Desk builds keep Cargo incrementals enabled. Crew vessel and CI builds set `CARGO_INCREMENTAL=0`. Each fleet host runs an mtime-based `cargo-sweep --time 3` daily, while `scripts/prune-target.sh` remains a size-cap backstop. See [docs/development.md](docs/development.md) for installation, scope, logs, and thresholds.
 
-**Nightly toolchain:** All nightly-dependent tools (rustfmt, llvm-cov, Dylint) are pinned to `nightly-2026-03-12`. Install with `rustup toolchain install nightly-2026-03-12 --component rustfmt llvm-tools-preview`.
+**Nightly toolchain:** Nightly-dependent tools (rustfmt, llvm-cov) are pinned to `nightly-2026-03-12`. Install with `rustup toolchain install nightly-2026-03-12 --component rustfmt llvm-tools-preview`.
 
 Only when `CODEX_SANDBOX` is set, use `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests` so native dependencies can create temp files and socket-bind tests stay skipped. Everywhere else, use the default `TMPDIR` and run `cargo test --workspace --locked`. Unix-socket tests use the shared harness's SUN_LEN-safe directory directly beneath `/tmp`, independent of `TMPDIR`; do not change this command to work around socket-path length errors.
 
@@ -192,7 +194,7 @@ Checkout VCS providers are demand-discovered through `vcs_for_checkout` and cach
 
 Use the checkout-scoped `flotilla_core::vcs::Vcs` trait for Git and other VCS operations outside its implementation in `crates/flotilla-core/src/vcs.rs` and `crates/flotilla-core/src/providers/vcs/`. Add a typed operation to the trait when a caller needs a new VCS action. CLI via the checkout's environment runner is the universal implementation. A library backend may be used as a host-local fast path behind the same trait; it must not replace the CLI path for remote or provisioned environments.
 
-Do not invoke `git` directly through `CommandRunner` methods or `run!`, or through `std::process::Command::new("git")`, outside the VCS implementation. The Dylint gate enforces this for production code. Build scripts and build tooling are exempt because they run before a `CommandRunner` exists; tests may use Git to construct fixtures.
+Do not invoke `git` directly through `CommandRunner` methods or `run!`, or through `std::process::Command::new("git")`, outside the VCS implementation. The ast-grep Git boundary check runs in the format job on every PR (once the workflow patch from #2793 is applied). Build scripts and build tooling are exempt because they run before a `CommandRunner` exists; tests may use Git to construct fixtures.
 
 ### Observed resources and aggregation
 
@@ -207,7 +209,7 @@ Every PR that changes a resource kind's serialized shape must name the out-of-re
 See [CODING_STANDARDS.md](CODING_STANDARDS.md) for coding conventions and judgement-call standards.
 
 - **Formatting**: `cargo +nightly-2026-03-12 fmt` — uses `max_width=140`, `imports_granularity="Crate"`, `group_imports="StdExternalCrate"`. See `rustfmt.toml`.
-- **Inline paths**: Prefer `use` imports over long inline `crate::`/`self::`/`super::` paths (>3 segments). Enforced by a Dylint lint (`cargo dylint --all -- --all-targets`). Config in `dylint.toml`.
+- **Inline paths**: Prefer `use` imports over long inline `crate::` paths (>3 segments). Enforced by Clippy `absolute_paths`, with external crates allowed in `clippy.toml` to preserve the former crate-relative scope. `self::` and `super::` paths are unchecked. Add new external dependencies to the allowed-crates list as needed.
 
 ## Design and Substrate Work
 

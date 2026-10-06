@@ -9,6 +9,7 @@ use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::terminal::{
         managed_session_name, parse_managed_session_name, ManagedSessionMetadata, TerminalEnvVars, TerminalPool, TerminalSession,
+        TerminalSessionTag,
     },
 };
 
@@ -53,7 +54,7 @@ impl TerminalPool for MockTerminalPool {
         command: &str,
         cwd: &ExecutionEnvironmentPath,
         env_vars: &TerminalEnvVars,
-        _tags: &[crate::providers::terminal::TerminalSessionTag],
+        _tags: &[TerminalSessionTag],
     ) -> Result<(), String> {
         self.calls.lock().expect("lock calls").push(PoolCall::EnsureSession {
             session_name: session_name.to_string(),
@@ -177,7 +178,7 @@ async fn ensure_running_uses_provider_discovery_session_name() {
             command: &str,
             cwd: &ExecutionEnvironmentPath,
             env_vars: &TerminalEnvVars,
-            _tags: &[crate::providers::terminal::TerminalSessionTag],
+            _tags: &[TerminalSessionTag],
         ) -> Result<(), String> {
             self.calls.lock().expect("lock").push(PoolCall::EnsureSession {
                 session_name: session_name.to_string(),
@@ -253,7 +254,7 @@ async fn attach_command_includes_env_vars() {
             _: &str,
             _: &ExecutionEnvironmentPath,
             _: &TerminalEnvVars,
-            _: &[crate::providers::terminal::TerminalSessionTag],
+            _: &[TerminalSessionTag],
         ) -> Result<(), String> {
             Ok(())
         }
@@ -363,7 +364,7 @@ async fn kill_terminal_delegates_to_pool() {
             _: &str,
             _: &ExecutionEnvironmentPath,
             _: &TerminalEnvVars,
-            _: &[crate::providers::terminal::TerminalSessionTag],
+            _: &[TerminalSessionTag],
         ) -> Result<(), String> {
             Ok(())
         }
@@ -487,7 +488,7 @@ async fn cascade_delete_removes_sets_and_kills_sessions() {
             _: &str,
             _: &ExecutionEnvironmentPath,
             _: &TerminalEnvVars,
-            _: &[crate::providers::terminal::TerminalSessionTag],
+            _: &[TerminalSessionTag],
         ) -> Result<(), String> {
             Ok(())
         }

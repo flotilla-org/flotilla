@@ -10,14 +10,18 @@ use crate::{
     attachable::{BindingObjectKind, ProviderBinding, SharedAttachableStore},
     hop_chain::{
         builder::HopPlanBuilder,
-        environment::{DockerEnvironmentHopResolver, NoopEnvironmentHopResolver},
+        environment::{DockerEnvironmentHopResolver, EnvironmentHopResolver, NoopEnvironmentHopResolver},
         remote::ssh_resolver_from_config,
         resolver::HopResolver,
         terminal::NoopTerminalHopResolver,
         Hop, ResolutionContext, ResolvedAction,
     },
     path_context::{DaemonHostPath, ExecutionEnvironmentPath},
-    providers::{presentation::PresentationManager, registry::ProviderRegistry, types::WorkspaceAttachRequest},
+    providers::{
+        presentation::PresentationManager,
+        registry::ProviderRegistry,
+        types::{WorkspaceAttachRequest, WorkspaceConfig},
+    },
     terminal_manager::TerminalManager,
 };
 
@@ -314,7 +318,7 @@ fn checkout_key_for_store(target_host: &HostName, checkout_path: &Path, checkout
     checkout_key.cloned().unwrap_or_else(|| QualifiedPath::from_host_name(target_host, checkout_path.to_path_buf()))
 }
 
-fn workspace_attach_request_from_config(config: crate::providers::types::WorkspaceConfig) -> WorkspaceAttachRequest {
+fn workspace_attach_request_from_config(config: WorkspaceConfig) -> WorkspaceAttachRequest {
     WorkspaceAttachRequest::builder()
         .name(config.name)
         .working_directory(config.working_directory)
@@ -339,7 +343,7 @@ pub(crate) fn resolve_prepared_commands_via_hop_chain(
     container_name: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
     let ssh_resolver = ssh_resolver_from_config(&DaemonHostPath::new(config_base))?;
-    let env_resolver: Arc<dyn crate::hop_chain::environment::EnvironmentHopResolver> = match (environment_id, container_name) {
+    let env_resolver: Arc<dyn EnvironmentHopResolver> = match (environment_id, container_name) {
         (Some(env_id), Some(name)) => {
             let mut containers = HashMap::new();
             containers.insert(env_id.clone(), name.to_string());

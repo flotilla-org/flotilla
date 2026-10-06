@@ -189,11 +189,11 @@ mod tests {
 
     use super::*;
     use crate::providers::{
-        github_api::{GhApi, GhApiResponse},
+        github_api::{GhApi, GhApiClient, GhApiResponse},
         github_test_support::{build_api_and_runner, repo_root_for_recording},
         issue_tracker::{tests::assert_provider_contract, IssueProvider},
         replay::{self, Masks},
-        testing::MockRunner,
+        testing::{fixture_path, MockRunner},
         ChannelLabel,
     };
 
@@ -265,7 +265,7 @@ mod tests {
     }
 
     fn fixture(name: &str) -> String {
-        crate::providers::testing::fixture_path("issue_tracker", name)
+        fixture_path("issue_tracker", name)
     }
 
     #[tokio::test]
@@ -434,7 +434,7 @@ mod tests {
             Ok("HTTP/2 200 OK\r\nETag: \"issue-window\"\r\nX-RateLimit-Remaining: 4800\r\n\r\n[{\"number\":1,\"title\":\"Changed\",\"state\":\"open\",\"labels\":[],\"updated_at\":\"2026-07-01T00:00:10Z\"}]".into()),
             Ok("HTTP/2 304 Not Modified\r\nETag: \"issue-window\"\r\nX-RateLimit-Remaining: 4800\r\n\r\n".into()),
         ]));
-        let api = Arc::new(crate::providers::github_api::GhApiClient::new(runner.clone()));
+        let api = Arc::new(GhApiClient::new(runner.clone()));
         let provider = GitHubIssueProvider::new(api, runner.clone(), Path::new("/neutral"));
 
         let first = provider.list_changed_since(&source(), "2026-07-01T00:00:00Z", 50).await.expect("first poll");
@@ -455,7 +455,7 @@ mod tests {
             Ok("HTTP/2 200 OK\r\nETag: \"issue-window\"\r\n\r\n[{\"number\":1,\"title\":\"Changed\",\"state\":\"open\",\"labels\":[],\"updated_at\":\"2026-07-01T00:00:10Z\"}]".into()),
             Ok("HTTP/2 304 Not Modified\r\nETag: \"issue-window\"\r\n\r\n".into()),
         ]));
-        let api = Arc::new(crate::providers::github_api::GhApiClient::new(runner.clone()));
+        let api = Arc::new(GhApiClient::new(runner.clone()));
         let provider = GitHubIssueProvider::new(api, runner, Path::new("/neutral"));
 
         provider.list_changed_since(&source(), "2026-07-01T00:00:00Z", 50).await.expect("first poll");

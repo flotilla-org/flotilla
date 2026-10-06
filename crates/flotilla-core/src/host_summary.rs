@@ -117,6 +117,7 @@ mod tests {
     use flotilla_protocol::HostEnvironment;
 
     use super::*;
+    use crate::providers::{discovery::test_support::DiscoveryMockRunner, environment::ProvisionedMount};
 
     // Glue: the sampler queries only the current process and reports bytes.
     #[test]
@@ -175,7 +176,7 @@ mod tests {
             None
         }
 
-        fn provisioned_mounts(&self) -> Vec<crate::providers::environment::ProvisionedMount> {
+        fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
             vec![]
         }
 
@@ -210,7 +211,7 @@ mod tests {
         let manager = EnvironmentManager::from_local_state(
             EnvironmentId::new("test-local-environment"),
             HostId::new("test-local-host-id"),
-            Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
+            Arc::new(DiscoveryMockRunner::builder().build()),
             EnvironmentBag::new().with(EnvironmentAssertion::versioned_binary("git", "/usr/bin/git", "2.40.0")),
             Arc::new(vec![]),
         );
@@ -238,7 +239,7 @@ mod tests {
         let manager = EnvironmentManager::from_local_state(
             EnvironmentId::new("test-local-environment"),
             HostId::new("test-local-host-id"),
-            Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
+            Arc::new(DiscoveryMockRunner::builder().build()),
             EnvironmentBag::new(),
             Arc::new(vec![]),
         );
@@ -247,7 +248,7 @@ mod tests {
             id: EnvironmentId::new("env-1"),
             image: ImageId::new("test-image:latest"),
             status: EnvironmentStatus::Running,
-            runner: Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
+            runner: Arc::new(DiscoveryMockRunner::builder().build()),
         });
 
         manager
@@ -287,7 +288,7 @@ mod tests {
         let manager = EnvironmentManager::from_local_state(
             EnvironmentId::new("test-local-environment"),
             HostId::new("test-local-host-id"),
-            Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
+            Arc::new(DiscoveryMockRunner::builder().build()),
             EnvironmentBag::new(),
             Arc::new(vec![]),
         );
@@ -296,7 +297,7 @@ mod tests {
         manager
             .register_direct_environment(
                 direct_env_id.clone(),
-                Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
+                Arc::new(DiscoveryMockRunner::builder().build()),
                 EnvironmentBag::new(),
                 Some(HostId::new("direct-host-id")),
             )
@@ -306,7 +307,7 @@ mod tests {
             id: EnvironmentId::new("env-1"),
             image: ImageId::new("test-image:latest"),
             status: EnvironmentStatus::Running,
-            runner: Arc::new(crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build()),
+            runner: Arc::new(DiscoveryMockRunner::builder().build()),
         });
         manager
             .register_provisioned_environment(EnvironmentId::new("env-1"), handle, EnvironmentBag::new(), None)
