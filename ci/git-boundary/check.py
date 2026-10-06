@@ -101,6 +101,8 @@ def raw_git(node):
             function = function.field("function")
         if function.kind() == "field_expression":
             return function.field("field").text() in RUN_METHODS
+        # Like the old AST lint, match any Type::new literal, including aliases;
+        # without name resolution this conservatively also catches Foo::new("git").
         return function.kind() == "scoped_identifier" and function.field("name").text() == "new"
     if node.kind() == "macro_invocation":
         macro = node.field("macro").text().split("::")[-1]
