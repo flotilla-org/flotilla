@@ -1398,6 +1398,7 @@ pub struct InProcessDaemon {
     /// Used to inject FLOTILLA_DAEMON_SOCKET into managed terminal sessions.
     daemon_socket_path: RwLock<Option<PathBuf>>,
     resource_backend: ResourceBackend,
+    message_inboxes: Mutex<HashMap<String, flotilla_resources::MessageInbox>>,
     clock: Arc<dyn Clock>,
     regard_lifecycle: Arc<RegardLifecycle>,
     observed_resource_backend: ResourceBackend,
@@ -1903,6 +1904,7 @@ impl InProcessDaemon {
             clock: Arc::clone(&clock),
             regard_lifecycle: Arc::clone(&regard_lifecycle),
             resource_backend: resource_backend.clone(),
+            message_inboxes: Mutex::new(HashMap::new()),
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
             aggregator_projection_state: aggregator_projection_state.clone(),
@@ -5475,10 +5477,86 @@ impl InProcessDaemon {
         let Some((namespace, kind, name)) = target else { return Ok(None) };
         let object = match get_resource_kind_including_replicas(&self.resource_backend, namespace, kind, name).await {
             Ok(object) => object,
-            Err(ResourceError::NotFound { .. }) => return Ok(None),
+            Err(ResourceError::NotFound { .. }) => {
+                if kind == "Message" {
+                    if let CommandAction::ResourceApply { document, .. } = action {
+                        return self.message_creation_origin(namespace, document).await;
+                    }
+                }
+                return Ok(None);
+            }
             Err(error) => return Err(error.to_string()),
         };
         Ok(object.value.pointer("/metadata/annotations/flotilla.work~1origin-root").and_then(serde_json::Value::as_str).map(NodeId::new))
+    }
+
+    async fn message_creation_origin(&self, namespace: &str, document: &serde_json::Value) -> Result<Option<NodeId>, String> {
+        let namespace = document.pointer("/metadata/namespace").and_then(serde_json::Value::as_str).unwrap_or(namespace);
+        let spec = flotilla_resources::qualify_message_spec(
+            serde_json::from_value(document.get("spec").cloned().unwrap_or_default()).map_err(|error| format!("Message spec: {error}"))?,
+        )
+        .map_err(|error| error.to_string())?;
+        let receiver = spec.receiver.as_str();
+        let parts = receiver.split('/').collect::<Vec<_>>();
+        let receiver_convoy = if let [project, convoy_name, vessel, _role] = parts.as_slice() {
+            let convoy = self
+                .resource_backend
+                .including_replicas::<ResourceConvoy>(namespace)
+                .get(convoy_name)
+                .await
+                .map_err(|error| format!("receiver `{receiver}` has no admitted convoy: {error}"))?;
+            if convoy.object.spec.project_ref.as_deref().unwrap_or(namespace) != *project {
+                return Err(format!("receiver `{receiver}` does not belong to the convoy's project"));
+            }
+            if let Some(status) = &convoy.object.status {
+                if status.phase.is_terminal() {
+                    return Err(format!("receiver `{receiver}` names a terminal convoy"));
+                }
+                if status
+                    .workflow_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| !snapshot.vessels.iter().any(|declared| declared.name == *vessel))
+                {
+                    return Err(format!("receiver `{receiver}` names an undeclared vessel"));
+                }
+            }
+            Some(convoy)
+        } else {
+            None
+        };
+        if let Some(holder) = flotilla_resources::resolve_message_receiver(&self.resource_backend, namespace, receiver)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(Some(match holder.provenance {
+                ResourceProvenance::Local => self.node_id.clone(),
+                ResourceProvenance::Replica { origin_root, .. } => origin_root,
+            }));
+        }
+        // An admitted vessel has a home before its agent starts. This lets its
+        // messages wait at the receiver while a holder is absent or provisioning.
+        if let (Some(convoy), [_, _, vessel, _]) = (receiver_convoy, parts.as_slice()) {
+            if let Some(pin) = flotilla_resources::vessel_placement_pin(&convoy.object, vessel) {
+                let actuator = placement_actuator_host_ref(&self.resource_backend, namespace, &pin.decision.target_host).await?;
+                if self.canonical_local_host_id().as_ref() == Some(&actuator) {
+                    return Ok(Some(self.node_id.clone()));
+                }
+                let host = canonical_placement_host_ref(&self.resource_backend, namespace, actuator.as_str())
+                    .await?
+                    .ok_or_else(|| format!("receiver `{receiver}` has an unknown home host"))?;
+                return self
+                    .host_registry
+                    .node_id_for_host_name(&HostName::new(host.display_name))
+                    .await?
+                    .map(Some)
+                    .ok_or_else(|| format!("receiver `{receiver}` home host has no route"));
+            }
+            return Ok(Some(match convoy.provenance {
+                ResourceProvenance::Local => self.node_id.clone(),
+                ResourceProvenance::Replica { origin_root, .. } => origin_root,
+            }));
+        }
+        Err(format!("receiver `{receiver}` has no declared home yet"))
     }
 
     pub async fn route_remote_attach_binding(&self, binding: &AttachBinding) -> Result<ResolvedAttachPlan, String> {
@@ -5644,20 +5722,49 @@ impl InProcessDaemon {
         Ok(id)
     }
 
+    pub async fn message_inbox(&self, namespace: &str) -> flotilla_resources::MessageInbox {
+        self.message_inboxes
+            .lock()
+            .await
+            .entry(namespace.to_string())
+            .or_insert_with(|| flotilla_resources::MessageInbox::new(self.resource_backend.clone(), namespace))
+            .clone()
+    }
+
+    /// Returns the canonical admitted record. Suppression before creation does
+    /// not create the successor ID. A recovered partial creation stays as a
+    /// superseded audit record and durably forwards admission to its predecessor.
+    async fn apply_intent_document(
+        &self,
+        namespace: &str,
+        document: serde_json::Value,
+    ) -> Result<flotilla_resources::DynamicResourceObject, ResourceError> {
+        use flotilla_resources::{get_resource_kind, MessageAdmission, MessageSpec};
+        if document.get("kind").and_then(serde_json::Value::as_str) != Some("Message") {
+            return apply_resource_document(&self.resource_backend, namespace, document).await;
+        }
+        flotilla_resources::validate_resource_document(&document)?;
+        let namespace = document.pointer("/metadata/namespace").and_then(serde_json::Value::as_str).unwrap_or(namespace);
+        let meta: InputMeta = serde_json::from_value(document.get("metadata").cloned().unwrap_or_default())
+            .map_err(|error| ResourceError::decode(format!("message metadata: {error}")))?;
+        let spec: MessageSpec = serde_json::from_value(document.get("spec").cloned().unwrap_or_default())
+            .map_err(|error| ResourceError::decode(format!("message spec: {error}")))?;
+        let spec = flotilla_resources::qualify_message_spec(spec)?;
+        let admission = self.message_inbox(namespace).await.accept(&meta, &spec, self.clock.now()).await?;
+        let record = match admission {
+            MessageAdmission::Accepted(record) => record,
+            MessageAdmission::Suppressed { predecessor } => predecessor,
+        };
+        get_resource_kind(&self.resource_backend, namespace, "Message", &record.metadata.name).await
+    }
+
     async fn execute_action_resource_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ResourceApply { namespace, document } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            // Artifact puts and creation reservations share one resource version.
-            // Retry optimistic conflicts without replacing authority-owned status.
-            let mut applied = apply_resource_document(&self.resource_backend, namespace, document.clone()).await;
-            if document.get("kind").and_then(serde_json::Value::as_str) == Some("Artifact") {
-                for _ in 0..15 {
-                    if !matches!(applied, Err(ResourceError::Conflict { .. })) {
-                        break;
-                    }
-                    applied = apply_resource_document(&self.resource_backend, namespace, document.clone()).await;
-                }
-            }
+            // Artifact reservations and Message admission can race status writers.
+            // Both mutations are replay-safe; retain a bounded conflict budget.
+            let kind = document.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
+            let applied = retry_resource_apply(kind, || self.apply_intent_document(namespace, document.clone())).await;
             let result = match applied {
                 Ok(applied) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
                     kind: applied.kind,
@@ -7794,4 +7901,20 @@ async fn request_manifest_resolution(
         }
     }
     Err("ManifestRoot spec conflict retry budget exhausted".to_string())
+}
+
+/// Retry only replay-safe mutations and only optimistic conflicts.
+async fn retry_resource_apply<T, F, Fut>(kind: &str, mut apply: F) -> Result<T, ResourceError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ResourceError>>,
+{
+    let attempts = if matches!(kind, "Artifact" | "Message") { 16 } else { 1 };
+    for attempt in 0..attempts {
+        let result = apply().await;
+        if attempt + 1 == attempts || !matches!(result, Err(ResourceError::Conflict { .. })) {
+            return result;
+        }
+    }
+    unreachable!("retry budget always makes an attempt")
 }

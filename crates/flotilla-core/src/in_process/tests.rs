@@ -9826,3 +9826,204 @@ async fn admission_refuses_same_role_briefs_before_writing_any_artifact() {
     assert!(error.contains("convoy-wide unique roles"));
     assert!(writer.writes.lock().await.is_empty(), "refusal is before all artifact writes");
 }
+
+// Message mutations use receiver-side admission, preserving idempotent IDs and
+// superseding pending intent rather than appending independent terminal inputs.
+#[tokio::test]
+async fn resource_message_mutations_use_durable_inbox_admission() {
+    use flotilla_resources::{Message, MessagePhase};
+    let temp = tempfile::tempdir().expect("config directory");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-test\"\n").expect("machine identity");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend.clone(),
+    )
+    .await;
+    let mut document = serde_json::json!({
+        "apiVersion": "flotilla.work/v1", "kind": "Message", "metadata": {"name": "first"},
+        "spec": {"sender": "flotilla/checks", "receiver": "flotilla/convoy/work/coder", "relation": "system", "body": "checks settled"}
+    });
+    let first = daemon.apply_intent_document("flotilla", document.clone()).await.expect("admit");
+    let retry = daemon.apply_intent_document("flotilla", document.clone()).await.expect("retry");
+    assert_eq!(first.value, retry.value);
+    document["metadata"]["name"] = "next".into();
+    document["spec"]["supersedes"] = "first".into();
+    daemon.apply_intent_document("flotilla", document).await.expect("successor");
+    let first = backend.using::<Message>("flotilla").get("first").await.expect("read first");
+    assert_eq!(first.status.expect("status").phase, MessagePhase::Superseded);
+}
+
+// A receiver's admitted convoy supplies a home before its terminal is present;
+// ordinary ResourceApply routing follows that origin rather than the sender or
+// an explicitly requested unrelated node.
+#[tokio::test]
+async fn new_message_mutations_route_to_the_absent_receivers_home() {
+    use crate::command_target::TargetHost;
+    let temp = tempfile::tempdir().expect("config directory");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-test\"\n").expect("machine identity");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("sender"),
+        backend.clone(),
+    )
+    .await;
+    let remote = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("receiver"));
+    let remote_convoys = remote.using::<ResourceConvoy>("flotilla");
+    remote_convoys
+        .create(&test_meta("convoy"), &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build())
+        .await
+        .expect("receiver convoy");
+    backend
+        .replica_writer::<ResourceConvoy>(NodeId::new("receiver"), "flotilla")
+        .replace(&remote_convoys.list().await.expect("receiver snapshot"), chrono::Utc::now())
+        .await
+        .expect("replicate");
+    let action = CommandAction::ResourceApply {
+        namespace: "flotilla".into(),
+        document: serde_json::json!({
+            "apiVersion": "flotilla.work/v1", "kind": "Message", "metadata": {"name": "first"},
+            "spec": {"sender": "flotilla/checks", "receiver": "flotilla/convoy/work/coder", "relation": "system", "body": "checks settled"}
+        }),
+    };
+    let target = daemon.resolve_command_target(&action, Some(&NodeId::new("unrelated"))).await.expect("route");
+    assert_eq!(target.host, TargetHost::Node(NodeId::new("receiver")));
+    assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("sender messages").items.is_empty());
+}
+
+// Resource admission qualifies a relative receiver from its sender context and
+// returns the canonical delivered predecessor without creating the suppressed ID.
+#[tokio::test]
+async fn message_admission_qualifies_and_exposes_canonical_suppression() {
+    use flotilla_resources::{Message, MessageStatusPatch, ResolvedMessageReceiver};
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-review-test\"\n").unwrap();
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+    let mut document = serde_json::json!({
+        "apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":"first"},
+        "spec":{"sender":"flotilla/convoy/work/reviewer","receiver":"coder","relation":"peer","body":"reply please","expectation":{"kind":"reply"},"references":[{"kind":"change_request","service":"github","scope":"owner/repo","number":1,"revision":"head"}],"subject":{"kind":"change_request","service":"github","scope":"owner/repo","number":1,"revision":"head"}}
+    });
+    daemon.apply_intent_document("flotilla", document.clone()).await.unwrap();
+    let messages = backend.using::<Message>("flotilla");
+    assert_eq!(messages.get("first").await.unwrap().spec.receiver, "flotilla/convoy/work/coder");
+    flotilla_resources::apply_status_patch(&messages, "first", &MessageStatusPatch::Delivered {
+        receiver: ResolvedMessageReceiver::builder()
+            .crew_id("crew".into())
+            .session("session".into())
+            .delivered_at(chrono::Utc::now())
+            .evidence("receipt".into())
+            .build(),
+        at: chrono::Utc::now(),
+    })
+    .await
+    .unwrap();
+    document["metadata"]["name"] = "next".into();
+    let canonical = daemon.apply_intent_document("flotilla", document).await.unwrap();
+    assert_eq!(canonical.value.pointer("/metadata/name").and_then(serde_json::Value::as_str), Some("first"));
+    assert!(matches!(messages.get("next").await, Err(ResourceError::NotFound { .. })));
+}
+
+// Unknown homes cannot fall through to the caller's requested host. A finished
+// convoy and an undeclared vessel are explicit refusals before holder lookup.
+#[tokio::test]
+async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-review-test\"\n").unwrap();
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("local"),
+        backend.clone(),
+    )
+    .await;
+    let document =
+        |receiver: &str| serde_json::json!({"spec":{"sender":"flotilla/checks","receiver":receiver,"relation":"system","body":"wake"}});
+    assert!(daemon.message_creation_origin("flotilla", &document("flotilla/undeclared")).await.unwrap_err().contains("no declared home"));
+    assert!(daemon
+        .message_creation_origin("flotilla", &document("flotilla/missing/work/coder"))
+        .await
+        .unwrap_err()
+        .contains("no admitted convoy"));
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let convoy = convoys
+        .create(&test_meta("finished"), &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build())
+        .await
+        .unwrap();
+    let status = ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() };
+    convoys.update_status("finished", &convoy.metadata.resource_version, &status).await.unwrap();
+    assert!(daemon
+        .message_creation_origin("flotilla", &document("flotilla/finished/work/coder"))
+        .await
+        .unwrap_err()
+        .contains("terminal convoy"));
+    let convoy = convoys.get("finished").await.unwrap();
+    let mut status = status;
+    status.phase = ConvoyPhase::Active;
+    status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        cascade: None,
+        exit: None,
+        turn_delivery: Default::default(),
+        stall_nudges: Default::default(),
+        supervision: None,
+        vessels: Vec::new(),
+    });
+    convoys.update_status("finished", &convoy.metadata.resource_version, &status).await.unwrap();
+    assert!(daemon
+        .message_creation_origin("flotilla", &document("flotilla/finished/work/coder"))
+        .await
+        .unwrap_err()
+        .contains("undeclared vessel"));
+}
+
+#[tokio::test]
+async fn message_apply_retries_only_conflicts_with_a_finite_budget() {
+    for kind in ["Message", "Artifact"] {
+        let mut attempts = 0;
+        let result = retry_resource_apply(kind, || {
+            attempts += 1;
+            std::future::ready(if attempts < 3 { Err(ResourceError::conflict("message", "concurrent status")) } else { Ok(attempts) })
+        })
+        .await;
+        assert_eq!(result.unwrap(), 3);
+        let mut attempts = 0;
+        let result: Result<(), _> = retry_resource_apply(kind, || {
+            attempts += 1;
+            std::future::ready(Err(ResourceError::conflict("message", "persistent conflict")))
+        })
+        .await;
+        assert!(matches!(result, Err(ResourceError::Conflict { .. })));
+        assert_eq!(attempts, 16);
+        let mut attempts = 0;
+        let result: Result<(), _> = retry_resource_apply(kind, || {
+            attempts += 1;
+            std::future::ready(Err(ResourceError::invalid("invalid intent")))
+        })
+        .await;
+        assert!(matches!(result, Err(ResourceError::Invalid { .. })));
+        assert_eq!(attempts, 1);
+    }
+    let mut attempts = 0;
+    let result: Result<(), _> = retry_resource_apply("Convoy", || {
+        attempts += 1;
+        std::future::ready(Err(ResourceError::conflict("convoy", "no replay contract")))
+    })
+    .await;
+    assert!(result.is_err());
+    assert_eq!(attempts, 1);
+}

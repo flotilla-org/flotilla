@@ -10,6 +10,22 @@ Flotilla is one member of a product family that communicates over HTTP-over-UDS
 
 ## Language
 
+**Message**:
+A durable communication addressed to a role and homed on its receiver. It names
+its sender, relationship, references and expectation. Delivery means there is
+evidence that a resolved holder accepted the input; satisfaction means the
+expectation has been met.
+
+**Message Subject**:
+The typed reference and revision a Message is regarding. Messages from the same
+sender to the same receiver regarding the same subject revision share a
+supersession relationship.
+
+**Role Address**:
+The name of a communication recipient or sender, independent of the current
+holder. A convoy-relative address is qualified when the Message is created;
+the holder is resolved when it can be delivered.
+
 **Fleet**:
 The whole set of development resources Flotilla coordinates across hosts. The
 boats are the dev resources; the islands are the repositories/projects. One

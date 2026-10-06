@@ -17,6 +17,7 @@ mod k8s_integration;
 mod landing_gate;
 mod lifecycle_status_patch;
 mod manifest_root;
+mod message;
 mod owner_gc;
 mod placement_tiebreak_capacity_wait;
 mod platform_vocabulary;
