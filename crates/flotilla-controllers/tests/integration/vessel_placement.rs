@@ -197,15 +197,17 @@ async fn placement_status_churn_does_not_spin() {
     struct SyncCounter(Arc<AtomicUsize>);
     impl<S: tracing::Subscriber> Layer<S> for SyncCounter {
         fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-            struct Message(bool);
-            impl tracing::field::Visit for Message {
-                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                    if field.name() == "message" && format!("{value:?}").contains("synchronized placed Vessel actuators") {
-                        self.0 = true;
+            struct SyncCompleted(bool);
+            impl tracing::field::Visit for SyncCompleted {
+                fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                    if field.name() == "placement_sync_completed" {
+                        self.0 = value;
                     }
                 }
+
+                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
             }
-            let mut message = Message(false);
+            let mut message = SyncCompleted(false);
             event.record(&mut message);
             if message.0 {
                 self.0.fetch_add(1, Ordering::SeqCst);

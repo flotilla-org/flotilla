@@ -54,6 +54,8 @@ type PresentationKey = (String, String, String);
 type ConvoyKey = (String, String, Option<flotilla_protocol::NodeId>);
 type EnsureKey = (String, String, Option<flotilla_protocol::NodeId>);
 type SessionKey = (String, String, Option<flotilla_protocol::NodeId>);
+const CONVOY_PROJECTION_COALESCE_INTERVAL: Duration = Duration::from_millis(25);
+
 const CHANGE_REQUEST_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const CHANGE_REQUEST_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const CHANGE_REQUEST_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -213,6 +215,7 @@ impl AttachCapabilityResolver for InProcessDaemon {
 
 #[derive(Debug, Clone, Copy, Default)]
 enum ConvoyProjectionDelivery {
+    /// Delivers synchronously during bootstrap, before the runtime loop starts.
     #[default]
     Immediate,
     Coalesced {
@@ -1573,7 +1576,7 @@ impl Aggregator {
     async fn rebuild_local_projection(&mut self) {
         if let ConvoyProjectionDelivery::Coalesced { deadline } = &mut self.projection_delivery {
             // Keep the first deadline: a continuous stream cannot postpone delivery.
-            deadline.get_or_insert_with(|| Instant::now() + Duration::from_millis(25));
+            deadline.get_or_insert_with(|| Instant::now() + CONVOY_PROJECTION_COALESCE_INTERVAL);
             return;
         }
         self.flush_local_projection().await;

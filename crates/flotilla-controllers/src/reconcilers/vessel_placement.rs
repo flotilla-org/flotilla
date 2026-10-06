@@ -12,6 +12,9 @@ use flotilla_resources::{
 use futures::StreamExt;
 use tracing::{debug, info, warn};
 
+const PLACEMENT_COALESCE_INTERVAL: Duration = Duration::from_millis(25);
+const PLACEMENT_RESYNC_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VesselPlacementSync {
     pub created: usize,
@@ -56,7 +59,7 @@ impl VesselPlacementProjector {
             vessel_inputs.update(source, vessel_input);
         }
         self.sync_once().await?;
-        let mut resync = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(60), Duration::from_secs(60));
+        let mut resync = tokio::time::interval_at(tokio::time::Instant::now() + PLACEMENT_RESYNC_INTERVAL, PLACEMENT_RESYNC_INTERVAL);
         resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut deadline = None;
         loop {
@@ -83,7 +86,7 @@ impl VesselPlacementProjector {
             };
             if changed {
                 // A fixed deadline coalesces bursts without starving continuous changes.
-                deadline.get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_millis(25));
+                deadline.get_or_insert_with(|| tokio::time::Instant::now() + PLACEMENT_COALESCE_INTERVAL);
             }
         }
     }
@@ -220,6 +223,7 @@ impl VesselPlacementProjector {
         }
 
         debug!(
+            placement_sync_completed = true,
             host_ref = %self.local_host_ref,
             created = result.created,
             updated = result.updated,
@@ -280,6 +284,8 @@ impl<I> Default for ReplicaInputs<I> {
 }
 
 impl<I: PartialEq> ReplicaInputs<I> {
+    // Inputs are recorded before reconciliation. Sync errors terminate run(); if
+    // retries are added, failed inputs must remain dirty until reconciliation succeeds.
     fn update<T: Resource>(&mut self, source: ReadResourceObject<T>, input: impl Fn(&ResourceObject<T>) -> Option<I>) -> bool {
         let ResourceProvenance::Replica { origin_root, .. } = source.provenance else { return false };
         let key = (origin_root.to_string(), source.object.metadata.name.clone());
