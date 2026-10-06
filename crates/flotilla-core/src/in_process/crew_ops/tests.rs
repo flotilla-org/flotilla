@@ -782,3 +782,72 @@ async fn unknown_controller_sender_has_a_creatable_system_reply() {
     daemon.apply_intent_document("flotilla", reply).await.expect("create correlated system reply");
     assert!(backend.using::<Message>("flotilla").get("legacy-reply").await.is_ok());
 }
+
+// Failed durable admission must not reopen settled work. Exercise an external
+// publication error and a receiver collision through the real crew service.
+#[tokio::test]
+async fn turn_publication_errors_restore_the_owned_activation() {
+    use crate::leaf_engine::{ResourceIntentPublisher, TurnDeliveryRequest};
+    struct FailedPublisher;
+    #[async_trait]
+    impl ResourceIntentPublisher for FailedPublisher {
+        async fn publish(self: Arc<Self>, _: &str, _: serde_json::Value) -> Result<ResourceRef, String> {
+            Err("receiver publication unavailable".into())
+        }
+    }
+    struct AdmissionCollision {
+        probe: Arc<StagingProbe>,
+        backend: ResourceBackend,
+    }
+    #[async_trait]
+    impl WorkCredentialReconciler for AdmissionCollision {
+        async fn reconcile(&self, namespace: &str, environment: &str) -> Result<(), String> {
+            self.probe.reconcile(namespace, environment).await?;
+            let receiver = "flotilla/crew/work/coder";
+            let sender = "system:legacy";
+            let name = flotilla_resources::message_record_name(receiver, sender, "turn-delivery:failure:failure-head");
+            let spec = flotilla_resources::MessageSpec::builder()
+                .sender(sender.into())
+                .receiver(receiver.into())
+                .relation(flotilla_resources::MessageRelation::System)
+                .body("concurrent intent".into())
+                .build();
+            flotilla_resources::MessageInbox::new(self.backend.clone(), namespace)
+                .accept(&InputMeta::builder().name(name).build(), &spec, Utc::now())
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        }
+    }
+    for external in [false, true] {
+        let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Done).await;
+        probe.fail.store(false, Ordering::SeqCst);
+        let publisher: Arc<dyn ResourceIntentPublisher> = Arc::new(FailedPublisher);
+        if external {
+            crew.set_resource_intent_publisher(Arc::downgrade(&publisher));
+        } else {
+            *crew.work_credential_reconciler.write().await =
+                Some(Arc::new(AdmissionCollision { probe: probe.clone(), backend: backend.clone() }));
+        }
+        let before = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("before admission").status;
+        let request = TurnDeliveryRequest::builder()
+            .namespace("flotilla".into())
+            .convoy("crew".into())
+            .source("failure".into())
+            .vessel("work".into())
+            .role("coder".into())
+            .subject_revision("failure-head".into())
+            .brief("continue".into())
+            .sender(CrewMessageSender::Unknown)
+            .build();
+        let error = crew.deliver_turn(&request).await.expect_err("durable admission fails");
+        assert!(error.contains(if external { "receiver publication unavailable" } else { "different intent" }), "{error}");
+        assert!(probe.calls.load(Ordering::SeqCst) > 0, "exercise activation before admission");
+        assert_eq!(backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("after failed admission").status, before);
+        let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver inbox").items;
+        assert_eq!(records.len(), usize::from(!external));
+        if !external {
+            assert_eq!(records[0].spec.body, "concurrent intent");
+        }
+    }
+}

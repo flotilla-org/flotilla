@@ -2106,8 +2106,18 @@ impl ReconcilerWake {
                             condition.rung = StallRung::Nudge;
                             if due {
                                 let leaf = row.leaves.first().ok_or_else(|| "actor row has no leaf".to_string())?;
-                                let obligation =
-                                    if let Some(refusal) = refusal { refusal_nudge_brief(refusal) } else { actor_obligation(leaf)? };
+                                let declared_stall = status
+                                    .crew_work
+                                    .get(vessel)
+                                    .and_then(|crew| crew.get(role))
+                                    .is_some_and(|crew| crew.phase == flotilla_resources::CrewWorkPhase::Stalled);
+                                let obligation = if declared_stall {
+                                    "Your stall is recorded. What changed since your report? If the blocker persists, update the stall with new evidence; if it has cleared, ask your supervisor to resume you.".into()
+                                } else if let Some(refusal) = refusal {
+                                    refusal_nudge_brief(refusal)
+                                } else {
+                                    actor_obligation(leaf)?
+                                };
                                 let brief = format!(
                                     "For {role}@{vessel} in {} (resource ref: {}):\n{obligation}",
                                     convoy_message_address(convoy),
@@ -4182,6 +4192,31 @@ mod tests {
         observe_claude_hook(&backend, &wake, "user-prompt-submit", start + chrono::Duration::seconds(1081)).await;
         observe_claude_hook(&backend, &wake, "stop", start + chrono::Duration::seconds(1082)).await;
         assert_eq!(delivery.requests.lock().expect("deliveries").len(), 1, "reply Stop must not rearm the nudge budget");
+    }
+
+    // A declared stall asks for changed evidence; a working crew retains the
+    // ordinary settlement obligation. Exercise the real nudge producer at idle.
+    #[tokio::test]
+    async fn declared_stall_nudges_preserve_the_changed_evidence_guidance() {
+        for phase in [CrewWorkPhase::Working, CrewWorkPhase::Stalled] {
+            let (backend, wake, delivery) = idle_nudge_scenario().await;
+            let convoys = backend.using::<Convoy>("flotilla");
+            let convoy = convoys.get("stalled-work").await.expect("nudge authority");
+            let mut status = convoy.status.expect("crew state");
+            status.crew_work.get_mut("work").expect("crew").get_mut("coder").expect("actor").phase = phase;
+            convoys.update_status("stalled-work", &convoy.metadata.resource_version, &status).await.expect("declared crew phase");
+            let start = Utc::now();
+            for second in [0, 60, 120, 180] {
+                observe_actor(&backend, &wake, TerminalAttentionState::Idle, start + chrono::Duration::seconds(second)).await;
+            }
+            let requests = delivery.requests.lock().expect("durable nudge admissions");
+            let request = requests.first().expect("settlement nudge");
+            assert_eq!(request.brief.contains("Your stall is recorded. What changed since your report?"), phase == CrewWorkPhase::Stalled);
+            if phase == CrewWorkPhase::Stalled {
+                assert!(request.brief.contains("update the stall with new evidence"));
+                assert!(request.brief.contains("ask your supervisor to resume you"));
+            }
+        }
     }
 
     #[tokio::test]

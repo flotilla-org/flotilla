@@ -2115,7 +2115,14 @@ impl CrewService {
             CrewMessageSender::FlotillaTurn { .. } => "system:turn-rules".to_string(),
             CrewMessageSender::FlotillaNudge => "system:nudge".to_string(),
             CrewMessageSender::FlotillaEscalation { .. } => "system:stall-judge".to_string(),
-            _ => "system:legacy".to_string(),
+            CrewMessageSender::Unknown => "system:legacy".to_string(),
+            CrewMessageSender::OperatorResume { .. }
+            | CrewMessageSender::OperatorFollowUp { .. }
+            | CrewMessageSender::Governor { .. }
+            | CrewMessageSender::Bosun { .. }
+            | CrewMessageSender::Handoff { .. } => {
+                return Err("operator and crew senders require their declared message path".into());
+            }
         };
         let relation = if matches!(request.sender, CrewMessageSender::FlotillaEscalation { .. }) {
             MessageRelation::Supervisor
@@ -2236,6 +2243,7 @@ impl CrewService {
         let holder = flotilla_resources::resolve_message_receiver(&self.resource_backend, &request.namespace, &receiver)
             .await
             .map_err(|error| error.to_string())?;
+        // This is the observed admission rung, not a transport or session receipt.
         let rung = if holder
             .as_ref()
             .is_some_and(|holder| holder.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Running))
@@ -2279,130 +2287,99 @@ impl CrewService {
             });
         }
         let mut activation = None;
-        // Workflow activation remains at the convoy authority and precedes
-        // publication, so a delivered turn has its staged work credentials.
-        if matches!(target.provenance, ResourceProvenance::Local) {
-            if let (Some(previous), Some(holder)) = (&convoy.status, &holder) {
-                let convoys = self.resource_backend.using::<ResourceConvoy>(&request.namespace);
-                let reopened = apply_resource_status_patch(
-                    &convoys,
-                    &request.convoy,
-                    &convoy_external_patches::resume_crew_work(
-                        request.vessel.clone(),
-                        request.role.clone(),
-                        self.clock.now(),
-                        request.brief.clone(),
-                        Some(name.clone()),
-                    ),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-                activation = Some((reopened.status.clone().expect("activated workflow"), previous.clone()));
-                self.reconcile_or_restore_crew_work(
-                    &request.namespace,
-                    &holder.object.spec.env_ref,
-                    &convoys,
-                    &request.convoy,
-                    previous.clone(),
-                    &reopened,
-                )
-                .await?;
-                if matches!(holder.provenance, ResourceProvenance::Local)
-                    && holder.object.status.as_ref().is_some_and(|status| {
-                        matches!(status.phase, ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost)
-                    })
-                {
-                    apply_resource_status_patch(
-                        &self.resource_backend.using::<ResourceTerminalSession>(&request.namespace),
-                        &holder.object.metadata.name,
-                        &TerminalSessionStatusPatch::MarkStarting,
+        let publication: Result<ResourceRef, String> = async {
+            // Workflow activation remains at the convoy authority and precedes
+            // publication, so a delivered turn has its staged work credentials.
+            if matches!(target.provenance, ResourceProvenance::Local) {
+                if let (Some(previous), Some(holder)) = (&convoy.status, &holder) {
+                    let convoys = self.resource_backend.using::<ResourceConvoy>(&request.namespace);
+                    let reopened = apply_resource_status_patch(
+                        &convoys,
+                        &request.convoy,
+                        &convoy_external_patches::resume_crew_work(
+                            request.vessel.clone(),
+                            request.role.clone(),
+                            self.clock.now(),
+                            request.brief.clone(),
+                            Some(name.clone()),
+                        ),
                     )
                     .await
                     .map_err(|error| error.to_string())?;
+                    activation = Some((reopened.status.clone().expect("activated workflow"), previous.clone()));
+                    self.reconcile_resumed_work_credentials(&request.namespace, &holder.object.spec.env_ref).await?;
+                    if matches!(holder.provenance, ResourceProvenance::Local)
+                        && holder.object.status.as_ref().is_some_and(|status| {
+                            matches!(status.phase, ResourceTerminalSessionPhase::Stopped | ResourceTerminalSessionPhase::Lost)
+                        })
+                    {
+                        apply_resource_status_patch(
+                            &self.resource_backend.using::<ResourceTerminalSession>(&request.namespace),
+                            &holder.object.metadata.name,
+                            &TerminalSessionStatusPatch::MarkStarting,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    }
                 }
             }
-        }
-        let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
-        let message = if let Some(publisher) = publisher {
-            publisher.publish(&request.namespace, serde_json::json!({ "apiVersion": "flotilla.work/v1", "kind": "Message", "metadata": { "name": name, "namespace": request.namespace }, "spec": intent })).await?
-        } else {
-            if matches!(target.provenance, ResourceProvenance::Replica { .. })
-                || holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. }))
-            {
-                return Err("receiver-home resource mutation router unavailable".into());
-            }
-            let inbox = self
-                .message_inboxes
-                .lock()
-                .await
-                .entry(request.namespace.clone())
-                .or_insert_with(|| {
-                    flotilla_resources::MessageInbox::new(self.resource_backend.clone(), &request.namespace).with_observation_staleness(
-                        self.leaf_subscriptions.change_request_stale_after(),
-                        self.leaf_subscriptions.issue_stale_after(),
-                    )
-                })
-                .clone();
-            let admission = inbox
-                .accept(&InputMeta::builder().name(name.clone()).build(), &intent, self.clock.now())
-                .await
-                .map_err(|error| error.to_string())?;
-            let record = match admission {
-                flotilla_resources::MessageAdmission::Accepted(record) => record,
-                flotilla_resources::MessageAdmission::Suppressed { predecessor } => predecessor,
+            let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
+            let message = if let Some(publisher) = publisher {
+                let document = serde_json::json!({
+                    "apiVersion": "flotilla.work/v1", "kind": "Message",
+                    "metadata": { "name": name, "namespace": request.namespace }, "spec": intent
+                });
+                publisher.publish(&request.namespace, document).await?
+            } else {
+                if matches!(target.provenance, ResourceProvenance::Replica { .. })
+                    || holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. }))
+                {
+                    return Err("receiver-home resource mutation router unavailable".into());
+                }
+                let inbox = self
+                    .message_inboxes
+                    .lock()
+                    .await
+                    .entry(request.namespace.clone())
+                    .or_insert_with(|| {
+                        flotilla_resources::MessageInbox::new(self.resource_backend.clone(), &request.namespace).with_observation_staleness(
+                            self.leaf_subscriptions.change_request_stale_after(),
+                            self.leaf_subscriptions.issue_stale_after(),
+                        )
+                    })
+                    .clone();
+                let admission = inbox
+                    .accept(&InputMeta::builder().name(name.clone()).build(), &intent, self.clock.now())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let record = match admission {
+                    flotilla_resources::MessageAdmission::Accepted(record) => record,
+                    flotilla_resources::MessageAdmission::Suppressed { predecessor } => predecessor,
+                };
+                ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, record.metadata.name)
             };
-            ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, record.metadata.name)
+            Ok(message)
+        }
+        .await;
+        let should_restore = match &publication {
+            Err(_) => true,
+            Ok(message) => message.name != name,
         };
-        let new_turn = message.name == name;
-        if !new_turn {
+        if should_restore {
             if let Some((activated, previous)) = activation {
-                let convoys = self.resource_backend.using::<ResourceConvoy>(&request.namespace);
-                let mut restored = false;
-                for _ in 0..3 {
-                    let current = convoys.get(&request.convoy).await.map_err(|error| error.to_string())?;
-                    let mut next = current.status.clone().unwrap_or_default();
-                    let state = next.crew_work.get(&request.vessel).and_then(|crew| crew.get(&request.role));
-                    let owned = activated.crew_work.get(&request.vessel).and_then(|crew| crew.get(&request.role));
-                    if state != owned {
-                        // A newer workflow action owns this crew now; preserve it.
-                        restored = true;
-                        break;
-                    }
-                    if let Some(prior) = previous.crew_work.get(&request.vessel).and_then(|crew| crew.get(&request.role)) {
-                        next.crew_work.get_mut(&request.vessel).expect("activated vessel").insert(request.role.clone(), prior.clone());
-                    }
-                    if next.crew_work.get(&request.vessel) == previous.crew_work.get(&request.vessel)
-                        && next.work.get(&request.vessel) == activated.work.get(&request.vessel)
-                    {
-                        if let Some(prior) = previous.work.get(&request.vessel) {
-                            next.work.insert(request.vessel.clone(), prior.clone());
-                        }
-                    }
-                    if next.work == previous.work
-                        && next.crew_work == previous.crew_work
-                        && next.phase == activated.phase
-                        && next.finished_at == activated.finished_at
-                    {
-                        next.phase = previous.phase;
-                        next.finished_at = previous.finished_at;
-                        if next.stalled == activated.stalled {
-                            next.stalled = previous.stalled.clone();
-                        }
-                    }
-                    match convoys.update_status(&request.convoy, &current.metadata.resource_version, &next).await {
-                        Ok(_) => {
-                            restored = true;
-                            break;
-                        }
-                        Err(ResourceError::Conflict { .. }) => continue,
-                        Err(error) => return Err(error.to_string()),
-                    }
-                }
-                if !restored {
-                    return Err("workflow restoration after receiver suppression conflicted three times".into());
+                let patch =
+                    convoy_external_patches::restore_turn_activation(request.vessel.clone(), request.role.clone(), activated, previous);
+                if let Err(error) =
+                    apply_resource_status_patch(&self.resource_backend.using::<ResourceConvoy>(&request.namespace), &request.convoy, &patch)
+                        .await
+                {
+                    let cause = publication.as_ref().err().map_or("receiver suppression", String::as_str);
+                    return Err(format!("{cause}; could not restore turn activation: {error}"));
                 }
             }
         }
+        let message = publication?;
+        let new_turn = message.name == name;
 
         Ok(crate::leaf_engine::CrewTurnAdmission { new_turn, rung, message })
     }

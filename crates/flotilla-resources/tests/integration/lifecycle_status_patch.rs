@@ -70,6 +70,7 @@ macro_rules! define_patch_kinds {
 }
 
 define_patch_kinds! {
+    ConvoyRestoreTurnActivation => DUPLICATE,
     ConvoyObserveEnvironment => NONE,
     ConvoySetStalled => NONE,
     ConvoySetNudgeObligations => NONE,
@@ -141,6 +142,7 @@ define_patch_kinds! {
 
 fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
     match patch {
+        ConvoyStatusPatch::RestoreTurnActivation { .. } => PatchKind::ConvoyRestoreTurnActivation,
         ConvoyStatusPatch::RecordEnsureAdmission { .. }
         | ConvoyStatusPatch::DiscoverSubjects { .. }
         | ConvoyStatusPatch::RecordBranchSubjectScan { .. }
@@ -407,6 +409,32 @@ fn patch_variants_exhaustively_declare_their_lifecycle_classes() {
 #[test]
 fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
     let cases = [
+        LifecycleCase {
+            name: "speculative turn activation rollback",
+            kind: PatchKind::ConvoyRestoreTurnActivation,
+            exercise: || {
+                let mut previous = settled_convoy_status();
+                previous.phase = ConvoyPhase::Landing;
+                let before = crew_timestamps(&previous);
+                let mut status = previous.clone();
+                flotilla_resources::external_patches::resume_crew_work(
+                    "implement".into(),
+                    "coder".into(),
+                    ts(30),
+                    "continue".into(),
+                    Some("intent".into()),
+                )
+                .apply(&mut status);
+                let patch = flotilla_resources::external_patches::restore_turn_activation(
+                    "implement".into(),
+                    "coder".into(),
+                    status.clone(),
+                    previous,
+                );
+                apply_and_replay(&mut status, &patch);
+                (before, crew_timestamps(&status))
+            },
+        },
         LifecycleCase {
             name: "convoy bootstrap",
             kind: PatchKind::ConvoyBootstrap,
