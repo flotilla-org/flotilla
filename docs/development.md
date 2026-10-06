@@ -45,7 +45,7 @@ Install and immediately verify the schedule on each fleet host from a Flotilla c
 scripts/install-cargo-sweep-schedule.sh
 ```
 
-The installer pins `cargo-sweep` 0.8.0 when the command is absent, copies the runner and `prune-target.sh` to `~/.local/libexec/flotilla/`, installs a systemd user timer on Linux or the checked-in launchd agent on macOS, enables the daily schedule, and starts one observed run. The installed policy runs `cargo-sweep --time 3` once a day. After that mtime-based three-day retention step, it applies `prune-target.sh` to the same root: oldest incremental generations are capped at 10 GiB and the complete target at 20 GiB. Re-run the installer to update existing schedules.
+The installer pins `cargo-sweep` 0.8.0 when the command is absent, copies the runner, `prune-target.sh`, and their shared cargo-sweep compatibility helper to `~/.local/libexec/flotilla/`, installs a systemd user timer on Linux or the checked-in launchd agent on macOS, enables the daily schedule, and starts one observed run. The installed policy runs `cargo-sweep --time 3` once a day. After that mtime-based three-day retention step, it applies `prune-target.sh` to the same root: oldest incremental generations are capped at 10 GiB and the complete target at 20 GiB. Re-run the installer to update existing schedules.
 
 Each run sweeps:
 
@@ -57,6 +57,8 @@ The runner records reclaimed bytes separately for the mtime and size-cap steps f
 ```text
 ~/.local/state/flotilla/cargo-sweep-mtime.log
 ```
+
+Reclaimed-byte figures use before/after disk usage and are approximate if builds run concurrently.
 
 Targets that remain over either cap log a warning (for example, artifacts that cargo-sweep cannot remove). Command failures are logged and make the scheduled run fail, while other roots are still processed. The same `FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE` and `FLOTILLA_TARGET_MAX_SIZE` overrides apply to both scheduled and manual pruning when supplied in their environment.
 
@@ -73,7 +75,7 @@ launchctl print "gui/$UID/org.flotilla.cargo-sweep-mtime"
 tail -n 50 ~/.local/state/flotilla/cargo-sweep-mtime.log
 ```
 
-Run the policy regression tests with `scripts/test-prune-target.sh` and `scripts/test-cargo-sweep-mtime.sh`; they require Cargo and provision cargo-sweep 0.8.0 in their temporary test directory when the command is absent.
+Run the policy regression tests with `scripts/test-prune-target.sh` and `scripts/test-cargo-sweep-mtime.sh`; they require Cargo and provision cargo-sweep 0.8.0 in their temporary test directory when the command is absent. Offline hosts must have that binary installed before running these tests.
 
 An identity-based artifact policy remains a candidate for future evaluation; it is not part of the installed policy.
 

@@ -133,7 +133,7 @@ run_cap >/dev/null
 # Real cargo-sweep 0.8.0 must tolerate profiles without build-script directories.
 # Its exit status alone misses this error, so assert on its diagnostic output too.
 command -v cargo-sweep >/dev/null || fail "install cargo-sweep 0.8.0 to run the regression test"
-real_repo=$test_root/real-repo
+real_repo=$test_root/real-[ERROR]-repo
 mkdir -p "$real_repo/src" "$real_repo/target/debug/deps" "$real_repo/target/debug/.fingerprint/probe-0123456789abcdef"
 printf '[package]\nname="prune-regression"\nversion="0.1.0"\nedition="2021"\n' > "$real_repo/Cargo.toml"
 : > "$real_repo/src/lib.rs"

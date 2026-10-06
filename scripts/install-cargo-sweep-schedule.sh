@@ -11,9 +11,10 @@ if [[ ! -x $HOME/.cargo/bin/cargo-sweep ]] && ! command -v cargo-sweep >/dev/nul
 fi
 
 install -d "$libexec_dir"
-install -m 0755 "$repo_root/scripts/cargo-sweep-mtime.sh" "$libexec_dir/cargo-sweep-mtime.sh"
-
+# Deploy dependencies before the entry point in case an existing schedule fires.
+install -m 0644 "$repo_root/scripts/cargo-sweep-support.sh" "$libexec_dir/cargo-sweep-support.sh"
 install -m 0755 "$repo_root/scripts/prune-target.sh" "$libexec_dir/prune-target.sh"
+install -m 0755 "$repo_root/scripts/cargo-sweep-mtime.sh" "$libexec_dir/cargo-sweep-mtime.sh"
 
 case $(uname -s) in
   Linux)

@@ -58,6 +58,7 @@ if ! command -v cargo-sweep >/dev/null 2>&1; then
 fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/cargo-sweep-support.sh"
 repo_root=$(cd -- "${checkout_root:-$script_dir/..}" && pwd)
 target_dir=${CARGO_TARGET_DIR:-"$repo_root/target"}
 
@@ -209,22 +210,8 @@ cap_target() {
   local after_kib
   local before_kib
   local sweep_output
-  local fingerprint_dir
-
-  # cargo-sweep 0.8.0 unconditionally reads build/ and deps/ for every profile
-  # with fingerprints, even when Cargo never needed a build script there.
-  # In preview mode these directories are created only in the temporary clone.
-  while IFS= read -r -d '' fingerprint_dir; do
-    mkdir -p "${fingerprint_dir%/.fingerprint}/build" "${fingerprint_dir%/.fingerprint}/deps"
-  done < <(find "$target_dir" -type d -name .fingerprint -prune -print0)
-
   before_kib=$(size_kib "$target_dir")
-  if ! sweep_output=$(cargo-sweep sweep --maxsize "$max_size" "$repo_root" 2>&1); then
-    printf '%s\n' "$sweep_output" >&2
-    return 1
-  fi
-  # This version logs cleanup errors but exits zero; do not report them as success.
-  if [[ $sweep_output == *'[ERROR]'* ]]; then
+  if ! sweep_output=$(checked_cargo_sweep "$target_dir" cargo-sweep sweep --maxsize "$max_size" "$repo_root" 2>&1); then
     printf '%s\n' "$sweep_output" >&2
     return 1
   fi

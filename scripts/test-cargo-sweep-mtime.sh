@@ -41,6 +41,10 @@ set -euo pipefail
 printf '%s\n' "$*" >> "$FLOTILLA_SWEEP_TEST_INVOCATIONS"
 # Process boundary: age sweeping removes stale files; size sweeping is a no-op.
 [[ $CARGO_TARGET_DIR == "${@: -1}/target" ]]
+if [[ ${FLOTILLA_SWEEP_TEST_LOG_ERROR:-0} == 1 ]]; then
+  echo '[ERROR] Failed to clean target: simulated cleanup failure'
+  exit 0
+fi
 if [[ ${FLOTILLA_SWEEP_TEST_FAIL:-0} == 1 && $2 == --maxsize ]]; then
   exit 42
 fi
@@ -97,6 +101,17 @@ fi
 grep -Fq "size-cap cargo prune root=$test_home/dev/flotilla-repos/convoy failed" "$sweep_log"
 grep -Eq 'completed: reclaimed_bytes=[0-9]+ failed_roots=2' "$sweep_log"
 
+# cargo-sweep's zero-exit error diagnostics must fail both scheduled stages.
+error_log=$test_root/error.log
+if HOME="$test_home" XDG_STATE_HOME="$test_home/.local/state" \
+  FLOTILLA_SWEEP_LOG="$error_log" FLOTILLA_SWEEP_TEST_INVOCATIONS="$stub_log" \
+  FLOTILLA_SWEEP_TEST_LOG_ERROR=1 "$repo_root/scripts/cargo-sweep-mtime.sh"; then
+  echo "scheduled sweep accepted an error diagnostic with exit zero" >&2
+  exit 1
+fi
+grep -Fq "mtime-based cargo sweep root=$test_home/dev/desk failed" "$error_log"
+grep -Fq "size-cap cargo prune root=$test_home/dev/desk failed" "$error_log"
+
 # Installer glue: both platform branches deploy the helper beside the runner.
 # Stubs stand in for OS scheduler commands; execute the installed runner separately.
 stub_bin=$test_root/scheduler-bin
@@ -112,6 +127,7 @@ chmod +x "$stub_bin/"*
 for platform in Linux Darwin; do
   HOME="$test_home" PATH="$stub_bin:$PATH" FLOTILLA_TEST_OS="$platform" \
     XDG_CONFIG_HOME="$test_home/.config" "$repo_root/scripts/install-cargo-sweep-schedule.sh" >/dev/null
+  cmp "$repo_root/scripts/cargo-sweep-support.sh" "$test_home/.local/libexec/flotilla/cargo-sweep-support.sh"
   cmp "$repo_root/scripts/prune-target.sh" "$test_home/.local/libexec/flotilla/prune-target.sh"
   cmp "$repo_root/scripts/cargo-sweep-mtime.sh" "$test_home/.local/libexec/flotilla/cargo-sweep-mtime.sh"
 done
@@ -123,6 +139,8 @@ test_rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
 test_cargo_home=${CARGO_HOME:-$HOME/.cargo}
 real_home=$test_root/real-home
 real_repo=$real_home/dev/desk
+mkdir -p "$real_repo/target/debug/.fingerprint/probe-0123456789abcdef"
+: > "$real_repo/target/debug/.fingerprint/probe-0123456789abcdef/lib-probe"
 mkdir -p "$real_home/.cargo/bin" "$real_repo/src" "$real_home/.local/libexec/flotilla"
 ln -s "$real_sweep" "$real_home/.cargo/bin/cargo-sweep"
 cp "$test_home/.local/libexec/flotilla/"*.sh "$real_home/.local/libexec/flotilla/"

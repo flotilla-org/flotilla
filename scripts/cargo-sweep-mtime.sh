@@ -6,6 +6,7 @@
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$script_dir/cargo-sweep-support.sh"
 readonly retention_days=3
 state_dir=${XDG_STATE_HOME:-"$HOME/.local/state"}/flotilla
 log_file=${FLOTILLA_SWEEP_LOG:-"$state_dir/cargo-sweep-mtime.log"}
@@ -83,7 +84,7 @@ fi
         continue
       fi
       root_failed=0
-      if ! CARGO_TARGET_DIR="$root/target" "$cargo_sweep" sweep --time "$retention_days" "$root"; then
+      if ! CARGO_TARGET_DIR="$root/target" checked_cargo_sweep "$root/target" "$cargo_sweep" sweep --time "$retention_days" "$root"; then
         root_failed=1
         echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root failed"
       fi
