@@ -1,19 +1,27 @@
 //! Receiver-side batching and durable transport accounting.
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{PrincipalRef, ResourceRef};
 
 use crate::{
-    api_version, apply_status_patch, resolve_message_receiver, ControllerRetry, ControllerRetryDisposition, Demand, DemandKind, DemandSpec,
-    DemandStatusPatch, InputMeta, Message, MessageExpectation, MessageInbox, MessagePhase, MessageStatus, MessageStatusPatch,
-    MessageSubmission, OwnerReference, ResolvedMessageReceiver, Resource, ResourceError, ResourceObject, ResourceProvenance, RetryBackoff,
-    StatusPatch, TerminalSession, TerminalSessionPhase,
+    api_version, apply_status_patch, message_expectation_open, message_supersedes, resolve_message_receiver, ControllerRetry,
+    ControllerRetryDisposition, Demand, DemandKind, DemandSpec, DemandStatusPatch, InputMeta, Message, MessageExpectation, MessageInbox,
+    MessagePhase, MessageRelation, MessageStatus, MessageStatusPatch, MessageSubmission, OwnerReference, ReadResourceObject,
+    ResolvedMessageReceiver, Resource, ResourceError, ResourceObject, ResourceProvenance, RetryBackoff, StatusPatch, TerminalSession,
+    TerminalSessionPhase,
 };
 
 const MAX_ATTEMPTS: u32 = 3;
+// Five minutes bounds uncertain acceptance before raising operator attention.
 const HOLD_BOUND: chrono::Duration = chrono::Duration::minutes(5);
+
+// Bound adapter calls while the admission lock protects batch selection and receipts.
+const TRANSPORT_CALL_BOUND: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MessageObservation {
@@ -64,8 +72,12 @@ impl MessageInbox {
         // A created record with no status is an interrupted admission. Finish
         // its predecessor cleanup before selecting any batch for transport.
         for message in self.messages.list().await?.items.into_iter().filter(|message| message.status.is_none()) {
-            self.accept_locked(&crate::InputMeta::from(&message.metadata), &message.spec, now).await?;
+            self.accept_locked(&InputMeta::from(&message.metadata), &message.spec, now).await?;
         }
+        // One demand snapshot repairs interrupted cleanup without deleting an
+        // absent signal for every historical Message on every pass.
+        let signals: BTreeSet<_> =
+            self.backend.using::<Demand>(&self.namespace).list().await?.items.into_iter().map(|demand| demand.metadata.name).collect();
         let replies = self.backend.including_replicas::<Message>(&self.namespace).list().await?.items;
         let mut messages = self.messages.list().await?.items;
         messages.sort_by_key(|message| {
@@ -78,11 +90,13 @@ impl MessageInbox {
         let mut groups: BTreeMap<String, (ResourceObject<TerminalSession>, Vec<ResourceObject<Message>>)> = BTreeMap::new();
         // Reuse a receiver lookup within this pass, never across passes: holder
         // evidence must refresh even while a submission is held.
-        let mut receivers: BTreeMap<String, Option<crate::ReadResourceObject<TerminalSession>>> = BTreeMap::new();
+        let mut receivers: BTreeMap<String, Option<ReadResourceObject<TerminalSession>>> = BTreeMap::new();
         for message in &messages {
             let phase = message.status.as_ref().map_or(MessagePhase::Accepted, |status| status.phase);
             if phase.is_terminal() {
-                self.clear_signal(message).await?;
+                if signals.contains(&format!("message-attention-{}", message.metadata.name)) {
+                    self.clear_signal(message).await?;
+                }
                 continue;
             }
             if phase == MessagePhase::Delivered && message.spec.expectation == MessageExpectation::None {
@@ -135,8 +149,8 @@ impl MessageInbox {
             if message.status.as_ref().is_none_or(|status| status.submission.is_none())
                 && messages.iter().any(|predecessor| {
                     predecessor.metadata.name != message.metadata.name
-                        && crate::message_expectation_open(predecessor)
-                        && crate::message_supersedes(&message.spec, predecessor)
+                        && message_expectation_open(predecessor)
+                        && message_supersedes(&message.spec, predecessor)
                 })
             {
                 apply_status_patch(&self.messages, &message.metadata.name, &MessageStatusPatch::Finish {
@@ -184,30 +198,33 @@ impl MessageInbox {
         now: DateTime<Utc>,
     ) -> Result<(), ResourceError> {
         let existing = pending.iter().find_map(|message| message.status.as_ref().and_then(|status| status.submission.clone()));
-        if existing.is_none()
-            && holder
-                .status
-                .as_ref()
-                .is_none_or(|status| status.phase != TerminalSessionPhase::Running || status.crew.is_none() || status.session_id.is_none())
-        {
+        let running_holder = holder
+            .status
+            .as_ref()
+            .filter(|status| status.phase == TerminalSessionPhase::Running)
+            .and_then(|status| Some((status.crew.as_ref()?, status.session_id.as_ref()?)));
+        if existing.is_none() && running_holder.is_none() {
             for message in pending {
                 self.wait(message, MessagePhase::Deliverable, "waiting for holder terminal startup", now).await?;
             }
             return Ok(());
         }
-        let observation = match transport.observe(holder, existing.as_ref()).await {
+        let observation = match tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.observe(holder, existing.as_ref()))
+            .await
+            .unwrap_or_else(|_| Err("transport observation timed out".into()))
+        {
             Ok(observation) => observation,
             Err(error) => {
                 if let Some(submission) = &existing {
                     if now.signed_duration_since(submission.started_at) >= HOLD_BOUND {
-                        self.failed(pending, holder, &error, true, now).await?;
+                        self.failed(pending, &error, true, now).await?;
                         return Ok(());
                     }
                     for message in pending {
                         self.wait(message, MessagePhase::Deliverable, &format!("held while observing acceptance: {error}"), now).await?;
                     }
                 } else {
-                    self.failed(pending, holder, &error, false, now).await?;
+                    self.failed(pending, &error, false, now).await?;
                 }
                 return Ok(());
             }
@@ -233,7 +250,7 @@ impl MessageInbox {
             {
                 // Recover a partially persisted batch receipt without polling or resubmitting.
                 self.accepted(&members, &receiver).await?;
-                transport.release(&batch(holder, &members, submission.clone())).await;
+                release(transport, &batch(holder, &members, submission.clone())).await;
                 self.clear_signal(&members[0]).await?;
                 return Ok(());
             }
@@ -242,6 +259,7 @@ impl MessageInbox {
                 && receiver == Some(submission.crew_id.as_str());
             let evidence = observation.evidence.clone().or_else(|| {
                 if same_holder && observation.working {
+                    // A full second of Working evidence rejects readiness flicker.
                     let since = submission.working_since.get_or_insert(now);
                     (now.signed_duration_since(*since) >= chrono::Duration::seconds(1))
                         .then(|| "holder remained Working after input submission".into())
@@ -262,7 +280,7 @@ impl MessageInbox {
                             .build(),
                     )
                     .await?;
-                    transport.release(&batch(holder, &members, submission.clone())).await;
+                    release(transport, &batch(holder, &members, submission.clone())).await;
                     self.clear_signal(&members[0]).await?;
                     return Ok(());
                 }
@@ -276,20 +294,24 @@ impl MessageInbox {
                 self.write(message, &status).await?;
             }
             if !same_holder {
-                self.failed(&members, holder, "recorded receiver session changed before acceptance was established", true, now).await?;
+                self.failed(&members, "recorded receiver session changed before acceptance was established", true, now).await?;
                 return Ok(());
             }
             let batch = batch(holder, &members, submission.clone());
-            let outcome = transport.poll(&batch).await;
+            let outcome = tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.poll(&batch))
+                .await
+                .unwrap_or_else(|_| MessageTransportOutcome::Unconfirmed { reason: "transport receipt poll timed out".into() });
             if matches!(outcome, MessageTransportOutcome::Pending | MessageTransportOutcome::Unconfirmed { .. })
                 && now.signed_duration_since(submission.started_at) >= HOLD_BOUND
             {
-                self.failed(&members, holder, "submission acceptance remained unresolved past the hold bound", true, now).await?;
+                self.failed(&members, "submission acceptance remained unresolved past the hold bound", true, now).await?;
             } else {
                 self.outcome(&members, holder, &submission, transport, outcome, now).await?;
             }
             return Ok(());
         }
+        // Preserve FIFO after a definitely-unsent batch exhausts its budget.
+        // A later message must not silently bypass the operator's held intent.
         if let Some(held) = pending.iter().find(|message| {
             message
                 .status
@@ -307,27 +329,26 @@ impl MessageInbox {
         }) {
             return Ok(());
         }
-        if holder
-            .status
-            .as_ref()
-            .is_none_or(|status| status.phase != TerminalSessionPhase::Running || status.crew.is_none() || status.session_id.is_none())
-            || !observation.ready
-        {
+        if running_holder.is_none() || !observation.ready {
             let reason = observation.waiting_reason.as_deref().unwrap_or("waiting for holder terminal readiness and a turn boundary");
             for message in pending {
                 self.wait(message, MessagePhase::Deliverable, reason, now).await?;
             }
             return Ok(());
         }
-        let status = holder.status.as_ref().expect("running holder");
+        let Some((crew, session)) = running_holder else {
+            return Ok(());
+        };
+        // The key is stable for every possibly submitted attempt. Membership
+        // can change only after definitely-unsent evidence clears that attempt.
         let submission = MessageSubmission::builder()
             .batch_id(format!(
                 "batch-{}-{}",
                 pending[0].metadata.name,
                 pending[0].status.as_ref().and_then(|status| status.retry.as_ref()).map_or(0, |retry| retry.attempts)
             ))
-            .crew_id(status.crew.as_ref().expect("holder crew").id.clone())
-            .session(status.session_id.clone().expect("holder session"))
+            .crew_id(crew.id.clone())
+            .session(session.clone())
             .started_at(now)
             .members(pending.iter().map(|message| message.metadata.name.clone()).collect())
             .maybe_output_digest(observation.output_digest)
@@ -342,7 +363,10 @@ impl MessageInbox {
             self.write(message, &status).await?;
         }
         let batch = batch(holder, pending, submission.clone());
-        self.outcome(pending, holder, &submission, transport, transport.submit(&batch).await, now).await
+        let outcome = tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.submit(&batch)).await.unwrap_or_else(|_| {
+            MessageTransportOutcome::Unconfirmed { reason: "transport submission timed out; input may have been accepted".into() }
+        });
+        self.outcome(pending, holder, &submission, transport, outcome, now).await
     }
 
     async fn outcome(
@@ -366,16 +390,16 @@ impl MessageInbox {
                         .build(),
                 )
                 .await?;
-                transport.release(&batch(holder, members, submission.clone())).await;
+                release(transport, &batch(holder, members, submission.clone())).await;
                 self.clear_signal(&members[0]).await
             }
-            MessageTransportOutcome::NotSubmitted { reason } => self.failed(members, holder, &reason, false, now).await,
+            MessageTransportOutcome::NotSubmitted { reason } => self.failed(members, &reason, false, now).await,
             MessageTransportOutcome::Unconfirmed { reason } => {
-                self.failed(members, holder, &format!("held pending acceptance evidence: {reason}"), true, now).await
+                self.failed(members, &format!("held pending acceptance evidence: {reason}"), true, now).await
             }
             MessageTransportOutcome::Pending => Ok(()),
             MessageTransportOutcome::Accepted { .. } => {
-                self.failed(members, holder, "transport supplied an empty acceptance receipt", true, now).await
+                self.failed(members, "transport supplied an empty acceptance receipt", true, now).await
             }
         }
     }
@@ -395,7 +419,6 @@ impl MessageInbox {
     async fn failed(
         &self,
         members: &[ResourceObject<Message>],
-        _holder: &ResourceObject<TerminalSession>,
         reason: &str,
         ambiguous: bool,
         now: DateTime<Utc>,
@@ -406,6 +429,8 @@ impl MessageInbox {
             if status.retry.as_ref().is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. })) {
                 continue;
             }
+            // Five-second exponential retries absorb startup jitter; the minute
+            // cap keeps definitely-unsent failures from retrying aggressively.
             let mut retry = ControllerRetry::retryable(status.retry.as_ref(), now, RetryBackoff {
                 initial: Duration::from_secs(5),
                 maximum: Duration::from_secs(60),
@@ -420,7 +445,7 @@ impl MessageInbox {
             MessageStatusPatch::Wait {
                 phase: MessagePhase::Deliverable,
                 reason: format!(
-                    "{}: {reason}; attempt {}/{}",
+                    "{}: {reason}; attempt {}/{}; inspect the recorded receiver session for acceptance evidence before replacing held intent",
                     if held { "delivery held" } else { "retrying delivery" },
                     retry.attempts,
                     MAX_ATTEMPTS
@@ -466,6 +491,9 @@ impl MessageInbox {
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error),
         }
+        // The Message reason retains the original session and submission. The
+        // operator must inspect that session for acceptance evidence; retrying
+        // uncertain input in a replacement session risks duplicate execution.
         let resource = ResourceRef::new(api_version(Message::API_PATHS), "Message", &self.namespace, &message.metadata.name);
         demands
             .create(
@@ -488,6 +516,7 @@ impl MessageInbox {
         apply_status_patch(&demands, &name, &DemandStatusPatch::Raise { as_of: now, authority: "message-delivery".into() }).await?;
         Ok(())
     }
+
     async fn clear_signal(&self, message: &ResourceObject<Message>) -> Result<(), ResourceError> {
         let demands = self.backend.using::<Demand>(&self.namespace);
         let name = format!("message-attention-{}", message.metadata.name);
@@ -513,11 +542,11 @@ fn batch(holder: &ResourceObject<TerminalSession>, members: &[ResourceObject<Mes
         .iter()
         .map(|message| {
             let relation = match message.spec.relation {
-                crate::MessageRelation::Supervisor => "supervisor",
-                crate::MessageRelation::Peer => "peer",
-                crate::MessageRelation::Dependency => "dependency",
-                crate::MessageRelation::Dependee => "dependee",
-                crate::MessageRelation::System => "system",
+                MessageRelation::Supervisor => "supervisor",
+                MessageRelation::Peer => "peer",
+                MessageRelation::Dependency => "dependency",
+                MessageRelation::Dependee => "dependee",
+                MessageRelation::System => "system",
             };
             let subject = message
                 .spec
@@ -538,4 +567,9 @@ fn batch(holder: &ResourceObject<TerminalSession>, members: &[ResourceObject<Mes
         .collect::<Vec<_>>()
         .join("\n\n");
     MessageBatch::builder().id(submission.batch_id.clone()).holder(holder.clone()).submission(submission).text(text).build()
+}
+
+async fn release(transport: &dyn MessageTransport, batch: &MessageBatch) {
+    // Receipt is already durable. A stuck bookkeeping release cannot reopen it.
+    let _ = tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.release(batch)).await;
 }

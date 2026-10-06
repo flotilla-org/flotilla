@@ -672,6 +672,12 @@ async fn genuinely_unsent_batches_back_off_and_stop_after_three_attempts() {
         assert_eq!(retry.attempts, 3);
         assert!(matches!(retry.disposition, flotilla_resources::ControllerRetryDisposition::Terminal { .. }));
     }
+    inbox.accept(&InputMeta::builder().name("later".into()).build(), &spec(None, MessageExpectation::None), at(101)).await.unwrap();
+    inbox.reconcile_delivery(&transport, at(102)).await.unwrap();
+    assert_eq!(transport.submissions.lock().unwrap().len(), 3, "later intent cannot bypass exhausted FIFO head");
+    let later = backend.using::<Message>("flotilla").get("later").await.unwrap();
+    assert!(later.status.unwrap().submission.is_none());
+    assert_eq!(transport.observations.load(std::sync::atomic::Ordering::SeqCst), 7, "held attention refreshes");
 }
 
 // Delivery leaves reply/outcome expectations open. A correlated durable reply
@@ -935,4 +941,117 @@ async fn older_admissions_without_sequence_keep_creation_order() {
     assert_eq!(inputs.len(), 1);
     assert!(inputs[0].find("body-0").unwrap() < inputs[0].find("body-1").unwrap());
     assert!(inputs[0].find("body-1").unwrap() < inputs[0].find("body-2").unwrap());
+}
+
+// A hung adapter must release admission within a bounded interval. A timeout
+// after submission remains uncertain; observation timeouts prove no input.
+struct HangingMessageTransport {
+    stage: &'static str,
+    inner: FakeMessageTransport,
+}
+#[async_trait::async_trait]
+impl flotilla_resources::MessageTransport for HangingMessageTransport {
+    async fn observe(
+        &self,
+        holder: &flotilla_resources::ResourceObject<flotilla_resources::TerminalSession>,
+        submission: Option<&flotilla_resources::MessageSubmission>,
+    ) -> Result<flotilla_resources::MessageObservation, String> {
+        if self.stage == "observe" {
+            return std::future::pending().await;
+        }
+        flotilla_resources::MessageTransport::observe(&self.inner, holder, submission).await
+    }
+    async fn submit(&self, batch: &flotilla_resources::MessageBatch) -> flotilla_resources::MessageTransportOutcome {
+        let outcome = flotilla_resources::MessageTransport::submit(&self.inner, batch).await;
+        if self.stage == "submit" {
+            return std::future::pending().await;
+        }
+        outcome
+    }
+    async fn poll(&self, batch: &flotilla_resources::MessageBatch) -> flotilla_resources::MessageTransportOutcome {
+        if self.stage == "poll" {
+            return std::future::pending().await;
+        }
+        flotilla_resources::MessageTransport::poll(&self.inner, batch).await
+    }
+    async fn release(&self, _: &flotilla_resources::MessageBatch) {
+        if self.stage == "release" {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn transport_timeouts_release_admission_without_retyping_uncertain_input() {
+    use flotilla_resources::MessageTransportOutcome;
+    for stage in ["observe", "submit", "poll", "release"] {
+        let (backend, inbox) = delivery_inbox().await;
+        let transport = HangingMessageTransport {
+            stage,
+            inner: FakeMessageTransport {
+                submissions: Default::default(),
+                observations: Default::default(),
+                outcome: if stage == "release" {
+                    MessageTransportOutcome::Accepted { evidence: "receipt".into() }
+                } else {
+                    MessageTransportOutcome::Pending
+                },
+                accepted: Default::default(),
+                working: Default::default(),
+            },
+        };
+        let started = tokio::time::Instant::now();
+        inbox.reconcile_delivery(&transport, at(20)).await.unwrap();
+        if stage == "poll" {
+            inbox.reconcile_delivery(&transport, at(21)).await.unwrap();
+        }
+        assert!(started.elapsed() >= std::time::Duration::from_secs(30), "{stage} is bounded");
+        inbox
+            .accept(&InputMeta::builder().name("after-timeout".into()).build(), &spec(None, MessageExpectation::None), at(22))
+            .await
+            .unwrap();
+        let status = backend.using::<Message>("flotilla").get("message-0").await.unwrap().status.unwrap();
+        assert_eq!(status.submission.is_some(), stage != "observe");
+        assert_eq!(status.resolved_receiver.is_some(), stage == "release");
+        assert_eq!(transport.inner.submissions.lock().unwrap().len(), usize::from(stage != "observe"));
+    }
+}
+
+// A crash can leave one member satisfied while the remaining batch receipt is
+// unwritten. Recover the original receiver without reopening the terminal one.
+#[tokio::test]
+async fn partial_receipt_recovery_keeps_terminal_members_closed() {
+    use flotilla_resources::*;
+    let (backend, inbox) = delivery_inbox().await;
+    let transport = FakeMessageTransport {
+        submissions: Default::default(),
+        observations: Default::default(),
+        outcome: MessageTransportOutcome::Pending,
+        accepted: Default::default(),
+        working: Default::default(),
+    };
+    inbox.reconcile_delivery(&transport, at(20)).await.unwrap();
+    let messages = backend.using::<Message>("flotilla");
+    let receipt = ResolvedMessageReceiver::builder()
+        .crew_id("crew".into())
+        .session("session".into())
+        .delivered_at(at(21))
+        .evidence("receipt before crash".into())
+        .build();
+    apply_status_patch(&messages, "message-0", &MessageStatusPatch::Delivered { receiver: receipt.clone(), at: at(21) }).await.unwrap();
+    apply_status_patch(&messages, "message-0", &MessageStatusPatch::Finish {
+        phase: MessagePhase::Satisfied,
+        reason: "notification accepted".into(),
+        at: at(21),
+    })
+    .await
+    .unwrap();
+    let settled = messages.get("message-0").await.unwrap();
+    MessageInbox::new(backend.clone(), "flotilla").reconcile_delivery(&transport, at(22)).await.unwrap();
+    assert_eq!(messages.get("message-0").await.unwrap().status, settled.status, "terminal receipt is immutable");
+    for name in ["message-1", "message-2"] {
+        let status = messages.get(name).await.unwrap().status.unwrap();
+        assert_eq!(status.phase, MessagePhase::Delivered);
+        assert_eq!(status.resolved_receiver, Some(receipt.clone()));
+    }
+    assert_eq!(transport.submissions.lock().unwrap().len(), 1);
 }
