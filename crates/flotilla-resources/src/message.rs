@@ -170,6 +170,9 @@ impl MessagePhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ResolvedMessageReceiver {
+    /// Qualified address of the delivered holder; absent on the previous generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_address: Option<String>,
     pub crew_id: String,
     pub session: String,
     pub delivered_at: DateTime<Utc>,
@@ -195,6 +198,10 @@ pub struct MessageStatus {
     /// definite non-submission before another attempt can type this batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission: Option<MessageSubmission>,
+    /// Members of the last definitely-unsent failure episode, including observation failures before submission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub failed_batch_members: Vec<String>,
 }
 
 impl Default for MessageStatus {
@@ -209,6 +216,7 @@ impl Default for MessageStatus {
             resolved_receiver: None,
             retry: None,
             submission: None,
+            failed_batch_members: Vec::new(),
         }
     }
 }

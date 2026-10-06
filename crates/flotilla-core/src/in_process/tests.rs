@@ -9960,6 +9960,58 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
         .await
         .unwrap_err()
         .contains("no admitted convoy"));
+    let declarations = backend.using::<flotilla_resources::ConvoyEnsure>("flotilla");
+    declarations
+        .create(
+            &test_meta("waiting-governor"),
+            &flotilla_resources::ConvoyEnsureSpec::builder()
+                .project_ref("flotilla".into())
+                .role("governor".into())
+                .repositories(Vec::new())
+                .build(),
+        )
+        .await
+        .expect("declared role before admission");
+    assert_eq!(
+        daemon.message_creation_origin("flotilla", &document("flotilla/governor")).await.expect("declared absent holder must wait"),
+        Some(daemon.node_id().clone())
+    );
+    let remote = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("remote-holder-home"));
+    remote
+        .using::<flotilla_resources::ConvoyEnsure>("flotilla")
+        .create(
+            &test_meta("waiting-reviewer"),
+            &flotilla_resources::ConvoyEnsureSpec::builder()
+                .project_ref("flotilla".into())
+                .role("reviewer".into())
+                .repositories(Vec::new())
+                .build(),
+        )
+        .await
+        .expect("remote absent holder declaration");
+    backend
+        .replica_writer::<flotilla_resources::ConvoyEnsure>(NodeId::new("remote-holder-home"), "flotilla")
+        .replace(&remote.using::<flotilla_resources::ConvoyEnsure>("flotilla").list().await.expect("declaration feed"), Utc::now())
+        .await
+        .expect("replicated declaration");
+    assert_eq!(
+        daemon.message_creation_origin("flotilla", &document("flotilla/reviewer")).await.expect("remote declared absent holder"),
+        Some(NodeId::new("remote-holder-home"))
+    );
+    let original = flotilla_resources::MessageSpec::builder()
+        .sender("system:checks".into())
+        .receiver("flotilla/governor".into())
+        .relation(flotilla_resources::MessageRelation::System)
+        .body("request".into())
+        .build();
+    daemon
+        .message_inbox("flotilla")
+        .await
+        .accept(&test_meta("system-request"), &original, Utc::now())
+        .await
+        .expect("original system request");
+    let reply = serde_json::json!({"spec":{"sender":"flotilla/c/work/coder","receiver":"system:checks","relation":"peer","body":"answer","in_reply_to":"system-request"}});
+    assert_eq!(daemon.message_creation_origin("flotilla", &reply).await.expect("system reply home"), Some(daemon.node_id().clone()));
     let convoys = backend.using::<ResourceConvoy>("flotilla");
     let convoy = convoys
         .create(&test_meta("finished"), &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build())

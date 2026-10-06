@@ -542,6 +542,8 @@ enum ResourceSubCommand {
     ReconcileNow(ResourceReconcileNowArgs),
     /// Replace the status subresource after typed validation
     PatchStatus(ResourceStatusPatchArgs),
+    /// Close a held or exhausted Message batch, preserving its submission audit.
+    FailMessageBatch(MessageFailBatchArgs),
     /// Get one resource by name
     Get(ResourceGetArgs),
     /// Explain the charter source and applied revision that authored a record
@@ -686,6 +688,19 @@ struct ResourceApplyArgs {
     #[arg(long, default_value = "flotilla")]
     namespace: String,
     /// Route the mutation to a peer host
+    #[arg(long)]
+    host: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct MessageFailBatchArgs {
+    /// A member of the held batch
+    name: String,
+    /// Operator explanation retained in every member's status
+    #[arg(long)]
+    reason: String,
+    #[arg(long, default_value = "flotilla")]
+    namespace: String,
     #[arg(long)]
     host: Option<String>,
 }
@@ -2224,6 +2239,20 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
         }
         ResourceSubCommand::Sync(args) => run_manifest_resolution(cli, args, flotilla_protocol::ManifestResolution::Sync, format).await,
         ResourceSubCommand::Adopt(args) => run_manifest_resolution(cli, args, flotilla_protocol::ManifestResolution::Adopt, format).await,
+        ResourceSubCommand::FailMessageBatch(args) => {
+            let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
+            run_control_command(
+                cli,
+                Command {
+                    node_id,
+                    provisioning_target: None,
+                    context_repo: None,
+                    action: CommandAction::MessageFailBatch { namespace: args.namespace, name: args.name, reason: args.reason },
+                },
+                format,
+            )
+            .await
+        }
         ResourceSubCommand::PatchStatus(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
             let raw = std::fs::read_to_string(&args.file)
@@ -3129,7 +3158,6 @@ mod tests {
         SubCommand, TopologyArgs, WaitArgs,
     };
 
-    // `--daemon` wins over FLOTILLA_DAEMON; an empty variable selects this host.
     // CLI endpoint selection must choose a viewer SSH hop only for remote
     // daemons, using the resolved session/host rather than the daemon-local plan.
     #[test]
@@ -3225,6 +3253,18 @@ mod tests {
         }
     }
 
+    // Glue: explicit operator intent requires a reason and identifies a member.
+    #[test]
+    fn fail_message_batch_cli_requires_an_operator_reason() {
+        let parsed = Cli::try_parse_from(["flotilla", "resource", "fail-message-batch", "held", "--reason", "cancel after inspection"])
+            .expect("operator command");
+        assert!(
+            matches!(parsed.command, Some(SubCommand::Resource { command: ResourceSubCommand::FailMessageBatch(args) }) if args.name == "held" && args.reason == "cancel after inspection")
+        );
+        assert!(Cli::try_parse_from(["flotilla", "resource", "fail-message-batch", "held"]).is_err());
+    }
+
+    // `--daemon` wins over FLOTILLA_DAEMON; an empty variable selects this host.
     #[test]
     fn remote_daemon_prefers_flag_and_ignores_empty_environment() {
         let flag = remote_daemon_from(Some("ssh://udder"), Some("ssh://kiwi"), false).expect("valid").expect("remote");

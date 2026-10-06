@@ -1124,6 +1124,11 @@ pub enum CommandAction {
         kind: String,
         name: String,
     },
+    MessageFailBatch {
+        namespace: String,
+        name: String,
+        reason: String,
+    },
     ResourceStatusPatch {
         namespace: String,
         kind: String,
@@ -1264,6 +1269,7 @@ impl Command {
             },
             CommandAction::ConvoyEnsureRoll { .. } => "roll changed ensure configuration",
             CommandAction::ResourceReconcileNow { .. } => "reconcile resource now",
+            CommandAction::MessageFailBatch { .. } => "fail held Message batch",
             CommandAction::ResourceStatusPatch { .. } => "patch resource status",
             CommandAction::ResourceDelete { .. } => "delete resource",
             CommandAction::ResourceWatch { .. } => "watch resources",

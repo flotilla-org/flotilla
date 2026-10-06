@@ -4274,3 +4274,122 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
 }
 
 mod image_layers;
+
+// Project roles retain a home before admission or launch. The ordinary router
+// must create their intent there and admit a reply addressed to a system sender.
+async fn run_message_role_waiting_home_case(remote: bool, admitted: bool) {
+    use flotilla_resources::{ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, Message, MessagePhase};
+    let topology =
+        spawn_in_memory_request_topology_stateful(empty_daemon_named("message-caller").await, empty_daemon_named("role-home").await)
+            .await
+            .expect("role Message topology");
+    let home = if remote { &topology.follower } else { &topology.leader };
+    let home_backend = home.resource_backend();
+    let declarations = home_backend.using::<ConvoyEnsure>("flotilla");
+    declarations
+        .create(
+            &InputMeta::builder().name("waiting-governor".into()).build(),
+            &ConvoyEnsureSpec::builder().project_ref("flotilla".into()).role("governor".into()).repositories(Vec::new()).build(),
+        )
+        .await
+        .expect("declared standing role");
+    if admitted {
+        home_backend
+            .using::<Convoy>("flotilla")
+            .create(
+                &InputMeta::builder().name("standing".into()).build(),
+                &ConvoySpec::builder().workflow_ref("standing".into()).project_ref("flotilla".into()).role("governor".into()).build(),
+            )
+            .await
+            .expect("admitted convoy without terminal");
+        let declaration = declarations.get("waiting-governor").await.expect("local declaration status version");
+        declarations
+            .update_status("waiting-governor", &declaration.metadata.resource_version, &ConvoyEnsureStatus {
+                convoy_ref: Some("standing".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("standing declaration status");
+    }
+    if remote {
+        topology
+            .leader
+            .resource_backend()
+            .replica_writer::<ConvoyEnsure>(home.node_id().clone(), "flotilla")
+            .replace(&declarations.list().await.expect("declaration feed"), Utc::now())
+            .await
+            .expect("replicate declaration origin");
+        topology
+            .leader
+            .resource_backend()
+            .replica_writer::<Convoy>(home.node_id().clone(), "flotilla")
+            .replace(&home_backend.using::<Convoy>("flotilla").list().await.expect("convoy feed"), Utc::now())
+            .await
+            .expect("replicate admitted convoy");
+    }
+    for (name, intent) in [
+        (
+            "request",
+            serde_json::json!({"sender":"system:checks","receiver":"flotilla/governor","relation":"system","body":"settled checks","expectation":{"kind":"reply"}}),
+        ),
+        (
+            "reply",
+            serde_json::json!({"sender":"flotilla/standing/work/coder","receiver":"system:checks","relation":"peer","body":"received","in_reply_to":"request"}),
+        ),
+    ] {
+        if remote && name == "reply" {
+            topology
+                .leader
+                .resource_backend()
+                .replica_writer::<Message>(home.node_id().clone(), "flotilla")
+                .replace(&home_backend.using::<Message>("flotilla").list().await.expect("system request feed"), Utc::now())
+                .await
+                .expect("replicate reply routing witness");
+        }
+        let mut events = topology.leader.subscribe();
+        let id = topology.client.execute(Command::builder().action(CommandAction::ResourceApply { namespace: "flotilla".into(), document: serde_json::json!({"apiVersion":"flotilla.work/v1","kind":"Message","metadata":{"name":name},"spec":intent}) }).build()).await.expect("ordinary Message mutation");
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let DaemonEvent::CommandFinished { command_id, node_id, result, .. } = events.recv().await.expect("command result") {
+                    if command_id == id {
+                        assert_eq!(node_id, *home.node_id());
+                        break result;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("receiver-home admission completes");
+        assert!(matches!(result, CommandValue::ResourceObject(_)), "{name}: {result:?}");
+        let record = home_backend.using::<Message>("flotilla").get(name).await.expect("home-authored Message");
+        assert_eq!(record.status.expect("accepted status").phase, MessagePhase::Accepted);
+        if remote {
+            assert!(
+                topology.leader.resource_backend().using::<Message>("flotilla").get(name).await.is_err(),
+                "caller must not author receiver intent"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn message_role_waiting_home_pinned_rows() {
+    for remote in [false, true] {
+        for admitted in [false, true] {
+            run_message_role_waiting_home_case(remote, admitted).await;
+        }
+    }
+}
+
+#[hegel::test]
+fn generated_message_role_waiting_home(tc: hegel::TestCase) {
+    // Cover both declaration origins with and without an admitted convoy;
+    // all four rows include the correlated system reply mutation.
+    let remote = tc.draw(hegel::generators::booleans());
+    let admitted = tc.draw(hegel::generators::booleans());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("scenario runtime")
+        .block_on(run_message_role_waiting_home_case(remote, admitted));
+}

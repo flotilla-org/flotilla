@@ -25,11 +25,11 @@ pub fn validate_message_address(address: &str) -> Result<(), ResourceError> {
     if address.is_empty() || address.chars().any(|character| character.is_whitespace() || character.is_control()) {
         return Err(ResourceError::invalid(format!("invalid message address `{address}`")));
     }
-    if let Some(principal) = address.strip_prefix("principal:") {
+    if let Some(principal) = address.strip_prefix("principal:").or_else(|| address.strip_prefix("system:")) {
         return if !principal.is_empty() && !principal.contains('/') {
             Ok(())
         } else {
-            Err(ResourceError::invalid("invalid principal address"))
+            Err(ResourceError::invalid("invalid principal or system address"))
         };
     }
     let parts: Vec<_> = address.split('/').collect();
@@ -44,7 +44,9 @@ pub fn validate_message_address(address: &str) -> Result<(), ResourceError> {
 pub fn qualify_message_address(address: &str, context: &MessageAddressContext) -> Result<String, ResourceError> {
     let parts: Vec<_> = address.split('/').collect();
     let qualified = match parts.as_slice() {
-        [role] if !address.starts_with("principal:") => format!("{}/{}/{}/{role}", context.project, context.convoy, context.vessel),
+        [role] if !address.starts_with("principal:") && !address.starts_with("system:") => {
+            format!("{}/{}/{}/{role}", context.project, context.convoy, context.vessel)
+        }
         // Two segments already name a project holder. Convoy-relative targets
         // in another vessel use convoy/vessel/role to avoid this ambiguity.
         [convoy, vessel, role] => format!("{}/{convoy}/{vessel}/{role}", context.project),
@@ -87,6 +89,7 @@ pub struct MessageInbox {
     pub(crate) issue_stale_after: std::time::Duration,
     pub(crate) messages: TypedResolver<Message>,
     pub(crate) admission: Arc<Mutex<()>>,
+    pub(crate) delivery: Arc<Mutex<()>>,
 }
 
 impl MessageInbox {
@@ -96,6 +99,7 @@ impl MessageInbox {
             backend,
             namespace: namespace.into(),
             admission: Arc::new(Mutex::new(())),
+            delivery: Arc::new(Mutex::new(())),
             change_request_stale_after: std::time::Duration::from_secs(300),
             issue_stale_after: std::time::Duration::from_secs(300),
         }
@@ -158,13 +162,10 @@ impl MessageInbox {
         };
         let existing = self.messages.list().await?.items;
         if let Some(id) = &spec.supersedes {
-            let predecessor = existing
+            let _predecessor = existing
                 .iter()
                 .find(|message| message.metadata.name == *id)
                 .ok_or_else(|| ResourceError::invalid(format!("superseded message `{id}` is absent from the receiver's store")))?;
-            if predecessor.spec.sender != spec.sender || predecessor.spec.receiver != spec.receiver {
-                return Err(ResourceError::invalid("explicit supersession requires the same sender and receiver"));
-            }
         }
         let predecessors: Vec<_> = existing
             .iter()
@@ -174,7 +175,7 @@ impl MessageInbox {
                     && partial.as_ref().is_none_or(|partial| message.metadata.creation_timestamp <= partial.metadata.creation_timestamp)
             })
             .collect();
-        if let Some(predecessor) = predecessors.iter().find(|message| message_expectation_open(message)) {
+        if let Some(predecessor) = predecessors.iter().find(|message| spec.supersedes.is_none() && message_expectation_open(message)) {
             if let Some(partial) = &partial {
                 apply_status_patch(&self.messages, &partial.metadata.name, &MessageStatusPatch::Suppressed {
                     predecessor: flotilla_protocol::ResourceRef::new(
@@ -195,9 +196,9 @@ impl MessageInbox {
         };
         for predecessor in predecessors {
             let phase = predecessor.status.as_ref().map_or(MessagePhase::Accepted, |status| status.phase);
-            if !phase.has_delivery_evidence()
-                && !phase.is_terminal()
-                && predecessor.status.as_ref().is_none_or(|status| status.submission.is_none())
+            if !phase.is_terminal()
+                && (spec.supersedes.as_deref() == Some(predecessor.metadata.name.as_str())
+                    || (!phase.has_delivery_evidence() && predecessor.status.as_ref().is_none_or(|status| status.submission.is_none())))
             {
                 apply_status_patch(&self.messages, &predecessor.metadata.name, &MessageStatusPatch::Finish {
                     phase: MessagePhase::Superseded,
@@ -210,13 +211,13 @@ impl MessageInbox {
         let status = crate::MessageStatus::builder()
             .phase(MessagePhase::Accepted)
             .since(message.metadata.creation_timestamp)
-            .accepted_sequence(
-                message
-                    .metadata
-                    .resource_version
-                    .parse()
-                    .map_err(|_| ResourceError::invalid("message creation version must be an ordered integer"))?,
-            )
+            // Kubernetes resource versions are opaque on older or extension
+            // API servers and can exceed u64. Their creation timestamps and
+            // immutable names give a deterministic fallback without refusing admission.
+            .maybe_accepted_sequence(match &self.backend {
+                ResourceBackend::Http(_) => None,
+                _ => message.metadata.resource_version.parse().ok(),
+            })
             .reason("waiting for receiver resolution".into())
             .build();
         let message = self.messages.update_status(&meta.name, &message.metadata.resource_version, &status).await?;
@@ -230,10 +231,10 @@ pub fn message_expectation_open(message: &ResourceObject<Message>) -> bool {
 }
 
 pub fn message_supersedes(successor: &MessageSpec, predecessor: &ResourceObject<Message>) -> bool {
-    successor.sender == predecessor.spec.sender
-        && successor.receiver == predecessor.spec.receiver
-        && (successor.supersedes.as_deref() == Some(predecessor.metadata.name.as_str())
-            || successor.subject.as_ref().is_some_and(|subject| predecessor.spec.subject.as_ref() == Some(subject)))
+    successor.supersedes.as_deref() == Some(predecessor.metadata.name.as_str())
+        || (successor.sender == predecessor.spec.sender
+            && successor.receiver == predecessor.spec.receiver
+            && successor.subject.as_ref().is_some_and(|subject| predecessor.spec.subject.as_ref() == Some(subject)))
 }
 
 /// Resolve a role against current durable convoy and terminal records. This

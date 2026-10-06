@@ -1,26 +1,22 @@
 //! Receiver-side batching and durable transport accounting.
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::Duration,
-};
+use std::{collections::BTreeMap, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use flotilla_protocol::{PrincipalRef, ResourceRef};
 
 use crate::{
-    api_version, apply_status_patch, message_expectation_open, message_supersedes, resolve_message_receiver, ControllerRetry,
-    ControllerRetryDisposition, Demand, DemandKind, DemandSpec, DemandStatusPatch, InputMeta, Message, MessageExpectation, MessageInbox,
-    MessagePhase, MessageRelation, MessageStatus, MessageStatusPatch, MessageSubmission, OwnerReference, ReadResourceObject,
-    ResolvedMessageReceiver, Resource, ResourceError, ResourceObject, ResourceProvenance, RetryBackoff, StatusPatch, TerminalSession,
-    TerminalSessionPhase,
+    apply_status_patch,
+    delivery_hold::{
+        delivery_acceptance_evidence, delivery_demand, delivery_demand_name, delivery_retry_backoff, delivery_retry_exhausted,
+        DELIVERY_HOLD_FOR, DELIVERY_MAX_ATTEMPTS,
+    },
+    message_expectation_open, message_supersedes, resolve_message_receiver, ControllerRetry, ControllerRetryDisposition, Demand,
+    DemandStatusPatch, InputMeta, Message, MessageExpectation, MessageInbox, MessagePhase, MessageRelation, MessageStatus,
+    MessageStatusPatch, MessageSubmission, ReadResourceObject, ResolvedMessageReceiver, ResourceError, ResourceObject, ResourceProvenance,
+    StatusPatch, TerminalSession, TerminalSessionPhase,
 };
 
-const MAX_ATTEMPTS: u32 = 3;
-// Five minutes bounds uncertain acceptance before raising operator attention.
-const HOLD_BOUND: chrono::Duration = chrono::Duration::minutes(5);
-
-// Bound adapter calls while the admission lock protects batch selection and receipts.
+// Bound adapter calls independently of admission.
 const TRANSPORT_CALL_BOUND: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -62,22 +58,24 @@ pub trait MessageTransport: Send + Sync {
     /// Forget exactly this batch's transport bookkeeping after durable receipt.
     /// This must not type input or modify the terminal's composer.
     async fn release(&self, _batch: &MessageBatch) {}
+    /// Drop bookkeeping for explicitly closed batches, without terminal input.
+    /// Partial closure must leave an unresolved batch intact.
+    async fn release_closed(&self, _messages: &[ResourceObject<Message>]) {}
 }
 
 impl MessageInbox {
     /// A pass always observes holders, including held submissions. Admission and
-    /// delivery share the inbox lock so a successor cannot race batch selection.
+    /// delivery serialize separately; admission never waits on transport I/O.
     pub async fn reconcile_delivery(&self, transport: &dyn MessageTransport, now: DateTime<Utc>) -> Result<(), ResourceError> {
-        let _guard = self.admission.lock().await;
-        // A created record with no status is an interrupted admission. Finish
-        // its predecessor cleanup before selecting any batch for transport.
-        for message in self.messages.list().await?.items.into_iter().filter(|message| message.status.is_none()) {
-            self.accept_locked(&InputMeta::from(&message.metadata), &message.spec, now).await?;
+        let _delivery = self.delivery.lock().await;
+        {
+            let _admission = self.admission.lock().await;
+            // A created record with no status is an interrupted admission. Finish
+            // its predecessor cleanup before selecting any batch for transport.
+            for message in self.messages.list().await?.items.into_iter().filter(|message| message.status.is_none()) {
+                self.accept_locked(&InputMeta::from(&message.metadata), &message.spec, now).await?;
+            }
         }
-        // One demand snapshot repairs interrupted cleanup without deleting an
-        // absent signal for every historical Message on every pass.
-        let signals: BTreeSet<_> =
-            self.backend.using::<Demand>(&self.namespace).list().await?.items.into_iter().map(|demand| demand.metadata.name).collect();
         let replies = self.backend.including_replicas::<Message>(&self.namespace).list().await?.items;
         let mut messages = self.messages.list().await?.items;
         messages.sort_by_key(|message| {
@@ -94,9 +92,6 @@ impl MessageInbox {
         for message in &messages {
             let phase = message.status.as_ref().map_or(MessagePhase::Accepted, |status| status.phase);
             if phase.is_terminal() {
-                if signals.contains(&format!("message-attention-{}", message.metadata.name)) {
-                    self.clear_signal(message).await?;
-                }
                 continue;
             }
             if phase == MessagePhase::Delivered && message.spec.expectation == MessageExpectation::None {
@@ -130,13 +125,19 @@ impl MessageInbox {
                         .await?;
                     }
                 }
-                if message.spec.expectation == MessageExpectation::Reply
-                    && replies.iter().any(|reply| {
-                        reply.object.spec.in_reply_to.as_deref() == Some(message.metadata.name.as_str())
-                            && reply.object.spec.sender == message.spec.receiver
+                let mut answered = false;
+                if message.spec.expectation == MessageExpectation::Reply {
+                    for reply in &replies {
+                        if reply.object.spec.in_reply_to.as_deref() == Some(message.metadata.name.as_str())
                             && reply.object.spec.receiver == message.spec.sender
-                    })
-                {
+                            && self.reply_sender_matches(message, &reply.object.spec.sender).await?
+                        {
+                            answered = true;
+                            break;
+                        }
+                    }
+                }
+                if answered {
                     apply_status_patch(&self.messages, &message.metadata.name, &MessageStatusPatch::Finish {
                         phase: MessagePhase::Answered,
                         reason: "receiver published a correlated reply".into(),
@@ -150,6 +151,7 @@ impl MessageInbox {
                 && messages.iter().any(|predecessor| {
                     predecessor.metadata.name != message.metadata.name
                         && message_expectation_open(predecessor)
+                        && message.spec.supersedes.is_none()
                         && message_supersedes(&message.spec, predecessor)
                 })
             {
@@ -186,7 +188,75 @@ impl MessageInbox {
         for (_, (holder, pending)) in groups {
             self.deliver_group(transport, &holder, &pending, &messages, now).await?;
         }
+        self.cleanup_delivery_gates(now).await?;
+        let current = self.messages.list().await?.items;
+        tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.release_closed(&current)).await.ok();
         Ok(())
+    }
+
+    /// Explicit operator closure is distinct from a receipt or an automatic
+    /// timeout. Preserve the original submission so the audit cannot imply a
+    /// definitely-unsent write; the operator accepts the uncertainty.
+    pub async fn fail_batch(&self, name: &str, reason: &str, now: DateTime<Utc>) -> Result<(), ResourceError> {
+        if reason.trim().is_empty() {
+            return Err(ResourceError::invalid("operator batch failure requires a reason"));
+        }
+        let _admission = self.admission.lock().await;
+        let message = self.messages.get(name).await?;
+        let status = message.status.as_ref().ok_or_else(|| ResourceError::invalid("Message has not been admitted"))?;
+        if status.phase.is_terminal() && !status.reason.as_deref().is_some_and(|reason| reason.starts_with("operator failed batch:")) {
+            return Ok(());
+        }
+        let exhausted = status.retry.as_ref().is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. }));
+        if status.submission.is_none() && !exhausted {
+            return Err(ResourceError::invalid("Message batch is neither held nor exhausted"));
+        }
+        let members = status.submission.as_ref().map(|submission| submission.members.clone()).unwrap_or_else(|| {
+            if status.failed_batch_members.is_empty() {
+                vec![name.to_string()]
+            } else {
+                status.failed_batch_members.clone()
+            }
+        });
+        let members = if members.is_empty() { vec![name.to_string()] } else { members };
+        for member in members {
+            apply_status_patch(&self.messages, &member, &MessageStatusPatch::Finish {
+                phase: MessagePhase::DeadLettered,
+                reason: format!("operator failed batch: {reason}"),
+                at: now,
+            })
+            .await?;
+        }
+        self.clear_signal(&message).await
+    }
+
+    async fn reply_sender_matches(&self, message: &ResourceObject<Message>, sender: &str) -> Result<bool, ResourceError> {
+        if sender == message.spec.receiver {
+            return Ok(true);
+        }
+        let request: Vec<_> = message.spec.receiver.split('/').collect();
+        let reply: Vec<_> = sender.split('/').collect();
+        if !matches!((&request[..], &reply[..]), ([project, _], [reply_project, _, _, _]) if project == reply_project) {
+            return Ok(false);
+        }
+        let Some(receiver) = message.status.as_ref().and_then(|status| status.resolved_receiver.as_ref()) else {
+            return Ok(false);
+        };
+        if let Some(address) = &receiver.role_address {
+            return Ok(address == sender);
+        }
+        // N→N+1 fallback: find the recorded incarnation directly, without
+        // requiring its old convoy to remain the current project-role holder.
+        let holders = self.backend.including_replicas::<TerminalSession>(&self.namespace).list().await?.items;
+        Ok(holders.iter().any(|holder| {
+            let labels = &holder.object.metadata.labels;
+            holder.object.status.as_ref().is_some_and(|status| {
+                status.crew.as_ref().is_some_and(|crew| crew.id == receiver.crew_id)
+                    && status.session_id.as_deref() == Some(receiver.session.as_str())
+            }) && labels.get(crate::CONVOY_LABEL).is_some_and(|value| value == reply[1])
+                && labels.get(crate::VESSEL_LABEL).is_some_and(|value| value == reply[2])
+                && labels.get(crate::ROLE_LABEL).is_some_and(|value| value == reply[3])
+        }))
     }
 
     async fn deliver_group(
@@ -216,8 +286,10 @@ impl MessageInbox {
             Ok(observation) => observation,
             Err(error) => {
                 if let Some(submission) = &existing {
-                    if now.signed_duration_since(submission.started_at) >= HOLD_BOUND {
-                        self.failed(pending, &error, true, now).await?;
+                    let held: Vec<_> =
+                        pending.iter().filter(|message| submission.members.contains(&message.metadata.name)).cloned().collect();
+                    if now.signed_duration_since(submission.started_at) >= DELIVERY_HOLD_FOR {
+                        self.failed(&held, &error, true, now).await?;
                         return Ok(());
                     }
                     for message in pending {
@@ -259,10 +331,19 @@ impl MessageInbox {
                 && receiver == Some(submission.crew_id.as_str());
             let evidence = observation.evidence.clone().or_else(|| {
                 if same_holder && observation.working {
-                    // A full second of Working evidence rejects readiness flicker.
+                    // Use the same Working debounce as legacy held inputs.
                     let since = submission.working_since.get_or_insert(now);
-                    (now.signed_duration_since(*since) >= chrono::Duration::seconds(1))
-                        .then(|| "holder remained Working after input submission".into())
+                    delivery_acceptance_evidence(
+                        false,
+                        false,
+                        true,
+                        now.signed_duration_since(*since) >= crate::delivery_hold::DELIVERY_WORKING_DEBOUNCE_FOR,
+                        observation
+                            .output_digest
+                            .as_ref()
+                            .is_some_and(|digest| submission.output_digest.as_ref().is_some_and(|previous| previous != digest)),
+                    )
+                    .then(|| "holder remained Working after input submission".into())
                 } else {
                     submission.working_since = None;
                     None
@@ -273,6 +354,7 @@ impl MessageInbox {
                     self.accepted(
                         &members,
                         &ResolvedMessageReceiver::builder()
+                            .maybe_role_address(delivered_role_address(&members[0], holder))
                             .crew_id(submission.crew_id.clone())
                             .session(submission.session.clone())
                             .delivered_at(now)
@@ -302,7 +384,7 @@ impl MessageInbox {
                 .await
                 .unwrap_or_else(|_| MessageTransportOutcome::Unconfirmed { reason: "transport receipt poll timed out".into() });
             if matches!(outcome, MessageTransportOutcome::Pending | MessageTransportOutcome::Unconfirmed { .. })
-                && now.signed_duration_since(submission.started_at) >= HOLD_BOUND
+                && now.signed_duration_since(submission.started_at) >= DELIVERY_HOLD_FOR
             {
                 self.failed(&members, "submission acceptance remained unresolved past the hold bound", true, now).await?;
             } else {
@@ -353,6 +435,20 @@ impl MessageInbox {
             .members(pending.iter().map(|message| message.metadata.name.clone()).collect())
             .maybe_output_digest(observation.output_digest)
             .build();
+        let admission = self.admission.lock().await;
+        // The observation was outside admission. A successor or an operator
+        // may have closed a candidate meanwhile; never submit stale intent.
+        let mut current_pending = Vec::new();
+        for message in pending {
+            let current = self.messages.get(&message.metadata.name).await?;
+            if current.status.as_ref().is_some_and(|status| status.phase.is_terminal() || status.resolved_receiver.is_some()) {
+                continue;
+            }
+            current_pending.push(current);
+        }
+        if current_pending.len() != pending.len() {
+            return Ok(());
+        }
         // Persist intent before any transport I/O. A crash can hold delivery, but
         // can never turn an ambiguous accepted batch into a fresh submission.
         for message in pending {
@@ -362,6 +458,7 @@ impl MessageInbox {
             status.submission = Some(submission.clone());
             self.write(message, &status).await?;
         }
+        drop(admission);
         let batch = batch(holder, pending, submission.clone());
         let outcome = tokio::time::timeout(TRANSPORT_CALL_BOUND, transport.submit(&batch)).await.unwrap_or_else(|_| {
             MessageTransportOutcome::Unconfirmed { reason: "transport submission timed out; input may have been accepted".into() }
@@ -383,6 +480,7 @@ impl MessageInbox {
                 self.accepted(
                     members,
                     &ResolvedMessageReceiver::builder()
+                        .maybe_role_address(delivered_role_address(&members[0], holder))
                         .crew_id(submission.crew_id.clone())
                         .session(submission.session.clone())
                         .delivered_at(now)
@@ -427,19 +525,25 @@ impl MessageInbox {
             let current = self.messages.get(&member.metadata.name).await?;
             let mut status = status_for(&current);
             if status.retry.as_ref().is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. })) {
+                if ambiguous
+                    && status
+                        .submission
+                        .as_ref()
+                        .is_some_and(|submission| crate::delivery_hold::delivery_hold_overdue(submission.started_at, now))
+                    && member.metadata.name == members[0].metadata.name
+                {
+                    self.signal(&current, now).await?;
+                }
                 continue;
             }
-            // Five-second exponential retries absorb startup jitter; the minute
-            // cap keeps definitely-unsent failures from retrying aggressively.
-            let mut retry = ControllerRetry::retryable(status.retry.as_ref(), now, RetryBackoff {
-                initial: Duration::from_secs(5),
-                maximum: Duration::from_secs(60),
-            });
-            let held = ambiguous || retry.attempts >= MAX_ATTEMPTS;
+            // Share the deployed legacy retry schedule and attempt budget.
+            let mut retry = ControllerRetry::retryable(status.retry.as_ref(), now, delivery_retry_backoff());
+            let held = ambiguous || delivery_retry_exhausted(retry.attempts);
             if held {
                 retry.disposition = ControllerRetryDisposition::Terminal { needs: reason.into() };
             }
             if !ambiguous {
+                status.failed_batch_members = members.iter().map(|message| message.metadata.name.clone()).collect();
                 status.submission = None;
             }
             MessageStatusPatch::Wait {
@@ -448,14 +552,18 @@ impl MessageInbox {
                     "{}: {reason}; attempt {}/{}; inspect the recorded receiver session for acceptance evidence before replacing held intent",
                     if held { "delivery held" } else { "retrying delivery" },
                     retry.attempts,
-                    MAX_ATTEMPTS
+                    DELIVERY_MAX_ATTEMPTS
                 ),
                 at: now,
             }
             .apply(&mut status);
             status.retry = Some(retry);
             self.write(&current, &status).await?;
-            if held && member.metadata.name == members[0].metadata.name {
+            let overdue = status
+                .submission
+                .as_ref()
+                .is_some_and(|submission| crate::delivery_hold::delivery_hold_overdue(submission.started_at, now));
+            if held && (!ambiguous || overdue) && member.metadata.name == members[0].metadata.name {
                 self.signal(&current, now).await?;
             }
         }
@@ -477,54 +585,107 @@ impl MessageInbox {
 
     async fn write(&self, message: &ResourceObject<Message>, status: &MessageStatus) -> Result<(), ResourceError> {
         let current = self.messages.get(&message.metadata.name).await?;
+        if current.status.as_ref().is_some_and(|current| current.phase.is_terminal()) {
+            return Ok(());
+        }
         if current.status.as_ref() != Some(status) {
             self.messages.update_status(&message.metadata.name, &current.metadata.resource_version, status).await?;
         }
         Ok(())
     }
 
-    async fn signal(&self, message: &ResourceObject<Message>, now: DateTime<Utc>) -> Result<(), ResourceError> {
+    // Repair a crash between terminal closure/receipt and gate deletion. Only
+    // actual receiver gates are checked; historical Messages cause no deletes.
+    async fn cleanup_delivery_gates(&self, now: DateTime<Utc>) -> Result<(), ResourceError> {
         let demands = self.backend.using::<Demand>(&self.namespace);
-        let name = format!("message-attention-{}", message.metadata.name);
-        match demands.get(&name).await {
+        let gates: Vec<_> = demands
+            .list()
+            .await?
+            .items
+            .into_iter()
+            .filter(|demand| {
+                demand.metadata.name.starts_with("terminal-delivery-")
+                    && demand.metadata.owner_references.iter().any(|owner| owner.kind == "TerminalSession" && owner.controller)
+            })
+            .collect();
+        if gates.is_empty() {
+            return Ok(());
+        }
+        let active: Vec<_> = self
+            .messages
+            .list()
+            .await?
+            .items
+            .into_iter()
+            .filter(|message| {
+                message.status.as_ref().is_some_and(|status| {
+                    !status.phase.is_terminal()
+                        && status.resolved_receiver.is_none()
+                        && status
+                            .retry
+                            .as_ref()
+                            .is_some_and(|retry| matches!(retry.disposition, ControllerRetryDisposition::Terminal { .. }))
+                })
+            })
+            .collect();
+        let mut retained = std::collections::BTreeSet::new();
+        for message in active {
+            if let Some(holder) = resolve_message_receiver(&self.backend, &self.namespace, &message.spec.receiver).await? {
+                retained.insert(delivery_demand_name(&holder.object));
+            }
+        }
+        for gate in gates {
+            if retained.contains(&gate.metadata.name) {
+                continue;
+            }
+            let name = gate.metadata.name.strip_prefix("terminal-delivery-").expect("filtered gate");
+            let legacy_pending = match self.backend.using::<TerminalSession>(&self.namespace).get(name).await {
+                Ok(holder) => crate::delivery_hold::legacy_delivery_gate_needed(&holder, now),
+                Err(ResourceError::NotFound { .. }) => false,
+                Err(error) => return Err(error),
+            };
+            if !legacy_pending {
+                match demands.delete(&gate.metadata.name).await {
+                    Ok(()) | Err(ResourceError::NotFound { .. }) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn signal(&self, message: &ResourceObject<Message>, now: DateTime<Utc>) -> Result<(), ResourceError> {
+        let Some(holder) = resolve_message_receiver(&self.backend, &self.namespace, &message.spec.receiver).await? else {
+            return Ok(());
+        };
+        let demands = self.backend.using::<Demand>(&self.namespace);
+        let (meta, spec) = delivery_demand(&holder.object);
+        match demands.get(&meta.name).await {
             Ok(_) => return Ok(()),
             Err(ResourceError::NotFound { .. }) => {}
             Err(error) => return Err(error),
         }
-        // The Message reason retains the original session and submission. The
-        // operator must inspect that session for acceptance evidence; retrying
-        // uncertain input in a replacement session risks duplicate execution.
-        let resource = ResourceRef::new(api_version(Message::API_PATHS), "Message", &self.namespace, &message.metadata.name);
-        demands
-            .create(
-                &InputMeta::builder()
-                    .name(name.clone())
-                    .owner_references(vec![OwnerReference {
-                        api_version: api_version(Message::API_PATHS),
-                        kind: "Message".into(),
-                        name: message.metadata.name.clone(),
-                        controller: true,
-                    }])
-                    .build(),
-                &DemandSpec::for_dispatching_principal(
-                    resource,
-                    DemandKind::HumanGate,
-                    PrincipalRef::implicit_for_namespace(&self.namespace),
-                ),
-            )
-            .await?;
-        apply_status_patch(&demands, &name, &DemandStatusPatch::Raise { as_of: now, authority: "message-delivery".into() }).await?;
+        demands.create(&meta, &spec).await?;
+        apply_status_patch(&demands, &meta.name, &DemandStatusPatch::Raise { as_of: now, authority: "terminal-delivery".into() }).await?;
         Ok(())
     }
 
     async fn clear_signal(&self, message: &ResourceObject<Message>) -> Result<(), ResourceError> {
+        let Some(holder) = resolve_message_receiver(&self.backend, &self.namespace, &message.spec.receiver).await? else {
+            return Ok(());
+        };
         let demands = self.backend.using::<Demand>(&self.namespace);
-        let name = format!("message-attention-{}", message.metadata.name);
-        match demands.delete(&name).await {
+        match demands.delete(&delivery_demand_name(&holder.object)).await {
             Ok(()) | Err(ResourceError::NotFound { .. }) => Ok(()),
             Err(error) => Err(error),
         }
     }
+}
+
+fn delivered_role_address(message: &ResourceObject<Message>, holder: &ResourceObject<TerminalSession>) -> Option<String> {
+    let project = message.spec.receiver.split('/').next()?;
+    let labels = &holder.metadata.labels;
+    Some(format!("{project}/{}/{}/{}", labels.get(crate::CONVOY_LABEL)?, labels.get(crate::VESSEL_LABEL)?, labels.get(crate::ROLE_LABEL)?))
 }
 
 fn status_for(message: &ResourceObject<Message>) -> MessageStatus {

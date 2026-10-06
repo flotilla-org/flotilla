@@ -100,6 +100,7 @@ impl InProcessDaemon {
             | A::ResourceManifestResolve { .. }
             | A::ConvoyEnsureRoll { .. }
             | A::ResourceReconcileNow { .. }
+            | A::MessageFailBatch { .. }
             | A::ResourceStatusPatch { .. }
             | A::ResourceDelete { .. }
             | A::RepositoryRemoteRemove { .. } => (TargetReason::RecordHome, RemoteDelivery::Command),

@@ -4477,7 +4477,22 @@ fn spawn_controller_loops(
         }),
         controller!(flotilla_resources::Message, {
             let state = Arc::clone(&state);
-            move |_backend: ResourceBackend, namespace: String| (vec![], MessageController { state: Arc::clone(&state), namespace })
+            move |_backend: ResourceBackend, namespace: String| {
+                (
+                    vec![
+                        MessageDependencyWatch::<flotilla_resources::Message>::boxed(),
+                        MessageDependencyWatch::<TerminalSession>::boxed(),
+                        MessageDependencyWatch::<Convoy>::boxed(),
+                        MessageDependencyWatch::<flotilla_resources::ConvoyEnsure>::boxed(),
+                        MessageDependencyWatch::<ChangeRequest>::boxed(),
+                        MessageDependencyWatch::<flotilla_resources::Issue>::boxed(),
+                        MessageDependencyWatch::<flotilla_resources::Artifact>::boxed(),
+                        MessageDependencyWatch::<flotilla_resources::Usage>::boxed(),
+                        MessageDependencyWatch::<Vessel>::boxed(),
+                    ],
+                    MessageController { state: Arc::clone(&state), namespace },
+                )
+            }
         }),
         controller!(TerminalSession, {
             let state = Arc::clone(&state);
@@ -5965,6 +5980,52 @@ fn clone_staging_path(target_path: &str) -> String {
     format!("{target_path}.flotilla-clone-partial")
 }
 
+/// Dependency events wake one inbox pass, not one timer per pending record.
+/// Federated watches include references and holders authored on other hosts.
+struct MessageDependencyWatch<R: Resource>(std::marker::PhantomData<R>);
+
+impl<R: Resource> MessageDependencyWatch<R> {
+    fn boxed() -> Box<dyn flotilla_resources::controller::SecondaryWatch<Primary = flotilla_resources::Message>> {
+        Box::new(Self(std::marker::PhantomData))
+    }
+}
+
+impl<R: Resource> flotilla_resources::controller::SecondaryWatch for MessageDependencyWatch<R> {
+    type Primary = flotilla_resources::Message;
+    fn clone_box(&self) -> Box<dyn flotilla_resources::controller::SecondaryWatch<Primary = Self::Primary>> {
+        Self::boxed()
+    }
+    fn spawn(
+        self: Box<Self>,
+        backend: ResourceBackend,
+        namespace: String,
+        sender: flotilla_resources::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            let resolver = backend.including_replicas::<R>(&namespace);
+            let mut watch = resolver.watch().await?;
+            loop {
+                if let Some(message) = backend
+                    .using::<flotilla_resources::Message>(&namespace)
+                    .list()
+                    .await?
+                    .items
+                    .into_iter()
+                    .filter(|message| message.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
+                    .min_by(|left, right| left.metadata.name.cmp(&right.metadata.name))
+                {
+                    sender.send(message.metadata.name).await.map_err(|_| ResourceError::other("Message controller queue closed"))?;
+                }
+                match watch.next().await {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(error),
+                    None => return Ok(()),
+                }
+            }
+        })
+    }
+}
+
 struct MessageController {
     state: Arc<ControllerRuntimeState>,
     namespace: String,
@@ -5972,21 +6033,48 @@ struct MessageController {
 
 impl flotilla_resources::controller::Reconciler for MessageController {
     type Resource = flotilla_resources::Message;
-    type Prepared = ();
-    async fn prepare(&self, _obj: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+    type Prepared = Option<std::time::Duration>;
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
         let inbox = self.state.daemon.message_inbox(&self.namespace).await;
-        inbox.reconcile_delivery(&TerminalControllerRuntime { state: Arc::clone(&self.state) }, Utc::now()).await
+        inbox.reconcile_delivery(&TerminalControllerRuntime { state: Arc::clone(&self.state) }, Utc::now()).await?;
+        let messages = self.state.daemon.resource_backend().using::<flotilla_resources::Message>(&self.namespace).list().await?.items;
+        let active: Vec<_> =
+            messages.iter().filter(|message| message.status.as_ref().is_none_or(|status| !status.phase.is_terminal())).collect();
+        // Only the lexicographically first active record owns the inbox deadline.
+        if active.iter().map(|message| message.metadata.name.as_str()).min() != Some(obj.metadata.name.as_str()) {
+            return Ok(None);
+        }
+        let now = Utc::now();
+        let next = active
+            .iter()
+            .flat_map(|message| {
+                let status = message.status.as_ref();
+                let submission = status.and_then(|status| status.submission.as_ref());
+                [
+                    message.spec.deadline.filter(|deadline| *deadline > now),
+                    status.and_then(|status| status.retry.as_ref()).and_then(|retry| retry.next_attempt_at()).filter(|due| *due > now),
+                    submission
+                        .map(|submission| submission.started_at + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR)
+                        .filter(|due| *due > now),
+                    submission
+                        .and_then(|submission| submission.working_since)
+                        .map(|since| since + flotilla_resources::delivery_hold::DELIVERY_WORKING_DEBOUNCE_FOR)
+                        .filter(|due| *due > now),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .min();
+        Ok(next.and_then(|due| (due - now).to_std().ok()))
     }
     fn reconcile(
         &self,
-        obj: &ResourceObject<Self::Resource>,
-        _: &(),
+        _: &ResourceObject<Self::Resource>,
+        next: &Self::Prepared,
         _: chrono::DateTime<Utc>,
     ) -> flotilla_resources::controller::ReconcileOutcome<Self::Resource> {
         let mut outcome = flotilla_resources::controller::ReconcileOutcome::new(None);
-        if obj.status.as_ref().is_none_or(|status| !status.phase.is_terminal()) {
-            outcome.requeue_after = Some(std::time::Duration::from_secs(1));
-        }
+        outcome.requeue_after = *next;
         outcome
     }
     async fn run_finalizer(&self, _: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
@@ -6007,20 +6095,9 @@ impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
         let status = holder.status.as_ref().ok_or("holder status is absent")?;
         let session = status.session_id.as_deref().ok_or("holder session is absent")?;
         let now = Utc::now();
-        if let Some(observation) = self.observe_attention(session, &holder.spec).await? {
-            flotilla_resources::apply_status_patch(
-                &self.state.daemon.resource_backend().using::<TerminalSession>(&holder.metadata.namespace),
-                &holder.metadata.name,
-                &flotilla_resources::TerminalSessionStatusPatch::Observe {
-                    attention: observation.attention,
-                    occupancy: observation.occupancy,
-                    output_digest: observation.output_digest,
-                    observed_at: now,
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        }
+        // Terminal reconciliation owns attention refresh. Reading its durable
+        // observations avoids feeding our own observation writes back into the
+        // Message dependency watch indefinitely.
         let current = self
             .state
             .daemon
@@ -6032,7 +6109,17 @@ impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
         let status = current.status.as_ref().ok_or("holder status is absent")?;
         let attention = status.attention.as_ref().filter(|attention| !attention.is_stale_at(now));
         let evidence = submission.and_then(|submission| {
-            if status.last_tool_activity_at.is_some_and(|at| at > submission.started_at) {
+            if flotilla_resources::delivery_hold::delivery_acceptance_evidence(
+                status.last_tool_activity_at.is_some_and(|at| at > submission.started_at),
+                attention.is_some_and(|attention| {
+                    attention.state == TerminalAttentionState::Working
+                        && attention.as_of > submission.started_at
+                        && attention.source == TerminalAttentionSource::Hook
+                }),
+                false,
+                false,
+                false,
+            ) {
                 Some("fresh agent tool activity after submission".into())
             } else {
                 None
@@ -6050,6 +6137,34 @@ impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
             output_digest: status.last_output_digest.clone(),
             waiting_reason: Some("waiting for a fresh idle holder observation".into()),
         })
+    }
+    async fn release_closed(&self, messages: &[ResourceObject<flotilla_resources::Message>]) {
+        let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
+        let closed: Vec<_> = deliveries
+            .iter()
+            .filter_map(|(session, delivery)| {
+                let batch_id = delivery.message_batch.as_deref()?;
+                let submission = messages.iter().find_map(|message| {
+                    message
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.submission.as_ref())
+                        .filter(|submission| submission.batch_id == batch_id && submission.session == *session)
+                })?;
+                let all_closed = !submission.members.is_empty()
+                    && submission.members.iter().all(|member| {
+                        messages.iter().any(|message| {
+                            message.metadata.name == *member && message.status.as_ref().is_some_and(|status| status.phase.is_terminal())
+                        })
+                    });
+                all_closed.then(|| session.clone())
+            })
+            .collect();
+        for session in closed {
+            if let Some(delivery) = deliveries.remove(&session) {
+                delivery.task.abort();
+            }
+        }
     }
     async fn submit(&self, batch: &flotilla_resources::MessageBatch) -> flotilla_resources::MessageTransportOutcome {
         match self.adapter_for_spec(&batch.holder.spec) {
@@ -14975,6 +15090,12 @@ mod tests {
     // later Working evidence, and releases its slot without typing again.
     #[tokio::test(start_paused = true)]
     async fn message_batch_uses_one_pool_input_and_releases_a_late_receipt() {
+        for operator_closes in [false, true] {
+            run_message_batch_pool_case(operator_closes).await;
+        }
+    }
+
+    async fn run_message_batch_pool_case(operator_closes: bool) {
         use flotilla_core::providers::discovery::test_support::fake_discovery;
         use flotilla_resources::{Message, MessageExpectation, MessagePhase, MessageRelation, MessageSpec, ROLE_LABEL, VESSEL_LABEL};
 
@@ -15044,6 +15165,21 @@ mod tests {
         };
         // The sender learns the receiver from replicated resources, then uses
         // ordinary ResourceApply across the real in-memory request router.
+        async fn refresh_attention(runtime: &TerminalControllerRuntime, backend: &ResourceBackend) {
+            let sessions = backend.using::<TerminalSession>(NAMESPACE);
+            let holder = sessions.get("agent").await.expect("attention holder");
+            let observation =
+                runtime.observe_attention("agent", &holder.spec).await.expect("terminal observation").expect("observed attention");
+            flotilla_resources::apply_status_patch(&sessions, "agent", &flotilla_resources::TerminalSessionStatusPatch::Observe {
+                attention: observation.attention,
+                occupancy: observation.occupancy,
+                output_digest: observation.output_digest,
+                observed_at: Utc::now(),
+            })
+            .await
+            .expect("terminal controller attention projection");
+        }
+        refresh_attention(&runtime, &backend).await;
         let sender_temp = TempDir::new().expect("cross-host Message fixture operation succeeds");
         fs::write(sender_temp.path().join("daemon.toml"), "machine_id = \"message-sender-test\"\n")
             .expect("cross-host Message fixture operation succeeds");
@@ -15075,7 +15211,7 @@ mod tests {
         let inbox = daemon.message_inbox(NAMESPACE).await;
         for index in 0..3 {
             let intent = MessageSpec::builder()
-                .sender("flotilla/turn-rules".into())
+                .sender("system:turn-rules".into())
                 .receiver(format!("{NAMESPACE}/message-pool/work/coder"))
                 .relation(MessageRelation::System)
                 .body(format!("payload-{index}"))
@@ -15141,7 +15277,40 @@ mod tests {
                 .state,
             TerminalAttentionState::Idle
         );
+        if operator_closes {
+            sender_backend
+                .replica_writer::<Message>(daemon.node_id().clone(), NAMESPACE)
+                .replace(&backend.using::<Message>(NAMESPACE).list().await.expect("held batch feed"), Utc::now())
+                .await
+                .expect("replicate batch home");
+            let mut events = sender.subscribe();
+            let id = topology
+                .client
+                .execute(
+                    Command::builder()
+                        .action(CommandAction::MessageFailBatch {
+                            namespace: NAMESPACE.into(),
+                            name: "message-0".into(),
+                            reason: "cancel held batch after inspecting original session".into(),
+                        })
+                        .build(),
+                )
+                .await
+                .expect("route operator closure to batch home");
+            assert!(matches!(wait_for_command_result(&mut events, id).await, CommandValue::Ok));
+            inbox.reconcile_delivery(&runtime, now + chrono::Duration::seconds(2)).await.expect("reap explicitly closed transport");
+            for message in backend.using::<Message>(NAMESPACE).list().await.expect("closed batch audit").items {
+                let status = message.status.expect("status");
+                assert_eq!(status.phase, MessagePhase::DeadLettered);
+                assert!(status.submission.is_some());
+                assert!(status.resolved_receiver.is_none());
+            }
+            assert!(runtime.state.terminal_deliveries.lock().expect("transport bookkeeping").is_empty());
+            assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1, "operator closure does not type input");
+            return;
+        }
         pool.observations.store(1000, Ordering::SeqCst);
+        refresh_attention(&runtime, &backend).await;
         inbox
             .reconcile_delivery(&runtime, now + chrono::Duration::seconds(2))
             .await
@@ -15152,7 +15321,9 @@ mod tests {
             .expect("cross-host Message fixture operation succeeds");
         for message in backend.using::<Message>(NAMESPACE).list().await.expect("cross-host Message fixture operation succeeds").items {
             let status = message.status.expect("cross-host Message fixture operation succeeds");
-            assert_eq!(status.phase, MessagePhase::Delivered);
+            // A receipt fulfills a Message with no reply expectation; the
+            // following pass advances it to Satisfied without another input.
+            assert_eq!(status.phase, MessagePhase::Satisfied);
             assert_eq!(status.resolved_receiver.expect("cross-host Message fixture operation succeeds").crew_id, "original-crew");
         }
         assert!(runtime.state.terminal_deliveries.lock().expect("cross-host Message fixture operation succeeds").is_empty());

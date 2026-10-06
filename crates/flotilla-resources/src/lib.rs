@@ -34,6 +34,7 @@ pub use image_layer::{
     PlacedImageIdentity, ResolvedImageInputs, IMAGE_LAYERS_ANNOTATION,
 };
 mod definition;
+pub mod delivery_hold;
 mod digest;
 pub use digest::{digest_bucket, DigestQuery, PartitionDigest, DIGEST_FANOUT};
 mod dispatch_hold;
