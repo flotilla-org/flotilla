@@ -32,7 +32,7 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
-          elif git diff --quiet HEAD~1 -- '**/*.rs' '**/Cargo.toml' 'Cargo.*' 'hegel.toml'; then
+          elif git diff --quiet HEAD~1 -- '**/*.rs' '**/Cargo.toml' 'Cargo.*' 'hegel.toml' 'rust-toolchain.toml' 'ci/toolchain/**' '.github/workflows/coverage.yml'; then
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           else
             echo "should_run=true" >> "$GITHUB_OUTPUT"
@@ -47,10 +47,19 @@ jobs:
       HEGEL_DEFAULT_PROFILE: nightly
     steps:
       - uses: actions/checkout@v4
+      - name: Read stable compiler pin
+        id: rust-pin
+        shell: bash
+        run: |
+          source ci/toolchain/pin.sh
+          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-03-12
-          components: llvm-tools-preview
+          toolchain: ${{ steps.rust-pin.outputs.version }}
+          components: rustfmt, clippy, llvm-tools-preview
+      - name: Assert compiler pin
+        shell: bash
+        run: ci/toolchain/assert.sh
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: actions/cache@v4
         with:
@@ -59,15 +68,14 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-coverage-v2-nightly-2026-03-12-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-coverage-v3-${{ steps.rust-pin.outputs.version }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-coverage-v2-nightly-2026-03-12-
+            ${{ runner.os }}-cargo-coverage-v3-${{ steps.rust-pin.outputs.version }}-
       - name: Generate coverage report
         run: |
-          # NOTE: --branch crashes llvm-cov (SIGSEGV from --show-mcdc in nightly LLVM).
-          # Revisit when upstream is fixed.
-          cargo +nightly-2026-03-12 llvm-cov --workspace --html --locked --remap-path-prefix
-          cargo +nightly-2026-03-12 llvm-cov --workspace --json --no-run --locked --output-path target/llvm-cov/html/coverage.json
+          # Line coverage only; branch coverage is intentionally disabled.
+          cargo llvm-cov --workspace --html --locked --remap-path-prefix
+          cargo llvm-cov --workspace --json --no-run --locked --output-path target/llvm-cov/html/coverage.json
       - name: Add badge JSON
         run: |
           PERCENT=$(jq -r '.data[0].totals.lines.percent | floor' target/llvm-cov/html/coverage.json)
