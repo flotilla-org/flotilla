@@ -29,3 +29,6 @@ ssh-cleat-proof = []
 name = "ssh_cleat"
 path = "tests/ssh_cleat.rs"
 required-features = ["ssh-cleat-proof"]
+
+[lints]
+workspace = true

@@ -563,6 +563,7 @@ mod tests {
     use crate::{
         app::test_support::TestWidgetHarness,
         table_view::{Alignment, CellTone, CellValue, ProjectedColumn, ProjectedRow, TableMeta, TableView, WidthHint},
+        widgets::table::FetchTrigger,
     };
 
     #[test]
@@ -715,7 +716,7 @@ mod tests {
         ProjectPageWidget::select_delta(&layouts, &mut state, 1);
 
         assert_eq!(state.active(), ProjectPanelKind::Issues);
-        assert!(ProjectPageWidget::fetch_more_query(&layouts, &state, crate::widgets::table::FetchTrigger::Explicit).is_some());
+        assert!(ProjectPageWidget::fetch_more_query(&layouts, &state, FetchTrigger::Explicit).is_some());
         assert!(matches!(ProjectPageWidget::active_action(&layouts, &state), Some(AppAction::DrillView(ViewAddress::Issues { .. }))));
     }
 
@@ -807,18 +808,13 @@ mod tests {
         state.set_active(ProjectPanelKind::Issues);
         state.focus_rows();
         state.table_mut(ProjectPanelKind::Issues).select_index(&panels[0].table, 0);
-        assert!(ProjectPageWidget::fetch_more_query(
-            &ProjectPageWidget::layouts(&panels),
-            &state,
-            crate::widgets::table::FetchTrigger::Explicit
-        )
-        .is_some());
+        assert!(ProjectPageWidget::fetch_more_query(&ProjectPageWidget::layouts(&panels), &state, FetchTrigger::Explicit).is_some());
 
         for _ in 0..20 {
             let layouts = ProjectPageWidget::layouts(&panels);
             ProjectPageWidget::select_delta(&layouts, &mut state, 1);
             assert!(
-                ProjectPageWidget::fetch_more_query(&layouts, &state, crate::widgets::table::FetchTrigger::NearBottom).is_none(),
+                ProjectPageWidget::fetch_more_query(&layouts, &state, FetchTrigger::NearBottom).is_none(),
                 "a non-terminal panel must not auto-extend"
             );
             ProjectPageWidget::reconcile(&ProjectPageWidget::layouts(&panels), &mut state);

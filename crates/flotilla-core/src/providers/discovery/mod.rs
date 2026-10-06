@@ -6,6 +6,8 @@
 //! Factories consume the bag to construct typed provider instances.
 
 use futures::StreamExt;
+
+use crate::providers::environment::EnvironmentProvider;
 pub mod detectors;
 pub mod factories;
 
@@ -447,7 +449,7 @@ pub type CloudAgentFactory = ProviderFactory<dyn CloudAgentService>;
 pub type AiUtilityFactory = ProviderFactory<dyn AiUtility>;
 pub type PresentationManagerFactory = ProviderFactory<dyn PresentationManager>;
 pub type TerminalPoolFactory = ProviderFactory<dyn TerminalPool>;
-pub type EnvironmentProviderFactory = ProviderFactory<dyn crate::providers::environment::EnvironmentProvider>;
+pub type EnvironmentProviderFactory = ProviderFactory<dyn EnvironmentProvider>;
 
 // ---------------------------------------------------------------------------
 // Factory registry
@@ -553,7 +555,7 @@ pub(crate) struct HostRegistry {
     pub(crate) ai_utilities: Vec<(ProviderDescriptor, Arc<dyn AiUtility>)>,
     pub(crate) presentation_managers: Vec<(ProviderDescriptor, Arc<dyn PresentationManager>)>,
     pub(crate) terminal_pools: Vec<(ProviderDescriptor, Arc<dyn TerminalPool>)>,
-    pub(crate) environment_providers: Vec<(ProviderDescriptor, Arc<dyn crate::providers::environment::EnvironmentProvider>)>,
+    pub(crate) environment_providers: Vec<(ProviderDescriptor, Arc<dyn EnvironmentProvider>)>,
 }
 
 #[derive(Clone, Default)]

@@ -31,7 +31,7 @@ use crate::{
         issue_tracker::IssueProvider,
         presentation::PresentationManager,
         terminal::{TerminalPool, TerminalSessionLiveness},
-        types::BranchInfo,
+        types::{BranchInfo, WorkspaceAttachRequest},
         vcs::{git_worktree::GitWorktreeStrategy, VcsInspection},
         ChannelLabel, CommandOutput, CommandRunner, ProcessCommandRunner,
     },
@@ -865,7 +865,7 @@ impl PresentationManager for FakePresentationManager {
         Ok(self.workspaces.lock().await.clone())
     }
 
-    async fn create_workspace(&self, config: &crate::providers::types::WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
+    async fn create_workspace(&self, config: &WorkspaceAttachRequest) -> Result<(String, Workspace), String> {
         let mut store = self.workspaces.lock().await;
         let ws_ref = format!("workspace:{}", store.len() + 1);
         let workspace = Workspace { name: config.name.clone(), attachable_set_id: None };

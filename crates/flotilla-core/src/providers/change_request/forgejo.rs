@@ -367,8 +367,9 @@ mod tests {
 
     use super::*;
     use crate::providers::{
+        issue_tracker::forgejo::ForgejoAuth,
         replay::{self, Masks},
-        testing::MockRunner,
+        testing::{fixture_path, MockRunner},
         ChannelLabel,
     };
 
@@ -426,11 +427,10 @@ mod tests {
         ForgejoChangeRequestProvider::new(
             http,
             Arc::new(MockRunner::new(vec![])),
-            ForgejoIssueProviderConfig::new(
-                "https://forgejo.example".into(),
-                None,
-                crate::providers::issue_tracker::forgejo::ForgejoAuth { token: "test".into(), token_path: PathBuf::from("test") },
-            ),
+            ForgejoIssueProviderConfig::new("https://forgejo.example".into(), None, ForgejoAuth {
+                token: "test".into(),
+                token_path: PathBuf::from("test"),
+            }),
             "team/repo".into(),
         )
     }
@@ -469,17 +469,14 @@ mod tests {
             .expect("response")
     }
 
-    fn auth() -> crate::providers::issue_tracker::forgejo::ForgejoAuth {
+    fn auth() -> ForgejoAuth {
         if !replay::is_live() {
-            return crate::providers::issue_tracker::forgejo::ForgejoAuth {
-                token: "fixture-token".into(),
-                token_path: PathBuf::from("fixture-token"),
-            };
+            return ForgejoAuth { token: "fixture-token".into(), token_path: PathBuf::from("fixture-token") };
         }
         let token_path =
             std::env::var_os("FORGEJO_TOKEN_FILE").map(PathBuf::from).expect("FORGEJO_TOKEN_FILE is required for live recording");
         let token = std::fs::read_to_string(&token_path).expect("read Forgejo token").trim().to_string();
-        crate::providers::issue_tracker::forgejo::ForgejoAuth { token, token_path }
+        ForgejoAuth { token, token_path }
     }
 
     #[test]
@@ -664,7 +661,7 @@ mod tests {
         let auth = auth();
         let mut masks = Masks::new();
         masks.add(&auth.token, "<LAB_FORGEJO_TOKEN>");
-        let fixture = crate::providers::testing::fixture_path("change_request", "forgejo_pulls.yaml");
+        let fixture = fixture_path("change_request", "forgejo_pulls.yaml");
         let session = replay::test_session(&fixture, masks);
         let provider = ForgejoChangeRequestProvider::new(
             replay::test_http_client(&session),
@@ -682,7 +679,7 @@ mod tests {
         let auth = auth();
         let mut masks = Masks::new();
         masks.add(&auth.token, "<LAB_FORGEJO_TOKEN>");
-        let fixture = crate::providers::testing::fixture_path("change_request", "forgejo_ghostty_governor.yaml");
+        let fixture = fixture_path("change_request", "forgejo_ghostty_governor.yaml");
         let session = replay::test_session(&fixture, masks);
         let provider = ForgejoChangeRequestProvider::new(
             replay::test_http_client(&session),
@@ -823,7 +820,7 @@ mod tests {
         let auth = auth();
         let mut masks = Masks::new();
         masks.add(&auth.token, "<LAB_FORGEJO_TOKEN>");
-        let fixture = crate::providers::testing::fixture_path("change_request", "forgejo_head_filter_capability.yaml");
+        let fixture = fixture_path("change_request", "forgejo_head_filter_capability.yaml");
         let session = replay::test_session(&fixture, masks);
         let provider = ForgejoChangeRequestProvider::new(
             replay::test_http_client(&session),

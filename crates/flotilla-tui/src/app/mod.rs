@@ -35,7 +35,7 @@ use crate::{
     keymap::Keymap,
     pm_open::PmConnector,
     theme::Theme,
-    widgets::file_picker::FilePickerWidget,
+    widgets::{file_picker::FilePickerWidget, screen::Screen},
 };
 
 /// Per-provider auth/health status from last refresh.
@@ -506,7 +506,7 @@ pub struct App {
     pub command_project_issue_starts: HashMap<u64, ProjectIssueStartContext>,
     pub pending_cancel: Option<u64>,
     pub should_quit: bool,
-    pub screen: crate::widgets::screen::Screen,
+    pub screen: Screen,
     /// Demand-backed issue windows keyed by their fully parameterized query.
     /// Default issue sections consume this; stateless paging remains for
     /// ephemeral searches beyond the window.
@@ -622,7 +622,7 @@ impl App {
         let ui = UiState::new(&model.repo_order);
         let loaded_config = config.load_config();
         let keymap = Keymap::from_config(&loaded_config.ui.keys);
-        let screen = crate::widgets::screen::Screen::new();
+        let screen = Screen::new();
         let (pm_update_tx, pm_update_rx) = mpsc::unbounded_channel();
         let session_id = uuid::Uuid::new_v4();
         let query_subscription = daemon.query_subscription(session_id);
@@ -1522,10 +1522,11 @@ fn view_regard_target(address: &ViewAddress) -> Option<ResourceRef> {
 #[cfg(test)]
 mod command_effect_tests {
     use super::*;
+    use crate::app::test_support::stub_app;
 
     #[test]
     fn command_results_remain_reviewable_after_next_status() {
-        let mut app = crate::app::test_support::stub_app();
+        let mut app = stub_app();
         app.set_status_message(Some("Convoy created".into()));
         app.set_status_message(None);
         app.set_status_message(Some("Project refreshed".into()));
@@ -1537,7 +1538,7 @@ mod command_effect_tests {
 
     #[test]
     fn previous_handoff_decodes_without_notifications() {
-        let app = crate::app::test_support::stub_app();
+        let app = stub_app();
         let mut old = serde_json::to_value(app.handoff()).expect("serialize handoff");
         let object = old.as_object_mut().expect("handoff object");
         object.remove("notifications");
@@ -1573,7 +1574,7 @@ mod command_effect_tests {
 
     #[test]
     fn another_tui_does_not_attach_a_convoy_started_elsewhere() {
-        let mut observer = crate::app::test_support::stub_app();
+        let mut observer = stub_app();
         observer.local_attach_effects.begin();
         broadcast_convoy_start(&mut observer);
         assert!(observer.pending_attach_plan.is_none());
@@ -1583,7 +1584,7 @@ mod command_effect_tests {
 
     #[test]
     fn initiating_tui_attaches_when_acknowledgement_arrives_first() {
-        let mut initiator = crate::app::test_support::stub_app();
+        let mut initiator = stub_app();
         initiator.local_attach_effects.begin();
         executor::handle_dispatch_completion(initiator.session_id, Ok(42), None, &mut initiator);
         broadcast_convoy_start(&mut initiator);
@@ -1592,7 +1593,7 @@ mod command_effect_tests {
 
     #[test]
     fn initiating_tui_attaches_when_finish_arrives_first() {
-        let mut initiator = crate::app::test_support::stub_app();
+        let mut initiator = stub_app();
         initiator.local_attach_effects.begin();
         broadcast_convoy_start(&mut initiator);
         assert!(initiator.pending_attach_plan.is_none());

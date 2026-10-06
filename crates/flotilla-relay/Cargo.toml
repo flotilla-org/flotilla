@@ -23,3 +23,6 @@ worker = "0.8.6"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 rusqlite = { version = "0.37", features = ["bundled"] }
+
+[lints]
+workspace = true

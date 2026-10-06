@@ -55,3 +55,6 @@ test = false
 [[example]]
 name = "splash_probe"
 test = false
+
+[lints]
+workspace = true

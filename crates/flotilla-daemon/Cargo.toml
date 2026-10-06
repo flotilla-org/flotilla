@@ -57,3 +57,6 @@ flotilla-test-support = { path = "../flotilla-test-support" }
 hegeltest = "=0.48.1"
 http = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
+
+[lints]
+workspace = true

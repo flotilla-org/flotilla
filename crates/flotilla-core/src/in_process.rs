@@ -11,6 +11,7 @@ mod crew_ops;
 pub(crate) use crew_ops::convoy_message_address;
 pub use crew_ops::{ConvoyResumeOutcome, CrewRoutingContext};
 use crew_ops::{CrewService, CrewSupervisionRequest, CrewTurnDeliveryActuator};
+
 // Exercise the real controller in the existing private daemon scenario harness
 // without adding a production dependency from core back to controllers.
 #[path = "in_process/convoy_admission.rs"]
@@ -128,8 +129,10 @@ use crate::{
         ai_utility::{AiUtility, ConvoyNames},
         change_request::{BoundObservations, ChangeRequestTracker, ObservationError},
         discovery::{
-            discover_checkout_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvironmentAssertion, EnvironmentBag,
+            discover_checkout_with_host_scoped, run_host_detectors, DiscoveryResult, DiscoveryRuntime, EnvVars, EnvironmentAssertion,
+            EnvironmentBag,
         },
+        environment::EnvironmentHandle,
         issue_tracker::IssueProvider,
         registry::ProviderRegistry,
         ssh_runner::SshCommandRunner,
@@ -742,7 +745,7 @@ impl StaticEnvVars {
     fn from_bag(bag: &EnvironmentBag) -> Self {
         let mut vars = HashMap::new();
         for assertion in bag.assertions() {
-            if let crate::providers::discovery::EnvironmentAssertion::EnvVarSet { key, value } = assertion {
+            if let EnvironmentAssertion::EnvVarSet { key, value } = assertion {
                 vars.insert(key.clone(), value.clone());
             }
         }
@@ -750,7 +753,7 @@ impl StaticEnvVars {
     }
 }
 
-impl crate::providers::discovery::EnvVars for StaticEnvVars {
+impl EnvVars for StaticEnvVars {
     fn get(&self, key: &str) -> Option<String> {
         self.vars.get(key).cloned()
     }
@@ -1173,7 +1176,7 @@ async fn discover_vcs_for_checkout(
         .environment_bag(environment_id)
         .ok_or_else(|| format!("discovery environment unavailable: {environment_id}"))?;
     let remote_env = StaticEnvVars::from_bag(&host_bag);
-    let env: &dyn crate::providers::discovery::EnvVars = if environment_id == local_environment_id { &*discovery.env } else { &remote_env };
+    let env: &dyn EnvVars = if environment_id == local_environment_id { &*discovery.env } else { &remote_env };
     let checkout = ExecutionEnvironmentPath::new(checkout_path);
     let mut bag = host_bag;
     for detector in &discovery.repo_detectors {
@@ -1212,7 +1215,7 @@ async fn discover_repo_for_environment(
     }
     let ee_path = ExecutionEnvironmentPath::new(repo_path);
     let remote_env = StaticEnvVars::from_bag(&host_bag);
-    let env: &dyn crate::providers::discovery::EnvVars = if environment_id == local_environment_id { &*discovery.env } else { &remote_env };
+    let env: &dyn EnvVars = if environment_id == local_environment_id { &*discovery.env } else { &remote_env };
 
     let host_scoped = discovery
         .host_scoped_providers
@@ -2599,10 +2602,7 @@ impl InProcessDaemon {
         self.environment_manager.environment_bag(env_id)
     }
 
-    pub fn environment_registry_for_environment(
-        &self,
-        env_id: &EnvironmentId,
-    ) -> Option<Arc<crate::providers::registry::ProviderRegistry>> {
+    pub fn environment_registry_for_environment(&self, env_id: &EnvironmentId) -> Option<Arc<ProviderRegistry>> {
         self.environment_manager.environment_registry(env_id)
     }
 
@@ -2623,11 +2623,7 @@ impl InProcessDaemon {
             .collect()
     }
 
-    pub fn set_direct_environment_registry(
-        &self,
-        env_id: &EnvironmentId,
-        registry: Arc<crate::providers::registry::ProviderRegistry>,
-    ) -> Result<(), String> {
+    pub fn set_direct_environment_registry(&self, env_id: &EnvironmentId, registry: Arc<ProviderRegistry>) -> Result<(), String> {
         self.environment_manager.set_direct_environment_registry(env_id, registry)
     }
 
@@ -2638,9 +2634,9 @@ impl InProcessDaemon {
     pub fn register_provisioned_environment(
         &self,
         env_id: EnvironmentId,
-        handle: crate::providers::environment::EnvironmentHandle,
+        handle: EnvironmentHandle,
         env_bag: EnvironmentBag,
-        registry: Option<Arc<crate::providers::registry::ProviderRegistry>>,
+        registry: Option<Arc<ProviderRegistry>>,
     ) -> Result<(), String> {
         self.environment_manager.register_provisioned_environment(env_id, handle, env_bag, registry)
     }
@@ -2946,7 +2942,7 @@ impl InProcessDaemon {
     pub fn register_provisioned_environment_for_test(
         &self,
         env_id: EnvironmentId,
-        handle: crate::providers::environment::EnvironmentHandle,
+        handle: EnvironmentHandle,
         env_bag: EnvironmentBag,
     ) -> Result<(), String> {
         self.environment_manager.register_provisioned_environment(env_id, handle, env_bag, None)

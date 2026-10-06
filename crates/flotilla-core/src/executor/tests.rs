@@ -20,13 +20,14 @@ use crate::{
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
         discovery::{
-            test_support::{fake_discovery, test_vcs_resolver, DiscoveryMockRunner},
-            ProviderCategory, ProviderDescriptor,
+            test_support::{fake_discovery, test_vcs_resolver, DiscoveryMockRunner, TestEnvVars},
+            EnvironmentBag, ProviderCategory, ProviderDescriptor,
         },
+        environment::ProvisionedMount,
         issue_tracker::IssueProvider,
         presentation::PresentationManager,
         registry::ProviderRegistry,
-        terminal::TerminalPool,
+        terminal::{TerminalEnvVars, TerminalPool, TerminalSession, TerminalSessionTag},
         testing::MockRunner,
         types::*,
         vcs::write_branch_issue_links,
@@ -1389,7 +1390,7 @@ struct MockTerminalPool {
 
 #[async_trait]
 impl TerminalPool for MockTerminalPool {
-    async fn list_sessions(&self) -> Result<Vec<crate::providers::terminal::TerminalSession>, String> {
+    async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
         Ok(vec![])
     }
     async fn ensure_session(
@@ -1397,8 +1398,8 @@ impl TerminalPool for MockTerminalPool {
         _session_name: &str,
         _cmd: &str,
         _cwd: &ExecutionEnvironmentPath,
-        _env_vars: &crate::providers::terminal::TerminalEnvVars,
-        _tags: &[crate::providers::terminal::TerminalSessionTag],
+        _env_vars: &TerminalEnvVars,
+        _tags: &[TerminalSessionTag],
     ) -> Result<(), String> {
         Ok(())
     }
@@ -1407,7 +1408,7 @@ impl TerminalPool for MockTerminalPool {
         session_name: &str,
         _cmd: &str,
         _cwd: &ExecutionEnvironmentPath,
-        _env_vars: &crate::providers::terminal::TerminalEnvVars,
+        _env_vars: &TerminalEnvVars,
     ) -> Result<Vec<flotilla_protocol::arg::Arg>, String> {
         Ok(vec![flotilla_protocol::arg::Arg::Literal(format!("attach:{session_name}"))])
     }
@@ -1421,7 +1422,7 @@ struct FailingEnsureTerminalPool;
 
 #[async_trait]
 impl TerminalPool for FailingEnsureTerminalPool {
-    async fn list_sessions(&self) -> Result<Vec<crate::providers::terminal::TerminalSession>, String> {
+    async fn list_sessions(&self) -> Result<Vec<TerminalSession>, String> {
         Ok(vec![])
     }
 
@@ -1430,8 +1431,8 @@ impl TerminalPool for FailingEnsureTerminalPool {
         _session_name: &str,
         _cmd: &str,
         _cwd: &ExecutionEnvironmentPath,
-        _env_vars: &crate::providers::terminal::TerminalEnvVars,
-        _tags: &[crate::providers::terminal::TerminalSessionTag],
+        _env_vars: &TerminalEnvVars,
+        _tags: &[TerminalSessionTag],
     ) -> Result<(), String> {
         Err("failed to start terminal".to_string())
     }
@@ -1441,7 +1442,7 @@ impl TerminalPool for FailingEnsureTerminalPool {
         session_name: &str,
         _cmd: &str,
         _cwd: &ExecutionEnvironmentPath,
-        _env_vars: &crate::providers::terminal::TerminalEnvVars,
+        _env_vars: &TerminalEnvVars,
     ) -> Result<Vec<Arg>, String> {
         Ok(vec![Arg::Literal(format!("attach:{session_name}"))])
     }
@@ -2238,7 +2239,7 @@ async fn run_build_plan_to_completion_with(
                 providers_data,
                 runner: runner.clone(),
                 vcs_resolver,
-                env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
+                env: Arc::new(TestEnvVars::default()),
                 config_base,
                 attachable_store,
                 daemon_socket_path: None,
@@ -2626,7 +2627,7 @@ async fn checkout_plan_end_to_end_creates_workspace() {
         registry,
         providers_data,
         runner: runner.clone(),
-        env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
+        env: Arc::new(TestEnvVars::default()),
         config_base: cb,
         attachable_store: attachable.clone(),
         daemon_socket_path: None,
@@ -2704,7 +2705,7 @@ async fn checkout_plan_creates_workspace_for_preexisting_checkout() {
         providers_data,
         runner: runner.clone(),
         vcs_resolver: test_vcs_resolver(runner),
-        env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
+        env: Arc::new(TestEnvVars::default()),
         config_base: cb,
         attachable_store: attachable,
         daemon_socket_path: None,
@@ -2768,7 +2769,7 @@ async fn checkout_plan_preserves_checkout_created_when_workspace_step_fails() {
         registry,
         providers_data,
         runner: runner.clone(),
-        env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
+        env: Arc::new(TestEnvVars::default()),
         config_base: cb,
         attachable_store: attachable,
         daemon_socket_path: None,
@@ -3489,7 +3490,7 @@ async fn executor_step_resolver_prepare_workspace_produces_prepared_workspace() 
         providers_data: Arc::new(empty_data()),
         runner: Arc::new(runner_ok()),
         vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
-        env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
+        env: Arc::new(TestEnvVars::default()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: None,
@@ -3527,7 +3528,7 @@ async fn executor_step_resolver_prepare_workspace_skips_when_no_checkout_path() 
         providers_data: Arc::new(empty_data()),
         runner: Arc::new(runner_ok()),
         vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
-        env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
+        env: Arc::new(TestEnvVars::default()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: None,
@@ -3590,7 +3591,7 @@ impl ProvisionedEnvironment for MockProvisionedEnvironment {
     fn container_name(&self) -> Option<&str> {
         Some("mock-container")
     }
-    fn provisioned_mounts(&self) -> Vec<crate::providers::environment::ProvisionedMount> {
+    fn provisioned_mounts(&self) -> Vec<ProvisionedMount> {
         vec![]
     }
     async fn status(&self) -> Result<EnvironmentStatus, String> {
@@ -3623,7 +3624,7 @@ async fn manager_with_provisioned_environment(
 ) -> Arc<EnvironmentManager> {
     let manager = empty_environment_manager().await;
     manager
-        .register_provisioned_environment(env_id.clone(), handle, crate::providers::discovery::EnvironmentBag::new(), registry)
+        .register_provisioned_environment(env_id.clone(), handle, EnvironmentBag::new(), registry)
         .expect("register provisioned environment");
     manager
 }
@@ -3654,7 +3655,7 @@ async fn executor_step_resolver_create_environment() {
         providers_data: Arc::new(empty_data()),
         runner: runner.clone(),
         vcs_resolver: test_vcs_resolver(runner),
-        env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::new([("GITHUB_TOKEN", "gh-test-token")])),
+        env: Arc::new(TestEnvVars::new([("GITHUB_TOKEN", "gh-test-token")])),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: Some(DaemonHostPath::new("/tmp/flotilla.sock")),
@@ -3692,7 +3693,7 @@ async fn executor_step_resolver_create_environment_errors_without_spec_outcome()
         providers_data: Arc::new(empty_data()),
         runner: Arc::new(runner_ok()),
         vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
-        env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
+        env: Arc::new(TestEnvVars::default()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: Some(DaemonHostPath::new("/tmp/flotilla.sock")),
@@ -3726,7 +3727,7 @@ async fn executor_step_resolver_destroy_environment() {
         providers_data: Arc::new(empty_data()),
         runner: Arc::new(runner_ok()),
         vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
-        env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
+        env: Arc::new(TestEnvVars::default()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: None,
@@ -3755,7 +3756,7 @@ async fn executor_step_resolver_destroy_environment_not_found() {
         providers_data: Arc::new(empty_data()),
         runner: Arc::new(runner_ok()),
         vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
-        env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
+        env: Arc::new(TestEnvVars::default()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: None,
@@ -3787,7 +3788,7 @@ async fn executor_step_resolver_prepare_workspace_uses_manager_container_name_fo
         providers_data: Arc::new(empty_data()),
         runner: Arc::new(runner_ok()),
         vcs_resolver: test_vcs_resolver(Arc::new(runner_ok())),
-        env: Arc::new(crate::providers::discovery::test_support::TestEnvVars::default()),
+        env: Arc::new(TestEnvVars::default()),
         config_base: config_base.clone(),
         attachable_store: test_attachable_store(&config_base),
         daemon_socket_path: None,

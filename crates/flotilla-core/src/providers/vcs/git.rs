@@ -103,6 +103,7 @@ mod tests {
     use super::*;
     use crate::providers::{
         replay,
+        testing::fixture_path,
         vcs::{checkout_test_support::git, VcsInspection},
     };
 
@@ -182,7 +183,7 @@ mod tests {
     }
 
     fn fixture(name: &str) -> String {
-        crate::providers::testing::fixture_path("vcs", name)
+        fixture_path("vcs", name)
     }
 
     // ── Record/replay tests ──

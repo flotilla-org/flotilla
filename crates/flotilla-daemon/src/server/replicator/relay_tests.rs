@@ -12,7 +12,7 @@ use flotilla_test_support::TestSocketDir;
 use tokio::{io::AsyncReadExt, net::UnixListener, task::JoinSet};
 
 use super::{replicate_kind_over_http, replicate_relay_over_http, ReplicationStore};
-use crate::server::resource_http::serve_resource_http;
+use crate::server::resource_http::{serve_resource_http, serve_resource_http_with_daemon};
 
 async fn await_template(daemon: &InProcessDaemon, name: &str, expected: &WorkflowTemplateSpec) {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -259,13 +259,7 @@ async fn observed_checkout_http_relay_keeps_ephemeral_origin_and_deletes() {
                 let daemon = Arc::clone(&server_daemon);
                 requests.spawn(async move {
                     if let Ok(first) = stream.read_u8().await {
-                        let _ = crate::server::resource_http::serve_resource_http_with_daemon(
-                            stream,
-                            first,
-                            daemon.resource_backend(),
-                            Some(daemon),
-                        )
-                        .await;
+                        let _ = serve_resource_http_with_daemon(stream, first, daemon.resource_backend(), Some(daemon)).await;
                     }
                 });
             }

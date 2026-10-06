@@ -9,6 +9,7 @@ use crate::{
         change_request::ChangeRequestTracker,
         coding_agent::CloudAgentService,
         discovery::ProviderDescriptor,
+        environment::EnvironmentProvider,
         issue_tracker::{provider_for_source, IssueProvider},
         presentation::PresentationManager,
         terminal::TerminalPool,
@@ -157,7 +158,7 @@ pub struct ProviderRegistry {
     pub ai_utilities: ProviderSet<dyn AiUtility>,
     pub presentation_managers: ProviderSet<dyn PresentationManager>,
     pub terminal_pools: ProviderSet<dyn TerminalPool>,
-    pub environment_providers: ProviderSet<dyn crate::providers::environment::EnvironmentProvider>,
+    pub environment_providers: ProviderSet<dyn EnvironmentProvider>,
 }
 
 impl ProviderRegistry {

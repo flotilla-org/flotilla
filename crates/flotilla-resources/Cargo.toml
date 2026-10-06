@@ -58,3 +58,6 @@ test = false
 [[example]]
 name = "validate_workflow"
 test = false
+
+[lints]
+workspace = true

@@ -10,7 +10,7 @@ use super::*;
 
 #[test]
 fn notification_history_can_be_opened_navigated_and_cleared() {
-    let mut app = crate::app::test_support::stub_app();
+    let mut app = stub_app();
     app.set_status_message(Some("First".into()));
     app.set_error_message("Second".into());
 
@@ -26,7 +26,7 @@ fn notification_history_can_be_opened_navigated_and_cleared() {
 
 #[test]
 fn notification_history_uses_configured_binding() {
-    let mut app = crate::app::test_support::stub_app();
+    let mut app = stub_app();
     let mut keys = flotilla_core::config::KeysConfig::default();
     keys.notifications.insert("ctrl-j".into(), "select_next".into());
     app.keymap = crate::keymap::Keymap::from_config(&keys);

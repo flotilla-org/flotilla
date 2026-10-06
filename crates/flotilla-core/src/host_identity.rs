@@ -500,7 +500,10 @@ async fn resolve_or_create_remote_environment_id_at(runner: &dyn CommandRunner, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{discovery::test_support::TestEnvVars, ProcessCommandRunner};
+    use crate::providers::{
+        discovery::test_support::{DiscoveryMockRunner, TestEnvVars},
+        ProcessCommandRunner,
+    };
 
     #[test]
     fn generates_and_persists_host_id() {
@@ -558,7 +561,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_local_host_id_persists_in_local_state_dir() {
         let base = tempfile::tempdir().unwrap();
-        let runner = crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build();
+        let runner = DiscoveryMockRunner::builder().build();
 
         let first = resolve_local_host_id(base.path(), None, &runner).await.expect("resolve local host id");
         let second = resolve_local_host_id(base.path(), None, &runner).await.expect("resolve local host id again");
@@ -571,9 +574,7 @@ mod tests {
     async fn resolve_or_create_remote_host_id_reads_persisted_remote_value() {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = temp.path().join("flotilla");
-        let runner = crate::providers::discovery::test_support::DiscoveryMockRunner::builder()
-            .with_file(state_dir.join("host-id"), "remote-host-id\n")
-            .build();
+        let runner = DiscoveryMockRunner::builder().with_file(state_dir.join("host-id"), "remote-host-id\n").build();
         let env = TestEnvVars::new([("XDG_STATE_HOME", temp.path().to_string_lossy().into_owned())]);
 
         let resolved = resolve_or_create_remote_host_id(&runner, &env).await.expect("resolve remote host id");
@@ -771,7 +772,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_local_node_id_uses_machine_scoped_identity_dir() {
         let base = tempfile::tempdir().unwrap();
-        let machine_runner = crate::providers::discovery::test_support::DiscoveryMockRunner::builder()
+        let machine_runner = DiscoveryMockRunner::builder()
             // This test resolves the machine UUID once per `resolve_local_node_id()` call and
             // once more when asserting the scoped identity directory path directly.
             .on_run("ioreg", &["-rd1", "-c", "IOPlatformExpertDevice"], Ok("\"IOPlatformUUID\" = \"machine-uuid\"\n".into()))
@@ -791,7 +792,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_local_node_id_errors_when_machine_identity_is_unavailable() {
         let base = tempfile::tempdir().unwrap();
-        let runner = crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build();
+        let runner = DiscoveryMockRunner::builder().build();
         if read_etc_machine_id().is_none() {
             let err = resolve_local_node_id(base.path(), None, &runner).await.unwrap_err();
             assert!(err.contains("Cannot determine machine identity"));
@@ -801,7 +802,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_local_node_id_uses_config_machine_id_override() {
         let base = tempfile::tempdir().unwrap();
-        let runner = crate::providers::discovery::test_support::DiscoveryMockRunner::builder().build();
+        let runner = DiscoveryMockRunner::builder().build();
 
         let node_id_1 = resolve_local_node_id(base.path(), Some("override-machine"), &runner).await.unwrap();
         let node_id_2 = resolve_local_node_id(base.path(), Some("override-machine"), &runner).await.unwrap();

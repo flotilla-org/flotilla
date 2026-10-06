@@ -586,8 +586,9 @@ mod tests {
     use super::*;
     use crate::providers::{
         discovery::{
+            detectors::default_host_detectors,
             test_support::{fake_discovery, DiscoveryMockRunner},
-            EnvironmentAssertion,
+            EnvironmentAssertion, ProviderCategory, ProviderDescriptor,
         },
         environment::{CreateOpts, EnvironmentHandle, EnvironmentProvider, ProvisionedEnvironment, ProvisionedMount},
         registry::ProviderRegistry,
@@ -1049,10 +1050,7 @@ mod tests {
         let mut registry = ProviderRegistry::new();
         registry.environment_providers.insert(
             "docker",
-            crate::providers::discovery::ProviderDescriptor::named(
-                crate::providers::discovery::ProviderCategory::EnvironmentProvider,
-                "docker",
-            ),
+            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "docker"),
             provider,
         );
 
@@ -1116,10 +1114,7 @@ mod tests {
         let mut registry = ProviderRegistry::new();
         registry.environment_providers.insert(
             "mock",
-            crate::providers::discovery::ProviderDescriptor::named(
-                crate::providers::discovery::ProviderCategory::EnvironmentProvider,
-                "mock",
-            ),
+            ProviderDescriptor::named(ProviderCategory::EnvironmentProvider, "mock"),
             Arc::new(MockEnvironmentProvider { create_result: tokio::sync::Mutex::new(Some(Ok(handle))) }),
         );
         manager
@@ -1154,7 +1149,7 @@ mod tests {
     async fn ensure_provisioned_environment_providers_updates_bag_and_registry() {
         let env_id = EnvironmentId::new("env-discover-1");
         let mut discovery = fake_discovery(false);
-        discovery.host_detectors = Arc::new(crate::providers::discovery::detectors::default_host_detectors());
+        discovery.host_detectors = Arc::new(default_host_detectors());
         let manager = EnvironmentManager::new_local(&discovery, test_local_environment_id(), test_local_host_id()).await;
         let handle: EnvironmentHandle = Arc::new(MockProvisionedEnvironment {
             id: env_id.clone(),

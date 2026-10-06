@@ -570,7 +570,7 @@ impl super::CloudAgentService for CodexCodingAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{coding_agent::CloudAgentService, replay};
+    use crate::providers::{coding_agent::CloudAgentService, replay, testing::fixture_path};
 
     // A transient probe failure preserves prior credentials and cache age,
     // and must not consume the separate missing-auth warning.
@@ -599,7 +599,7 @@ mod tests {
         std::fs::write(&auth_path, r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fresh-token","account_id":"acc-1"}}"#)
             .expect("write auth file");
 
-        let fixture = crate::providers::testing::fixture_path("coding_agent", "codex_fallback_auth_retry.yaml");
+        let fixture = fixture_path("coding_agent", "codex_fallback_auth_retry.yaml");
         let session = replay::test_session(&fixture, replay::Masks::new());
         let http = replay::test_http_client(&session);
         let agent = CodexCodingAgent::new("codex".into(), ExecutionEnvironmentPath::new(auth_path), http);

@@ -437,7 +437,7 @@ mod tests {
         change_request::ChangeRequestTracker,
         github_api::{GhApiClient, GithubRetrySource},
         replay,
-        testing::MockRunner,
+        testing::{fixture_path, MockRunner},
         CommandOutput,
     };
 
@@ -505,7 +505,7 @@ mod tests {
     // the exact filtered endpoint exercised in production.
     #[tokio::test]
     async fn replayed_real_github_head_lookup_found_and_absent() {
-        let fixture = crate::providers::testing::fixture_path("change_request", "github_head_lookup.yaml");
+        let fixture = fixture_path("change_request", "github_head_lookup.yaml");
         let session = replay::test_session(&fixture, replay::Masks::new());
         let runner = replay::test_runner(&session);
         let api = replay::test_gh_api(&session);
@@ -980,7 +980,7 @@ mod tests {
 
     #[tokio::test]
     async fn replayed_real_batched_github_observation() {
-        let fixture = crate::providers::testing::fixture_path("change_request", "github_observer_busy.yaml");
+        let fixture = fixture_path("change_request", "github_observer_busy.yaml");
         let session = replay::test_session(&fixture, replay::Masks::new());
         let runner = replay::test_runner(&session);
         let provider =

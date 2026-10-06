@@ -21,7 +21,7 @@ use ratatui::{
 use crate::{
     app::{self, App},
     event::{self, Event},
-    widgets::InteractiveWidget,
+    widgets::{tabs::tab_label, InteractiveWidget},
 };
 
 pub enum EventLoopExit {
@@ -258,8 +258,7 @@ fn spawn_fleet_health_refresh(app: &App, event_tx: tokio::sync::mpsc::UnboundedS
 }
 
 fn sync_terminal_title(app: &App, current: &mut Option<String>) -> Result<()> {
-    let next =
-        app.views.is_scoped().then(|| crate::widgets::tabs::tab_label(app.views.active(), &app.model, &app.namespaces).trim().to_string());
+    let next = app.views.is_scoped().then(|| tab_label(app.views.active(), &app.model, &app.namespaces).trim().to_string());
     if next != *current {
         if let Some(title) = &next {
             execute!(stdout(), SetTitle(format!("{title} — flotilla")))?;

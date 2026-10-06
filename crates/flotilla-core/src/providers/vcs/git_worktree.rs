@@ -290,7 +290,11 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::providers::{testing::MockRunner, vcs::parse_porcelain_status, CommandRunner};
+    use crate::providers::{
+        testing::{fixture_path, MockRunner},
+        vcs::parse_porcelain_status,
+        CommandRunner,
+    };
 
     #[test]
     fn parse_porcelain_normal_worktrees() {
@@ -395,7 +399,7 @@ branch refs/heads/feature
     // ── Record/replay tests ──
 
     fn fixture(name: &str) -> String {
-        crate::providers::testing::fixture_path("vcs", name)
+        fixture_path("vcs", name)
     }
 
     #[tokio::test]

@@ -21,3 +21,6 @@ flotilla-test-support = { path = "../flotilla-test-support" }
 hegeltest = "=0.48.1"
 tokio = { version = "1", features = ["macros", "rt", "fs"] }
 tempfile = "3"
+
+[lints]
+workspace = true

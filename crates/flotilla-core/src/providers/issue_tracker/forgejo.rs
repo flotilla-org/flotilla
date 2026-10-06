@@ -251,7 +251,7 @@ mod tests {
     use crate::providers::{
         issue_tracker::{tests::assert_provider_contract, IssueProvider},
         replay::{self, Masks},
-        testing::MockRunner,
+        testing::{fixture_path, MockRunner},
         ChannelLabel,
     };
 
@@ -324,7 +324,7 @@ mod tests {
     }
 
     fn fixture(name: &str) -> String {
-        crate::providers::testing::fixture_path("issue_tracker", name)
+        fixture_path("issue_tracker", name)
     }
 
     fn replay_auth() -> ForgejoAuth {

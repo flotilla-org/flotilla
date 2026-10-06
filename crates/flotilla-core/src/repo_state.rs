@@ -6,7 +6,10 @@ use std::{
 
 use flotilla_protocol::EnvironmentId;
 
-use crate::{model::RepoModel, providers::discovery::UnmetRequirement};
+use crate::{
+    model::RepoModel,
+    providers::{discovery::UnmetRequirement, registry::ProviderRegistry},
+};
 
 pub(crate) struct RepoRootState {
     pub(crate) path: PathBuf,
@@ -36,7 +39,7 @@ impl RepoState {
     pub(crate) fn preferred_environment_id(&self) -> Option<&EnvironmentId> {
         self.preferred_root().model.environment_id.as_ref()
     }
-    pub(crate) fn registry(&self) -> Arc<crate::providers::registry::ProviderRegistry> {
+    pub(crate) fn registry(&self) -> Arc<ProviderRegistry> {
         Arc::clone(&self.preferred_root().model.registry)
     }
     pub(crate) fn slug(&self) -> Option<&str> {
