@@ -14,10 +14,14 @@ RUN_MACROS = {"run", "run_output"}
 VCS = "crates/flotilla-core/src/"
 
 
-def exempt(path):
+def integration_test_path(path):
     parts = Path(path).parts
+    return bool(parts) and (parts[0] == "tests" or (len(parts) >= 4 and parts[0] == "crates" and parts[2] == "tests"))
+
+
+def exempt(path, production=False):
     return (
-        "tests" in parts
+        (integration_test_path(path) and not production)
         or Path(path).name == "build.rs"
         or path == "crates/build_identity.rs"
         or path == VCS + "vcs.rs"
@@ -117,6 +121,7 @@ def raw_git(node):
 def test_modules(source, path, production=False):
     """Resolve out-of-line cfg(test) modules, including arbitrarily named ones."""
     root = SgRoot(source, "rust").root()
+    file = Path(path)
     result = set()
 
     def visit(node, directory, inherited_test=False, path_directory=None):
@@ -150,14 +155,13 @@ def test_modules(source, path, production=False):
             skip = False
             override = None
 
-    file = Path(path)
     directory = file.parent if file.stem in {"lib", "main", "mod"} else file.parent / file.stem
     visit(root, directory)
     return result
 
 
-def violations(source, path):
-    if exempt(path):
+def violations(source, path, production=False):
+    if exempt(path, production):
         return []
     root = SgRoot(source, "rust").root()
     found = []
@@ -191,18 +195,33 @@ def module_descendant(file, modules):
 
 
 def scan_sources(sources):
+    for file, source in sources.items():
+        errors = SgRoot(source, "rust").root().find_all(kind="ERROR")
+        if errors:
+            line = errors[0].range().start.line + 1
+            raise ValueError(f"{file}:{line}: Rust parse error; refusing an incomplete Git boundary check")
     excluded = set()
     for file, source in sources.items():
         excluded.update(test_modules(source, file))
     # Only references from production sources can make a shared module production.
     # A test-only module's unannotated children remain test-only themselves.
     production = set()
-    for file, source in sources.items():
-        if file not in excluded and not module_descendant(file, excluded):
-            production.update(test_modules(source, file, production=True))
+    pending = [
+        file for file in sources
+        if not integration_test_path(file) and file not in excluded and not module_descendant(file, excluded)
+    ]
+    visited = set()
+    while pending:
+        file = pending.pop()
+        if file in visited:
+            continue
+        visited.add(file)
+        references = test_modules(sources[file], file, production=True)
+        production.update(references)
+        pending.extend(reference for reference in references if reference in sources and reference not in visited)
     excluded.difference_update(production)
     return {
-        file: violations(source, file)
+        file: violations(source, file, production=file in production)
         for file, source in sources.items()
         if file in production or not (file in excluded or module_descendant(file, excluded))
     }
@@ -215,7 +234,12 @@ def main():
     files = subprocess.check_output(["git", "ls-files", "-z", "--", "*.rs"], cwd=args.root).decode().split("\0")
     sources = {file: (args.root / file).read_text() for file in filter(None, files) if (args.root / file).exists()}
     failed = False
-    for file, lines in scan_sources(sources).items():
+    try:
+        results = scan_sources(sources)
+    except ValueError as error:
+        print(error)
+        return 1
+    for file, lines in results.items():
         for line in lines:
             print(f"{file}:{line}: invoke Git through the checkout-scoped Vcs trait instead of a raw command")
             failed = True

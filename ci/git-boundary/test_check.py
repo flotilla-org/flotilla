@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import tomllib
 
 spec = importlib.util.spec_from_file_location("git_boundary", Path(__file__).with_name("check.py"))
 check = importlib.util.module_from_spec(spec)
@@ -45,7 +46,7 @@ class GitBoundaryTests(unittest.TestCase):
                      check.VCS + 'providers/vcs/git.rs', check.VCS + 'providers/discovery/test_support.rs']:
             self.assertEqual(check.violations(source, path), [])
         for path in ['src/build.rs.bak', 'src/tests_like.rs', check.VCS + 'vcs_extra.rs',
-                     check.VCS + 'providers/vcs_extra/git.rs', 'crates/other/src/vcs.rs']:
+                     check.VCS + 'providers/vcs_extra/git.rs', 'crates/other/src/vcs.rs', 'src/tests/fixture.rs', 'crates/a/src/tests/fixture.rs']:
             self.assertEqual(check.violations(source, path), [1])
 
     # Only code known to be disabled with cfg(test)=false is exempt; cfg(any)
@@ -87,6 +88,48 @@ class GitBoundaryTests(unittest.TestCase):
         self.assertEqual(check.scan_sources(sources), {'src/lib.rs': [], 'src/prod.rs': [1]})
         sources['src/lib.rs'] += '\n#[path = "fixtures.rs"] mod production;'
         self.assertEqual(check.scan_sources(sources)['src/fixtures.rs'], [1])
+
+
+    # A production module remains checked even when imported from Cargo's
+    # integration-test directory; merely naming a directory tests is no exemption.
+    def test_production_test_directories(self):
+        call = 'fn a() { Command::new("git"); }'
+        sources = {'src/lib.rs': 'mod tests { mod fixture; }', 'src/tests/fixture.rs': call}
+        self.assertEqual(check.scan_sources(sources)['src/tests/fixture.rs'], [1])
+        sources = {'crates/a/src/lib.rs': '#[path = "../tests/fixture.rs"] mod fixture;',
+                   'crates/a/tests/fixture.rs': call}
+        self.assertEqual(check.scan_sources(sources)['crates/a/tests/fixture.rs'], [1])
+        sources['crates/a/tests/fixture.rs'] += '\nmod helper;'
+        sources['crates/a/tests/fixture/helper.rs'] = call
+        self.assertEqual(check.scan_sources(sources)['crates/a/tests/fixture/helper.rs'], [1])
+        self.assertEqual(check.scan_sources({'crates/a/tests/fixture.rs': call}), {'crates/a/tests/fixture.rs': []})
+        sources = {'crates/a/tests/integration/main.rs': 'mod fixture;',
+                   'crates/a/tests/integration/fixture.rs': call}
+        self.assertEqual(check.scan_sources(sources)['crates/a/tests/integration/fixture.rs'], [])
+
+    # Incomplete parses fail the scan, including exempt files: an ERROR node
+    # must never silently suppress a Git violation.
+    def test_parse_errors_rejected(self):
+        for path in ['src/lib.rs', 'crates/a/tests/fixture.rs']:
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, 'Rust parse error'):
+                check.scan_sources({path: 'fn broken() { @@@ Command::new("git"); }'})
+
+    # Ordinary identifiers named raw are valid Rust, not parser errors. The
+    # parser upgrade preserves this syntax while retaining fail-closed scanning.
+    def test_raw_identifier(self):
+        source = 'fn a() { let raw = "git"; consume(&raw); runner.run("git", args); }'
+        self.assertEqual(check.scan_sources({'src/lib.rs': source}), {'src/lib.rs': [1]})
+
+    # Every workspace member must opt into the shared lint or the Clippy gate
+    # would silently stop enforcing the crate-relative path rule for that member.
+    def test_workspace_lint_inheritance(self):
+        root = Path(__file__).resolve().parents[2]
+        manifest = tomllib.loads((root / 'Cargo.toml').read_text())
+        self.assertEqual(manifest['workspace']['lints']['clippy']['absolute_paths'], 'warn')
+        for directory in ['.'] + manifest['workspace']['members']:
+            with self.subTest(directory=directory):
+                package = tomllib.loads((root / directory / 'Cargo.toml').read_text())
+                self.assertIs(package['lints']['workspace'], True)
 
 
 if __name__ == '__main__':

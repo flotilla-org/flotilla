@@ -24,6 +24,8 @@ resolver = "2"
 [workspace.package]
 license = "Apache-2.0 OR MIT"
 
+# When adding dependencies anywhere in the workspace, update the external-crate
+# allowlist in clippy.toml (use the library crate name, including any rename).
 [workspace.dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 serde = { version = "1", features = ["derive"] }
@@ -49,6 +51,7 @@ license.workspace = true
 default = []
 aws-lc-provider = ["flotilla-core/aws-lc-provider", "flotilla-daemon/aws-lc-provider"]
 
+# New external crates also belong in clippy.toml's absolute-paths-allowed-crates.
 [dependencies]
 flotilla-client = { path = "crates/flotilla-client" }
 flotilla-commands = { path = "crates/flotilla-commands" }
