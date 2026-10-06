@@ -25,3 +25,6 @@ pub use terminal_session::{
 };
 pub use vessel::{checkout_path_component, VesselPrepared, VesselReconciler};
 pub use vessel_placement::{VesselPlacementProjector, VesselPlacementSync};
+
+pub mod image_build;
+pub use image_build::{ImageBuildReconciler, ImageBuildResult, ImageBuildRunner};

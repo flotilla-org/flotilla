@@ -30,6 +30,13 @@ pub struct HostDirectEnvironmentSpec {
 pub struct DockerEnvironmentSpec {
     pub host_ref: String,
     pub image: String,
+    /// ADR 0047: remove decoder default one roll after build references land.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_build_ref: Option<String>,
+    /// ADR 0047: previous-generation Environments omit frozen compositions;
+    /// remove this decoder default after one roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_composition: Option<Box<crate::ImageComposition>>,
     /// Agent adapters the placement policy expects discovery to find in the image.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub declared_agent_adapters: BTreeSet<String>,
@@ -65,6 +72,7 @@ pub enum EnvironmentMountMode {
 pub enum EnvironmentPhase {
     #[default]
     Pending,
+    Provisioning,
     Ready,
     Terminating,
     Failed,
@@ -72,6 +80,9 @@ pub enum EnvironmentPhase {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentStatus {
+    /// ADR 0047: remove default one roll after staged build progress lands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_build_refs: Vec<String>,
     /// Configured limits, not usage. Remove the decoder default one fleet roll
     /// after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,6 +123,10 @@ pub enum EnvironmentStatusPatch {
         local_image_id: Option<String>,
         registry_digest: Option<String>,
     },
+    WaitForImageBuild {
+        message: String,
+        build_refs: Vec<String>,
+    },
     MarkFailed {
         message: String,
     },
@@ -139,6 +154,12 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
                 status.local_image_id = local_image_id.clone();
                 status.registry_digest = registry_digest.clone();
                 status.message = None;
+            }
+            Self::WaitForImageBuild { message, build_refs } => {
+                status.image_build_refs = build_refs.clone();
+                status.phase = EnvironmentPhase::Provisioning;
+                status.ready = false;
+                status.message = Some(message.clone());
             }
             Self::MarkFailed { message } => {
                 status.phase = EnvironmentPhase::Failed;

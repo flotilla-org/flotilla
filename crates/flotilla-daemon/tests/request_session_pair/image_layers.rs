@@ -1,9 +1,22 @@
+use flotilla_core::image_build::{ImageBuildInputResolver, ImageBuildSourceInputs};
 use flotilla_resources::{
-    CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, FrozenImageLayers, ImageLayer, ImageLayerParent, ImageLayerSelection,
-    ImageLayerSpec, ImageLayerStage, IMAGE_LAYERS_ANNOTATION,
+    CrewImageBaseline, CrewImageBaselineSpec, DockerImageSource, FrozenImageLayer, FrozenImageLayers, ImageBuild, ImageComposition,
+    ImageInputStability, ImageLayer, ImageLayerParent, ImageLayerSelection, ImageLayerSpec, ImageLayerStage, IMAGE_LAYERS_ANNOTATION,
 };
 
 use super::*;
+
+struct BuildInputs;
+#[async_trait::async_trait]
+impl ImageBuildInputResolver for BuildInputs {
+    async fn resolve(&self, _layer: &FrozenImageLayer, architecture: &str) -> Result<ImageBuildSourceInputs, String> {
+        Ok(ImageBuildSourceInputs::builder()
+            .architecture(architecture.into())
+            .content_hashes(vec![format!("sha256:{}", "2".repeat(64))])
+            .stability(ImageInputStability::Pinned)
+            .build())
+    }
+}
 
 fn layer(stage: ImageLayerStage, provides: &[&str]) -> ImageLayerSpec {
     ImageLayerSpec::builder()
@@ -21,10 +34,10 @@ fn layer(stage: ImageLayerStage, provides: &[&str]) -> ImageLayerSpec {
         .build()
 }
 
-// Behaviour (#2727): automatic routing can select a layered baseline before
-// admission freezes it. Admission belongs to the selected host, freezes the
-// canonical composition, and retains the generation-1 running baseline.
-async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool) {
+// Behaviour (#2727/#2728): routing freezes baseline or explicit composition
+// on the selected host. Two admitted convoys share a pinned execution; the
+// generation-1 baseline remains authoritative during the transition.
+async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: bool) {
     let hosts = vec![empty_daemon_named("image-home").await, empty_daemon_named("image-issuer").await];
     let home = Arc::clone(&hosts[0]);
     seed_host_capacity(&home, 100 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024).await;
@@ -33,6 +46,14 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool) {
     let backend = home.resource_backend();
     let host = backend.using::<Host>("flotilla").get(&host_id).await.expect("host");
     let mut status = host.status.expect("status");
+    status.description = Some(
+        flotilla_protocol::HostSummary::builder()
+            .environment_id(flotilla_protocol::EnvironmentId::new(&host_id))
+            .node(flotilla_protocol::NodeInfo::new(flotilla_protocol::NodeId::new(&host_id), host_id.clone()))
+            .system(flotilla_protocol::SystemInfo { arch: Some("x86_64".into()), ..Default::default() })
+            .build(),
+    );
+    home.set_image_build_input_resolver(Arc::new(BuildInputs)).await;
     status.capabilities.insert("docker".into(), serde_json::json!(true));
     status.capabilities.insert("os".into(), serde_json::json!("linux"));
     backend.using::<Host>("flotilla").update_status(&host_id, &host.metadata.resource_version, &status).await.expect("Docker capacity");
@@ -40,7 +61,25 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool) {
         .pool("cleat".into())
         .docker_per_vessel(DockerPerVesselPlacementPolicySpec {
             host_ref: host_id.clone(),
-            image: DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() },
+            image: if build {
+                DockerImageSource::Composition {
+                    composition: Box::new(
+                        ImageComposition::builder()
+                            .selection(ImageLayerSelection::builder().base("base".into()).harness("harness".into()).build())
+                            .needs(BTreeSet::new())
+                            .layers(vec![
+                                FrozenImageLayer { name: "base".into(), spec: layer(ImageLayerStage::Base, &["os:debian-family"]) },
+                                FrozenImageLayer {
+                                    name: "harness".into(),
+                                    spec: layer(ImageLayerStage::Harness, &["harness:codex@0.160.0"]),
+                                },
+                            ])
+                            .build(),
+                    ),
+                }
+            } else {
+                DockerImageSource::Baseline { image_baseline_ref: "fleet-crew".into() }
+            },
             pull_policy: Default::default(),
             memory_policy: Default::default(),
             agent_adapters: BTreeSet::from(["codex".into()]),
@@ -128,14 +167,40 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool) {
         serde_json::from_str(convoys[0].metadata.annotations.get(IMAGE_LAYERS_ANNOTATION).expect("frozen layer record"))
             .expect("decode layers");
     assert_eq!(frozen.layers.keys().map(String::as_str).collect::<Vec<_>>(), ["base", "display", "harness"]);
-    assert_eq!(frozen.baseline_image.as_deref(), Some("crew:authoritative"));
+    if build {
+        assert_eq!(frozen.baseline_image, None);
+        let builds = backend.using::<ImageBuild>("flotilla").list().await.expect("joined builds").items;
+        assert_eq!(builds.len(), 1, "admission joins the first stage before accepting the convoy");
+        assert_eq!(builds[0].spec.host_ref, host_id);
+        let second = CommandAction::ConvoyStart {
+            intent: Box::new(
+                ConvoyStartIntent::builder()
+                    .project_ref("flotilla".into())
+                    .name("layered-work-second".into())
+                    .branch("test/layered-work-second".into())
+                    .needs(vec![need.into()])
+                    .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                    .build(),
+            ),
+        };
+        let command_id = mesh.clients[issuer].execute(Command::builder().action(second).build()).await.expect("second admission");
+        assert!(matches!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted { .. }));
+        assert_eq!(backend.using::<Convoy>("flotilla").list().await.expect("both admitted").items.len(), 2);
+        assert_eq!(backend.using::<ImageBuild>("flotilla").list().await.expect("shared execution").items.len(), 1);
+
+        assert!(mesh.hosts[1].resource_backend().using::<ImageBuild>("flotilla").list().await.expect("issuer builds").items.is_empty());
+    } else {
+        assert_eq!(frozen.baseline_image.as_deref(), Some("crew:authoritative"));
+    }
     assert!(mesh.hosts[1].resource_backend().using::<Convoy>("flotilla").list().await.expect("issuer authored convoys").items.is_empty());
 }
 
 #[tokio::test]
 async fn layered_baseline_routing_pinned_rows() {
-    for (issuer, satisfiable) in [(1, true), (0, true), (1, false)] {
-        layered_baseline_routing_row(issuer, satisfiable).await;
+    for (issuer, satisfiable, build) in
+        [(1, true, false), (0, true, false), (1, false, false), (1, true, true), (0, true, true), (1, false, true)]
+    {
+        layered_baseline_routing_row(issuer, satisfiable, build).await;
     }
 }
 
@@ -144,10 +209,11 @@ fn generated_layered_baseline_routing(tc: hegel::TestCase) {
     // Both issuer locations and satisfiable/unsatisfiable catalogue needs.
     let issuer = tc.draw(gs::integers::<usize>().min_value(0).max_value(1));
     let satisfiable = tc.draw(gs::booleans());
+    let build = tc.draw(gs::booleans());
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .start_paused(true)
         .build()
         .expect("runtime")
-        .block_on(layered_baseline_routing_row(issuer, satisfiable));
+        .block_on(layered_baseline_routing_row(issuer, satisfiable, build));
 }

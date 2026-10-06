@@ -601,6 +601,8 @@ async fn environment_controller_marks_docker_environment_ready() {
         .create(&controller_meta().name("docker-env").call(), &EnvironmentSpec {
             host_direct: None,
             docker: Some(DockerEnvironmentSpec {
+                image_composition: None,
+                image_build_ref: None,
                 memory_policy: Default::default(),
                 host_ref: "01HXYZ".to_string(),
                 image: "ghcr.io/flotilla/dev:latest".to_string(),

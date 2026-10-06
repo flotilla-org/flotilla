@@ -828,6 +828,28 @@ impl DaemonRuntime {
         if options.start_controllers {
             let local_repo_root =
                 phase("tracked_repo_paths", daemon.tracked_repo_paths()).await.into_iter().next().map(ExecutionEnvironmentPath::new);
+            let image_build_runner = {
+                use flotilla_core::{
+                    providers::vcs::git_worktree::GitWorktreeStrategy,
+                    vcs::{FlotillaVcs, GitCheckoutStrategy},
+                };
+                let runner = daemon.local_command_runner().ok_or("image build command runner unavailable")?;
+                let directory = config.state_dir().as_path().join("image-builds");
+                let vcs = Arc::new(FlotillaVcs::new(
+                    ExecutionEnvironmentPath::new(&directory),
+                    Arc::clone(&runner),
+                    GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), Arc::clone(&runner)))),
+                ));
+                Arc::new(crate::image_build::BuildxRunner {
+                    runner,
+                    vcs,
+                    directory,
+                    backend: daemon.resource_backend(),
+                    namespace: options.namespace.clone(),
+                    blobs: Arc::clone(&blob_store),
+                })
+            };
+            daemon.set_image_build_input_resolver(image_build_runner.clone()).await;
             let state = Arc::new(
                 ControllerRuntimeState::new(
                     Arc::clone(&daemon),
@@ -843,7 +865,8 @@ impl DaemonRuntime {
                 .with_agentless_ssh(ssh_profiles.clone())
                 .with_credential_store(Arc::clone(&credential_store))
                 .with_agent_material(agent_material)
-                .with_blob_store(Arc::clone(&blob_store)),
+                .with_blob_store(Arc::clone(&blob_store))
+                .with_image_build_runner(image_build_runner),
             );
             phase(
                 "set_operator_reconciler",
@@ -1483,6 +1506,7 @@ struct ControllerRuntimeState {
     credential_store: Option<Arc<CredentialStore>>,
     agent_material: Option<Arc<AgentMaterialRegistry>>,
     blob_store: Option<Arc<TieredBlobStore>>,
+    image_build_runner: Option<Arc<crate::image_build::BuildxRunner>>,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     /// Latched after one complete post-startup local Docker adoption pass.
     /// A fresh provider listing is still required for each absence judgement.
@@ -1617,6 +1641,7 @@ impl ControllerRuntimeState {
             credential_store: None,
             agent_material: None,
             blob_store: None,
+            image_build_runner: None,
             provisioned_environments: Mutex::new(HashMap::new()),
             local_backing_observed: AtomicBool::new(false),
             clone_flights: Arc::new(CloneFlights::default()),
@@ -1686,6 +1711,11 @@ impl ControllerRuntimeState {
 
     fn with_agent_material(mut self, agent_material: Arc<AgentMaterialRegistry>) -> Self {
         self.agent_material = Some(agent_material);
+        self
+    }
+
+    fn with_image_build_runner(mut self, runner: Arc<crate::image_build::BuildxRunner>) -> Self {
+        self.image_build_runner = Some(runner);
         self
     }
 
@@ -2613,6 +2643,7 @@ async fn ensure_host_exists(backend: &ResourceBackend, namespace: &str, host_nam
                     display_name: display_name.to_string(),
                     connection: Default::default(),
                     expected_concurrent_rust_crews: existing.spec.expected_concurrent_rust_crews,
+                    image_build_capacity: existing.spec.image_build_capacity.clone(),
                 })
                 .await
                 .map(|_| ())
@@ -3930,6 +3961,27 @@ async fn apply_host_heartbeat_with_credentials(
     let admission_free_space_floor_bytes = daemon.admission_free_space_floor_bytes()?;
     migrate_live_placement_policies(&backend, namespace, &profile.host_id, std::env::consts::OS).await?;
     let mut conditions = runtime_health.conditions().await;
+    let build_records = backend.using::<flotilla_resources::ImageBuild>(namespace).list().await.map_err(|error| error.to_string())?;
+    for build in &build_records.items {
+        if build.spec.host_ref == profile.host_id
+            && build.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ImageBuildPhase::Failed)
+            && !build_records.items.iter().any(|next| next.spec.previous_build_ref.as_deref() == Some(build.metadata.name.as_str()))
+        {
+            let reason =
+                build.status.as_ref().and_then(|status| status.failure.as_ref()).map(|failure| failure.reason.clone()).unwrap_or_default();
+            conditions.push(
+                HostCondition::builder()
+                    .condition_type(format!("ImageBuild/{}", build.metadata.name))
+                    .value(ConditionValue::False)
+                    .reason("ImageBuildFailed")
+                    .message(reason)
+                    .observed_at(Utc::now())
+                    .blocks_readiness(false)
+                    .build(),
+            );
+        }
+    }
+
     conditions.extend(file_descriptor_pressure_condition());
     if let Some(condition) = daemon.cleat_build_skew_condition().await {
         conditions.push(condition);
@@ -4302,7 +4354,7 @@ fn spawn_controller_loops(
         .await;
     });
 
-    vec![
+    let mut controllers = vec![
         gc,
         spawn_vessel_placement_projector(
             backend.clone(),
@@ -4330,10 +4382,13 @@ fn spawn_controller_loops(
             move |backend: ResourceBackend, namespace_string: String| {
                 let local_host_ref = state.local_host_ref.clone();
                 let additional_host_refs = state.agentless_host_refs();
+                let image_inputs =
+                    state.image_build_runner.clone().map(|runner| runner as Arc<dyn flotilla_core::image_build::ImageBuildInputResolver>);
                 let state = Arc::clone(&state);
                 (
                     vec![],
                     EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, &namespace_string)
+                        .with_image_build_inputs(image_inputs)
                         .with_local_host_ref(CanonicalHostId::resolved(local_host_ref))
                         .with_additional_host_refs(additional_host_refs),
                 )
@@ -4469,7 +4524,38 @@ fn spawn_controller_loops(
                 )
             }
         }),
-    ]
+    ];
+    if let Some(runner) = &state.image_build_runner {
+        let projection_backend = backend.clone();
+        let projection_namespace = namespace_string.clone();
+        let projection_host = state.local_host_ref.clone();
+        let projection_supervision = supervision.clone();
+        let projection_health = runtime_health.clone();
+        controllers.push(tokio::spawn(async move {
+            supervise_controller("image_build_placement", projection_supervision, projection_health, move || {
+                let backend = projection_backend.clone();
+                let namespace = projection_namespace.clone();
+                let host = projection_host.clone();
+                async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(1));
+                    loop {
+                        interval.tick().await;
+                        crate::image_build::project_builds(&backend, &namespace, &host).await?;
+                    }
+                    #[allow(unreachable_code)]
+                    Ok(())
+                }
+            })
+            .await;
+        }));
+
+        let runner = Arc::clone(runner);
+        let host = state.local_host_ref.clone();
+        controllers.push(controller!(flotilla_resources::ImageBuild, move |backend: ResourceBackend, namespace_string: String| {
+            (vec![], flotilla_controllers::reconcilers::ImageBuildReconciler::new(Arc::clone(&runner), backend, &namespace_string, &host))
+        }));
+    }
+    controllers
 }
 
 /// A long reconcile also stalls other names, so it counts as missing loop progress.
@@ -7260,6 +7346,8 @@ mod tests {
         let repository = flotilla_resources::RepositoryKey("github.com-flotilla-org-flotilla".to_string());
         let expected = BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository]))]);
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: "host-a".to_string(),
             image: "crew:latest".to_string(),
@@ -8943,6 +9031,8 @@ mod tests {
             .with_environment_tools(with_fourth_tool(fixed_environment_tools(config.state_dir().as_path().to_path_buf()))),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
@@ -9048,6 +9138,8 @@ mod tests {
             )),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
@@ -9183,6 +9275,8 @@ mod tests {
         );
         let credential_refs = BTreeSet::from(["claude-max".to_string(), "github-crew-pr".to_string()]);
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
@@ -9268,6 +9362,8 @@ mod tests {
             .with_agent_material(agent_material),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
@@ -9359,6 +9455,8 @@ mod tests {
                 .create(&empty_meta(name), &EnvironmentSpec {
                     host_direct: None,
                     docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                        image_composition: None,
+                        image_build_ref: None,
                         memory_policy: Default::default(),
                         host_ref: "host-test".to_string(),
                         image: "test".to_string(),
@@ -9465,6 +9563,8 @@ mod tests {
             .with_agent_material(agent_material),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
@@ -9550,6 +9650,8 @@ mod tests {
             .with_agent_material(agent_material),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "registry.example/crew:latest".to_string(),
@@ -9651,6 +9753,8 @@ mod tests {
                 state.with_credential_store(credential_store)
             });
             let spec = flotilla_resources::DockerEnvironmentSpec {
+                image_composition: None,
+                image_build_ref: None,
                 memory_policy: Default::default(),
                 host_ref: "host-test".to_string(),
                 image: "registry.example/crew:latest".to_string(),
@@ -9895,6 +9999,8 @@ mod tests {
                 &flotilla_resources::EnvironmentSpec {
                     host_direct: None,
                     docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                        image_composition: None,
+                        image_build_ref: None,
                         memory_policy: Default::default(),
                         host_ref: "host-test".to_string(),
                         image: "contained-image".to_string(),
@@ -9976,6 +10082,8 @@ mod tests {
             "host-direct-host-test".to_string(),
         ));
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
@@ -10027,6 +10135,8 @@ mod tests {
             .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf())),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
@@ -10050,6 +10160,8 @@ mod tests {
         assert!(provider.create_opts.lock().await.is_none(), "reserved mount collisions should fail before invoking the provider");
 
         let cli_collision_spec = flotilla_resources::DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
             memory_policy: Default::default(),
             mounts: vec![flotilla_resources::EnvironmentMount {
                 source_path: "/host/replacement-flotilla".to_string(),
@@ -11763,6 +11875,8 @@ mod tests {
         assert!(registered.agent_adapters.get("claude-code").is_some());
 
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
@@ -11788,6 +11902,8 @@ mod tests {
             .create(&empty_meta(name), &EnvironmentSpec {
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    image_composition: None,
+                    image_build_ref: None,
                     memory_policy: Default::default(),
                     host_ref,
                     image: "contained-image".to_string(),
@@ -12542,6 +12658,8 @@ mod tests {
             .create(&empty_meta(orphaned_id.as_str()), &EnvironmentSpec {
                 host_direct: None,
                 docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    image_composition: None,
+                    image_build_ref: None,
                     memory_policy: Default::default(),
                     host_ref: "deleted-host".to_string(),
                     image: "contained-image".to_string(),
@@ -12679,6 +12797,8 @@ mod tests {
             .with_environment_tools(fixed_environment_tools(config.state_dir().as_path().to_path_buf())),
         );
         let spec = flotilla_resources::DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: "host-test".to_string(),
             image: "contained-image".to_string(),
@@ -16169,6 +16289,8 @@ mod tests {
                 .create(&empty_meta(env_id.as_str()), &EnvironmentSpec {
                     host_direct: None,
                     docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                        image_composition: None,
+                        image_build_ref: None,
                         memory_policy: Default::default(),
                         host_ref: "host-test".into(),
                         image: "contained-image".into(),
