@@ -968,7 +968,11 @@ grep -Fq "generation $generation_two failed health confirmation; rolled back to 
 assert_darwin_tcc_payload "$generation_one"
 : >"$test_root/codesign.log"
 : >"$test_root/launchctl.log"
+# Refresh must prune obsolete libraries and recursively copy nested payloads.
+mkdir -p "$darwin_home/.local/opt/flotilla-fleet/tcc/lib/nested"
+printf stale >"$darwin_home/.local/opt/flotilla-fleet/tcc/lib/nested/obsolete.dylib"
 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-install.out"
+test ! -e "$darwin_home/.local/opt/flotilla-fleet/tcc/lib/nested/obsolete.dylib" || fail 'obsolete TCC library survived refresh'
 assert_darwin_tcc_payload "$generation_two"
 test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$generation_two" \
   || fail 'signed Darwin generation was not selected'
@@ -1030,6 +1034,7 @@ test "$(grep -Ec '^kickstart -k gui/[0-9]+/work\.flotilla\.flotillad\|' "$test_r
 
 : >"$test_root/launchctl.log"
 LAUNCHD_AGENT_DISABLED=true run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-dev-mode-install.out"
+assert_darwin_tcc_payload "$generation_two"
 grep -Fq 'preserving flotillad dev mode' "$test_root/darwin-dev-mode-install.out" \
   || fail 'Darwin install did not report preserved dev mode'
 if grep -Eq '^(enable|bootstrap|kickstart) ' "$test_root/launchctl.log"; then
@@ -1148,5 +1153,28 @@ grep -Fq 'fleet prune --fleet-root ' "$prune_log" || fail 'prune did not delegat
 grep -Fq -- '--keep-others 0' "$prune_log" || fail 'prune lost retention argument'
 grep -Fq -- '--keep-others 9 --dry-run' "$prune_log" || fail 'dry-run lost arguments'
 grep -Fq '/current/bin/flotilla|' "$prune_log" || fail 'prune did not use active binary'
+
+# Exercise the production copy boundary with a nested library and stale payload.
+python3 - "$installer" <<'PYTHON'
+from pathlib import Path
+import sys
+import tempfile
+script = Path(sys.argv[1]).read_text()
+marker = "python3 - \"$CURRENT_LINK\" \"$DARWIN_TCC_ROOT\" <<'PYTHON'\n"
+body = script.split(marker, 1)[1].split('\nPYTHON', 1)[0]
+with tempfile.TemporaryDirectory() as root:
+    source, destination = Path(root) / "source", Path(root) / "destination"
+    (source / "bin").mkdir(parents=True)
+    for name in ("flotilla", "flotillad", "cleat"):
+        (source / "bin" / name).write_text(name)
+    (source / "lib" / "nested").mkdir(parents=True)
+    (source / "lib" / "nested" / "data").write_text("nested")
+    (destination / "lib").mkdir(parents=True)
+    (destination / "lib" / "obsolete").write_text("stale")
+    sys.argv = ["refresh", str(source), str(destination)]
+    exec(compile(body, "fleet-install copy boundary", "exec"))
+    assert (destination / "lib" / "nested" / "data").read_text() == "nested"
+    assert not (destination / "lib" / "obsolete").exists()
+PYTHON
 
 echo 'fleet-install contract passed'

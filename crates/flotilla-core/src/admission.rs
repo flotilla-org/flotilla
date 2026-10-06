@@ -111,8 +111,8 @@ mod tests {
     #[cfg(unix)]
     #[hegel::test]
     fn space_probe_touches_only_target_ancestors(tc: hegel::TestCase) {
-        let depth = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(8));
-        for depth in [0, 1, 8, depth] {
+        let drawn_depth = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(8));
+        for depth in [0, 1, 8, drawn_depth] {
             let mut path = std::path::PathBuf::from("/workspace");
             for _ in 0..depth {
                 path.push("new");

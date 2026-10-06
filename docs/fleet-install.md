@@ -47,7 +47,9 @@ gate for those locations; no extra blanket protected-directory probe is added.
 Filesystem probes run in blocking tasks with a five-second caller deadline.
 At most eight such probes can remain outstanding, including timed-out OS calls;
 a pending TCC prompt cannot exhaust the async workers or accumulate an unlimited
-retry queue. Discovery bounds each detector/factory independently and retains
+retry queue. This capacity is shared by filesystem callers; saturation makes
+new probes fail immediately with a distinct capacity-exhausted error, including
+git guards and path resolution, until an outstanding OS call completes. Discovery bounds each detector/factory independently and retains
 other capabilities. Subprocess discovery deadlines kill their process groups.
 A timed-out OS filesystem call itself cannot be cancelled: answering the prompt
 releases its blocking task and capacity. A failed space probe publishes unknown

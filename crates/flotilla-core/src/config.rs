@@ -723,7 +723,6 @@ impl ConfigStore {
         }
     }
 
-    /// Load global flotilla config (cached for the lifetime of the store).
     /// Discovery must not synchronously read a configurable host path on a
     /// runtime worker. Populate the same cache as the synchronous UI API.
     pub async fn load_config_for_probe(&self) -> Result<FlotillaConfig, String> {
@@ -733,9 +732,15 @@ impl ConfigStore {
         let path = self.base.join("config.toml");
         let loaded = crate::probe::blocking("discovery config", crate::probe::PROBE_TIMEOUT, move || {
             match std::fs::read_to_string(path.as_path()) {
-                Ok(contents) => toml::from_str(&contents).map_err(|error| format!("parse {path}: {error}")),
+                Ok(contents) => Ok(toml::from_str(&contents).unwrap_or_else(|error| {
+                    tracing::warn!(%path, err = %error, "failed to parse config; using defaults");
+                    FlotillaConfig::default()
+                })),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FlotillaConfig::default()),
-                Err(error) => Err(format!("read {path}: {error}")),
+                Err(error) => {
+                    tracing::warn!(%path, err = %error, "failed to read config; using defaults");
+                    Ok(FlotillaConfig::default())
+                }
             }
         })
         .await?;
@@ -743,6 +748,7 @@ impl ConfigStore {
         Ok(cached.lock().expect("config cache mutex poisoned").clone())
     }
 
+    /// Load global flotilla config (cached for the lifetime of the store).
     pub fn load_config(&self) -> FlotillaConfig {
         self.global_config
             .get_or_init(|| {

@@ -589,11 +589,28 @@ impl CommandRunner for ProcessCommandRunner {
     }
 
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
-        tokio::time::timeout(crate::probe::PROBE_TIMEOUT, Self::command_output(cmd, args, Path::new("/")))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .is_some_and(|output| output.status.success())
+        tokio::time::timeout(crate::probe::PROBE_TIMEOUT, async {
+            let mut child = Self::checked_command(cmd, args, Path::new("/"))
+                .await?
+                .kill_on_drop(true)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            let mut guard = ProcessGroupGuard::for_child(&child)?;
+            let status = child.wait().await.map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            {
+                guard.0 = 0;
+            }
+            Ok::<_, String>(status.success())
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(false)
     }
 
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {

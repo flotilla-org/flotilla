@@ -16,8 +16,18 @@ pub async fn blocking<T: Send + 'static>(
 ) -> Result<T, String> {
     static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
     let slots = SLOTS.get_or_init(|| Arc::new(Semaphore::new(8)));
+    blocking_with_slots(name, timeout, probe, Arc::clone(slots)).await
+}
+
+async fn blocking_with_slots<T: Send + 'static>(
+    name: &'static str,
+    timeout: Duration,
+    probe: impl FnOnce() -> Result<T, String> + Send + 'static,
+    slots: Arc<Semaphore>,
+) -> Result<T, String> {
+    // Fail immediately rather than queue unrelated work behind pending prompts.
+    let permit = slots.try_acquire_owned().map_err(|_| format!("{name} probe capacity exhausted"))?;
     tokio::time::timeout(timeout, async {
-        let permit = Arc::clone(slots).acquire_owned().await.map_err(|error| error.to_string())?;
         tokio::task::spawn_blocking(move || {
             // Retain the slot even if the caller times out. Blocking OS calls
             // cannot be cancelled; bounded capacity prevents retry storms.
@@ -42,6 +52,25 @@ pub async fn canonicalize(path: &std::path::Path) -> Result<std::path::PathBuf, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Saturated OS capacity fails promptly and never invokes a new OS call.
+    #[tokio::test]
+    async fn saturated_capacity_is_distinct_from_os_timeout() {
+        let slots = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&slots).acquire_owned().await.unwrap();
+        let result = blocking_with_slots(
+            "isolated",
+            Duration::from_secs(5),
+            || -> Result<(), String> {
+                panic!("saturated probe must not start");
+            },
+            Arc::clone(&slots),
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "isolated probe capacity exhausted");
+        drop(held);
+        assert_eq!(blocking_with_slots("isolated", Duration::from_secs(1), || Ok(42), slots).await, Ok(42));
+    }
 
     // A TCC-style blocking file read times out while the current-thread runtime
     // continues serving the resource store. Release the OS boundary afterwards

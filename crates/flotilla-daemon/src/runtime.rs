@@ -3057,6 +3057,8 @@ async fn supervise_controller<F, Fut>(
         let result = supervise(name, supervision.clone(), || {
             let run = make_run();
             let health = runtime_health.clone();
+            // Use the supervisor's same healthy duration for alarm recovery.
+            // A run failing before this window leaves the exhaustion alarm set.
             let healthy_after = supervision.success_reset_after;
             async move {
                 tokio::pin!(run);

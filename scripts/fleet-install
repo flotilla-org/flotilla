@@ -594,7 +594,11 @@ import tempfile
 
 source, destination = map(Path, sys.argv[1:])
 files = [Path("bin") / name for name in ("flotilla", "flotillad", "cleat")]
-files += [path.relative_to(source) for path in (source / "lib").glob("*") if path.is_file()]
+files += [path.relative_to(source) for path in (source / "lib").rglob("*") if path.is_file()]
+expected = set(files)
+for stale in (destination / "lib").rglob("*"):
+    if (stale.is_file() or stale.is_symlink()) and stale.relative_to(destination) not in expected:
+        stale.unlink()
 for relative in files:
     target = destination / relative
     target.parent.mkdir(parents=True, exist_ok=True)

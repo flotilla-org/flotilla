@@ -559,3 +559,21 @@ checkout_path = "/tmp/{{ branch }}"
     assert_eq!(config.presentation_manager.preference.backend.as_deref(), Some("zellij"));
     assert_eq!(config.vcs.git.checkout_path, "/tmp/{{ branch }}");
 }
+
+// Malformed or unreadable user config must preserve discovery's defaults.
+#[tokio::test]
+async fn probe_config_errors_use_cached_defaults() {
+    for unreadable in [false, true] {
+        let dir = tempdir().expect("config tempdir");
+        let path = dir.path().join("config.toml");
+        if unreadable {
+            std::fs::create_dir(&path).expect("directory read error");
+        } else {
+            std::fs::write(&path, "[invalid").expect("malformed config");
+        }
+        let store = ConfigStore::with_base(dir.path());
+        let config = store.load_config_for_probe().await.expect("fallback defaults");
+        assert_eq!(toml::to_string(&config).unwrap(), toml::to_string(&FlotillaConfig::default()).unwrap());
+        assert!(store.global_config.get().is_some());
+    }
+}
