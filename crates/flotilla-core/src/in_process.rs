@@ -1398,7 +1398,7 @@ pub struct InProcessDaemon {
     /// Used to inject FLOTILLA_DAEMON_SOCKET into managed terminal sessions.
     daemon_socket_path: RwLock<Option<PathBuf>>,
     resource_backend: ResourceBackend,
-    message_inboxes: Mutex<HashMap<String, flotilla_resources::MessageInbox>>,
+    message_inboxes: Arc<Mutex<HashMap<String, flotilla_resources::MessageInbox>>>,
     clock: Arc<dyn Clock>,
     regard_lifecycle: Arc<RegardLifecycle>,
     observed_resource_backend: ResourceBackend,
@@ -1835,8 +1835,10 @@ impl InProcessDaemon {
                 .provisioning_namespace(Arc::clone(&provisioning_namespace))
                 .build(),
         );
+        let message_inboxes = Arc::new(Mutex::new(HashMap::new()));
         let crew_ops = Arc::new(
             CrewService::builder()
+                .message_inboxes(Arc::clone(&message_inboxes))
                 .resource_backend(resource_backend.clone())
                 .leaf_subscriptions(leaf_subscriptions.clone())
                 .clock(Arc::clone(&clock))
@@ -1904,7 +1906,7 @@ impl InProcessDaemon {
             clock: Arc::clone(&clock),
             regard_lifecycle: Arc::clone(&regard_lifecycle),
             resource_backend: resource_backend.clone(),
-            message_inboxes: Mutex::new(HashMap::new()),
+            message_inboxes,
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
             aggregator_projection_state: aggregator_projection_state.clone(),
@@ -5364,12 +5366,16 @@ impl InProcessDaemon {
         self.crew_ops.reconcile_crew_stalls_once(namespace).await
     }
 
+    pub fn set_resource_intent_publisher(&self, publisher: Weak<dyn crate::leaf_engine::ResourceIntentPublisher>) {
+        self.crew_ops.set_resource_intent_publisher(publisher);
+    }
+
     pub fn set_remote_turn_delivery(&self, delivery: Weak<dyn crate::leaf_engine::RemoteTurnDelivery>) {
         self.crew_ops.set_remote_turn_delivery(delivery)
     }
 
     pub async fn deliver_standing_turn(&self, request: &crate::leaf_engine::TurnDeliveryRequest) -> Result<TurnDeliveryRung, String> {
-        self.crew_ops.deliver_turn(request).await
+        self.crew_ops.deliver_turn(request).await.map(|admission| admission.rung)
     }
 
     pub async fn reconcile_pending_supervisor_turns_once(&self, namespace: &str) -> Result<(), String> {

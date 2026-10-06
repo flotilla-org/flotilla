@@ -1289,3 +1289,37 @@ fn ledger_admission_digest_survives_duplicates_and_resets_for_new_turns(tc: hege
         assert_eq!(status.crew_work["implement"]["coder"].superseded_claims[0].decision_ledger_digest.as_deref(), Some("admitted"));
     }
 }
+
+// Suppression records an episode reference without reopening completed work or
+// changing lifecycle timestamps. The receiver still owns the open expectation.
+#[test]
+fn suppressed_message_admission_does_not_open_another_workflow_turn() {
+    let mut status = settled_convoy_status();
+    status.phase = ConvoyPhase::Landing;
+    let before = status.clone();
+    let episode = TurnDeliveryEpisode {
+        subject_revision: "head".into(),
+        evidence_at: ts(30),
+        judged_claim_at: ts(20),
+        sender: Default::default(),
+        outcome: TurnDeliveryOutcome::MessageAccepted {
+            new_turn: false,
+            message: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "canonical"),
+            rung: TurnDeliveryRung::WarmSession,
+            accepted_at: ts(30),
+        },
+    };
+    let patch = ConvoyStatusPatch::RecordTurnDelivery {
+        source: "review".into(),
+        episode,
+        vessel: "implement".into(),
+        role: "coder".into(),
+        prompt: "suppressed turn".into(),
+    };
+    apply_and_replay(&mut status, &patch);
+    assert_eq!(status.work, before.work);
+    assert_eq!(status.crew_work, before.crew_work);
+    assert_eq!(status.phase, before.phase);
+    assert_eq!(convoy_timestamps(&status), convoy_timestamps(&before));
+    assert_eq!(status.turn_deliveries["review"].episodes.len(), 1);
+}

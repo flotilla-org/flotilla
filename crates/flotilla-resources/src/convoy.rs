@@ -1208,6 +1208,14 @@ pub struct TurnDeliveryEpisode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum TurnDeliveryOutcome {
+    /// Producer admission evidence only. The referenced receiver-homed Message
+    /// owns delivery status, retries and attention; this is a workflow latch.
+    MessageAccepted {
+        new_turn: bool,
+        message: flotilla_protocol::ResourceRef,
+        rung: TurnDeliveryRung,
+        accepted_at: DateTime<Utc>,
+    },
     /// Accepted into the terminal FIFO; no agent turn has been confirmed yet.
     Queued {
         rung: TurnDeliveryRung,
@@ -2188,6 +2196,9 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 delivery.failure = None;
                 if !delivery.episodes.iter().any(|existing| existing.subject_revision == episode.subject_revision) {
                     delivery.episodes.push(episode.clone());
+                }
+                if matches!(episode.outcome, TurnDeliveryOutcome::MessageAccepted { new_turn: false, .. }) {
+                    return;
                 }
                 status.attention = None;
                 if let Some(work) = status.work.get_mut(vessel) {

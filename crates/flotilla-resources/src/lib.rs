@@ -285,8 +285,8 @@ macro_rules! for_each_registered_resource {
 }
 pub use fulfilment_kind::{effective_grants, version_at_least, CapabilityNeed};
 pub use message::{
-    Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation, MessageSpec, MessageStatus, MessageStatusPatch,
-    MessageSubmission, ResolvedMessageReceiver,
+    message_record_name, Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation, MessageSpec, MessageStatus,
+    MessageStatusPatch, MessageSubmission, ResolvedMessageReceiver,
 };
 pub use message_delivery::{MessageBatch, MessageObservation, MessageTransport, MessageTransportOutcome};
 pub use message_inbox::{

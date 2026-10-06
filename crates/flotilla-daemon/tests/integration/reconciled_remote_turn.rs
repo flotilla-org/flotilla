@@ -15,14 +15,18 @@ use flotilla_core::{
     leaf_engine::TurnDeliveryRequest,
     providers::discovery::test_support::fake_discovery,
 };
-use flotilla_daemon::runtime::{spawn_pending_supervisor_turn_task, spawn_pending_supervisor_turn_task_with_watches};
+use flotilla_daemon::{
+    runtime::{spawn_pending_supervisor_turn_task, spawn_pending_supervisor_turn_task_with_watches},
+    server::test_support::spawn_in_memory_request_topology_stateful,
+};
 use flotilla_protocol::{HostName, NodeId};
 use flotilla_resources::{
     controller::{Actuation, Reconciler},
-    ClaimExit, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewMessageSender, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState,
-    Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, ExitDeclaration, HostDirectEnvironmentSpec,
-    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, PlacementPolicy, PlacementPolicySpec, Resource,
-    ResourceBackend, ResourceObject, Selector, SqliteBackend, TerminalCrewMessage, TerminalSession, TerminalSessionPhase,
+    ClaimExit, Convoy, ConvoyPhase, ConvoySpec, ConvoyStatus, CrewMessageSender, CrewSessionStatus, CrewSource, CrewSpec, CrewWorkPhase,
+    CrewWorkState, Environment, EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, ExitDeclaration, HostDirectEnvironmentSpec,
+    HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InputMeta, Message, MessageBatch, MessageExpectation,
+    MessageObservation, MessagePhase, MessageSubmission, MessageTransport, MessageTransportOutcome, PlacementPolicy, PlacementPolicySpec,
+    Resource, ResourceBackend, ResourceObject, Selector, SqliteBackend, TerminalCrewMessage, TerminalSession, TerminalSessionPhase,
     TerminalSessionSource, TerminalSessionStatus, Vessel, VesselRequirement, VesselSpec, WorkPhase, WorkState, WorkflowSnapshot,
     ACTUATOR_SOURCE_ROOT_ANNOTATION,
 };
@@ -33,9 +37,9 @@ fn meta(name: &str) -> InputMeta {
     InputMeta::builder().name(name.to_string()).build()
 }
 
-async fn replicate<T: Resource>(source: &ResourceBackend, destination: &ResourceBackend, source_root: &str) {
+async fn replicate<T: Resource>(source: &ResourceBackend, destination: &ResourceBackend, source_root: &NodeId) {
     let objects = source.clone().using::<T>("flotilla").list().await.expect("source list");
-    destination.replica_writer::<T>(NodeId::new(source_root), "flotilla").replace(&objects, Utc::now()).await.expect("replicate resources");
+    destination.replica_writer::<T>(source_root.clone(), "flotilla").replace(&objects, Utc::now()).await.expect("replicate resources");
 }
 
 fn agent_message(session: ResourceObject<TerminalSession>) -> TerminalCrewMessage {
@@ -92,6 +96,15 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .await,
     );
 
+    let home = home_daemon.resource_backend();
+    let placement = placement_daemon.resource_backend();
+
+    // Keep the real request endpoints alive: producers publish ordinary
+    // receiver-homed mutations rather than enqueueing at the convoy authority.
+    let _topology = spawn_in_memory_request_topology_stateful(home_daemon.as_ref().clone(), placement_daemon.as_ref().clone())
+        .await
+        .expect("cross-host Message mutation router");
+
     let convoys = home.clone().using::<Convoy>("flotilla");
     let created =
         convoys.create(&meta("nudge-convoy"), &ConvoySpec::builder().workflow_ref("wf".to_string()).build()).await.expect("convoy");
@@ -125,7 +138,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         })
         .await
         .expect("working crew");
-    replicate::<Convoy>(&home, &placement, "home").await;
+    replicate::<Convoy>(&home, &placement, home_daemon.node_id()).await;
     home.using::<PlacementPolicy>("flotilla")
         .create(
             &meta("placement-policy"),
@@ -139,7 +152,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         )
         .await
         .expect("placement policy");
-    replicate::<PlacementPolicy>(&home, &placement, "home").await;
+    replicate::<PlacementPolicy>(&home, &placement, home_daemon.node_id()).await;
     let environments = placement.clone().using::<Environment>("flotilla");
     let environment = environments
         .create(&meta("host-direct-placement-host"), &EnvironmentSpec {
@@ -164,7 +177,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .create(
             &InputMeta::builder()
                 .name("nudge-convoy-work".to_string())
-                .annotations(BTreeMap::from([(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), "home".to_string())]))
+                .annotations(BTreeMap::from([(ACTUATOR_SOURCE_ROOT_ANNOTATION.to_string(), home_daemon.node_id().to_string())]))
                 .build(),
             &VesselSpec {
                 convoy_ref: "nudge-convoy".to_string(),
@@ -192,6 +205,8 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     sessions
         .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
             phase: TerminalSessionPhase::Running,
+            session_id: Some("receiver-session".into()),
+            crew: Some(CrewSessionStatus { id: "receiver-crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
             ..Default::default()
         })
         .await
@@ -200,7 +215,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     let mut status = convoy.status.expect("working status");
     status.crew_work.get_mut("work").expect("work crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Stalled;
     convoys.update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &status).await.expect("stall crew");
-    replicate::<TerminalSession>(&placement, &home, "placement").await;
+    replicate::<TerminalSession>(&placement, &home, placement_daemon.node_id()).await;
 
     // #2287: replication wakes delivery and acknowledgment well before the 300s resync.
     // Await the subscribed startup scan so delivery cannot accidentally come from startup.
@@ -265,68 +280,35 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .subject_revision("stall-1".to_string())
         .sender(CrewMessageSender::FlotillaNudge)
         .build();
-    let mut disallowed = request.clone();
-    disallowed.sender = CrewMessageSender::OperatorResume { principal: None };
-    let error = home_daemon.deliver_standing_turn(&disallowed).await.expect_err("operator cannot queue a remote turn");
-    assert!(error.contains("sender is not permitted"), "{error}");
-    let mut missing = request.clone();
-    missing.role = "missing".to_string();
-    let error = home_daemon.deliver_standing_turn(&missing).await.expect_err("nudge requires a remote session");
-    assert!(error.contains("has no durable terminal-session record"), "{error}");
+    // Generic Message mutation admission is the producer path. The retained
+    // legacy RPC's caller/sender restrictions have separate routing scenarios.
     home_daemon.deliver_standing_turn(&request).await.expect("nudge accepted at convoy home");
-    let queued = convoys.get("nudge-convoy").await.expect("queued convoy");
-    assert!(queued.status.expect("status").turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
-    replicate::<Convoy>(&home, &placement, "home").await;
-    if closed_watch.is_some() {
-        wait_until("terminal observation before replacement subscription", || async {
-            before_retry.lock().expect("retry observation lock").is_some()
-        })
-        .await;
-        let stored = before_retry.lock().expect("retry observation lock").take().expect("retry observation");
-        // The failed first subscription must not have delivered the pending turn.
-        assert_eq!(stored.len(), 1, "one fixture terminal captured before resubscribing");
-        assert!(
-            matches!(&stored[0].spec.source, TerminalSessionSource::Agent { message: None, .. }),
-            "initial subscription must leave the pending turn undelivered"
-        );
-    }
-    wait_until("nudge delivery after convoy replication", || async {
-        matches!(sessions.get(&session_meta.name).await.expect("session").spec.source, TerminalSessionSource::Agent {
-            message: Some(_),
-            ..
-        })
-    })
-    .await;
-    if closed_watch.is_some() {
-        // Delivery requires replacing the closed stream, without waiting 300s.
-        assert!(subscriptions.load(Ordering::SeqCst) >= 2);
-    }
-    let delivered = sessions.get(&session_meta.name).await.expect("delivered session");
-    let nudge = agent_message(delivered.clone());
-    assert!(nudge.text.contains("Your stall is recorded. What changed since your report?"));
-    assert!(matches!(nudge.sender, CrewMessageSender::FlotillaNudge));
-    let nudge_id = nudge.id.clone();
-    let mut delivered_status = delivered.status.expect("running terminal status");
-    delivered_status.delivered_message_id = Some(nudge_id.clone());
-    sessions
-        .update_status(&session_meta.name, &delivered.metadata.resource_version, &delivered_status)
-        .await
-        .expect("confirm nudge delivery");
-    replicate::<TerminalSession>(&placement, &home, "placement").await;
-    wait_until("nudge acknowledgment after terminal replication", || async {
-        !convoys
-            .get("nudge-convoy")
-            .await
-            .expect("convoy")
-            .status
-            .expect("status")
-            .turn_deliveries
-            .values()
-            .any(|delivery| delivery.pending_supervisor_turn.is_some())
-    })
-    .await;
+    let records = placement.using::<Message>("flotilla").list().await.expect("receiver inbox").items;
+    assert_eq!(records.len(), 1);
+    let nudge = &records[0];
+    assert_eq!(nudge.spec.sender, "system:nudge");
+    assert_eq!(nudge.spec.receiver, "flotilla/nudge-convoy/work/coder");
+    assert!(nudge.spec.body.contains("Please continue"));
+    assert!(matches!(nudge.spec.expectation, MessageExpectation::Outcome { .. }));
+    assert!(home.using::<Message>("flotilla").list().await.expect("sender-local inbox").items.is_empty());
+    assert!(matches!(
+        sessions.get(&session_meta.name).await.expect("terminal after admission").spec.source,
+        TerminalSessionSource::Agent { message: None, .. }
+    ));
+    let transport = AcceptedMessageTransport(AtomicUsize::new(0));
+    placement_daemon.message_inbox("flotilla").await.reconcile_delivery(&transport, Utc::now()).await.expect("receiver delivery");
+    let delivered = placement.using::<Message>("flotilla").get(&nudge.metadata.name).await.expect("durable nudge receipt");
+    assert_eq!(delivered.status.as_ref().expect("delivery status").phase, MessagePhase::Delivered);
+    assert_eq!(
+        delivered.status.as_ref().expect("delivery status").resolved_receiver.as_ref().expect("receiver receipt").crew_id,
+        "receiver-crew"
+    );
+    assert_eq!(transport.0.load(Ordering::SeqCst), 1);
+    replicate::<Message>(&placement, &home, placement_daemon.node_id()).await;
 
-    let convoy = convoys.get("nudge-convoy").await.expect("convoy after nudge");
+    // C still supports the previous operator-resume queue. Preserve #2287's
+    // closed-watch recovery coverage here until D adopts that stored shape.
+    let convoy = convoys.get("nudge-convoy").await.expect("convoy after Message delivery");
     let mut status = convoy.status.expect("convoy status");
     status.crew_work.get_mut("work").expect("work crew").get_mut("coder").expect("coder").phase = CrewWorkPhase::Stalled;
     convoys.update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &status).await.expect("stall crew again");
@@ -335,54 +317,58 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .await
         .expect("resume reconciled remote session");
     assert!(matches!(outcome, ConvoyResumeOutcome::Queued { .. }));
-    let resumed_convoy = convoys.get("nudge-convoy").await.expect("resumed convoy");
-    assert!(resumed_convoy.status.as_ref().and_then(|status| status.crew_work["work"]["coder"].resumed_at).is_some());
-    let mut racing_nudge = request.clone();
-    racing_nudge.source = "stall-nudge-2".to_string();
-    racing_nudge.subject_revision = "stall-2".to_string();
-    home_daemon.deliver_standing_turn(&racing_nudge).await.expect("racing nudge accepted");
-    replicate::<Convoy>(&home, &placement, "home").await;
+    let resumed_convoy = convoys.get("nudge-convoy").await.expect("queued resume");
+    assert!(resumed_convoy
+        .status
+        .as_ref()
+        .expect("resume status")
+        .turn_deliveries
+        .values()
+        .any(|delivery| delivery.pending_supervisor_turn.is_some()));
+    replicate::<Convoy>(&home, &placement, home_daemon.node_id()).await;
+    if closed_watch.is_some() {
+        wait_until("terminal observation before replacement subscription", || async {
+            before_retry.lock().expect("retry observation lock").is_some()
+        })
+        .await;
+        let stored = before_retry.lock().expect("retry observation lock").take().expect("retry observation");
+        assert_eq!(stored.len(), 1);
+        assert!(
+            matches!(&stored[0].spec.source, TerminalSessionSource::Agent { message: None, .. }),
+            "closed initial watch must not deliver the legacy resume"
+        );
+    }
     wait_until("resume delivery after convoy replication", || async {
-        let message = agent_message(sessions.get(&session_meta.name).await.expect("session"));
-        message.next_after(Some(&nudge_id)).is_some()
+        matches!(sessions.get(&session_meta.name).await.expect("session").spec.source, TerminalSessionSource::Agent {
+            message: Some(_),
+            ..
+        })
     })
     .await;
+    if closed_watch.is_some() {
+        assert!(subscriptions.load(Ordering::SeqCst) >= 2, "replace the closed watch before the 300-second resync");
+    }
     let resumed_session = sessions.get(&session_meta.name).await.expect("resumed session");
-    let resumed = agent_message(resumed_session.clone());
-    let resume = resumed.next_after(Some(&nudge_id)).expect("resume follows nudge");
+    let resume = agent_message(resumed_session.clone());
     assert!(resume.text.contains("Resume this turn"));
     assert!(matches!(resume.sender, CrewMessageSender::OperatorResume { .. }));
-    let resume_id = resume.id.clone();
-    let mut status = resumed_session.status.expect("terminal status");
-    status.delivered_message_id = Some(resume_id);
-    sessions.update_status(&session_meta.name, &resumed_session.metadata.resource_version, &status).await.expect("resume delivered");
-    wait_until("nudge delivery after local terminal acknowledgment", || async {
-        agent_message(sessions.get(&session_meta.name).await.expect("session")).following.len() == 2
-    })
-    .await;
-    let after_race = sessions.get(&session_meta.name).await.expect("session after race");
-    let messages = agent_message(after_race.clone());
-    assert_eq!(messages.following.len(), 2);
-    assert!(messages.following[0].text.contains("Resume this turn"));
-    assert!(matches!(messages.following[1].sender, CrewMessageSender::FlotillaNudge));
-    let mut status = after_race.status.expect("terminal status");
-    status.delivered_message_id = Some(messages.following[1].id.clone());
-    sessions.update_status(&session_meta.name, &after_race.metadata.resource_version, &status).await.expect("both turns delivered");
-    replicate::<TerminalSession>(&placement, &home, "placement").await;
-    wait_until("cumulative acknowledgment after terminal replication", || async {
+    let mut status = resumed_session.status.expect("running terminal status");
+    status.delivered_message_id = Some(resume.id);
+    sessions.update_status(&session_meta.name, &resumed_session.metadata.resource_version, &status).await.expect("confirm legacy resume");
+    replicate::<TerminalSession>(&placement, &home, placement_daemon.node_id()).await;
+    wait_until("resume acknowledgment after terminal replication", || async {
         !convoys
             .get("nudge-convoy")
             .await
-            .expect("convoy")
+            .expect("authority convoy")
             .status
-            .expect("status")
+            .expect("authority status")
             .turn_deliveries
             .values()
             .any(|delivery| delivery.pending_supervisor_turn.is_some())
     })
     .await;
-    let convoy = convoys.get("nudge-convoy").await.expect("convoy after acknowledgments");
-    assert!(!convoy.status.expect("status").turn_deliveries.values().any(|delivery| delivery.pending_supervisor_turn.is_some()));
+    assert_eq!(placement.using::<Message>("flotilla").list().await.expect("nudge remains receiver-homed").items.len(), 1);
 }
 
 async fn wait_until<F, Fut>(behavior: &str, mut condition: F)
@@ -397,4 +383,21 @@ where
     })
     .await
     .unwrap_or_else(|_| panic!("{behavior} must complete without waiting for the resync interval"));
+}
+
+// Fake only the transport receipt; stores, producer publication and cross-host
+// mutation dispatch remain real. Pool framing is covered by runtime scenarios.
+struct AcceptedMessageTransport(AtomicUsize);
+#[async_trait::async_trait]
+impl MessageTransport for AcceptedMessageTransport {
+    async fn observe(&self, _: &ResourceObject<TerminalSession>, _: Option<&MessageSubmission>) -> Result<MessageObservation, String> {
+        Ok(MessageObservation { ready: true, ..Default::default() })
+    }
+    async fn submit(&self, _: &MessageBatch) -> MessageTransportOutcome {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        MessageTransportOutcome::Accepted { evidence: "receiver transport receipt".into() }
+    }
+    async fn poll(&self, _: &MessageBatch) -> MessageTransportOutcome {
+        panic!("a confirmed submission must not be polled")
+    }
 }
