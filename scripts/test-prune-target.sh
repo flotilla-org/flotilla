@@ -137,6 +137,7 @@ real_repo=$test_root/real-[ERROR]-repo
 mkdir -p "$real_repo/src" "$real_repo/target/debug/deps" "$real_repo/target/debug/.fingerprint/probe-0123456789abcdef"
 printf '[package]\nname="prune-regression"\nversion="0.1.0"\nedition="2021"\n' > "$real_repo/Cargo.toml"
 : > "$real_repo/src/lib.rs"
+cargo generate-lockfile --manifest-path "$real_repo/Cargo.toml"
 printf '{}' > "$real_repo/target/debug/.fingerprint/probe-0123456789abcdef/lib-probe.json"
 dd if=/dev/zero of="$real_repo/target/debug/deps/libprobe-0123456789abcdef.rlib" bs=1048576 count=2 >/dev/null 2>&1
 preview_output=$(CARGO_TARGET_DIR="$real_repo/target" FLOTILLA_TARGET_MAX_SIZE=1MiB "$repo_root/scripts/prune-target.sh" --root "$real_repo" --dry-run 2>&1)
@@ -170,5 +171,19 @@ dd if=/dev/zero of="$broken_repo/target/debug/incremental/probe/s-old/artifact.o
 broken_output=$(FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE=1MiB "$repo_root/scripts/prune-target.sh" --root "$broken_repo" 2>&1)
 grep -Fq 'cargo metadata failed:' <<< "$broken_output" || fail "metadata reason was not logged"
 [[ -f $broken_repo/target/debug/incremental/probe/s-old/artifact.o ]] || fail "metadata rejection still deleted incrementals"
+
+# Read-only no-deps metadata permits a valid lockless manifest without creating
+# Cargo.lock. Normal desk pruning still applies to that target.
+lockless_repo=$test_root/lockless
+mkdir -p "$lockless_repo/src" "$lockless_repo/target/debug/incremental/probe/s-old"
+printf '[package]\nname="lockless"\nversion="0.1.0"\nedition="2021"\n' > "$lockless_repo/Cargo.toml"
+: > "$lockless_repo/src/lib.rs"
+dd if=/dev/zero of="$lockless_repo/target/debug/incremental/probe/s-old/artifact.o" bs=1048576 count=2 >/dev/null 2>&1
+lockless_output=$(FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE=1MiB "$repo_root/scripts/prune-target.sh" --root "$lockless_repo" 2>&1)
+if grep -Fq 'cargo metadata failed:' <<< "$lockless_output"; then
+  fail "no-deps preflight rejected a valid lockless manifest"
+fi
+[[ ! -e $lockless_repo/Cargo.lock ]] || fail "metadata wrote a lockfile"
+[[ ! -e $lockless_repo/target/debug/incremental/probe/s-old/artifact.o ]] || fail "lockless desk escaped its cap"
 
 echo "target size-cap behavior tests passed"

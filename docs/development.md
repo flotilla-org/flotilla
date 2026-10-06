@@ -64,7 +64,7 @@ The runner records reclaimed bytes separately for the mtime and size-cap steps f
 
 Reclaimed-byte figures use before/after disk usage and are approximate if builds run concurrently.
 
-Targets that remain over either cap log a warning (for example, artifacts that cargo-sweep cannot remove). Before touching a non-convoy target, each policy validates its manifest with `cargo metadata --no-deps`. Metadata failures log Cargo's reason and skip that root without failing the job; other roots continue. Cleanup command failures are logged and make the scheduled run fail, while other roots are still processed. The same `FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE` and `FLOTILLA_TARGET_MAX_SIZE` overrides apply to both scheduled and manual pruning when supplied in their environment.
+Targets that remain over either cap log a warning (for example, artifacts that cargo-sweep cannot remove). Before touching a non-convoy target, each policy validates its manifest with `cargo metadata --no-deps --locked`. This preflight cannot create or update a lockfile. Root-resolution failures also refuse cleanup. Metadata failures log Cargo's reason on one line and skip that root without failing the job; other roots continue. Cleanup command failures are logged and make the scheduled run fail, while other roots are still processed. The same `FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE` and `FLOTILLA_TARGET_MAX_SIZE` overrides apply to both scheduled and manual pruning when supplied in their environment.
 
 Inspect the scheduler and the most recent result with:
 

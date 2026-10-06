@@ -79,9 +79,9 @@ fi
 
   if (( ${#sweep_roots[@]} > 0 )); then
     for root in "${sweep_roots[@]}"; do
-      if convoy_checkout_root "$root"; then
+      if skip_reason=$(cargo_cleanup_skip_reason "$root"); then
         skipped_roots=$((skipped_roots + 1))
-        echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root skipped: convoy checkout (teardown/GC owns cleanup)"
+        echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root skipped: $skip_reason"
         continue
       fi
       if ! metadata_error=$(CARGO_TARGET_DIR="$root/target" check_cargo_metadata "$root" 2>&1); then

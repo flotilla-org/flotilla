@@ -28,8 +28,10 @@ stub_cargo_bin=$test_root/cargo-bin
 mkdir -p "$stub_cargo_bin"
 cat > "$stub_cargo_bin/cargo" <<'STUB'
 #!/usr/bin/env bash
-if [[ $* == *broken* ]]; then
-  echo 'invalid manifest: fixture metadata failure' >&2
+set -euo pipefail
+[[ $# == 7 && $1 == metadata && $2 == --format-version && $3 == 1 && $4 == --no-deps && $5 == --locked && $6 == --manifest-path ]]
+if [[ ${7%/Cargo.toml} == */broken ]]; then
+  printf 'invalid manifest: fixture metadata failure\nsecond diagnostic line\n' >&2
   exit 1
 fi
 printf '{}\n'
@@ -88,7 +90,11 @@ if grep -Fq "$test_home/dev/broken" "$stub_log"; then
   echo "scheduled sweep touched a root rejected by metadata" >&2
   exit 1
 fi
-grep -Fq 'invalid manifest: fixture metadata failure' "$sweep_log"
+grep -Fq 'invalid manifest: fixture metadata failure second diagnostic line' "$sweep_log"
+# Resolution uncertainty must refuse cleanup, rather than classify as a desk.
+source "$repo_root/scripts/cargo-sweep-support.sh"
+missing_reason=$(cargo_cleanup_skip_reason "$test_root/missing")
+[[ $missing_reason == 'could not resolve checkout root; refusing cleanup' ]]
 grep -Eq 'completed: reclaimed_bytes=[0-9]+ failed_roots=0 skipped_roots=2' "$sweep_log"
 grep -Fq "root=$test_home/dev/flotilla-repos/convoy-live/flotilla skipped: convoy checkout" "$sweep_log"
 [[ $(wc -l < "$stub_log") == 4 ]]
@@ -175,6 +181,7 @@ ln -s "$real_sweep" "$real_home/.cargo/bin/cargo-sweep"
 cp "$test_home/.local/libexec/flotilla/"*.sh "$real_home/.local/libexec/flotilla/"
 printf '[package]\nname="scheduled-cap"\nversion="0.1.0"\nedition="2021"\n' > "$real_repo/Cargo.toml"
 : > "$real_repo/src/lib.rs"
+cargo generate-lockfile --manifest-path "$real_repo/Cargo.toml"
 for generation in old middle new; do
   generation_dir=$real_repo/target/debug/incremental/probe/s-$generation
   mkdir -p "$generation_dir"
