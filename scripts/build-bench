@@ -120,8 +120,10 @@ def build_environment(config, variant, target, jobs, ambient):
     encoded = env.get('CARGO_ENCODED_RUSTFLAGS')
     flags = (encoded.split('\x1f') if encoded else []) if encoded is not None else env.get('RUSTFLAGS', '').split()
     flags += config.get('rustflags', '').split() + variant.get('rustflags', '').split()
-    env['RUSTFLAGS'] = ' '.join(flags)
-    env['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(flags)
+    # Leave Cargo config flags authoritative unless flags were explicitly supplied.
+    if flags or 'RUSTFLAGS' in env or 'CARGO_ENCODED_RUSTFLAGS' in env:
+        env['RUSTFLAGS'] = ' '.join(flags)
+        env['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(flags)
     return env
 
 
@@ -130,14 +132,6 @@ def measure(root, scratch, config, variant_name, scenario, profile, cpus, worker
     home = scratch / f'run-{run_id}-worker-{worker}'
     source, target = home / 'source', home / 'target'
     fresh = not source.exists()
-    if fresh:
-        source.mkdir(parents=True)
-        # Archive the recorded commit, never the vessel's mutable working tree.
-        archive = subprocess.Popen(['git', 'archive', revision], cwd=root, stdout=subprocess.PIPE)
-        subprocess.run(['tar', '-x', '-C', str(source)], stdin=archive.stdout, check=True)
-        archive.stdout.close()
-        if archive.wait():
-            raise RuntimeError('git archive failed')
     env = build_environment(config, variant, target, jobs, os.environ)
     actions = workload(scenario, variant)
     prefix = f'{run_id}-{worker}-{variant_name}-{scenario}'
@@ -148,6 +142,16 @@ def measure(root, scratch, config, variant_name, scenario, profile, cpus, worker
                      'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'FLOTILLA_LINKER_THREADS', 'RUSTUP_TOOLCHAIN',
                      'GIT_TERMINAL_PROMPT', 'GIT_SSH_COMMAND', 'CARGO_ENCODED_RUSTFLAGS'})}}
     try:
+        if fresh:
+            source.mkdir(parents=True)
+            # Reap the archive even if extraction fails; close its pipe first.
+            with subprocess.Popen(['git', 'archive', revision], cwd=root, stdout=subprocess.PIPE) as archive:
+                try:
+                    subprocess.run(['tar', '-x', '-C', str(source)], stdin=archive.stdout, check=True)
+                finally:
+                    archive.stdout.close()
+            if archive.returncode:
+                raise RuntimeError('git archive failed')
         if scenario != 'cold':
             warm_actions = actions if scenario == 'crew-cycle' else ['no-run']
             warmup = run_commands([command(variant, a, toolchain, jobs) for a in warm_actions], source, env, cpus, logs / (prefix + '-warmup.log'))
@@ -167,7 +171,7 @@ def measure(root, scratch, config, variant_name, scenario, profile, cpus, worker
         return {**identity,
                 'warmup': warmup, **result, 'target_bytes': size(target), 'log': str(logs / (prefix + '.log'))}
     finally:
-        if not keep:
+        if not keep and home.exists():
             shutil.rmtree(home)
 
 

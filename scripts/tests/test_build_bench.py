@@ -109,6 +109,53 @@ class BenchmarkContract(unittest.TestCase):
             self.assertGreaterEqual(result['wall_seconds'], 0)
             self.assertTrue(result['load_samples'])
 
+    def test_absent_flags_leave_cargo_config_authoritative(self):
+        # Unset environment flags must not suppress Cargo config flags; explicit
+        # empty flags still request Cargo's normal environment precedence.
+        env = bench.build_environment({}, {}, Path('/target'), 4, {})
+        self.assertNotIn('RUSTFLAGS', env)
+        self.assertNotIn('CARGO_ENCODED_RUSTFLAGS', env)
+        for key in ['RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS']:
+            explicit = bench.build_environment({}, {}, Path('/target'), 4, {key: ''})
+            self.assertEqual(explicit['CARGO_ENCODED_RUSTFLAGS'], '')
+        declared = bench.build_environment({}, {'rustflags': '-Zthreads=4'}, Path('/target'), 4, {})
+        self.assertEqual(declared['CARGO_ENCODED_RUSTFLAGS'], '-Zthreads=4')
+
+    def test_archive_failure_cleans_and_reaps_without_masking_error(self):
+        # Real archive/extractor failures must clean partial sources and preserve
+        # the original extraction exception, with no unreaped child warning.
+        import os
+        import warnings
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / 'repo'
+            root.mkdir()
+            (root / 'leaf.rs').write_text('original')
+            subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            subprocess.run(['git', '-C', str(root), 'add', '.'], check=True)
+            subprocess.run(['git', '-C', str(root), '-c', 'user.name=test', '-c', 'user.email=test@example.com',
+                            'commit', '-qm', 'fixture'], check=True)
+            scratch, logs = Path(temp) / 'scratch', Path(temp) / 'logs'
+            scratch.mkdir()
+            logs.mkdir()
+            config = dict(variants={'a': {}})
+            args = (root, scratch, config, 'a', 'cold', 'limited', None, 0, 0, logs, 'stable')
+            with self.assertRaises(subprocess.CalledProcessError):
+                bench.measure(*args, revision='missing-revision')
+            self.assertFalse(list(scratch.iterdir()))
+            tools = Path(temp) / 'tools'
+            tools.mkdir()
+            extractor = tools / 'tar'
+            extractor.write_text('#!/bin/sh\nexit 23\n')
+            extractor.chmod(0o755)
+            with patch.dict(os.environ, {'PATH': str(tools) + os.pathsep + os.environ['PATH']}):
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter('always', ResourceWarning)
+                    with self.assertRaises(subprocess.CalledProcessError) as error:
+                        bench.measure(*args)
+                self.assertEqual(error.exception.returncode, 23)
+                self.assertFalse([w for w in caught if issubclass(w.category, ResourceWarning)])
+            self.assertFalse(list(scratch.iterdir()))
+
     def test_worker_isolation_edit_and_cleanup(self):
         # Stand in for Cargo only at its process boundary. Real git archives
         # and files must isolate targets, edit only the copy, and clean up.

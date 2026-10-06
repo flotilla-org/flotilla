@@ -316,7 +316,8 @@ points for #2750; those tools are not required by the default variant map.
 
 Ambient or config `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` are preserved, with
 encoded flags taking Cargo’s usual precedence; declared `rustflags` are appended.
-Effective flags are recorded in each run.
+Effective flags are recorded in each run. If no flags are supplied, the harness
+leaves both flag environment variables unset so Cargo config flags still apply.
 
 The baseline explicitly uses line tables, dependency `debug=0`, four Cargo jobs,
 and incremental off. All variants use the same pinned nightly, including those
@@ -331,13 +332,18 @@ python3 -m unittest scripts.tests.test_build_bench
 ```
 
 Use `--jobs N` to enforce a uniform job count over config and variant environment
-values. The four-job default is the crew vessel baseline; full host parallelism
+values. Both the environment variable and final Cargo `build.jobs` config are
+set deliberately: the latter also overrides a variant’s `build.jobs` entry.
+The four-job default is the crew vessel baseline; full host parallelism
 is an operator run. `--reuse-prime` keeps each worker’s private target across the
 selected scenarios in a pair and deletes it at the end. Edits accumulate in the
 disposable source, and the first crew round then starts primed by prior scenarios;
 `source_state` records this distinction. Omit it for independent fresh scenario
 primes, including a crew cycle starting from a cold target. A failed prime stops
-that worker’s suite because later edit timings would be invalid.
+that worker’s suite because later edit timings would be invalid. Each non-cold
+scenario still runs its declared warm-up against the reused target; this is
+usually a no-change rebuild, is recorded separately, and is excluded from edit,
+primed and test-runtime timings. Crew-cycle includes both rounds in its total.
 
 Use `--variants incremental threads-4` and `--scenarios cold core-edit` for a
 smaller experiment. The quiet profile uses the vessel's available affinity;
@@ -349,7 +355,8 @@ Every worker gets a disposable source archive and isolated target, removed after
 its scenario or scenario suite even on build failure. Dependency downloads share Cargo's registry;
 run `cargo fetch --locked` first to avoid timing downloads. `results.json` records
 flags, selected environment, host/toolchain/linker, affinity/quota, phase times,
-load samples and final target bytes; `medians.md` compares each challenger with
+load samples and final target bytes. CPU quota and memory limits are read from
+cgroup v2 files and are null where those files are unavailable; `medians.md` compares each challenger with
 its paired baseline. Logs survive beside those files. Choose a new output directory
 for each invocation. Git prompts are disabled; SSH defaults to batch mode, strict
 host-key checking, and a five-second connection timeout so test fixtures cannot
