@@ -252,6 +252,12 @@ pub struct Aggregator {
     #[builder(skip)]
     attach_resolver: Option<Arc<dyn AttachCapabilityResolver>>,
     #[builder(skip)]
+    attach_refresh_tasks: tokio::task::JoinSet<AttachCapabilityResolution>,
+    #[builder(skip)]
+    attach_refresh_generation: Option<uuid::Uuid>,
+    #[builder(skip)]
+    attach_refresh_inputs: HashMap<SessionKey, AttachCapabilityInput>,
+    #[builder(skip)]
     change_request_resolver: Option<Arc<dyn ConvoyChangeRequestResolver>>,
     #[builder(skip)]
     convoy_change_requests: HashMap<ResourceRef, ConvoyChangeRequest>,
@@ -273,6 +279,19 @@ pub struct Aggregator {
     issue_materializer: Option<IssueMaterializer>,
     event_sink: Arc<dyn EventSink>,
     event_rx: broadcast::Receiver<DaemonEvent>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct AttachCapabilityInput {
+    host: HostName,
+    metadata: flotilla_resources::ObjectMeta,
+    spec: flotilla_resources::TerminalSessionSpec,
+    status: Option<flotilla_resources::TerminalSessionStatus>,
+}
+
+struct AttachCapabilityResolution {
+    generation: uuid::Uuid,
+    attachable_sessions: HashSet<SessionKey>,
 }
 
 struct ChangeRequestResolution {
@@ -340,6 +359,9 @@ impl Aggregator {
             bootstrapping: false,
             emitted_queries: HashSet::new(),
             attach_resolver: None,
+            attach_refresh_tasks: tokio::task::JoinSet::new(),
+            attach_refresh_generation: None,
+            attach_refresh_inputs: HashMap::new(),
             change_request_resolver: None,
             convoy_change_requests: HashMap::new(),
             change_request_refresh_generations: HashMap::new(),
@@ -589,6 +611,15 @@ impl Aggregator {
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         return Err(ResourceError::other("daemon event channel closed"));
+                    }
+                },
+                resolution = self.attach_refresh_tasks.join_next(), if !self.attach_refresh_tasks.is_empty() => {
+                    match resolution {
+                        Some(Ok(resolution)) => self.apply_attach_capability_resolution(resolution).await?,
+                        Some(Err(error)) if !error.is_cancelled() => {
+                            tracing::warn!(%error, "terminal capability refresh failed");
+                        }
+                        _ => {}
                     }
                 },
                 resolution = self.change_request_refresh_queue.rx.recv() => {
@@ -1932,26 +1963,69 @@ impl Aggregator {
         self.refresh_origin_hosts().await;
         let salience_changed = self.rebuild_salience_projection().await;
 
-        let attach_candidates = self
+        self.refresh_attach_capabilities();
+        self.publish_independents_projection(salience_changed).await;
+    }
+
+    fn refresh_attach_capabilities(&mut self) {
+        // Provider liveness/preflight I/O must not hold up resource projection.
+        // Keep confirmed capabilities only while their resource snapshot and host
+        // are unchanged; superseded checks cannot restore an obsolete recipe.
+        let candidates = self
             .terminal_sessions
             .iter()
             .filter_map(|(key, session)| {
-                self.read_host(&session.provenance).map(|host| (key.clone(), session.object.metadata.name.clone(), host))
+                self.read_host(&session.provenance).map(|host| {
+                    (
+                        key.clone(),
+                        session.object.metadata.name.clone(),
+                        AttachCapabilityInput {
+                            host: host.clone(),
+                            metadata: session.object.metadata.clone(),
+                            spec: session.object.spec.clone(),
+                            status: session.object.status.clone(),
+                        },
+                        host,
+                    )
+                })
             })
             .collect::<Vec<_>>();
-        self.attachable_sessions = match &self.attach_resolver {
-            Some(resolver) => {
-                let targets = attach_candidates.iter().map(|(_, reference, host)| (reference.clone(), host.clone())).collect::<Vec<_>>();
-                match resolver.resolvable_attach_targets(&targets).await {
-                    Ok(resolved) if resolved.len() == attach_candidates.len() => {
-                        attach_candidates.into_iter().zip(resolved).filter_map(|((key, _, _), resolved)| resolved.then_some(key)).collect()
-                    }
-                    Ok(_) | Err(_) => HashSet::new(),
-                }
-            }
-            None => HashSet::new(),
+        let inputs = candidates.iter().map(|(key, _, input, _)| (key.clone(), input.clone())).collect::<HashMap<_, _>>();
+        self.attachable_sessions.retain(|key| inputs.get(key).is_some_and(|input| self.attach_refresh_inputs.get(key) == Some(input)));
+        self.attach_refresh_inputs = inputs;
+        self.attach_refresh_tasks.abort_all();
+        let generation = uuid::Uuid::new_v4();
+        self.attach_refresh_generation = Some(generation);
+        let Some(resolver) = self.attach_resolver.clone() else {
+            self.attachable_sessions.clear();
+            return;
         };
+        if candidates.is_empty() {
+            return;
+        }
+        self.attach_refresh_tasks.spawn(async move {
+            let targets = candidates.iter().map(|(_, name, _, host)| (name.clone(), host.clone())).collect::<Vec<_>>();
+            let attachable_sessions = match resolver.resolvable_attach_targets(&targets).await {
+                Ok(resolved) if resolved.len() == candidates.len() => {
+                    candidates.into_iter().zip(resolved).filter_map(|((key, _, _, _), resolved)| resolved.then_some(key)).collect()
+                }
+                Ok(_) | Err(_) => HashSet::new(),
+            };
+            AttachCapabilityResolution { generation, attachable_sessions }
+        });
+    }
 
+    async fn apply_attach_capability_resolution(&mut self, resolution: AttachCapabilityResolution) -> Result<(), ResourceError> {
+        if self.attach_refresh_generation != Some(resolution.generation) {
+            return Ok(());
+        }
+        self.attachable_sessions = resolution.attachable_sessions;
+        self.publish_independents_projection(false).await;
+        self.rebuild_local_projection().await;
+        self.rebuild_checkout_rows().await
+    }
+
+    async fn publish_independents_projection(&self, salience_changed: bool) {
         let mut local_replacement = Vec::new();
         let mut replica_replacements: HashMap<HostName, Vec<IndependentRow>> = HashMap::new();
         for session in self.terminal_sessions.values() {
@@ -3437,6 +3511,7 @@ mod tests {
             }])
             .await;
 
+        settle_attach_refresh(&mut aggregator).await;
         let result = state.result_set().await;
         let convoy = result.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
         let vessel = convoy.vessels.first().expect("vessel row");
@@ -3553,6 +3628,7 @@ mod tests {
             }])
             .await;
 
+        settle_attach_refresh(&mut aggregator).await;
         let result = state.result_set().await;
         let vessel = &result.rows.as_convoys().expect("convoy rows")[0].vessels[0];
         assert_eq!(vessel.host, HostName::new("feta"));
@@ -3744,8 +3820,13 @@ mod tests {
         let (convoy, awareness) = timeout(Duration::from_secs(1), async {
             let mut convoy = None;
             let mut awareness = None;
-            while convoy.is_none() || awareness.is_none() {
+            while convoy.as_ref().is_none_or(|row: &ConvoyRow| row.vessels[0].materialize.is_none()) || awareness.is_none() {
                 let event = event_rx.recv().await.expect("aggregator bootstrap event");
+                if let DaemonEvent::ResultDelta(delta) = &event {
+                    if let Some(rows) = delta.changes.as_convoys() {
+                        convoy = rows.first().cloned();
+                    }
+                }
                 let DaemonEvent::ResultSet(result) = event else { continue };
                 if result.query() == (QueryId::Convoys { scope: None }) {
                     convoy = result.rows.as_convoys().expect("convoy rows").first().cloned();
@@ -4913,6 +4994,7 @@ mod tests {
             .replace_session_source(LocalSource::Durable, vec![session_object("session-a").await, session_object("session-b").await])
             .await;
 
+        settle_attach_refresh(&mut aggregator).await;
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
         let result_set = state.independents_result_set(&None).await;
         let rows = result_set.rows.as_independents().expect("session rows");
@@ -5086,11 +5168,13 @@ mod tests {
             BTreeMap::from([(CONVOY_LABEL.to_string(), "convoy-a".to_string()), (VESSEL_LABEL.to_string(), "implement".to_string())]);
         aggregator.replace_session_source(LocalSource::Durable, vec![session]).await;
 
+        settle_attach_refresh(&mut aggregator).await;
         let before = state.result_set().await;
         assert_eq!(before.rows.as_convoys().expect("convoy rows")[0].vessels[0].materialize, None);
 
         aggregator.apply_environment_event(WatchEvent::Modified(environment_object("local").await)).await;
 
+        settle_attach_refresh(&mut aggregator).await;
         let after = state.result_set().await;
         assert_eq!(after.rows.as_convoys().expect("convoy rows")[0].vessels[0].materialize.as_deref(), Some("terminal-convoy-a-implement"));
     }
@@ -5153,12 +5237,19 @@ mod tests {
         tokio::select! {
             result = &mut run => panic!("aggregator stopped during route transition test: {result:?}"),
             () = async {
-                let initial = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial convoy set").await;
-                let DaemonEvent::ResultSet(initial) = initial else { panic!("expected initial result set") };
-                assert_eq!(
-                    initial.rows.as_convoys().expect("convoy rows")[0].vessels[0].materialize.as_deref(),
-                    Some("terminal-convoy-a-implement")
-                );
+                // Bootstrap publishes promptly, then a capability delta supplies
+                // the materialization recipe once the provider check finishes.
+                timeout(Duration::from_secs(1), async {
+                    loop {
+                        let event = recv_query_event(&mut event_rx, QueryId::Convoys { scope: None }, "initial convoy enrichment").await;
+                        let rows = match &event {
+                            DaemonEvent::ResultSet(set) => set.rows.as_convoys().expect("convoy rows"),
+                            DaemonEvent::ResultDelta(delta) => delta.changes.as_convoys().expect("convoy changes"),
+                            _ => unreachable!(),
+                        };
+                        if rows.first().is_some_and(|row| row.vessels[0].materialize.as_deref() == Some("terminal-convoy-a-implement")) { break; }
+                    }
+                }).await.expect("bootstrap recipe becomes available");
 
                 resolver.live.store(false, Ordering::SeqCst);
                 let _ = event_tx.send(DaemonEvent::PeerStatusChanged {
@@ -6527,6 +6618,242 @@ mod tests {
             ConvoyStatus { phase: ResourceConvoyPhase::Failed, message: Some("missing input 'topic'".into()), ..Default::default() };
 
         assert!(!convoy_is_initializing(Some(&status)));
+    }
+    async fn settle_attach_refresh(aggregator: &mut Aggregator) {
+        timeout(Duration::from_secs(1), async {
+            while let Some(result) = aggregator.attach_refresh_tasks.join_next().await {
+                if let Ok(resolution) = result {
+                    aggregator.apply_attach_capability_resolution(resolution).await.expect("apply capability result");
+                }
+            }
+        })
+        .await
+        .expect("capability refresh finishes");
+    }
+
+    // Provider-boundary stand-in: terminal liveness can fail or return an invalid batch.
+    struct ScriptedAttachResult(Mutex<Result<Vec<bool>, String>>);
+
+    #[async_trait]
+    impl AttachCapabilityResolver for ScriptedAttachResult {
+        async fn resolvable_attach_targets(&self, _: &[(String, HostName)]) -> Result<Vec<bool>, String> {
+            self.0.lock().await.clone()
+        }
+    }
+
+    // Capability results may enrich only the current resource snapshot. Generated
+    // sequences cover deletion/recreation, changed versions, errors, malformed
+    // batches, and empty terminal sets; every step checks published attach recipes.
+    #[hegel::test]
+    fn capability_results_do_not_restore_superseded_sessions(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
+        let ops =
+            (0..steps).map(|_| (tc.draw(gs::booleans()), tc.draw(gs::integers::<usize>().min_value(0).max_value(2)))).collect::<Vec<_>>();
+        tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+            let state = AggregatorProjectionState::new();
+            let (tx, _) = broadcast::channel(64);
+            let resolver = Arc::new(ScriptedAttachResult(Mutex::new(Ok(vec![true]))));
+            let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver(resolver.clone());
+            for (step, (recreate, mode)) in ops.into_iter().enumerate() {
+                *resolver.0.lock().await = Ok(vec![true]);
+                let mut session = session_object("changing-session").await;
+                session.metadata.resource_version = format!("{step}-before");
+                aggregator.replace_session_source(LocalSource::Durable, vec![session.clone()]).await;
+                settle_attach_refresh(&mut aggregator).await;
+                let before = state.independents_result_set(&None).await;
+                assert!(before.rows.as_independents().expect("rows")[0].attach.is_some());
+
+                // Complete the old check, but let a resource change win the race
+                // before the aggregator applies its queued result.
+                aggregator.rebuild_independents_projection().await;
+                let old = aggregator.attach_refresh_tasks.join_next().await.expect("check").expect("completed check");
+                *resolver.0.lock().await = match mode {
+                    0 => Ok(vec![false]),
+                    1 => Err("terminal unavailable".into()),
+                    _ => Ok(vec![]),
+                };
+                session.metadata.resource_version = format!("{step}-after");
+                aggregator.replace_session_source(LocalSource::Durable, if recreate { vec![session] } else { vec![] }).await;
+                aggregator.apply_attach_capability_resolution(old).await.expect("ignore stale result");
+                let pending = state.independents_result_set(&None).await;
+                assert_eq!(pending.rows.len(), usize::from(recreate));
+                assert!(
+                    pending.rows.as_independents().expect("rows").iter().all(|row| row.attach.is_none()),
+                    "obsolete result restored a recipe"
+                );
+                settle_attach_refresh(&mut aggregator).await;
+                let after = state.independents_result_set(&None).await;
+                assert_eq!(after.rows.len(), usize::from(recreate));
+                assert!(
+                    after.rows.as_independents().expect("rows").iter().all(|row| row.attach.is_none()),
+                    "failed or malformed check granted a recipe"
+                );
+            }
+        });
+    }
+
+    // A held provider check belongs to the aggregator lifetime, including an
+    // aborted run. Dropping the aggregator must release the resolver task.
+    #[tokio::test]
+    async fn dropping_aggregator_cancels_held_capability_check() {
+        let (entered, mut entered_rx) = mpsc::unbounded_channel();
+        let resolver = Arc::new(HeldAttachResolver { entered, release: tokio::sync::Semaphore::new(0) });
+        let state = AggregatorProjectionState::new();
+        let (tx, _) = broadcast::channel(16);
+        let mut aggregator = Aggregator::new(state, HostName::new("local"), tx).with_attach_resolver(resolver.clone());
+        aggregator.replace_session_source(LocalSource::Durable, vec![session_object("held-session").await]).await;
+        timeout(Duration::from_secs(1), entered_rx.recv()).await.expect("check starts").expect("signal");
+        drop(aggregator);
+        timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&resolver) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("held provider check is canceled on drop");
+    }
+
+    fn resource_resolvers(d: &ResourceBackend, observed: &ResourceBackend) -> AggregatorResolvers {
+        AggregatorResolvers::builder()
+            .durable_convoys(d.including_replicas::<Convoy>("flotilla"))
+            .durable_convoy_ensures(d.including_replicas::<ConvoyEnsure>("flotilla"))
+            .durable_demands(d.using::<Demand>("flotilla"))
+            .durable_environments(d.using::<Environment>("flotilla"))
+            .durable_presentations(d.using::<Presentation>("flotilla"))
+            .durable_sessions(d.including_replicas::<TerminalSession>("flotilla"))
+            .durable_projects(d.including_replicas::<Project>("flotilla"))
+            .durable_repositories(d.including_replicas::<Repository>("flotilla"))
+            .durable_regards(d.using::<Regard>("flotilla"))
+            .durable_vessels(d.including_replicas::<Vessel>("flotilla"))
+            .durable_checkouts(d.including_replicas::<Checkout>("flotilla"))
+            .durable_clones(d.using::<CloneResource>("flotilla"))
+            .observed_convoys(observed.using::<Convoy>("flotilla"))
+            .observed_presentations(observed.using::<Presentation>("flotilla"))
+            .observed_sessions(observed.including_replicas::<TerminalSession>("flotilla"))
+            .observed_checkouts(observed.using::<Checkout>("flotilla"))
+            .observed_checkout_replicas(observed.including_replicas::<Checkout>("flotilla"))
+            .build()
+    }
+
+    // Boundary stand-in: terminal/provider capability lookup can await I/O.
+    struct HeldAttachResolver {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl AttachCapabilityResolver for HeldAttachResolver {
+        async fn resolvable_attach_targets(&self, targets: &[(String, HostName)]) -> Result<Vec<bool>, String> {
+            if !targets.is_empty() {
+                self.entered.send(()).expect("probe observer");
+                self.release.acquire().await.expect("probe release").forget();
+            }
+            Ok(vec![true; targets.len()])
+        }
+    }
+
+    // Local row publication should remain prompt while an unrelated terminal
+    // capability lookup is waiting. A provider gate makes the ordering exact.
+    #[tokio::test]
+    async fn local_convoy_publishes_while_attach_check_is_held() {
+        for sqlite in [false, true] {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let durable = if sqlite {
+                ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open(temp.path().join("gate.sqlite")).expect("sqlite"))
+            } else {
+                ResourceBackend::InMemory(InMemoryBackend::default())
+            };
+            let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
+            let sessions = durable.using::<TerminalSession>("flotilla");
+            let session = session_object("terminal-probe").await;
+            let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+            let gate = Arc::new(HeldAttachResolver { entered: entered_tx, release: tokio::sync::Semaphore::new(0) });
+            let state = AggregatorProjectionState::new();
+            let (tx, mut rx) = broadcast::channel(4096);
+            let aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx).with_attach_resolver(gate.clone());
+            let resolvers = resource_resolvers(&durable, &observed);
+            let task = tokio::spawn(aggregator.run(resolvers));
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if let DaemonEvent::ResultSet(set) = rx.recv().await.expect("startup event") {
+                        if set.query() == (QueryId::Convoys { scope: None }) {
+                            break;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("startup");
+            let created = sessions
+                .create(&InputMeta::builder().name("terminal-probe".to_string()).build(), &session.spec)
+                .await
+                .expect("trigger probe");
+            sessions
+                .update_status(&created.metadata.name, &created.metadata.resource_version, session.status.as_ref().expect("status"))
+                .await
+                .expect("running terminal");
+            timeout(Duration::from_secs(1), entered_rx.recv()).await.expect("probe entered").expect("probe signal");
+            let convoys = durable.using::<Convoy>("flotilla");
+            let mut watch = convoys.watch(WatchStart::Now).await.expect("watch");
+            let start = std::time::Instant::now();
+            convoys
+                .create(
+                    &InputMeta::builder().name("prompt-local".to_string()).build(),
+                    &flotilla_resources::ConvoySpec::builder().workflow_ref("latency".to_string()).build(),
+                )
+                .await
+                .expect("local write");
+            let committed = std::time::Instant::now();
+            watch.next().await.expect("watch event").expect("watch success");
+            let watch_us = committed.elapsed().as_micros();
+            let prompt = timeout(Duration::from_millis(200), async {
+                loop {
+                    if !state.local_result_set().await.rows.is_empty() {
+                        break;
+                    }
+                    rx.recv().await.expect("projection event");
+                }
+            })
+            .await
+            .is_ok();
+            let held_us = committed.elapsed().as_micros();
+            gate.release.add_permits(16);
+            let released = std::time::Instant::now();
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if !state.local_result_set().await.rows.is_empty() {
+                        break;
+                    }
+                    rx.recv().await.expect("projection event");
+                }
+            })
+            .await
+            .expect("projection catches up after probe release");
+            eprintln!(
+            "HELD_CHECK_PROJECTION sqlite={} write_us={} direct_watch_us={} held_us={} projected_before_probe_release={} projection_after_release_us={}",
+                sqlite,
+            committed.duration_since(start).as_micros(),
+            watch_us,
+            held_us,
+            prompt,
+            released.elapsed().as_micros()
+        );
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    let rows = state.independents_result_set(&None).await;
+                    if rows.rows.as_independents().expect("terminal rows").iter().any(|row| row.attach.is_some()) {
+                        break;
+                    }
+                    rx.recv().await.expect("capability event");
+                }
+            })
+            .await
+            .expect("capabilities apply after release");
+            task.abort();
+            let _ = task.await;
+            assert!(prompt, "local convoy projection was blocked by unrelated attach capability lookup");
+        }
     }
 }
 
