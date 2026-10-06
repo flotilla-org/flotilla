@@ -6,7 +6,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
     sync::Arc,
     time::Duration,
@@ -860,8 +860,7 @@ impl Vcs for FlotillaVcs {
             .map_err(|_| format!("fetch charter branch {branch}: timed out after 60s"))??;
         let revision = backend.resolve_ref("FETCH_HEAD^{commit}").await?.trim().to_string();
         let tree = backend.run(&["ls-tree", "-r", "-z", &revision]).await?;
-        let normalized_path: PathBuf =
-            Path::new(path).components().filter(|part| matches!(part, std::path::Component::Normal(_))).collect();
+        let normalized_path: PathBuf = Path::new(path).components().filter(|part| matches!(part, Component::Normal(_))).collect();
         let prefix = normalized_path.to_str().ok_or("charter path is not UTF-8")?;
         let mut files = BTreeMap::new();
         let mut found_path = prefix.is_empty();
@@ -882,7 +881,16 @@ impl Vcs for FlotillaVcs {
             if !meta.starts_with("100644 blob ") && !meta.starts_with("100755 blob ") {
                 return Err(format!("charter path {name} is not a regular file"));
             }
-            let contents = backend.run(&["show", &format!("{revision}:{name}")]).await?;
+            // String command output is lossy. Stream the blob bytes first so
+            // invalid UTF-8 is refused with its source path, like local files.
+            let output = directory.join("flotilla-charter-blob");
+            let contents = async {
+                self.runner.run_to_file("git", &["show", &format!("{revision}:{name}")], &directory, &output).await?;
+                tokio::fs::read_to_string(&output).await.map_err(|error| error.to_string())
+            }
+            .await;
+            let _ = tokio::fs::remove_file(&output).await;
+            let contents = contents.map_err(|error| format!("read charter {name}: {error}"))?;
             files.insert(relative.to_string(), contents);
         }
         if !found_path {

@@ -365,7 +365,11 @@ Local revisions are SHA-256 hashes of the ordered paths and contents actually
 read. No remote or clean Git checkout is required. Source readers include
 Markdown, YAML, JSON, TOML and text files; fleet manifests consume JSON/YAML
 resource envelopes (`apiVersion`, `kind`, `metadata`, `spec`). Symlinked charter
-inputs are refused.
+inputs are refused. Local directories reject every symlink to avoid following
+paths outside the source, including symlinked directories. Git ignores entries
+whose names are not charter files, including gitlinks and symlinked directories;
+charter-named non-regular entries are refused. Both sources require UTF-8 charter
+contents, and refusal reasons identify the file.
 
 Ops members use the same reader. Declare their source in `project.yaml`, or in
 `Project.spec.repositories[].charter_store`:

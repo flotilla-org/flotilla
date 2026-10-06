@@ -1083,6 +1083,20 @@ mod tests {
         assert!(repaired.source_error.is_none());
         assert!(repaired.stalled.is_none());
         assert_ne!(repaired.applied_revision.as_deref(), Some(merged.as_str()));
+        // Invalid blob bytes must not be silently replaced by string decoding.
+        let mut blob = manifest("versioned", "invalid").into_bytes();
+        let offset = blob.windows(7).position(|bytes| bytes == b"invalid").expect("pool value");
+        blob[offset] = 0xff;
+        std::fs::write(repo.path().join("charters/policy.yaml"), blob).expect("non-UTF8 charter");
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "non-UTF8 charter"]);
+        assert!(reconciler.reconcile_once().await.is_err());
+        let invalid = test_root(&backend).await.status.expect("non-UTF8 status");
+        assert_eq!(invalid.applied_revision, repaired.applied_revision);
+        assert!(invalid.source_error.expect("non-UTF8 reason").contains("policy.yaml"));
+        write(&repo.path().join("charters/policy.yaml"), &manifest("versioned", "must-not-apply"));
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "restore text inputs"]);
         // A Git symlink refusal must reach source status without advancing it.
         #[cfg(unix)]
         {

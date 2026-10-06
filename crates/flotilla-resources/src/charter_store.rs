@@ -59,7 +59,7 @@ mod tests {
     // Transport glue: local repositories are supported, external helpers are not.
     #[test]
     fn repository_transports_exclude_external_helpers() {
-        for repo in ["ext::sh -c command", "custom::destination"] {
+        for repo in ["ext::sh -c command", "custom::destination", " ext::x"] {
             assert!(CharterSource::Repository { repo: repo.into(), branch: "main".into(), path: String::new() }.validate().is_err());
         }
         for repo in ["/tmp/source", "file:///tmp/source", "https://github.com/example/source", "ssh://[::1]/source"] {
