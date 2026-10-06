@@ -6,7 +6,7 @@ use flotilla_protocol::LeafAddress;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use super::project_ledger_comment;
+use super::{ledger_projection_tests::stored_creation, project_ledger_comment};
 
 #[derive(Default)]
 struct Comments {
@@ -82,12 +82,13 @@ async fn forgejo_projection_satisfies_http_comment_contract() {
     let env = BTreeMap::from([("FORGEJO_TOKEN_FILE".into(), token.display().to_string()), ("FORGEJO_API_URL".into(), api.clone())]);
     let address = LeafAddress::ChangeRequest { service: "forgejo.example".into(), scope: "acme/repo".into(), number: 42 };
     let runner = ProcessCommandRunner;
+    let authority = stored_creation(flotilla_resources::ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default())).await;
     let first = b"## Decision ledger\nfirst";
     let revised = b"## Decision ledger\nrevised";
     let project = async |body: &[u8]| {
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            project_ledger_comment("contract", "coder", body, &address, &runner, Path::new("/"), &env),
+            project_ledger_comment("demo", "coder", body, &address, &runner, Path::new("/"), &env, &authority),
         )
         .await
         .expect("bounded projection")
@@ -143,8 +144,9 @@ async fn forgejo_projection_satisfies_http_comment_contract() {
         StatusCode::NOT_FOUND
     );
     std::fs::write(&token, "wrong-token").expect("invalid staged credential");
-    let error =
-        project_ledger_comment("contract", "coder", first, &address, &runner, Path::new("/"), &env).await.expect_err("auth refusal");
+    let error = project_ledger_comment("demo", "coder", first, &address, &runner, Path::new("/"), &env, &authority)
+        .await
+        .expect_err("auth refusal");
     assert!(error.contains("403"), "{error}");
     assert_eq!(state.lock().await.writes.len(), 3);
     server.abort();

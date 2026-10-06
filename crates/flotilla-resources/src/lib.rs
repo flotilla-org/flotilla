@@ -65,7 +65,7 @@ mod vessel;
 mod watch;
 mod workflow_template;
 
-pub use artifact::{artifact_record_name, Artifact, ArtifactSpec};
+pub use artifact::{artifact_record_name, reserve_ledger_comment_creation, Artifact, ArtifactSpec, ArtifactStatus, ArtifactStatusPatch};
 pub use backend::{ReplicaReadResolver, ReplicaWriter, ResourceBackend, TypedResolver};
 pub use change_request::{
     change_request_record_name, change_request_subject, merge_change_request_history, retain_change_request, select_change_request_sources,

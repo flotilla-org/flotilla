@@ -5388,6 +5388,7 @@ impl InProcessDaemon {
             | CommandAction::ResourceStatusPatch { namespace, kind, name, .. }
             | CommandAction::ResourceManifestResolve { namespace, kind, name, .. }
             | CommandAction::ResourceReconcileNow { namespace, kind, name } => Some((namespace.as_str(), kind.as_str(), name.as_str())),
+            CommandAction::ArtifactReserveLedgerComment { namespace, name, .. } => Some((namespace.as_str(), "Artifact", name.as_str())),
             CommandAction::RepositoryRemoteRemove { namespace, name, .. } => Some((namespace.as_str(), "Repository", name.as_str())),
             CommandAction::ResourceApply { namespace, document } => match (
                 document.get("kind").and_then(serde_json::Value::as_str),
@@ -5557,10 +5558,34 @@ impl InProcessDaemon {
         result
     }
 
+    async fn execute_action_artifact_reserve_ledger_comment(&self, id: u64, command: &Command) -> Result<u64, String> {
+        let CommandAction::ArtifactReserveLedgerComment { namespace, name, address } = &command.action else {
+            return Err("ledger reservation selected the wrong handler".into());
+        };
+        let identity = self.start_context_free_command(id, command.description().to_string());
+        let result = match flotilla_resources::reserve_ledger_comment_creation(&self.resource_backend, namespace, name, address).await {
+            Ok(granted) => CommandValue::LedgerCommentCreationReserved { granted },
+            Err(error) => CommandValue::Error { message: error.to_string() },
+        };
+        self.finish_context_free_command(id, identity, result);
+        Ok(id)
+    }
+
     async fn execute_action_resource_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ResourceApply { namespace, document } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let result = match apply_resource_document(&self.resource_backend, namespace, document.clone()).await {
+            // Artifact puts and creation reservations share one resource version.
+            // Retry optimistic conflicts without replacing authority-owned status.
+            let mut applied = apply_resource_document(&self.resource_backend, namespace, document.clone()).await;
+            if document.get("kind").and_then(serde_json::Value::as_str) == Some("Artifact") {
+                for _ in 0..15 {
+                    if !matches!(applied, Err(ResourceError::Conflict { .. })) {
+                        break;
+                    }
+                    applied = apply_resource_document(&self.resource_backend, namespace, document.clone()).await;
+                }
+            }
+            let result = match applied {
                 Ok(applied) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
                     kind: applied.kind,
                     plural: applied.plural,
@@ -6938,6 +6963,9 @@ impl InProcessDaemon {
         }
 
         match &command.action {
+            CommandAction::ArtifactReserveLedgerComment { .. } => {
+                return boxed_action!(self.execute_action_artifact_reserve_ledger_comment(id, &command))
+            }
             flotilla_protocol::CommandAction::ResourceApply { .. } => {
                 return boxed_action!(self.execute_action_resource_apply(id, &command))
             }

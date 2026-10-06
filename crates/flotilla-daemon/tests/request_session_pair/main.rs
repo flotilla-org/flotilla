@@ -2032,6 +2032,92 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
     assert!(error.contains("artifact address cannot change"), "unexpected routed error: {error}");
 }
 
+// #2623: callers on different hosts compete at the same artifact authority.
+// A retry (including a lost reservation response) must never grant another POST.
+async fn ledger_creation_authority_scenario(steps: Vec<(bool, u64)>) {
+    let caller = empty_daemon_named("ledger-caller").await;
+    let authority = empty_daemon_named("ledger-authority").await;
+    let topology = spawn_in_memory_request_topology(caller.clone(), authority.clone()).await.expect("ledger topology");
+    let namespace = "flotilla";
+    let name = flotilla_resources::artifact_record_name("ledger", "coder", "decision-ledger", "ledger");
+    let spec = flotilla_resources::ArtifactSpec::builder()
+        .convoy("ledger".into())
+        .producer("coder".into())
+        .kind("decision-ledger".into())
+        .subject("ledger".into())
+        .digest("digest".into())
+        .size(1)
+        .media_type("text/markdown".into())
+        .expires_at(Utc::now())
+        .build();
+    authority
+        .resource_backend()
+        .using::<Artifact>(namespace)
+        .create(&InputMeta::builder().name(name.clone()).build(), &spec)
+        .await
+        .expect("authority envelope");
+    let mut granted = BTreeSet::new();
+    for (remote, number) in steps {
+        let command = Command::builder()
+            .node_id(authority.node_id().clone())
+            .action(CommandAction::ArtifactReserveLedgerComment {
+                namespace: namespace.into(),
+                name: name.clone(),
+                address: flotilla_protocol::LeafAddress::ChangeRequest { service: "github.com".into(), scope: "acme/repo".into(), number },
+            })
+            .build();
+        let mut remote_events = caller.subscribe();
+        let mut local_events = authority.subscribe();
+        // Each operation contains the pinned remote/local collision; the drawn
+        // bit varies which contender receives the first dispatch opportunity.
+        let (remote_id, local_id) = if remote {
+            tokio::join!(topology.client.execute(command.clone()), authority.execute(command))
+        } else {
+            let (local, remote) = tokio::join!(authority.execute(command.clone()), topology.client.execute(command));
+            (remote, local)
+        };
+        let (one, two) = tokio::join!(
+            await_command_result(&mut remote_events, remote_id.expect("remote reservation")),
+            await_command_result(&mut local_events, local_id.expect("local reservation"))
+        );
+        let grants = [one, two]
+            .into_iter()
+            .map(|result| match result {
+                CommandValue::LedgerCommentCreationReserved { granted } => usize::from(granted),
+                other => panic!("unexpected reservation result: {other:?}"),
+            })
+            .sum::<usize>();
+        assert_eq!(grants, usize::from(granted.insert(number)), "one durable grant per binding across hosts and retries");
+        let resolver = authority.resource_backend().using::<Artifact>(namespace);
+        let current = resolver.get(&name).await.expect("authority status");
+        assert_eq!(current.status.as_ref().expect("reserved").ledger_comment_creations.len(), granted.len());
+        // A later ledger revision must preserve every binding's creation identity.
+        resolver.update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec).await.expect("revision");
+        assert!(
+            caller.resource_backend().using::<Artifact>(namespace).get(&name).await.is_err(),
+            "caller must not author a second envelope"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ledger_creation_authority_serializes_cross_host_callers() {
+    ledger_creation_authority_scenario(vec![(true, 42), (false, 42), (false, 43), (true, 43)]).await;
+}
+
+// Generated routing scenario: remote/local dispatch order, repeated bindings,
+// and independently bound PRs. Check the durable grant invariant after each step.
+#[hegel::test]
+fn generated_ledger_creation_authority_preserves_single_grants(tc: hegel::TestCase) {
+    let count = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+    let steps = (0..count).map(|_| (tc.draw(gs::booleans()), tc.draw(gs::integers::<u64>().min_value(41).max_value(43)))).collect();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(ledger_creation_authority_scenario(steps));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArtifactEnvironment {
     LocalHostDirect,

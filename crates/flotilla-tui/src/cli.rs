@@ -1182,6 +1182,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
     use flotilla_protocol::commands::CommandValue;
     match result {
         CommandValue::CrewTurnDelivered { rung } => format!("Crew turn delivered: {rung:?}"),
+        CommandValue::LedgerCommentCreationReserved { granted } => format!("ledger comment creation granted: {granted}"),
         CommandValue::Ok => "ok".to_string(),
         CommandValue::CrewFollowUpDelivered => flotilla_protocol::commands::CREW_FOLLOW_UP_INSTRUCTION.to_string(),
         CommandValue::CrewCompletionWaiting { reason, retry_at } => format!("crew completion waiting until {retry_at}: {reason}"),
