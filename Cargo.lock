@@ -1470,6 +1470,7 @@ dependencies = [
  "tui-input",
  "unicode-width",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

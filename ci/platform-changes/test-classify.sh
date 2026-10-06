@@ -27,6 +27,9 @@ check "docs-only PR runs neither" pull_request false "docs/x.md" "" "windows=fal
 check "plain core change runs neither" pull_request false "crates/flotilla-core/src/x.rs" "$core_diff" "windows=false macos=false "
 check "client change runs Windows" pull_request false "crates/flotilla-client/src/lib.rs" "" "windows=true macos=false "
 check "CLI definition change runs Windows" pull_request false "crates/flotilla-commands/src/commands/convoy.rs" "" "windows=true macos=false "
+# Connector viewer-locality changes must run the Windows-client tests.
+check "connector locality runs Windows" pull_request false "crates/flotilla-tui/src/pm_connect.rs" "" "windows=true macos=false "
+check "connector tests run Windows" pull_request false "crates/flotilla-tui/src/pm_connect/tests.rs" "" "windows=true macos=false "
 check "transport change runs both" merge_group false "crates/flotilla-transport/src/message.rs" "" "windows=true macos=true "
 check "caller change runs macOS" pull_request false "crates/flotilla-daemon/src/server/caller.rs" "" "windows=false macos=true "
 # The compiler pin and its assertion are shared platform-job inputs.

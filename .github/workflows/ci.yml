@@ -289,6 +289,11 @@ jobs:
         run: |
           cargo --config 'profile.dev.package."*".debug=0' test --locked --bin flotilla remote_
           cargo --config 'profile.dev.package."*".debug=0' test --locked --bin flotilla daemon_endpoint_conflicts
+      - name: Test attach routing, raw-mode lifetime and viewer locality
+        run: |
+          cargo --config 'profile.dev.package."*".debug=0' check -p flotilla-tui --all-targets --locked
+          cargo --config 'profile.dev.package."*".debug=0' test -p flotilla-tui --locked --lib terminal::tests::
+          cargo --config 'profile.dev.package."*".debug=0' test -p flotilla-tui --locked --lib remote_connector_keeps_viewer_locality
       - name: Test Wheelhouse named-pipe HTTP contract
         run: "cargo --config 'profile.dev.package.\"*\".debug=0' test -p flotilla-manifest --locked --lib sink::tests::"
 

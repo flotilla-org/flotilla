@@ -4,6 +4,8 @@
 //! The test subscribes the TUI App directly to the daemon's broadcast channel
 //! and polls app.convoys() — no real socket needed.
 
+#![cfg(unix)]
+
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,

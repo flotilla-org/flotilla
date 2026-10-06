@@ -1,5 +1,7 @@
 //! #2523: the real PM connector consumes the daemon's resource-watch commands
 //! and Aggregator queries. No watch-accepting daemon mock is involved.
+#![cfg(unix)]
+
 use std::{
     sync::{Arc, Mutex},
     time::Duration,

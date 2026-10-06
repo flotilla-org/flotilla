@@ -492,3 +492,57 @@ operator_login = "your-login"
 ```
 
 When this is unset, `review_requested_from_owner` remains Unknown rather than assuming that the repository owner is the operator.
+
+## Windows viewers and attached terminals
+
+A Windows viewer connects to an existing daemon over OpenSSH; it does not run a
+local daemon. For example, in PowerShell:
+
+```powershell
+$env:FLOTILLA_DAEMON = "ssh://crew@kiwi"
+flotilla pm connect # inside Wheelhouse, which supplies WHEELHOUSE_SOCKET
+flotilla attach --host kiwi <session-or-role-reference>
+```
+
+Use Windows Terminal (ConPTY) and the native Windows OpenSSH client (`ssh.exe`
+on PATH). Authenticate and accept the server's host key with an interactive
+`ssh crew@kiwi` first. Both the daemon bridge and attachment use batch
+authentication. The remote account must find `flotilla` in its login-shell PATH.
+
+The daemon endpoint and terminal route are separate: the endpoint supplies
+fleet metadata and resolves the session; the viewer opens SSH to the resolved
+binding's host. Add routes to the **Windows viewer's** `hosts.toml` in its
+Flotilla config directory (or select that directory with `--config-dir`):
+
+```toml
+[hosts.kiwi]
+hostname = "kiwi" # Windows OpenSSH config alias or reachable DNS name
+user = "crew"
+expected_host_name = "kiwi" # Flotilla host identity, not necessarily DNS
+ssh_multiplex = false
+```
+
+Add one entry per host the viewer attaches to, even when it is also the daemon
+endpoint. Multiple entries for the same `expected_host_name` are ambiguous and
+are refused. Windows OpenSSH does not need Unix ControlMaster sockets.
+The connector uses the Windows machine's hostname for local reachability when
+its daemon is remote; copying the daemon's `host_name` setting does not make
+that remote host local.
+
+Attachment inherits the real console handles. Native OpenSSH carries console
+size changes to its remote PTY; Flotilla scopes raw input mode to the SSH child
+and restores it after exit or a spawn/wait error. No byte-copying pipe is placed
+between OpenSSH and ConPTY.
+
+Remote-daemon attachment uses the same viewer-side routing on Linux and macOS:
+SSH batch authentication avoids unattended prompts, and a login shell finds the
+remote account's Flotilla executable. Attach consumes `hostname` and optional
+`user` from `hosts.toml`; configure ports, identity files and jump hosts in the
+viewer's native OpenSSH config under that hostname/alias. `hosts.toml` has no
+port, identity-file or jump-host fields. Viewer attaches do not use daemon-side
+SSH multiplex settings.
+
+For a remote endpoint, `flotilla --json attach --host kiwi <reference>` resolves
+and prints the **viewer-side SSH plan**, rather than the daemon-relative
+terminal-pool command. It does not start the attachment. With a local daemon,
+JSON output retains the daemon-relative plan.

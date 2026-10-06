@@ -1279,11 +1279,12 @@ impl Command {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct AttachBinding {
-    /// Host whose daemon owns the session.
+    /// Host whose daemon owns the attach target, including transient checkouts.
     pub host: crate::HostName,
     pub namespace: String,
     /// Session name. Absent when resolution is delegated cross-host and the
-    /// local daemon only knows the target host, not the remote session.
+    /// local daemon only knows the target host, not the remote session. Also
+    /// absent for transient checkouts, which have no durable session identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

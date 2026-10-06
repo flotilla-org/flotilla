@@ -79,5 +79,6 @@ absolute-paths-allowed-crates = [
     "urlencoding",
     "uuid",
     "visibility",
+    "windows_sys",
     "worker",
 ]
