@@ -52,8 +52,8 @@ GENERATION_PATTERN = re.compile(r"^(\d{8}T\d{6}Z-r\d+-f([0-9a-f]{12})-c([0-9a-f]
 # Component metadata is embedded in the signed v2 pin list, so compatibility
 # claims are authenticated together with the identity and archive digest.
 COMPONENT_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
-FACT_PATTERN = re.compile(r"^([a-z][a-z0-9-]*(?::[a-z0-9][a-z0-9_.-]*)+)(?:=([0-9]+))?$")
-REQUIREMENT_PATTERN = re.compile(r"^([a-z][a-z0-9-]*(?::[a-z0-9][a-z0-9_.-]*)+)(?:(=|>=)([0-9]+))?$")
+FACT_PATTERN = re.compile(r"^([a-z][a-z0-9-]*(?::[a-z0-9][a-z0-9_.-]*)+)(?:=(0|[1-9][0-9]*))?$")
+REQUIREMENT_PATTERN = re.compile(r"^([a-z][a-z0-9-]*(?::[a-z0-9][a-z0-9_.-]*)+)(?:(=|>=)(0|[1-9][0-9]*))?$")
 INDEPENDENT_PLATFORM = "platform-independent"
 
 
@@ -304,7 +304,12 @@ def validate_component(document):
 
 
 def validate_composition(components, platform):
-    """Refuse missing facts in one platform's validated effective pin set."""
+    """Refuse missing facts in one platform's validated effective pin set.
+
+    Callers must run validate_component on every pin and refuse duplicate
+    component names. Ownership checks then make fact-key collisions impossible: no other
+    component can provide facts in a pin's namespace.
+    """
     facts = {}
     for component in components:
         for fact in component["provides"]:
@@ -387,12 +392,19 @@ def verify_generation_signature(manifest, signature, trusted_certificate):
 
     Structural validation does not establish authenticity. Never trust a
     certificate shipped by the candidate. Ignore embedded signer certificates
-    and use only the provisioning-owned trust anchor supplied by the caller.
+    and use only the provisioning-owned exact leaf-certificate pin supplied by
+    the caller, not a CA certificate or a chain trust store. -noverify disables
+    chain, validity-period and purpose checks; revocation is not checked either.
+    Expired certificates remain usable for rollback while explicitly provisioned.
+    Withdrawing a signer requires removing its pin from provisioning.
     """
-    result = subprocess.run(
-        ["openssl", "cms", "-verify", "-binary", "-inform", "DER", "-in", str(signature),
-         "-content", str(manifest), "-nointern", "-certfile", str(trusted_certificate),
-         "-noverify", "-out", os.devnull], capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            ["openssl", "cms", "-verify", "-binary", "-inform", "DER", "-in", str(signature),
+             "-content", str(manifest), "-nointern", "-certfile", str(trusted_certificate),
+             "-noverify", "-out", os.devnull], capture_output=True, text=True)
+    except FileNotFoundError as error:
+        raise ValidationError("OpenSSL CMS verifier is unavailable") from error
     if result.returncode != 0:
         raise ValidationError("generation signature does not verify against the trusted certificate")
 
@@ -524,6 +536,8 @@ def validate_fixture(path):
     document = fixture["manifest"]
     sources, _ = validate_generation(document, fixture["generation"])
     if document["schema_version"] == 2:
+        # V2 fixtures exercise the pin list, not a monolithic bundle payload.
+        # Component archive verification belongs to the component installer.
         return
     payload = fixture.get("payload", sorted(REQUIRED_PAYLOAD))
     if not REQUIRED_PAYLOAD.issubset(payload) or any(not allowed_payload(item) for item in payload):

@@ -2,10 +2,12 @@
 import copy
 import itertools
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import generation_validation as validation
@@ -114,6 +116,36 @@ class ComponentValidationTests(unittest.TestCase):
         with self.assertRaises(validation.ValidationError):
             validation.validate_component(valid)
 
+    # Numeric compatibility facts have a single decimal spelling so measured
+    # protocol facts and the generation's integer diagnostic agree lexically.
+    def test_canonical_numeric_facts(self):
+        for number in ("0", "7", "20", "4294967295"):
+            for operator in ("=", ">="):
+                pin = component("porthole", validation.PLATFORMS[0],
+                                [f"porthole:protocol={number}"], [f"porthole:protocol{operator}{number}"])
+                validation.validate_component(pin)
+                validation.validate_composition([pin], validation.PLATFORMS[0])
+        for number in ("00", "07", "020"):
+            for field, operators in (("provides", ("=",)), ("requires", ("=", ">="))):
+                for operator in operators:
+                    pin = component("porthole", validation.PLATFORMS[0])
+                    pin[field] = [f"porthole:protocol{operator}{number}"]
+                    with self.subTest(field=field, number=number, operator=operator), self.assertRaises(validation.ValidationError):
+                        validation.validate_component(pin)
+
+    # The library and CLI both refuse a missing verifier executable cleanly.
+    # The fake stands at the subprocess boundary to simulate absent OpenSSL.
+    def test_missing_openssl(self):
+        with mock.patch.object(validation.subprocess, "run", side_effect=FileNotFoundError("openssl")):
+            with self.assertRaisesRegex(validation.ValidationError, "OpenSSL.*unavailable"):
+                validation.verify_generation_signature("manifest", "signature", "trusted.pem")
+        with tempfile.TemporaryDirectory() as empty_path:
+            result = subprocess.run([sys.executable, validation.__file__, "verify-signature", "manifest", "signature", "trusted.pem"],
+                                    env=dict(os.environ, PATH=empty_path), capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("OpenSSL", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
     # V2 refuses empty cohorts, misplaced/duplicate pins, conflicting source
     # identities, signing contracts and generation/protocol mismatches.
     def test_invalid_generation(self):
@@ -208,6 +240,19 @@ class ComponentValidationTests(unittest.TestCase):
             for trust in (root / "foreign.pem", root / "missing.pem"):
                 with self.assertRaises(validation.ValidationError):
                     validation.verify_generation_signature(manifest, signature, trust)
+            # Adding a foreign embedded certificate cannot change the pinned
+            # signer, nor can embedding the trusted certificate bless a foreign
+            # signature. The genuine signer certificate is embedded by CMS too.
+            for signer, embedded, accepted in (("trusted", "foreign", True), ("foreign", "trusted", False)):
+                other_signature = root / f"{signer}-with-{embedded}.cms"
+                openssl("cms", "-sign", "-binary", "-md", "sha256", "-in", manifest,
+                        "-signer", root / f"{signer}.pem", "-inkey", root / f"{signer}.key",
+                        "-certfile", root / f"{embedded}.pem", "-outform", "DER", "-out", other_signature)
+                if accepted:
+                    validation.verify_generation_signature(manifest, other_signature, root / "trusted.pem")
+                else:
+                    with self.assertRaises(validation.ValidationError):
+                        validation.verify_generation_signature(manifest, other_signature, root / "trusted.pem")
             manifest.write_text(manifest.read_text() + "\n")
             with self.assertRaises(validation.ValidationError):
                 validation.verify_generation_signature(manifest, signature, root / "trusted.pem")

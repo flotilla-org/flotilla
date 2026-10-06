@@ -58,7 +58,9 @@ digits, dots, underscores and hyphens. A component may provide only facts in
 its own namespace, with one value per fact key. Requirements accept a bare
 fact (presence), `=N` (numeric equality), or `>=N` (numeric minimum). Numeric
 requirements cannot be met by a bare presence flag. Other comparison operators,
-negative numbers and semver ranges refuse rather than being silently ignored.
+negative numbers, leading zeros (except the number `0`) and semver ranges
+refuse rather than being silently ignored. Numeric facts and requirements use
+one canonical decimal spelling, consistent with the generation protocol integer.
 
 ## Generation manifest (schema version 2)
 
@@ -135,7 +137,14 @@ python3 generation_validation.py verify-signature generation.json generation.jso
 
 `verify-signature` uses OpenSSL CMS verification with only the explicit signer
 certificate (`-nointern -certfile`); certificate-chain discovery is disabled
-because trust is an exact provisioned certificate pin. A structural pass alone
+because trust is an exact provisioned **leaf signer certificate** pin, not a CA
+certificate. `-noverify` disables chain, validity-period and purpose checks;
+revocation is not checked either. An expired or revoked certificate still
+verifies while explicitly provisioned, preserving rollback to old signed
+releases. Provisioning must remove a signer's pin to withdraw trust; this
+verifier does not discover revocation or accept a CA as authority for new
+signers. Embedded certificates never expand the pinned signer set.
+A structural pass alone
 never establishes authenticity. Installers must verify the signature and archive
 digests before trusting any component code. The v1 `release` verifier explicitly
 refuses v2, preventing accidental treatment of a pin list as a monolithic
