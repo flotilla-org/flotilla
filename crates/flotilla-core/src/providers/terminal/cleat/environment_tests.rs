@@ -16,7 +16,7 @@ use crate::{
     },
 };
 
-// Process boundary: emulate Cleat's additive/default and proposed declared
+// Process boundary: emulate Cleat's additive/default and declared
 // spawn contracts, with an already-running daemon polluted independently of
 // the environment of the Flotilla client that sends the launch request.
 struct CleatProcessFake {
@@ -63,8 +63,10 @@ impl CommandRunner for CleatProcessFake {
         self.clients.lock().expect("clients").push(environment.clone());
         match arguments.first().copied() {
             Some("list") => Ok("[]".into()),
+            Some("kill") => Ok(String::new()),
             Some("launch") if arguments.contains(&"--help") => Ok(if self.supports_clear { "--env-clear --env" } else { "--env" }.into()),
             Some("launch") => {
+                let coordinates = environment.clone();
                 let mut child = if self.daemon_from_client { environment } else { polluted_environment() };
                 if arguments.contains(&"--env-clear") {
                     if !self.supports_clear {
@@ -72,9 +74,10 @@ impl CommandRunner for CleatProcessFake {
                     }
                     child.clear();
                 }
-                // Cleat, rather than the outer terminal, owns VT identity.
-                child.insert("TERM".into(), "xterm-ghostty".into());
+                // Cleat owns VT identity; use its portable terminfo fallback in this fake.
+                child.insert("TERM".into(), "xterm-256color".into());
                 child.insert("COLORTERM".into(), "truecolor".into());
+                child.insert("TERM_PROGRAM".into(), "ghostty".into());
                 // Cleat's validate_environment refuses its own session coordinates.
                 const MANAGED: [&str; 4] = ["CLEAT_RUNTIME_DIR", "CLEAT_DAEMON", "CLEAT_SESSION", "CLEAT_OUTPUT_DAEMON"];
                 for pair in arguments.windows(2).filter(|pair| pair[0] == "--env") {
@@ -87,6 +90,14 @@ impl CommandRunner for CleatProcessFake {
                     }
                     child.insert(key.into(), value.into());
                 }
+                // Mint coordinates after overrides, as the daemon does.
+                for key in ["CLEAT_RUNTIME_DIR", "CLEAT_DAEMON"] {
+                    if let Some(value) = coordinates.get(key) {
+                        child.insert(key.into(), value.clone());
+                    }
+                }
+                let id = arguments.iter().position(|arg| *arg == "--record").map(|index| arguments[index + 1]).unwrap_or("crew");
+                child.insert("CLEAT_SESSION".into(), id.into());
                 *self.child.lock().expect("child") = Some(child);
                 Ok("{}".into())
             }
@@ -101,84 +112,6 @@ impl CommandRunner for CleatProcessFake {
     async fn exists(&self, _cmd: &str, _args: &[&str]) -> bool {
         false
     }
-}
-
-// #2706: arbitrary ambient values and unrelated harness credentials must not
-// reach the crew, even when the serving daemon is already contaminated.
-#[tokio::test]
-async fn crew_environment_excludes_the_daemons_ambient_variables() {
-    let runner = Arc::new(CleatProcessFake {
-        supports_clear: true,
-        daemon_from_client: false,
-        clients: Mutex::new(Vec::new()),
-        child: Mutex::new(None),
-    });
-    let bag = EnvironmentBag::new()
-        .with(EnvironmentAssertion::env_var("HOME", "/crew/home"))
-        .with(EnvironmentAssertion::env_var("FLOTILLA_DAEMON_SOCKET", "/run/flotilla-daemon/daemon.sock"))
-        .with(EnvironmentAssertion::env_var("FLOTILLA_CONTAINED_HOST_DAEMON", "1"))
-        .with(EnvironmentAssertion::env_var("CARGO_PROFILE_DEV_DEBUG", "line-tables-only"));
-    let pool = CleatTerminalPool::new(runner.clone(), "cleat", &bag);
-    let declared = vec![
-        ("CLAUDE_CODE_ENTRYPOINT".into(), "declared-adapter".into()),
-        ("EMPTY".into(), "".into()),
-        ("TEXT".into(), "spaces = 'quotes'".into()),
-    ];
-    pool.ensure_session("crew", "codex", &ExecutionEnvironmentPath::new("/repo"), &declared, &[]).await.expect("launch");
-    let child = runner.child.lock().expect("child");
-    let child = child.as_ref().expect("launched crew");
-    for key in ["NO_COLOR", "CLAUDECODE", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "ARBITRARY_AMBIENT"] {
-        assert!(!child.contains_key(key), "ambient {key} leaked to crew");
-    }
-    assert_eq!(child.get("HOME").map(String::as_str), Some("/crew/home"));
-    assert_eq!(child.get("FLOTILLA_DAEMON_SOCKET").map(String::as_str), Some("/run/flotilla-daemon/daemon.sock"));
-    assert_eq!(child.get("FLOTILLA_CONTAINED_HOST_DAEMON").map(String::as_str), Some("1"));
-    assert_eq!(child.get("CARGO_PROFILE_DEV_DEBUG").map(String::as_str), Some("line-tables-only"));
-    for (key, value) in declared {
-        assert_eq!(child.get(&key), Some(&value));
-    }
-    assert_eq!(child.get("TERM").map(String::as_str), Some("xterm-ghostty"));
-    assert_eq!(child.get("COLORTERM").map(String::as_str), Some("truecolor"));
-}
-
-// #2706: any Flotilla client operation can start a daemon on demand. Every
-// such invocation must use the controlled host baseline, with no ambient leak.
-#[tokio::test]
-async fn on_demand_daemon_starts_without_the_clients_ambient_variables() {
-    let runner = Arc::new(CleatProcessFake {
-        supports_clear: true,
-        daemon_from_client: false,
-        clients: Mutex::new(Vec::new()),
-        child: Mutex::new(None),
-    });
-    let pool = CleatTerminalPool::new(runner.clone(), "cleat", &EnvironmentBag::new());
-    pool.list_sessions().await.expect("list starts daemon");
-    let clients = runner.clients.lock().expect("clients");
-    assert_eq!(clients.len(), 1);
-    for key in ["NO_COLOR", "CLAUDECODE", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN", "ARBITRARY_AMBIENT"] {
-        assert!(!clients[0].contains_key(key), "ambient {key} leaked to daemon startup");
-    }
-    assert!(clients[0].contains_key("PATH"));
-}
-
-// Until cleat#318 ships, old binaries launch without --env-clear rather than
-// refusing every crew (flotilla#2756). Declared variables are still passed,
-// and the session inherits only the daemon's environment. Restore the refusal
-// when the fleet's cleat supports --env-clear.
-#[tokio::test]
-async fn old_cleat_launches_without_env_clear() {
-    let runner = Arc::new(CleatProcessFake {
-        supports_clear: false,
-        daemon_from_client: false,
-        clients: Mutex::new(Vec::new()),
-        child: Mutex::new(None),
-    });
-    let pool = CleatTerminalPool::new(runner.clone(), "cleat", &EnvironmentBag::new());
-    pool.ensure_session("crew", "codex", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[])
-        .await
-        .expect("old cleat launches without --env-clear");
-    let child = runner.child.lock().expect("child").clone().expect("session launched");
-    assert_eq!(child.get("TERM").map(String::as_str), Some("xterm-ghostty"));
 }
 
 // Process boundary: run real commands with injected contamination on just
@@ -324,3 +257,7 @@ fn docker_crew_preserves_vessel_environment(tc: hegel::TestCase) {
         }
     });
 }
+
+#[cfg(target_os = "linux")]
+#[path = "environment_contract.rs"]
+mod environment_contract;
