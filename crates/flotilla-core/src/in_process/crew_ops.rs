@@ -438,6 +438,10 @@ async fn queue_crew_message_object(
 }
 
 impl CrewService {
+    pub(super) fn message_observation_staleness(&self) -> (std::time::Duration, std::time::Duration) {
+        (self.leaf_subscriptions.change_request_stale_after(), self.leaf_subscriptions.issue_stale_after())
+    }
+
     pub(super) async fn subscribe_wait(
         &self,
         connection_id: uuid::Uuid,

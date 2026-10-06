@@ -419,3 +419,88 @@ async fn current_position_reads_only_collection_metadata() {
     let request = request.await.expect("request");
     assert!(request.starts_with("GET /apis/flotilla.work/v1/namespaces/flotilla/convoys HTTP/1.1"));
 }
+
+// API-server resource versions can be opaque or exceed a fixed integer width.
+// Admission preserves the CAS token verbatim and falls back to creation order.
+#[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "requires socket bind")]
+async fn message_admission_accepts_opaque_and_large_kubernetes_versions() {
+    use flotilla_resources::{InputMeta, MessageAdmission, MessageExpectation, MessageInbox, MessageRelation, MessageSpec};
+    for version in ["opaque-create-token", "184467440737095516160000"] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind Kubernetes stand-in");
+        let address = listener.local_addr().expect("server address");
+        let intent = MessageSpec::builder()
+            .sender("system:checks".into())
+            .receiver("flotilla/governor".into())
+            .relation(MessageRelation::System)
+            .body("settled checks".into())
+            .expectation(MessageExpectation::Reply)
+            .build();
+        let object = serde_json::json!({"apiVersion":"flotilla.work/v1","kind":"Message",
+            "metadata":{"name":"partial","namespace":"flotilla","resourceVersion":version,"creationTimestamp":"2026-04-13T12:00:00Z"},"spec":intent});
+        // HTTP boundary stand-in enforces the point-read, collection-read and
+        // status-CAS requests used to recover a created-but-unadmitted record.
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for index in 0..3 {
+                let (mut socket, _) = listener.accept().await.expect("accept admission request");
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let header_end = loop {
+                    let count = socket.read(&mut buffer).await.expect("read request headers");
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|length| length.trim().parse::<usize>().expect("content length"))
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < header_end + length {
+                    let count = socket.read(&mut buffer).await.expect("read request body");
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(bytes).expect("UTF-8 request");
+                let body = match index {
+                    0 => {
+                        assert!(request.starts_with("GET /apis/flotilla.work/v1/namespaces/flotilla/messages/partial "));
+                        object.clone()
+                    }
+                    1 => {
+                        assert!(request.starts_with("GET /apis/flotilla.work/v1/namespaces/flotilla/messages "));
+                        serde_json::json!({"metadata":{"resourceVersion":version},"items":[object]})
+                    }
+                    _ => {
+                        assert!(request.starts_with("PUT /apis/flotilla.work/v1/namespaces/flotilla/messages/partial/status "));
+                        let patch: serde_json::Value = serde_json::from_str(&request[header_end..]).expect("status body");
+                        assert_eq!(patch["metadata"]["resourceVersion"], version, "CAS must retain the opaque token");
+                        let mut result = object.clone();
+                        result["status"] = patch["status"].clone();
+                        result["metadata"]["resourceVersion"] = serde_json::json!("after-status-token");
+                        result
+                    }
+                };
+                socket.write_all(response("200 OK", &body.to_string()).as_bytes()).await.expect("write API response");
+                socket.shutdown().await.expect("close connection");
+                requests.push(request);
+            }
+            requests
+        });
+        let backend = ResourceBackend::Http(HttpBackend::new(flotilla_resources::tls::client(), format!("http://{address}")));
+        let admission = MessageInbox::new(backend, "flotilla")
+            .accept(&InputMeta::builder().name("partial".into()).build(), &intent, chrono::Utc::now())
+            .await
+            .expect("opaque-version admission");
+        let MessageAdmission::Accepted(message) = admission else { panic!("admitted record") };
+        assert!(message.status.expect("admission status").accepted_sequence.is_none());
+        assert_eq!(timeout(Duration::from_secs(5), server).await.expect("server completed").expect("HTTP contract").len(), 3);
+    }
+}

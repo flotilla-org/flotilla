@@ -34,6 +34,7 @@ pub use image_layer::{
     PlacedImageIdentity, ResolvedImageInputs, IMAGE_LAYERS_ANNOTATION,
 };
 mod definition;
+pub mod delivery_hold;
 mod digest;
 pub use digest::{digest_bucket, DigestQuery, PartitionDigest, DIGEST_FANOUT};
 mod dispatch_hold;
@@ -54,6 +55,8 @@ mod landing_gate;
 mod leaf;
 mod manifest_root;
 mod message;
+mod message_conditions;
+mod message_delivery;
 mod message_inbox;
 mod owner_gc;
 mod placement_policy;
@@ -285,6 +288,7 @@ pub use message::{
     Message, MessageExpectation, MessagePhase, MessageReference, MessageRelation, MessageSpec, MessageStatus, MessageStatusPatch,
     MessageSubmission, ResolvedMessageReceiver,
 };
+pub use message_delivery::{MessageBatch, MessageObservation, MessageTransport, MessageTransportOutcome};
 pub use message_inbox::{
     message_expectation_open, message_supersedes, qualify_message_address, qualify_message_spec, resolve_message_receiver,
     validate_message_address, MessageAddressContext, MessageAdmission, MessageInbox,

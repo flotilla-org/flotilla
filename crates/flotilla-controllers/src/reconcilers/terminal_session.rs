@@ -7,12 +7,13 @@ use flotilla_resources::{
     api_version,
     controller::{Actuation, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
     Convoy, ConvoyPhase, CrewMessageDelivery, Demand, DemandAddressee, DemandKind, DemandSpec, Environment, EnvironmentPhase, InputMeta,
-    LifecycleAuthority, OwnerReference, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
-    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase,
-    TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, Vessel, ACTUATOR_HOST_REF_ANNOTATION,
-    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG,
-    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
-    TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON, TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
+    LifecycleAuthority, Message, OwnerReference, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject,
+    ResourceProvenance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession,
+    TerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, Vessel,
+    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION,
+    CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION,
+    CREDENTIAL_SCOPES_SESSION_TAG, TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON,
+    TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -166,6 +167,7 @@ pub struct TerminalSessionReconciler<R> {
     environments: TypedResolver<Environment>,
     vessels: TypedResolver<Vessel>,
     demands: TypedResolver<Demand>,
+    messages: TypedResolver<Message>,
     local_host_ref: Option<CanonicalHostId>,
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
 }
@@ -179,6 +181,7 @@ impl<R> TerminalSessionReconciler<R> {
             federated_convoys: None,
             environments: backend.clone().using::<Environment>(namespace),
             vessels: backend.clone().using::<Vessel>(namespace),
+            messages: backend.clone().using::<Message>(namespace),
             demands: backend.using::<Demand>(namespace),
             local_host_ref: None,
             additional_host_refs: Default::default(),
@@ -343,10 +346,10 @@ pub enum TerminalPrepared {
     Failed(String),
 }
 
-const DELIVERY_MAX_ATTEMPTS: u32 = 3;
-// Ambiguous writes are never retried. Allow late evidence for five minutes,
-// then surface a durable failure for explicit intervention.
-const DELIVERY_HOLD_FOR: chrono::Duration = chrono::Duration::minutes(5);
+use flotilla_resources::delivery_hold::{
+    delivery_acceptance_evidence, delivery_demand, delivery_demand_name, delivery_retry_delay, delivery_retry_exhausted, DELIVERY_HOLD_FOR,
+    DELIVERY_MAX_ATTEMPTS, DELIVERY_WORKING_DEBOUNCE_FOR,
+};
 
 fn pending_delivery_hold(session: &ResourceObject<TerminalSession>) -> Option<&flotilla_resources::TerminalSessionDegradedCondition> {
     let status = session.status.as_ref()?;
@@ -360,10 +363,6 @@ fn pending_delivery_hold(session: &ResourceObject<TerminalSession>) -> Option<&f
     head.next_after(status.delivered_message_id.as_deref())
         .filter(|message| condition.message_id.as_deref() == Some(message.id.as_str()))
         .map(|_| condition)
-}
-
-fn delivery_retry_delay(failures: u32) -> Duration {
-    Duration::from_secs(60 * (1_u64 << failures.saturating_sub(1).min(2)))
 }
 
 fn retirement_pending(obj: &ResourceObject<TerminalSession>) -> bool {
@@ -485,12 +484,39 @@ where
             }
             if let flotilla_resources::TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
                 if let Some(message) = head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
+                    // A durable Message submission owns this incarnation's
+                    // transport until its receipt resolves, including restart.
+                    // This full scan is limited to sessions with a legacy queue;
+                    // migration removes that path in the next stack stage.
+                    let message_in_flight = self.messages.list().await?.items.iter().any(|message| {
+                        message.status.as_ref().is_some_and(|status| {
+                            !status.phase.is_terminal()
+                                && status.resolved_receiver.is_none()
+                                && status.submission.as_ref().is_some_and(|submission| {
+                                    submission.session == session_id
+                                        && obj
+                                            .status
+                                            .as_ref()
+                                            .and_then(|status| status.crew.as_ref())
+                                            .is_some_and(|crew| crew.id == submission.crew_id)
+                                })
+                        })
+                    });
+                    if message_in_flight {
+                        return self
+                            .runtime
+                            .observe_attention(session_id, &obj.spec)
+                            .await
+                            .map(|observation| observation.map_or(TerminalPrepared::MessageDeliveryPending, TerminalPrepared::Attention))
+                            .map_err(ResourceError::other);
+                    }
+
                     if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
                         condition.message_id.as_deref() == Some(message.id.as_str())
                             && (condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON
                                 || condition.reason == TERMINAL_DELIVERY_EXPIRED_REASON
                                 || (condition.reason == TERMINAL_DELIVERY_NOT_SUBMITTED_REASON
-                                    && (condition.consecutive_failures >= DELIVERY_MAX_ATTEMPTS
+                                    && (delivery_retry_exhausted(condition.consecutive_failures)
                                         || Utc::now().signed_duration_since(condition.observed_at)
                                             < chrono::Duration::from_std(delivery_retry_delay(condition.consecutive_failures))
                                                 .unwrap_or(chrono::Duration::MAX))))
@@ -749,7 +775,7 @@ where
                 }
                 TerminalPrepared::MessageDeliveryNotSubmitted { message_id, message } => {
                     let failures = obj.status.as_ref().map_or(1, |status| status.next_delivery_failure_count(message_id));
-                    let disposition = if failures >= DELIVERY_MAX_ATTEMPTS {
+                    let disposition = if delivery_retry_exhausted(failures) {
                         "retry budget exhausted; delivery held for explicit intervention"
                     } else {
                         "retrying with backoff"
@@ -860,11 +886,7 @@ where
             }
             _ => Vec::new(),
         };
-        let delivery_failure_visible = obj
-            .status
-            .as_ref()
-            .and_then(|status| status.degraded.as_ref())
-            .is_some_and(|condition| condition.reason == TERMINAL_DELIVERY_EXPIRED_REASON);
+        let delivery_failure_visible = flotilla_resources::delivery_hold::legacy_delivery_gate_needed(obj, now);
         if delivery_failure_visible
             && (consumed
                 || matches!(
@@ -879,8 +901,13 @@ where
                 || matches!(phase, TerminalSessionPhase::Stopped | TerminalSessionPhase::Failed | TerminalSessionPhase::Lost))
         {
             actuations.push(Actuation::DeleteDemand { name: delivery_demand_name(obj) });
-        } else if expired {
-            actuations.push(terminal_demand_actuation(obj, delivery_demand_name(obj)));
+        } else if expired
+            || matches!(prepared, TerminalPrepared::MessageDeliveryNotSubmitted { message_id, .. } if delivery_retry_exhausted(obj.status.as_ref().map_or(1, |status| status.next_delivery_failure_count(message_id))))
+        {
+            actuations.push({
+                let (meta, spec) = delivery_demand(obj);
+                Actuation::CreateDemand { meta, spec }
+            });
         }
         if let TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
             let delivered = obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref());
@@ -903,7 +930,7 @@ where
         }
         if let TerminalPrepared::MessageDeliveryNotSubmitted { message_id, .. } = prepared {
             let failures = obj.status.as_ref().map_or(1, |status| status.next_delivery_failure_count(message_id));
-            if failures < DELIVERY_MAX_ATTEMPTS {
+            if !delivery_retry_exhausted(failures) {
                 outcome.requeue_after = Some(delivery_retry_delay(failures));
             }
         }
@@ -1028,7 +1055,7 @@ fn held_delivery_consumed(
     // Tool hooks retain positive evidence after the turn ends and a Stop hook
     // replaces Working with Idle, including holds recovered after an upgrade.
     if stored_hook || status.last_tool_activity_at.is_some_and(|at| at > held_at) {
-        return true;
+        return delivery_acceptance_evidence(true, false, false, false, false);
     }
     let TerminalPrepared::Attention(observation) = prepared else { return false };
     // Hooks are authoritative. Screen Working must survive a debounce window,
@@ -1037,7 +1064,7 @@ fn held_delivery_consumed(
         working(attention)
             && (attention.source == TerminalAttentionSource::Hook
                 || status.attention.as_ref().is_some_and(|previous| {
-                    working(previous) && attention.as_of.signed_duration_since(previous.as_of) >= TerminalAttention::DEBOUNCE_FOR
+                    working(previous) && attention.as_of.signed_duration_since(previous.as_of) >= DELIVERY_WORKING_DEBOUNCE_FOR
                 }))
     });
     let changed_output = observation
@@ -1046,7 +1073,7 @@ fn held_delivery_consumed(
         .is_some_and(|digest| status.last_output_digest.as_ref().is_some_and(|previous| previous != digest));
     // A digest also changes on idle prompt/status redraws. Only combine it
     // with fresh Working evidence; otherwise wait for hooks or stable Working.
-    observed_working || (changed_output && observation.attention.as_ref().is_some_and(working))
+    delivery_acceptance_evidence(false, false, observation.attention.as_ref().is_some_and(working), observed_working, changed_output)
 }
 
 fn attention_demand_actuation(session: &ResourceObject<TerminalSession>, observation: &TerminalObservation) -> Actuation {
@@ -1058,10 +1085,6 @@ fn attention_demand_actuation(session: &ResourceObject<TerminalSession>, observa
     }
 
     terminal_demand_actuation(session, name)
-}
-
-fn delivery_demand_name(session: &ResourceObject<TerminalSession>) -> String {
-    format!("terminal-delivery-{}", session.metadata.name)
 }
 
 fn terminal_demand_actuation(session: &ResourceObject<TerminalSession>, name: String) -> Actuation {

@@ -3132,3 +3132,110 @@ async fn unchanged_attention_decisions_log_once() {
     assert!(output.contains("accept_observation"));
     assert!(output.contains("attention_source=Some(Screen)"));
 }
+
+// Durable ownership survives an adapter restart, but does not fence another incarnation.
+#[tokio::test]
+async fn message_submission_fences_legacy_input_for_its_original_incarnation() {
+    use flotilla_resources::{Message, MessagePhase, MessageRelation, MessageSpec, MessageStatus, MessageSubmission};
+    for (crew, session_id, fenced) in
+        [("current-crew", "cleat-session", true), ("older-crew", "cleat-session", false), ("current-crew", "older-session", false)]
+    {
+        let backend = ResourceBackend::InMemory(Default::default());
+        create_ready_environment(&backend, "env-a").await;
+        create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
+        let sessions = backend.clone().using::<TerminalSession>("flotilla");
+        let created = sessions
+            .create(&meta("term-a"), &TerminalSessionSpec {
+                env_ref: "env-a".to_string(),
+                role: "reviewer".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Agent {
+                    selector: flotilla_resources::Selector::for_capability("review"),
+                    brief: flotilla_resources::TerminalBrief {
+                        artifact_digest: None,
+                        path: ".flotilla/briefs/reviewer.md".into(),
+                        content: "brief".into(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(flotilla_resources::TerminalCrewContext {
+                        namespace: "flotilla".into(),
+                        convoy: "demo".into(),
+                        vessel_ref: "demo-review".into(),
+                    }),
+                    message: Some(flotilla_resources::TerminalCrewMessage {
+                        id: "message-new".into(),
+                        text: "Review the amended commit".into(),
+                        sender: Default::default(),
+                        delivery: Default::default(),
+                        acknowledged: Default::default(),
+                        following: Vec::new(),
+                    }),
+                },
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
+            })
+            .await
+            .expect("session");
+        let mut status = TerminalSessionStatus::default();
+        TerminalSessionStatusPatch::MarkRunning {
+            configured_limits: None,
+            session_id: "cleat-session".into(),
+            pid: None,
+            started_at: Utc::now(),
+            crew: Some(
+                flotilla_resources::CrewSessionStatus::builder()
+                    .id("current-crew".into())
+                    .adapter("codex".into())
+                    .stance("trusted".into())
+                    .build(),
+            ),
+            launch_command: "claude".into(),
+            delivered_message_id: None,
+        }
+        .apply(&mut status);
+        let session = sessions.update_status("term-a", &created.metadata.resource_version, &status).await.expect("running session");
+
+        let messages = backend.using::<Message>("flotilla");
+        let record = messages
+            .create(
+                &meta("durable-batch"),
+                &MessageSpec::builder()
+                    .sender("flotilla/checks".into())
+                    .receiver("flotilla/demo/review/reviewer".into())
+                    .relation(MessageRelation::System)
+                    .body("new message input".into())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        messages
+            .update_status(
+                &record.metadata.name,
+                &record.metadata.resource_version,
+                &MessageStatus::builder()
+                    .phase(MessagePhase::Deliverable)
+                    .since(Utc::now())
+                    .reason("waiting for recorded submission evidence".into())
+                    .submission(
+                        MessageSubmission::builder()
+                            .batch_id("batch".into())
+                            .crew_id(crew.into())
+                            .session(session_id.into())
+                            .started_at(Utc::now())
+                            .members(vec![record.metadata.name.clone()])
+                            .build(),
+                    )
+                    .build(),
+            )
+            .await
+            .unwrap();
+        // A fresh reconciler has no in-memory submission task to consult.
+        let runtime = Arc::new(DeliveringTerminalRuntime::default());
+        let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend, "flotilla");
+        let prepared = reconciler.prepare(&session).await.unwrap();
+        assert_eq!(runtime.delivered.lock().unwrap().len(), usize::from(!fenced));
+        if fenced {
+            assert!(matches!(prepared, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
+        }
+    }
+}

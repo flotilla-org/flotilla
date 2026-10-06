@@ -2,7 +2,7 @@
 
 Agent inputs are durable **Message** resources, homed on the receiver's host and created through ordinary cross-host mutations. Replication carries the records; transport adapters attempt delivery and record evidence. Turn rules, nudges, escalations, resumes, rulings and handoffs are producers of the same records rather than independent queues. This follows the owner ruling on [#2678](https://github.com/flotilla-org/flotilla/issues/2678) and amends ADR 0050: its cross-vessel carries become typed Message references, staged and visible from the receiver's location before delivery.
 
-Addresses are role-address strings: `project/convoy/vessel/role`, `project/role`, `fleet/role`, `principal:<name>` and system senders `flotilla/<subsystem>`. Convoy-relative addresses are qualified at creation; holders are resolved at delivery. An absent holder leaves the record waiting with a reason and since-timestamp. Delivered records retain the actual crew and session, independent of later holder changes.
+Addresses are role-address strings: `project/convoy/vessel/role`, `project/role`, `fleet/role`, `principal:<name>` and system senders `system:<subsystem>`. Convoy-relative addresses are qualified at creation; holders are resolved at delivery. An absent holder leaves the record waiting with a reason and since-timestamp. Delivered records retain the actual crew and session, independent of later holder changes.
 
 Messages declare notification (`none`), `reply` or `outcome` expectations, with optional deadlines. Replies link through `in_reply_to`; outcomes name condition leaves. A typed reference may be the subject, including its revision. The same sender and receiver regarding that subject revision replaces an undelivered predecessor and is suppressed while a delivered predecessor has an open expectation. A new revision is independent. A message without a subject supersedes only through an explicit predecessor ID. Content hashes and opaque producer keys do not define supersession.
 
@@ -21,3 +21,35 @@ Routing reads a replicated holder view, so its home decision may lag a holder ch
 If a crash left the successor intent stored before suppression could be decided, recovery retains that intent as a Superseded audit record with a typed `canonical_predecessor` reference. Every replay returns that predecessor, even after its expectation closes. Normal suppression still creates no successor record; GET of a recovered partial returns its audit status rather than pretending the creation never happened.
 
 Four-part addresses select both the named vessel and role, including when several roles share a vessel. A project role selects the unique agent holder of its declared standing convoy; its workload's internal terminal role may differ from the project role. Multiple holders are refused rather than guessed.
+
+### Owner rulings on delivery and addressing
+
+System producers use a distinct `system:<name>` sender namespace, such as
+`system:checks`. A correlated reply to a system sender is homed at the original
+Message's origin. It is durable reply evidence and does not require a system
+terminal. Project-role replies from a qualified crew address match the recorded
+receiver incarnation, rather than requiring textual address equality.
+
+A declared `project/role` with no current holder waits at its `ConvoyEnsure`
+origin. Holder absence is not a creation refusal. Fleet and principal routing
+remain deferred to #2658.
+
+Explicit `supersedes` replaces its target, including an open delivered
+expectation. Same-subject-revision repeats alone are suppressed by an open
+expectation. Replacement is not transport receipt evidence.
+
+Legacy terminal inputs and Message batches share the hold/evidence policy:
+three definitely-unsent attempts, the deployed 60/120/240-second retry schedule,
+five minutes before operator escalation, and fresh acceptance evidence including
+changed output accompanied by fresh Working. There is one receiver-scoped
+operator gate. An explicit operator batch failure preserves the uncertain input
+audit while closing that intent so later inbox work may proceed.
+
+Message reconciliation wakes on resource watches. One inbox deadline schedules
+actual retries, hold escalation, and debounce completion; waiting records do not
+each requeue every second. Transport calls run outside admission, and batch
+intent is revalidated and persisted under admission before submission.
+
+HTTP/Kubernetes resource versions are not assumed to fit an ordered `u64`.
+Admission uses the immutable creation timestamp and name fallback on that
+backend, retaining a numeric tie-breaker only for local backends.

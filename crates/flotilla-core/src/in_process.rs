@@ -5458,6 +5458,7 @@ impl InProcessDaemon {
             }
         }
         let target = match action {
+            CommandAction::MessageFailBatch { namespace, name, .. } => Some((namespace.as_str(), "Message", name.as_str())),
             CommandAction::ConvoyEnsureRoll { namespace, name } => Some((namespace.as_str(), "ConvoyEnsure", name.as_str())),
             CommandAction::ResourceDelete { namespace, kind, name, replica_origin: None }
             | CommandAction::ResourceStatusPatch { namespace, kind, name, .. }
@@ -5497,6 +5498,22 @@ impl InProcessDaemon {
         )
         .map_err(|error| error.to_string())?;
         let receiver = spec.receiver.as_str();
+        if receiver.starts_with("system:") {
+            let original_id = spec.in_reply_to.as_deref().ok_or("a system receiver requires a correlated reply")?;
+            let original = self
+                .resource_backend
+                .including_replicas::<flotilla_resources::Message>(namespace)
+                .get(original_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if original.object.spec.sender != receiver {
+                return Err("reply system receiver does not match the original sender".into());
+            }
+            return Ok(Some(match original.provenance {
+                ResourceProvenance::Local => self.node_id.clone(),
+                ResourceProvenance::Replica { origin_root, .. } => origin_root,
+            }));
+        }
         let parts = receiver.split('/').collect::<Vec<_>>();
         let receiver_convoy = if let [project, convoy_name, vessel, _role] = parts.as_slice() {
             let convoy = self
@@ -5555,6 +5572,56 @@ impl InProcessDaemon {
                 ResourceProvenance::Local => self.node_id.clone(),
                 ResourceProvenance::Replica { origin_root, .. } => origin_root,
             }));
+        }
+        if let [project, role] = parts.as_slice() {
+            if *project != "fleet" {
+                let declarations = self
+                    .resource_backend
+                    .including_replicas::<flotilla_resources::ConvoyEnsure>(namespace)
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut homes = declarations
+                    .items
+                    .into_iter()
+                    .filter(|declaration| declaration.object.spec.project_ref == *project && declaration.object.spec.role == *role);
+                if let Some(home) = homes.next() {
+                    if homes.next().is_some() {
+                        return Err("project role has multiple holder declarations".into());
+                    }
+                    // Definitions reads merge sources and report Local even
+                    // when the declaration exists only at a remote origin.
+                    // Keep the merged spec for selection, but recover the home
+                    // from the original stored declaration sources.
+                    let home = match &self.resource_backend {
+                        ResourceBackend::Http(_) => home,
+                        _ => {
+                            let sources = self
+                                .resource_backend
+                                .including_replicas::<flotilla_resources::ConvoyEnsure>(namespace)
+                                .list_replica_sources()
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            sources
+                                .items
+                                .into_iter()
+                                .filter(|source| source.object.metadata.name == home.object.metadata.name)
+                                .min_by_key(|source| {
+                                    let origin = match &source.provenance {
+                                        ResourceProvenance::Local => self.node_id.clone(),
+                                        ResourceProvenance::Replica { origin_root, .. } => origin_root.clone(),
+                                    };
+                                    (source.object.metadata.creation_timestamp, origin)
+                                })
+                                .ok_or_else(|| "project role declaration has no stored origin".to_string())?
+                        }
+                    };
+                    return Ok(Some(match home.provenance {
+                        ResourceProvenance::Local => self.node_id.clone(),
+                        ResourceProvenance::Replica { origin_root, .. } => origin_root,
+                    }));
+                }
+            }
         }
         Err(format!("receiver `{receiver}` has no declared home yet"))
     }
@@ -5727,7 +5794,11 @@ impl InProcessDaemon {
             .lock()
             .await
             .entry(namespace.to_string())
-            .or_insert_with(|| flotilla_resources::MessageInbox::new(self.resource_backend.clone(), namespace))
+            .or_insert_with(|| {
+                let (change_request, issue) = self.crew_ops.message_observation_staleness();
+                flotilla_resources::MessageInbox::new(self.resource_backend.clone(), namespace)
+                    .with_observation_staleness(change_request, issue)
+            })
             .clone()
     }
 
@@ -7160,6 +7231,15 @@ impl InProcessDaemon {
             }
             flotilla_protocol::CommandAction::ResourceReconcileNow { .. } => {
                 return boxed_action!(self.execute_action_resource_reconcile_now(id, &command))
+            }
+            flotilla_protocol::CommandAction::MessageFailBatch { namespace, name, reason } => {
+                let empty_identity = self.start_context_free_command(id, command.description().to_string());
+                let result = match self.message_inbox(namespace).await.fail_batch(name, reason, self.clock.now()).await {
+                    Ok(()) => CommandValue::Ok,
+                    Err(error) => CommandValue::Error { message: error.to_string() },
+                };
+                self.finish_context_free_command(id, empty_identity, result);
+                return Ok(id);
             }
             flotilla_protocol::CommandAction::ResourceStatusPatch { .. } => {
                 return boxed_action!(self.execute_action_resource_status_patch(id, &command))

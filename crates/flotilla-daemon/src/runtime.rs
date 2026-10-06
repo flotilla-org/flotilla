@@ -1544,6 +1544,7 @@ async fn stage_remote_rustc_wrapper(runner: &dyn CommandRunner, base: &Path) -> 
 }
 
 struct PendingTerminalDelivery {
+    message_batch: Option<String>,
     message: String,
     task: JoinHandle<Result<TerminalDeliveryOutcome, String>>,
 }
@@ -1561,6 +1562,7 @@ fn lookup_terminal_delivery(
 ) -> TerminalDeliveryLookup {
     let mut deliveries = deliveries.lock().expect("terminal deliveries lock poisoned");
     match deliveries.get(session_id) {
+        Some(delivery) if delivery.message_batch.is_some() => TerminalDeliveryLookup::InFlight,
         Some(delivery) if delivery.message == message && !delivery.task.is_finished() => TerminalDeliveryLookup::InFlight,
         Some(_) => TerminalDeliveryLookup::Taken(deliveries.remove(session_id).expect("observed terminal delivery")),
         None => TerminalDeliveryLookup::Vacant,
@@ -4473,6 +4475,25 @@ fn spawn_controller_loops(
                 )
             }
         }),
+        controller!(flotilla_resources::Message, {
+            let state = Arc::clone(&state);
+            move |_backend: ResourceBackend, namespace: String| {
+                (
+                    vec![
+                        MessageDependencyWatch::<flotilla_resources::Message>::boxed(),
+                        MessageDependencyWatch::<TerminalSession>::boxed(),
+                        MessageDependencyWatch::<Convoy>::boxed(),
+                        MessageDependencyWatch::<flotilla_resources::ConvoyEnsure>::boxed(),
+                        MessageDependencyWatch::<ChangeRequest>::boxed(),
+                        MessageDependencyWatch::<flotilla_resources::Issue>::boxed(),
+                        MessageDependencyWatch::<flotilla_resources::Artifact>::boxed(),
+                        MessageDependencyWatch::<flotilla_resources::Usage>::boxed(),
+                        MessageDependencyWatch::<Vessel>::boxed(),
+                    ],
+                    MessageController { state: Arc::clone(&state), namespace },
+                )
+            }
+        }),
         controller!(TerminalSession, {
             let state = Arc::clone(&state);
             move |backend: ResourceBackend, namespace_string: String| {
@@ -5959,6 +5980,288 @@ fn clone_staging_path(target_path: &str) -> String {
     format!("{target_path}.flotilla-clone-partial")
 }
 
+/// Dependency events wake one inbox pass, not one timer per pending record.
+/// Federated watches include references and holders authored on other hosts.
+struct MessageDependencyWatch<R: Resource>(std::marker::PhantomData<R>);
+
+impl<R: Resource> MessageDependencyWatch<R> {
+    fn boxed() -> Box<dyn flotilla_resources::controller::SecondaryWatch<Primary = flotilla_resources::Message>> {
+        Box::new(Self(std::marker::PhantomData))
+    }
+}
+
+impl<R: Resource> flotilla_resources::controller::SecondaryWatch for MessageDependencyWatch<R> {
+    type Primary = flotilla_resources::Message;
+    fn clone_box(&self) -> Box<dyn flotilla_resources::controller::SecondaryWatch<Primary = Self::Primary>> {
+        Self::boxed()
+    }
+    fn spawn(
+        self: Box<Self>,
+        backend: ResourceBackend,
+        namespace: String,
+        sender: flotilla_resources::controller::WorkQueueSender,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>> + Send>> {
+        Box::pin(async move {
+            let resolver = backend.including_replicas::<R>(&namespace);
+            let mut watch = resolver.watch().await?;
+            loop {
+                if let Some(message) = backend
+                    .using::<flotilla_resources::Message>(&namespace)
+                    .list()
+                    .await?
+                    .items
+                    .into_iter()
+                    .filter(|message| message.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
+                    .min_by(|left, right| left.metadata.name.cmp(&right.metadata.name))
+                {
+                    sender.send(message.metadata.name).await.map_err(|_| ResourceError::other("Message controller queue closed"))?;
+                }
+                match watch.next().await {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(error),
+                    None => return Ok(()),
+                }
+            }
+        })
+    }
+}
+
+struct MessageController {
+    state: Arc<ControllerRuntimeState>,
+    namespace: String,
+}
+
+impl flotilla_resources::controller::Reconciler for MessageController {
+    type Resource = flotilla_resources::Message;
+    type Prepared = Option<std::time::Duration>;
+    async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        let inbox = self.state.daemon.message_inbox(&self.namespace).await;
+        inbox.reconcile_delivery(&TerminalControllerRuntime { state: Arc::clone(&self.state) }, Utc::now()).await?;
+        let messages = self.state.daemon.resource_backend().using::<flotilla_resources::Message>(&self.namespace).list().await?.items;
+        let active: Vec<_> =
+            messages.iter().filter(|message| message.status.as_ref().is_none_or(|status| !status.phase.is_terminal())).collect();
+        // Only the lexicographically first active record owns the inbox deadline.
+        if active.iter().map(|message| message.metadata.name.as_str()).min() != Some(obj.metadata.name.as_str()) {
+            return Ok(None);
+        }
+        let now = Utc::now();
+        let next = active
+            .iter()
+            .flat_map(|message| {
+                let status = message.status.as_ref();
+                let submission = status.and_then(|status| status.submission.as_ref());
+                [
+                    message.spec.deadline.filter(|deadline| *deadline > now),
+                    status.and_then(|status| status.retry.as_ref()).and_then(|retry| retry.next_attempt_at()).filter(|due| *due > now),
+                    submission
+                        .map(|submission| submission.started_at + flotilla_resources::delivery_hold::DELIVERY_HOLD_FOR)
+                        .filter(|due| *due > now),
+                    submission
+                        .and_then(|submission| submission.working_since)
+                        .map(|since| since + flotilla_resources::delivery_hold::DELIVERY_WORKING_DEBOUNCE_FOR)
+                        .filter(|due| *due > now),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .min();
+        Ok(next.and_then(|due| (due - now).to_std().ok()))
+    }
+    fn reconcile(
+        &self,
+        _: &ResourceObject<Self::Resource>,
+        next: &Self::Prepared,
+        _: chrono::DateTime<Utc>,
+    ) -> flotilla_resources::controller::ReconcileOutcome<Self::Resource> {
+        let mut outcome = flotilla_resources::controller::ReconcileOutcome::new(None);
+        outcome.requeue_after = *next;
+        outcome
+    }
+    async fn run_finalizer(&self, _: &ResourceObject<Self::Resource>) -> Result<(), ResourceError> {
+        Ok(())
+    }
+    fn finalizer_name(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+#[async_trait]
+impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
+    async fn observe(
+        &self,
+        holder: &ResourceObject<TerminalSession>,
+        submission: Option<&flotilla_resources::MessageSubmission>,
+    ) -> Result<flotilla_resources::MessageObservation, String> {
+        let status = holder.status.as_ref().ok_or("holder status is absent")?;
+        let session = status.session_id.as_deref().ok_or("holder session is absent")?;
+        let now = Utc::now();
+        // Terminal reconciliation owns attention refresh. Reading its durable
+        // observations avoids feeding our own observation writes back into the
+        // Message dependency watch indefinitely.
+        let current = self
+            .state
+            .daemon
+            .resource_backend()
+            .using::<TerminalSession>(&holder.metadata.namespace)
+            .get(&holder.metadata.name)
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = current.status.as_ref().ok_or("holder status is absent")?;
+        let attention = status.attention.as_ref().filter(|attention| !attention.is_stale_at(now));
+        let evidence = submission.and_then(|submission| {
+            if flotilla_resources::delivery_hold::delivery_acceptance_evidence(
+                status.last_tool_activity_at.is_some_and(|at| at > submission.started_at),
+                attention.is_some_and(|attention| {
+                    attention.state == TerminalAttentionState::Working
+                        && attention.as_of > submission.started_at
+                        && attention.source == TerminalAttentionSource::Hook
+                }),
+                false,
+                false,
+                false,
+            ) {
+                Some("fresh agent tool activity after submission".into())
+            } else {
+                None
+            }
+        });
+        let legacy_pending = matches!(&current.spec.source, TerminalSessionSource::Agent { message: Some(message), .. } if message.next_after(status.delivered_message_id.as_deref()).is_some());
+        let other_delivery = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned").contains_key(session);
+        Ok(flotilla_resources::MessageObservation {
+            ready: !legacy_pending && !other_delivery && attention.is_some_and(|attention| attention.state == TerminalAttentionState::Idle),
+            working: attention.is_some_and(|attention| {
+                attention.state == TerminalAttentionState::Working
+                    && submission.is_some_and(|submission| attention.as_of > submission.started_at)
+            }),
+            evidence,
+            output_digest: status.last_output_digest.clone(),
+            waiting_reason: Some("waiting for a fresh idle holder observation".into()),
+        })
+    }
+    async fn release_closed(&self, messages: &[ResourceObject<flotilla_resources::Message>]) {
+        let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
+        let closed: Vec<_> = deliveries
+            .iter()
+            .filter_map(|(session, delivery)| {
+                let batch_id = delivery.message_batch.as_deref()?;
+                let submission = messages.iter().find_map(|message| {
+                    message
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.submission.as_ref())
+                        .filter(|submission| submission.batch_id == batch_id && submission.session == *session)
+                })?;
+                let all_closed = !submission.members.is_empty()
+                    && submission.members.iter().all(|member| {
+                        messages.iter().any(|message| {
+                            message.metadata.name == *member && message.status.as_ref().is_some_and(|status| status.phase.is_terminal())
+                        })
+                    });
+                all_closed.then(|| session.clone())
+            })
+            .collect();
+        for session in closed {
+            if let Some(delivery) = deliveries.remove(&session) {
+                delivery.task.abort();
+            }
+        }
+    }
+    async fn submit(&self, batch: &flotilla_resources::MessageBatch) -> flotilla_resources::MessageTransportOutcome {
+        match self.adapter_for_spec(&batch.holder.spec) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return flotilla_resources::MessageTransportOutcome::NotSubmitted {
+                    reason: "agent acceptance observations unavailable".into(),
+                }
+            }
+            Err(reason) => return flotilla_resources::MessageTransportOutcome::NotSubmitted { reason },
+        }
+        let pool = match self.pool_for_spec(&batch.holder.spec) {
+            Ok(pool) => pool,
+            Err(reason) => return flotilla_resources::MessageTransportOutcome::NotSubmitted { reason },
+        };
+        let adapter = match self.adapter_for_spec(&batch.holder.spec) {
+            Ok(adapter) => adapter,
+            Err(reason) => return flotilla_resources::MessageTransportOutcome::NotSubmitted { reason },
+        };
+        let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
+        if deliveries.contains_key(&batch.submission.session) {
+            return flotilla_resources::MessageTransportOutcome::NotSubmitted {
+                reason: "another terminal turn reserved the transport".into(),
+            };
+        }
+        let session = batch.submission.session.clone();
+        let text = batch.text.clone();
+        let task = tokio::spawn(async move {
+            deliver_and_confirm(&*pool, adapter.as_deref(), &session, &text, TerminalDeliveryReadiness::TurnBoundary, false).await
+        });
+        deliveries.insert(batch.submission.session.clone(), PendingTerminalDelivery {
+            message_batch: Some(batch.submission.batch_id.clone()),
+            message: batch.text.clone(),
+            task,
+        });
+        flotilla_resources::MessageTransportOutcome::Pending
+    }
+    async fn release(&self, batch: &flotilla_resources::MessageBatch) {
+        let delivery = {
+            let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
+            if deliveries
+                .get(&batch.submission.session)
+                .is_some_and(|delivery| delivery.message_batch.as_deref() == Some(batch.submission.batch_id.as_str()))
+            {
+                deliveries.remove(&batch.submission.session)
+            } else {
+                None
+            }
+        };
+        if let Some(delivery) = delivery {
+            delivery.task.abort();
+        }
+    }
+
+    async fn poll(&self, batch: &flotilla_resources::MessageBatch) -> flotilla_resources::MessageTransportOutcome {
+        let delivery = {
+            let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
+            match deliveries.get(&batch.submission.session) {
+                Some(delivery)
+                    if delivery.message_batch.as_deref() == Some(batch.submission.batch_id.as_str())
+                        && delivery.message == batch.text
+                        && !delivery.task.is_finished() =>
+                {
+                    return flotilla_resources::MessageTransportOutcome::Pending
+                }
+                Some(delivery)
+                    if delivery.message_batch.as_deref() == Some(batch.submission.batch_id.as_str()) && delivery.message == batch.text =>
+                {
+                    deliveries.remove(&batch.submission.session)
+                }
+                _ => None,
+            }
+        };
+        match delivery {
+            Some(delivery) => message_transport_outcome(delivery.task.await.unwrap_or_else(|error| Err(error.to_string()))),
+            None => flotilla_resources::MessageTransportOutcome::Unconfirmed {
+                reason: "submission task unavailable; observing acceptance without resubmission".into(),
+            },
+        }
+    }
+}
+
+fn message_transport_outcome(result: Result<TerminalDeliveryOutcome, String>) -> flotilla_resources::MessageTransportOutcome {
+    use flotilla_resources::MessageTransportOutcome as Outcome;
+    match result {
+        Ok(TerminalDeliveryOutcome::Pending) => Outcome::Pending,
+        Ok(TerminalDeliveryOutcome::Confirmed) => Outcome::Accepted { evidence: "holder remained Working after cleat submission".into() },
+        Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::StartupNotReady)) => {
+            Outcome::NotSubmitted { reason: "terminal was not ready before submission".into() }
+        }
+        Ok(TerminalDeliveryOutcome::Unconfirmed(TerminalDeliveryFailure::SubmissionUnconfirmed)) => {
+            Outcome::Unconfirmed { reason: "cleat submission has no acceptance evidence yet".into() }
+        }
+        Err(reason) => Outcome::Unconfirmed { reason },
+    }
+}
+
 struct TerminalControllerRuntime {
     state: Arc<ControllerRuntimeState>,
 }
@@ -6517,14 +6820,16 @@ impl TerminalRuntime for TerminalControllerRuntime {
         let adapter = self.adapter_for_spec(spec)?;
         let session_id_owned = session_id.to_string();
         let message_owned = message.to_string();
+        let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
+        // Recheck under the insertion lock: another controller may reserve the
+        // session while an old replacement task is being drained.
+        if deliveries.contains_key(session_id) {
+            return Ok(TerminalDeliveryOutcome::Pending);
+        }
         let task = tokio::spawn(async move {
             deliver_and_confirm(&*pool, adapter.as_deref(), &session_id_owned, &message_owned, readiness, clear_before_delivery).await
         });
-        self.state
-            .terminal_deliveries
-            .lock()
-            .expect("terminal deliveries lock poisoned")
-            .insert(session_id.to_string(), PendingTerminalDelivery { message: message.to_string(), task });
+        deliveries.insert(session_id.to_string(), PendingTerminalDelivery { message_batch: None, message: message.to_string(), task });
         Ok(TerminalDeliveryOutcome::Pending)
     }
 
@@ -14096,6 +14401,7 @@ mod tests {
     }
 
     struct DeliveryProbePool {
+        inputs: StdMutex<Vec<String>>,
         activities: Vec<ScreenActivity>,
         observations: AtomicUsize,
         deliveries: AtomicUsize,
@@ -14108,6 +14414,7 @@ mod tests {
         fn new(activities: Vec<ScreenActivity>) -> Self {
             assert!(!activities.is_empty(), "delivery probe needs at least one activity state");
             Self {
+                inputs: StdMutex::new(Vec::new()),
                 activities,
                 observations: AtomicUsize::new(0),
                 deliveries: AtomicUsize::new(0),
@@ -14167,7 +14474,8 @@ mod tests {
             Ok(self.screens.get(index).or_else(|| self.screens.last()).cloned())
         }
 
-        async fn deliver(&self, _session_name: &str, _text: &str) -> Result<(), String> {
+        async fn deliver(&self, _session_name: &str, text: &str) -> Result<(), String> {
+            self.inputs.lock().unwrap().push(text.to_string());
             self.deliveries.fetch_add(1, Ordering::SeqCst);
             if self.submission_error {
                 Err("reply lost after PTY accepted input".into())
@@ -14297,6 +14605,85 @@ mod tests {
         pool.inner.set_captured_screen("agent", "• Working (1s • esc to interrupt)\n› Ask Codex to do anything").await;
         tokio::time::advance(Duration::from_millis(100)).await;
         assert_eq!(submit.await.expect("task").expect("delivery"), TerminalDeliveryOutcome::Confirmed);
+        assert_eq!(pool.inner.delivered.lock().await.len(), 1);
+    }
+
+    // A fresh idle composer accepts one batch; stable Working supplies evidence.
+    // Once its task is gone, polling the durable intent never types it again.
+    #[tokio::test(start_paused = true)]
+    async fn durable_message_transport_accepts_idle_input_once_and_restart_poll_never_types() {
+        use flotilla_resources::{MessageBatch, MessageSubmission, MessageTransport, MessageTransportOutcome};
+        const ID: &str = "message-crew";
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-transport-test\"\n").expect("daemon config");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let (daemon, _) = crew_daemon(config.clone()).await;
+        let backend = daemon.resource_backend();
+        let pool = Arc::new(HooklessComposerPool {
+            inner: FakeTerminalPool::new(),
+            submitted_screen: "• Working (1s • esc to interrupt)\n› Ask Codex to do anything",
+        });
+        pool.inner
+            .add_sessions(vec![ProviderTerminalSession::builder()
+                .session_name(ID.into())
+                .status(TerminalStatus::Running)
+                .screen_activity(ScreenActivity::Stable)
+                .build()])
+            .await;
+        pool.inner.set_captured_screen(ID, "› Ask Codex to do anything").await;
+        let mut registry = probe_local_provider_registry(&daemon, &config).await.expect("registry");
+        Arc::get_mut(&mut registry).expect("exclusive registry").terminal_pools.insert(
+            "hookless",
+            ProviderDescriptor::named(ProviderCategory::TerminalPool, "hookless"),
+            pool.clone(),
+        );
+        let profile = build_local_profile(&daemon, &registry).expect("profile");
+        ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("environment");
+        create_credential_test_session(&backend, ID, "message", "message-work", &profile.host_direct_environment_name()).await;
+        let sessions = backend.using::<TerminalSession>(NAMESPACE);
+        let holder = sessions.get(ID).await.expect("holder");
+        let mut spec = holder.spec.clone();
+        spec.pool = "hookless".into();
+        let holder = sessions.update(&empty_meta(ID), &holder.metadata.resource_version, &spec).await.expect("pool");
+        let runtime = TerminalControllerRuntime {
+            state: Arc::new(ControllerRuntimeState::new(
+                daemon,
+                config,
+                registry,
+                None,
+                profile.host_id.clone(),
+                None,
+                profile.host_direct_environment_name(),
+            )),
+        };
+        let batch = MessageBatch::builder()
+            .id("batch".into())
+            .holder(holder)
+            .submission(
+                MessageSubmission::builder()
+                    .batch_id("batch".into())
+                    .crew_id("crew".into())
+                    .session(ID.into())
+                    .started_at(Utc::now())
+                    .members(vec!["a".into(), "b".into(), "c".into()])
+                    .build(),
+            )
+            .text("first\nsecond\nthird".into())
+            .build();
+        assert_eq!(MessageTransport::submit(&runtime, &batch).await, MessageTransportOutcome::Pending);
+        let mut accepted = false;
+        for _ in 0..30 {
+            tokio::time::advance(Duration::from_millis(200)).await;
+            tokio::task::yield_now().await;
+            if matches!(MessageTransport::poll(&runtime, &batch).await, MessageTransportOutcome::Accepted { .. }) {
+                accepted = true;
+                break;
+            }
+        }
+        assert!(accepted, "stable Working establishes acceptance");
+        assert_eq!(pool.inner.delivered.lock().await.as_slice(), &[(ID.to_string(), batch.text.clone(), true)]);
+        // With no retained task, a restart can observe evidence but never submit.
+        assert!(matches!(MessageTransport::poll(&runtime, &batch).await, MessageTransportOutcome::Unconfirmed { .. }));
         assert_eq!(pool.inner.delivered.lock().await.len(), 1);
     }
 
@@ -14669,10 +15056,11 @@ mod tests {
             std::future::pending::<()>().await;
             Ok(TerminalDeliveryOutcome::Confirmed)
         });
-        deliveries
-            .lock()
-            .expect("delivery lock")
-            .insert("agent".to_string(), PendingTerminalDelivery { message: "first".to_string(), task: pending_task });
+        deliveries.lock().expect("delivery lock").insert("agent".to_string(), PendingTerminalDelivery {
+            message_batch: None,
+            message: "first".to_string(),
+            task: pending_task,
+        });
 
         assert!(matches!(lookup_terminal_delivery(&deliveries, "agent", "first"), TerminalDeliveryLookup::InFlight));
         let TerminalDeliveryLookup::Taken(replaced) = lookup_terminal_delivery(&deliveries, "agent", "second") else {
@@ -14686,14 +15074,290 @@ mod tests {
         while !completed_task.is_finished() {
             tokio::task::yield_now().await;
         }
-        deliveries
-            .lock()
-            .expect("delivery lock")
-            .insert("agent".to_string(), PendingTerminalDelivery { message: "second".to_string(), task: completed_task });
+        deliveries.lock().expect("delivery lock").insert("agent".to_string(), PendingTerminalDelivery {
+            message_batch: None,
+            message: "second".to_string(),
+            task: completed_task,
+        });
         let TerminalDeliveryLookup::Taken(completed) = lookup_terminal_delivery(&deliveries, "agent", "second") else {
             panic!("finished delivery should be drained")
         };
         assert_eq!(completed.task.await.expect("delivery task").expect("delivery result"), TerminalDeliveryOutcome::Confirmed);
+    }
+
+    // Three receiver-homed intents reach the real adapter/pool boundary as one
+    // ordered frame. An ambiguous write keeps observations fresh, resolves on
+    // later Working evidence, and releases its slot without typing again.
+    #[tokio::test(start_paused = true)]
+    async fn message_batch_uses_one_pool_input_and_releases_a_late_receipt() {
+        for operator_closes in [false, true] {
+            run_message_batch_pool_case(operator_closes).await;
+        }
+    }
+
+    async fn run_message_batch_pool_case(operator_closes: bool) {
+        use flotilla_core::providers::discovery::test_support::fake_discovery;
+        use flotilla_resources::{Message, MessageExpectation, MessagePhase, MessageRelation, MessageSpec, ROLE_LABEL, VESSEL_LABEL};
+
+        use crate::server::test_support::spawn_in_memory_request_topology_stateful;
+        let temp = TempDir::new().expect("cross-host Message fixture operation succeeds");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-pool-test\"\n")
+            .expect("cross-host Message fixture operation succeeds");
+        let config = Arc::new(ConfigStore::with_base(temp.path()));
+        let (daemon, _) = crew_daemon(config.clone()).await;
+        let backend = daemon.resource_backend();
+        let mut probe = DeliveryProbePool::new(vec![ScreenActivity::Stable]);
+        probe.submission_error = true;
+        probe.screens = vec!["› Ask Codex to do anything".into(); 1000];
+        probe.screens.push("new tool output\n• Working (1s • esc to interrupt)\n› Ask Codex to do anything".into());
+        let pool = Arc::new(probe);
+        let mut registry = probe_local_provider_registry(&daemon, &config).await.expect("cross-host Message fixture operation succeeds");
+        Arc::get_mut(&mut registry).expect("cross-host Message fixture operation succeeds").terminal_pools.insert(
+            "message-probe",
+            ProviderDescriptor::named(ProviderCategory::TerminalPool, "message-probe"),
+            pool.clone(),
+        );
+        let profile = build_local_profile(&daemon, &registry).expect("cross-host Message fixture operation succeeds");
+        ensure_host_direct_environment_exists(&backend, NAMESPACE, &profile).await.expect("cross-host Message fixture operation succeeds");
+        backend
+            .using::<Convoy>(NAMESPACE)
+            .create(&empty_meta("message-pool"), &ConvoySpec::builder().workflow_ref("test".into()).project_ref(NAMESPACE.into()).build())
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        create_credential_test_session(&backend, "agent", "message-pool", "message-pool-work", &profile.host_direct_environment_name())
+            .await;
+        let sessions = backend.using::<TerminalSession>(NAMESPACE);
+        let terminal = sessions.get("agent").await.expect("cross-host Message fixture operation succeeds");
+        let mut spec = terminal.spec.clone();
+        spec.pool = "message-probe".into();
+        let TerminalSessionSource::Agent { selector, .. } = &mut spec.source else { unreachable!() };
+        selector.adapter = Some("codex".into());
+        let mut metadata = InputMeta::from(&terminal.metadata);
+        metadata.labels.insert(CONVOY_LABEL.into(), "message-pool".into());
+        metadata.labels.insert(VESSEL_LABEL.into(), "work".into());
+        metadata.labels.insert(ROLE_LABEL.into(), "coder".into());
+        let terminal = sessions
+            .update(&metadata, &terminal.metadata.resource_version, &spec)
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        let mut status = terminal.status.clone().expect("cross-host Message fixture operation succeeds");
+        status.session_id = Some("agent".into());
+        status.crew = Some(flotilla_resources::CrewSessionStatus {
+            id: "original-crew".into(),
+            adapter: "codex".into(),
+            model: None,
+            stance: "trusted-implicit".into(),
+        });
+        sessions
+            .update_status("agent", &terminal.metadata.resource_version, &status)
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        let runtime = TerminalControllerRuntime {
+            state: Arc::new(ControllerRuntimeState::new(
+                daemon.clone(),
+                config,
+                registry,
+                None,
+                profile.host_id.clone(),
+                None,
+                profile.host_direct_environment_name(),
+            )),
+        };
+        // The sender learns the receiver from replicated resources, then uses
+        // ordinary ResourceApply across the real in-memory request router.
+        async fn refresh_attention(runtime: &TerminalControllerRuntime, backend: &ResourceBackend) {
+            let sessions = backend.using::<TerminalSession>(NAMESPACE);
+            let holder = sessions.get("agent").await.expect("attention holder");
+            let observation =
+                runtime.observe_attention("agent", &holder.spec).await.expect("terminal observation").expect("observed attention");
+            flotilla_resources::apply_status_patch(&sessions, "agent", &flotilla_resources::TerminalSessionStatusPatch::Observe {
+                attention: observation.attention,
+                occupancy: observation.occupancy,
+                output_digest: observation.output_digest,
+                observed_at: Utc::now(),
+            })
+            .await
+            .expect("terminal controller attention projection");
+        }
+        refresh_attention(&runtime, &backend).await;
+        let sender_temp = TempDir::new().expect("cross-host Message fixture operation succeeds");
+        fs::write(sender_temp.path().join("daemon.toml"), "machine_id = \"message-sender-test\"\n")
+            .expect("cross-host Message fixture operation succeeds");
+        let sender = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(sender_temp.path())),
+            fake_discovery(false),
+            HostName::new("message-sender"),
+            ResourceBackend::InMemory(Default::default()),
+        )
+        .await;
+        let topology = spawn_in_memory_request_topology_stateful(sender.clone(), daemon.clone())
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        let sender_backend = sender.resource_backend();
+        let now = Utc::now();
+        let convoys = backend.using::<Convoy>(NAMESPACE).list().await.expect("cross-host Message fixture operation succeeds");
+        sender_backend
+            .replica_writer::<Convoy>(daemon.node_id().clone(), NAMESPACE)
+            .replace(&convoys, now)
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        let terminals = sessions.list().await.expect("cross-host Message fixture operation succeeds");
+        sender_backend
+            .replica_writer::<TerminalSession>(daemon.node_id().clone(), NAMESPACE)
+            .replace(&terminals, now)
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        let inbox = daemon.message_inbox(NAMESPACE).await;
+        for index in 0..3 {
+            let intent = MessageSpec::builder()
+                .sender("system:turn-rules".into())
+                .receiver(format!("{NAMESPACE}/message-pool/work/coder"))
+                .relation(MessageRelation::System)
+                .body(format!("payload-{index}"))
+                .expectation(MessageExpectation::None)
+                .build();
+            let mut events = sender.subscribe();
+            let command = topology
+                .client
+                .execute(
+                    Command::builder()
+                        .action(CommandAction::ResourceApply {
+                            namespace: NAMESPACE.into(),
+                            document: serde_json::json!({"apiVersion":"flotilla.work/v1","kind":"Message",
+                    "metadata":{"name":format!("message-{index}")},"spec":intent}),
+                        })
+                        .build(),
+                )
+                .await
+                .expect("cross-host Message fixture operation succeeds");
+            let result = wait_for_command_result(&mut events, command).await;
+            assert!(matches!(result, CommandValue::ResourceObject(..)), "receiver admission failed: {result:?}");
+        }
+        assert!(
+            sender_backend
+                .using::<Message>(NAMESPACE)
+                .list()
+                .await
+                .expect("cross-host Message fixture operation succeeds")
+                .items
+                .is_empty(),
+            "intent is homed only at the receiver"
+        );
+        assert_eq!(backend.using::<Message>(NAMESPACE).list().await.expect("cross-host Message fixture operation succeeds").items.len(), 3);
+        inbox.reconcile_delivery(&runtime, now).await.expect("cross-host Message fixture operation succeeds");
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        inbox
+            .reconcile_delivery(&runtime, now + chrono::Duration::seconds(1))
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.retries.load(Ordering::SeqCst), 0);
+        {
+            let inputs = pool.inputs.lock().expect("cross-host Message fixture operation succeeds");
+            assert_eq!(inputs.len(), 1);
+            assert!(
+                inputs[0].find("payload-0").expect("cross-host Message fixture operation succeeds")
+                    < inputs[0].find("payload-1").expect("cross-host Message fixture operation succeeds")
+            );
+            assert!(
+                inputs[0].find("payload-1").expect("cross-host Message fixture operation succeeds")
+                    < inputs[0].find("payload-2").expect("cross-host Message fixture operation succeeds")
+            );
+        }
+        assert_eq!(
+            sessions
+                .get("agent")
+                .await
+                .expect("cross-host Message fixture operation succeeds")
+                .status
+                .expect("cross-host Message fixture operation succeeds")
+                .attention
+                .expect("cross-host Message fixture operation succeeds")
+                .state,
+            TerminalAttentionState::Idle
+        );
+        if operator_closes {
+            sender_backend
+                .replica_writer::<Message>(daemon.node_id().clone(), NAMESPACE)
+                .replace(&backend.using::<Message>(NAMESPACE).list().await.expect("held batch feed"), Utc::now())
+                .await
+                .expect("replicate batch home");
+            let mut events = sender.subscribe();
+            let id = topology
+                .client
+                .execute(
+                    Command::builder()
+                        .action(CommandAction::MessageFailBatch {
+                            namespace: NAMESPACE.into(),
+                            name: "message-0".into(),
+                            reason: "cancel held batch after inspecting original session".into(),
+                        })
+                        .build(),
+                )
+                .await
+                .expect("route operator closure to batch home");
+            assert!(matches!(wait_for_command_result(&mut events, id).await, CommandValue::Ok));
+            inbox.reconcile_delivery(&runtime, now + chrono::Duration::seconds(2)).await.expect("reap explicitly closed transport");
+            for message in backend.using::<Message>(NAMESPACE).list().await.expect("closed batch audit").items {
+                let status = message.status.expect("status");
+                assert_eq!(status.phase, MessagePhase::DeadLettered);
+                assert!(status.submission.is_some());
+                assert!(status.resolved_receiver.is_none());
+            }
+            assert!(runtime.state.terminal_deliveries.lock().expect("transport bookkeeping").is_empty());
+            assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1, "operator closure does not type input");
+            return;
+        }
+        pool.observations.store(1000, Ordering::SeqCst);
+        refresh_attention(&runtime, &backend).await;
+        inbox
+            .reconcile_delivery(&runtime, now + chrono::Duration::seconds(2))
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        inbox
+            .reconcile_delivery(&runtime, now + chrono::Duration::seconds(4))
+            .await
+            .expect("cross-host Message fixture operation succeeds");
+        for message in backend.using::<Message>(NAMESPACE).list().await.expect("cross-host Message fixture operation succeeds").items {
+            let status = message.status.expect("cross-host Message fixture operation succeeds");
+            // A receipt fulfills a Message with no reply expectation; the
+            // following pass advances it to Satisfied without another input.
+            assert_eq!(status.phase, MessagePhase::Satisfied);
+            assert_eq!(status.resolved_receiver.expect("cross-host Message fixture operation succeeds").crew_id, "original-crew");
+        }
+        assert!(runtime.state.terminal_deliveries.lock().expect("cross-host Message fixture operation succeeds").is_empty());
+        assert_eq!(pool.deliveries.load(Ordering::SeqCst), 1);
+    }
+
+    // Legacy queue work cannot drain or replace a Message batch's task,
+    // whether it is still pending or has finished awaiting its durable receipt.
+    #[tokio::test]
+    async fn message_batch_owns_its_task_until_the_receiver_releases_it() {
+        for completed in [false, true] {
+            let deliveries = StdMutex::new(HashMap::new());
+            let task = tokio::spawn(async move {
+                if !completed {
+                    std::future::pending::<()>().await;
+                }
+                Ok(TerminalDeliveryOutcome::Confirmed)
+            });
+            if completed {
+                while !task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            }
+            deliveries.lock().unwrap().insert("agent".into(), PendingTerminalDelivery {
+                message_batch: Some("batch".into()),
+                message: "framed input".into(),
+                task,
+            });
+            for text in ["framed input", "legacy follow-up"] {
+                assert!(matches!(lookup_terminal_delivery(&deliveries, "agent", text), TerminalDeliveryLookup::InFlight));
+                assert_eq!(deliveries.lock().unwrap().len(), 1);
+            }
+            deliveries.lock().unwrap().remove("agent").unwrap().task.abort();
+        }
     }
 
     impl TransientTerminalPool {
