@@ -39,6 +39,13 @@ from dispatch `--need`, issue labels, project `role_needs`, template roles and
 adapter minimum versions compose by union. An unsatisfiable need refuses
 admission by name. Admission does not wait for a proposal to be adopted.
 
+The exact cover search prunes capabilities unrelated to needs or their transitive
+prerequisites, then removes layers with impossible earlier prerequisites. It
+refuses more than 64 relevant layers or more than 10,000 search nodes with a
+named search-limit error, leaving freezing untouched. This bounds admission
+work without substituting a nonminimal greedy cover. Split an over-complex
+catalogue or need-set before retrying.
+
 Stacking is canonical: base/toolchains, utilities, capabilities sorted by
 name, harness, project. Only base/toolchains and utilities have fixed parents;
 capability, harness and project fragments start `FROM ${BASE}`, supplied with

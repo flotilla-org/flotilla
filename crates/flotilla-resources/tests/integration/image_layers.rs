@@ -366,3 +366,72 @@ fn root_accepts_local_ids_and_registry_digests() {
         assert!(base.validate().is_err());
     }
 }
+
+// Behaviour: catalogue size alone cannot cause combinatorial admission work.
+// Keep transitive prerequisites, prune unrelated layers and impossible order.
+#[test]
+fn large_catalogue_prunes_irrelevant_and_impossible_layers() {
+    let mut catalogue = catalogue();
+    for index in 0..100 {
+        catalogue.insert(format!("unused-{index:03}"), layer(ImageLayerStage::Capability, &[&format!("extra:item-{index}")]));
+    }
+    let mut prerequisite = layer(ImageLayerStage::Capability, &["setup:display"]);
+    prerequisite.requires.insert("os:debian-family".into());
+    catalogue.insert("a-setup".into(), prerequisite);
+    catalogue.get_mut("a-display").unwrap().requires.insert("setup:display".into());
+    // Rename setup to precede the display in canonical order.
+    let setup = catalogue.remove("a-setup").unwrap();
+    catalogue.insert("a-before-display".into(), setup);
+    let needs = BTreeSet::from(["display:headless-x11".into()]);
+    let composed = compose_image(&selection(), &needs, &catalogue, &mut FrozenImageLayers::default()).expect("pruned cover");
+    assert_eq!(
+        composed
+            .layers
+            .iter()
+            .filter(|layer| layer.spec.stage == ImageLayerStage::Capability)
+            .map(|layer| layer.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a-before-display", "a-display"]
+    );
+    catalogue.get_mut("a-before-display").unwrap().requires.insert("absent:prerequisite".into());
+    let mut frozen = FrozenImageLayers::default();
+    assert!(compose_image(&selection(), &needs, &catalogue, &mut frozen).unwrap_err().contains("display:headless-x11"));
+    assert!(frozen.layers.is_empty());
+}
+
+#[test]
+fn difficult_cover_refuses_at_search_limit_without_freezing() {
+    let mut catalogue = catalogue();
+    for index in 0..24 {
+        catalogue.insert(format!("candidate-{index:02}"), layer(ImageLayerStage::Capability, &["goal:all", &format!("part:{index}")]));
+        catalogue.get_mut("harness").unwrap().requires.insert(format!("part:{index}"));
+    }
+    let mut frozen = FrozenImageLayers::default();
+    let error = compose_image(&selection(), &BTreeSet::from(["goal:all".into()]), &catalogue, &mut frozen).unwrap_err();
+    assert!(error.contains("search limit"), "{error}");
+    assert!(error.contains("goal:all"));
+    assert!(frozen.layers.is_empty());
+}
+
+#[test]
+fn digest_case_and_adoption_fields_are_strict() {
+    let mut root = layer(ImageLayerStage::Base, &[]);
+    root.parent = ImageLayerParent::Image(format!("sha256:{}", "A".repeat(64)));
+    assert!(root.validate().is_err());
+    let inputs = ResolvedImageInputs::builder()
+        .parent_digest(format!("sha256:{}", "A".repeat(64)))
+        .content_hashes(vec![format!("sha256:{}", "b".repeat(64))])
+        .architecture("amd64".into())
+        .stability(ImageInputStability::Pinned)
+        .build();
+    assert!(inputs.recipe_key().is_err());
+    let mut inputs = inputs;
+    inputs.parent_digest = inputs.parent_digest.to_lowercase();
+    assert!(inputs.recipe_key().is_ok());
+    inputs.content_hashes[0] = inputs.content_hashes[0].to_uppercase();
+    assert!(inputs.recipe_key().is_err());
+    assert!(serde_json::from_value::<flotilla_resources::ImageInputAdoption>(
+        serde_json::json!({"policy":"auto","constraint":"1.*","typo":true})
+    )
+    .is_err());
+}

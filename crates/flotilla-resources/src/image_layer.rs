@@ -76,7 +76,7 @@ pub struct ImageInputPin {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "policy", rename_all = "snake_case")]
+#[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImageInputAdoption {
     Auto { constraint: Option<String> },
     Approve,
@@ -273,11 +273,48 @@ pub fn compose_image(
             fixed.push(FrozenImageLayer { name: name.clone(), spec: spec.clone() });
         }
     }
-    let optional = available
+    let mut optional = available
         .iter()
         .filter(|(_, spec)| spec.stage == ImageLayerStage::Capability)
         .map(|(name, spec)| FrozenImageLayer { name: name.clone(), spec: spec.clone() })
         .collect::<Vec<_>>();
+    // Only providers of requested capabilities or their transitive prerequisites
+    // can affect a minimum cover. Fixed upper layers' requires participate too.
+    let mut relevant = needs.clone();
+    relevant.extend(fixed.iter().flat_map(|layer| layer.spec.requires.iter().cloned()));
+    loop {
+        let previous = relevant.len();
+        for layer in &optional {
+            if layer.spec.provides.iter().any(|provided| relevant.iter().any(|need| capability_satisfies(provided, need))) {
+                relevant.extend(layer.spec.requires.clone());
+            }
+        }
+        if previous == relevant.len() {
+            break;
+        }
+    }
+    optional.retain(|layer| layer.spec.provides.iter().any(|provided| relevant.iter().any(|need| capability_satisfies(provided, need))));
+    // Capability order is lexical: an impossible earlier prerequisite cannot
+    // become satisfiable by selecting a later layer or the harness/project.
+    let mut possible = fixed
+        .iter()
+        .filter(|layer| layer.spec.stage < ImageLayerStage::Capability)
+        .flat_map(|layer| layer.spec.provides.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    optional.retain(|layer| {
+        let viable = layer.spec.validate().is_ok()
+            && layer.spec.requires.iter().all(|need| possible.iter().any(|provided| capability_satisfies(provided, need)));
+        if viable {
+            possible.extend(layer.spec.provides.clone());
+        }
+        viable
+    });
+    // Exact set cover is NP-hard even after pruning. Refuse excessive work
+    // explicitly rather than monopolising admission or returning a greedy cover.
+    if optional.len() > 64 {
+        return Err(format!("image composition search limit: {} relevant capability layers for needs {:?}", optional.len(), needs));
+    }
+    let mut search_budget = 10_000;
     for need in needs {
         validate_capability(need)?;
         if !fixed.iter().chain(&optional).any(|layer| layer.spec.provides.iter().any(|provided| capability_satisfies(provided, need))) {
@@ -285,7 +322,9 @@ pub fn compose_image(
         }
     }
     for count in 0..=optional.len() {
-        if let Some(layers) = covering_subset(&fixed, &optional, needs, count, 0, &mut Vec::new()) {
+        if let Some(layers) = covering_subset(&fixed, &optional, needs, count, 0, &mut Vec::new(), &mut search_budget)
+            .map_err(|()| format!("image composition search limit reached for needs {needs:?}"))?
+        {
             let composition = ImageComposition::builder()
                 .selection(selection.clone())
                 .needs(needs.clone())
@@ -307,7 +346,12 @@ fn covering_subset(
     remaining: usize,
     offset: usize,
     selected: &mut Vec<FrozenImageLayer>,
-) -> Option<Vec<FrozenImageLayer>> {
+    search_budget: &mut usize,
+) -> Result<Option<Vec<FrozenImageLayer>>, ()> {
+    if *search_budget == 0 {
+        return Err(());
+    }
+    *search_budget -= 1;
     if remaining == 0 {
         let mut chain = fixed.iter().chain(selected.iter()).cloned().collect::<Vec<_>>();
         chain.sort_by(|left, right| (left.spec.stage, &left.name).cmp(&(right.spec.stage, &right.name)));
@@ -317,30 +361,30 @@ fn covering_subset(
             if layer.spec.validate().is_err()
                 || layer.spec.requires.iter().any(|need| !provides.iter().any(|provided: &String| capability_satisfies(provided, need)))
             {
-                return None;
+                return Ok(None);
             }
             if let ImageLayerParent::Layer(parent) = &layer.spec.parent {
                 if previous != Some(parent.as_str()) {
-                    return None;
+                    return Ok(None);
                 }
             }
             provides.extend(layer.spec.provides.clone());
             previous = Some(&layer.name);
         }
-        return needs.iter().all(|need| provides.iter().any(|provided| capability_satisfies(provided, need))).then_some(chain);
+        return Ok(needs.iter().all(|need| provides.iter().any(|provided| capability_satisfies(provided, need))).then_some(chain));
     }
     if optional.len().saturating_sub(offset) < remaining {
-        return None;
+        return Ok(None);
     }
     for index in offset..optional.len() {
         selected.push(optional[index].clone());
-        let found = covering_subset(fixed, optional, needs, remaining - 1, index + 1, selected);
+        let found = covering_subset(fixed, optional, needs, remaining - 1, index + 1, selected, search_budget)?;
         selected.pop();
         if found.is_some() {
-            return found;
+            return Ok(found);
         }
     }
-    None
+    Ok(None)
 }
 
 /// Builder-resolved content, not paths, repository revisions, timestamps or host
@@ -388,5 +432,7 @@ impl ResolvedImageInputs {
 }
 
 fn is_sha256(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
 }
