@@ -21,6 +21,7 @@ use crate::{
 // the environment of the Flotilla client that sends the launch request.
 struct CleatProcessFake {
     supports_clear: bool,
+    daemon_from_client: bool,
     clients: Mutex<Vec<BTreeMap<String, String>>>,
     child: Mutex<Option<BTreeMap<String, String>>>,
 }
@@ -59,12 +60,12 @@ impl CommandRunner for CleatProcessFake {
         } else {
             assert_eq!(cmd, "cleat");
         }
-        self.clients.lock().expect("clients").push(environment);
+        self.clients.lock().expect("clients").push(environment.clone());
         match arguments.first().copied() {
             Some("list") => Ok("[]".into()),
             Some("launch") if arguments.contains(&"--help") => Ok(if self.supports_clear { "--env-clear --env" } else { "--env" }.into()),
             Some("launch") => {
-                let mut child = polluted_environment();
+                let mut child = if self.daemon_from_client { environment } else { polluted_environment() };
                 if arguments.contains(&"--env-clear") {
                     if !self.supports_clear {
                         return Err("unknown --env-clear".into());
@@ -98,7 +99,12 @@ impl CommandRunner for CleatProcessFake {
 // reach the crew, even when the serving daemon is already contaminated.
 #[tokio::test]
 async fn crew_environment_excludes_the_daemons_ambient_variables() {
-    let runner = Arc::new(CleatProcessFake { supports_clear: true, clients: Mutex::new(Vec::new()), child: Mutex::new(None) });
+    let runner = Arc::new(CleatProcessFake {
+        supports_clear: true,
+        daemon_from_client: false,
+        clients: Mutex::new(Vec::new()),
+        child: Mutex::new(None),
+    });
     let bag = EnvironmentBag::new()
         .with(EnvironmentAssertion::env_var("HOME", "/crew/home"))
         .with(EnvironmentAssertion::env_var("FLOTILLA_DAEMON_SOCKET", "/run/flotilla-daemon/daemon.sock"))
@@ -131,7 +137,12 @@ async fn crew_environment_excludes_the_daemons_ambient_variables() {
 // such invocation must use the controlled host baseline, with no ambient leak.
 #[tokio::test]
 async fn on_demand_daemon_starts_without_the_clients_ambient_variables() {
-    let runner = Arc::new(CleatProcessFake { supports_clear: true, clients: Mutex::new(Vec::new()), child: Mutex::new(None) });
+    let runner = Arc::new(CleatProcessFake {
+        supports_clear: true,
+        daemon_from_client: false,
+        clients: Mutex::new(Vec::new()),
+        child: Mutex::new(None),
+    });
     let pool = CleatTerminalPool::new(runner.clone(), "cleat", &EnvironmentBag::new());
     pool.list_sessions().await.expect("list starts daemon");
     let clients = runner.clients.lock().expect("clients");
@@ -148,7 +159,12 @@ async fn on_demand_daemon_starts_without_the_clients_ambient_variables() {
 // when the fleet's cleat supports --env-clear.
 #[tokio::test]
 async fn old_cleat_launches_without_env_clear() {
-    let runner = Arc::new(CleatProcessFake { supports_clear: false, clients: Mutex::new(Vec::new()), child: Mutex::new(None) });
+    let runner = Arc::new(CleatProcessFake {
+        supports_clear: false,
+        daemon_from_client: false,
+        clients: Mutex::new(Vec::new()),
+        child: Mutex::new(None),
+    });
     let pool = CleatTerminalPool::new(runner.clone(), "cleat", &EnvironmentBag::new());
     pool.ensure_session("crew", "codex", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[])
         .await
@@ -216,4 +232,85 @@ async fn controlled_runner_replaces_the_real_process_environment() {
         .await
         .expect("real deadline path");
     assert_eq!(output, format!("HOME={value}\nPATH=/usr/bin:/bin\n"));
+}
+
+// #2790: Docker's configured environment is the baseline for both the Cleat
+// client/daemon and its launched crew, with or without --env-clear. Host facts
+// added by other discovery remain excluded; explicit session values win.
+#[hegel::test]
+fn docker_crew_preserves_vessel_environment(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+
+    use crate::providers::discovery::run_provisioned_host_detectors;
+
+    // Generate both Cleat versions, empty/nonempty vessel maps, absent/present PATH,
+    // both bag merge orders, and empty, ordinary and shell-special values.
+    // Sequential launches cover session overrides; no global environment is mutated.
+    let supports_clear = tc.draw(gs::booleans());
+    // An empty explicitly configured PATH is still a declaration: importing
+    // host PATH here would change the contract. Executable selection is separate.
+    let configured_path = tc.draw(gs::booleans());
+    let empty_vessel = tc.draw(gs::booleans());
+    let reverse_merge = tc.draw(gs::booleans());
+    let values = ["", "vessel value", "quotes'\" = $() `literal`\nsecond line"];
+    let value = values[tc.draw(gs::integers::<usize>().min_value(0).max_value(values.len() - 1))];
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let runner = Arc::new(CleatProcessFake {
+            supports_clear,
+            daemon_from_client: true,
+            clients: Mutex::new(Vec::new()),
+            child: Mutex::new(None),
+        });
+        let mut vessel: std::collections::HashMap<String, String> = [
+            ("HOME", "/home/crew"),
+            ("RUSTUP_HOME", "/usr/local/rustup"),
+            ("CARGO_HOME", "/tmp/flotilla-config/cargo"),
+            ("GIT_CONFIG_COUNT", "3"),
+            ("GIT_CONFIG_KEY_0", "safe.directory"),
+            ("GIT_CONFIG_VALUE_0", "/workspace"),
+            ("GIT_CONFIG_KEY_1", "user.name"),
+            ("GIT_CONFIG_VALUE_1", "crew"),
+            ("GIT_CONFIG_KEY_2", "user.email"),
+            ("GIT_CONFIG_VALUE_2", "crew@example.test"),
+            ("FLOTILLA_CREW_SKILLS", value),
+            ("DISABLE_AUTOUPDATER", "1"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect();
+        if empty_vessel {
+            vessel.clear();
+        }
+        if configured_path {
+            vessel.insert("PATH".into(), value.into());
+        }
+        let provisioned = run_provisioned_host_detectors(&[], &*runner, &vessel).await;
+        let host = EnvironmentBag::new()
+            .with(EnvironmentAssertion::env_var("ARBITRARY_AMBIENT", "host"))
+            .with(EnvironmentAssertion::env_var("HOME", "/host-home"))
+            .with(EnvironmentAssertion::env_var("PATH", "/host-bin"));
+        let bag = if reverse_merge { host.merge(&provisioned) } else { provisioned.merge(&host) };
+        let pool = CleatTerminalPool::new(runner.clone(), "cleat", &bag);
+        for declared in [vec![], vec![("RUSTUP_HOME".into(), "session override".into()), ("RUSTUP_HOME".into(), value.into())]] {
+            pool.ensure_session("crew", "codex", &ExecutionEnvironmentPath::new("/repo"), &declared, &[]).await.expect("launch");
+            let child = runner.child.lock().expect("child").clone().expect("launched crew");
+            for (key, expected) in &vessel {
+                let expected = declared.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v).unwrap_or(expected);
+                assert_eq!(child.get(key), Some(expected), "lost vessel {key}");
+            }
+            if !declared.is_empty() {
+                assert_eq!(child.get("RUSTUP_HOME").map(String::as_str), Some(value), "last session override wins");
+            }
+            assert!(!child.contains_key("ARBITRARY_AMBIENT"), "host ambient leaked");
+            assert_eq!(child.get("HOME"), vessel.get("HOME"), "host HOME must not replace the vessel HOME");
+            assert_eq!(child.get("PATH").map(String::as_str), Some(if configured_path { value } else { "/usr/local/bin:/usr/bin:/bin" }));
+        }
+        for client in runner.clients.lock().expect("clients").iter() {
+            for (key, expected) in &vessel {
+                assert_eq!(client.get(key), Some(expected), "lost daemon baseline {key}");
+            }
+            assert!(!client.contains_key("ARBITRARY_AMBIENT"));
+        }
+    });
 }

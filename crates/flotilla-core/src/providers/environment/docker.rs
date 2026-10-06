@@ -448,19 +448,39 @@ impl DockerEnvironmentProviderInner {
     }
 
     async fn env_vars(&self, container_name: &str) -> Result<HashMap<String, String>, String> {
-        let output =
-            self.runner.run("docker", &["exec", container_name, "sh", "-lc", "env"], Path::new("/"), &ChannelLabel::Default).await?;
-
-        // Note: `sh -lc env` output is line-delimited. Values containing newlines
-        // (e.g. PEM certificates) will be silently truncated. Acceptable for now;
-        // a structured query (docker inspect) could provide the full picture if needed.
-        Ok(output
-            .lines()
-            .filter_map(|line| {
-                let (key, value) = line.split_once('=')?;
-                Some((key.to_string(), value.to_string()))
-            })
-            .collect())
+        // Config.Env includes image defaults and docker-run declarations, without
+        // importing host ambient values or running a login shell inside the vessel.
+        let output = self
+            .runner
+            .run("docker", &["inspect", "--format", "{{json .Config.Env}}", container_name], Path::new("/"), &ChannelLabel::Default)
+            .await?;
+        let entries: Option<Vec<String>> = serde_json::from_str(output.trim())
+            .map_err(|error| format!("docker returned invalid environment for container {container_name}: {error}"))?;
+        let entries = entries.unwrap_or_default();
+        if entries.is_empty() {
+            tracing::debug!(container = %container_name, "container has no configured environment; resolving runtime defaults");
+        }
+        // Docker entries are NAME=VALUE. Ignore malformed entries without '='.
+        let mut environment: HashMap<String, String> = entries
+            .into_iter()
+            .filter_map(|entry| entry.split_once('=').map(|(key, value)| (key.to_string(), value.to_string())))
+            .collect();
+        if !environment.contains_key("HOME") {
+            // Docker supplies HOME for the container user at exec time even when
+            // Config.Env omits it. Read only that vessel-local default, without
+            // login-shell mutations; an explicitly configured HOME always wins.
+            // Probe errors fail discovery rather than silently launching crew tools
+            // with an unknown HOME. Images without a shell can declare HOME
+            // explicitly and avoid this probe.
+            let home = self
+                .runner
+                .run("docker", &["exec", container_name, "sh", "-c", "printf %s \"${HOME-}\""], Path::new("/"), &ChannelLabel::Default)
+                .await?;
+            if !home.is_empty() {
+                environment.insert("HOME".to_string(), home);
+            }
+        }
+        Ok(environment)
     }
 
     async fn destroy(&self, container_name: &str) -> Result<(), String> {

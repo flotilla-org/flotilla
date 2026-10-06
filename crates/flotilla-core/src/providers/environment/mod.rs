@@ -241,6 +241,8 @@ pub trait ProvisionedEnvironment: Send + Sync {
     async fn runtime_observation(&self) -> Result<Option<flotilla_protocol::EnvironmentRuntimeObservation>, String> {
         Ok(None)
     }
+    /// The vessel's configured environment, used as the terminal baseline.
+    /// This must not include the provisioning host's ambient environment.
     async fn env_vars(&self) -> Result<HashMap<String, String>, String>;
     fn runner(&self) -> Arc<dyn CommandRunner>;
     async fn destroy(&self) -> Result<(), String>;

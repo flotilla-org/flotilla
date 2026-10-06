@@ -107,6 +107,9 @@ impl EnvironmentAssertion {
 #[derive(Debug, Clone, Default)]
 pub struct EnvironmentBag {
     assertions: Vec<EnvironmentAssertion>,
+    // Only provisioned discovery supplies this baseline. Keep its provenance
+    // separate from observations subsequently merged into the bag.
+    provisioned_environment: Option<HashMap<String, String>>,
 }
 
 impl EnvironmentBag {
@@ -134,6 +137,11 @@ impl EnvironmentBag {
             EnvironmentAssertion::BinaryAvailable { name: n, path, .. } if n == name => Some(path),
             _ => None,
         })
+    }
+
+    /// Configured vessel environment, absent for host-direct discovery.
+    pub(crate) fn provisioned_environment(&self) -> Option<&HashMap<String, String>> {
+        self.provisioned_environment.as_ref()
     }
 
     pub fn find_env_var(&self, key: &str) -> Option<&str> {
@@ -212,9 +220,13 @@ impl EnvironmentBag {
     }
 
     /// Create a new bag containing assertions from both `self` and `other`.
+    /// The first provisioned baseline wins: use `self`'s, or `other`'s if absent.
     pub fn merge(&self, other: &EnvironmentBag) -> EnvironmentBag {
         let mut merged = self.clone();
         merged.assertions.extend(other.assertions.clone());
+        if merged.provisioned_environment.is_none() {
+            merged.provisioned_environment.clone_from(&other.provisioned_environment);
+        }
         merged
     }
 
@@ -737,9 +749,10 @@ pub async fn run_provisioned_host_detectors(
         }
     }
 
-    let bag = env_vars
+    let mut bag = env_vars
         .iter()
         .fold(EnvironmentBag::new(), |bag, (key, value)| bag.with(EnvironmentAssertion::env_var(key.clone(), value.clone())));
+    bag.provisioned_environment = Some(env_vars.clone());
     let detected = run_host_detectors(detectors, runner, &ProvisionedEnvVars { values: env_vars }).await;
     bag.extend(detected.assertions().iter().filter(|assertion| !matches!(assertion, EnvironmentAssertion::EnvVarSet { .. })).cloned())
 }
