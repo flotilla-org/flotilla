@@ -1,8 +1,9 @@
 # Cleat launch-environment contracts
 
 `revisions.sh` is the single source of old/additive and new/declared cleat pins.
-Linux PR CI runs the shared scenario matrix against the fake and both actual
-Ghostty-enabled binaries when terminal, discovery, build inputs or this rig change.
+The operator-applied workflow in PR #2837 runs the Linux PR CI
+shared scenario matrix against the fake and both actual Ghostty-enabled binaries
+when terminal, discovery, build inputs or this rig change.
 Missing binaries fail the explicitly enabled real suite; ordinary workspace tests
 run the same matrix against the fake without downloading/building cleat.
 
@@ -30,3 +31,9 @@ ambient values; the new binary must exclude them. Both must preserve on-demand
 controlled startup, vessel values, last explicit overrides, and refuse managed
 coordinates. Removing the managed-key filter in `session_environment` is the
 #2826 negative control: the real launch must fail with cleat's refusal.
+
+The real probe requires `/usr/bin/python3`; the suite checks it before launching.
+Each old/new scenario is a separate test result. Successful real scenarios assert
+the private PID-file layout and verify that fixture cleanup stops the daemon.
+Builds use separate Cargo target directories and retain the effective prepared
+Ghostty toolchain file before restoring the source manifest.

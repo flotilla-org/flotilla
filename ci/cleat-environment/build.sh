@@ -15,11 +15,14 @@ for version in old new; do
   rust_version=$(read_cleat_toolchain_value rust-toolchain.toml toolchain channel)
   rustup toolchain install "$rust_version" --profile minimal
   bash "$repo_root/ci/fork-actions/runtime/cleat/prepare-ghostty-vt.sh"
+  cp tools/ghostty-toolchain.toml "$output_dir/$version-effective-ghostty-toolchain.toml"
   git restore tools/ghostty-toolchain.toml
+  export CARGO_TARGET_DIR="$source_dir/target/environment-$version"
   cargo +"$rust_version" build -p cleat --release --locked --features ghostty-vt
   mkdir -p "$output_dir/$version"
-  install -m 0755 target/release/cleat "$output_dir/$version/cleat"
-  if ldd "$output_dir/$version/cleat" | grep -q ghostty-vt; then
+  install -m 0755 "$CARGO_TARGET_DIR/release/cleat" "$output_dir/$version/cleat"
+  readelf -d "$output_dir/$version/cleat" > "$output_dir/$version-dynamic-section.txt"
+  if grep -q ghostty-vt "$output_dir/$version-dynamic-section.txt"; then
     echo 'contract binary must use static Ghostty VT' >&2
     exit 1
   fi
@@ -27,7 +30,7 @@ for version in old new; do
     printf 'revision=%s\n' "$revision"
     rustc +"$rust_version" --version --verbose
     printf 'ghostty_revision=%s\n' "$(git -C .tools/ghostty-src rev-parse HEAD)"
-    cat tools/ghostty-toolchain.toml
+    cat "$output_dir/$version-effective-ghostty-toolchain.toml"
     "$output_dir/$version/cleat" version --json
     sha256sum "$output_dir/$version/cleat"
   } > "$output_dir/$version-provenance.txt"
