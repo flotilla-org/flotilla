@@ -3770,7 +3770,7 @@ fn spawn_projection_parity_task(
         let projection = projection.clone();
         let runtime_health = runtime_health.clone();
         async move {
-            match projection_parity_condition(&backend, &namespace, &projection).await {
+            match projection_parity_condition(&backend, &namespace, &projection, &SystemClock).await {
                 Ok(condition) => runtime_health.report_projection_parity(condition),
                 Err(error) => warn!(%error, "failed to evaluate aggregator projection parity"),
             }
@@ -3778,18 +3778,38 @@ fn spawn_projection_parity_task(
     })
 }
 
+// Local convoy creation and aggregator watch delivery are not atomic. Give
+// newly authored rows a small, non-renewing grace period; rows still missing
+// at the boundary retain the existing host-readiness failure (#2736).
+const PROJECTION_PARITY_GRACE: chrono::Duration = chrono::Duration::seconds(10);
+
 async fn projection_parity_condition(
     backend: &ResourceBackend,
     namespace: &str,
     projection: &AggregatorProjectionState,
+    clock: &dyn flotilla_resources::Clock,
 ) -> Result<Option<HostCondition>, String> {
     let stored = backend.using::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?;
-    let expected = stored.items.into_iter().map(|convoy| convoy.metadata.name).collect::<BTreeSet<_>>();
     let projected = match projection.local_result_set().await.rows {
         Rows::Convoys { rows, .. } => rows.into_iter().map(|row| row.resource.name).collect::<BTreeSet<_>>(),
         rows => return Err(format!("local convoy projection returned unexpected rows: {rows:?}")),
     };
-    let missing = expected.difference(&projected).cloned().collect::<Vec<_>>();
+    let now = clock.now();
+    let expected = stored.items.iter().map(|convoy| convoy.metadata.name.clone()).collect::<BTreeSet<_>>();
+    // `using` lists only this root's durable rows, never replicas. Creation time
+    // (rather than last update or first parity observation) bounds the grace
+    // even if controllers keep updating the row or the daemon restarts.
+    let missing = stored
+        .items
+        .into_iter()
+        .filter_map(|convoy| {
+            let age = now.signed_duration_since(convoy.metadata.creation_timestamp);
+            let within_grace = age >= chrono::Duration::zero() && age < PROJECTION_PARITY_GRACE;
+            (!projected.contains(&convoy.metadata.name) && !within_grace).then_some(convoy.metadata.name)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     if missing.is_empty() {
         return Ok(None);
     }
@@ -3811,7 +3831,7 @@ async fn projection_parity_condition(
             .value(ConditionValue::False)
             .reason("LocalRowsMissing")
             .message(message)
-            .observed_at(Utc::now())
+            .observed_at(now)
             .build(),
     ))
 }
@@ -13029,6 +13049,187 @@ mod tests {
         );
     }
 
+    // #2736: sequential admissions to one placement succeed without sleeps,
+    // even when its local aggregator has not projected any admitted convoys.
+    #[hegel::test]
+    fn projection_parity_sequential_admissions(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Cover empty batches, one admission, and batches larger than the
+        // reported three-dispatch failure; no controller or projection sleeps.
+        let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(8));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let temp = TempDir::new().expect("tempdir");
+            fs::write(temp.path().join("daemon.toml"), "machine_id = \"projection-admission-test\"\n").expect("config");
+            let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+            let host_id = daemon.local_host_id().expect("host identity").to_string();
+            let profile =
+                LocalProvisioningProfile { repo_default_dir: temp.path().display().to_string(), ..manual_profile(&host_id, false) };
+            let backend = daemon.resource_backend();
+            register_startup_resources(&daemon, NAMESPACE, &profile).await.expect("register placement");
+            backend
+                .using::<WorkflowTemplate>(NAMESPACE)
+                .create(
+                    &empty_meta("parity-workflow"),
+                    &WorkflowTemplateSpec::builder()
+                        .vessels(vec![VesselRequirement::builder()
+                            .name("work".to_string())
+                            .crew(vec![CrewSpec::builder()
+                                .role("coder".to_string())
+                                .source(CrewSource::Tool { command: "true".to_string() })
+                                .build()])
+                            .build()])
+                        .build(),
+                )
+                .await
+                .expect("workflow");
+            backend
+                .using::<Project>(NAMESPACE)
+                .create(
+                    &empty_meta("parity-project"),
+                    &flotilla_resources::ProjectSpec::builder()
+                        .display_name("Parity".to_string())
+                        .default_workflow_ref("parity-workflow".to_string())
+                        .build(),
+                )
+                .await
+                .expect("project");
+            let projection = AggregatorProjectionState::new();
+            let health = RuntimeHealth::default();
+            let identity = test_health_identity();
+            let clock = flotilla_resources::VirtualClock::new(Utc::now());
+            for index in 0..count {
+                // Store timestamps come from its real clock; pin the decision
+                // clock to the newest write so test scheduling cannot age it.
+                if let Some(newest) = backend
+                    .using::<Convoy>(NAMESPACE)
+                    .list()
+                    .await
+                    .expect("convoys")
+                    .items
+                    .iter()
+                    .map(|convoy| convoy.metadata.creation_timestamp)
+                    .max()
+                {
+                    clock.set(newest);
+                }
+                health.report_projection_parity(
+                    projection_parity_condition(&backend, NAMESPACE, &projection, &clock).await.expect("parity before admission"),
+                );
+                apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &identity, &health)
+                    .await
+                    .expect("publish readiness");
+                let mut events = daemon.subscribe();
+                let command_id = daemon
+                    .execute(
+                        Command::builder()
+                            .action(CommandAction::ConvoyStart {
+                                intent: Box::new(
+                                    flotilla_protocol::ConvoyStartIntent::builder()
+                                        .project_ref("parity-project".to_string())
+                                        .name(format!("batch-{index}"))
+                                        .branch(format!("test/batch-{index}"))
+                                        .placement_policy(format!("host-direct-{host_id}"))
+                                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                                        .build(),
+                                ),
+                            })
+                            .build(),
+                    )
+                    .await
+                    .expect("dispatch");
+                let result = wait_for_command_result(&mut events, command_id).await;
+                assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "admission {index}: {result:?}");
+                assert_eq!(backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.len(), index + 1);
+            }
+            if count > 0 {
+                let newest = backend
+                    .using::<Convoy>(NAMESPACE)
+                    .list()
+                    .await
+                    .expect("convoys")
+                    .items
+                    .iter()
+                    .map(|convoy| convoy.metadata.creation_timestamp)
+                    .max()
+                    .expect("admitted rows");
+                clock.set(newest + PROJECTION_PARITY_GRACE);
+                health.report_projection_parity(
+                    projection_parity_condition(&backend, NAMESPACE, &projection, &clock).await.expect("expired parity"),
+                );
+                apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &identity, &health)
+                    .await
+                    .expect("publish divergence");
+                let mut events = daemon.subscribe();
+                let command_id = daemon
+                    .execute(
+                        Command::builder()
+                            .action(CommandAction::ConvoyStart {
+                                intent: Box::new(
+                                    flotilla_protocol::ConvoyStartIntent::builder()
+                                        .project_ref("parity-project".to_string())
+                                        .name("after-bound".to_string())
+                                        .branch("test/after-bound".to_string())
+                                        .placement_policy(format!("host-direct-{host_id}"))
+                                        .auto_attach(flotilla_protocol::ConvoyAutoAttach::Never)
+                                        .build(),
+                                ),
+                            })
+                            .build(),
+                    )
+                    .await
+                    .expect("dispatch with divergence");
+                let result = wait_for_command_result(&mut events, command_id).await;
+                assert!(
+                    matches!(result, CommandValue::Error { ref message } if message.contains("LocalRowsMissing")),
+                    "old missing rows must refuse admission: {result:?}"
+                );
+                assert_eq!(
+                    backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.len(),
+                    count,
+                    "refusal must not write another convoy"
+                );
+            }
+        });
+    }
+
+    // #2736: only rows younger than ten seconds get grace. The boundary is
+    // inclusive for divergence, and future timestamps fail closed. Each case
+    // also checks that catching up clears the diagnosis at that same instant.
+    #[tokio::test]
+    async fn projection_parity_creation_age_boundaries() {
+        let backend = ResourceBackend::InMemory(Default::default());
+        let created = backend
+            .using::<Convoy>(NAMESPACE)
+            .create(&empty_meta("recent"), &ConvoySpec::builder().workflow_ref("workflow".to_string()).build())
+            .await
+            .expect("create local convoy");
+        for age_ms in [-1, 0, 1, 9_999, 10_000, 10_001, 60_000] {
+            let clock = flotilla_resources::VirtualClock::new(created.metadata.creation_timestamp + chrono::Duration::milliseconds(age_ms));
+            let projection = AggregatorProjectionState::new();
+            let condition = projection_parity_condition(&backend, NAMESPACE, &projection, &clock).await.expect("evaluate missing row");
+            assert_eq!(condition.is_some(), !(0..10_000).contains(&age_ms), "row age {age_ms}ms");
+            if let Some(condition) = condition {
+                assert_eq!(condition.reason, "LocalRowsMissing");
+                assert_eq!(condition.message, "durable store has 1 convoys but the local aggregator projection has 0; missing: recent");
+            }
+            let resource = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", NAMESPACE, "recent");
+            projection.write().await.local_rows.insert(
+                resource.clone(),
+                flotilla_protocol::ConvoyRow::builder()
+                    .resource(resource)
+                    .name("recent")
+                    .workflow_ref("workflow")
+                    .phase(flotilla_protocol::ConvoyPhase::Pending)
+                    .build(),
+            );
+            assert!(
+                projection_parity_condition(&backend, NAMESPACE, &projection, &clock).await.expect("evaluate caught-up row").is_none(),
+                "caught-up row age {age_ms}ms"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn projection_parity_reports_and_clears_missing_local_convoys() {
         let backend = ResourceBackend::InMemory(Default::default());
@@ -13047,8 +13248,9 @@ mod tests {
             .expect("mark durable convoy failed");
         convoys.delete(&failed.metadata.name).await.expect("begin durable convoy reaping");
         let projection = AggregatorProjectionState::new();
+        let clock = flotilla_resources::VirtualClock::new(created.metadata.creation_timestamp + PROJECTION_PARITY_GRACE);
 
-        let degraded = projection_parity_condition(&backend, NAMESPACE, &projection)
+        let degraded = projection_parity_condition(&backend, NAMESPACE, &projection, &clock)
             .await
             .expect("evaluate parity")
             .expect("missing projection should degrade the host");
@@ -13067,7 +13269,7 @@ mod tests {
                 .build(),
         );
         assert!(
-            projection_parity_condition(&backend, NAMESPACE, &projection).await.expect("evaluate restored parity").is_none(),
+            projection_parity_condition(&backend, NAMESPACE, &projection, &clock).await.expect("evaluate restored parity").is_none(),
             "restored parity should clear the degraded condition"
         );
     }
