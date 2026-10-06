@@ -48,7 +48,7 @@ pub fn is_incompatible_daemon_error(error: &str) -> bool {
 /// Deterministic refusals cannot be repaired by reconnecting the same client.
 /// Resource-message classification is owned by the error's producer/formatter.
 pub fn is_permanent_daemon_error(error: &str) -> bool {
-    ResourceError::is_invalid_message(error) || is_incompatible_daemon_error(error)
+    ResourceError::is_invalid_message(error) || is_incompatible_daemon_error(error) || error.contains(crate::UNSUPPORTED_LOCAL_DAEMON_ERROR)
 }
 
 /// Connect to a daemon with the shared retry policy used by every long-lived
@@ -71,7 +71,7 @@ where
                 std::env::remove_var(REEXEC_BUILD_ENV);
                 return Ok(daemon);
             }
-            Err(error) if is_incompatible_daemon_error(&error) => return Err(error),
+            Err(error) if is_permanent_daemon_error(&error) => return Err(error),
             Err(error) => {
                 let delay = backoff.next_delay();
                 notify(ReconnectNotice::Retry { attempt, error, delay });
@@ -156,8 +156,11 @@ mod tests {
         for message in ["", "unsupported watch parameters", "arbitrary detail"] {
             assert!(is_permanent_daemon_error(&ResourceError::invalid(message).to_string()));
         }
-        for error in ["protocol version mismatch", "wire generation mismatch"] {
+        for error in ["protocol version mismatch", "wire generation mismatch", crate::UNSUPPORTED_LOCAL_DAEMON_ERROR] {
             assert!(is_permanent_daemon_error(error));
+        }
+        for error in ["", "unsupported request", "connection refused", "daemon unavailable", "connection timed out"] {
+            assert!(!is_permanent_daemon_error(error));
         }
         for error in
             [ResourceError::not_found("name"), ResourceError::conflict("name", "stale view"), ResourceError::other("daemon unavailable")]

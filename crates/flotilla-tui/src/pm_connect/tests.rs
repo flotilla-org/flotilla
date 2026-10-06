@@ -435,6 +435,69 @@ async fn reconnect_loop_retries_unavailable_daemon_but_exits_for_incompatible_da
     assert_eq!(attempts.load(Ordering::SeqCst), 3, "ordinary connection failures must keep retrying");
 }
 
+// #2589: a restarting daemon is retried with exponential, jittered backoff
+// bounded at 30 seconds, and a successful retry enters the connector session.
+#[tokio::test(start_paused = true)]
+async fn reconnect_loop_retries_restarting_daemon_with_capped_backoff() {
+    let daemon = Arc::new(MockDaemon::new(vec![]));
+    let mut times = Vec::new();
+    let mut sessions = 0;
+    let result = run_reconnecting(
+        || {
+            times.push(tokio::time::Instant::now());
+            let attempt = times.len();
+            let daemon = daemon.clone() as Arc<dyn DaemonHandle>;
+            // Boundary double: dial failures while the daemon restarts.
+            async move {
+                if attempt <= 10 {
+                    Err("Connection refused (os error 111)".to_string())
+                } else {
+                    Ok(daemon)
+                }
+            }
+        },
+        |_| {
+            sessions += 1;
+            async { Err("daemon protocol version mismatch: stop test session".to_string()) }
+        },
+    )
+    .await;
+    assert_eq!(result, Err("daemon protocol version mismatch: stop test session".to_string()));
+    assert_eq!(sessions, 1, "a successful retry enters the connector");
+    assert_eq!(times.len(), 11);
+    let mut base = Duration::from_millis(500);
+    for pair in times.windows(2) {
+        let elapsed = pair[1] - pair[0];
+        assert!(elapsed >= base / 2 && elapsed <= base + Duration::from_millis(1), "retry delay {elapsed:?} for base {base:?}");
+        base = (base * 2).min(Duration::from_secs(30));
+    }
+}
+
+// #2589: unsupported endpoint/platform combinations must return the actionable
+// error immediately, without sleeping or trying to establish a session.
+#[tokio::test(start_paused = true)]
+async fn reconnect_loop_exits_promptly_for_unsupported_local_endpoint() {
+    let message = "local Unix daemon sockets are unsupported on this platform; connect to a remote daemon with --daemon ssh://HOST or FLOTILLA_DAEMON (no local daemon will be spawned)";
+    let mut attempts = 0;
+    let started = tokio::time::Instant::now();
+    // Boundary double: the daemon dial returns the Windows endpoint refusal.
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        run_reconnecting(
+            || {
+                attempts += 1;
+                async { Err::<Arc<dyn DaemonHandle>, _>(message.to_string()) }
+            },
+            |_| async { panic!("a refused endpoint cannot establish a session") },
+        ),
+    )
+    .await
+    .expect("unsupported endpoints must terminate promptly");
+    assert_eq!(result, Err(message.to_string()));
+    assert_eq!(attempts, 1);
+    assert_eq!(started.elapsed(), Duration::ZERO);
+}
+
 fn standing_role_row(role: &str) -> StandingRoleRow {
     StandingRoleRow::builder()
         .resource(ResourceRef::new("flotilla.work/v1", "ConvoyEnsure", "dev", format!("ensure-{role}")))
