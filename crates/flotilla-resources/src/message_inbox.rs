@@ -207,7 +207,7 @@ pub async fn resolve_message_receiver(
     namespace: &str,
     address: &str,
 ) -> Result<Option<crate::ReadResourceObject<crate::TerminalSession>>, ResourceError> {
-    use crate::{Convoy, ResourceProvenance, TerminalSession, TerminalSessionSource, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
+    use crate::{Convoy, TerminalSession, TerminalSessionSource, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
     validate_message_address(address)?;
     let parts: Vec<_> = address.split('/').collect();
     let convoys = backend.including_replicas::<Convoy>(namespace).list().await?.items;
@@ -263,7 +263,6 @@ pub async fn resolve_message_receiver(
         .collect::<Vec<_>>();
     // Local authority shadows a self-origin replica; the read resolver already
     // deduplicates that pair. Multiple independent holders are not a guess.
-    holders.sort_by_key(|source| (matches!(source.provenance, ResourceProvenance::Replica { .. }), source.object.metadata.name.clone()));
     match holders.len() {
         0 => Ok(None),
         1 => Ok(holders.pop()),

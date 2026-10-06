@@ -59,7 +59,8 @@ fn deployed_stored_records_still_decode() {
                         | "ImageBuild"
                         | "FleetDesignation"
                         | "DispatchHold"
-                        | "DispatchDeployment" | "Message"
+                        | "DispatchDeployment"
+                        | "Message"
                 )
             })
             .map(|kind| format!("{}.json", kind.kind))
@@ -74,7 +75,14 @@ fn deployed_stored_records_still_decode() {
         for kind in REGISTERED_RESOURCE_KINDS.iter().filter(|kind| {
             !matches!(
                 kind.kind,
-                "ManifestRoot" | "CrewDefaults" | "ImageLayer" | "ImageBuild" | "FleetDesignation" | "DispatchHold" | "DispatchDeployment" | "Message"
+                "ManifestRoot"
+                    | "CrewDefaults"
+                    | "ImageLayer"
+                    | "ImageBuild"
+                    | "FleetDesignation"
+                    | "DispatchHold"
+                    | "DispatchDeployment"
+                    | "Message"
             )
         }) {
             let file = generation.join(format!("{}.json", kind.kind));
