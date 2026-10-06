@@ -75,7 +75,8 @@ pub struct CleatTerminalPool {
     runner: Arc<dyn CommandRunner>,
     binary: String,
     environment: ControlledTerminalEnvironment,
-    launch_capability: tokio::sync::OnceCell<()>,
+    /// Whether this cleat accepts `launch --env-clear` (cleat#318).
+    launch_capability: tokio::sync::OnceCell<bool>,
     attach_capability: tokio::sync::OnceCell<()>,
     endpoint_cache: tokio::sync::Mutex<Option<EndpointCache>>,
     last_recording_prune: tokio::sync::Mutex<Instant>,
@@ -172,22 +173,31 @@ impl CleatTerminalPool {
             return Ok(());
         }
 
-        self.launch_capability
+        let env_clear = *self
+            .launch_capability
             .get_or_try_init(|| async {
                 let help = run!(self.runner, &self.binary, &["launch", "--help"], Path::new("/"))
                     .map_err(|_| format!("cleat '{}' cannot verify declared environment support (--env-clear)", self.binary))?;
-                if !help.split_whitespace().any(|word| word == "--env-clear") {
-                    return Err(format!(
-                        "cleat '{}' lacks declared environment support (--env-clear); upgrade cleat before launching sessions (cleat#318)",
-                        self.binary
-                    ));
+                let supported = help.split_whitespace().any(|word| word == "--env-clear");
+                if !supported {
+                    // Until cleat#318 ships, sessions inherit the cleat daemon's environment. The
+                    // client itself runs under the controlled envelope, so a daemon it starts is
+                    // clean; only a daemon started elsewhere can leak ambient variables.
+                    // Remove this fallback once fleet cleat supports --env-clear (flotilla#2756).
+                    // The probe result is cached for the pool's lifetime, so this warns once per
+                    // pool and an upgraded cleat is only picked up after a daemon restart.
+                    tracing::warn!(binary = %self.binary, "cleat lacks --env-clear; launching without clearing inherited environment (cleat#318)");
                 }
-                Ok(())
+                Ok::<bool, String>(supported)
             })
             .await?;
 
         let cwd = cwd.as_path().display().to_string();
-        let mut args = vec!["launch", "--env-clear", "--json", "--record", session_name, "--cwd", &cwd, "--cmd", command];
+        let mut args = vec!["launch"];
+        if env_clear {
+            args.push("--env-clear");
+        }
+        args.extend(["--json", "--record", session_name, "--cwd", &cwd, "--cmd", command]);
         let encoded_size = initial_size.map(|size| size.to_string());
         if let Some(size) = &encoded_size {
             args.extend(["--size", size]);
@@ -405,7 +415,7 @@ mod tests {
     // capability has been established. environment_tests covers the real probe.
     fn test_pool(runner: Arc<dyn CommandRunner>, binary: &str) -> CleatTerminalPool {
         let pool = CleatTerminalPool::new(runner, binary, &EnvironmentBag::new());
-        pool.launch_capability.set(()).expect("known launch capability");
+        pool.launch_capability.set(true).expect("known launch capability");
         pool
     }
 
@@ -585,6 +595,21 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].0, "cleat");
         assert_eq!(calls[1].1, vec!["launch", "--env-clear", "--json", "--record", "my-session", "--cwd", "/repo", "--cmd", "bash"]);
+    }
+
+    #[tokio::test]
+    async fn ensure_launches_without_env_clear_when_cleat_lacks_it() {
+        // `--env` in the stub help is deliberately a prefix of `--env-clear`: the probe must match
+        // whole words, not substrings.
+        let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("Usage: cleat launch [OPTIONS] --env".into()), Ok("{}".into())]));
+        let pool = CleatTerminalPool::new(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat", &EnvironmentBag::new());
+
+        pool.ensure_session("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[]).await.expect("ensure session");
+
+        let calls = logical_calls(&runner);
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[1].1, vec!["launch", "--help"]);
+        assert_eq!(calls[2].1, vec!["launch", "--json", "--record", "my-session", "--cwd", "/repo", "--cmd", "bash"]);
     }
 
     #[tokio::test]

@@ -142,18 +142,19 @@ async fn on_demand_daemon_starts_without_the_clients_ambient_variables() {
     assert!(clients[0].contains_key("PATH"));
 }
 
-// Old binaries must refuse unsafe launches instead of silently falling back
-// to inherited environments. Listing an existing daemon remains available.
+// Until cleat#318 ships, old binaries launch without --env-clear rather than
+// refusing every crew (flotilla#2756). Declared variables are still passed,
+// and the session inherits only the daemon's environment. Restore the refusal
+// when the fleet's cleat supports --env-clear.
 #[tokio::test]
-async fn old_cleat_refuses_new_crew_launches() {
+async fn old_cleat_launches_without_env_clear() {
     let runner = Arc::new(CleatProcessFake { supports_clear: false, clients: Mutex::new(Vec::new()), child: Mutex::new(None) });
     let pool = CleatTerminalPool::new(runner.clone(), "cleat", &EnvironmentBag::new());
-    let error = pool
-        .ensure_session("crew", "codex", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[])
+    pool.ensure_session("crew", "codex", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[])
         .await
-        .expect_err("unsafe launch refused");
-    assert!(error.contains("--env-clear"));
-    assert!(runner.child.lock().expect("child").is_none());
+        .expect("old cleat launches without --env-clear");
+    let child = runner.child.lock().expect("child").clone().expect("session launched");
+    assert_eq!(child.get("TERM").map(String::as_str), Some("xterm-ghostty"));
 }
 
 // Process boundary: run real commands with injected contamination on just
