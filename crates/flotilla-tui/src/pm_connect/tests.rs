@@ -465,6 +465,8 @@ async fn reconnect_loop_retries_restarting_daemon_with_capped_backoff() {
     assert_eq!(result, Err("daemon protocol version mismatch: stop test session".to_string()));
     assert_eq!(sessions, 1, "a successful retry enters the connector");
     assert_eq!(times.len(), 11);
+    // These ranges specify ReconnectBackoff in flotilla-client/src/reconnect.rs:
+    // 500ms initial base, half-to-full jitter, and a 30s cap.
     let mut base = Duration::from_millis(500);
     for pair in times.windows(2) {
         let elapsed = pair[1] - pair[0];
@@ -477,7 +479,7 @@ async fn reconnect_loop_retries_restarting_daemon_with_capped_backoff() {
 // error immediately, without sleeping or trying to establish a session.
 #[tokio::test(start_paused = true)]
 async fn reconnect_loop_exits_promptly_for_unsupported_local_endpoint() {
-    let message = "local Unix daemon sockets are unsupported on this platform; connect to a remote daemon with --daemon ssh://HOST or FLOTILLA_DAEMON (no local daemon will be spawned)";
+    let message = flotilla_client::UNSUPPORTED_LOCAL_DAEMON_ERROR;
     let mut attempts = 0;
     let started = tokio::time::Instant::now();
     // Boundary double: the daemon dial returns the Windows endpoint refusal.
