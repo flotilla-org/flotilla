@@ -122,15 +122,26 @@ fn with_raw_terminal<T, S>(
 // occupy bits 0..2. Preserve window/VT input and every other console flag.
 #[cfg(any(windows, test))]
 fn raw_input_mode(mode: u32) -> u32 {
-    mode & !0x0007
+    #[cfg(windows)]
+    let cooked_input = windows_console::COOKED_INPUT;
+    // Portable tests exercise the documented Windows flag layout without
+    // linking console APIs on Unix.
+    #[cfg(all(test, not(windows)))]
+    let cooked_input = 0x0007;
+    mode & !cooked_input
 }
 
 #[cfg(windows)]
 mod windows_console {
     use windows_sys::Win32::{
         Foundation::{HANDLE, INVALID_HANDLE_VALUE},
-        System::Console::{GetConsoleMode, GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
+        System::Console::{
+            GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, STD_INPUT_HANDLE,
+            STD_OUTPUT_HANDLE,
+        },
     };
+
+    pub(super) const COOKED_INPUT: u32 = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT;
 
     pub(super) struct Modes {
         input: HANDLE,
@@ -205,6 +216,17 @@ pub fn exec_attach_plan(plan: &ResolvedAttachPlan) -> Result<Infallible, String>
     let status = with_raw_terminal(windows_console::enter, windows_console::restore, || {
         Command::new(&program).args(args).status().map_err(|error| format!("could not start {program} attach hop: {error}"))
     })?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Preserve process-spawn attachment on platforms without Unix exec or a
+/// Windows console adapter.
+#[cfg(not(any(unix, windows)))]
+pub fn exec_attach_plan(plan: &ResolvedAttachPlan) -> Result<Infallible, String> {
+    install_panic_hook();
+    restore_terminal();
+    let (program, args) = attach_argv(plan)?;
+    let status = Command::new(&program).args(args).status().map_err(|error| format!("could not start {program} attach hop: {error}"))?;
     std::process::exit(status.code().unwrap_or(1));
 }
 
