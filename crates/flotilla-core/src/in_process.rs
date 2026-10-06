@@ -1398,6 +1398,7 @@ pub struct InProcessDaemon {
     /// Used to inject FLOTILLA_DAEMON_SOCKET into managed terminal sessions.
     daemon_socket_path: RwLock<Option<PathBuf>>,
     resource_backend: ResourceBackend,
+    message_inboxes: Mutex<HashMap<String, flotilla_resources::MessageInbox>>,
     clock: Arc<dyn Clock>,
     regard_lifecycle: Arc<RegardLifecycle>,
     observed_resource_backend: ResourceBackend,
@@ -1903,6 +1904,7 @@ impl InProcessDaemon {
             clock: Arc::clone(&clock),
             regard_lifecycle: Arc::clone(&regard_lifecycle),
             resource_backend: resource_backend.clone(),
+            message_inboxes: Mutex::new(HashMap::new()),
             observed_resource_backend: observed_resource_backend.clone(),
             observed_checkout_reconciliation: Arc::clone(&observed_checkout_reconciliation),
             aggregator_projection_state: aggregator_projection_state.clone(),
@@ -5475,10 +5477,67 @@ impl InProcessDaemon {
         let Some((namespace, kind, name)) = target else { return Ok(None) };
         let object = match get_resource_kind_including_replicas(&self.resource_backend, namespace, kind, name).await {
             Ok(object) => object,
-            Err(ResourceError::NotFound { .. }) => return Ok(None),
+            Err(ResourceError::NotFound { .. }) => {
+                if kind == "Message" {
+                    if let CommandAction::ResourceApply { document, .. } = action {
+                        return self.message_creation_origin(namespace, document).await;
+                    }
+                }
+                return Ok(None);
+            }
             Err(error) => return Err(error.to_string()),
         };
         Ok(object.value.pointer("/metadata/annotations/flotilla.work~1origin-root").and_then(serde_json::Value::as_str).map(NodeId::new))
+    }
+
+    async fn message_creation_origin(&self, namespace: &str, document: &serde_json::Value) -> Result<Option<NodeId>, String> {
+        let receiver = document
+            .pointer("/spec/receiver")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "Message requires a receiver address".to_string())?;
+        if let Some(holder) = flotilla_resources::resolve_message_receiver(&self.resource_backend, namespace, receiver)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(Some(match holder.provenance {
+                ResourceProvenance::Local => self.node_id.clone(),
+                ResourceProvenance::Replica { origin_root, .. } => origin_root,
+            }));
+        }
+        // An admitted vessel has a home before its agent starts. This lets its
+        // messages wait at the receiver while a holder is absent or provisioning.
+        let parts = receiver.split('/').collect::<Vec<_>>();
+        if let [project, convoy_name, vessel, _role] = parts.as_slice() {
+            let convoy = self
+                .resource_backend
+                .including_replicas::<ResourceConvoy>(namespace)
+                .get(convoy_name)
+                .await
+                .map_err(|error| error.to_string())?;
+            if convoy.object.spec.project_ref.as_deref() != Some(*project) {
+                return Err(format!("receiver `{receiver}` does not belong to the convoy's project"));
+            }
+            if let Some(pin) = flotilla_resources::vessel_placement_pin(&convoy.object, vessel) {
+                let actuator = placement_actuator_host_ref(&self.resource_backend, namespace, &pin.decision.target_host).await?;
+                if self.canonical_local_host_id().as_ref() == Some(&actuator) {
+                    return Ok(Some(self.node_id.clone()));
+                }
+                let host = canonical_placement_host_ref(&self.resource_backend, namespace, actuator.as_str())
+                    .await?
+                    .ok_or_else(|| format!("receiver `{receiver}` has an unknown home host"))?;
+                return self
+                    .host_registry
+                    .node_id_for_host_name(&HostName::new(host.display_name))
+                    .await?
+                    .map(Some)
+                    .ok_or_else(|| format!("receiver `{receiver}` home host has no route"));
+            }
+            return Ok(Some(match convoy.provenance {
+                ResourceProvenance::Local => self.node_id.clone(),
+                ResourceProvenance::Replica { origin_root, .. } => origin_root,
+            }));
+        }
+        Ok(None)
     }
 
     pub async fn route_remote_attach_binding(&self, binding: &AttachBinding) -> Result<ResolvedAttachPlan, String> {
@@ -5644,18 +5703,50 @@ impl InProcessDaemon {
         Ok(id)
     }
 
+    pub async fn message_inbox(&self, namespace: &str) -> flotilla_resources::MessageInbox {
+        self.message_inboxes
+            .lock()
+            .await
+            .entry(namespace.to_string())
+            .or_insert_with(|| flotilla_resources::MessageInbox::new(self.resource_backend.clone(), namespace))
+            .clone()
+    }
+
+    async fn apply_intent_document(
+        &self,
+        namespace: &str,
+        document: serde_json::Value,
+    ) -> Result<flotilla_resources::DynamicResourceObject, ResourceError> {
+        use flotilla_resources::{get_resource_kind, MessageAdmission, MessageSpec};
+        if document.get("kind").and_then(serde_json::Value::as_str) != Some("Message") {
+            return apply_resource_document(&self.resource_backend, namespace, document).await;
+        }
+        flotilla_resources::validate_resource_document(&document)?;
+        let namespace = document.pointer("/metadata/namespace").and_then(serde_json::Value::as_str).unwrap_or(namespace);
+        let meta: InputMeta = serde_json::from_value(document.get("metadata").cloned().unwrap_or_default())
+            .map_err(|error| ResourceError::decode(format!("message metadata: {error}")))?;
+        let spec: MessageSpec = serde_json::from_value(document.get("spec").cloned().unwrap_or_default())
+            .map_err(|error| ResourceError::decode(format!("message spec: {error}")))?;
+        let admission = self.message_inbox(namespace).await.accept(&meta, &spec, self.clock.now()).await?;
+        let record = match admission {
+            MessageAdmission::Accepted(record) => record,
+            MessageAdmission::Suppressed { predecessor } => predecessor,
+        };
+        get_resource_kind(&self.resource_backend, namespace, "Message", &record.metadata.name).await
+    }
+
     async fn execute_action_resource_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ResourceApply { namespace, document } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             // Artifact puts and creation reservations share one resource version.
             // Retry optimistic conflicts without replacing authority-owned status.
-            let mut applied = apply_resource_document(&self.resource_backend, namespace, document.clone()).await;
+            let mut applied = self.apply_intent_document(namespace, document.clone()).await;
             if document.get("kind").and_then(serde_json::Value::as_str) == Some("Artifact") {
                 for _ in 0..15 {
                     if !matches!(applied, Err(ResourceError::Conflict { .. })) {
                         break;
                     }
-                    applied = apply_resource_document(&self.resource_backend, namespace, document.clone()).await;
+                    applied = self.apply_intent_document(namespace, document.clone()).await;
                 }
             }
             let result = match applied {

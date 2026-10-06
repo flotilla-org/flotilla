@@ -17,6 +17,11 @@ impl Resource for Message {
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::HomeBoundRuntime;
 
     fn validate_spec(_meta: &InputMeta, spec: &Self::Spec) -> Result<(), ResourceError> {
+        crate::validate_message_address(&spec.sender)?;
+        crate::validate_message_address(&spec.receiver)?;
+        if spec.interrupting && spec.relation != MessageRelation::Supervisor {
+            return Err(ResourceError::invalid("only supervisor messages may interrupt an active turn"));
+        }
         if spec.sender.is_empty() || spec.receiver.is_empty() {
             return Err(ResourceError::invalid("message sender and receiver must be nonempty addresses"));
         }

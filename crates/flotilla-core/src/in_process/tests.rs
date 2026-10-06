@@ -9826,3 +9826,73 @@ async fn admission_refuses_same_role_briefs_before_writing_any_artifact() {
     assert!(error.contains("convoy-wide unique roles"));
     assert!(writer.writes.lock().await.is_empty(), "refusal is before all artifact writes");
 }
+
+// Message mutations use receiver-side admission, preserving idempotent IDs and
+// superseding pending intent rather than appending independent terminal inputs.
+#[tokio::test]
+async fn resource_message_mutations_use_durable_inbox_admission() {
+    use flotilla_resources::{Message, MessagePhase};
+    let temp = tempfile::tempdir().expect("config directory");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-test\"\n").expect("machine identity");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("test-host"),
+        backend.clone(),
+    )
+    .await;
+    let mut document = serde_json::json!({
+        "apiVersion": "flotilla.work/v1", "kind": "Message", "metadata": {"name": "first"},
+        "spec": {"sender": "flotilla/checks", "receiver": "flotilla/convoy/work/coder", "relation": "system", "body": "checks settled"}
+    });
+    let first = daemon.apply_intent_document("flotilla", document.clone()).await.expect("admit");
+    let retry = daemon.apply_intent_document("flotilla", document.clone()).await.expect("retry");
+    assert_eq!(first.value, retry.value);
+    document["metadata"]["name"] = "next".into();
+    document["spec"]["supersedes"] = "first".into();
+    daemon.apply_intent_document("flotilla", document).await.expect("successor");
+    let first = backend.using::<Message>("flotilla").get("first").await.expect("read first");
+    assert_eq!(first.status.expect("status").phase, MessagePhase::Superseded);
+}
+
+// A receiver's admitted convoy supplies a home before its terminal is present;
+// ordinary ResourceApply routing follows that origin rather than the sender or
+// an explicitly requested unrelated node.
+#[tokio::test]
+async fn new_message_mutations_route_to_the_absent_receivers_home() {
+    use crate::command_target::TargetHost;
+    let temp = tempfile::tempdir().expect("config directory");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"message-test\"\n").expect("machine identity");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery(false),
+        HostName::new("sender"),
+        backend.clone(),
+    )
+    .await;
+    let remote = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("receiver"));
+    let remote_convoys = remote.using::<ResourceConvoy>("flotilla");
+    remote_convoys
+        .create(&test_meta("convoy"), &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build())
+        .await
+        .expect("receiver convoy");
+    backend
+        .replica_writer::<ResourceConvoy>(NodeId::new("receiver"), "flotilla")
+        .replace(&remote_convoys.list().await.expect("receiver snapshot"), chrono::Utc::now())
+        .await
+        .expect("replicate");
+    let action = CommandAction::ResourceApply {
+        namespace: "flotilla".into(),
+        document: serde_json::json!({
+            "apiVersion": "flotilla.work/v1", "kind": "Message", "metadata": {"name": "first"},
+            "spec": {"sender": "flotilla/checks", "receiver": "flotilla/convoy/work/coder", "relation": "system", "body": "checks settled"}
+        }),
+    };
+    let target = daemon.resolve_command_target(&action, Some(&NodeId::new("unrelated"))).await.expect("route");
+    assert_eq!(target.host, TargetHost::Node(NodeId::new("receiver")));
+    assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("sender messages").items.is_empty());
+}

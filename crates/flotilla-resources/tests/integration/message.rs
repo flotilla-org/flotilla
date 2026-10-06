@@ -134,3 +134,245 @@ fn malformed_message_states_are_refused() {
         Some(MessageReference::ChangeRequest { service: "github".into(), scope: "org/repo".into(), number: 1, revision: "head".into() });
     assert!(Message::validate_spec(&InputMeta::builder().name("invalid".into()).build(), &malformed).is_err());
 }
+
+// Convoy-relative roles are qualified at creation, while fully qualified role
+// and principal addresses remain strings with no closed set of role names.
+#[hegel::test]
+fn relative_role_addresses_are_qualified_once(tc: hegel::TestCase) {
+    use flotilla_resources::{qualify_message_address, validate_message_address, MessageAddressContext};
+    let index = tc.draw(gs::integers::<u32>().min_value(0).max_value(100));
+    let role = format!("reviewer-{index}");
+    let context = MessageAddressContext { project: "project".into(), convoy: "convoy".into(), vessel: "work".into() };
+    let address = qualify_message_address(&role, &context).expect("qualify role");
+    assert_eq!(address, format!("project/convoy/work/{role}"));
+    assert_eq!(qualify_message_address(&address, &context).expect("qualify again"), address);
+    for address in ["project/governor", "fleet/operator", "principal:alice", "flotilla/checks"] {
+        assert_eq!(qualify_message_address(address, &context).expect("full address"), address);
+    }
+    for invalid in ["", "project//work/coder", "principal:", "project/..", "fleet/op\nerator"] {
+        assert!(validate_message_address(invalid).is_err(), "invalid address: {invalid:?}");
+    }
+}
+
+// Identical subject revisions replace pending messages but suppress a new
+// message while a delivered predecessor expects a reply or outcome. A new
+// revision, another sender/receiver, or no subject is independent.
+#[hegel::test]
+fn subject_supersession_follows_identity_and_expectation(tc: hegel::TestCase) {
+    use flotilla_resources::{MessageAdmission, MessageInbox};
+    let delivered = tc.draw(gs::booleans());
+    let open = tc.draw(gs::booleans());
+    let same_revision = tc.draw(gs::booleans());
+    let same_sender = tc.draw(gs::booleans());
+    let same_receiver = tc.draw(gs::booleans());
+    let has_subject = tc.draw(gs::booleans());
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let resolver = backend.using::<Message>("flotilla");
+        let inbox = MessageInbox::new(backend, "flotilla");
+        let subject = has_subject.then(|| MessageReference::ChangeRequest {
+            service: "github".into(),
+            scope: "org/repo".into(),
+            number: 1,
+            revision: "head".into(),
+        });
+        let first_spec = spec(subject, if open { MessageExpectation::Reply } else { MessageExpectation::None });
+        inbox.accept(&InputMeta::builder().name("first".into()).build(), &first_spec, at(10)).await.expect("first");
+        if delivered {
+            flotilla_resources::apply_status_patch(&resolver, "first", &MessageStatusPatch::Delivered {
+                receiver: ResolvedMessageReceiver::builder()
+                    .crew_id("crew".into())
+                    .session("session".into())
+                    .delivered_at(at(20))
+                    .evidence("accepted".into())
+                    .build(),
+                at: at(20),
+            })
+            .await
+            .expect("deliver first");
+        }
+        let mut second_spec = first_spec.clone();
+        second_spec.body = "replacement".into();
+        if !same_revision && has_subject {
+            let Some(MessageReference::ChangeRequest { revision, .. }) = &mut second_spec.subject else { unreachable!() };
+            *revision = "new-head".into();
+            second_spec.references = second_spec.subject.clone().into_iter().collect();
+        }
+        if !same_sender {
+            second_spec.sender = "flotilla/review".into();
+        }
+        if !same_receiver {
+            second_spec.receiver = "flotilla/convoy/work/reviewer".into();
+        }
+        let admission = inbox.accept(&InputMeta::builder().name("second".into()).build(), &second_spec, at(30)).await.expect("second");
+        let matches = has_subject && same_revision && same_sender && same_receiver;
+        assert_eq!(matches!(admission, MessageAdmission::Suppressed { .. }), matches && delivered && open);
+        let first = resolver.get("first").await.expect("first record");
+        assert_eq!(first.status.as_ref().is_some_and(|status| status.phase == MessagePhase::Superseded), matches && !delivered);
+        assert_eq!(resolver.list().await.expect("records").items.len(), if matches && delivered && open { 1 } else { 2 });
+    });
+}
+
+// Subject-free intent is independent unless the producer explicitly names a
+// predecessor. Retries with the same ID are idempotent; an ID cannot change body.
+#[tokio::test]
+async fn explicit_supersession_and_creation_retries_are_scoped_and_idempotent() {
+    use flotilla_resources::{MessageAdmission, MessageInbox};
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let resolver = backend.using::<Message>("flotilla");
+    let inbox = MessageInbox::new(backend, "flotilla");
+    let original = spec(None, MessageExpectation::None);
+    let meta = InputMeta::builder().name("original".into()).build();
+    let first = inbox.accept(&meta, &original, at(10)).await.expect("create");
+    let retry = inbox.accept(&meta, &original, at(20)).await.expect("retry");
+    let (MessageAdmission::Accepted(first), MessageAdmission::Accepted(retry)) = (first, retry) else { panic!("accepted") };
+    assert_eq!(first.metadata.resource_version, retry.metadata.resource_version);
+    let mut replacement = original.clone();
+    replacement.body = "different".into();
+    assert!(inbox.accept(&meta, &replacement, at(30)).await.is_err());
+    replacement.supersedes = Some("original".into());
+    let replacement_meta = InputMeta::builder().name("replacement".into()).build();
+    replacement.sender = "flotilla/other".into();
+    assert!(inbox.accept(&replacement_meta, &replacement, at(30)).await.is_err());
+    replacement.sender = original.sender;
+    inbox.accept(&replacement_meta, &replacement, at(30)).await.expect("explicit successor");
+    assert_eq!(resolver.get("original").await.expect("original").status.expect("status").phase, MessagePhase::Superseded);
+    replacement.interrupting = true;
+    assert!(inbox.accept(&InputMeta::builder().name("interrupt".into()).build(), &replacement, at(40)).await.is_err());
+}
+
+// Concurrent admissions for one subject leave exactly one pending successor;
+// the inbox serializes the check and supersession for all cloned producers.
+#[tokio::test]
+async fn concurrent_same_subject_admissions_leave_one_pending_message() {
+    use flotilla_resources::MessageInbox;
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let resolver = backend.using::<Message>("flotilla");
+    let inbox = MessageInbox::new(backend, "flotilla");
+    let original = spec(
+        Some(MessageReference::ChangeRequest { service: "github".into(), scope: "org/repo".into(), number: 1, revision: "head".into() }),
+        MessageExpectation::Reply,
+    );
+    let mut tasks = Vec::new();
+    for index in 0..8 {
+        let inbox = inbox.clone();
+        let spec = original.clone();
+        tasks.push(tokio::spawn(async move {
+            inbox.accept(&InputMeta::builder().name(format!("message-{index}")).build(), &spec, at(10 + index)).await.expect("admit")
+        }));
+    }
+    for task in tasks {
+        task.await.expect("join");
+    }
+    let messages = resolver.list().await.expect("messages").items;
+    assert_eq!(messages.len(), 8);
+    assert_eq!(messages.iter().filter(|message| message.status.as_ref().is_none_or(|status| !status.phase.is_terminal())).count(), 1);
+}
+
+fn holder_spec(convoy: &str) -> flotilla_resources::TerminalSessionSpec {
+    use flotilla_resources::{Selector, TerminalBrief, TerminalCrewContext, TerminalSessionSource, TerminalSessionSpec};
+    TerminalSessionSpec::builder()
+        .env_ref("host-direct".into())
+        .role("coder".into())
+        .cwd("/workspace".into())
+        .pool("cleat".into())
+        .source(TerminalSessionSource::Agent {
+            selector: Selector::for_capability("coding"),
+            brief: TerminalBrief {
+                path: ".flotilla/briefs/coder.md".into(),
+                content: "work".into(),
+                artifact_digest: None,
+                copies: Vec::new(),
+            },
+            context: Box::new(TerminalCrewContext {
+                namespace: "flotilla".into(),
+                convoy: convoy.into(),
+                vessel_ref: format!("{convoy}-work"),
+            }),
+            message: None,
+        })
+        .build()
+}
+
+// A role with no holder waits. Resolution reads today's holder, including
+// replicated terminals, and project-level addresses follow the newest admitted
+// standing generation rather than retaining yesterday's session.
+#[tokio::test]
+async fn addresses_resolve_current_holders_after_replication() {
+    use std::collections::BTreeMap;
+
+    use flotilla_protocol::NodeId;
+    use flotilla_resources::{
+        resolve_message_receiver, Convoy, ConvoySpec, ResourceProvenance, TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL,
+    };
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let remote = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("remote"));
+    assert!(resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/work/coder").await.expect("resolve absent").is_none());
+    let convoys = backend.using::<Convoy>("flotilla");
+    convoys
+        .create(
+            &InputMeta::builder().name("convoy".into()).build(),
+            &ConvoySpec::builder()
+                .workflow_ref("workflow".into())
+                .project_ref("flotilla".into())
+                .role("governor".into())
+                .generation(1)
+                .build(),
+        )
+        .await
+        .expect("old generation");
+    assert!(resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/work/coder").await.expect("resolve absent terminal").is_none());
+    let remote_terminals = remote.using::<TerminalSession>("flotilla");
+    remote_terminals
+        .create(
+            &InputMeta::builder()
+                .name("terminal".into())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.into(), "convoy".into()),
+                    (ROLE_LABEL.into(), "coder".into()),
+                    (VESSEL_LABEL.into(), "work".into()),
+                ]))
+                .build(),
+            &holder_spec("convoy"),
+        )
+        .await
+        .expect("remote holder");
+    backend
+        .replica_writer::<TerminalSession>(NodeId::new("remote"), "flotilla")
+        .replace(&remote_terminals.list().await.expect("remote snapshot"), at(20))
+        .await
+        .expect("replicate");
+    let holder = resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/work/coder").await.expect("resolve").expect("holder");
+    assert_eq!(holder.object.metadata.name, "terminal");
+    assert!(matches!(holder.provenance, ResourceProvenance::Replica { origin_root, .. } if origin_root == NodeId::new("remote")));
+    convoys
+        .create(
+            &InputMeta::builder().name("next-convoy".into()).build(),
+            &ConvoySpec::builder()
+                .workflow_ref("workflow".into())
+                .project_ref("flotilla".into())
+                .role("coder".into())
+                .generation(2)
+                .build(),
+        )
+        .await
+        .expect("new generation");
+    backend
+        .using::<TerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name("new-terminal".into())
+                .labels(BTreeMap::from([
+                    (CONVOY_LABEL.into(), "next-convoy".into()),
+                    (ROLE_LABEL.into(), "coder".into()),
+                    (VESSEL_LABEL.into(), "work".into()),
+                ]))
+                .build(),
+            &holder_spec("next-convoy"),
+        )
+        .await
+        .expect("new holder");
+    let holder = resolve_message_receiver(&backend, "flotilla", "flotilla/coder").await.expect("project role").expect("holder");
+    assert_eq!(holder.object.metadata.name, "new-terminal");
+}
