@@ -428,6 +428,9 @@ fn evaluate_declared_completion_condition(
             let leaves = change_request_leaves()?;
             if leaves.is_empty() && *optional_when_absent {
                 let checkouts_expected = !expected_checkout_refs(convoy)?.is_empty();
+                // Discovery gets one observation freshness window by policy;
+                // keep its grace named separately from bound-record freshness.
+                let discovery_grace = stale_after;
                 let discovery_complete = convoy.status.as_ref().is_some_and(|status| {
                     status.branch_subject_scan_error.is_none()
                         && status.branch_subject_scan_at.is_some_and(|at| {
@@ -440,7 +443,15 @@ fn evaluate_declared_completion_condition(
                 // failed or missing discovery must not make optional PRs mandatory.
                 // A subject discovered later always takes the ordinary bound path.
                 let discovery_expired =
-                    now.signed_duration_since(convoy.metadata.creation_timestamp).to_std().is_ok_and(|age| age >= stale_after);
+                    now.signed_duration_since(convoy.metadata.creation_timestamp).to_std().is_ok_and(|age| age >= discovery_grace);
+                if checkouts_expected && !discovery_complete && discovery_expired {
+                    tracing::info!(
+                        convoy = %convoy.metadata.name,
+                        discovery_grace_seconds = discovery_grace.as_secs(),
+                        discovery_failed = convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_error.is_some()),
+                        "optional change-request completion condition satisfied after discovery grace expired"
+                    );
+                }
                 if !checkouts_expected || discovery_complete || discovery_expired {
                     return Ok(None);
                 }
