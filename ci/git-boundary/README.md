@@ -3,6 +3,15 @@
 This check uses ast-grep's Rust parser to reject literal Git invocations outside
 `flotilla_core::vcs::Vcs` implementations. It runs without compiling Rust.
 
+With `uv` (available in crew images, which lack `ensurepip`), run it in one line; `uv` caches the pinned package:
+
+```bash
+uv run --with-requirements ci/git-boundary/requirements.txt python ci/git-boundary/check.py
+uv run --with-requirements ci/git-boundary/requirements.txt python -m unittest discover -s ci/git-boundary -p test_check.py
+```
+
+Without `uv`:
+
 ```sh
 python3 -m venv /tmp/flotilla-git-check
 /tmp/flotilla-git-check/bin/pip install -r ci/git-boundary/requirements.txt
@@ -27,6 +36,6 @@ file fails the scan, including fixture and build files. The pinned parser is
 0.45.3: 0.39.5 misparsed ordinary identifiers named `raw`.
 Only the exact core VCS implementation paths are exempt from production checks.
 
-The workflow patch in #2793's PR description installs the pinned parser and runs
+CI's format job installs the pinned parser and runs
 both commands in the existing every-PR Format job. Workflow changes are applied
 by the operator.

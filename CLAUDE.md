@@ -33,7 +33,7 @@ cargo +nightly-2026-03-12 fmt --check          # CI format gate
 cargo clippy --workspace --all-targets --locked -- -D warnings  # CI clippy gate
 cargo test --workspace --locked                # CI test gate
 cargo +nightly-2026-03-12 fmt                  # apply pinned formatting
-python3 ci/git-boundary/check.py               # ast-grep Git boundary check (setup below)
+uv run --with-requirements ci/git-boundary/requirements.txt python ci/git-boundary/check.py  # ast-grep Git boundary check
 cargo run                                      # run, auto-detect repo from cwd
 scripts/prune-target.sh --dry-run              # preview the per-checkout target size-cap backstop
 scripts/prune-target.sh                        # apply the per-checkout target size-cap backstop
@@ -194,7 +194,7 @@ Checkout VCS providers are demand-discovered through `vcs_for_checkout` and cach
 
 Use the checkout-scoped `flotilla_core::vcs::Vcs` trait for Git and other VCS operations outside its implementation in `crates/flotilla-core/src/vcs.rs` and `crates/flotilla-core/src/providers/vcs/`. Add a typed operation to the trait when a caller needs a new VCS action. CLI via the checkout's environment runner is the universal implementation. A library backend may be used as a host-local fast path behind the same trait; it must not replace the CLI path for remote or provisioned environments.
 
-Do not invoke `git` directly through `CommandRunner` methods or `run!`, or through `std::process::Command::new("git")`, outside the VCS implementation. The ast-grep Git boundary check runs in the format job on every PR (once the workflow patch from #2793 is applied). Build scripts and build tooling are exempt because they run before a `CommandRunner` exists; tests may use Git to construct fixtures.
+Do not invoke `git` directly through `CommandRunner` methods or `run!`, or through `std::process::Command::new("git")`, outside the VCS implementation. The ast-grep Git boundary check runs in the format job on every PR. Build scripts and build tooling are exempt because they run before a `CommandRunner` exists; tests may use Git to construct fixtures.
 
 ### Observed resources and aggregation
 

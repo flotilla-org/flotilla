@@ -40,6 +40,14 @@ jobs:
         run: ci/crew-image/test-workflow.sh
       - name: Test platform job classification
         run: ci/platform-changes/test-classify.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check Git operation boundary
+        run: |
+          python -m pip install -r ci/git-boundary/requirements.txt
+          python -m unittest discover -s ci/git-boundary -p test_check.py
+          python ci/git-boundary/check.py
       - name: Check Rust formatting
         run: cargo +nightly-2026-03-12 fmt --check
 
