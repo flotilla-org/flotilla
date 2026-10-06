@@ -211,7 +211,7 @@ fn docker_per_vessel_policy_uses_vessel_spelling_in_serialized_resources() {
                 "host_ref": "01HXYZ",
                 "image": "ghcr.io/flotilla/dev:latest",
                 "pull_policy": "never",
-                "memory_policy": {"host_memory_percent": 50, "expected_concurrent_crews": 4, "swap_bytes": 0},
+                "memory_policy": {"host_memory_percent": 80, "expected_concurrent_crews": 4, "swap_bytes": 0},
                 "default_cwd": "/workspace",
                 "env": {"FOO": "bar"},
                 "checkout": {"fresh_clone_in_container": {"clone_path": "/workspace"}}
