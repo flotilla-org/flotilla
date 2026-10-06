@@ -75,8 +75,16 @@ impl CommandRunner for CleatProcessFake {
                 // Cleat, rather than the outer terminal, owns VT identity.
                 child.insert("TERM".into(), "xterm-ghostty".into());
                 child.insert("COLORTERM".into(), "truecolor".into());
+                // Cleat's validate_environment refuses its own session coordinates.
+                const MANAGED: [&str; 4] = ["CLEAT_RUNTIME_DIR", "CLEAT_DAEMON", "CLEAT_SESSION", "CLEAT_OUTPUT_DAEMON"];
                 for pair in arguments.windows(2).filter(|pair| pair[0] == "--env") {
                     let (key, value) = pair[1].split_once('=').expect("NAME=VALUE");
+                    if MANAGED.iter().any(|managed| key.eq_ignore_ascii_case(managed)) {
+                        return Err(format!(
+                            "error: invalid value '{}' for '--env <NAME=VALUE>': {key} is managed by cleat and cannot be overridden",
+                            pair[1]
+                        ));
+                    }
                     child.insert(key.into(), value.into());
                 }
                 *self.child.lock().expect("child") = Some(child);
@@ -275,6 +283,8 @@ fn docker_crew_preserves_vessel_environment(tc: hegel::TestCase) {
             ("GIT_CONFIG_VALUE_2", "crew@example.test"),
             ("FLOTILLA_CREW_SKILLS", value),
             ("DISABLE_AUTOUPDATER", "1"),
+            // #2825: provisioning installs durable cleat state for the client.
+            ("CLEAT_RUNTIME_DIR", "/var/lib/flotilla/cleat"),
         ]
         .into_iter()
         .map(|(k, v)| (k.into(), v.into()))
@@ -295,7 +305,7 @@ fn docker_crew_preserves_vessel_environment(tc: hegel::TestCase) {
         for declared in [vec![], vec![("RUSTUP_HOME".into(), "session override".into()), ("RUSTUP_HOME".into(), value.into())]] {
             pool.ensure_session("crew", "codex", &ExecutionEnvironmentPath::new("/repo"), &declared, &[]).await.expect("launch");
             let child = runner.child.lock().expect("child").clone().expect("launched crew");
-            for (key, expected) in &vessel {
+            for (key, expected) in vessel.iter().filter(|(key, _)| key.as_str() != "CLEAT_RUNTIME_DIR") {
                 let expected = declared.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v).unwrap_or(expected);
                 assert_eq!(child.get(key), Some(expected), "lost vessel {key}");
             }
