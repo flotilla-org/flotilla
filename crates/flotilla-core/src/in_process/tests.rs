@@ -9685,3 +9685,33 @@ async fn image_layer_admission_freezes_inputs_and_keeps_baseline_authoritative()
         daemon.resolve_convoy_placement("flotilla", None, &[], &missing, Some("crew-policy"), false).await.expect_err("missing need");
     assert!(error.contains("display:missing"));
 }
+
+// #2767: address-taking commands share this resolver. Terminal history must
+// never displace a live governor; an exact record ID still addresses history.
+#[hegel::test]
+fn convoy_address_prefers_live_over_two_terminal_namesakes(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+
+    // Generate both project-scoped and projectless role addresses; exhaust all
+    // six input orders. All terminal phases share this boolean resolver input.
+    let project = tc.draw(gs::booleans()).then_some("p");
+    let address = format!("governor@{}", project.unwrap_or_default());
+    for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+        let names = ["old-a", "old-b", "live"];
+        let identities =
+            order.map(|index| ConvoyAddressIdentity { record_name: names[index], role: Some("governor"), project, terminal: index < 2 });
+        for address in [address.as_str(), "governor"] {
+            let indices = resolve_convoy_candidate_indices(&identities, address).expect("unique live governor");
+            assert_eq!(indices.iter().map(|index| identities[*index].record_name).collect::<Vec<_>>(), ["live"]);
+        }
+        let indices = resolve_convoy_candidate_indices(&identities, "old-a").expect("explicit history ID");
+        assert_eq!(indices.iter().map(|index| identities[*index].record_name).collect::<Vec<_>>(), ["old-a"]);
+
+        // A second live match must refuse and name both resource IDs.
+        let mut ambiguous = Vec::from(identities);
+        ambiguous.push(ConvoyAddressIdentity { record_name: "another-live", role: Some("governor"), project, terminal: false });
+        let error = resolve_convoy_candidate_indices(&ambiguous, &address).expect_err("ambiguous live address");
+        assert_eq!(error, format!("convoy address `{address}` matches multiple records; use an exact record name: another-live, live"));
+    }
+    assert!(resolve_convoy_candidate_indices(&[], "governor@p").expect("empty candidates").is_empty());
+}

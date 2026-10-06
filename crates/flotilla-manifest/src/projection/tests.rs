@@ -2795,3 +2795,95 @@ fn project_parent_is_raw_catalog_metadata() {
     assert!(after.diff_patches(&before).iter().any(|patch| patch.target == MetadataTarget::Entity(child_entity.clone())
         && patch.unset.contains(&crate::keys::KEY_PROJECT_PARENT.to_string())));
 }
+
+// #2767: a live standing governor keeps its own identity and state when two
+// abandoned namesakes remain as history, in both PM catalog input paths.
+#[hegel::test]
+fn running_governor_survives_two_abandoned_namesakes(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+
+    use crate::keys::{KEY_ROLE_ATTEMPTS, KEY_ROLE_CURRENT_ATTEMPT};
+
+    // Generation offsets include zero and vary without changing the role identity.
+    // Exhaust all six input orders and both raw-row and awareness projections.
+    let generation = tc.draw(gs::integers::<u64>().min_value(0).max_value(32));
+    let role = standing_role("p", "governor");
+    let rows = [
+        attempt()
+            .name("old-a")
+            .role("governor")
+            .generation(generation)
+            .phase(ConvoyPhase::Abandoned)
+            .ensured_from(&role.resource.name)
+            .call(),
+        attempt()
+            .name("old-b")
+            .role("governor")
+            .generation(generation + 1)
+            .phase(ConvoyPhase::Abandoned)
+            .ensured_from(&role.resource.name)
+            .call(),
+        attempt()
+            .name("live")
+            .role("governor")
+            .generation(generation + 2)
+            .phase(ConvoyPhase::Active)
+            .ensured_from(&role.resource.name)
+            .call(),
+    ];
+    for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+        let rows = order.map(|index| rows[index].clone());
+        let entries = rows
+            .iter()
+            .map(|row| {
+                AwarenessEntry::builder()
+                    .id(format!("convoy/dev/{}", row.resource.name))
+                    .kind(AwarenessKind::Convoy)
+                    .label("governor".to_owned())
+                    .refs(vec![row.resource.clone()])
+                    .phase(AwarenessPhase::Convoy(row.phase))
+                    .annotations(std::collections::HashMap::from([(KEY_CONVOY_NAME.to_owned(), row.name.clone())]))
+                    .state(if row.phase.is_terminal() { AwarenessState::Cancelled } else { AwarenessState::Active })
+                    .as_of(Timestamp::UNIX_EPOCH)
+                    .build()
+            })
+            .collect();
+        let nodes = [AwarenessNode::builder()
+            .id("project/dev/p".to_owned())
+            .kind(AwarenessKind::Project)
+            .label("p".to_owned())
+            .state(AwarenessState::Active)
+            .as_of(Timestamp::UNIX_EPOCH)
+            .counts(AwarenessCounts::builder().total(3).convoys(3).build())
+            .entries(entries)
+            .build()];
+        for awareness in [None, Some(nodes.as_slice())] {
+            let input = CatalogInput { awareness, standing_roles: std::slice::from_ref(&role), ..catalog_input(&rows) };
+            let patches = project_catalog(&input, &mint()).reassert_patches();
+            let live_entity = entity::convoy("dev", "live", "kiwi");
+            let live = find_entity(&patches, &live_entity);
+            assert_eq!(text(live, KEY_CONVOY), live_entity.id);
+            assert_eq!(text(live, KEY_CONVOY_NAME), "governor");
+            assert_eq!(text(live, KEY_STATUS_STATE), "active");
+            assert_eq!(text(live, KEY_CONVOY_PHASE), "active");
+            assert_eq!(live.set[KEY_CONVOY_SUPERSEDED].value, MetadataValue::Bool(false));
+            for name in ["old-a", "old-b"] {
+                let old_entity = entity::convoy("dev", name, "kiwi");
+                let old = find_entity(&patches, &old_entity);
+                assert_eq!(text(old, KEY_CONVOY), old_entity.id);
+                assert_eq!(text(old, KEY_CONVOY_NAME), "governor");
+                assert_eq!(text(old, KEY_CONVOY_PHASE), "abandoned");
+                assert_eq!(old.set[KEY_CONVOY_SUPERSEDED].value, MetadataValue::Bool(true));
+            }
+            // The stable address lifts the live attempt, while preserving history edges.
+            let standing = find_entity(&patches, &role_entity(&role));
+            assert_eq!(text(standing, KEY_STATUS_STATE), "active");
+            assert_eq!(text(standing, KEY_CONVOY_PHASE), "active");
+            assert_eq!(standing.set[KEY_ROLE_CURRENT_ATTEMPT].value, MetadataValue::EntityRefs(vec![live_entity]));
+            assert_eq!(
+                standing.set[KEY_ROLE_ATTEMPTS].value,
+                MetadataValue::EntityRefs(["old-a", "old-b", "live"].map(|name| entity::convoy("dev", name, "kiwi")).to_vec())
+            );
+        }
+    }
+}
