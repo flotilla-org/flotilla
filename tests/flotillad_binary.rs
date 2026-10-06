@@ -16,7 +16,7 @@ fn binaries_report_their_wire_generation_and_protocol_version() {
         assert!(output.status.success(), "{} --version should succeed", binary);
         let stdout = String::from_utf8(output.stdout).expect("version output should be UTF-8");
         assert!(
-            stdout.contains(&format!("wire={}", flotilla_client::BUILD_ID)),
+            stdout.contains(&format!("wire={}", env!("FLOTILLA_BUILD_ID"))),
             "{} should report its wire generation, got {stdout:?}",
             binary
         );
@@ -26,4 +26,14 @@ fn binaries_report_their_wire_generation_and_protocol_version() {
             binary
         );
     }
+}
+
+// Glue: the final executable injects one diagnostic identity shared by client and daemon.
+// This integration binary isolates process-wide identity initialization from library tests.
+#[test]
+fn executable_identity_is_shared_with_libraries() {
+    assert_eq!(flotilla_core::build_info::build_id(), "unknown");
+    flotilla_core::build_info::initialize_build_id(env!("FLOTILLA_BUILD_ID"));
+    assert_eq!(flotilla_core::build_info::build_id(), env!("FLOTILLA_BUILD_ID"));
+    assert_eq!(flotilla_client::build_id(), env!("FLOTILLA_BUILD_ID"));
 }

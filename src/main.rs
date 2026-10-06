@@ -81,7 +81,7 @@ struct Cli {
 fn binary_version() -> &'static str {
     static VERSION: OnceLock<String> = OnceLock::new();
     VERSION.get_or_init(|| {
-        format!("{} (wire={}, proto={})", env!("CARGO_PKG_VERSION"), flotilla_client::BUILD_ID, flotilla_protocol::PROTOCOL_VERSION)
+        format!("{} (wire={}, proto={})", env!("CARGO_PKG_VERSION"), flotilla_client::build_id(), flotilla_protocol::PROTOCOL_VERSION)
     })
 }
 
@@ -897,6 +897,7 @@ fn allows_daemon_reexec(command: &Option<SubCommand>) -> bool {
 }
 
 fn main() -> Result<()> {
+    flotilla_core::build_info::initialize_build_id(env!("FLOTILLA_BUILD_ID"));
     flotilla_core::tls::install_default_provider();
     color_eyre::install()?;
     let mut cli = Cli::try_parse().unwrap_or_else(|error| exit_cli_parse_error(error));
@@ -912,7 +913,7 @@ fn main() -> Result<()> {
         let message = format!("{error:?}");
         let already_reexecuted = std::env::var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV).ok();
         if allow_daemon_reexec && should_reexec_for_incompatible_daemon(&message, already_reexecuted.as_deref(), remote_daemon_selected) {
-            std::env::set_var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV, flotilla_tui::socket::BUILD_ID);
+            std::env::set_var(flotilla_tui::socket::reconnect::REEXEC_BUILD_ENV, flotilla_tui::socket::build_id());
             if let Err(reexec_error) = reexec_current_process() {
                 return Err(color_eyre::eyre::eyre!(incompatible_daemon_reexec_failure(&message, &reexec_error)));
             }
@@ -1031,7 +1032,7 @@ fn should_reexec_for_incompatible_daemon(error: &str, already_reexecuted_build: 
     // remote daemon, and on Windows would detach a replacement and exit zero.
     !remote_daemon_selected
         && flotilla_tui::socket::reconnect::is_incompatible_daemon_error(error)
-        && already_reexecuted_build != Some(flotilla_tui::socket::BUILD_ID)
+        && already_reexecuted_build != Some(flotilla_tui::socket::build_id())
 }
 
 fn incompatible_daemon_reexec_failure(incompatibility: &str, reexec_error: &dyn std::fmt::Display) -> String {
@@ -3375,7 +3376,7 @@ mod tests {
     fn incompatible_daemon_reexecs_once_per_client_build() {
         let mismatch = "daemon protocol version mismatch: daemon has 18, client has 17";
         assert!(should_reexec_for_incompatible_daemon(mismatch, None, false));
-        assert!(!should_reexec_for_incompatible_daemon(mismatch, Some(flotilla_tui::socket::BUILD_ID), false));
+        assert!(!should_reexec_for_incompatible_daemon(mismatch, Some(flotilla_tui::socket::build_id()), false));
         assert!(!should_reexec_for_incompatible_daemon("daemon unavailable", None, false));
     }
 

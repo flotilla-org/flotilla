@@ -42,3 +42,19 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 rstest = { workspace = true }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+[[example]]
+name = "check_crew_skills"
+test = false
+
+[[example]]
+name = "convoy_controller"
+test = false
+
+[[example]]
+name = "k8s_crud"
+test = false
+
+[[example]]
+name = "validate_workflow"
+test = false

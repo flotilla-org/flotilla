@@ -9,7 +9,13 @@ async fn hello_result(
     let (client, server) = flotilla_transport::message::message_session_pair();
     let display_name = flotilla_protocol::hello_display_name("daemon", daemon_build, daemon_fingerprint);
     let server_task = tokio::spawn(async move {
-        assert!(matches!(server.read().await.expect("read client hello"), Some(Message::Hello { .. })));
+        // Diagnostic identity travels in Hello; protocol compatibility remains independent.
+        let Some(Message::Hello { display_name: client_name, .. }) = server.read().await.expect("read client hello") else {
+            panic!("expected client Hello");
+        };
+        let info = flotilla_protocol::hello_build_info(&client_name).expect("client build metadata");
+        assert_eq!(info.build_id, build_id());
+        assert_eq!(info.protocol_fingerprint, PROTOCOL_FINGERPRINT);
         server
             .write(Message::Hello {
                 protocol_version,
@@ -43,7 +49,7 @@ async fn normal_hello_gates_all_protocol_version_and_fingerprint_combinations() 
     assert!(fingerprint_error.contains("wire generation mismatch"), "unexpected error: {fingerprint_error}");
     assert!(fingerprint_error.contains(PROTOCOL_FINGERPRINT), "missing client fingerprint: {fingerprint_error}");
     assert!(fingerprint_error.contains("different-fingerprint"), "missing daemon fingerprint: {fingerprint_error}");
-    assert!(fingerprint_error.contains(BUILD_ID), "missing client build: {fingerprint_error}");
+    assert!(fingerprint_error.contains(build_id()), "missing client build: {fingerprint_error}");
     assert!(fingerprint_error.contains("daemon-build"), "missing daemon build: {fingerprint_error}");
 
     let version_error = hello_result(PROTOCOL_VERSION + 1, "daemon-build", PROTOCOL_FINGERPRINT, WireGenerationPolicy::RequireMatch)
@@ -57,7 +63,7 @@ async fn normal_hello_gates_all_protocol_version_and_fingerprint_combinations() 
     assert!(both_error.contains("protocol version mismatch"), "unexpected error: {both_error}");
     assert!(both_error.contains(PROTOCOL_FINGERPRINT), "missing client fingerprint: {both_error}");
     assert!(both_error.contains("different-fingerprint"), "missing daemon fingerprint: {both_error}");
-    assert!(both_error.contains(BUILD_ID), "missing client build: {both_error}");
+    assert!(both_error.contains(build_id()), "missing client build: {both_error}");
     assert!(both_error.contains("daemon-build"), "missing daemon build: {both_error}");
     assert!(both_error.contains(&PROTOCOL_VERSION.to_string()), "missing client protocol version: {both_error}");
     assert!(both_error.contains(&(PROTOCOL_VERSION + 1).to_string()), "missing daemon protocol version: {both_error}");

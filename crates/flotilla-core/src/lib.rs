@@ -10,6 +10,7 @@ pub mod aggregator_projection;
 pub mod attachable;
 pub mod awareness_projection;
 mod branch_lookup_observer;
+pub mod build_info;
 pub mod change_request_observer;
 pub mod charter_store;
 pub mod checkout_integration;

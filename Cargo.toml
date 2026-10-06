@@ -1,3 +1,6 @@
+[profile.dev]
+debug = "line-tables-only"
+
 [workspace]
 members = [
     "crates/flotilla-client",
@@ -81,3 +84,7 @@ async-trait = { workspace = true }
 tempfile = "3"
 flotilla-core = { path = "crates/flotilla-core", features = ["test-support"] }
 flotilla-test-support = { path = "crates/flotilla-test-support" }
+
+[[example]]
+name = "glyph_showcase"
+test = false

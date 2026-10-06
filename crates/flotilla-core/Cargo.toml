@@ -24,7 +24,6 @@ async-trait = { workspace = true }
 bon = { workspace = true }
 tracing = { workspace = true }
 indexmap = { workspace = true }
-color-eyre = { workspace = true }
 dirs = "6"
 toml = "0.8"
 toml_edit = "0.22"
@@ -37,7 +36,6 @@ futures = "0.3"
 urlencoding = "2"
 url = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-gethostname = "1.1.0"
 sysinfo = "0.38.4"
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
@@ -61,3 +59,11 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 [[test]]
 name = "in_process_daemon"
 required-features = ["test-support"]
+
+[[example]]
+name = "environment_checkout"
+test = false
+
+[[example]]
+name = "list_sessions"
+test = false

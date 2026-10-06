@@ -8,7 +8,7 @@ mod replicator;
 mod request_dispatch;
 mod resource_http;
 mod shared;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
 use std::{
@@ -161,7 +161,7 @@ impl AcceptErrorBackoff {
 ///
 /// Visibility is promoted to `pub` with the `test-support` feature so
 /// integration tests can construct notices to drive the outbound task.
-#[cfg_attr(feature = "test-support", visibility::make(pub))]
+#[cfg_attr(any(test, feature = "test-support"), visibility::make(pub))]
 pub(crate) struct PeerConnectedNotice {
     pub peer: NodeId,
     pub generation: u64,
@@ -179,7 +179,7 @@ pub(crate) struct PeerConnectedNotice {
 /// replicators. The generation is checked against the currently tracked
 /// generation before acting, so a stale/displaced connection's belated
 /// teardown can't cancel a newer, already-reconnected generation.
-#[cfg_attr(feature = "test-support", visibility::make(pub))]
+#[cfg_attr(any(test, feature = "test-support"), visibility::make(pub))]
 pub(crate) enum PeerConnectionEvent {
     Connected(PeerConnectedNotice),
     Disconnected { peer: NodeId, generation: u64 },
@@ -287,7 +287,7 @@ pub fn spawn_embedded_peer_networking(daemon: Arc<InProcessDaemon>, config: &Con
 /// senders (e.g. CapturePeerSender). Passes `None` for `inbound_peer_rx` to skip
 /// the inbound connection task — tests drive the outbound task via the returned
 /// `PeerConnectionEvent` sender.
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub fn spawn_test_peer_networking(
     daemon: Arc<InProcessDaemon>,
     peer_manager: Arc<Mutex<PeerManager>>,
@@ -812,7 +812,7 @@ async fn handle_client_session_with_caller(
         _ = shutdown_rx.changed() => None,
     };
 
-    const BUILD_ID: &str = env!("FLOTILLA_BUILD_ID");
+    let build_id = flotilla_core::build_info::build_id();
 
     let Some(first_msg) = first_msg else {
         return;
@@ -834,7 +834,7 @@ async fn handle_client_session_with_caller(
                     .write(Message::Hello {
                         protocol_version: PROTOCOL_VERSION,
                         node_id: daemon.node_id().clone(),
-                        display_name: flotilla_protocol::hello_display_name(daemon.host_name().as_str(), BUILD_ID, PROTOCOL_FINGERPRINT),
+                        display_name: flotilla_protocol::hello_display_name(daemon.host_name().as_str(), build_id, PROTOCOL_FINGERPRINT),
                         session_id: daemon.session_id(),
                         connection_role: Some(ConnectionRole::Client),
                         surface: None,
@@ -855,7 +855,7 @@ async fn handle_client_session_with_caller(
                     warn!(
                         expected_fingerprint = PROTOCOL_FINGERPRINT,
                         got_fingerprint = client_fingerprint,
-                        expected_build = BUILD_ID,
+                        expected_build = build_id,
                         got_build = client_build,
                         %node_id,
                         "restricting client with protocol fingerprint mismatch to shutdown"

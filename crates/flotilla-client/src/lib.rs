@@ -30,7 +30,7 @@ pub mod launchd;
 pub mod reconnect;
 pub mod resource;
 pub mod systemd;
-pub const BUILD_ID: &str = env!("FLOTILLA_BUILD_ID");
+pub use flotilla_core::build_info::build_id;
 
 /// Std RwLock for local seq tracking — the critical sections are single HashMap
 /// operations (no async work while holding the lock), and using a sync lock
@@ -83,12 +83,13 @@ async fn do_client_hello_with_surface(
     surface: Option<SurfaceDeclaration>,
     wire_generation_policy: WireGenerationPolicy,
 ) -> Result<Option<String>, String> {
+    let client_build = build_id();
     let session_id = uuid::Uuid::new_v4();
     session
         .write(Message::Hello {
             protocol_version: PROTOCOL_VERSION,
             node_id: NodeId::new("client"),
-            display_name: flotilla_protocol::hello_display_name("client", BUILD_ID, PROTOCOL_FINGERPRINT),
+            display_name: flotilla_protocol::hello_display_name("client", build_id(), PROTOCOL_FINGERPRINT),
             session_id,
             connection_role: Some(ConnectionRole::Client),
             surface,
@@ -103,7 +104,7 @@ async fn do_client_hello_with_surface(
             let daemon_fingerprint = daemon_info.map_or("unknown", |info| info.protocol_fingerprint);
             Err(format!(
                 "daemon protocol version mismatch: client fingerprint {PROTOCOL_FINGERPRINT} speaks proto {PROTOCOL_VERSION} (build \
-                 {BUILD_ID}); daemon fingerprint {daemon_fingerprint} speaks proto {protocol_version} (build {daemon_build})"
+                 {client_build}); daemon fingerprint {daemon_fingerprint} speaks proto {protocol_version} (build {daemon_build})"
             ))
         }
         Some(Message::Hello { display_name, .. }) => {
@@ -113,7 +114,7 @@ async fn do_client_hello_with_surface(
             if daemon_fingerprint != PROTOCOL_FINGERPRINT && matches!(wire_generation_policy, WireGenerationPolicy::RequireMatch) {
                 return Err(format!(
                     "wire generation mismatch: client fingerprint {PROTOCOL_FINGERPRINT} speaks proto {PROTOCOL_VERSION} (build \
-                     {BUILD_ID}); daemon fingerprint {daemon_fingerprint} speaks proto {PROTOCOL_VERSION} (build {daemon_build})"
+                     {client_build}); daemon fingerprint {daemon_fingerprint} speaks proto {PROTOCOL_VERSION} (build {daemon_build})"
                 ));
             }
             Ok(Some(daemon_build.to_owned()))
@@ -1267,7 +1268,7 @@ mod spawn_lock_tests {
                     .write(Message::Hello {
                         protocol_version: PROTOCOL_VERSION,
                         node_id: NodeId::new("daemon"),
-                        display_name: flotilla_protocol::hello_display_name("daemon", BUILD_ID, PROTOCOL_FINGERPRINT),
+                        display_name: flotilla_protocol::hello_display_name("daemon", build_id(), PROTOCOL_FINGERPRINT),
                         session_id: uuid::Uuid::nil(),
                         connection_role: Some(ConnectionRole::Client),
                         surface: None,
