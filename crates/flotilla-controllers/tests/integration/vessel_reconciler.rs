@@ -923,7 +923,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
 
     // #2682: writable exceptions are exactly the vessel's resolved admins;
     // all current and future siblings inherit the read-only parent.
-    for slice in mounts[1..].chunks_exact(5) {
+    for slice in mounts[1..].as_chunks::<5>().0 {
         assert_eq!(slice[4].mode, flotilla_resources::EnvironmentMountMode::Rw);
         assert!(slice[4].source_path.starts_with(&format!("{}/worktrees/resolved-", slice[0].source_path)));
         assert_eq!(slice[4].target_path, slice[4].source_path);
@@ -987,7 +987,10 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
     assert_eq!(after.phase, VesselPhase::Ready);
     assert_eq!(after.terminal_session_refs, before.terminal_session_refs);
     assert_eq!(after.environment_ref, before.environment_ref);
-    assert!(after.message.as_deref().is_some_and(|message| message.contains("stop crews and recreate")));
+    assert!(after
+        .message
+        .as_deref()
+        .is_some_and(|message| message.contains("stop crews and recreate") && message.contains("environment env-workspace-multi-docker")));
     assert_eq!(sessions.get(&session.metadata.name).await.expect("existing crew").status, session.status);
     environments.delete(&environment.metadata.name).await.expect("remove legacy environment");
 

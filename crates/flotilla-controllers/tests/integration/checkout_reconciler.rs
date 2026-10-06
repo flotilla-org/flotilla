@@ -103,9 +103,12 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
             return Err("creation is outside this test scope".to_string().into());
         }
         self.creation_attempts.fetch_add(1, Ordering::SeqCst);
-        if self.creation_protection_failures.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1)).is_ok()
-        {
-            return Err(CheckoutMaterialisationError::Protection("temporary protection failure".into()));
+        let mut remaining = self.creation_protection_failures.load(Ordering::SeqCst);
+        while remaining > 0 {
+            match self.creation_protection_failures.compare_exchange(remaining, remaining - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Err(CheckoutMaterialisationError::Protection("temporary protection failure".into())),
+                Err(observed) => remaining = observed,
+            }
         }
         Ok(PreparedCheckout { commit: Some("base-commit".into()), branch_provenance: CheckoutBranchProvenance::CreatedForConvoy })
     }
