@@ -14,6 +14,7 @@ fn ts(seconds: i64) -> chrono::DateTime<Utc> {
 
 fn sample_snapshot() -> WorkflowSnapshot {
     WorkflowSnapshot {
+        cascade: None,
         stall_nudges: Default::default(),
         supervision: None,
         exit: None,

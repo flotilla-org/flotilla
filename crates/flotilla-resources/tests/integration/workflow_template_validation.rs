@@ -388,6 +388,7 @@ fn turn_delivery_can_subscribe_to_an_artifact_leaf() {
         "$artifact(reviewer,review-round,convoy).summary.disposition == approve".parse().expect("parse artifact leaf");
     validate(&workflow).expect("artifact turn delivery is admitted");
     let snapshot = flotilla_resources::WorkflowSnapshot {
+        cascade: None,
         stall_nudges: Default::default(),
         supervision: None,
         exit: workflow.exit,
@@ -452,6 +453,7 @@ vessels:
 fn fresh_convoy_workflow_snapshot_renders_both_standard_turn_delivery_rules() {
     let workflow = single_agent_workflow_spec();
     let snapshot = flotilla_resources::WorkflowSnapshot {
+        cascade: None,
         stall_nudges: Default::default(),
         supervision: None,
         exit: workflow.exit,

@@ -314,6 +314,7 @@ pub fn tool_only_workflow_template_object(name: &str) -> ResourceObject<Workflow
 pub fn bootstrapped_convoy_status() -> RealConvoyStatus {
     let workflow = valid_workflow_template_spec();
     let snapshot = flotilla_resources::WorkflowSnapshot {
+        cascade: None,
         stall_nudges: Default::default(),
         supervision: None,
         exit: workflow.exit,
@@ -416,6 +417,7 @@ where
 pub fn bootstrapped_tool_only_convoy_status() -> RealConvoyStatus {
     let workflow = tool_only_workflow_template_spec();
     let snapshot = flotilla_resources::WorkflowSnapshot {
+        cascade: None,
         stall_nudges: Default::default(),
         supervision: None,
         exit: workflow.exit,

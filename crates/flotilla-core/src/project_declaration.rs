@@ -18,6 +18,10 @@ pub struct ProjectDeclaration {
     pub parent: Option<String>,
     pub default_workflow: Option<String>,
     #[serde(default)]
+    pub role_definitions: BTreeMap<String, flotilla_resources::RoleDefinition>,
+    #[serde(default)]
+    pub charter_prose: BTreeMap<String, String>,
+    #[serde(default)]
     pub role_needs: BTreeMap<String, BTreeSet<CapabilityNeed>>,
     // Previous-generation declarations omit skills (ADR 0047).
     #[serde(default)]

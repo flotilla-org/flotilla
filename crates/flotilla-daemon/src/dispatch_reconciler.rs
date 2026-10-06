@@ -478,6 +478,8 @@ mod tests {
             .using::<Project>(NAMESPACE)
             .create(&InputMeta::builder().name("widgets".to_string()).build(), &ProjectSpec {
                 charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
                 parent: None,
                 platform_matrix: Vec::new(),
                 role_needs: Default::default(),

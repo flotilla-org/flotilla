@@ -1202,6 +1202,13 @@ impl ReadProjections<'_> {
         artifacts.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.address.cmp(&b.address)));
 
         Ok(ConvoyExplanation {
+            cascade: convoy
+                .status
+                .as_ref()
+                .and_then(|status| status.workflow_snapshot.as_ref())
+                .and_then(|workflow| workflow.cascade.as_deref())
+                .or_else(|| pinned_workflow.as_ref().and_then(|workflow| workflow.object.spec.cascade.as_deref()))
+                .map(|cascade| serde_json::to_value(cascade).expect("serialize cascade")),
             environment_observations: convoy.status.as_ref().map(|status| status.environment_observations.clone()).unwrap_or_default(),
             skills: convoy
                 .status

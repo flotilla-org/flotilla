@@ -77,10 +77,12 @@ fn normalize_project_name(name: &str) -> Result<String, String> {
 fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: String) -> Result<ProjectSpec, String> {
     normalize_project_spec(ProjectSpec {
         charter: None,
+        role_definitions: BTreeMap::new(),
+        charter_prose: BTreeMap::new(),
         parent: None,
         platform_matrix: Vec::new(),
         display_name,
-        default_workflow_ref: "single-agent".to_string(),
+        default_workflow_ref: String::new(),
         role_needs: BTreeMap::new(),
         skills: BTreeMap::new(),
         supervision: None,
@@ -499,9 +501,11 @@ impl ProjectService<'_> {
         }
         let spec = normalize_project_spec(ProjectSpec {
             charter: None,
+            role_definitions: declaration.role_definitions,
+            charter_prose: declaration.charter_prose,
             parent: declaration.parent.clone(),
             display_name: declaration.name.clone(),
-            default_workflow_ref: declaration.default_workflow.unwrap_or_else(|| "single-agent".to_string()),
+            default_workflow_ref: declaration.default_workflow.unwrap_or_default(),
             role_needs: declaration.role_needs,
             skills: declaration.skills,
             platform_matrix: declaration.platform_matrix,

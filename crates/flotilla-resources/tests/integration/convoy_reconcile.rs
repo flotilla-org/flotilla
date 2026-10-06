@@ -70,6 +70,7 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr(tc: hegel::
     let workflow = implement_review_workflow_spec();
     let status = ConvoyStatus {
         workflow_snapshot: Some(WorkflowSnapshot {
+            cascade: None,
             stall_nudges: Default::default(),
             supervision: None,
             exit: workflow.exit,
@@ -325,6 +326,7 @@ fn declared_artifact_completion_accepts_a_new_kind_and_rebinds_to_current_head()
     flotilla_resources::validate(&workflow).expect("new artifact kind needs no core admission change");
     let status = ConvoyStatus {
         workflow_snapshot: Some(WorkflowSnapshot {
+            cascade: None,
             stall_nudges: Default::default(),
             supervision: None,
             exit: workflow.exit,
@@ -971,6 +973,7 @@ fn bootstrap_from_valid_template_returns_bootstrap_patch() {
     let outcome = reconcile(&convoy, Some(&template), timestamp(10));
 
     let expected_snapshot = flotilla_resources::WorkflowSnapshot {
+        cascade: None,
         stall_nudges: Default::default(),
         supervision: None,
         exit: template.spec.exit.clone(),
@@ -1128,6 +1131,7 @@ fn fan_out_advances_all_newly_ready_tasks() {
     let spec = valid_convoy_spec();
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        cascade: None,
         stall_nudges: Default::default(),
         supervision: None,
         exit: None,
@@ -1184,6 +1188,7 @@ fn fan_out_advances_all_newly_ready_tasks() {
 fn fan_in_waits_until_all_dependencies_complete() {
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        cascade: None,
         stall_nudges: Default::default(),
         supervision: None,
         exit: None,
@@ -1376,6 +1381,7 @@ fn landing_requires_each_active_subject_to_reach_either_world_terminal() {
     let status = ConvoyStatus {
         phase: ConvoyPhase::Landing,
         workflow_snapshot: Some(WorkflowSnapshot {
+            cascade: None,
             stall_nudges: Default::default(),
             supervision: None,
             exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
@@ -1436,6 +1442,7 @@ fn landing_waits_for_a_branch_scan_before_treating_an_empty_subject_set_as_no_pr
     let status = ConvoyStatus {
         phase: ConvoyPhase::Landing,
         workflow_snapshot: Some(WorkflowSnapshot {
+            cascade: None,
             stall_nudges: Default::default(),
             supervision: None,
             exit: Some(flotilla_resources::ExitDeclaration::standard_table()),
@@ -2082,6 +2089,7 @@ fn advancing_ready_tasks_emits_task_phase_change_events() {
     let spec = valid_convoy_spec();
     let mut status = bootstrapped_convoy_status();
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        cascade: None,
         stall_nudges: Default::default(),
         supervision: None,
         exit: None,
@@ -2255,6 +2263,7 @@ fn interactive_convoy_stays_active_until_crew_reports_complete() {
     let mut status = bootstrapped_convoy_status();
     status.phase = ConvoyPhase::Active;
     status.workflow_snapshot = Some(WorkflowSnapshot {
+        cascade: None,
         stall_nudges: Default::default(),
         supervision: None,
         exit: None,

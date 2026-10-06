@@ -103,6 +103,7 @@ async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Ar
         .update_status("crew", &convoy.metadata.resource_version, &ConvoyStatus {
             phase: ConvoyPhase::Landing,
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 vessels: vec![flotilla_resources::VesselRequirement::builder()
                     .name("work".into())
                     .crew(vec![flotilla_resources::CrewSpec::builder()

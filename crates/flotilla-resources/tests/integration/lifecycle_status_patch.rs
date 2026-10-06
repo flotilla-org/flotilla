@@ -415,6 +415,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                 let before = convoy_timestamps(&status);
                 let patch = ConvoyStatusPatch::Bootstrap {
                     workflow_snapshot: WorkflowSnapshot {
+                        cascade: None,
                         stall_nudges: Default::default(),
                         supervision: None,
                         exit: None,

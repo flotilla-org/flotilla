@@ -402,6 +402,7 @@ async fn controller_materializes_a_missing_repository_for_a_multi_repository_con
     convoys
         .update_status("convoy-multi", &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,

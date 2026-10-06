@@ -924,6 +924,8 @@ async fn resource_list_and_get_queries_return_wire_json() {
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("missing-repository".to_string()).build(), &ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -978,6 +980,7 @@ async fn convoy_explain_discharges_terminal_checkout_only_after_vessel_teardown(
     let mut status = flotilla_resources::ConvoyStatus {
         phase: ConvoyPhase::Landing,
         workflow_snapshot: Some(WorkflowSnapshot {
+            cascade: None,
             stall_nudges: Default::default(),
             supervision: None,
             exit: workflow.exit,
@@ -1932,6 +1935,8 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -2014,6 +2019,8 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("zellij".to_string()).build(), &ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -2043,6 +2050,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
         Command::builder()
             .action(CommandAction::ConvoyStart {
                 intent: Box::new(ConvoyStartIntent {
+                    standing_role: None,
                     namespace: None,
                     project_ref: "zellij".into(),
                     change_request: None,
@@ -2150,6 +2158,8 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -2177,6 +2187,7 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".to_string(),
                         change_request: Some("1071".to_string()),
@@ -2744,6 +2755,9 @@ async fn implement_review_admission_shares_a_vessel_with_different_resolved_skil
     backend
         .definitions::<CrewDefaults>("flotilla")
         .apply(&InputMeta::builder().name("fleet".into()).build(), &CrewDefaultsSpec {
+            project_ref: None,
+            default_workflow_ref: None,
+            roles: BTreeMap::new(),
             skills: BTreeMap::from([("coder".into(), vec!["implement".into()]), ("reviewer".into(), vec!["review".into()])]),
         })
         .await
@@ -3213,6 +3227,8 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -3243,6 +3259,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
                         change_request: None,
@@ -3273,6 +3290,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
                         change_request: None,
@@ -3345,6 +3363,8 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -3372,6 +3392,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
                         change_request: None,
@@ -3479,6 +3500,8 @@ async fn convoy_start_accepts_project_list_identifier() {
         .definitions::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -3518,6 +3541,7 @@ async fn convoy_start_accepts_project_list_identifier() {
                 Command::builder()
                     .action(CommandAction::ConvoyStart {
                         intent: Box::new(ConvoyStartIntent {
+                            standing_role: None,
                             namespace: None,
                             project_ref,
                             change_request: None,
@@ -3562,6 +3586,7 @@ async fn convoy_start_unknown_project_reports_resolved_reference_tried() {
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: None,
                         project_ref: "missing".into(),
                         change_request: None,
@@ -3636,6 +3661,8 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -3676,6 +3703,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
                         change_request: None,
@@ -3761,6 +3789,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                 Command::builder()
                     .action(CommandAction::ConvoyStart {
                         intent: Box::new(ConvoyStartIntent {
+                            standing_role: None,
                             namespace: None,
                             project_ref: "flotilla".into(),
                             change_request: None,
@@ -3798,6 +3827,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
                         change_request: None,
@@ -3828,6 +3858,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
                         change_request: None,
@@ -3870,6 +3901,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
                         change_request: None,
@@ -3922,6 +3954,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
                         change_request: None,
@@ -3968,6 +4001,8 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("explicit-workflow".to_string()).build(), &ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -4011,6 +4046,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: Some("flotilla".into()),
                         project_ref: "explicit-workflow".into(),
                         change_request: None,
@@ -4054,6 +4090,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: Some("other".into()),
                         project_ref: "flotilla".into(),
                         change_request: None,
@@ -4097,6 +4134,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
                         change_request: None,
@@ -4164,6 +4202,8 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
         .using::<Project>("flotilla")
         .create(&InputMeta::builder().name("flotilla".to_string()).build(), &ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -4191,6 +4231,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
                         change_request: None,
@@ -4585,6 +4626,7 @@ async fn convoy_start_acknowledges_while_admission_is_in_flight() {
                     Command::builder()
                         .action(CommandAction::ConvoyStart {
                             intent: Box::new(ConvoyStartIntent {
+                                standing_role: None,
                                 namespace: None,
                                 project_ref: "flotilla".into(),
                                 change_request: None,
@@ -4652,6 +4694,7 @@ async fn convoy_start_rejects_the_same_project_start_while_admission_is_in_fligh
     let command = Command::builder()
         .action(CommandAction::ConvoyStart {
             intent: Box::new(ConvoyStartIntent {
+                standing_role: None,
                 namespace: None,
                 project_ref: "flotilla".into(),
                 change_request: None,
@@ -4746,6 +4789,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
             Command::builder()
                 .action(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: None,
                         project_ref: "flotilla".into(),
                         change_request: None,
@@ -4786,6 +4830,7 @@ async fn convoy_start_reports_failed_work_without_waiting_for_auto_attach_timeou
         &record_name,
         &convoy_controller_patches::bootstrap(
             WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,
@@ -6093,6 +6138,8 @@ async fn tracking_does_not_materialize_when_project_name_is_occupied() {
     projects
         .create(&InputMeta::builder().name("repo".to_string()).build(), &ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -6348,6 +6395,8 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
     projects
         .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -6594,6 +6643,8 @@ async fn forge_identity_sweep_reports_conflicting_aliases_before_changing_reposi
         .definitions::<Project>("flotilla")
         .create(&InputMeta::builder().name("ghostty".to_string()).build(), &ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),
@@ -7811,6 +7862,7 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
         InProcessDaemon::new(vec![], test_config_store(terminal_temp.path().join("config")), fake_discovery(false), HostName::new("kiwi"))
             .await;
     let snapshot = WorkflowSnapshot {
+        cascade: None,
         exit: None,
         turn_delivery: Default::default(),
         stall_nudges: Default::default(),
@@ -8567,6 +8619,7 @@ async fn crew_completion_without_a_decision_ledger_is_refused() {
                 )]),
             )]),
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,

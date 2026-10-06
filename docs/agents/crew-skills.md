@@ -1,7 +1,8 @@
 # Crew skill declarations
 
-Crew skill selection is explicit. A namespace has one `CrewDefaults` definition
-whose `spec.skills` maps `*` and role names to ordered import/removal entries.
+Crew skill selection is explicit. A namespace has one unbound root `CrewDefaults`
+definition and may have one additional definition per `spec.project_ref`. Each
+`spec.skills` maps `*` and role names to ordered import/removal entries.
 Projects use the same `skills` map in `project.yaml` or their Project manifest:
 
 ```yaml
@@ -13,7 +14,8 @@ skills:
 
 `flotilla convoy start --project example --skill owner/repo@name --skill=-other`
 adds a dispatch layer for every agent role. Admission applies fleet `*`, fleet
-role, project `*`, project role, then dispatch. Omission never removes a skill.
+role, then every ancestor and project `*`/role layer, then dispatch. The shared
+parent-chain cascade and named provenance are described in [role-cascade.md](role-cascade.md). Omission never removes a skill.
 Bare imports require one provider; qualified imports use SKILL.md frontmatter
 names. Distinct imports cannot share an install name. `convoy explain` exposes
 the selected entries and the ordered provenance, including removal warnings.

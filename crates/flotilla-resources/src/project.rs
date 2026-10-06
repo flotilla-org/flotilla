@@ -57,7 +57,17 @@ pub struct ProjectSpec {
     #[serde(default)]
     pub parent: Option<String>,
     pub display_name: String,
+    #[builder(default)]
+    #[serde(default)]
     pub default_workflow_ref: String,
+    /// Inherited role shape; standing-role presence remains in local ensures.
+    #[builder(default)]
+    #[serde(default)]
+    pub role_definitions: BTreeMap<String, crate::RoleDefinition>,
+    /// Local charter prose, keyed by role (`*` applies to every local role).
+    #[builder(default)]
+    #[serde(default)]
+    pub charter_prose: BTreeMap<String, String>,
     /// Standing additions to each workflow role's capability needs.
     #[builder(default)]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -398,7 +408,10 @@ pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, Stri
         }
     }
     spec.display_name = required_value(spec.display_name, "display_name")?;
-    spec.default_workflow_ref = required_value(spec.default_workflow_ref, "default_workflow_ref")?;
+    if !spec.default_workflow_ref.is_empty() {
+        spec.default_workflow_ref = required_value(spec.default_workflow_ref, "default_workflow_ref")?;
+    }
+    crate::role_cascade::validate_role_definitions(&spec.role_definitions).map_err(|error| error.to_string())?;
     for binding in &mut spec.issue_source_bindings {
         binding.source.service = required_value(std::mem::take(&mut binding.source.service), "issue_source_bindings[].source.service")?;
         binding.source.scope = required_value(std::mem::take(&mut binding.source.scope), "issue_source_bindings[].source.scope")?;
@@ -582,6 +595,8 @@ mod tests {
     fn dispatch_policy_rejects_zero_staleness_threshold() {
         let spec = ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             display_name: "Widgets".to_string(),
@@ -620,6 +635,8 @@ mod tests {
         };
         let spec = ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             display_name: "Widgets".to_string(),

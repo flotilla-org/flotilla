@@ -384,6 +384,7 @@ fn bound_change_request_identity_uses_matching_declared_or_discovered_subject() 
         Utc::now(),
     );
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        cascade: None,
         exit: None,
         turn_delivery: Default::default(),
         stall_nudges: Default::default(),
@@ -1008,6 +1009,7 @@ async fn resume_staging_fixture_with_clock(
         .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
             phase: flotilla_resources::ConvoyPhase::Landing,
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,
@@ -1681,6 +1683,7 @@ async fn turn_delivery_reopens_work_and_stages_credentials_before_queuing_every_
             .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
                 phase: flotilla_resources::ConvoyPhase::Landing,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
                     stall_nudges: Default::default(),
                     supervision: None,
                     exit: None,
@@ -3194,6 +3197,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
         .update_status("refused-claim", &convoy.metadata.resource_version, &ConvoyStatus {
             phase: flotilla_resources::ConvoyPhase::Active,
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: indexmap::IndexMap::from([("work/coder".to_string(), flotilla_resources::StallNudgePolicy {
                     max_per_episode: 2,
                     max_refusals: None,
@@ -3534,6 +3538,7 @@ async fn contained_codex_to_claude_handoff_stages_credentials_for_the_latent_rev
         .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
             phase: flotilla_resources::ConvoyPhase::Active,
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,
@@ -4093,6 +4098,7 @@ async fn rebooted_standing_governor_admits_one_replacement_vessel_without_a_seco
     status.phase = ConvoyPhase::Active;
     status.observed_workflow_ref = Some(admitted.spec.workflow_ref.clone());
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        cascade: None,
         exit: workflow.spec.exit,
         turn_delivery: workflow.spec.turn_delivery,
         stall_nudges: workflow.spec.stall_nudges,
@@ -4828,7 +4834,15 @@ struct RecordingBriefArtifacts {
 
 #[async_trait]
 impl BriefArtifactWriter for RecordingBriefArtifacts {
-    async fn put_brief(&self, _namespace: &str, convoy: &str, role: &str, subject: &str, content: &[u8]) -> Result<String, String> {
+    async fn put_brief(
+        &self,
+        _namespace: &str,
+        convoy: &str,
+        role: &str,
+        subject: &str,
+        content: &[u8],
+        _charter_commit: Option<&str>,
+    ) -> Result<String, String> {
         assert_eq!(subject, convoy);
         self.writes.lock().await.push((convoy.to_string(), role.to_string(), content.to_vec()));
         Ok(format!("{:x}", Sha256::digest(content)))
@@ -8090,6 +8104,7 @@ async fn wait_for_stall(backend: &ResourceBackend, name: &str, expected: bool) -
 
 fn stall_workflow_snapshot(crew: Vec<flotilla_resources::CrewSpec>) -> flotilla_resources::WorkflowSnapshot {
     flotilla_resources::WorkflowSnapshot {
+        cascade: None,
         exit: None,
         turn_delivery: Default::default(),
         stall_nudges: Default::default(),
@@ -8379,6 +8394,7 @@ async fn landing_without_armed_exit_rows_stalls() {
         .update_status("unarmed-landing", &created.metadata.resource_version, &ConvoyStatus {
             phase: flotilla_resources::ConvoyPhase::Landing,
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,
@@ -8419,6 +8435,7 @@ async fn stale_change_request_observation_stalls_landing_convoy() {
         .update_status("stale-observation", &created.metadata.resource_version, &ConvoyStatus {
             phase: flotilla_resources::ConvoyPhase::Landing,
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: Some(flotilla_resources::ExitDeclaration::Table(indexmap::IndexMap::from([(
@@ -9724,4 +9741,65 @@ fn convoy_address_prefers_live_over_two_terminal_namesakes() {
         }
     }
     assert!(resolve_convoy_candidate_indices(&[], "governor@p").expect("empty candidates").is_empty());
+}
+
+// #2719: local standing presence inherits fleet shape, freezes it for explain,
+// and delivers local charter prose and its source commit in the brief artifact.
+#[tokio::test]
+async fn standing_presence_inherits_role_shape_and_delivers_charter_artifact() {
+    use flotilla_resources::{FleetDesignation, FleetDesignationSpec, RoleDefinition};
+
+    let (daemon, backend, _, _temp) = standing_ensure_fixture().await;
+    configure_standing_ensure_agent(&backend, Vec::new()).await;
+    let projects = backend.definitions::<Project>("flotilla");
+    let fleet = ProjectSpec::builder()
+        .display_name("Fleet".into())
+        .role_definitions(BTreeMap::from([
+            ("quartermaster".into(), RoleDefinition { workflow: Some("quartermaster".into()), ..Default::default() }),
+            ("governor".into(), RoleDefinition {
+                agent: Some("codex".into()),
+                brief_template: Some("{% block operating_instructions %}Fleet governor template{% endblock %}".into()),
+                ..Default::default()
+            }),
+        ]))
+        .build();
+    projects.apply(&test_meta("fleet"), &fleet).await.expect("fleet");
+    backend
+        .definitions::<FleetDesignation>("flotilla")
+        .apply(&test_meta("fleet"), &FleetDesignationSpec { project: "fleet".into() })
+        .await
+        .expect("fleet designation");
+    let mut project = projects.get("standing-project").await.expect("project");
+    project.spec.default_workflow_ref.clear();
+    project.spec.charter_prose.insert("governor".into(), "Govern the child project from this delivered charter.".into());
+    let mut meta = InputMeta::from(&project.metadata);
+    meta.annotations.insert(crate::project_declaration::BOOTSTRAP_COMMIT_ANNOTATION.into(), "charter-2719".into());
+    projects.apply(&meta, &project.spec).await.expect("local charter");
+    let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
+    let mut ensure = ensures.get("quartermaster").await.expect("presence");
+    ensure.spec.workflow_ref.clear();
+    ensures.apply(&InputMeta::from(&ensure.metadata), &ensure.spec).await.expect("presence only workflow");
+    let live = daemon.explain_project_internal("standing-project").await.expect("project explain");
+    assert_eq!(live["cascade"]["settings"]["roles.governor.brief_template"]["layer"], "project:fleet");
+    let writer = Arc::new(RecordingBriefArtifacts::default());
+    daemon.set_brief_artifact_writer(writer.clone()).await;
+    let frozen = admitted_standing_workflow(&daemon, &backend).await;
+    let cascade = frozen.cascade.as_ref().expect("frozen defaults");
+    assert_eq!(cascade.settings["roles.quartermaster.workflow"].layer, "project:fleet");
+    let writes = writer.writes.lock().await;
+    let (_, role, body) = &writes[0];
+    assert_eq!(role, "governor");
+    let rendered = String::from_utf8_lossy(body);
+    assert!(rendered.contains("Fleet governor template"));
+    assert!(rendered.contains("Govern the child project from this delivered charter."));
+    assert!(rendered.contains("Charter commit: `charter-2719`"));
+    let explanation = daemon.explain_convoy_internal(Some("flotilla"), &writes[0].0).await.expect("explain");
+    assert_eq!(explanation.cascade.as_ref().expect("cascade")["charter_commit"], "charter-2719");
+    project.spec.charter_prose.insert("governor".into(), "Later prose".into());
+    projects.apply(&meta, &project.spec).await.expect("charter change");
+    let explanation = daemon.explain_convoy_internal(Some("flotilla"), &writes[0].0).await.expect("frozen explain");
+    assert_eq!(
+        explanation.cascade.expect("frozen cascade")["charter"]["governor"],
+        "Govern the child project from this delivered charter."
+    );
 }

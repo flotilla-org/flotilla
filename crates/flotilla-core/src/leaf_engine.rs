@@ -3853,6 +3853,7 @@ mod tests {
                 phase: ConvoyPhase::Active,
                 work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
                 workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
                     stall_nudges: Default::default(),
                     supervision: None,
                     exit: None,
@@ -5708,6 +5709,7 @@ mod tests {
         let status = ConvoyStatus {
             phase: ConvoyPhase::Landing,
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: Some(ExitDeclaration::standard_table()),
@@ -5909,6 +5911,7 @@ mod tests {
             phase: ConvoyPhase::Active,
             started_at: Some(base),
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: workflow.stall_nudges,
                 supervision: workflow.supervision,
                 exit: workflow.exit,
@@ -6113,6 +6116,7 @@ mod tests {
             phase: ConvoyPhase::Active,
             started_at: Some(base),
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: workflow.stall_nudges,
                 supervision: workflow.supervision,
                 exit: workflow.exit,
@@ -6450,6 +6454,7 @@ mod tests {
             .update_status("wake-turn", &created.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
                     stall_nudges: Default::default(),
                     supervision: None,
                     exit: Some(ExitDeclaration::standard_table()),
@@ -6654,6 +6659,7 @@ mod tests {
             phase: ConvoyPhase::Landing,
             observed_workflow_ref: Some("workflow".to_string()),
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: Some(ExitDeclaration::Table(indexmap::IndexMap::from([(
@@ -6732,6 +6738,7 @@ mod tests {
             .update_status("no-cr", &created.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
                     stall_nudges: Default::default(),
                     supervision: None,
                     exit: Some(ExitDeclaration::standard_table()),
@@ -6803,6 +6810,7 @@ mod tests {
             .update_status("adopt-late", &created.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
                     stall_nudges: Default::default(),
                     supervision: None,
                     exit: Some(ExitDeclaration::standard_table()),
@@ -6891,6 +6899,7 @@ mod tests {
             .update_status("cross-host", &created.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Landing,
                 workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
                     stall_nudges: Default::default(),
                     supervision: None,
                     exit: Some(ExitDeclaration::standard_table()),

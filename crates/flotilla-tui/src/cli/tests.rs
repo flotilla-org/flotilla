@@ -188,6 +188,7 @@ fn fulfilment_list_distinguishes_image_and_host_model_support() {
 #[test]
 fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     let explanation = ConvoyExplanation {
+        cascade: None,
         environment_observations: Default::default(),
         stalled: None,
         recent_events: Vec::new(),
@@ -309,6 +310,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
 #[test]
 fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
     let explanation = ConvoyExplanation {
+        cascade: None,
         environment_observations: Default::default(),
         namespace: "flotilla".into(),
         convoy: "reserved-only".into(),

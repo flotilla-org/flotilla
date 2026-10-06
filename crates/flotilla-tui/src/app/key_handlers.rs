@@ -249,6 +249,7 @@ impl App {
             TableIntent::StartConvoy { namespace, project, issue } => {
                 self.proto_commands.push(self.command(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: Some(namespace),
                         project_ref: project,
                         change_request: None,
@@ -273,6 +274,7 @@ impl App {
                 for issue in issues {
                     let command = self.command(CommandAction::ConvoyStart {
                         intent: Box::new(ConvoyStartIntent {
+                            standing_role: None,
                             namespace: Some(namespace.clone()),
                             project_ref: project.clone(),
                             change_request: None,
@@ -312,6 +314,7 @@ impl App {
                 let issue_count = issues.len();
                 self.proto_commands.push(self.command(CommandAction::ConvoyStart {
                     intent: Box::new(ConvoyStartIntent {
+                        standing_role: None,
                         namespace: Some(namespace),
                         project_ref: project,
                         change_request: None,

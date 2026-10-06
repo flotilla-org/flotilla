@@ -274,3 +274,6 @@ pub use workflow_template::{
     LeafTemplate, LegacyCompletionExpectation, RoleHandoff, Selector, StallNudgePolicy, Stance, SubjectVariable, SupervisionTarget,
     TurnDeliveryRule, TurnDeliveryTarget, ValidationError, VesselRequirement, WorkflowTemplate, WorkflowTemplateSpec,
 };
+
+pub mod role_cascade;
+pub use role_cascade::{ResolvedCascade, ResolvedSetting, RoleCascadeLayer, RoleDefinition};

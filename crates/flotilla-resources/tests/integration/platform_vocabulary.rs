@@ -5,6 +5,8 @@ use flotilla_resources::{normalize_project_spec, CapabilityNeed, Platform, Proje
 fn project_with_matrix(platforms: &[&str]) -> ProjectSpec {
     ProjectSpec {
         charter: None,
+        role_definitions: BTreeMap::new(),
+        charter_prose: BTreeMap::new(),
         parent: None,
         platform_matrix: platforms.iter().map(|platform| platform.to_string()).collect(),
         display_name: "Widgets".to_string(),

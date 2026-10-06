@@ -847,6 +847,11 @@ fn format_subject_fact(fact: Option<&ExplainedSubjectFact>) -> String {
 }
 
 pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::ConvoyExplanation) -> String {
+    let cascade_text = explanation
+        .cascade
+        .as_ref()
+        .map(|cascade| format!("\nResolved defaults:\n{}\n", serde_json::to_string_pretty(cascade).expect("serialize cascade")))
+        .unwrap_or_default();
     let mut output = format!("Convoy: {}/{}\nPhase: {}\n", explanation.namespace, explanation.convoy, explanation.phase);
     for mutation in &explanation.lifecycle_mutations {
         let _ = writeln!(output, "{} by {} at {}", mutation.action, mutation.caller, mutation.at);
@@ -1156,6 +1161,7 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
             }
         }
     }
+    output.push_str(&cascade_text);
     output
 }
 
@@ -1310,6 +1316,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
         }
         CommandValue::CrewList(crew) => format_crew_list_human(crew),
         CommandValue::DaemonLogs { lines } => lines.join("\n"),
+        CommandValue::ProjectExplanation(explanation) => serde_json::to_string_pretty(explanation).expect("serialize project explanation"),
         CommandValue::ConvoyExplanation(explanation) => format_convoy_explanation_human(explanation),
         CommandValue::ResourceDigest(value) => serde_json::to_string_pretty(value).unwrap_or_default(),
         CommandValue::ResourceRead(response) => {

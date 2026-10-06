@@ -1780,13 +1780,31 @@ impl CrewService {
                             repo_roots,
                             fork_stance,
                         );
+                    render_options.apply_cascade(
+                        convoy
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.workflow_snapshot.as_ref())
+                            .and_then(|workflow| workflow.cascade.as_deref()),
+                        target,
+                    );
                     render_options.has_credential_scope = !task.credential_scopes.is_empty();
                     let mut brief =
                         handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, task, &render_options)?;
                     if let Some(writer) = self.brief_artifact_writer.read().await.clone() {
                         let subject = format!("{}/handoff/{}", context.convoy, uuid::Uuid::new_v4().simple());
-                        brief.artifact_digest =
-                            Some(writer.put_brief(&context.namespace, &context.convoy, target, &subject, brief.content.as_bytes()).await?);
+                        brief.artifact_digest = Some(
+                            writer
+                                .put_brief(
+                                    &context.namespace,
+                                    &context.convoy,
+                                    target,
+                                    &subject,
+                                    brief.content.as_bytes(),
+                                    render_options.charter_commit.as_deref(),
+                                )
+                                .await?,
+                        );
                         brief.content.clear();
                     }
                     let terminal_meta = terminal_meta_with_vessel_credentials(identity.input_meta(), task);

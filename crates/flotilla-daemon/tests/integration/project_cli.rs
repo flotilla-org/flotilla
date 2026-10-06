@@ -378,7 +378,8 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
     // The host-local observation root survives restart even when the bootstrap
     // repository is not itself a Project member.
     assert!(config.load_observation_roots().expect("local roots").iter().any(|root| root.as_ref() == tmp.path()));
-    assert_eq!(flotilla.spec.default_workflow_ref, "single-agent");
+    // #2719: an omitted default inherits; admission supplies the builtin fallback.
+    assert!(flotilla.spec.default_workflow_ref.is_empty());
     assert_eq!(flotilla.spec.repositories[0].alias.as_deref(), Some("flotilla"));
     assert_eq!(
         flotilla.spec.repositories[0].roles,
@@ -1753,6 +1754,8 @@ async fn tracking_repo_does_not_widen_project_name_or_overwrite_custom_project()
     let projects = backend.clone().using::<Project>("flotilla");
     let custom_spec = flotilla_resources::ProjectSpec {
         charter: None,
+        role_definitions: BTreeMap::new(),
+        charter_prose: BTreeMap::new(),
         parent: None,
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
@@ -1786,6 +1789,8 @@ async fn tracking_repo_does_not_use_naming_cascade_when_slug_candidates_collide(
         projects
             .create(&InputMeta::builder().name(name.to_string()).build(), &flotilla_resources::ProjectSpec {
                 charter: None,
+                role_definitions: BTreeMap::new(),
+                charter_prose: BTreeMap::new(),
                 parent: None,
                 platform_matrix: Vec::new(),
                 role_needs: Default::default(),
@@ -1833,7 +1838,8 @@ async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_p
     assert_eq!(checkouts.items.len(), 1);
     let project = backend.using::<Project>("flotilla").get("my-project").await.expect("project should exist");
     assert_eq!(project.spec.display_name, "My Project");
-    assert_eq!(project.spec.default_workflow_ref, "single-agent");
+    // #2719: generated Projects leave workflow choice to the cascade.
+    assert!(project.spec.default_workflow_ref.is_empty());
     assert_eq!(project.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
         charter_store: None,
         repo: repository_key,
@@ -2244,7 +2250,7 @@ async fn project_apply_rejects_invalid_or_incomplete_definitions() {
     let mut rx = daemon.subscribe();
     for spec_yaml in [
         "this is: not {valid yaml structure for: a project",
-        "display_name: Missing workflow\nrepositories:\n  - repo: a\n",
+        "repositories:\n  - repo: a\n",
         "display_name: Empty repos\ndefault_workflow_ref: wf\nrepositories: []\n",
     ] {
         let id = daemon
@@ -2253,4 +2259,17 @@ async fn project_apply_rejects_invalid_or_incomplete_definitions() {
             .expect("execute");
         assert!(matches!(await_command_result(&mut rx, id).await, CommandValue::Error { .. }));
     }
+    // #2719: an omitted workflow inherits, while required identity remains local.
+    let id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ProjectApply {
+                    name: "inherits".into(),
+                    spec_yaml: "display_name: Inherits workflow\nrepositories:\n  - repo: a\n".into(),
+                })
+                .build(),
+        )
+        .await
+        .expect("apply sparse project");
+    assert_eq!(await_command_result(&mut rx, id).await, CommandValue::ProjectApplied { name: "inherits".into() });
 }

@@ -23,6 +23,10 @@ define_resource!(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct WorkflowTemplateSpec {
+    /// Admission freezes both values and their winning layers for explain/launch.
+    // Previous-generation workflow snapshots omit this field (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cascade: Option<Box<crate::ResolvedCascade>>,
     #[builder(default)]
     #[serde(default)]
     pub inputs: Vec<InputDefinition>,
@@ -1213,6 +1217,7 @@ mod tests {
     fn previous_stock_workflow_snapshots_decode_unchanged() {
         let workflow = super::single_agent_workflow_spec();
         let mut snapshot = crate::WorkflowSnapshot {
+            cascade: None,
             exit: workflow.exit,
             turn_delivery: workflow.turn_delivery,
             vessels: workflow.vessels,

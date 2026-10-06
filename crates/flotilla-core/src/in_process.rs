@@ -1436,7 +1436,15 @@ pub const BRIEF_ARTIFACTS_ANNOTATION: &str = "flotilla.work/brief-artifacts";
 
 #[async_trait]
 pub trait BriefArtifactWriter: Send + Sync {
-    async fn put_brief(&self, namespace: &str, convoy: &str, role: &str, subject: &str, content: &[u8]) -> Result<String, String>;
+    async fn put_brief(
+        &self,
+        namespace: &str,
+        convoy: &str,
+        role: &str,
+        subject: &str,
+        content: &[u8],
+        charter_commit: Option<&str>,
+    ) -> Result<String, String>;
 }
 
 #[async_trait]
@@ -4083,7 +4091,8 @@ impl InProcessDaemon {
             .project_ref(ensure.spec.project_ref.clone())
             .name(ensure.spec.role.clone())
             .branch(ensure.spec.role.clone())
-            .workflow_ref(ensure.spec.workflow_ref.clone())
+            .standing_role(ensure.spec.role.clone())
+            .maybe_workflow_ref((!ensure.spec.workflow_ref.is_empty()).then(|| ensure.spec.workflow_ref.clone()))
             .maybe_placement_policy(ensure.spec.placement_policy.clone())
             .maybe_escalation_reason(ensure.spec.escalation_reason.clone())
             .agent_overrides(ensure.spec.agent_overrides.clone())
@@ -7298,6 +7307,15 @@ async fn execute_local_remote_step_batch(
 }
 
 impl InProcessDaemon {
+    async fn explain_project_internal(&self, name: &str) -> Result<serde_json::Value, String> {
+        let namespace = self.provisioning_namespace().await;
+        let project = self.resource_backend.definitions::<Project>(&namespace).get(name).await.map_err(|error| error.to_string())?;
+        let cascade = flotilla_resources::ResolvedCascade::load(&self.resource_backend, &namespace, name, &project.spec)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({ "namespace": namespace, "project": name, "cascade": cascade }))
+    }
+
     async fn explain_convoy_internal(&self, requested_namespace: Option<&str>, name: &str) -> Result<ConvoyExplanation, String> {
         let namespace = requested_namespace.map(ToOwned::to_owned).unwrap_or(self.provisioning_namespace().await);
         self.read_projections().explain_convoy(&namespace, name).await
@@ -7366,6 +7384,10 @@ impl DaemonHandle for InProcessDaemon {
             CommandAction::QueryHostList {} => match self.list_hosts_internal().await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::HostList(Box::new(v))),
                 Err(message) => Ok(flotilla_protocol::CommandValue::Error { message }),
+            },
+            CommandAction::QueryExplainProject { name } => match self.explain_project_internal(name).await {
+                Ok(explanation) => Ok(CommandValue::ProjectExplanation(explanation)),
+                Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryProjectList {} => match self.list_projects_internal().await {
                 Ok(v) => Ok(flotilla_protocol::CommandValue::ProjectList(Box::new(v))),

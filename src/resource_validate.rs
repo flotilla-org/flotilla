@@ -127,7 +127,7 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
                     failed = true;
                 }
             }
-            if store_base == base && catalog.is_some() && matches!(kind.as_str(), "projects" | "crewdefaults") {
+            if store_base == base && catalog.is_some() && matches!(kind.as_str(), "projects" | "crewdefaults" | "fleetdesignations") {
                 // Schema validation checks every stored provenance above. Skill
                 // policy must use the merged definition view, just like admission.
                 let merged: Value = client
@@ -355,7 +355,7 @@ pub fn validate_path(path: &Path, skill_catalog: Option<&Path>) -> Result<()> {
             Ok(documents) => {
                 for (index, document) in documents.iter().enumerate() {
                     let label = format!("{}#{}", file.display(), index + 1);
-                    if catalog.is_some() && matches!(document["kind"].as_str(), Some("Project" | "CrewDefaults")) {
+                    if catalog.is_some() && matches!(document["kind"].as_str(), Some("Project" | "CrewDefaults" | "FleetDesignation")) {
                         skill_documents.push(document.clone());
                     }
                     match validate_resource_document(document) {
@@ -437,30 +437,42 @@ fn load_catalog(path: &Path) -> Result<Vec<flotilla_resources::SkillCatalogEntry
 fn validate_skill_documents(catalog: &[flotilla_resources::SkillCatalogEntry], documents: &[Value]) -> Result<()> {
     use std::collections::BTreeMap;
 
-    use flotilla_resources::{crew_defaults::check_skill_declarations, CrewDefaultsSpec, ProjectSpec};
-    let mut namespaces = BTreeMap::<String, (BTreeMap<String, Vec<CrewDefaultsSpec>>, Vec<ProjectSpec>)>::new();
+    use flotilla_resources::{role_cascade::validate_cascade_skills, CrewDefaultsSpec, ProjectSpec};
+    #[derive(Default)]
+    struct SkillNamespace {
+        defaults: BTreeMap<String, CrewDefaultsSpec>,
+        projects: BTreeMap<String, ProjectSpec>,
+        fleet: Option<String>,
+    }
+    let mut namespaces = BTreeMap::<String, SkillNamespace>::new();
     for document in documents {
         let namespace = document["metadata"]["namespace"].as_str().unwrap_or(DEFAULT_PROVISIONING_NAMESPACE).to_string();
-        let (defaults, projects) = namespaces.entry(namespace).or_default();
+        let data = namespaces.entry(namespace).or_default();
+        let name = document["metadata"]["name"].as_str().ok_or_else(|| eyre!("cascade resource name missing"))?;
         match document["kind"].as_str() {
             Some("CrewDefaults") => {
-                defaults
-                    .entry(document["metadata"]["name"].as_str().ok_or_else(|| eyre!("CrewDefaults name missing"))?.to_string())
-                    .or_default()
-                    .push(serde_json::from_value(document["spec"].clone())?);
+                let spec = serde_json::from_value(document["spec"].clone())?;
+                if data.defaults.get(name).is_some_and(|previous| previous != &spec) {
+                    return Err(eyre!("conflicting CrewDefaults/{name} declarations"));
+                }
+                data.defaults.insert(name.into(), spec);
             }
-            Some("Project") => projects.push(serde_json::from_value(document["spec"].clone())?),
+            Some("Project") => {
+                let spec = serde_json::from_value(document["spec"].clone())?;
+                if data.projects.get(name).is_some_and(|previous| previous != &spec) {
+                    return Err(eyre!("conflicting Project/{name} declarations"));
+                }
+                data.projects.insert(name.into(), spec);
+            }
+            Some("FleetDesignation") => {
+                data.fleet = Some(serde_json::from_value::<flotilla_resources::FleetDesignationSpec>(document["spec"].clone())?.project);
+            }
             _ => {}
         }
     }
-    for (namespace, (defaults, projects)) in namespaces {
-        if defaults.len() > 1 {
-            return Err(eyre!("{namespace}: skill admission requires at most one CrewDefaults"));
-        }
-        let defaults = if defaults.is_empty() { vec![CrewDefaultsSpec::default()] } else { defaults.into_values().flatten().collect() };
-        for defaults in &defaults {
-            check_skill_declarations(catalog, defaults, &projects).map_err(|error| eyre!("{namespace}: {error}"))?;
-        }
+    for (namespace, data) in namespaces {
+        validate_cascade_skills(catalog, &data.projects, &data.defaults.into_iter().collect::<Vec<_>>(), data.fleet)
+            .map_err(|error| eyre!("{namespace}: {error}"))?;
     }
     println!("validated crew skill declarations against the candidate catalog");
     Ok(())
@@ -1191,6 +1203,17 @@ mod tests {
             .expect_err("ambiguous fleet defaults")
             .to_string()
             .contains("at most one CrewDefaults"));
+    }
+
+    // A second declaration cannot hide a missing skill in the same resource.
+    #[test]
+    fn pre_roll_refuses_conflicting_duplicates_instead_of_shadowing_them() {
+        let invalid = serde_json::json!({"kind":"Project", "metadata":{"name":"child"}, "spec":{"display_name":"Child", "skills":{"coder":["missing"]}}});
+        let valid = serde_json::json!({"kind":"Project", "metadata":{"name":"child"}, "spec":{"display_name":"Child"}});
+        assert!(super::validate_skill_documents(&[], &[invalid, valid])
+            .expect_err("conflicting declarations")
+            .to_string()
+            .contains("conflicting Project/child"));
     }
 
     #[test]

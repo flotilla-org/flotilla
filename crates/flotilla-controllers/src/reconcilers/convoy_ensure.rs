@@ -1,6 +1,6 @@
 //! Standing-convoy reconciliation and its complete transaction guard.
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -486,8 +486,36 @@ impl EnsurePass<'_> {
                 }
             }
         }
+        let projects = self.resource_backend.definitions::<Project>(namespace);
+        let cascade = match projects.get(&ensure.spec.project_ref).await {
+            Ok(project) => {
+                match flotilla_resources::ResolvedCascade::load(self.resource_backend, namespace, &ensure.spec.project_ref, &project.spec)
+                    .await
+                {
+                    Ok(cascade) => {
+                        versions.insert("RoleCascade".into(), serde_json::to_string(&cascade).map_err(|error| error.to_string())?);
+                        Some(cascade)
+                    }
+                    Err(error) => {
+                        versions.insert("RoleCascade".into(), format!("refused:{error}"));
+                        None
+                    }
+                }
+            }
+            Err(_) => None,
+        };
+        let workflow_ref = if ensure.spec.workflow_ref.is_empty() {
+            cascade.as_ref().map(|cascade| cascade.workflow(Some(&ensure.spec.role)).value.as_str()).unwrap_or("")
+        } else {
+            &ensure.spec.workflow_ref
+        };
         let workflows = self.resource_backend.clone().definitions::<WorkflowTemplate>(namespace);
-        for name in [materialized_workflow_name(&ensure.spec.project_ref, &ensure.spec.workflow_ref), ensure.spec.workflow_ref.clone()] {
+        let mut workflow_names =
+            BTreeSet::from([materialized_workflow_name(&ensure.spec.project_ref, workflow_ref), workflow_ref.to_string()]);
+        if let Some(cascade) = &cascade {
+            workflow_names.extend(cascade.project_chain.iter().map(|owner| materialized_workflow_name(owner, workflow_ref)));
+        }
+        for name in workflow_names {
             let version = workflows
                 .get(&name)
                 .await

@@ -2223,6 +2223,7 @@ async fn artifact_environment_reference_contract() {
             .update_status(convoy, &created.metadata.resource_version, &ConvoyStatus {
                 phase: ResourceConvoyPhase::Active,
                 workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
                     exit: None,
                     turn_delivery: Default::default(),
                     stall_nudges: Default::default(),
@@ -3620,6 +3621,7 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
         let spec = ConvoySpec::builder().workflow_ref("scratch".into()).project_ref("project".into()).role(role.into()).build();
         let convoy = convoys.create(&convoy_meta(name, role), &spec).await.expect("convoy");
         let snapshot = WorkflowSnapshot {
+            cascade: None,
             vessels: vec![VesselRequirement::builder()
                 .name(vessel.into())
                 .crew(vec![CrewSpec::builder()
