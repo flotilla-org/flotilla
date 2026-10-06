@@ -48,6 +48,10 @@ pub const DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS: u64 = 3600;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ProjectSpec {
+    /// Declares one bounded charter source. Omission preserves legacy authoring.
+    // ADR 0047: previous-generation Projects omit the registration pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charter: Option<crate::CharterPointer>,
     /// Declared parent in this namespace; omission inherits the designated fleet.
     // Previous-generation Projects omit parent (ADR 0047).
     #[serde(default)]
@@ -376,6 +380,9 @@ pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Re
     }
 }
 pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, String> {
+    if let Some(pointer) = &spec.charter {
+        pointer.validate()?;
+    }
     for refs in spec.skills.values() {
         for reference in refs {
             crate::validate_skill_ref(reference)?;
@@ -574,6 +581,7 @@ mod tests {
     #[test]
     fn dispatch_policy_rejects_zero_staleness_threshold() {
         let spec = ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             display_name: "Widgets".to_string(),
@@ -611,6 +619,7 @@ mod tests {
             default_branch: None,
         };
         let spec = ProjectSpec {
+            charter: None,
             parent: None,
             platform_matrix: Vec::new(),
             display_name: "Widgets".to_string(),

@@ -30,6 +30,12 @@ pub fn reconciliation_lock(identity: &str) -> Arc<tokio::sync::Mutex<()>> {
     lock
 }
 
+/// Fleet and legacy project writers share one exclusion during pointer cut-over.
+/// Release this guard before entering another charter-authoring operation.
+pub fn authoring_lock(namespace: &str) -> Arc<tokio::sync::Mutex<()>> {
+    reconciliation_lock(&format!("charter-authoring:{namespace}"))
+}
+
 /// The cache holds Git objects only. No checkout, reset, or fast-forward step
 /// occurs, and all blobs are read at one fetched commit.
 pub async fn read_charter_source(source: &CharterSource, cache: &Path, vcs: Option<&dyn Vcs>) -> Result<CharterSnapshot, String> {

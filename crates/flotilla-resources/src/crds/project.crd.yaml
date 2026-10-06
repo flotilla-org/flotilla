@@ -21,6 +21,31 @@ spec:
               type: object
               required: [display_name, default_workflow_ref, repositories]
               properties:
+                charter:
+                  type: object
+                  nullable: true
+                  required: [kind]
+                  properties:
+                    kind:
+                      type: string
+                      enum: [inline, repository]
+                    documents:
+                      type: array
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    files:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    repo:
+                      type: string
+                      minLength: 1
+                    branch:
+                      type: string
+                      minLength: 1
+                    path:
+                      type: string
                 parent:
                   type: string
                   nullable: true

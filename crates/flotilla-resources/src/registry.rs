@@ -852,6 +852,11 @@ fn typed_spec_hash<T: Resource>(spec: &Value) -> Result<String, ResourceError> {
     crate::content_hash(&normalized)
 }
 
+/// Resolve aliases through the same inventory used by dynamic resource writes.
+pub fn canonical_resource_kind(kind: &str) -> Result<&'static str, ResourceError> {
+    Ok(lookup_resource_kind(kind)?.kind)
+}
+
 fn lookup_resource_kind(kind: &str) -> Result<&'static RegisteredResourceKind, ResourceError> {
     let normalized = kind.trim();
     REGISTERED_RESOURCE_KINDS

@@ -6,6 +6,7 @@ mod agent_material;
 mod aggregator;
 pub mod artifact;
 pub mod blob_store;
+mod charter_delegation;
 mod codex_central;
 mod credential;
 mod dispatch_reconciler;

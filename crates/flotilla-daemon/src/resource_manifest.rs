@@ -41,7 +41,7 @@ const LEGACY_STATE_ANNOTATIONS: [&str; 5] = [
     "flotilla.work/manifest-resolution",
 ];
 
-type LoadedManifestFile = (PathBuf, Result<Vec<Value>, String>);
+pub(crate) type LoadedManifestFile = (PathBuf, Result<Vec<Value>, String>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ObjectIdentity {
@@ -328,7 +328,7 @@ impl ResourceManifestReconciler {
     }
 
     pub async fn reconcile_once(&mut self) -> Result<ManifestPassReport, String> {
-        let lock = flotilla_core::charter_store::reconciliation_lock(&format!("manifest:{}/{}", self.default_namespace, self.root_name()));
+        let lock = flotilla_core::charter_store::authoring_lock(&self.default_namespace);
         let _guard = lock.lock().await;
         let root_resource = self
             .backend
@@ -337,16 +337,60 @@ impl ResourceManifestReconciler {
             .await
             .map_err(|error| format!("read ManifestRoot: {error}"))?;
         let inputs = self.load_inputs().await;
-        let (revision, files) = match inputs {
+        let (revision, mut files) = match inputs {
             Ok(inputs) => inputs,
             Err(error) => {
                 self.publish_source_failure(&root_resource, &error).await?;
                 return Err(error);
             }
         };
+        let reader =
+            crate::charter_delegation::BoundCharterReader { cache: &self.root.with_extension("charter-cache"), vcs: self.vcs.as_deref() };
+        let registered =
+            match crate::charter_delegation::expand_registered_charters(&files, &revision, &self.default_namespace, &self.backend, &reader)
+                .await
+            {
+                Ok(Some(expanded)) => {
+                    files = expanded;
+                    true
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    self.publish_source_failure(&root_resource, &error).await?;
+                    return Err(error);
+                }
+            };
+        if registered {
+            for (path, parsed) in &files {
+                for document in parsed.as_ref().map_err(Clone::clone)? {
+                    if document.get("kind").and_then(Value::as_str) != Some("Project") {
+                        continue;
+                    }
+                    let identity = document_identity(document, &self.default_namespace)?;
+                    match get_resource_kind(&self.backend, &identity.namespace, &identity.kind, &identity.name).await {
+                        Ok(existing) => {
+                            let annotations = string_map(&existing.value, "annotations")?;
+                            if let Some(other) =
+                                annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION).filter(|other| **other != self.root_name())
+                            {
+                                let error = format!(
+                                    "Project `{identity}` claimed by two sources: ManifestRoot/{other} and ManifestRoot/{} ({})",
+                                    self.root_name(),
+                                    path.display()
+                                );
+                                self.publish_source_failure(&root_resource, &error).await?;
+                                return Err(error);
+                            }
+                        }
+                        Err(ResourceError::NotFound { .. }) => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+            }
+        }
         // A bound revision is accepted as a whole. Validate all documents before
         // any resource writes, including typed specs and duplicate identities.
-        if self.binding.is_some() {
+        if self.binding.is_some() || registered {
             let mut identities = HashSet::new();
             let validation = files.iter().try_for_each(|(path, parsed)| {
                 for document in parsed.as_ref().map_err(|error| format!("{}: {error}", path.display()))? {
@@ -400,10 +444,15 @@ impl ResourceManifestReconciler {
                         name: format!("#{}", index + 1),
                     },
                 };
+                let document_revision = document
+                    .pointer("/metadata/annotations/flotilla.work~1charter-revision")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&revision)
+                    .to_string();
                 let result = match identity {
                     Ok(identity) => {
                         self.reconcile_document(
-                            ManifestDocumentContext { path: &relative, revision: &revision, key: &key, identity: &identity },
+                            ManifestDocumentContext { path: &relative, revision: &document_revision, key: &key, identity: &identity },
                             document,
                             &root_resource.spec,
                             previous.get(&key),
@@ -559,10 +608,26 @@ impl ResourceManifestReconciler {
             ));
         };
         let annotations = string_map(&existing, "annotations")?;
+        let labels = string_map(&existing, "labels")?;
+        if identity.kind == "Project"
+            && document.pointer("/spec/charter").is_some_and(|pointer| !pointer.is_null())
+            && existing.pointer("/spec/charter").is_none_or(Value::is_null)
+            && !annotations.contains_key(MANIFEST_RECONCILER_ROOT_ANNOTATION)
+            && (annotations.contains_key(flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION)
+                || labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some("whole-repository-project"))
+        {
+            // The explicit registration transfers a legacy-generated Project.
+            // Unrelated unmanaged objects retain the ordinary adoption refusal.
+            preserve_external_metadata(&mut document, &existing)?;
+            clear_manifest_state(&mut document)?;
+            self.apply_manifest_document(document).await?;
+            report.updated += 1;
+            let hash = self.stored_spec_hash(identity).await?;
+            return Ok(document_state(DocumentPhase::Applied, None, Some(hash.clone()), Some(desired_hash), Some(hash), previous));
+        }
         let live_hash = resource_document_spec_hash(&existing).map_err(|error| format!("{identity}: {error}"))?;
         let baseline =
             annotations.get(MANIFEST_BASELINE_HASH_ANNOTATION).or_else(|| annotations.get(LAST_APPLIED_HASH_ANNOTATION)).cloned();
-        let labels = string_map(&existing, "labels")?;
         if let Some(resolution) = resolution.filter(|resolution| {
             resolution.action != ResolutionAction::Sync
                 || labels.get(MANAGED_BY_LABEL).map(String::as_str) == Some(MANIFEST_MANAGED_BY_VALUE)
@@ -647,7 +712,18 @@ impl ResourceManifestReconciler {
                 && annotations.get(MANIFEST_SOURCE_ANNOTATION).map(String::as_str) == Some(self.source.as_str())
                 && annotations.get(MANIFEST_PATH_ANNOTATION).map(String::as_str) == Some(path.to_string_lossy().as_ref())
                 && annotations.contains_key(MANIFEST_REVISION_ANNOTATION)
-                && (self.binding.is_none() || annotations.get(MANIFEST_REVISION_ANNOTATION).map(String::as_str) == Some(revision))
+                && [
+                    crate::charter_delegation::CHARTER_SOURCE,
+                    crate::charter_delegation::CHARTER_REVISION,
+                    crate::charter_delegation::CHARTER_SCOPE,
+                ]
+                .iter()
+                .all(|key| {
+                    document["metadata"]["annotations"].get(*key).and_then(Value::as_str) == annotations.get(*key).map(String::as_str)
+                })
+                && ((self.binding.is_none()
+                    && document["metadata"]["annotations"].get(crate::charter_delegation::CHARTER_REVISION).is_none())
+                    || annotations.get(MANIFEST_REVISION_ANNOTATION).map(String::as_str) == Some(revision))
                 && annotations.get(MANIFEST_RECONCILER_ROOT_ANNOTATION).map(String::as_str) == Some(self.root_name().as_str())
                 && LEGACY_STATE_ANNOTATIONS.iter().all(|key| !annotations.contains_key(*key));
             if settled {
@@ -745,6 +821,11 @@ impl ResourceManifestReconciler {
     }
 
     async fn adopt_live_spec(&self, source: &Path, identity: &ObjectIdentity, existing: &Value) -> Result<(), String> {
+        if existing.pointer("/metadata/annotations/flotilla.work~1charter-scope").is_some() {
+            return Err(
+                "adoption cannot write a registered charter; edit the declared inline inputs or commit to its repository branch".into()
+            );
+        }
         if matches!(self.binding, Some(CharterSource::Repository { .. })) {
             return Err("adoption cannot write a repository-bound charter; commit the desired change to its branch".into());
         }
@@ -907,7 +988,7 @@ fn parse_documents(path: &Path) -> Result<Vec<Value>, String> {
     parse_document_contents(path, &content)
 }
 
-fn parse_document_contents(path: &Path, content: &str) -> Result<Vec<Value>, String> {
+pub(crate) fn parse_document_contents(path: &Path, content: &str) -> Result<Vec<Value>, String> {
     if path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("json")) {
         return serde_json::from_str(content).map(|document| vec![document]).map_err(|error| format!("parse JSON: {error}"));
     }
@@ -984,6 +1065,18 @@ fn preserve_external_metadata(document: &mut Value, existing: &Value) -> Result<
         let desired_values = desired_values.as_object_mut().ok_or_else(|| format!("metadata.{field} must be an object"))?;
         if let Some(stored_values) = stored.get(field).and_then(Value::as_object) {
             for (key, value) in stored_values {
+                // Charter provenance is reconciler-owned, so removing a pointer
+                // can clear it instead of preserving stale delegated authority.
+                if field == "annotations"
+                    && [
+                        crate::charter_delegation::CHARTER_SOURCE,
+                        crate::charter_delegation::CHARTER_REVISION,
+                        crate::charter_delegation::CHARTER_SCOPE,
+                    ]
+                    .contains(&key.as_str())
+                {
+                    continue;
+                }
                 desired_values.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
@@ -1994,5 +2087,198 @@ mod tests {
             assert!(!cleaned.metadata.annotations.contains_key(key), "stale state annotation {key}");
         }
         assert!(cleaned.metadata.annotations.contains_key(MANIFEST_BASELINE_HASH_ANNOTATION));
+    }
+}
+
+#[cfg(test)]
+mod registered_charter_tests {
+    use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
+    use flotilla_protocol::HostName;
+    use flotilla_resources::{
+        CharterPointer, InMemoryBackend, PlacementPolicy, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec,
+        RepositoryKey, ResourceProvenance,
+    };
+
+    use super::*;
+    use crate::server::test_support::spawn_in_memory_request_topology;
+
+    fn project(pointer: CharterPointer) -> Value {
+        let spec = ProjectSpec::builder()
+            .display_name("App".into())
+            .default_workflow_ref("single-agent".into())
+            .charter(pointer)
+            .repositories(vec![ProjectRepositorySpec::builder()
+                .repo(RepositoryKey("app-repo".into()))
+                .roles(std::collections::BTreeSet::from([ProjectRepositoryRole::Code]))
+                .build()])
+            .build();
+        serde_json::json!({"apiVersion": "flotilla.work/v1", "kind": "Project", "metadata": {"name": "app"}, "spec": spec})
+    }
+
+    // #2721: scope refusal happens before any resource writes and preserves the
+    // last applied revision and records. Fixing the source recovers its attention.
+    #[tokio::test]
+    async fn scope_refusal_preserves_the_entire_last_applied_candidate() {
+        let directory = tempfile::tempdir().expect("fleet directory");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let pointer = CharterPointer::Inline { documents: vec![], files: BTreeMap::new() };
+        let good = project(pointer);
+        std::fs::write(directory.path().join("project.json"), serde_json::to_string(&good).expect("encode")).expect("write");
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), "flotilla", directory.path())
+            .with_binding(Some(CharterSource::LocalDirectory { directory: directory.path().to_string_lossy().into_owned() }));
+        reconciler.reconcile_once_for_test().await.expect("initial apply");
+        let initial_root = backend.using::<ManifestRoot>("flotilla").get(&reconciler.root_name()).await.expect("root");
+        let initial_project = backend.using::<Project>("flotilla").get("app").await.expect("project");
+        let mut bad = good.clone();
+        bad["spec"]["display_name"] = serde_json::json!("Must not apply");
+        bad["spec"]["charter"]["documents"] = serde_json::json!([{"apiVersion": "flotilla.work/v1", "kind": "PlacementPolicy", "metadata": {"name": "escape"}, "spec": {"pool": "other"}}]);
+        std::fs::write(directory.path().join("project.json"), serde_json::to_string(&bad).expect("encode")).expect("write refused head");
+        let error = reconciler.reconcile_once().await.expect_err("refuse whole candidate");
+        assert!(error.contains("delegated scope `flotilla/app`"), "{error}");
+        assert_eq!(backend.using::<Project>("flotilla").get("app").await.expect("project").spec, initial_project.spec);
+        assert!(backend.using::<PlacementPolicy>("flotilla").list().await.expect("policies").items.is_empty());
+        let refused =
+            backend.using::<ManifestRoot>("flotilla").get(&reconciler.root_name()).await.expect("refused root").status.expect("status");
+        assert_eq!(refused.applied_revision, initial_root.status.expect("initial status").applied_revision);
+        assert!(refused.source_error.is_some());
+        assert!(refused.stalled.is_some());
+        std::fs::write(directory.path().join("project.json"), serde_json::to_string(&good).expect("encode")).expect("restore");
+        reconciler.reconcile_once().await.expect("recover");
+        let recovered = backend.using::<ManifestRoot>("flotilla").get(&reconciler.root_name()).await.expect("root").status.expect("status");
+        assert!(recovered.source_error.is_none());
+        assert!(recovered.stalled.is_none());
+    }
+
+    // #2721: even a legacy unbound fleet source stamps updated charter revisions
+    // when resource specs are unchanged; pointer removal clears charter provenance.
+    #[tokio::test]
+    async fn unbound_source_refreshes_charter_provenance_and_can_return_to_legacy() {
+        let directory = tempfile::tempdir().expect("fleet input");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let ensure = serde_json::json!({"apiVersion": "flotilla.work/v1", "kind": "ConvoyEnsure", "metadata": {"name": "app-governor"}, "spec": {"project_ref": "app", "role": "governor", "workflow_ref": "govern", "repositories": ["app-repo"]}});
+        let mut registration = project(CharterPointer::Inline { documents: vec![ensure.clone()], files: BTreeMap::new() });
+        let mut legacy_spec: ProjectSpec = serde_json::from_value(registration["spec"].clone()).expect("legacy spec");
+        legacy_spec.charter = None;
+        backend
+            .definitions::<Project>("flotilla")
+            .create(
+                &InputMeta::builder()
+                    .name("app".into())
+                    .annotations(BTreeMap::from([(
+                        flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION.into(),
+                        "app-repo".into(),
+                    )]))
+                    .build(),
+                &legacy_spec,
+            )
+            .await
+            .expect("legacy bootstrap Project");
+        let path = directory.path().join("project.json");
+        std::fs::write(&path, serde_json::to_string(&registration).expect("encode")).expect("registration");
+        let mut reconciler = ResourceManifestReconciler::new(backend.clone(), "flotilla", directory.path()).with_revision("first");
+        let report = reconciler.reconcile_once_for_test().await.expect("first apply");
+        assert!(report.errors.is_empty(), "{report:?}");
+        let registered = backend.using::<Project>("flotilla").get("app").await.expect("transferred registration");
+        assert!(registered.spec.charter.is_some());
+        assert_eq!(registered.metadata.labels[MANAGED_BY_LABEL], MANIFEST_MANAGED_BY_VALUE);
+        assert_eq!(registered.metadata.annotations[flotilla_core::project_declaration::BOOTSTRAP_REPOSITORY_ANNOTATION], "app-repo");
+        let ensures = backend.using::<flotilla_resources::ConvoyEnsure>("flotilla");
+        assert_eq!(ensures.get("app-governor").await.expect("ensure").metadata.annotations[MANIFEST_REVISION_ANNOTATION], "first");
+        reconciler.fixed_revision = Some("second".into());
+        reconciler.reconcile_once().await.expect("refresh same specs");
+        let refreshed = ensures.get("app-governor").await.expect("ensure");
+        assert_eq!(refreshed.metadata.annotations[MANIFEST_REVISION_ANNOTATION], "second");
+        assert_eq!(refreshed.metadata.annotations[crate::charter_delegation::CHARTER_REVISION], "second");
+        registration["spec"].as_object_mut().expect("spec").remove("charter");
+        std::fs::write(&path, serde_json::to_string(&registration).expect("encode")).expect("remove pointer");
+        std::fs::write(directory.path().join("ensure.json"), serde_json::to_string(&ensure).expect("encode")).expect("legacy document");
+        reconciler.fixed_revision = Some("third".into());
+        reconciler.reconcile_once().await.expect("return to legacy");
+        let legacy = ensures.get("app-governor").await.expect("preserved ensure");
+        assert!(!legacy.metadata.annotations.contains_key(crate::charter_delegation::CHARTER_SCOPE));
+        assert!(!legacy.metadata.annotations.contains_key(crate::charter_delegation::CHARTER_REVISION));
+        assert_eq!(legacy.spec, refreshed.spec);
+    }
+
+    // #2721: a fleet-repo policy federates to the host it targets alongside a
+    // legacy locally authored policy; updates federate without altering local inputs.
+    #[tokio::test]
+    async fn fleet_placement_policy_federates_alongside_host_local_policy() {
+        let directory = tempfile::tempdir().expect("fleet input");
+        let fleet_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let host_backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        for (name, machine) in [("fleet-config", "fleet-root"), ("host-config", "host-root")] {
+            let config = directory.path().join(name);
+            std::fs::create_dir_all(&config).expect("config directory");
+            std::fs::write(config.join("daemon.toml"), format!("machine_id = '{machine}'\n")).expect("machine identity");
+        }
+        let input = directory.path().join("input");
+        std::fs::create_dir(&input).expect("input directory");
+        let fleet = InProcessDaemon::new_with_resource_backend(
+            vec![],
+            Arc::new(ConfigStore::with_base(directory.path().join("fleet-config"))),
+            fake_discovery(false),
+            HostName::new("fleet-home"),
+            fleet_backend.clone(),
+        )
+        .await;
+        let host = InProcessDaemon::new_with_resource_backend(
+            vec![],
+            Arc::new(ConfigStore::with_base(directory.path().join("host-config"))),
+            fake_discovery(false),
+            HostName::new("target-host"),
+            host_backend.clone(),
+        )
+        .await;
+        let host_ref = host.local_host_summary().await.environment_id.host_id().expect("host ID").to_string();
+        let spec = flotilla_resources::PlacementPolicySpec::builder()
+            .pool("passthrough".into())
+            .host_direct(flotilla_resources::HostDirectPlacementPolicySpec {
+                host_ref,
+                checkout: flotilla_resources::HostDirectPlacementPolicyCheckout::Worktree,
+            })
+            .priority(40)
+            .build();
+        host_backend
+            .using::<PlacementPolicy>("flotilla")
+            .create(&InputMeta::builder().name("legacy-local".into()).build(), &spec)
+            .await
+            .expect("legacy local policy");
+        let path = input.join("placement.json");
+        let mut document = serde_json::json!({"apiVersion": "flotilla.work/v1", "kind": "PlacementPolicy", "metadata": {"name": "fleet-target-host"}, "spec": spec});
+        std::fs::write(&path, serde_json::to_string(&document).expect("encode")).expect("fleet policy");
+        let mut reconciler = ResourceManifestReconciler::new(fleet_backend.clone(), "flotilla", &input)
+            .with_binding(Some(CharterSource::LocalDirectory { directory: input.to_string_lossy().into_owned() }));
+        reconciler.reconcile_once_for_test().await.expect("apply fleet policy");
+        let topology = spawn_in_memory_request_topology(fleet, host).await.expect("connect daemon stores");
+        for priority in [40, 75] {
+            if priority == 75 {
+                document["spec"]["priority"] = serde_json::json!(priority);
+                std::fs::write(&path, serde_json::to_string(&document).expect("encode")).expect("update fleet policy");
+                reconciler.reconcile_once().await.expect("apply policy update");
+            }
+            let replicated = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(policy) = host_backend.including_replicas::<PlacementPolicy>("flotilla").get("fleet-target-host").await {
+                        if policy.object.spec.priority == priority {
+                            break policy;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("policy federates to target host");
+            assert!(matches!(replicated.provenance, ResourceProvenance::Replica { .. }));
+            assert_eq!(
+                replicated.object.spec.host_direct.as_ref().expect("host strategy").host_ref,
+                spec.host_direct.as_ref().expect("host strategy").host_ref
+            );
+            assert_eq!(
+                host_backend.using::<PlacementPolicy>("flotilla").get("legacy-local").await.expect("local policy preserved").spec,
+                spec
+            );
+        }
+        drop(topology);
     }
 }
