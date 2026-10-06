@@ -1435,8 +1435,8 @@ async fn create_bounds_memory_and_swap() {
         .expect("create");
     let calls = runner.calls();
     let args = &calls.iter().find(|(cmd, args, _)| cmd == "docker" && args.first().is_some_and(|arg| arg == "run")).expect("docker run").1;
-    assert!(args.windows(2).any(|pair| pair == ["--memory", "8589934592"]));
-    assert!(args.windows(2).any(|pair| pair == ["--memory-swap", "8589934592"]));
+    assert!(args.windows(2).any(|pair| pair == ["--memory", "13743895347"]));
+    assert!(args.windows(2).any(|pair| pair == ["--memory-swap", "13743895347"]));
 }
 
 // Subprocess boundary: replay the operator's real inspect/journal recordings.
@@ -1555,7 +1555,7 @@ async fn create_uses_configured_memory_policy() {
         flotilla_resources::EnvironmentMemoryPolicy { host_memory_percent: 25, expected_concurrent_crews: 2, swap_bytes: 1073741824 };
     provider.create(EnvironmentId::new("configured-memory"), &flotilla_protocol::ImageId::new("image"), opts).await.expect("create");
     let args = docker_run_args(&runner);
-    assert!(args.windows(2).any(|pair| pair == ["--memory", "8589934592"]));
+    assert!(args.windows(2).any(|pair| pair == ["--memory", "13743895347"]));
     assert!(args.windows(2).any(|pair| pair == ["--memory-swap", "9663676416"]));
 }
 
