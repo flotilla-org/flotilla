@@ -576,7 +576,7 @@ mod tests {
     // and must not consume the separate missing-auth warning.
     #[tokio::test]
     async fn failed_auth_probe_preserves_cache() {
-        let fixture = crate::providers::testing::fixture_path("coding_agent", "codex_fallback_auth_retry.yaml");
+        let fixture = fixture_path("coding_agent", "codex_fallback_auth_retry.yaml");
         let session = replay::test_session(&fixture, replay::Masks::new());
         let agent = CodexCodingAgent::new(
             "codex".into(),
