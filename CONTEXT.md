@@ -438,7 +438,7 @@ observed state and starts a new generation (repopulated by a full provider
 refresh). Watch-from-version is valid only within a generation; a consumer or
 federated replica that sees the generation change must re-list. The durable
 **Managed** log has no generations — its version is continuous across restarts.
-Distinct sense: see **Convoy generation**.
+Distinct senses: see **Convoy generation** and **Fleet generation**.
 _Avoid_: Epoch, session, restart-id.
 
 **Convoy generation**:
@@ -447,10 +447,26 @@ life's crew turns, archive pointers, and terminal reason (ADR 0032). Records
 are never reused across restarts — an ensure rebuilds by admitting the next
 generation; terminal generations are retained as history. At most one live
 generation exists per **Role address**. Distinct from the store-lifespan
-sense of **Generation**, and from the fleet-release generations of the
-deployment pipeline.
+sense of **Generation**, and from **Fleet generation** in the deployment
+pipeline.
 _Avoid_: Incarnation (in code), husk (except informally for a terminal
 generation blocking nothing).
+
+**Fleet component**:
+An independently pinned unit of installed fleet software or skills (ADR 0037).
+Its artifact is the installable archive, distinct from caches used to build it.
+A component measures what it provides and declares what it requires from the
+other components installed alongside it. Project-distributed tools and skills
+can be promoted to fleet components.
+_Avoid_: Build cache, whole generation, project (a component need not be a project).
+
+**Fleet generation**:
+A signed selection of **Fleet component** identities and artifact digests for
+the fleet's supported platforms, with platform-independent components shared.
+Composition checks that the selected components meet each other's requirements;
+rollback selects a previous generation. Distinct from **Generation** of the
+observed store and **Convoy generation** of a standing convoy.
+_Avoid_: Monolithic build, rebuild, convoy incarnation.
 
 **Role address**:
 The stable identity of a standing **Convoy**: `{project, role}`, written

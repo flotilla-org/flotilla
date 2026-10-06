@@ -21,13 +21,49 @@ one program:
 ## Decision
 
 **1. The generation *format* is the public contract; hosting is
-per-installation.** The layout — schema-versioned `generation.json`,
-per-platform archives, signature scheme, N-ary source pins — is documented and
-versioned; `fleet-install` speaks only "channel URL + format." The lab Forgejo
-registry is one server of it; GitHub Releases or an object-storage bucket can
-serve a future public release; a plain directory serves the rehearsal and the
-disconnected case. No tool below the contract may know which server it is
-talking to.
+per-installation.** Amended by the [#1848 owner ruling](https://github.com/flotilla-org/flotilla/issues/1848#issuecomment-6013492819)
+(2026-10-06), implemented first in #2762: the format is **component artifacts
+plus a signed generation pin list**. A component is anything with an independent
+pin: today flotilla (flotilla and flotillad), cleat (with runtime libghostty-vt),
+and skills (the pinned skill trees, platform-independent). Artifacts are what
+gets installed; Ghostty/Zig prefixes and Cargo targets are build caches inside
+a component build, never fleet artifacts.
+
+A component's identity is (component, source SHA, platform, recipe hash), with
+toolchain pins and build features in the recipe; identical inputs build once
+and are reused. Its archive digest is the truth, with an optional version label
+for people and compatibility. Darwin signing happens per component, once,
+before its digest is recorded. Component builds prove execution and linkage and
+**measure provides** from binaries and payload (capabilities, protocol, skill
+trees). Components declare requires; compose refuses unmet requirements against
+the pinned components' provides and names the gap. Component manifests and both
+generation schemas live in the one shared validation module; see the
+[component format contract](../../ci/fleet-candidates/component-manifests.md).
+
+`generation.json` schema v2 is a signed pin list of component identities and
+archive digests per platform, with platform-independent components listed once.
+Components are digest-addressed in the package store. Builds reuse identities
+already in the store; promotion composes, checks requirements and publishes.
+Rehearsal consumes that composition unchanged (§3); install verifies digests
+and signatures against the generation manifest, fetching only missing
+components. Rollback remains a manifest switch, and retention keeps components
+of the current, previous and recent generations.
+
+There are two distribution routes: fleet components pinned in the generation,
+and project tools/skills distributed from their own repositories, resolved at
+a project ref and staged into its crews. A repository-distributed tool can be
+promoted to a fleet component. Today's bundled mattpocock-skills and rjw-sdlc
+from rjw-skills form the skills fleet component; the owner may revisit that
+membership.
+
+Hosting is per-installation: the lab Forgejo registry today, a plain directory
+for rehearsal/disconnected installs, or other servers for public releases.
+`fleet-install` speaks only "channel URL + format"; no tool below the contract
+may know which server it is talking to. Migration is one dual-published
+transition generation (v2 pin list plus a v1-compatible bundle for the old
+installer's §2 self-update handoff); validators and installers read v1 and v2
+for that generation, removing v1 one fleet roll later. Per-component build jobs
+and compose/publication/installer support follow in #2763 and #2764.
 
 **2. Tooling homes by nature.**
 - *Contract and validators* — schema plus all validation logic (promote,

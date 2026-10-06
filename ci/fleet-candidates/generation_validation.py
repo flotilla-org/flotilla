@@ -49,6 +49,13 @@ REQUIRED_PAYLOAD = {
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 GENERATION_PATTERN = re.compile(r"^(\d{8}T\d{6}Z-r\d+-f([0-9a-f]{12})-c([0-9a-f]{12}))$")
+# Component metadata is embedded in the signed v2 pin list, so compatibility
+# claims are authenticated together with the identity and archive digest.
+COMPONENT_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
+FACT_PATTERN = re.compile(r"^([a-z][a-z0-9-]*(?::[a-z0-9][a-z0-9_.-]*)+)(?:=(0|[1-9][0-9]*))?$")
+REQUIREMENT_PATTERN = re.compile(r"^([a-z][a-z0-9-]*(?::[a-z0-9][a-z0-9_.-]*)+)(?:(=|>=)(0|[1-9][0-9]*))?$")
+INDEPENDENT_PLATFORM = "platform-independent"
+
 
 
 class ValidationError(ValueError):
@@ -256,14 +263,165 @@ def validate_codex_home_template(root):
             raise ValidationError(f"codex home template must be credential-free, but carries {relative}")
 
 
-def validate_generation(document, generation, platform=None, trusted_team="973L4GV58R", require_installable=False):
+def validate_component(document):
+    """Read a component manifest; builders must measure provides from payload.
+
+    Identity is (component, source_sha, platform, recipe_sha256). The recipe
+    hashes canonical build inputs including toolchain pins and build features;
+    archive_sha256 identifies the installed bytes, not a build cache.
+    """
+    fields = {"schema_version", "kind", "component", "source_sha", "platform",
+              "recipe_sha256", "archive_sha256", "provides", "requires"}
+    if (not isinstance(document, dict) or not fields.issubset(document)
+            or set(document) - fields - {"version"}
+            or type(document.get("schema_version")) is not int or document["schema_version"] != 1
+            or document.get("kind") != "fleet-component"):
+        raise ValidationError("invalid component manifest")
+    name = document["component"]
+    if not isinstance(name, str) or not COMPONENT_PATTERN.fullmatch(name):
+        raise ValidationError("invalid component name")
+    sha = document["source_sha"]
+    if not isinstance(sha, str) or not SHA_PATTERN.fullmatch(sha):
+        raise ValidationError(f"invalid {name} source pin")
+    if document["platform"] not in (*PLATFORMS, INDEPENDENT_PLATFORM):
+        raise ValidationError(f"invalid {name} platform")
+    require_digest(document["recipe_sha256"], f"{name} recipe hash")
+    require_digest(document["archive_sha256"], f"{name} archive digest")
+    if "version" in document and (not isinstance(document["version"], str) or not document["version"].strip()):
+        raise ValidationError(f"invalid {name} version label")
+    for field, pattern in (("provides", FACT_PATTERN), ("requires", REQUIREMENT_PATTERN)):
+        values = document[field]
+        if (not isinstance(values, list) or any(not isinstance(value, str) or not pattern.fullmatch(value) for value in values)
+                or len(values) != len(set(values))):
+            raise ValidationError(f"invalid or duplicate {name} {field}")
+    keys = set()
+    for fact in document["provides"]:
+        key = FACT_PATTERN.fullmatch(fact).group(1)
+        if not key.startswith(name + ":") or key in keys:
+            raise ValidationError(f"foreign or conflicting {name} provides: {fact}")
+        keys.add(key)
+    return document
+
+
+def validate_composition(components, platform):
+    """Refuse missing facts in one platform's validated effective pin set.
+
+    Callers must run validate_component on every pin and refuse duplicate
+    component names. Ownership checks then make fact-key collisions impossible: no other
+    component can provide facts in a pin's namespace.
+    """
+    facts = {}
+    for component in components:
+        for fact in component["provides"]:
+            match = FACT_PATTERN.fullmatch(fact)
+            facts[match.group(1)] = match.group(2)
+    for component in components:
+        for requirement in component["requires"]:
+            key, operator, number = REQUIREMENT_PATTERN.fullmatch(requirement).groups()
+            met = key in facts
+            if operator is not None:
+                measured = facts.get(key)
+                met = measured is not None and (int(measured) >= int(number) if operator == ">=" else int(measured) == int(number))
+            if not met:
+                raise ValidationError(f"{platform}: {component['component']} requires {requirement}, not provided by pinned components")
+
+
+def validate_generation_v2(document, generation, platform=None, require_installable=False):
+    fields = {"schema_version", "kind", "generation", "peer_protocol_version", "signing", "platforms", "platform_independent"}
+    if set(document) != fields:
+        raise ValidationError("invalid v2 generation fields")
+    if document["signing"] != {"scheme": "cms-detached", "signature": "generation.json.cms"}:
+        raise ValidationError("invalid v2 generation signing contract")
+    version = document["peer_protocol_version"]
+    require_size(version, "peer_protocol_version")
+    platforms = document["platforms"]
+    if not isinstance(platforms, dict) or not platforms or not set(platforms).issubset(PLATFORMS):
+        raise ValidationError("invalid v2 platform set")
+    shared = document["platform_independent"]
+    if not isinstance(shared, list):
+        raise ValidationError("invalid platform-independent pin list")
+
+    def pins(values, expected_platform):
+        if not isinstance(values, list):
+            raise ValidationError(f"invalid {expected_platform} pin list")
+        names = set()
+        for value in values:
+            component = validate_component(value)
+            if component["platform"] != expected_platform:
+                raise ValidationError(f"component {component['component']} platform does not match {expected_platform}")
+            if component["component"] in names:
+                raise ValidationError(f"duplicate {expected_platform} component: {component['component']}")
+            names.add(component["component"])
+        return names
+
+    shared_names = pins(shared, INDEPENDENT_PLATFORM)
+    sources = {}
+    for target, entry in platforms.items():
+        if (not isinstance(entry, dict) or set(entry) != {"state", "components"}
+                or not isinstance(entry["state"], str) or entry["state"] not in {"candidate", "installable-internal"}):
+            raise ValidationError(f"invalid {target} composition")
+        names = pins(entry["components"], target)
+        if names & shared_names:
+            raise ValidationError(f"platform-independent component repeated in {target}")
+        effective = entry["components"] + shared
+        if not {"flotilla", "cleat"}.issubset(names) or "skills" not in shared_names:
+            raise ValidationError(f"{target} missing required fleet components")
+        for component in effective:
+            name, sha = component["component"], component["source_sha"]
+            if name in sources and sources[name] != sha:
+                raise ValidationError(f"component {name} source pins differ across platforms")
+            sources[name] = sha
+        validate_composition(effective, target)
+        flotilla = next(component for component in effective if component["component"] == "flotilla")
+        if f"flotilla:protocol={version}" not in flotilla["provides"]:
+            raise ValidationError(f"{target} peer protocol differs from measured flotilla protocol")
+        if require_installable and (platform is None or platform == target) and entry["state"] != "installable-internal":
+            raise ValidationError(f"generation artifact for {target} is not installable")
     identity = GENERATION_PATTERN.fullmatch(generation)
+    if sources["flotilla"][:12] != identity.group(2) or sources["cleat"][:12] != identity.group(3):
+        raise ValidationError("generation identity does not match component pins")
+    if platform is None:
+        return sources, version
+    if platform not in platforms:
+        raise ValidationError(f"generation has no {platform} composition")
+    return sources, version, platforms[platform]
+
+
+def verify_generation_signature(manifest, signature, trusted_certificate):
+    """Verify exact manifest bytes with a caller-pinned CMS signer certificate.
+
+    Structural validation does not establish authenticity. Never trust a
+    certificate shipped by the candidate. Ignore embedded signer certificates
+    and use only the provisioning-owned exact leaf-certificate pin supplied by
+    the caller, not a CA certificate or a chain trust store. -noverify disables
+    chain, validity-period and purpose checks; revocation is not checked either.
+    Expired certificates remain usable for rollback while explicitly provisioned.
+    Withdrawing a signer requires removing its pin from provisioning.
+    """
+    try:
+        result = subprocess.run(
+            ["openssl", "cms", "-verify", "-binary", "-inform", "DER", "-in", str(signature),
+             "-content", str(manifest), "-nointern", "-certfile", str(trusted_certificate),
+             "-noverify", "-out", os.devnull], capture_output=True, text=True)
+    except FileNotFoundError as error:
+        raise ValidationError("OpenSSL CMS verifier is unavailable") from error
+    if result.returncode != 0:
+        raise ValidationError("generation signature does not verify against the trusted certificate")
+
+
+def validate_generation(document, generation, platform=None, trusted_team="973L4GV58R", require_installable=False):
+    identity = GENERATION_PATTERN.fullmatch(generation) if isinstance(generation, str) else None
     if identity is None:
         raise ValidationError("invalid generation id")
-    if not isinstance(document, dict) or document.get("schema_version") != 1 or document.get("kind") != "internal-promoted-fleet-generation":
+    if (not isinstance(document, dict) or type(document.get("schema_version")) is not int
+            or document.get("schema_version") not in {1, 2}
+            or document.get("kind") != "internal-promoted-fleet-generation"):
         raise ValidationError("unsupported generation manifest")
     if document.get("generation") != generation:
         raise ValidationError("generation manifest identity mismatch")
+    if document["schema_version"] == 2:
+        return validate_generation_v2(document, generation, platform, require_installable)
+    # Remove v1 decoding one fleet roll after the dual-published transition.
     sources = require_sources(document.get("sources"))
     if sources["flotilla"][:12] != identity.group(2) or sources["cleat"][:12] != identity.group(3):
         raise ValidationError("generation identity does not match source pins")
@@ -324,6 +482,8 @@ def validate_generation(document, generation, platform=None, trusted_team="973L4
 
 
 def validate_release(root, outer, platform):
+    if outer.get("schema_version") == 2:
+        raise ValidationError("v2 component installation requires the component installer; cannot verify as a v1 bundle")
     root = Path(root)
     manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
@@ -375,6 +535,10 @@ def validate_fixture(path):
     fixture = json.loads(Path(path).read_text())
     document = fixture["manifest"]
     sources, _ = validate_generation(document, fixture["generation"])
+    if document["schema_version"] == 2:
+        # V2 fixtures exercise the pin list, not a monolithic bundle payload.
+        # Component archive verification belongs to the component installer.
+        return
     payload = fixture.get("payload", sorted(REQUIRED_PAYLOAD))
     if not REQUIRED_PAYLOAD.issubset(payload) or any(not allowed_payload(item) for item in payload):
         raise ValidationError("unexpected or missing payload")
@@ -482,6 +646,12 @@ def main():
     generation.add_argument("generation")
     generation.add_argument("platform", nargs="?")
     generation.add_argument("--installable", action="store_true")
+    component = sub.add_parser("component")
+    component.add_argument("manifest")
+    signature = sub.add_parser("verify-signature")
+    signature.add_argument("manifest")
+    signature.add_argument("signature")
+    signature.add_argument("trusted_certificate")
     release = sub.add_parser("release")
     release.add_argument("root")
     release.add_argument("manifest")
@@ -529,6 +699,10 @@ def main():
             validate_codex_home_template(args.root)
         elif args.command == "generation":
             validate_generation(json.loads(Path(args.manifest).read_text()), args.generation, args.platform, require_installable=args.installable)
+        elif args.command == "component":
+            validate_component(json.loads(Path(args.manifest).read_text()))
+        elif args.command == "verify-signature":
+            verify_generation_signature(args.manifest, args.signature, args.trusted_certificate)
         elif args.command == "release":
             validate_release(args.root, json.loads(Path(args.manifest).read_text()), args.platform)
         elif args.command == "package-page":
