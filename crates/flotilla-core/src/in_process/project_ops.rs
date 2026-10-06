@@ -747,7 +747,7 @@ impl ProjectService<'_> {
                     unavailable_source = true;
                     continue;
                 }
-                let snapshot = inspector.charter_snapshot(&binding.source).await?;
+                let snapshot = crate::charter_store::source_read(inspector.charter_snapshot(&binding.source)).await?;
                 let spec = self
                     .resource_backend
                     .including_replicas::<Repository>(&namespace)
@@ -806,7 +806,8 @@ impl ProjectService<'_> {
                     .spec;
                 RepositoryInspection { spec, checkout, transport_url: None, replaces_prior_repository: false }
             };
-            let (mut commit, files) = inspector.operational_entry_files_at(&repository.checkout.path).await?;
+            let (mut commit, files) =
+                crate::charter_store::source_read(inspector.operational_entry_files_at(&repository.checkout.path)).await?;
             if let Some(bootstrap) = bootstrap.filter(|bootstrap| member.repo == bootstrap.repository.key()) {
                 commit.clone_from(&bootstrap.commit);
             }
@@ -1784,10 +1785,20 @@ mod tests {
             operations: &operations,
         };
 
-        assert_eq!(
-            service.project_register(temp.path().to_str().expect("UTF-8 checkout path")).await.expect("register"),
-            ("app".into(), 1)
-        );
+        // #2777 review: exercise bootstrap's handoff to ops materialization
+        // while the fleet writer's namespace critical section contends. A
+        // retained non-reentrant guard must fail this deadline, not hang CI.
+        let fleet_lock = crate::charter_store::authoring_lock("flotilla");
+        let fleet_guard = fleet_lock.lock().await;
+        let (registration, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(service.project_register(temp.path().to_str().expect("UTF-8 checkout path")), async {
+                tokio::task::yield_now().await;
+                drop(fleet_guard);
+            })
+        })
+        .await
+        .expect("bootstrap and fleet authoring must not deadlock");
+        assert_eq!(registration.expect("register"), ("app".into(), 1));
         assert_eq!(operations.identity_resolutions.load(Ordering::SeqCst), 1);
         let project = backend.definitions::<Project>("flotilla").get("app").await.expect("registered project");
         assert_eq!(project.spec.repositories[0].repo, repository_spec.key());

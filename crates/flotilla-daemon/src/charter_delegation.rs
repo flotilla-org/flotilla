@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::resource_manifest::{parse_document_contents, LoadedManifestFile};
 
 pub(crate) const CHARTER_SOURCE: &str = "flotilla.work/charter-source";
+const MAX_REPOSITORY_FETCHES: usize = 32;
 pub(crate) const CHARTER_REVISION: &str = "flotilla.work/charter-revision";
 pub(crate) const CHARTER_SCOPE: &str = "flotilla.work/charter-scope";
 
@@ -95,6 +96,7 @@ pub(crate) async fn expand_registered_charters(
         }
     }
     let mut documents = Vec::<Document>::new();
+    let mut repository_fetches = 0;
     let mut claims = BTreeMap::<(String, String), String>::new();
     let mut registration_fleets = BTreeMap::<String, String>::new();
     let mut registration_catalogs = BTreeMap::<String, BTreeMap<String, ProjectSpec>>::new();
@@ -189,9 +191,15 @@ pub(crate) async fn expand_registered_charters(
                         documents.clone(),
                     ),
                     CharterPointer::Repository { repo, branch, path } => {
+                        if repository_fetches == MAX_REPOSITORY_FETCHES {
+                            return Err(format!("charter expansion exceeds {MAX_REPOSITORY_FETCHES} repository fetches"));
+                        }
+                        repository_fetches += 1;
                         let source = CharterSource::Repository { repo: repo.clone(), branch: branch.clone(), path: path.clone() };
                         (
-                            reader.read(&source).await.map_err(|error| format!("charter scope `{ns}/{project}`: {error}"))?,
+                            flotilla_core::charter_store::source_read(reader.read(&source))
+                                .await
+                                .map_err(|error| format!("charter scope `{ns}/{project}`: {error}"))?,
                             format!("{repo}@{branch}:{path}"),
                             Vec::new(),
                         )
@@ -477,7 +485,10 @@ fn parse_charter_file(path: &str, contents: &str, project: &str, spec: &ProjectS
                 }
             }
         }
-        _ => Ok(Vec::new()),
+        _ => {
+            tracing::debug!(path, project, "ignoring charter file with unrecognized extension");
+            Ok(Vec::new())
+        }
     }
 }
 
@@ -508,6 +519,29 @@ mod tests {
     }
     fn backend() -> ResourceBackend {
         ResourceBackend::InMemory(InMemoryBackend::default())
+    }
+
+    // #2777 review: the fetch budget is independent of the document budget,
+    // and rejects the next fetch before contacting its source.
+    #[tokio::test]
+    async fn repository_fetch_budget_refuses_before_next_read() {
+        let reader = reader(BTreeMap::new());
+        let registrations = (0..=MAX_REPOSITORY_FETCHES)
+            .map(|index| {
+                project(
+                    &format!("app-{index}"),
+                    None,
+                    Some(CharterPointer::Repository {
+                        repo: format!("https://example.test/ops-{index}"),
+                        branch: "main".into(),
+                        path: String::new(),
+                    }),
+                )
+            })
+            .collect();
+        let error = expand(registrations, &backend(), &reader).await.expect_err("fetch budget");
+        assert!(error.contains("32 repository fetches"), "{error}");
+        assert_eq!(reader.reads.lock().expect("reads").len(), MAX_REPOSITORY_FETCHES);
     }
     fn project(name: &str, parent: Option<&str>, charter: Option<CharterPointer>) -> Value {
         let spec = ProjectSpec::builder()

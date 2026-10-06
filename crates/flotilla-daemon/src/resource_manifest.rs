@@ -346,20 +346,25 @@ impl ResourceManifestReconciler {
         };
         let reader =
             crate::charter_delegation::BoundCharterReader { cache: &self.root.with_extension("charter-cache"), vcs: self.vcs.as_deref() };
-        let registered =
-            match crate::charter_delegation::expand_registered_charters(&files, &revision, &self.default_namespace, &self.backend, &reader)
-                .await
-            {
-                Ok(Some(expanded)) => {
-                    files = expanded;
-                    true
-                }
-                Ok(None) => false,
-                Err(error) => {
-                    self.publish_source_failure(&root_resource, &error).await?;
-                    return Err(error);
-                }
-            };
+        let registered = match flotilla_core::charter_store::source_read(crate::charter_delegation::expand_registered_charters(
+            &files,
+            &revision,
+            &self.default_namespace,
+            &self.backend,
+            &reader,
+        ))
+        .await
+        {
+            Ok(Some(expanded)) => {
+                files = expanded;
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                self.publish_source_failure(&root_resource, &error).await?;
+                return Err(error);
+            }
+        };
         if registered {
             for (path, parsed) in &files {
                 for document in parsed.as_ref().map_err(Clone::clone)? {

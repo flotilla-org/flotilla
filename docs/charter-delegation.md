@@ -190,3 +190,5 @@ For an inline/delegated change later, update the single registration pointer and
 move its input documents together, preserving resource identities. Avoid
 introducing concurrent sources. Source disappearance does not prune manifest
 resources; deletions remain explicit lifecycle acts.
+
+Source reads have a 30-second deadline, including injected source readers. A registered charter expansion has the same total deadline and refuses before a 33rd repository fetch; inline documents still count against the 10,000-document budget. Unknown text-file extensions produce a debug log and no resource documents.
