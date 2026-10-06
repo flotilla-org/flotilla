@@ -29,9 +29,6 @@ on:
         type: string
         default: '0.16.0'
 
-permissions:
-  contents: read
-
 concurrency:
   group: crew-image-${{ inputs.codex_version }}-${{ inputs.claude_code_version }}-${{ inputs.tea_version }}-${{ inputs.cleat_ref }}-${{ inputs.zig_version }}
   cancel-in-progress: false
