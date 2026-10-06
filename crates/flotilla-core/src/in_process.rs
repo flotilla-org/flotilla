@@ -5760,17 +5760,10 @@ impl InProcessDaemon {
     async fn execute_action_resource_apply(&self, id: u64, command: &Command) -> Result<u64, String> {
         if let flotilla_protocol::CommandAction::ResourceApply { namespace, document } = &command.action {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            // Artifact puts and creation reservations share one resource version.
-            // Retry optimistic conflicts without replacing authority-owned status.
-            let mut applied = self.apply_intent_document(namespace, document.clone()).await;
-            if document.get("kind").and_then(serde_json::Value::as_str) == Some("Artifact") {
-                for _ in 0..15 {
-                    if !matches!(applied, Err(ResourceError::Conflict { .. })) {
-                        break;
-                    }
-                    applied = self.apply_intent_document(namespace, document.clone()).await;
-                }
-            }
+            // Artifact reservations and Message admission can race status writers.
+            // Both mutations are replay-safe; retain a bounded conflict budget.
+            let kind = document.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
+            let applied = retry_resource_apply(kind, || self.apply_intent_document(namespace, document.clone())).await;
             let result = match applied {
                 Ok(applied) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
                     kind: applied.kind,
@@ -7907,4 +7900,20 @@ async fn request_manifest_resolution(
         }
     }
     Err("ManifestRoot spec conflict retry budget exhausted".to_string())
+}
+
+/// Retry only replay-safe mutations and only optimistic conflicts.
+async fn retry_resource_apply<T, F, Fut>(kind: &str, mut apply: F) -> Result<T, ResourceError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ResourceError>>,
+{
+    let attempts = if matches!(kind, "Artifact" | "Message") { 16 } else { 1 };
+    for attempt in 0..attempts {
+        let result = apply().await;
+        if attempt + 1 == attempts || !matches!(result, Err(ResourceError::Conflict { .. })) {
+            return result;
+        }
+    }
+    unreachable!("retry budget always makes an attempt")
 }

@@ -9989,3 +9989,40 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
         .unwrap_err()
         .contains("undeclared vessel"));
 }
+
+#[tokio::test]
+async fn message_apply_retries_only_conflicts_with_a_finite_budget() {
+    for kind in ["Message", "Artifact"] {
+        let mut attempts = 0;
+        let result = retry_resource_apply(kind, || {
+            attempts += 1;
+            std::future::ready(if attempts < 3 { Err(ResourceError::conflict("message", "concurrent status")) } else { Ok(attempts) })
+        })
+        .await;
+        assert_eq!(result.unwrap(), 3);
+        let mut attempts = 0;
+        let result: Result<(), _> = retry_resource_apply(kind, || {
+            attempts += 1;
+            std::future::ready(Err(ResourceError::conflict("message", "persistent conflict")))
+        })
+        .await;
+        assert!(matches!(result, Err(ResourceError::Conflict { .. })));
+        assert_eq!(attempts, 16);
+        let mut attempts = 0;
+        let result: Result<(), _> = retry_resource_apply(kind, || {
+            attempts += 1;
+            std::future::ready(Err(ResourceError::invalid("invalid intent")))
+        })
+        .await;
+        assert!(matches!(result, Err(ResourceError::Invalid { .. })));
+        assert_eq!(attempts, 1);
+    }
+    let mut attempts = 0;
+    let result: Result<(), _> = retry_resource_apply("Convoy", || {
+        attempts += 1;
+        std::future::ready(Err(ResourceError::conflict("convoy", "no replay contract")))
+    })
+    .await;
+    assert!(result.is_err());
+    assert_eq!(attempts, 1);
+}
