@@ -10,6 +10,9 @@ use crate::{
     Vessel, CONVOY_LABEL, CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 
+/// An ambiguous write whose confirmation deadline elapsed; never retried.
+/// Later consumption evidence can still acknowledge the held message.
+pub const TERMINAL_DELIVERY_EXPIRED_REASON: &str = "DeliveryExpired";
 /// Stored degradation reason shared by writers, controllers and surfaces.
 pub const TERMINAL_DELIVERY_UNCONFIRMED_REASON: &str = "DeliveryUnconfirmed";
 /// An attempt known to have sent no input; safe to retry within its budget.
@@ -384,7 +387,10 @@ impl TerminalSessionDegradedCondition {
     /// Delivery evidence is cleared only by an explicit delivery or lifecycle
     /// transition, never by an unrelated observation or provider recovery.
     pub fn is_delivery(&self) -> bool {
-        matches!(self.reason.as_str(), TERMINAL_DELIVERY_UNCONFIRMED_REASON | TERMINAL_DELIVERY_NOT_SUBMITTED_REASON)
+        matches!(
+            self.reason.as_str(),
+            TERMINAL_DELIVERY_UNCONFIRMED_REASON | TERMINAL_DELIVERY_NOT_SUBMITTED_REASON | TERMINAL_DELIVERY_EXPIRED_REASON
+        )
     }
 }
 
@@ -502,6 +508,7 @@ pub enum TerminalSessionStatusPatch {
     MarkMessageDelivered {
         message_id: String,
     },
+    MarkDeliveryExpired,
     MarkDeliveryNotSubmitted {
         message_id: String,
         message: String,
@@ -584,6 +591,17 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 // A fresh idle observation must follow delivery before stall
                 // supervision treats the agent as having finished this turn.
                 status.attention = None;
+            }
+            Self::MarkDeliveryExpired => {
+                if let Some(condition) =
+                    status.degraded.as_mut().filter(|condition| condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON)
+                {
+                    condition.reason = TERMINAL_DELIVERY_EXPIRED_REASON.to_string();
+                    condition.message =
+                        "message delivery confirmation deadline expired; submission may have been accepted; explicit intervention required"
+                            .to_string();
+                    status.message = Some(condition.message.clone());
+                }
             }
             Self::MarkDeliveryUnconfirmed { message_id, message, observed_at }
             | Self::MarkDeliveryNotSubmitted { message_id, message, observed_at } => {
@@ -714,6 +732,64 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::*;
+
+    // #2755: observations and repeated expiry cannot erase a delivery failure,
+    // reset its deadline, acknowledge the message, or change its attempt count.
+    #[hegel::test]
+    fn delivery_expiry_survives_observation_interleavings(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let at = Utc.with_ymd_and_hms(2026, 10, 6, 0, 0, 0).single().expect("timestamp");
+        let mut status = TerminalSessionStatus::default();
+        TerminalSessionStatusPatch::MarkDeliveryUnconfirmed { message_id: "turn".into(), message: "held".into(), observed_at: at }
+            .apply(&mut status);
+        // Includes no observations, duplicate expiry, every attention state,
+        // both sources, observation errors, and output/tool activity updates.
+        let steps = tc.draw(gs::integers::<usize>().min_value(0).max_value(12));
+        let mut expired = false;
+        for step in 0..steps {
+            let attention = TerminalAttention {
+                state: [
+                    TerminalAttentionState::Idle,
+                    TerminalAttentionState::Working,
+                    TerminalAttentionState::NeedsInput,
+                    TerminalAttentionState::Unobservable,
+                ][tc.draw(gs::integers::<usize>().min_value(0).max_value(3))],
+                source: if tc.draw(gs::booleans()) { TerminalAttentionSource::Hook } else { TerminalAttentionSource::Screen },
+                as_of: at + chrono::Duration::seconds((step as i64 + 1) * 6),
+            };
+            let patch = match tc.draw(gs::integers::<usize>().min_value(0).max_value(4)) {
+                0 => {
+                    expired = true;
+                    TerminalSessionStatusPatch::MarkDeliveryExpired
+                }
+                1 => TerminalSessionStatusPatch::ObserveAttention { attention },
+                2 => TerminalSessionStatusPatch::ObserveToolActivity { attention },
+                3 => TerminalSessionStatusPatch::Observe {
+                    attention: Some(attention),
+                    occupancy: TerminalOccupancy::Vacant,
+                    output_digest: Some(format!("output-{step}")),
+                    observed_at: at,
+                },
+                _ => TerminalSessionStatusPatch::MarkReconcileDegraded {
+                    message: "pool unavailable".into(),
+                    consecutive_failures: 5,
+                    observed_at: at + chrono::Duration::minutes(1),
+                },
+            };
+            patch.apply(&mut status);
+            let condition = status.degraded.as_ref().expect("durable delivery failure");
+            assert!(condition.is_delivery());
+            assert_eq!(condition.reason, if expired { TERMINAL_DELIVERY_EXPIRED_REASON } else { TERMINAL_DELIVERY_UNCONFIRMED_REASON });
+            assert_eq!(condition.observed_at, at);
+            assert_eq!(condition.consecutive_failures, 1);
+            assert_eq!(condition.message_id.as_deref(), Some("turn"));
+            assert!(status.delivered_message_id.is_none());
+        }
+        // Only consumption evidence or an explicit lifecycle transition clears it.
+        TerminalSessionStatusPatch::MarkMessageDelivered { message_id: "turn".into() }.apply(&mut status);
+        assert!(status.degraded.is_none());
+        assert_eq!(status.delivered_message_id.as_deref(), Some("turn"));
+    }
 
     #[test]
     fn previous_generation_message_decodes_and_new_message_writes_queue_shape() {

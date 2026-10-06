@@ -450,3 +450,105 @@ async fn turn_hold_resolves_discovered_pr_without_legacy_binding() {
     let issue = flotilla_protocol::Subject { kind: flotilla_protocol::SubjectKind::Issue, ..subject };
     assert!(turn_hold_subject(&convoy, Some(&issue)).is_err());
 }
+
+// #2755: fresh Idle evidence releases a brief regardless of when it was queued,
+// but a pending terminal turn, delivery failure, or non-running phase blocks it.
+#[hegel::test]
+fn idle_boundary_requires_no_in_flight_turn(tc: hegel::TestCase) {
+    use flotilla_resources::{TerminalAttention, TerminalAttentionSource, TerminalSessionDegradedCondition, TerminalSessionStatus};
+    use hegel::generators as gs;
+    // Cross freshness boundaries and cover all phases/states, missing attention,
+    // empty/acknowledged/pending queues, pending completion, and degradation.
+    let age = tc.draw(gs::integers::<i64>().min_value(0).max_value(121));
+    let phase = [
+        ResourceTerminalSessionPhase::Starting,
+        ResourceTerminalSessionPhase::Running,
+        ResourceTerminalSessionPhase::Stopped,
+        ResourceTerminalSessionPhase::Lost,
+        ResourceTerminalSessionPhase::Failed,
+    ][tc.draw(gs::integers::<usize>().min_value(0).max_value(4))];
+    let state = [
+        TerminalAttentionState::Idle,
+        TerminalAttentionState::Working,
+        TerminalAttentionState::NeedsInput,
+        TerminalAttentionState::Unobservable,
+    ][tc.draw(gs::integers::<usize>().min_value(0).max_value(3))];
+    let observed = tc.draw(gs::booleans());
+    let queued = tc.draw(gs::booleans());
+    let delivered = tc.draw(gs::booleans());
+    let acknowledged = tc.draw(gs::booleans());
+    let degradation = tc.draw(gs::integers::<usize>().min_value(0).max_value(3));
+    let completion_pending = tc.draw(gs::booleans());
+    let now = chrono::DateTime::parse_from_rfc3339("2026-10-06T00:00:00Z").expect("timestamp").with_timezone(&chrono::Utc);
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let mut message = pending_crew_message(CrewMessageSender::Unknown, "brief");
+        message.id = "turn".into();
+        if acknowledged {
+            message.acknowledged.insert("turn".into());
+        }
+        let spec = TerminalSessionSpec::builder()
+            .env_ref("env".into())
+            .role("coder".into())
+            .cwd("/workspace".into())
+            .pool("test".into())
+            .source(TerminalSessionSource::Agent {
+                selector: Selector::for_capability("code"),
+                brief: TerminalBrief { artifact_digest: None, path: "brief.md".into(), content: "brief".into(), copies: Vec::new() },
+                context: Box::new(TerminalCrewContext { namespace: "flotilla".into(), convoy: "crew".into(), vessel_ref: "work".into() }),
+                message: queued.then_some(message),
+            })
+            .build();
+        let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+        let mut session = sessions.create(&InputMeta::builder().name("session".into()).build(), &spec).await.expect("session");
+        session.status = Some(TerminalSessionStatus {
+            phase,
+            attention: observed.then_some(TerminalAttention {
+                state,
+                source: TerminalAttentionSource::Hook,
+                as_of: now - chrono::Duration::seconds(age),
+            }),
+            delivered_message_id: delivered.then(|| "turn".into()),
+            completion_pending: completion_pending.then(|| flotilla_resources::CrewCompletionPending {
+                message: None,
+                disposition: None,
+                decision_ledger_ref: None,
+                force: false,
+                principal_ref: None,
+                attempted_at: now,
+                authority: "host".into(),
+                last_error: "awaiting acknowledgement".into(),
+            }),
+            degraded: (degradation != 0).then(|| TerminalSessionDegradedCondition {
+                reason: ["", "DeliveryUnconfirmed", "DeliveryExpired", "ReconcileBackoff"][degradation].into(),
+                message: "failure".into(),
+                message_id: Some("turn".into()),
+                consecutive_failures: 1,
+                observed_at: now,
+            }),
+            ..Default::default()
+        });
+        let expected = phase == ResourceTerminalSessionPhase::Running
+            && observed
+            && state == TerminalAttentionState::Idle
+            && age < 120
+            && (!queued || delivered || acknowledged)
+            && (degradation == 0 || degradation == 3)
+            && !completion_pending;
+        assert_eq!(terminal_at_turn_boundary(&session, now), expected);
+        // Pin the admitted and pending-turn boundaries in every generated case
+        // so combinations of independent blockers cannot make the oracle vacuous.
+        session.status = Some(TerminalSessionStatus {
+            phase: ResourceTerminalSessionPhase::Running,
+            attention: Some(TerminalAttention { state: TerminalAttentionState::Idle, source: TerminalAttentionSource::Hook, as_of: now }),
+            ..Default::default()
+        });
+        let TerminalSessionSource::Agent { message, .. } = &mut session.spec.source else { unreachable!() };
+        *message = None;
+        assert!(terminal_at_turn_boundary(&session, now));
+        let TerminalSessionSource::Agent { message, .. } = &mut session.spec.source else { unreachable!() };
+        *message = Some(pending_crew_message(CrewMessageSender::Unknown, "next turn"));
+        assert!(!terminal_at_turn_boundary(&session, now), "idle evidence cannot overtake a pending turn");
+    });
+}

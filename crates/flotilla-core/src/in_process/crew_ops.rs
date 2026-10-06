@@ -319,6 +319,22 @@ fn turn_delivery_text(request: &crate::leaf_engine::TurnDeliveryRequest, status:
     }
 }
 
+/// Fresh idle evidence is a boundary only when no submitted or queued turn
+/// still needs acknowledgement. Its timestamp need not postdate a new brief.
+fn terminal_at_turn_boundary(session: &ResourceObject<ResourceTerminalSession>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    session.status.as_ref().is_some_and(|status| {
+        status.phase == ResourceTerminalSessionPhase::Running
+            && status.completion_pending.is_none()
+            && !status.degraded.as_ref().is_some_and(|condition| condition.is_delivery())
+            && status
+                .attention
+                .as_ref()
+                .is_some_and(|attention| attention.state == TerminalAttentionState::Idle && !attention.is_stale_at(now))
+            && !matches!(&session.spec.source, TerminalSessionSource::Agent { message: Some(head), .. }
+                if head.next_after(status.delivered_message_id.as_deref()).is_some())
+    })
+}
+
 fn pending_crew_message(sender: CrewMessageSender, body: &str) -> TerminalCrewMessage {
     TerminalCrewMessage {
         id: uuid::Uuid::new_v4().to_string(),
@@ -1913,16 +1929,11 @@ impl CrewService {
             .await
             .map_err(|err| err.to_string())
             .map(|list| list.items.into_iter().next());
-        // Explicit resume accepts fresh idle evidence. Observation-driven pending
-        // release additionally checks that the observation postdates queued_at.
-        let at_turn_boundary = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
-            session.object.status.as_ref().is_some_and(|status| {
-                status.phase == ResourceTerminalSessionPhase::Running
-                    && status.attention.as_ref().is_some_and(|attention| {
-                        attention.state == TerminalAttentionState::Idle && !attention.is_stale_at(self.clock.now())
-                    })
-            })
-        });
+        let at_turn_boundary = session
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .is_some_and(|session| terminal_at_turn_boundary(&session.object, self.clock.now()));
         let agent_exited = session.as_ref().ok().and_then(Option::as_ref).is_some_and(|session| {
             session.object.status.as_ref().is_some_and(|status| status.phase == ResourceTerminalSessionPhase::Stopped)
         });
@@ -2360,16 +2371,7 @@ impl CrewService {
                         (ROLE_LABEL.to_string(), pending.role.clone()),
                     ]);
                     let visible = visible_sessions.list_matching_labels(&selector).await.map_err(|error| error.to_string())?;
-                    let boundary = visible.items.iter().any(|session| {
-                        session.object.status.as_ref().is_some_and(|status| {
-                            status.phase == ResourceTerminalSessionPhase::Running
-                                && status.attention.as_ref().is_some_and(|attention| {
-                                    attention.state == TerminalAttentionState::Idle
-                                        && !attention.is_stale_at(self.clock.now())
-                                        && attention.as_of > pending.queued_at
-                                })
-                        })
-                    });
+                    let boundary = visible.items.iter().any(|session| terminal_at_turn_boundary(&session.object, self.clock.now()));
                     let attention = visible
                         .items
                         .iter()
@@ -2392,9 +2394,9 @@ impl CrewService {
                         }};
                     }
                     if boundary {
-                        log_pending_decision!(info, "release_fresh_idle_after_queue");
+                        log_pending_decision!(info, "release_fresh_idle_without_in_flight_turn");
                     } else {
-                        log_pending_decision!(debug, "skip_without_fresh_idle_after_queue");
+                        log_pending_decision!(debug, "skip_without_fresh_idle_boundary");
                     }
                     if boundary {
                         if let Err(error) = self
