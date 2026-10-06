@@ -166,6 +166,7 @@ pub struct TerminalSessionReconciler<R> {
     environments: TypedResolver<Environment>,
     vessels: TypedResolver<Vessel>,
     demands: TypedResolver<Demand>,
+    messages: TypedResolver<flotilla_resources::Message>,
     local_host_ref: Option<CanonicalHostId>,
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
 }
@@ -179,6 +180,7 @@ impl<R> TerminalSessionReconciler<R> {
             federated_convoys: None,
             environments: backend.clone().using::<Environment>(namespace),
             vessels: backend.clone().using::<Vessel>(namespace),
+            messages: backend.clone().using::<flotilla_resources::Message>(namespace),
             demands: backend.using::<Demand>(namespace),
             local_host_ref: None,
             additional_host_refs: Default::default(),
@@ -485,6 +487,31 @@ where
             }
             if let flotilla_resources::TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
                 if let Some(message) = head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
+                    // A durable Message submission owns this incarnation's
+                    // transport until its receipt resolves, including restart.
+                    let message_in_flight = self.messages.list().await?.items.iter().any(|message| {
+                        message.status.as_ref().is_some_and(|status| {
+                            !status.phase.is_terminal()
+                                && status.resolved_receiver.is_none()
+                                && status.submission.as_ref().is_some_and(|submission| {
+                                    submission.session == session_id
+                                        && obj
+                                            .status
+                                            .as_ref()
+                                            .and_then(|status| status.crew.as_ref())
+                                            .is_some_and(|crew| crew.id == submission.crew_id)
+                                })
+                        })
+                    });
+                    if message_in_flight {
+                        return self
+                            .runtime
+                            .observe_attention(session_id, &obj.spec)
+                            .await
+                            .map(|observation| observation.map_or(TerminalPrepared::MessageDeliveryPending, TerminalPrepared::Attention))
+                            .map_err(ResourceError::other);
+                    }
+
                     if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
                         condition.message_id.as_deref() == Some(message.id.as_str())
                             && (condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON

@@ -22,6 +22,9 @@ impl Resource for Message {
         if spec.interrupting && spec.relation != MessageRelation::Supervisor {
             return Err(ResourceError::invalid("only supervisor messages may interrupt an active turn"));
         }
+        if let MessageExpectation::Outcome { condition } = &spec.expectation {
+            crate::admit_leaf(condition).map_err(ResourceError::invalid)?;
+        }
         if spec.subject.as_ref().is_some_and(|subject| !spec.references.contains(subject)) {
             return Err(ResourceError::invalid("message subject must be one of its references"));
         }
@@ -57,6 +60,9 @@ impl Resource for Message {
             return Err(ResourceError::invalid("canonical suppression requires a superseded Message reference"));
         }
         if let Some(current) = current {
+            if current.accepted_sequence.is_some() && current.accepted_sequence != requested.accepted_sequence {
+                return Err(ResourceError::invalid("message acceptance order cannot change"));
+            }
             if current.phase.is_terminal() && current != requested {
                 return Err(ResourceError::invalid("terminal message status is immutable"));
             }
@@ -173,6 +179,8 @@ pub struct ResolvedMessageReceiver {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct MessageStatus {
     pub phase: MessagePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_sequence: Option<u64>,
     pub since: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -193,6 +201,7 @@ impl Default for MessageStatus {
     fn default() -> Self {
         Self {
             phase: MessagePhase::Accepted,
+            accepted_sequence: None,
             // An absent status has no evidence timestamp. Writers provide their clock.
             since: DateTime::<Utc>::UNIX_EPOCH,
             reason: Some("waiting for receiver resolution".into()),
@@ -210,6 +219,13 @@ pub struct MessageSubmission {
     pub crew_id: String,
     pub session: String,
     pub started_at: DateTime<Utc>,
+    #[serde(default)]
+    #[builder(default)]
+    pub members: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_since: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

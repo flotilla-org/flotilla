@@ -5727,7 +5727,11 @@ impl InProcessDaemon {
             .lock()
             .await
             .entry(namespace.to_string())
-            .or_insert_with(|| flotilla_resources::MessageInbox::new(self.resource_backend.clone(), namespace))
+            .or_insert_with(|| {
+                let (change_request, issue) = self.crew_ops.message_observation_staleness();
+                flotilla_resources::MessageInbox::new(self.resource_backend.clone(), namespace)
+                    .with_observation_staleness(change_request, issue)
+            })
             .clone()
     }
 

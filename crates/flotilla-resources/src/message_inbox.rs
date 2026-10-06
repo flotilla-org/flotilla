@@ -81,13 +81,30 @@ pub enum MessageAdmission {
 /// Namespace inboxes live for the daemon lifetime and are reused by mutations.
 #[derive(Debug, Clone)]
 pub struct MessageInbox {
-    messages: TypedResolver<Message>,
-    admission: Arc<Mutex<()>>,
+    pub(crate) backend: ResourceBackend,
+    pub(crate) namespace: String,
+    pub(crate) change_request_stale_after: std::time::Duration,
+    pub(crate) issue_stale_after: std::time::Duration,
+    pub(crate) messages: TypedResolver<Message>,
+    pub(crate) admission: Arc<Mutex<()>>,
 }
 
 impl MessageInbox {
     pub fn new(backend: ResourceBackend, namespace: &str) -> Self {
-        Self { messages: backend.using::<Message>(namespace), admission: Arc::new(Mutex::new(())) }
+        Self {
+            messages: backend.using::<Message>(namespace),
+            backend,
+            namespace: namespace.into(),
+            admission: Arc::new(Mutex::new(())),
+            change_request_stale_after: std::time::Duration::from_secs(300),
+            issue_stale_after: std::time::Duration::from_secs(300),
+        }
+    }
+
+    pub fn with_observation_staleness(mut self, change_request: std::time::Duration, issue: std::time::Duration) -> Self {
+        self.change_request_stale_after = change_request;
+        self.issue_stale_after = issue;
+        self
     }
 
     /// Qualify relative addresses with the sender's explicit creation context.
@@ -108,6 +125,16 @@ impl MessageInbox {
     /// qualified sender supplies context for a relative receiver.
     pub async fn accept(&self, meta: &InputMeta, spec: &MessageSpec, now: DateTime<Utc>) -> Result<MessageAdmission, ResourceError> {
         let _guard = self.admission.lock().await;
+        self.accept_locked(meta, spec, now).await
+    }
+
+    // Recovery during reconciliation already owns the shared admission lock.
+    pub(crate) async fn accept_locked(
+        &self,
+        meta: &InputMeta,
+        spec: &MessageSpec,
+        now: DateTime<Utc>,
+    ) -> Result<MessageAdmission, ResourceError> {
         Message::validate_spec(meta, spec)?;
         let partial = match self.messages.get(&meta.name).await {
             Ok(existing) if existing.spec == *spec => {
@@ -168,7 +195,10 @@ impl MessageInbox {
         };
         for predecessor in predecessors {
             let phase = predecessor.status.as_ref().map_or(MessagePhase::Accepted, |status| status.phase);
-            if !phase.has_delivery_evidence() && !phase.is_terminal() {
+            if !phase.has_delivery_evidence()
+                && !phase.is_terminal()
+                && predecessor.status.as_ref().is_none_or(|status| status.submission.is_none())
+            {
                 apply_status_patch(&self.messages, &predecessor.metadata.name, &MessageStatusPatch::Finish {
                     phase: MessagePhase::Superseded,
                     reason: format!("replaced by {}", message.metadata.name),
@@ -180,6 +210,13 @@ impl MessageInbox {
         let status = crate::MessageStatus::builder()
             .phase(MessagePhase::Accepted)
             .since(message.metadata.creation_timestamp)
+            .accepted_sequence(
+                message
+                    .metadata
+                    .resource_version
+                    .parse()
+                    .map_err(|_| ResourceError::invalid("message creation version must be an ordered integer"))?,
+            )
             .reason("waiting for receiver resolution".into())
             .build();
         let message = self.messages.update_status(&meta.name, &message.metadata.resource_version, &status).await?;

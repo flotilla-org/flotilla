@@ -44,7 +44,7 @@ fn message_stored_shape_round_trips(tc: hegel::TestCase) {
     let expectation = match tc.draw(gs::integers::<u8>().min_value(0).max_value(2)) {
         0 => MessageExpectation::None,
         1 => MessageExpectation::Reply,
-        _ => MessageExpectation::Outcome { condition: "convoy/work .phase == Landed".parse().expect("leaf") },
+        _ => MessageExpectation::Outcome { condition: "convoy/work .status.phase == Landed".parse().expect("leaf") },
     };
     let phases = [
         MessagePhase::Accepted,
@@ -538,4 +538,401 @@ async fn four_part_addresses_select_the_role_within_a_shared_vessel() {
         assert_eq!(receiver.object.metadata.name, role);
     }
     assert!(resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/work/absent").await.unwrap().is_none());
+}
+
+// Boundary fake for terminal submission and externally observed acceptance.
+struct FakeMessageTransport {
+    submissions: std::sync::Mutex<Vec<String>>,
+    observations: std::sync::atomic::AtomicUsize,
+    outcome: flotilla_resources::MessageTransportOutcome,
+    accepted: std::sync::atomic::AtomicBool,
+    working: std::sync::atomic::AtomicBool,
+}
+#[async_trait::async_trait]
+impl flotilla_resources::MessageTransport for FakeMessageTransport {
+    async fn observe(
+        &self,
+        _: &flotilla_resources::ResourceObject<flotilla_resources::TerminalSession>,
+        _: Option<&flotilla_resources::MessageSubmission>,
+    ) -> Result<flotilla_resources::MessageObservation, String> {
+        self.observations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(flotilla_resources::MessageObservation {
+            ready: true,
+            working: self.working.load(std::sync::atomic::Ordering::SeqCst),
+            evidence: self.accepted.load(std::sync::atomic::Ordering::SeqCst).then(|| "later hook receipt".into()),
+            ..Default::default()
+        })
+    }
+    async fn submit(&self, batch: &flotilla_resources::MessageBatch) -> flotilla_resources::MessageTransportOutcome {
+        self.submissions.lock().expect("submissions").push(batch.text.clone());
+        self.outcome.clone()
+    }
+    async fn poll(&self, _: &flotilla_resources::MessageBatch) -> flotilla_resources::MessageTransportOutcome {
+        self.outcome.clone()
+    }
+}
+async fn delivery_inbox() -> (ResourceBackend, flotilla_resources::MessageInbox) {
+    use flotilla_resources::*;
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    backend
+        .using::<Convoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("convoy".into()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build(),
+        )
+        .await
+        .expect("convoy");
+    let terminals = backend.using::<TerminalSession>("flotilla");
+    let holder = terminals
+        .create(
+            &InputMeta::builder()
+                .name("terminal".into())
+                .labels(std::collections::BTreeMap::from([
+                    (CONVOY_LABEL.into(), "convoy".into()),
+                    (ROLE_LABEL.into(), "coder".into()),
+                    (VESSEL_LABEL.into(), "work".into()),
+                ]))
+                .build(),
+            &holder_spec("convoy"),
+        )
+        .await
+        .expect("holder");
+    terminals
+        .update_status("terminal", &holder.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            session_id: Some("session".into()),
+            crew: Some(CrewSessionStatus { id: "crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
+            ..Default::default()
+        })
+        .await
+        .expect("running");
+    let inbox = MessageInbox::new(backend.clone(), "flotilla");
+    for index in 0..3 {
+        let mut intent = spec(None, MessageExpectation::None);
+        intent.body = format!("body-{index}");
+        inbox.accept(&InputMeta::builder().name(format!("message-{index}")).build(), &intent, at(10)).await.expect("message");
+    }
+    (backend, inbox)
+}
+
+// Messages at one turn boundary form one FIFO batch. A held submission keeps
+// observing and later evidence resolves it without typing again, even on restart.
+#[tokio::test]
+async fn delivery_batches_fifo_and_held_batches_resolve_without_retyping() {
+    use std::sync::atomic::Ordering;
+    let (backend, inbox) = delivery_inbox().await;
+    let transport = FakeMessageTransport {
+        submissions: Default::default(),
+        observations: Default::default(),
+        outcome: flotilla_resources::MessageTransportOutcome::Unconfirmed { reason: "acceptance not yet observed".into() },
+        accepted: Default::default(),
+        working: Default::default(),
+    };
+    inbox.reconcile_delivery(&transport, at(20)).await.expect("submit");
+    // Reconstruct the inbox as on restart: the durable submission still forbids retyping.
+    let restarted = flotilla_resources::MessageInbox::new(backend.clone(), "flotilla");
+    restarted.reconcile_delivery(&transport, at(21)).await.expect("held observation");
+    assert_eq!(transport.submissions.lock().expect("submissions").len(), 1);
+    let text = transport.submissions.lock().expect("submissions")[0].clone();
+    assert!(text.find("body-0").unwrap() < text.find("body-1").unwrap());
+    assert!(text.find("body-1").unwrap() < text.find("body-2").unwrap());
+    assert_eq!(backend.using::<flotilla_resources::Demand>("flotilla").list().await.expect("demands").items.len(), 1);
+    transport.accepted.store(true, Ordering::SeqCst);
+    restarted.reconcile_delivery(&transport, at(22)).await.expect("later evidence");
+    assert_eq!(transport.observations.load(Ordering::SeqCst), 3);
+    assert_eq!(transport.submissions.lock().expect("submissions").len(), 1);
+    assert!(backend.using::<Message>("flotilla").list().await.expect("messages").items.iter().all(|message| message
+        .status
+        .as_ref()
+        .expect("status")
+        .phase
+        == MessagePhase::Delivered));
+    assert!(backend.using::<flotilla_resources::Demand>("flotilla").list().await.expect("demands").items.is_empty());
+}
+
+// Definitely unsent input backs off between counted attempts and stops at
+// the durable budget; stopping retries does not stop attention observations.
+#[tokio::test]
+async fn genuinely_unsent_batches_back_off_and_stop_after_three_attempts() {
+    let (backend, inbox) = delivery_inbox().await;
+    let transport = FakeMessageTransport {
+        submissions: Default::default(),
+        observations: Default::default(),
+        outcome: flotilla_resources::MessageTransportOutcome::NotSubmitted { reason: "pool unavailable before typing".into() },
+        accepted: Default::default(),
+        working: Default::default(),
+    };
+    for second in [20, 21, 25, 26, 35, 100] {
+        inbox.reconcile_delivery(&transport, at(second)).await.expect("reconcile");
+    }
+    assert_eq!(transport.submissions.lock().expect("submissions").len(), 3);
+    assert_eq!(transport.observations.load(std::sync::atomic::Ordering::SeqCst), 6);
+    for message in backend.using::<Message>("flotilla").list().await.expect("messages").items {
+        let retry = message.status.expect("status").retry.expect("retry");
+        assert_eq!(retry.attempts, 3);
+        assert!(matches!(retry.disposition, flotilla_resources::ControllerRetryDisposition::Terminal { .. }));
+    }
+}
+
+// Delivery leaves reply/outcome expectations open. A correlated durable reply
+// or a true admitted Leaf closes them, while unknown outcome evidence waits.
+#[tokio::test]
+async fn delivered_expectations_settle_from_reply_and_outcome_evidence() {
+    use flotilla_resources::{Convoy, ConvoyPhase, ConvoyStatus, MessageTransportOutcome};
+    let (backend, inbox) = delivery_inbox().await;
+    for (name, expectation) in [
+        ("reply-request", MessageExpectation::Reply),
+        ("outcome-request", MessageExpectation::Outcome { condition: "convoy/convoy .status.phase == Active".parse().expect("condition") }),
+    ] {
+        inbox.accept(&InputMeta::builder().name(name.into()).build(), &spec(None, expectation), at(11)).await.expect("expectation");
+    }
+    let transport = FakeMessageTransport {
+        submissions: Default::default(),
+        observations: Default::default(),
+        outcome: MessageTransportOutcome::Accepted { evidence: "accepted by holder".into() },
+        accepted: Default::default(),
+        working: Default::default(),
+    };
+    inbox.reconcile_delivery(&transport, at(20)).await.expect("deliver");
+    inbox.reconcile_delivery(&transport, at(21)).await.expect("unknown outcome");
+    let messages = backend.using::<Message>("flotilla");
+    assert_eq!(messages.get("outcome-request").await.expect("outcome").status.expect("status").phase, MessagePhase::Delivered);
+    let mut reply = spec(None, MessageExpectation::None);
+    std::mem::swap(&mut reply.sender, &mut reply.receiver);
+    reply.in_reply_to = Some("reply-request".into());
+    inbox.accept(&InputMeta::builder().name("reply".into()).build(), &reply, at(22)).await.expect("reply");
+    let convoys = backend.using::<Convoy>("flotilla");
+    let convoy = convoys.get("convoy").await.expect("convoy");
+    convoys
+        .update_status("convoy", &convoy.metadata.resource_version, &ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() })
+        .await
+        .expect("active evidence");
+    inbox.reconcile_delivery(&transport, at(23)).await.expect("settle");
+    assert_eq!(messages.get("outcome-request").await.expect("outcome").status.expect("status").phase, MessagePhase::OutcomeMet);
+    assert_eq!(messages.get("reply-request").await.expect("reply").status.expect("status").phase, MessagePhase::Answered);
+}
+
+// A single Working observation can be a redraw flicker. Only sustained
+// post-submission Working evidence confirms a pending batch.
+#[tokio::test]
+async fn working_flicker_does_not_establish_delivery() {
+    use std::sync::atomic::Ordering;
+    let (backend, inbox) = delivery_inbox().await;
+    let transport = FakeMessageTransport {
+        submissions: Default::default(),
+        observations: Default::default(),
+        outcome: flotilla_resources::MessageTransportOutcome::Pending,
+        accepted: Default::default(),
+        working: Default::default(),
+    };
+    inbox.reconcile_delivery(&transport, at(20)).await.expect("submit");
+    for (second, working) in [(21, true), (22, false), (23, true)] {
+        transport.working.store(working, Ordering::SeqCst);
+        inbox.reconcile_delivery(&transport, at(second)).await.expect("observe flicker");
+        assert!(backend.using::<Message>("flotilla").list().await.expect("messages").items.iter().all(|message| message
+            .status
+            .as_ref()
+            .expect("status")
+            .phase
+            == MessagePhase::Deliverable));
+    }
+    inbox.reconcile_delivery(&transport, at(24)).await.expect("stable working");
+    assert!(backend.using::<Message>("flotilla").list().await.expect("messages").items.iter().all(|message| message
+        .status
+        .as_ref()
+        .expect("status")
+        .phase
+        == MessagePhase::Delivered));
+    assert_eq!(transport.submissions.lock().expect("submissions").len(), 1);
+}
+
+// An uncertain submission cannot be superseded as definitely undelivered.
+// Queue its successor behind the recorded batch; later delivery either opens
+// an expectation and suppresses the successor, or permits its independent turn.
+#[tokio::test]
+async fn same_subject_successor_waits_for_uncertain_predecessor_acceptance() {
+    use std::sync::atomic::Ordering;
+
+    use flotilla_resources::{MessageAdmission, MessageTransportOutcome};
+    for expectation in [MessageExpectation::None, MessageExpectation::Reply] {
+        let (backend, inbox) = delivery_inbox().await;
+        let original = spec(
+            Some(MessageReference::ChangeRequest {
+                service: "github.com".into(),
+                scope: "org/repo".into(),
+                number: 1,
+                revision: "head".into(),
+            }),
+            expectation.clone(),
+        );
+        inbox.accept(&InputMeta::builder().name("original".into()).build(), &original, at(11)).await.expect("original");
+        let transport = FakeMessageTransport {
+            submissions: Default::default(),
+            observations: Default::default(),
+            outcome: MessageTransportOutcome::Unconfirmed { reason: "possible submission".into() },
+            accepted: Default::default(),
+            working: Default::default(),
+        };
+        inbox.reconcile_delivery(&transport, at(20)).await.expect("possible input");
+        let mut successor = original.clone();
+        successor.body = "newer body".into();
+        assert!(matches!(
+            inbox
+                .accept(&InputMeta::builder().name("successor".into()).build(), &successor, at(21))
+                .await
+                .expect("successor intent retained"),
+            MessageAdmission::Accepted(_)
+        ));
+        inbox.reconcile_delivery(&transport, at(21)).await.expect("held pass");
+        let messages = backend.using::<Message>("flotilla");
+        assert_eq!(messages.get("original").await.expect("original").status.expect("status").phase, MessagePhase::Deliverable);
+        assert!(messages
+            .get("successor")
+            .await
+            .expect("successor")
+            .status
+            .expect("status")
+            .reason
+            .expect("waiting reason")
+            .starts_with("waiting behind recorded batch"));
+        assert_eq!(transport.submissions.lock().expect("submissions").len(), 1);
+        transport.accepted.store(true, Ordering::SeqCst);
+        inbox.reconcile_delivery(&transport, at(22)).await.expect("late receipt");
+        inbox.reconcile_delivery(&transport, at(23)).await.expect("successor disposition");
+        if expectation == MessageExpectation::Reply {
+            assert_eq!(messages.get("successor").await.expect("successor").status.expect("status").phase, MessagePhase::Superseded);
+            assert_eq!(transport.submissions.lock().expect("submissions").len(), 1);
+        } else {
+            assert_eq!(transport.submissions.lock().expect("submissions").len(), 2);
+            assert!(transport.submissions.lock().expect("submissions")[1].contains("newer body"));
+        }
+    }
+}
+
+// Recovery finishes an interrupted admission before batch selection, so its
+// superseded predecessor never becomes a second terminal input after restart.
+#[tokio::test]
+async fn delivery_repairs_interrupted_admission_before_transport() {
+    use flotilla_resources::{MessageInbox, MessageTransportOutcome};
+    let (backend, inbox) = delivery_inbox().await;
+    let messages = backend.using::<Message>("flotilla");
+    for message in messages.list().await.unwrap().items {
+        messages.delete(&message.metadata.name).await.unwrap();
+    }
+    let mut original = spec(
+        Some(MessageReference::ChangeRequest { service: "github".into(), scope: "owner/repo".into(), number: 1, revision: "head".into() }),
+        MessageExpectation::None,
+    );
+    original.body = "older payload".into();
+    inbox.accept(&InputMeta::builder().name("old".into()).build(), &original, at(10)).await.unwrap();
+    original.body = "recovered payload".into();
+    messages.create(&InputMeta::builder().name("partial".into()).build(), &original).await.unwrap();
+    let restarted = MessageInbox::new(backend, "flotilla");
+    let transport = FakeMessageTransport {
+        submissions: Default::default(),
+        observations: Default::default(),
+        outcome: MessageTransportOutcome::Accepted { evidence: "receipt".into() },
+        accepted: Default::default(),
+        working: Default::default(),
+    };
+    restarted.reconcile_delivery(&transport, at(20)).await.unwrap();
+    {
+        let inputs = transport.submissions.lock().unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs[0].contains("recovered payload"));
+        assert!(!inputs[0].contains("older payload"));
+    }
+    assert_eq!(messages.get("old").await.unwrap().status.unwrap().phase, MessagePhase::Superseded);
+    assert_eq!(messages.get("partial").await.unwrap().status.unwrap().phase, MessagePhase::Delivered);
+}
+
+// A deadline can close an unanswered known delivery, but cannot erase possible
+// input. A notification already accepted remains satisfied past its deadline.
+#[tokio::test]
+async fn deadlines_preserve_acceptance_and_unresolved_submission() {
+    use flotilla_resources::*;
+    for (name, expectation, expected) in [
+        ("notification", MessageExpectation::None, MessagePhase::Satisfied),
+        ("reply", MessageExpectation::Reply, MessagePhase::Expired),
+        ("uncertain", MessageExpectation::Reply, MessagePhase::Deliverable),
+    ] {
+        let (backend, inbox) = delivery_inbox().await;
+        let messages = backend.using::<Message>("flotilla");
+        for record in messages.list().await.unwrap().items {
+            messages.delete(&record.metadata.name).await.unwrap();
+        }
+        let transport = FakeMessageTransport {
+            submissions: Default::default(),
+            observations: Default::default(),
+            outcome: MessageTransportOutcome::Unconfirmed { reason: "possible input".into() },
+            accepted: Default::default(),
+            working: Default::default(),
+        };
+        let mut intent = spec(None, expectation);
+        intent.deadline = Some(at(25));
+        inbox.accept(&InputMeta::builder().name(name.into()).build(), &intent, at(10)).await.unwrap();
+        inbox.reconcile_delivery(&transport, at(20)).await.unwrap();
+        if name != "uncertain" {
+            apply_status_patch(&messages, name, &MessageStatusPatch::Delivered {
+                receiver: ResolvedMessageReceiver::builder()
+                    .crew_id("crew".into())
+                    .session("session".into())
+                    .delivered_at(at(21))
+                    .evidence("later transport receipt".into())
+                    .build(),
+                at: at(21),
+            })
+            .await
+            .unwrap();
+        }
+        inbox.reconcile_delivery(&transport, at(30)).await.unwrap();
+        let status = messages.get(name).await.unwrap().status.unwrap();
+        assert_eq!(status.phase, expected);
+        assert_eq!(status.resolved_receiver.is_some(), name != "uncertain");
+        assert!(status.submission.is_some(), "the original batch identity survives deadline handling");
+        assert_eq!(transport.submissions.lock().unwrap().len(), 1);
+    }
+}
+
+// Records accepted by A lack the optional delivery sequence introduced in B.
+// Updating their status must not place their original intent behind new input.
+#[tokio::test]
+async fn older_admissions_without_sequence_keep_creation_order() {
+    let (backend, inbox) = delivery_inbox().await;
+    let messages = backend.using::<Message>("flotilla");
+    for record in messages.list().await.unwrap().items {
+        messages.delete(&record.metadata.name).await.unwrap();
+    }
+    let mut intent = spec(None, MessageExpectation::None);
+    intent.body = "body-0".into();
+    let older = messages.create(&InputMeta::builder().name("older".into()).build(), &intent).await.unwrap();
+    // This is A's stored accepted shape, not a mutation of B's immutable sequence.
+    messages
+        .update_status(
+            "older",
+            &older.metadata.resource_version,
+            &MessageStatus::builder()
+                .phase(MessagePhase::Accepted)
+                .since(older.metadata.creation_timestamp)
+                .reason("waiting for receiver resolution".into())
+                .build(),
+        )
+        .await
+        .unwrap();
+    for index in 1..3 {
+        intent.body = format!("body-{index}");
+        inbox.accept(&InputMeta::builder().name(format!("newer-{index}")).build(), &intent, at(10)).await.unwrap();
+    }
+    let transport = FakeMessageTransport {
+        submissions: Default::default(),
+        observations: Default::default(),
+        outcome: flotilla_resources::MessageTransportOutcome::Unconfirmed { reason: "uncertain input".into() },
+        accepted: Default::default(),
+        working: Default::default(),
+    };
+    inbox.reconcile_delivery(&transport, at(20)).await.unwrap();
+    let inputs = transport.submissions.lock().unwrap();
+    assert_eq!(inputs.len(), 1);
+    assert!(inputs[0].find("body-0").unwrap() < inputs[0].find("body-1").unwrap());
+    assert!(inputs[0].find("body-1").unwrap() < inputs[0].find("body-2").unwrap());
 }
