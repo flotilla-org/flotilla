@@ -6,6 +6,10 @@ stored values, including bare host IDs in references. Display names never
 replace references inside resource JSON. Use `--json` when consuming these
 commands from a script.
 
+For an ID-to-name lookup, run `flotilla resource list host --include-replicas --json`.
+Each Host record pairs `metadata.name` (the host ID) with `spec.display_name`.
+`flotilla host list` provides the named fleet-health overview.
+
 To edit a resource, copy the record's `object` with its `apiVersion`, `kind`,
 `metadata.name`, `metadata.namespace`, and full `spec` into an apply document.
 Change the intended spec fields and run `flotilla resource apply -f doc.json`.

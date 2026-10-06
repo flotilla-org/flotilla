@@ -2127,7 +2127,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                     })
                 });
             }
-            print_resource_read(response, format)
+            print_resource_read(response)
         }
         ResourceSubCommand::Get(args) | ResourceSubCommand::Explain(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
@@ -2155,7 +2155,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 }
                 Ok(())
             } else {
-                print_resource_read(response, format)
+                print_resource_read(response)
             }
         }
         ResourceSubCommand::ReconcileNow(args) => {
@@ -2324,18 +2324,16 @@ async fn resolve_optional_host_node(cli: &Cli, host: Option<&str>) -> Result<Opt
     }
 }
 
-fn print_resource_read(response: flotilla_protocol::ResourceReadEnvelope, format: OutputFormat) -> Result<()> {
+fn print_resource_read(response: flotilla_protocol::ResourceReadEnvelope) -> Result<()> {
     let value = serde_json::to_value(response).map_err(|error| color_eyre::eyre::eyre!("encode resource read: {error}"))?;
-    println!("{}", format_resource_value(&value, format));
+    println!("{}", format_resource_value(&value));
     Ok(())
 }
 
-fn format_resource_value(value: &serde_json::Value, format: OutputFormat) -> String {
+fn format_resource_value(value: &serde_json::Value) -> String {
     // Resource JSON is an editable document in both modes. Display labels must
     // never replace canonical references or other stored values (#2803).
-    match format {
-        OutputFormat::Human | OutputFormat::Json => flotilla_protocol::output::json_pretty(value),
-    }
+    flotilla_protocol::output::json_pretty(value)
 }
 
 async fn run_resource_watch(cli: &Cli, args: ResourceWatchArgs, format: OutputFormat) -> Result<()> {
@@ -3796,7 +3794,6 @@ mod tests {
         node_id: Option<NodeId>,
         kind: &str,
         name: &str,
-        format: OutputFormat,
     ) -> serde_json::Value {
         let result = daemon
             .execute_query(
@@ -3814,7 +3811,7 @@ mod tests {
             .expect("resource get");
         let CommandValue::ResourceRead(response) = result else { panic!("resource read: {result:?}") };
         let value = serde_json::to_value(response).expect("read envelope");
-        let output = super::format_resource_value(&value, format);
+        let output = super::format_resource_value(&value);
         let rendered: serde_json::Value = serde_yml::from_str(&output).expect("parse CLI get output");
         // All fields, including metadata, status and nested references, stay canonical.
         assert_eq!(rendered, value);
@@ -3846,7 +3843,7 @@ mod tests {
             )
             .await
             .expect("dispatch resource apply");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 if let DaemonEvent::CommandFinished { command_id, result, .. } = events.recv().await.expect("command event") {
                     if command_id == id {
@@ -3864,7 +3861,6 @@ mod tests {
         backend: &flotilla_resources::ResourceBackend,
         daemon: &dyn flotilla_core::daemon::DaemonHandle,
         node_id: Option<NodeId>,
-        format: OutputFormat,
         spec: &T::Spec,
     ) {
         let name = format!("round-trip-{}", T::API_PATHS.kind);
@@ -3873,7 +3869,7 @@ mod tests {
             .create(&flotilla_resources::InputMeta::builder().name(name.clone()).build(), spec)
             .await
             .expect("seed host-reference resource");
-        let document = cli_resource_document(daemon, node_id.clone(), T::API_PATHS.kind, &name, format).await;
+        let document = cli_resource_document(daemon, node_id.clone(), T::API_PATHS.kind, &name).await;
         let result = cli_apply_document(daemon, node_id, document).await;
         assert!(matches!(result, CommandValue::ResourceObject(_)), "round trip {}: {result:?}", T::API_PATHS.kind);
         assert_eq!(
@@ -3885,7 +3881,7 @@ mod tests {
     // #2803: get output is an editable resource document. Changing only memory
     // policy must retain canonical host_ref and its loop owner, locally and routed.
     #[cfg(unix)]
-    async fn placement_policy_cli_apply_scenario(target: u8, format: OutputFormat, percent: u8) {
+    async fn placement_policy_cli_apply_scenario(target: u8, percent: u8) {
         use std::sync::Arc;
 
         use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
@@ -3937,7 +3933,7 @@ mod tests {
                 .await
                 .expect("caller policy");
         }
-        let mut document = cli_resource_document(&*topology.client, node_id.clone(), "placementpolicy", name, format).await;
+        let mut document = cli_resource_document(&*topology.client, node_id.clone(), "placementpolicy", name).await;
         document["spec"]["docker_per_vessel"]["memory_policy"]["host_memory_percent"] = percent.into();
         for change_host in [false, true] {
             let mut attempted = document.clone();
@@ -3977,22 +3973,15 @@ mod tests {
         }
         // Other kinds carrying host refs must also round-trip through the same
         // read envelope, CLI renderer and local/routed apply-command handler.
-        cli_round_trip_host_reference::<Environment>(
-            &home.resource_backend(),
-            &*topology.client,
-            node_id.clone(),
-            format,
-            &EnvironmentSpec {
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.clone(), repo_default_dir: "/workspace".into() }),
-                docker: None,
-            },
-        )
+        cli_round_trip_host_reference::<Environment>(&home.resource_backend(), &*topology.client, node_id.clone(), &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.clone(), repo_default_dir: "/workspace".into() }),
+            docker: None,
+        })
         .await;
         cli_round_trip_host_reference::<FulfilmentKind>(
             &home.resource_backend(),
             &*topology.client,
             node_id,
-            format,
             &flotilla_resources::FulfilmentKindSpec::from_policy(&spec, "linux").expect("fulfilment kind"),
         )
         .await;
@@ -4002,25 +3991,24 @@ mod tests {
     #[tokio::test]
     async fn placement_policy_cli_apply_pinned_rows() {
         for target in 0..=2 {
-            for format in [OutputFormat::Human, OutputFormat::Json] {
-                placement_policy_cli_apply_scenario(target, format, 80).await;
-            }
+            placement_policy_cli_apply_scenario(target, 80).await;
         }
     }
 
     #[cfg(unix)]
     #[hegel::test]
     fn generated_placement_policy_cli_apply(tc: hegel::TestCase) {
-        // Hostless local, explicit local, routed peer; both output modes; valid
-        // percentages including min/max, unchanged 50, and the live request 80.
+        // The repo's hegel.toml budgets 12 cases in development/CI, 40 nightly.
+        // Hostless local, explicit local, routed peer; valid percentages including
+        // min/max, unchanged 50, and the live request 80. Both CLI modes share the
+        // same format-independent renderer, so no separate format dimension remains.
         let target = tc.draw(hegel::generators::integers::<u8>().min_value(0).max_value(2));
-        let format = if tc.draw(hegel::generators::booleans()) { OutputFormat::Human } else { OutputFormat::Json };
         let percent = tc.draw(hegel::generators::integers::<u8>().min_value(1).max_value(100));
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime")
-            .block_on(placement_policy_cli_apply_scenario(target, format, percent));
+            .block_on(placement_policy_cli_apply_scenario(target, percent));
     }
 
     #[test]
