@@ -669,7 +669,11 @@ impl ProjectService<'_> {
         let mut revisions = BTreeMap::new();
         let result = self.materialize_project_operational_entries_inner(project_name, bootstrap, entry_path, &mut revisions).await;
         for name in names {
-            let root = roots.get(&name).await.map_err(|error| error.to_string())?;
+            let publication_error = |error: ResourceError| match &result {
+                Err(source_error) => format!("{source_error}; publish ManifestRoot/{name} status: {error}"),
+                Ok(_) => format!("publish ManifestRoot/{name} status: {error}"),
+            };
+            let root = roots.get(&name).await.map_err(&publication_error)?;
             let status = crate::charter_store::source_status(
                 root.status.clone().unwrap_or_default(),
                 revisions.remove(&name),
@@ -677,7 +681,7 @@ impl ProjectService<'_> {
                 &name,
             );
             if root.status.as_ref() != Some(&status) {
-                roots.update_status(&name, &root.metadata.resource_version, &status).await.map_err(|error| error.to_string())?;
+                roots.update_status(&name, &root.metadata.resource_version, &status).await.map_err(publication_error)?;
             }
         }
         result
@@ -746,6 +750,8 @@ impl ProjectService<'_> {
                 });
                 continue;
             }
+            // ADR 0047: remove incidental-checkout loading after one fleet roll
+            // has migrated existing ops members to explicit charter bindings.
             let repository = if let Some(bootstrap) = bootstrap.filter(|bootstrap| member.repo == bootstrap.repository.key()) {
                 bootstrap.repository.clone()
             } else {
@@ -1677,6 +1683,17 @@ mod tests {
             let projects = backend.definitions::<Project>("flotilla");
             let project = projects.get("app").await.expect("project definition");
             let mut spec = project.spec.clone();
+            let mut unavailable = spec.repositories[0].clone();
+            unavailable.repo = RepositoryKey("missing-ops".into());
+            unavailable.charter_store = None;
+            spec.repositories.push(unavailable);
+            projects.apply(&InputMeta::from(&project.metadata), &spec).await.expect("unavailable ops member");
+            service.reconcile_bound_charters().await.expect("partial-source refusal");
+            let refused = roots.get(&root_name).await.expect("root").status.expect("status");
+            assert_eq!(refused.applied_revision, status.applied_revision);
+            assert!(refused.source_error.expect("missing source reason").contains("no local checkout"));
+            assert_eq!(workflows.get("app--review").await.expect("retained workflow").spec.vessels[0].name, "second");
+            spec.repositories.pop();
             spec.repositories[0].charter_store = None;
             projects.apply(&InputMeta::from(&project.metadata), &spec).await.expect("remove binding");
             service.reconcile_bound_charters().await.expect("retire source");

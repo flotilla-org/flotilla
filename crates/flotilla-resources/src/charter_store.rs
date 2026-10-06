@@ -32,6 +32,9 @@ impl CharterSource {
                 if repo.trim().is_empty() || repo.starts_with('-') {
                     return Err("charter repository must be nonempty and cannot start with '-'".into());
                 }
+                if repo.split_once("::").is_some_and(|(helper, _)| !helper.contains('/') && !helper.contains(':')) {
+                    return Err("charter repository cannot use an external transport helper".into());
+                }
                 if branch.trim().is_empty() || branch.starts_with('-') || branch.starts_with("refs/") {
                     return Err("charter branch must be a branch name".into());
                 }
@@ -46,5 +49,21 @@ impl CharterSource {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Transport glue: local repositories are supported, external helpers are not.
+    #[test]
+    fn repository_transports_exclude_external_helpers() {
+        for repo in ["ext::sh -c command", "custom::destination"] {
+            assert!(CharterSource::Repository { repo: repo.into(), branch: "main".into(), path: String::new() }.validate().is_err());
+        }
+        for repo in ["/tmp/source", "file:///tmp/source", "https://github.com/example/source", "ssh://[::1]/source"] {
+            assert!(CharterSource::Repository { repo: repo.into(), branch: "main".into(), path: String::new() }.validate().is_ok());
+        }
     }
 }

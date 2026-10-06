@@ -4,6 +4,7 @@
 //! inside a provisioned environment, and across command transports.
 
 use std::{
+    collections::BTreeMap,
     fmt,
     path::{Path, PathBuf},
     process::Command,
@@ -14,9 +15,11 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::CheckoutIntent;
 use flotilla_resources::{canonicalize_repo_url, CheckoutBranchProvenance};
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::{
+    charter_store::{is_charter_file, reconciliation_lock, CharterSnapshot},
     path_context::ExecutionEnvironmentPath,
     providers::{
         command_channel_label,
@@ -650,13 +653,7 @@ pub enum CheckoutRegistration<'a> {
 #[async_trait]
 pub trait Vcs: Send + Sync {
     /// Fetch a bound branch and read its immutable blobs from a private object cache.
-    async fn charter_snapshot(
-        &self,
-        _cache: &Path,
-        _repo: &str,
-        _branch: &str,
-        _path: &str,
-    ) -> Result<crate::charter_store::CharterSnapshot, String> {
+    async fn charter_snapshot(&self, _cache: &Path, _repo: &str, _branch: &str, _path: &str) -> Result<CharterSnapshot, String> {
         Err("bound charter inspection is unavailable".into())
     }
 
@@ -845,21 +842,14 @@ impl FlotillaVcs {
 
 #[async_trait]
 impl Vcs for FlotillaVcs {
-    async fn charter_snapshot(
-        &self,
-        cache: &Path,
-        repo: &str,
-        branch: &str,
-        path: &str,
-    ) -> Result<crate::charter_store::CharterSnapshot, String> {
-        use sha2::{Digest, Sha256};
+    async fn charter_snapshot(&self, cache: &Path, repo: &str, branch: &str, path: &str) -> Result<CharterSnapshot, String> {
         // Serialise fetch+resolve: overlapping reconciliation and candidate reads
         // must never observe another fetch's FETCH_HEAD.
         let source = flotilla_resources::CharterSource::Repository { repo: repo.into(), branch: branch.into(), path: path.into() };
         source.validate()?;
         let digest = Sha256::digest(format!("{repo}\0{branch}").as_bytes());
         let directory = cache.join(format!("{:x}", digest));
-        let lock = crate::charter_store::reconciliation_lock(&format!("cache:{}", directory.display()));
+        let lock = reconciliation_lock(&format!("cache:{}", directory.display()));
         let _guard = lock.lock().await;
         tokio::fs::create_dir_all(&directory).await.map_err(|error| error.to_string())?;
         let backend = GitCliBackend::new(&directory, &*self.runner);
@@ -873,7 +863,7 @@ impl Vcs for FlotillaVcs {
         let normalized_path: PathBuf =
             Path::new(path).components().filter(|part| matches!(part, std::path::Component::Normal(_))).collect();
         let prefix = normalized_path.to_str().ok_or("charter path is not UTF-8")?;
-        let mut files = std::collections::BTreeMap::new();
+        let mut files = BTreeMap::new();
         let mut found_path = prefix.is_empty();
         for entry in tree.split('\0').filter(|entry| !entry.is_empty()) {
             let (meta, name) = entry.split_once('\t').ok_or("invalid charter tree entry")?;
@@ -886,7 +876,7 @@ impl Vcs for FlotillaVcs {
                 relative
             };
             found_path = true;
-            if !crate::charter_store::is_charter_file(Path::new(relative)) {
+            if !is_charter_file(Path::new(relative)) {
                 continue;
             }
             if !meta.starts_with("100644 blob ") && !meta.starts_with("100755 blob ") {
@@ -898,7 +888,7 @@ impl Vcs for FlotillaVcs {
         if !found_path {
             return Err(format!("charter path {path} has no files at {revision}"));
         }
-        Ok(crate::charter_store::CharterSnapshot { revision, files })
+        Ok(CharterSnapshot { revision, files })
     }
 
     async fn read_repository(&self, path: &Path, read: RepositoryRead<'_>) -> Result<String, String> {

@@ -495,7 +495,8 @@ impl ResourceManifestReconciler {
             return Ok((snapshot.revision, files));
         }
         // ADR 0047: previous-generation clean-checkout configuration remains
-        // readable for one roll. New installations declare an explicit binding.
+        // readable for one roll. Remove this fallback after that fleet roll has
+        // migrated all declared manifest sources to explicit bindings.
         let revision = match &self.fixed_revision {
             Some(revision) => revision.clone(),
             None => self.vcs.as_ref().ok_or("manifest VCS provider unavailable")?.clean_revision().await?,
@@ -1082,6 +1083,17 @@ mod tests {
         assert!(repaired.source_error.is_none());
         assert!(repaired.stalled.is_none());
         assert_ne!(repaired.applied_revision.as_deref(), Some(merged.as_str()));
+        // A Git symlink refusal must reach source status without advancing it.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("policy.yaml", repo.path().join("charters/link.yaml")).expect("symlink");
+            git(repo.path(), &["add", "."]);
+            git(repo.path(), &["commit", "-m", "symlink charter"]);
+            assert!(reconciler.reconcile_once().await.is_err());
+            let refused = test_root(&backend).await.status.expect("symlink status");
+            assert_eq!(refused.applied_revision, repaired.applied_revision);
+            assert!(refused.source_error.expect("symlink reason").contains("link.yaml"));
+        }
         reconciler.binding = Some(CharterSource::Repository {
             repo: repo.path().to_string_lossy().into_owned(),
             branch: "missing".into(),
