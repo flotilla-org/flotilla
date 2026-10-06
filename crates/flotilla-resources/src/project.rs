@@ -183,6 +183,9 @@ pub struct ProjectStatus {
     pub declaration_refused: Option<DeclarationRefusedCondition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dispatch_queue: Vec<DispatchQueueEntry>,
+    /// Previous-generation Projects omit this; remove the default after one fleet roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_queue_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_queue_attention: Option<DispatchQueueAttention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -224,6 +227,7 @@ pub struct DispatchQueueAttention {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectStatusPatch {
+    DispatchQueueError { message: Option<String> },
     ReplaceDispatchQueue { queue: Vec<DispatchQueueEntry>, attention: Option<DispatchQueueAttention> },
     ReplaceOperationalEntries { ready: bool, message: String },
     DeclarationRefused { condition: Option<DeclarationRefusedCondition> },
@@ -232,6 +236,7 @@ pub enum ProjectStatusPatch {
 impl StatusPatch<ProjectStatus> for ProjectStatusPatch {
     fn apply(&self, status: &mut ProjectStatus) {
         match self {
+            Self::DispatchQueueError { message } => status.dispatch_queue_error.clone_from(message),
             Self::DeclarationRefused { condition } => status.declaration_refused.clone_from(condition),
             Self::ReplaceDispatchQueue { queue, attention } => {
                 status.dispatch_queue.clone_from(queue);

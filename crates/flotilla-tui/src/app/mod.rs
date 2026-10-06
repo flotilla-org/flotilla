@@ -266,6 +266,7 @@ pub struct NamespaceModel {
 /// window it subscribed to.
 #[derive(Default)]
 pub struct QueryTableCache {
+    pub dispatch_ready: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::DispatchQueueRow>>,
     pub convoys: HashMap<flotilla_protocol::QueryId, QueryTableResult<crate::convoy_model::ConvoySummary>>,
     pub independents: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::IndependentRow>>,
     pub issues: HashMap<flotilla_protocol::QueryId, QueryTableResult<flotilla_protocol::IssueRow>>,
@@ -1335,6 +1336,11 @@ impl App {
                         self.query_tables.awareness.insert(query, QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
                     }
                     // Consumed by presentation-manager connectors; the TUI has no role table.
+                    flotilla_protocol::Rows::DispatchReady { rows, .. } => {
+                        self.query_tables
+                            .dispatch_ready
+                            .insert(query, QueryTableResult { rows: rows.clone(), state: result_set.state.clone() });
+                    }
                     flotilla_protocol::Rows::StandingRoles { .. } | flotilla_protocol::Rows::ProjectRepositories { .. } => {}
                 }
             }
@@ -1423,7 +1429,8 @@ impl App {
                             },
                         );
                     }
-                    flotilla_protocol::QueryChanges::ProjectRepositories { .. } => {}
+                    flotilla_protocol::QueryChanges::DispatchReady { .. } | flotilla_protocol::QueryChanges::ProjectRepositories { .. } => {
+                    }
                     flotilla_protocol::QueryChanges::Awareness { changed, removed, .. } => {
                         let result = self.query_tables.awareness.entry(query).or_default();
                         result.apply_delta(

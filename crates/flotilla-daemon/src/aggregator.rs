@@ -1925,6 +1925,35 @@ impl Aggregator {
             })
             .collect();
         deltas.extend(self.state.replace_project_repository_rows(rows).await);
+        let rows = self
+            .projects
+            .values()
+            .flat_map(|project| {
+                let attention = project.status.as_ref().is_some_and(|status| status.dispatch_queue_attention.is_some());
+                project.status.as_ref().into_iter().flat_map(|status| status.dispatch_queue.iter()).map(move |entry| {
+                    flotilla_protocol::DispatchQueueRow::builder()
+                        .namespace(project.metadata.namespace.clone())
+                        .project(project.metadata.name.clone())
+                        .issue(entry.issue.clone())
+                        .title(entry.title.clone())
+                        .ready_observed_at(entry.ready_observed_at)
+                        .age_seconds(chrono::Utc::now().signed_duration_since(entry.ready_observed_at).num_seconds().max(0) as u64)
+                        .attention(attention)
+                        .provenance(entry.provenance.clone())
+                        .build()
+                })
+            })
+            .collect();
+        let errors =
+            self.projects
+                .values()
+                .filter_map(|project| {
+                    project.status.as_ref()?.dispatch_queue_error.as_ref().map(|error| {
+                        (flotilla_protocol::QueryScope::new(&project.metadata.namespace, &project.metadata.name), error.clone())
+                    })
+                })
+                .collect();
+        deltas.extend(self.state.replace_dispatch_ready_rows(rows, errors).await);
         self.emit_store_deltas(deltas).await;
     }
 

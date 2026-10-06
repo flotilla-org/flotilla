@@ -5,12 +5,13 @@ use chrono::{DateTime, Duration, Utc};
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_protocol::{
     issue_query::{IssueQuery, READY_ISSUE_LABEL},
-    Issue, IssueRef, IssueState, QueryScope,
+    DispatchIssueFacts, Issue, IssueRef, IssueState, QueryScope,
 };
 use flotilla_resources::{
-    apply_status_patch, content_hash, pinned_workflow_ref, Clock, Convoy, DispatchObservation, DispatchObservationSpec, DispatchPolicy,
-    DispatchQueueAttention, DispatchQueueEntry, InputMeta, Project, ProjectStatusPatch, ResolvedIssueSourceBinding, ResourceBackend,
-    ResourceError, ResourceObject, SystemClock, WorkflowTemplate, DISPATCH_RECONCILER_PROVENANCE,
+    apply_status_patch, content_hash, pinned_workflow_ref, Clock, Convoy, DispatchDeployment, DispatchHold, DispatchHoldStatusPatch,
+    DispatchObservation, DispatchObservationSpec, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, HoldClearWhen, InputMeta,
+    Project, ProjectStatusPatch, ResolvedIssueSourceBinding, ResourceBackend, ResourceError, ResourceObject, SystemClock, WorkflowTemplate,
+    DISPATCH_RECONCILER_PROVENANCE,
 };
 use tracing::{info, warn};
 
@@ -20,6 +21,7 @@ const ISSUE_PAGE_SIZE: usize = 100;
 pub(crate) trait DispatchIssueSource: Send + Sync {
     async fn ready_issues(&self, project: &ResourceObject<Project>) -> Result<Vec<Issue>, String>;
     async fn fetch_issue(&self, reference: &IssueRef) -> Result<Issue, String>;
+    async fn dispatch_facts(&self, reference: &IssueRef) -> Result<DispatchIssueFacts, String>;
 }
 
 pub(crate) struct DaemonDispatchIssueSource {
@@ -56,6 +58,9 @@ impl DispatchIssueSource for DaemonDispatchIssueSource {
 
     async fn fetch_issue(&self, reference: &IssueRef) -> Result<Issue, String> {
         self.daemon.fetch_issue_by_ref(reference).await
+    }
+    async fn dispatch_facts(&self, reference: &IssueRef) -> Result<DispatchIssueFacts, String> {
+        self.daemon.issue_provider_for_source(&reference.source).await?.dispatch_facts(reference).await
     }
 }
 
@@ -105,6 +110,14 @@ impl DispatchReconciler {
                 }
                 Err(error) => {
                     warn!(project = %project.metadata.name, %error, "dispatch reconciliation failed for project; continuing pass");
+                    self.replace_queue(&project, Vec::new(), None).await?;
+                    apply_status_patch(
+                        &self.backend.clone().using::<Project>(&self.namespace),
+                        &project.metadata.name,
+                        &ProjectStatusPatch::DispatchQueueError { message: Some(error) },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
                     total.project_errors += 1;
                 }
             }
@@ -115,24 +128,35 @@ impl DispatchReconciler {
     async fn reconcile_project(&self, project: &ResourceObject<Project>, now: DateTime<Utc>) -> Result<ReconcilePass, String> {
         let Some(policy) = project.spec.dispatch_policy.as_ref().filter(|policy| policy.enabled) else {
             self.replace_queue(project, Vec::new(), None).await?;
+            if project.status.as_ref().is_some_and(|status| status.dispatch_queue_error.is_some()) {
+                apply_status_patch(
+                    &self.backend.clone().using::<Project>(&self.namespace),
+                    &project.metadata.name,
+                    &ProjectStatusPatch::DispatchQueueError { message: None },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            }
             return Ok(ReconcilePass::default());
         };
 
-        let existing = self.project_convoys(project).await?;
+        let convoys = self.namespace_convoys(project).await?;
+        let held = self.active_holds(project, &convoys, now).await?;
+        let existing =
+            convoys.into_iter().filter(|convoy| convoy.spec.project_ref.as_deref() == Some(&project.metadata.name)).collect::<Vec<_>>();
         let previous_queue = project.status.as_ref().map(|status| status.dispatch_queue.as_slice()).unwrap_or_default();
         let observations_recorded = self.observe_dispatches(project, previous_queue, &existing, now).await?;
-        // Admission itself makes an issue dispatched, regardless of the convoy's later phase. Failed,
-        // cancelled, and abandoned convoys remain durable evidence of that decision; retrying requires
-        // an explicit human/provider re-triage rather than automatic re-proposal from a terminal phase.
         let dispatched = existing
             .iter()
+            .filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
             .flat_map(|convoy| convoy.spec.issues.iter().map(|issue| issue.reference.clone()))
             .collect::<std::collections::HashSet<_>>();
         let previous_by_issue = previous_queue.iter().map(|entry| (entry.issue.clone(), entry)).collect::<BTreeMap<_, _>>();
 
         let mut ready = self.issues.ready_issues(project).await?;
         ready.retain(|issue| issue.state == IssueState::Open && issue.labels.iter().any(|label| label == READY_ISSUE_LABEL));
-        ready.sort_by(|left, right| left.reference.cmp(&right.reference));
+        ready.sort_by(|left, right| left.reference.cmp(&right.reference).then_with(|| right.as_of.cmp(&left.as_of)));
+        ready.dedup_by(|left, right| left.reference == right.reference);
 
         let mut queue = Vec::new();
         let mut blocked = 0;
@@ -140,14 +164,19 @@ impl DispatchReconciler {
             if dispatched.contains(&issue.reference) {
                 continue;
             }
-            let blockers = match blocked_by_references(&issue) {
-                Ok(blockers) => blockers,
-                Err(error) => {
-                    warn!(project = %project.metadata.name, issue = %issue.reference.id, %error, "issue Blocked by section is unparseable; treating issue as blocked");
-                    blocked += 1;
-                    continue;
-                }
-            };
+            if held.contains(&issue.reference) {
+                blocked += 1;
+                continue;
+            }
+            let facts = self.issues.dispatch_facts(&issue.reference).await?;
+            let ideation = facts.issue_type.iter().chain(issue.labels.iter()).any(|kind| {
+                matches!(kind.rsplit(':').next().unwrap_or(kind).to_ascii_lowercase().as_str(), "grill" | "grilling" | "map" | "brainstorm")
+            });
+            if ideation || facts.has_open_pull_request {
+                blocked += 1;
+                continue;
+            }
+            let blockers = facts.blockers;
             let previous = previous_by_issue.get(&issue.reference).copied();
             let mut is_blocked = false;
             let mut blockers_unknown = false;
@@ -156,7 +185,7 @@ impl DispatchReconciler {
                     Ok(blocker) if blocker.state == IssueState::Closed => {}
                     Ok(_) => is_blocked = true,
                     Err(error) => {
-                        warn!(project = %project.metadata.name, issue = %issue.reference.id, blocker = %blocker.id, %error, "blocker could not be observed; preserving only a previously verified proposal");
+                        warn!(project = %project.metadata.name, issue = %issue.reference.id, blocker = %blocker.id, %error, "blocker could not be observed; treating issue as unavailable");
                         blockers_unknown = true;
                     }
                 }
@@ -166,11 +195,7 @@ impl DispatchReconciler {
                 continue;
             }
             if blockers_unknown {
-                if let Some(previous) = previous {
-                    queue.push(previous.clone());
-                } else {
-                    blocked += 1;
-                }
+                blocked += 1;
                 continue;
             }
 
@@ -195,10 +220,68 @@ impl DispatchReconciler {
         let previous_attention = project.status.as_ref().and_then(|status| status.dispatch_queue_attention.as_ref());
         let attention = dispatch_queue_attention(&queue, policy, previous_attention, now);
         self.replace_queue(project, queue.clone(), attention).await?;
+        if project.status.as_ref().is_some_and(|status| status.dispatch_queue_error.is_some()) {
+            apply_status_patch(
+                &self.backend.clone().using::<Project>(&self.namespace),
+                &project.metadata.name,
+                &ProjectStatusPatch::DispatchQueueError { message: None },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+
         Ok(ReconcilePass { queued: queue.len(), blocked, observations_recorded, ..ReconcilePass::default() })
     }
 
-    async fn project_convoys(&self, project: &ResourceObject<Project>) -> Result<Vec<ResourceObject<Convoy>>, String> {
+    async fn active_holds(
+        &self,
+        project: &ResourceObject<Project>,
+        convoys: &[ResourceObject<Convoy>],
+        now: DateTime<Utc>,
+    ) -> Result<std::collections::HashSet<IssueRef>, String> {
+        let holds =
+            self.backend.definitions::<DispatchHold>(&project.metadata.namespace).list().await.map_err(|error| error.to_string())?;
+        let deployments = self
+            .backend
+            .clone()
+            .including_replicas::<DispatchDeployment>(&project.metadata.namespace)
+            .list()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut active = std::collections::HashSet::new();
+        for hold in holds {
+            if hold.spec.project_ref != project.metadata.name || hold.status.as_ref().is_some_and(|status| status.cleared_at.is_some()) {
+                continue;
+            }
+            let cleared = match &hold.spec.clear_when {
+                HoldClearWhen::Landed => {
+                    let convoy_landed = convoys.iter().any(|convoy| {
+                        convoy.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Landed)
+                            && convoy.spec.issues.iter().any(|issue| issue.reference == hold.spec.land_after)
+                    });
+                    convoy_landed || self.issues.dispatch_facts(&hold.spec.land_after).await.map(|facts| facts.landed).unwrap_or(false)
+                }
+                HoldClearWhen::Deployed { installation } => deployments.items.iter().any(|deployment| {
+                    deployment.object.spec.issue == hold.spec.land_after && deployment.object.spec.installation == *installation
+                }),
+            };
+            if cleared {
+                // Clear only on the authoring store; replicas can project the satisfied
+                // relationship immediately and receive its durable latch on replication.
+                let local = self.backend.clone().using::<DispatchHold>(&project.metadata.namespace);
+                if local.get(&hold.metadata.name).await.is_ok() {
+                    apply_status_patch(&local, &hold.metadata.name, &DispatchHoldStatusPatch::Clear { at: now })
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+            } else {
+                active.insert(hold.spec.issue);
+            }
+        }
+        Ok(active)
+    }
+
+    async fn namespace_convoys(&self, project: &ResourceObject<Project>) -> Result<Vec<ResourceObject<Convoy>>, String> {
         let listed = self
             .backend
             .clone()
@@ -208,9 +291,7 @@ impl DispatchReconciler {
             .map_err(|error| error.to_string())?;
         let mut by_name = BTreeMap::new();
         for convoy in listed.items.into_iter().map(|item| item.object) {
-            if convoy.spec.project_ref.as_deref() == Some(&project.metadata.name) {
-                by_name.entry(convoy.metadata.name.clone()).or_insert(convoy);
-            }
+            by_name.entry(convoy.metadata.name.clone()).or_insert(convoy);
         }
         Ok(by_name.into_values().collect())
     }
@@ -319,77 +400,6 @@ fn dispatch_queue_attention(
     })
 }
 
-fn blocked_by_references(issue: &Issue) -> Result<Vec<IssueRef>, String> {
-    let Some(body) = issue.body.as_deref() else { return Ok(Vec::new()) };
-    let mut lines = body.lines();
-    let Some(_) = lines.find(|line| line.trim().eq_ignore_ascii_case("## blocked by")) else {
-        return Ok(Vec::new());
-    };
-    let section = lines.take_while(|line| !line.trim_start().starts_with("## ")).collect::<Vec<_>>().join("\n");
-    if section.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut references = section.split_whitespace().filter_map(issue_url_reference).collect::<Vec<_>>();
-    let bytes = section.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'#' {
-            index += 1;
-            continue;
-        }
-        let start = index + 1;
-        let mut end = start;
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            end += 1;
-        }
-        if end > start {
-            let token_start = section[..index]
-                .rfind(|character: char| character.is_whitespace() || matches!(character, '(' | '[' | '`'))
-                .map_or(0, |position| position + 1);
-            let prefix = section[token_start..index].trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '/');
-            let source = issue_reference_source(&issue.reference.source, prefix).unwrap_or_else(|| issue.reference.source.clone());
-            references.push(IssueRef { source, id: section[start..end].to_string() });
-            index = end;
-        } else {
-            index += 1;
-        }
-    }
-    if references.is_empty() {
-        Err("section contains no issue references".to_string())
-    } else {
-        references.sort();
-        references.dedup();
-        Ok(references)
-    }
-}
-
-fn issue_reference_source(current: &flotilla_protocol::IssueSource, prefix: &str) -> Option<flotilla_protocol::IssueSource> {
-    let mut segments = prefix.split('/');
-    let owner = segments.next()?;
-    let repository = segments.next()?;
-    if owner.is_empty() || repository.is_empty() || segments.next().is_some() {
-        return None;
-    }
-    Some(flotilla_protocol::IssueSource { service: current.service.clone(), scope: format!("{owner}/{repository}") })
-}
-
-fn issue_url_reference(token: &str) -> Option<IssueRef> {
-    let token = token.trim_matches(|character: char| matches!(character, '(' | ')' | '[' | ']' | '<' | '>' | ',' | '.' | ';' | '`'));
-    let url = url::Url::parse(token).ok()?;
-    let segments = url.path_segments()?.collect::<Vec<_>>();
-    let [scope @ .., "issues", id] = segments.as_slice() else { return None };
-    if scope.len() != 2 || id.is_empty() {
-        return None;
-    }
-    let host = url.host_str()?;
-    let service = match url.port() {
-        Some(port) => format!("{}://{host}:{port}", url.scheme()),
-        None => format!("{}://{host}", url.scheme()),
-    };
-    Some(IssueRef { source: flotilla_protocol::IssueSource { service, scope: scope.join("/") }, id: (*id).to_string() })
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashMap, sync::Mutex};
@@ -407,6 +417,7 @@ mod tests {
         ready: Mutex<Vec<Issue>>,
         by_ref: Mutex<HashMap<IssueRef, Issue>>,
         ready_calls: Mutex<usize>,
+        facts: Mutex<HashMap<IssueRef, DispatchIssueFacts>>,
         failing_projects: Mutex<std::collections::HashSet<String>>,
         failing_refs: Mutex<std::collections::HashSet<IssueRef>>,
     }
@@ -426,6 +437,9 @@ mod tests {
                 return Err("issue fetch unavailable".to_string());
             }
             self.by_ref.lock().expect("issues lock").get(reference).cloned().ok_or_else(|| "missing issue".to_string())
+        }
+        async fn dispatch_facts(&self, reference: &IssueRef) -> Result<DispatchIssueFacts, String> {
+            Ok(self.facts.lock().expect("facts lock").get(reference).cloned().unwrap_or_default())
         }
     }
 
@@ -507,6 +521,7 @@ mod tests {
             ready: Mutex::new(ready),
             by_ref: Mutex::new(blockers.into_iter().map(|issue| (issue.reference.clone(), issue)).collect()),
             ready_calls: Mutex::new(0),
+            facts: Mutex::new(HashMap::new()),
             failing_projects: Mutex::new(Default::default()),
             failing_refs: Mutex::new(Default::default()),
         });
@@ -514,6 +529,17 @@ mod tests {
         let reconciler = DispatchReconciler::new(backend.clone(), NAMESPACE, Arc::clone(&issues) as Arc<dyn DispatchIssueSource>)
             .with_clock(Arc::clone(&clock) as Arc<dyn Clock>);
         (backend, issues, clock, reconciler)
+    }
+
+    fn native_edge(issues: &FakeIssues, issue_id: &str, blocker_id: &str) {
+        issues
+            .facts
+            .lock()
+            .expect("native facts")
+            .entry(IssueRef { source: source(), id: issue_id.into() })
+            .or_default()
+            .blockers
+            .push(IssueRef { source: source(), id: blocker_id.into() });
     }
 
     fn policy(stale_after_seconds: u64) -> DispatchPolicy {
@@ -526,7 +552,8 @@ mod tests {
         let unlabeled = issue("1", &[], None, IssueState::Open);
         let blocked = issue("3", &[READY_ISSUE_LABEL], Some("## Blocked by\n\n#9"), IssueState::Open);
         let blocker = issue("9", &[], None, IssueState::Open);
-        let (backend, _, _, reconciler) = harness(vec![unlabeled, blocked, ready.clone()], vec![blocker], policy(300)).await;
+        let (backend, issues, _, reconciler) = harness(vec![unlabeled, blocked, ready.clone()], vec![blocker], policy(300)).await;
+        native_edge(&issues, "3", "9");
 
         let outcome = reconciler.reconcile_once().await.expect("reconcile");
 
@@ -542,6 +569,7 @@ mod tests {
         let dependent = issue("2", &[READY_ISSUE_LABEL], Some("## Blocked by\n#9"), IssueState::Open);
         let blocker = issue("9", &[], None, IssueState::Open);
         let (backend, issues, _, reconciler) = harness(vec![dependent], vec![blocker], policy(300)).await;
+        native_edge(&issues, "2", "9");
         assert_eq!(reconciler.reconcile_once().await.expect("blocked pass").queued, 0);
 
         issues
@@ -558,26 +586,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_transient_blocker_fetch_failure_preserves_a_verified_proposals_ready_time() {
+    async fn unknown_native_dependencies_are_never_proof_of_readiness() {
         let dependent = issue("2", &[READY_ISSUE_LABEL], Some("## Blocked by\n#9"), IssueState::Open);
         let newcomer = issue("3", &[READY_ISSUE_LABEL], Some("## Blocked by\n#9"), IssueState::Open);
         let blocker = issue("9", &[], None, IssueState::Closed);
         let blocker_ref = blocker.reference.clone();
         let (backend, issues, clock, reconciler) = harness(vec![dependent.clone()], vec![blocker], policy(60)).await;
+        native_edge(&issues, "2", "9");
         reconciler.reconcile_once().await.expect("verified pass");
-        let original =
-            backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status").dispatch_queue[0].clone();
+        issues
+            .facts
+            .lock()
+            .expect("facts lock")
+            .insert(newcomer.reference.clone(), DispatchIssueFacts { blockers: vec![blocker_ref.clone()], ..Default::default() });
         issues.ready.lock().expect("ready lock").push(newcomer);
         issues.failing_refs.lock().expect("failing refs lock").insert(blocker_ref);
         clock.advance(Duration::seconds(60));
 
         let outcome = reconciler.reconcile_once().await.expect("transient failure pass");
 
-        assert_eq!(outcome.queued, 1);
-        assert_eq!(outcome.blocked, 1, "an unverified new issue remains conservatively excluded");
+        // Native dependency availability is required even for previously ready issues.
+        assert_eq!(outcome.queued, 0);
+        assert_eq!(outcome.blocked, 2);
         let status = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
-        assert_eq!(status.dispatch_queue, vec![original]);
-        assert_eq!(status.dispatch_queue_attention.expect("stale attention").count, 1);
+        assert!(status.dispatch_queue.is_empty());
+        assert!(status.dispatch_queue_attention.is_none());
     }
 
     #[tokio::test]
@@ -653,6 +686,28 @@ mod tests {
             observation.time_from_ready_seconds,
             observation.dispatched_at.signed_duration_since(observation.ready_observed_at).num_seconds().max(0) as u64
         );
+        // Only live convoys serve an issue; terminal history cannot suppress a
+        // reopened/retriaged issue forever. Every lifecycle phase is covered.
+        use flotilla_resources::{ConvoyPhase, ConvoyStatus};
+        let convoys = backend.clone().using::<Convoy>(NAMESPACE);
+        for phase in [
+            ConvoyPhase::Pending,
+            ConvoyPhase::Active,
+            ConvoyPhase::Interrupted,
+            ConvoyPhase::Anchored,
+            ConvoyPhase::Landing,
+            ConvoyPhase::Landed,
+            ConvoyPhase::Failed,
+            ConvoyPhase::Cancelled,
+            ConvoyPhase::Abandoned,
+        ] {
+            let current = convoys.get("human-dispatch").await.expect("convoy");
+            convoys
+                .update_status("human-dispatch", &current.metadata.resource_version, &ConvoyStatus { phase, ..Default::default() })
+                .await
+                .expect("phase");
+            assert_eq!(reconciler.reconcile_once().await.expect("phase pass").queued, usize::from(phase.is_terminal()));
+        }
     }
 
     #[tokio::test]
@@ -790,31 +845,129 @@ mod tests {
         assert!(status.dispatch_queue.is_empty());
         assert!(status.dispatch_queue_attention.is_none());
     }
-
-    #[test]
-    fn prose_only_blocked_by_section_is_unparseable() {
-        let issue = issue("2", &[READY_ISSUE_LABEL], Some("## Blocked by\n\nSequencing decision — later."), IssueState::Open);
-        assert_eq!(blocked_by_references(&issue).expect_err("prose is not a reference"), "section contains no issue references");
+    // Each predicate input is pinned independently so a missing gate cannot
+    // hide behind another false conjunct in a generated combination.
+    #[tokio::test]
+    async fn every_predicate_input_has_an_independent_gate() {
+        let mut candidates = (1..=14)
+            .filter(|id| *id != 12)
+            .map(|id| issue(&id.to_string(), &[READY_ISSUE_LABEL], None, IssueState::Open))
+            .collect::<Vec<_>>();
+        candidates.iter_mut().find(|issue| issue.reference.id == "2").expect("closed").state = IssueState::Closed;
+        candidates.iter_mut().find(|issue| issue.reference.id == "3").expect("unlabelled").labels.clear();
+        for (id, label) in [("4", "grilling"), ("5", "wayfinder:map"), ("6", "brainstorm")] {
+            candidates.iter_mut().find(|issue| issue.reference.id == id).expect("ideation").labels.push(label.into());
+        }
+        candidates.iter_mut().find(|issue| issue.reference.id == "13").expect("body").body = Some("## Blocked by\n#12".into());
+        let duplicates = candidates.iter().find(|issue| issue.reference.id == "1").expect("valid").clone();
+        candidates.extend([duplicates.clone(), duplicates]);
+        let (backend, issues, _, reconciler) =
+            harness(candidates, vec![issue("12", &[], None, IssueState::Open), issue("15", &[], None, IssueState::Closed)], policy(60))
+                .await;
+        for (id, kind) in [("7", "Grill"), ("8", "Map"), ("9", "Brainstorm")] {
+            issues.facts.lock().expect("facts").insert(IssueRef { source: source(), id: id.into() }, DispatchIssueFacts {
+                issue_type: Some(kind.into()),
+                ..Default::default()
+            });
+        }
+        issues.facts.lock().expect("facts").insert(IssueRef { source: source(), id: "10".into() }, DispatchIssueFacts {
+            has_open_pull_request: true,
+            ..Default::default()
+        });
+        native_edge(&issues, "11", "12");
+        native_edge(&issues, "14", "15");
+        reconciler.reconcile_once().await.expect("pass");
+        let queue = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status").dispatch_queue;
+        assert_eq!(queue.iter().map(|entry| entry.issue.id.as_str()).collect::<Vec<_>>(), ["1", "13", "14"]);
     }
 
-    #[test]
-    fn blocked_by_parser_preserves_qualified_reference_sources() {
-        let issue = issue(
-            "2",
-            &[READY_ISSUE_LABEL],
-            Some("## Blocked by\n\nother/repo#7 and https://forgejo.example/team/widgets/issues/8"),
-            IssueState::Open,
-        );
+    // Contract #2782: every required input independently gates readiness;
+    // body prose cannot create a native dependency.
+    #[hegel::test]
+    fn predicate_inputs_are_conjunctive(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let open = tc.draw(gs::booleans());
+        let ready_label = tc.draw(gs::booleans());
+        let native_blocked = tc.draw(gs::booleans());
+        let serving_pr = tc.draw(gs::booleans());
+        let ideation = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
+        let kinds = [None, Some("grill"), Some("map"), Some("brainstorm"), Some("Grilling"), Some("Map"), Some("Brainstorm")];
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let mut candidate = issue(
+                "2",
+                if ready_label { &[READY_ISSUE_LABEL] } else { &[] },
+                Some("## Blocked by\nUnparseable old convention #99"),
+                if open { IssueState::Open } else { IssueState::Closed },
+            );
+            if ideation > 0 && ideation < 4 {
+                candidate.labels.push(kinds[ideation].expect("kind").into());
+            }
+            let reference = candidate.reference.clone();
+            let (backend, issues, _, reconciler) =
+                harness(vec![candidate], vec![issue("9", &[], None, IssueState::Open)], policy(300)).await;
+            issues.facts.lock().expect("facts").insert(reference, DispatchIssueFacts {
+                issue_type: if ideation >= 4 { kinds[ideation].map(str::to_string) } else { None },
+                blockers: if native_blocked { vec![IssueRef { source: source(), id: "9".into() }] } else { vec![] },
+                has_open_pull_request: serving_pr,
+                landed: false,
+            });
+            assert_eq!(
+                reconciler.reconcile_once().await.expect("pass").queued,
+                usize::from(open && ready_label && !native_blocked && !serving_pr && ideation == 0)
+            );
+            assert!(backend.using::<Convoy>(NAMESPACE).list().await.expect("convoys").items.is_empty());
+        });
+    }
 
-        assert_eq!(blocked_by_references(&issue).expect("qualified references"), vec![
-            IssueRef {
-                source: IssueSource { service: "https://forgejo.example".to_string(), scope: "team/widgets".to_string() },
-                id: "8".to_string(),
-            },
-            IssueRef {
-                source: IssueSource { service: "https://github.com".to_string(), scope: "other/repo".to_string() },
-                id: "7".to_string(),
-            },
-        ]);
+    // Land-after is a separate relationship, retained as a cleared audit record.
+    // Deploy-dependent holds require positive evidence for their installation;
+    // neither issue closure, merge, nor another installation's receipt suffices.
+    #[tokio::test]
+    async fn holds_clear_on_landing_or_matching_deployment_and_stay_cleared() {
+        use flotilla_resources::{DispatchDeploymentSpec, DispatchHoldSpec};
+        for deploy in [false, true] {
+            let candidate = issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open);
+            let target = issue("9", &[], None, IssueState::Closed);
+            let reference = candidate.reference.clone();
+            let after = target.reference.clone();
+            let (backend, issues, clock, reconciler) = harness(vec![candidate], vec![target], policy(300)).await;
+            let spec = DispatchHoldSpec::builder()
+                .project_ref("widgets".into())
+                .issue(reference)
+                .land_after(after.clone())
+                .reason("shared interface".into())
+                .author("governor".into())
+                .clear_when(if deploy { HoldClearWhen::Deployed { installation: "lab".into() } } else { HoldClearWhen::Landed })
+                .build();
+            let holds = backend.clone().using::<DispatchHold>(NAMESPACE);
+            holds.create(&InputMeta::builder().name("serialise".into()).build(), &spec).await.expect("hold");
+            assert_eq!(reconciler.reconcile_once().await.expect("closed only").queued, 0);
+            issues.facts.lock().expect("facts").insert(after.clone(), DispatchIssueFacts { landed: true, ..Default::default() });
+            if deploy {
+                assert_eq!(reconciler.reconcile_once().await.expect("merged only").queued, 0);
+                let receipts = backend.clone().using::<DispatchDeployment>(NAMESPACE);
+                for installation in ["other", "lab"] {
+                    receipts
+                        .create(
+                            &InputMeta::builder().name(installation.into()).build(),
+                            &DispatchDeploymentSpec::builder()
+                                .issue(after.clone())
+                                .installation(installation.into())
+                                .revision("abc123".into())
+                                .deployed_at(clock.now())
+                                .build(),
+                        )
+                        .await
+                        .expect("receipt");
+                    assert_eq!(reconciler.reconcile_once().await.expect("deployment").queued, usize::from(installation == "lab"));
+                }
+            } else {
+                assert_eq!(reconciler.reconcile_once().await.expect("landed").queued, 1);
+            }
+            assert!(holds.get("serialise").await.expect("hold").status.expect("status").cleared_at.is_some());
+            issues.facts.lock().expect("facts").clear();
+            assert_eq!(reconciler.reconcile_once().await.expect("latched clear").queued, 1);
+        }
     }
 }

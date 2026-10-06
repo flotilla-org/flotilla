@@ -408,6 +408,7 @@ pub async fn build_plan(
         | CommandAction::QueryExplainProject { .. }
         | CommandAction::QueryProjectList {}
         | CommandAction::QueryCliList { .. }
+        | CommandAction::QueryDispatchBoard { .. }
         | CommandAction::QueryDispatchQueue { .. }
         | CommandAction::QueryFleetHealth {}
         | CommandAction::FleetPostInstall { .. }

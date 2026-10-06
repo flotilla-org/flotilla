@@ -36,6 +36,7 @@ pub use image_layer::{
 mod definition;
 mod digest;
 pub use digest::{digest_bucket, DigestQuery, PartitionDigest, DIGEST_FANOUT};
+mod dispatch_hold;
 mod dispatch_observation;
 mod environment;
 mod error;
@@ -129,6 +130,9 @@ pub use credential::{
 };
 pub use crew_image_baseline::{CrewImageBaseline, CrewImageBaselineSpec};
 pub use definition::DefinitionResolver;
+pub use dispatch_hold::{
+    DispatchDeployment, DispatchDeploymentSpec, DispatchHold, DispatchHoldSpec, DispatchHoldStatus, DispatchHoldStatusPatch, HoldClearWhen,
+};
 pub use dispatch_observation::{DispatchObservation, DispatchObservationSpec, DISPATCH_RECONCILER_PROVENANCE};
 pub use environment::{
     host_direct_environment_name, DockerEnvironmentSpec, Environment, EnvironmentMemoryPolicy, EnvironmentMount, EnvironmentMountMode,
@@ -255,6 +259,8 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::CrewDefaults>($($argument),*);
         $callback::<$crate::FulfilmentKind>($($argument),*);
         $callback::<$crate::Demand>($($argument),*);
+        $callback::<$crate::DispatchHold>($($argument),*);
+        $callback::<$crate::DispatchDeployment>($($argument),*);
         $callback::<$crate::DispatchObservation>($($argument),*);
         $callback::<$crate::Environment>($($argument),*);
         $callback::<$crate::FleetDesignation>($($argument),*);

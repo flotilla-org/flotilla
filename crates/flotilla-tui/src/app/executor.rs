@@ -202,6 +202,7 @@ pub fn handle_result(result: CommandValue, app: &mut App) {
         | CommandValue::HostList(_)
         | CommandValue::ProjectList(_)
         | CommandValue::CliList(_)
+        | CommandValue::DispatchBoard(_)
         | CommandValue::DispatchQueue(_)
         | CommandValue::HostStatus(_)
         | CommandValue::HostProviders(_)

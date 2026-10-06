@@ -34,6 +34,7 @@ pub fn tui_actionable_action(action: &CommandAction) -> bool {
         | CommandAction::QueryExplainProject { .. }
         | CommandAction::QueryProjectList {}
         | CommandAction::QueryCliList { .. }
+        | CommandAction::QueryDispatchBoard { .. }
         | CommandAction::QueryDispatchQueue { .. }
         | CommandAction::QueryHostStatus { .. }
         | CommandAction::QueryHostProviders { .. }

@@ -3,10 +3,12 @@
 The portfolio board keeps tracker and fleet facts separate from operator
 judgment:
 
-- `scripts/dag-fetch` replaces only the generated JSON layer. It reads GitHub
-  issues and pull requests for `flotilla-org/flotilla` and
-  `flotilla-org/andamento`, plus exact issue associations from Flotilla convoy
-  resources.
+- `scripts/dag-fetch` replaces only the generated JSON layer. It reads `flotilla dispatch ready --json` and daemon board facts for the
+  `flotilla` and `andamento` Projects, plus exact issue associations from
+  Flotilla convoy resources. The client does not contact GitHub. `ready` means
+  the daemon’s full contract-ready predicate, including native dependencies,
+  serving work and soft holds; unblocked issues alone are not ready.
+  Source failures abort the refresh, preserving the previous generated file.
 - `scripts/flotilla-tickets-dag.authored.json` owns the pulse, detail notes,
   display metadata for groups, stages, shapes, landed rollups and any edges
   that are judgments rather than native GitHub dependencies.

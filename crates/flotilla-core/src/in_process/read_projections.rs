@@ -238,6 +238,9 @@ impl ReadProjections<'_> {
                 continue;
             }
             let Some(status) = project.status else { continue };
+            if let Some(error) = &status.dispatch_queue_error {
+                return Err(format!("dispatch readiness unavailable for {}: {error}", project.metadata.name));
+            }
             let attention = status.dispatch_queue_attention.is_some();
             for entry in status.dispatch_queue {
                 entries.push(

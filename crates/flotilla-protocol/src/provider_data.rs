@@ -128,6 +128,16 @@ pub struct Issue {
     pub provider_display_name: String,
 }
 
+/// Native tracker facts required by the daemon's dispatch predicate.
+/// Unavailable facts are an error at the provider seam, never an empty set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct DispatchIssueFacts {
+    pub issue_type: Option<String>,
+    pub blockers: Vec<IssueRef>,
+    pub has_open_pull_request: bool,
+    pub landed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueChangeset {
     pub updated: Vec<Issue>,

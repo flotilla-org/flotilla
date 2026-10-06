@@ -86,6 +86,39 @@ repository extraction, the provisional→canonical identity upgrade, and
 stay identity, and history is explicit rather than carried invisibly.
 _Avoid_: UID, alias, redirect.
 
+**Contract-ready**:
+An issue whose body is a settled work contract, signalled by the `ready` judgment
+label. Contract-readiness alone does not establish dispatchability.
+
+**Dispatchable Issue**:
+An open, contract-ready work issue with no open native dependency, active soft
+hold, live serving convoy or open serving change request. Grills, maps and
+brainstorms belong to ideation rather than this set.
+
+**Soft Hold**:
+An authored land-after relationship with a reason, separate from a native
+blocked-by dependency. It expires when its target lands or, for a
+deploy-dependent relationship, reaches the specified installation.
+
+**Deployment Receipt**:
+Positive evidence that one installation contains an issue's change at a stated
+revision and time. A merged change alone is not a deployment receipt.
+
+**Work Queue**:
+A Project's contract-ready work issues, which governors may batch into convoy
+requests as they become dispatchable.
+
+**Ideation Queue**:
+Fleet-wide grills, maps and brainstorms organised for operator selection.
+
+**Convoy Admission Queue**:
+Briefed convoy requests with resolved workflows awaiting whole-convoy admission,
+ordered globally across the fleet.
+
+**Placement Queue**:
+A host's resource users awaiting reservations, inheriting the priority of their
+waiting convoy or highest-priority consumer.
+
 **Convoy**:
 A named instance of a workflow — the primary unit of *launched* work. What a
 convoy *declares* is a DAG of **VesselRequirements** — vessels with crew
@@ -594,6 +627,10 @@ ones. The aspiration is instilled stewardship — improving quality, looking out
 for updates.
 _Avoid_: Repo bot, maintainer-agent.
 
+**Navigator**:
+The fleet role that organises the ideation queue for the operator to select and
+mix. It does not make global dispatch decisions.
+
 **Bosun**:
 The **PersistentAgent** role scoped to a single **Convoy**: the orchestrating
 agent (ADR 0008) that chivvies it along — continuation, unsticking, rewind —
@@ -610,9 +647,10 @@ _Avoid_: Scratch space (it is durable), transcript (that is the harness's).
 
 **Meta-agent**:
 The concept of a persistent agent that operates the fleet rather than writing
-code — stewardship (Governor), convoy-driving (Bosun), allocation
-(Quartermaster), accounting (Purser), presentation (Yeoman). Realised as
-**PersistentAgent** resources; Governor and Bosun arrive first.
+code — stewardship (Governor), convoy-driving (Bosun), ideation (Navigator),
+accounting (Purser), presentation (Yeoman). Dispatch and allocation are
+deterministic substrate decisions; the Quartermaster dispatch-agent idea is
+retired (ADR 0055).
 _Avoid_: Bot, assistant.
 
 **Settlement Claim**:

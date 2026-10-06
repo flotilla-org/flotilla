@@ -1043,6 +1043,9 @@ pub enum CommandAction {
     QueryCliList {
         kind: CliListKind,
     },
+    QueryDispatchBoard {
+        project: Option<String>,
+    },
     QueryDispatchQueue {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project: Option<String>,
@@ -1159,6 +1162,7 @@ impl CommandAction {
                 | CommandAction::QueryExplainProject { .. }
                 | CommandAction::QueryProjectList {}
                 | CommandAction::QueryCliList { .. }
+                | CommandAction::QueryDispatchBoard { .. }
                 | CommandAction::QueryDispatchQueue { .. }
                 | CommandAction::QueryHostStatus { .. }
                 | CommandAction::QueryHostProviders { .. }
@@ -1237,6 +1241,7 @@ impl Command {
             CommandAction::QueryExplainProject { .. } => "explain project",
             CommandAction::QueryProjectList {} => "query project list",
             CommandAction::QueryCliList { .. } => "query cli list",
+            CommandAction::QueryDispatchBoard { .. } => "query dispatch board",
             CommandAction::QueryDispatchQueue { .. } => "query dispatch queue",
             CommandAction::QueryHostStatus { .. } => "query host status",
             CommandAction::QueryHostProviders { .. } => "query host providers",
@@ -1399,6 +1404,7 @@ pub enum CommandValue {
     HostList(Box<HostListResponse>),
     ProjectList(Box<ProjectListResponse>),
     CliList(Box<CliListResponse>),
+    DispatchBoard(Box<crate::DispatchBoardResponse>),
     DispatchQueue(Box<DispatchQueueResponse>),
     HostStatus(Box<HostStatusResponse>),
     HostProviders(Box<HostProvidersResponse>),

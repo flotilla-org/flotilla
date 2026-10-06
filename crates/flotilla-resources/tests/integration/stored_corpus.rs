@@ -46,11 +46,22 @@ fn deployed_stored_records_still_decode() {
         }
         generation_count += 1;
         // ManifestRoot, CrewDefaults, ImageLayer, ImageBuild (#2728) and FleetDesignation (#2718) were introduced
-        // after this deployed generation. Remove their exemptions when the
+        // after this deployed generation, as were DispatchHold and DispatchDeployment (#2782). Remove their exemptions when the
         // corpus is refreshed after the next fleet roll (ADR 0047).
         let expected: BTreeSet<_> = REGISTERED_RESOURCE_KINDS
             .iter()
-            .filter(|kind| !matches!(kind.kind, "ManifestRoot" | "CrewDefaults" | "ImageLayer" | "ImageBuild" | "FleetDesignation"))
+            .filter(|kind| {
+                !matches!(
+                    kind.kind,
+                    "ManifestRoot"
+                        | "CrewDefaults"
+                        | "ImageLayer"
+                        | "ImageBuild"
+                        | "FleetDesignation"
+                        | "DispatchHold"
+                        | "DispatchDeployment"
+                )
+            })
             .map(|kind| format!("{}.json", kind.kind))
             .collect();
         let actual: BTreeSet<_> = fs::read_dir(&generation)
@@ -60,10 +71,12 @@ fn deployed_stored_records_still_decode() {
         assert_eq!(actual, expected, "{} must cover every registered resource kind", generation.display());
         let mut document_count = 0;
         let mut status_count = 0;
-        for kind in REGISTERED_RESOURCE_KINDS
-            .iter()
-            .filter(|kind| !matches!(kind.kind, "ManifestRoot" | "CrewDefaults" | "ImageLayer" | "ImageBuild" | "FleetDesignation"))
-        {
+        for kind in REGISTERED_RESOURCE_KINDS.iter().filter(|kind| {
+            !matches!(
+                kind.kind,
+                "ManifestRoot" | "CrewDefaults" | "ImageLayer" | "ImageBuild" | "FleetDesignation" | "DispatchHold" | "DispatchDeployment"
+            )
+        }) {
             let file = generation.join(format!("{}.json", kind.kind));
             let content = fs::read_to_string(&file).unwrap_or_else(|error| panic!("{}: {error}", file.display()));
             let documents: Vec<Value> = serde_json::from_str(&content).unwrap_or_else(|error| panic!("{}: {error}", file.display()));

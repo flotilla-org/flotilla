@@ -253,14 +253,15 @@ pub use commands::{
 pub use delta::{Branch, BranchStatus, Change, DeltaEntry, EntryOp};
 pub use provider_data::{
     Agent, AgentContext, AgentEventType, AgentHarness, AgentHookEvent, AgentHookTerminalRef, AgentStatus, AheadBehind, AttachableId,
-    AttachableSet, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, Issue, IssueChangeset,
-    IssueRef, IssueSource, IssueState, ManagedTerminal, PaneExitAttention, ProviderData, RemoteAccessPoint, RemoteAccessType,
-    SessionStatus, TerminalStatus, WorkingTreeStatus, Workspace,
+    AttachableSet, AttachableSetId, ChangeRequest, ChangeRequestStatus, Checkout, CloudAgentSession, CommitInfo, DispatchIssueFacts, Issue,
+    IssueChangeset, IssueRef, IssueSource, IssueState, ManagedTerminal, PaneExitAttention, ProviderData, RemoteAccessPoint,
+    RemoteAccessType, SessionStatus, TerminalStatus, WorkingTreeStatus, Workspace,
 };
 pub use query::{
     BlobSyncStatus, CredentialAttention, CredentialAttentionSeverity, CrewAttention, CrewCommandContext, CrewListMember, CrewListResponse,
     CrewProject, CrewProjectRepository, CrewStallRow, CrewStallsResponse, DeclarationAttentionKind, DeclarationAttentionRow,
-    DiscoveryEntry, DispatchQueueResponse, DispatchQueueRow, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse,
+    DiscoveryEntry, DispatchBoardDependency, DispatchBoardIssue, DispatchBoardPullRequest, DispatchBoardRepository, DispatchBoardResponse,
+    DispatchQueueResponse, DispatchQueueRow, DispatchReadyKey, FleetHealthResponse, FleetHostRow, FleetHostStaleness, FleetListResponse,
     FleetListRow, FleetObservationAgreement, FleetReplicaStatus, FleetStaleness, FleetSurfaceCounts, FulfilmentHarness,
     FulfilmentListResponse, FulfilmentModel, FulfilmentRow, HostListEntry, HostListResponse, HostProvidersResponse, HostStatusResponse,
     PeerReconnectStatus, ProjectListEntry, ProjectListRepository, ProjectListResponse, ProjectRepositoryRole, ProviderHealthMap,
