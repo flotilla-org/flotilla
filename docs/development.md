@@ -97,7 +97,7 @@ For a build requiring workspace variables and types in a debugger, use `CARGO_PR
 
 ### Executable build identity
 
-The root build script generates `FLOTILLA_BUILD_ID` for `flotilla` and `flotillad`; both inject it into libraries before parsing CLI arguments or starting tasks. Fleet and candidate builds can still set `FLOTILLA_BUILD_ID` explicitly. Otherwise it includes the Git revision and a fingerprint of workspace sources, including dirty changes. Library-only embeddings report `unknown` unless they call `flotilla_core::build_info::initialize_build_id`. This diagnostic identity does not gate compatibility: the protocol-source fingerprint still controls client and peer admission and `fleet check`.
+The root build script generates `FLOTILLA_BUILD_ID` for `flotilla` and `flotillad`; both inject it into libraries before parsing CLI arguments or starting tasks. Fleet and candidate builds can still set `FLOTILLA_BUILD_ID` explicitly. Otherwise it includes the Git revision and a fingerprint of workspace sources, including dirty changes. Library-only embeddings report `unknown` unless they call `flotilla_core::build_info::initialize_build_id`. Repeating the same identity is safe; empty or conflicting identities are rejected. This diagnostic identity does not gate compatibility: the protocol-source fingerprint still controls client and peer admission and `fleet check`.
 
 ### Size-cap backstop
 

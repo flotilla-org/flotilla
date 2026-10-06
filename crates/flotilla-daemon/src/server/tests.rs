@@ -697,7 +697,14 @@ fn current_client_hello() -> Message {
 
 async fn complete_client_hello(session: &MessageSession) {
     session.write(current_client_hello()).await.expect("write client hello");
-    assert!(matches!(read_session_message(session).await, Message::Hello { protocol_version: PROTOCOL_VERSION, .. }));
+    // The daemon advertises the executable identity independently of protocol compatibility.
+    let Message::Hello { protocol_version, display_name, .. } = read_session_message(session).await else {
+        panic!("expected daemon Hello");
+    };
+    assert_eq!(protocol_version, PROTOCOL_VERSION);
+    let info = flotilla_protocol::hello_build_info(&display_name).expect("daemon build metadata");
+    assert_eq!(info.build_id, flotilla_core::build_info::build_id());
+    assert_eq!(info.protocol_fingerprint, flotilla_protocol::PROTOCOL_FINGERPRINT);
 }
 
 async fn empty_daemon() -> (tempfile::TempDir, Arc<InProcessDaemon>) {

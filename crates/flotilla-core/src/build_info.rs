@@ -4,11 +4,11 @@ use std::sync::OnceLock;
 static BUILD_ID: OnceLock<&'static str> = OnceLock::new();
 
 /// Initialize before parsing CLI arguments or starting client/daemon tasks.
-/// Call exactly once with a nonempty identity. Library-only embeddings may
-/// leave the diagnostic identity unknown.
+/// Repeating the same nonempty identity is safe; changing it after initialization
+/// panics. Library-only embeddings may leave the diagnostic identity unknown.
 pub fn initialize_build_id(build_id: &'static str) {
     assert!(!build_id.is_empty(), "build identity must not be empty");
-    BUILD_ID.set(build_id).expect("initialize build identity only once");
+    assert_eq!(*BUILD_ID.get_or_init(|| build_id), build_id, "cannot change initialized build identity");
 }
 
 /// Return the executable's diagnostic identity. Compatibility uses PROTOCOL_FINGERPRINT.

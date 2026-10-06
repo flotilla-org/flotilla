@@ -8,7 +8,8 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
 // Generate diagnostic identity only for the final binaries. Libraries receive
-// it at startup, so workspace edits do not invalidate unrelated library crates.
+// it through flotilla_core::build_info at startup, so workspace edits do not
+// invalidate unrelated library crates.
 // Protocol compatibility remains governed by the separate protocol fingerprint.
 
 fn git_output(workspace_root: &Path, args: &[&str]) -> Option<String> {
