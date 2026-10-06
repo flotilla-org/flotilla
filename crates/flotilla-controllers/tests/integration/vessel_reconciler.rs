@@ -22,10 +22,10 @@ use flotilla_resources::{
     DockerCheckoutStrategy, DockerEnvironmentSpec, DockerImagePullPolicy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentSpec,
     ExitDeclaration, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec, InnerCommandStatus,
     InputMeta, IssueSnapshot, LifecycleAuthority, ObservedCheckoutSpec, PlacementPolicySpec, Repository, RepositorySpec, ResourceBackend,
-    ResourceError, Selector, Stance, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionPhase, TerminalSessionSource,
-    TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus, WorkPhase, WorkState,
-    WorkflowSnapshot, WorkflowTemplate, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION, CREW_ORDINAL_LABEL,
-    ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
+    ResourceError, Selector, Stance, StatusPatch, TerminalBrief, TerminalCrewContext, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionSpec, TerminalSessionStatus, Vessel, VesselPhase, VesselRequirement, VesselSpec, VesselStatus,
+    WorkPhase, WorkState, WorkflowSnapshot, WorkflowTemplate, CHANGE_REQUEST_ID_LABEL, CONVOY_LABEL, CREDENTIAL_SCOPES_ANNOTATION,
+    CREW_ORDINAL_LABEL, ROLE_LABEL, VESSEL_LABEL, VESSEL_ORDINAL_LABEL, VESSEL_REF_LABEL,
 };
 use rstest::rstest;
 use tokio::time::{timeout, Duration};
@@ -939,6 +939,58 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
             _ => None,
         })
         .expect("docker spec");
+    // A fleet roll leaves legacy mounts on a Ready vessel with running crews.
+    // Report recreation without changing that phase or interrupting its session.
+    let mut legacy = docker.clone();
+    legacy.mounts.retain(|mount| !mount.source_path.contains("/worktrees"));
+    let environments = backend.clone().using::<Environment>(NAMESPACE);
+    let environment = create_ready_docker_environment(&backend, NAMESPACE, "env-workspace-multi-docker", legacy).await;
+    let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
+    let session = sessions
+        .create(&meta("existing-crew"), &TerminalSessionSpec {
+            env_ref: environment.metadata.name.clone(),
+            role: "coder".into(),
+            source: TerminalSessionSource::Tool { command: "codex".into() },
+            cwd: "/workspace".into(),
+            env: Default::default(),
+            pool: "cleat".into(),
+        })
+        .await
+        .expect("running crew");
+    let session = sessions
+        .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
+            phase: TerminalSessionPhase::Running,
+            session_id: Some("running-crew".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("running status");
+    let mut running = vessel.clone();
+    running.status = Some(VesselStatus {
+        phase: VesselPhase::Ready,
+        environment_ref: Some(environment.metadata.name.clone()),
+        terminal_session_refs: vec![session.metadata.name.clone()],
+        ..Default::default()
+    });
+    let before = running.status.clone().expect("ready status");
+    let prepared = reconciler.prepare(&running).await.expect("legacy rollout");
+    let rollout = reconciler.reconcile(&running, &prepared, Utc::now());
+    assert!(
+        rollout.actuations.iter().all(|actuation| !matches!(
+            actuation,
+            Actuation::CreateTerminalSession { .. } | Actuation::RestartTerminalSession { .. } | Actuation::DeleteTerminalSession { .. }
+        )),
+        "rollout must not interrupt or launch crews"
+    );
+    rollout.patch.expect("visible recreation message").apply(running.status.as_mut().expect("ready status"));
+    let after = running.status.as_ref().expect("ready status");
+    assert_eq!(after.phase, VesselPhase::Ready);
+    assert_eq!(after.terminal_session_refs, before.terminal_session_refs);
+    assert_eq!(after.environment_ref, before.environment_ref);
+    assert!(after.message.as_deref().is_some_and(|message| message.contains("stop crews and recreate")));
+    assert_eq!(sessions.get(&session.metadata.name).await.expect("existing crew").status, session.status);
+    environments.delete(&environment.metadata.name).await.expect("remove legacy environment");
+
     let mut stale = docker.clone();
     stale.mounts.pop();
     let environment = create_ready_docker_environment(&backend, NAMESPACE, "env-workspace-multi-docker", stale).await;
@@ -953,7 +1005,14 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
     );
     let environments = backend.clone().using::<Environment>(NAMESPACE);
     environments.delete(&environment.metadata.name).await.expect("remove stale environment");
-    create_ready_docker_environment(&backend, NAMESPACE, "env-workspace-multi-docker", docker).await;
+    let mut reordered = docker;
+    reordered.mounts.reverse();
+    reordered.mounts.push(flotilla_resources::EnvironmentMount {
+        source_path: "/policy/cache".into(),
+        target_path: "/cache".into(),
+        mode: flotilla_resources::EnvironmentMountMode::Rw,
+    });
+    create_ready_docker_environment(&backend, NAMESPACE, "env-workspace-multi-docker", reordered).await;
     let deps = reconciler.prepare(&vessel).await.expect("matching membership");
     let unblocked = reconciler.reconcile(&vessel, &deps, Utc::now());
     assert!(

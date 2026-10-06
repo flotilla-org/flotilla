@@ -251,9 +251,11 @@ paths inside the container, preserving `.git` pointers and host backlinks.
 
 Docker cannot update these bind mounts in place. When checkout membership or
 resolved administration paths change, vessel reconciliation holds provisioning
-and requests environment recreation before launching crews. Stop existing crews,
-remove the vessel environment, and let reconciliation recreate it with the new
-mount set; it does not automatically interrupt running work. Environments created
+and requests environment recreation before launching crews. A Ready vessel
+keeps its phase and existing terminal sessions while showing the recreation
+message. Stop existing crews, remove the vessel environment with
+`flotilla resource delete Environment <environment-name>`, and let reconciliation
+recreate it with the new mount set; it does not automatically interrupt running work. Environments created
 before these protection mounts also require recreation.
 
 Managed creation uses `git worktree add --lock --reason` so a later protection

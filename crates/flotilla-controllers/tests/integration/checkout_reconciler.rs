@@ -200,7 +200,7 @@ async fn pending_checkout_recovers_creation_protection_through_controller_loop()
         .expect("checkout");
     let runtime = Arc::new(RecordingCheckoutRuntime {
         allow_creation: true,
-        creation_protection_failures: AtomicUsize::new(2),
+        creation_protection_failures: AtomicUsize::new(7),
         ..Default::default()
     });
     let reconciler = CheckoutReconciler::new(Arc::clone(&runtime), backend.clone(), NAMESPACE);
@@ -212,14 +212,25 @@ async fn pending_checkout_recovers_creation_protection_through_controller_loop()
             secondaries: Vec::new(),
             reconciler,
             resync_interval: Duration::from_secs(3600),
-            backend,
+            backend: backend.clone(),
         }
         .run(),
     );
-    timeout(Duration::from_secs(4), async {
+    let mut saw_exhausted_retry = false;
+    timeout(Duration::from_secs(90), async {
         loop {
             let status = checkouts.get("checkout-recovery").await.expect("checkout").status.unwrap_or_default();
             assert_ne!(status.phase, CheckoutPhase::Failed, "protection failures are not terminal");
+            if runtime.creation_attempts.load(Ordering::SeqCst) >= 6 && status.phase == CheckoutPhase::Pending {
+                let events = backend.clone().using::<Event>(NAMESPACE).list().await.expect("retry events");
+                assert!(
+                    events.items.iter().any(|event| {
+                        event.spec.reason == "ReconcileFailed" && event.spec.message.contains("temporary protection failure")
+                    }),
+                    "exhausted retry must remain visible through object events"
+                );
+                saw_exhausted_retry = true;
+            }
             if status.phase == CheckoutPhase::Ready {
                 assert_eq!(status.branch_provenance, CheckoutBranchProvenance::CreatedForConvoy);
                 assert_eq!(status.commit.as_deref(), Some("base-commit"));
@@ -230,7 +241,8 @@ async fn pending_checkout_recovers_creation_protection_through_controller_loop()
     })
     .await
     .expect("automatic recovery without operator reset");
-    assert!(runtime.creation_attempts.load(Ordering::SeqCst) >= 3);
+    assert!(runtime.creation_attempts.load(Ordering::SeqCst) >= 8);
+    assert!(saw_exhausted_retry, "exercise failures beyond the retry budget before recovery");
     controller.abort();
     let _ = controller.await;
 }

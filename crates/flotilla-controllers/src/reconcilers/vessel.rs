@@ -42,6 +42,34 @@ const VESSEL_INTERRUPTED_REQUEUE_AFTER: Duration = Duration::from_millis(250);
 const VESSEL_PROVISIONING_STUCK_SECONDS: i64 = 2 * 60;
 const CHECKOUT_RECREATE_BACKOFF: Duration = Duration::from_secs(60);
 
+// Compare the grants we own, independent of serialization order and unrelated
+// policy mounts. Legacy config/hooks overlays identify old shared roots too, so
+// removing an entire repository still detects its stale writable grants.
+fn git_mounts_match(existing: &[EnvironmentMount], desired: &[EnvironmentMount]) -> bool {
+    let roots = existing
+        .iter()
+        .chain(desired)
+        .filter(|mount| {
+            mount.mode == EnvironmentMountMode::Ro
+                && mount.source_path == mount.target_path
+                && PathBuf::from(&mount.source_path).file_name().is_some_and(|name| name == "config" || name == "hooks")
+        })
+        .filter_map(|mount| PathBuf::from(&mount.source_path).parent().map(PathBuf::from))
+        .collect::<BTreeSet<_>>();
+    let grants = |mounts: &[EnvironmentMount]| {
+        mounts
+            .iter()
+            .filter(|mount| {
+                roots
+                    .iter()
+                    .any(|root| PathBuf::from(&mount.source_path).starts_with(root) || PathBuf::from(&mount.target_path).starts_with(root))
+            })
+            .map(|mount| (mount.source_path.clone(), mount.target_path.clone(), mount.mode == EnvironmentMountMode::Rw))
+            .collect::<BTreeSet<_>>()
+    };
+    grants(existing) == grants(desired)
+}
+
 /// Environment-scoped VCS inspection used to plan contained Git mounts.
 #[async_trait::async_trait]
 pub trait WorktreeMetadataResolver: Send + Sync {
@@ -122,8 +150,7 @@ impl VesselReconciler {
             let CheckoutSpec::Worktree(spec) = &checkout.spec else {
                 return Err(ResourceError::invalid(format!("checkout {checkout_name} is no longer a managed worktree")));
             };
-            let resolver =
-                self.worktree_metadata.as_ref().ok_or_else(|| ResourceError::invalid("worktree metadata resolver unavailable"))?;
+            let resolver = self.worktree_metadata.as_ref().ok_or_else(|| ResourceError::other("worktree metadata resolver unavailable"))?;
             let metadata = resolver.worktree_metadata(&spec.env_ref, &spec.target_path).await.map_err(ResourceError::other)?;
             // Only direct registration children may override the read-only parent.
             // Reject unrelated paths rather than granting a broader writable mount.
@@ -929,13 +956,16 @@ impl Reconciler for VesselReconciler {
                                 docker.mounts.iter().filter(|mount| mount.target_path != *mount_path).cloned().collect::<Vec<_>>()
                             })
                             .unwrap_or_default();
-                        if existing_git_mounts != git_mounts {
+                        if !git_mounts_match(&existing_git_mounts, &git_mounts) {
                             return Ok(VesselPrepared {
                                 patch: PlannedPatch::EnvironmentRecreation {
                                     observed_policy_ref: placement_policy.metadata.name.clone(),
                                     observed_policy_version: placement_policy.metadata.resource_version.clone(),
                                     placement_decision: placement_decision.clone(),
-                                    message: format!("environment {env_name} Git checkout membership or protection mounts changed; recreate the environment before launching crews"),
+                                    message: format!(
+                                        "environment {env_name} Git checkout membership or protection mounts changed; \
+                                         stop crews and recreate the environment before launching crews"
+                                    ),
                                 },
                                 actuations,
                             });
@@ -1296,6 +1326,12 @@ impl Reconciler for VesselReconciler {
                     started_at: now,
                     message: provisioning_stuck_message(obj, waiting_for, now),
                 })
+            }
+            PlannedPatch::EnvironmentRecreation { message, .. }
+                if obj.status.as_ref().is_some_and(|status| status.phase == VesselPhase::Ready) =>
+            {
+                (obj.status.as_ref().and_then(|status| status.message.as_deref()) != Some(message))
+                    .then(|| VesselStatusPatch::RequireEnvironmentRecreation { message: message.clone() })
             }
             PlannedPatch::CheckoutChurn { observed_policy_ref, observed_policy_version, placement_decision, message }
             | PlannedPatch::EnvironmentRecreation { observed_policy_ref, observed_policy_version, placement_decision, message } => {
@@ -1716,7 +1752,10 @@ mod tests {
             assert!(refusing.contained_git_mounts(std::slice::from_ref(&own)).await.is_err(), "invalid metadata must fail closed");
         }
         let unavailable = VesselReconciler::new(backend, namespace);
-        assert!(unavailable.contained_git_mounts(&[own]).await.is_err(), "missing resolver must not guess paths");
+        assert!(
+            matches!(unavailable.contained_git_mounts(&[own]).await, Err(ResourceError::Other { .. })),
+            "missing resolver must retry without guessing paths or failing the vessel"
+        );
     }
 
     // Glue: append Git's fixed settings without replacing policy or credential environment.

@@ -380,6 +380,8 @@ pub enum WorktreeAdd<'a> {
 }
 
 /// Creation refusals are terminal; protection failures must retry the same target.
+/// Converting a String defaults to Creation. Backends must explicitly classify
+/// failures after materialisation as Protection to retain retryable recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutMaterialisationError {
     Creation(String),
@@ -2141,21 +2143,24 @@ mod tests {
         let commit = backend.head_commit_text().await.expect("commit");
         for (index, branch) in ["HEAD", commit.trim()].into_iter().enumerate() {
             let target = dir.path().join(format!("detached-{index}"));
-            let result = backend.create_worktree(branch, None, target.to_str().expect("path")).await.expect("detached snapshot");
+            let result = backend
+                .create_worktree(branch, None, target.to_str().expect("path"), "managed detached snapshot")
+                .await
+                .expect("detached snapshot");
             assert_eq!(result.provenance, CheckoutBranchProvenance::PreExisting);
             let detached = GitCliBackend::checkout_root(&target, &runner);
             assert!(detached.current_branch().await.is_err(), "detached snapshot has no symbolic branch");
             assert_eq!(detached.head_commit_text().await.expect("snapshot commit").trim(), commit.trim());
         }
         assert!(backend
-            .create_worktree("main", None, dir.path().join("reused").to_str().expect("path"))
+            .create_worktree("main", None, dir.path().join("reused").to_str().expect("path"), "managed")
             .await
             .err()
             .expect("branch reuse")
             .contains("main"));
         backend.update_ref("refs/remotes/origin/stale", commit.trim()).await.expect("stale tracking ref");
         let error = backend
-            .create_worktree("stale", Some("main"), dir.path().join("stale").to_str().expect("path"))
+            .create_worktree("stale", Some("main"), dir.path().join("stale").to_str().expect("path"), "managed")
             .await
             .err()
             .expect("stale ref refusal");

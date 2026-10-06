@@ -96,6 +96,10 @@ pub enum VesselStatusPatch {
     CredentialRefresh {
         retry: Option<ControllerRetry>,
     },
+    /// Report immutable mount drift without changing the phase of running crews.
+    RequireEnvironmentRecreation {
+        message: String,
+    },
     MarkProvisioning {
         observed_policy_ref: String,
         observed_policy_version: String,
@@ -135,6 +139,7 @@ impl StatusPatch<VesselStatus> for VesselStatusPatch {
             Self::ObserveRuntime { observation } => status.runtime_observation.get_or_insert_with(Default::default).merge(observation),
             Self::CredentialDelivery { retry } => status.credential_delivery_retry = retry.clone(),
             Self::CredentialRefresh { retry } => status.credential_refresh_retry = retry.clone(),
+            Self::RequireEnvironmentRecreation { message } => status.message = Some(message.clone()),
             Self::MarkProvisioning { observed_policy_ref, observed_policy_version, placement_decision, started_at, message } => {
                 status.phase = VesselPhase::Provisioning;
                 status.observed_policy_ref = Some(observed_policy_ref.clone());
