@@ -533,3 +533,11 @@ Attachment inherits the real console handles. Native OpenSSH carries console
 size changes to its remote PTY; Flotilla scopes raw input mode to the SSH child
 and restores it after exit or a spawn/wait error. No byte-copying pipe is placed
 between OpenSSH and ConPTY.
+
+Remote-daemon attachment uses the same viewer-side routing on Linux and macOS:
+SSH batch authentication avoids unattended prompts, and a login shell finds the
+remote account's Flotilla executable. Attach consumes `hostname` and optional
+`user` from `hosts.toml`; configure ports, identity files and jump hosts in the
+viewer's native OpenSSH config under that hostname/alias. `hosts.toml` has no
+port, identity-file or jump-host fields. Viewer attaches do not use daemon-side
+SSH multiplex settings.

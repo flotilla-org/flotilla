@@ -1716,6 +1716,24 @@ fn attach_mode(watch: bool, strict: bool, take: bool) -> flotilla_protocol::comm
     }
 }
 
+/// Translate a daemon-relative plan exactly once at the client endpoint seam.
+fn client_attach_plan(
+    endpoint: &DaemonEndpoint,
+    plan: flotilla_protocol::ResolvedAttachPlan,
+    binding: Option<&flotilla_protocol::AttachBinding>,
+    reference: &str,
+    mode: flotilla_protocol::commands::AttachMode,
+    load_hosts: impl FnOnce() -> Result<flotilla_core::config::HostsConfig, String>,
+) -> Result<flotilla_protocol::ResolvedAttachPlan, String> {
+    match endpoint {
+        DaemonEndpoint::Local(_) => Ok(plan),
+        DaemonEndpoint::Ssh(_) => {
+            let binding = binding.ok_or("remote attach response has no host binding")?;
+            flotilla_tui::terminal::remote_attach_plan(&load_hosts()?, &binding.host, binding.session.as_deref().unwrap_or(reference), mode)
+        }
+    }
+}
+
 async fn run_attach(
     cli: &Cli,
     reference: &str,
@@ -1758,19 +1776,18 @@ async fn run_attach(
 
     match result {
         CommandValue::AttachCommandResolved { plan, binding } => {
-            let plan = if cli.remote_daemon().map_err(color_eyre::eyre::Report::msg)?.is_some() {
-                let binding = binding.as_ref().ok_or_else(|| color_eyre::eyre::eyre!("remote attach response has no host binding"))?;
-                let config = ConfigStore::with_base(&cli.client_paths().map_err(color_eyre::eyre::Report::msg)?.config_dir);
-                flotilla_tui::terminal::remote_attach_plan(
-                    &config.load_hosts().map_err(color_eyre::eyre::Report::msg)?,
-                    &binding.host,
-                    binding.session.as_deref().unwrap_or(reference),
-                    mode,
-                )
-                .map_err(color_eyre::eyre::Report::msg)?
-            } else {
-                plan
-            };
+            let plan = client_attach_plan(
+                &cli.daemon_endpoint().map_err(color_eyre::eyre::Report::msg)?,
+                plan,
+                binding.as_ref(),
+                reference,
+                mode,
+                || {
+                    let paths = cli.client_paths()?;
+                    ConfigStore::with_base(&paths.config_dir).load_hosts()
+                },
+            )
+            .map_err(color_eyre::eyre::Report::msg)?;
             match format {
                 OutputFormat::Json => {
                     println!("{}", flotilla_protocol::output::json_pretty(&CommandValue::AttachCommandResolved { plan, binding }));
@@ -3113,6 +3130,56 @@ mod tests {
     };
 
     // `--daemon` wins over FLOTILLA_DAEMON; an empty variable selects this host.
+    // CLI endpoint selection must choose a viewer SSH hop only for remote
+    // daemons, using the resolved session/host rather than the daemon-local plan.
+    #[test]
+    fn remote_attach_cli_endpoint_selects_viewer_route() {
+        use flotilla_protocol::{arg::Arg, commands::AttachMode, AttachBinding, ResolvedAttachAction, ResolvedAttachPlan};
+        let daemon_plan = ResolvedAttachPlan::shell_command("daemon-only-terminal-pool");
+        let hosts = || {
+            serde_json::from_value(serde_json::json!({"hosts": {"kiwi": {
+                "hostname": "viewer-route", "expected_host_name": "kiwi"
+            }}}))
+            .map_err(|error| error.to_string())
+        };
+        let remote =
+            Cli::try_parse_from(["flotilla", "--daemon", "ssh://kiwi", "attach", "--host", "kiwi", "role-ref"]).expect("remote CLI");
+        let endpoint = remote.daemon_endpoint().expect("endpoint");
+        for session in [None, Some("resolved-session".to_string())] {
+            let binding = AttachBinding::builder().host(HostName::new("kiwi")).namespace("flotilla").maybe_session(session.clone()).build();
+            let plan = super::client_attach_plan(&endpoint, daemon_plan.clone(), Some(&binding), "role-ref", AttachMode::Take, hosts)
+                .expect("viewer plan");
+            assert_ne!(plan, daemon_plan);
+            let [ResolvedAttachAction::Command(args)] = plan.0.as_slice() else { panic!("one hop") };
+            assert_eq!(args.first(), Some(&Arg::Literal("ssh".into())));
+            assert!(args.contains(&Arg::Quoted("viewer-route".into())));
+            let Arg::NestedCommand(shell) = args.last().expect("shell") else { panic!("shell command") };
+            let Arg::NestedCommand(command) = shell.last().expect("command") else { panic!("attach command") };
+            assert_eq!(command.last(), Some(&Arg::Quoted(session.unwrap_or_else(|| "role-ref".into()))));
+        }
+        assert!(super::client_attach_plan(&endpoint, daemon_plan.clone(), None, "ref", AttachMode::Default, hosts).is_err());
+        assert!(super::client_attach_plan(
+            &endpoint,
+            daemon_plan.clone(),
+            Some(&AttachBinding::builder().host(HostName::new("kiwi")).namespace("flotilla").build()),
+            "ref",
+            AttachMode::Default,
+            || Err("config unavailable".into())
+        )
+        .is_err());
+        let local = Cli::try_parse_from(["flotilla", "--socket", "local.sock", "attach", "ref"]).expect("local CLI");
+        let result = super::client_attach_plan(
+            &local.daemon_endpoint().expect("local endpoint"),
+            daemon_plan.clone(),
+            None,
+            "ref",
+            AttachMode::Default,
+            || panic!("local attach must not load viewer routes"),
+        )
+        .expect("local plan");
+        assert_eq!(result, daemon_plan);
+    }
+
     #[test]
     fn remote_daemon_prefers_flag_and_ignores_empty_environment() {
         let flag = remote_daemon_from(Some("ssh://udder"), Some("ssh://kiwi"), false).expect("valid").expect("remote");

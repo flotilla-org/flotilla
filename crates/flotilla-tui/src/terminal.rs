@@ -128,7 +128,7 @@ fn raw_input_mode(mode: u32) -> u32 {
 #[cfg(windows)]
 mod windows_console {
     use windows_sys::Win32::{
-        Foundation::HANDLE,
+        Foundation::{HANDLE, INVALID_HANDLE_VALUE},
         System::Console::{GetConsoleMode, GetStdHandle, SetConsoleMode, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
     };
 
@@ -140,18 +140,25 @@ mod windows_console {
     }
 
     pub(super) fn enter() -> Result<Modes, String> {
+        // Capture the cooked console after leaving any TUI mouse/raw modes.
+        super::restore_terminal();
         // SAFETY: standard handles are borrowed for the child lifetime; mode
         // pointers refer to live u32s. No handle is closed by this module.
         unsafe {
             let input = GetStdHandle(STD_INPUT_HANDLE);
             let output = GetStdHandle(STD_OUTPUT_HANDLE);
+            if input.is_null() || output.is_null() || input == INVALID_HANDLE_VALUE || output == INVALID_HANDLE_VALUE {
+                return Err("attach requires Windows console input and output; missing or invalid standard handle".into());
+            }
             let mut input_mode = 0;
             let mut output_mode = 0;
             if GetConsoleMode(input, &mut input_mode) == 0 || GetConsoleMode(output, &mut output_mode) == 0 {
-                return Err(format!("attach requires a Windows console: {}", std::io::Error::last_os_error()));
+                return Err(format!(
+                    "attach requires Windows console input and output (redirected handles are unsupported): {}",
+                    std::io::Error::last_os_error()
+                ));
             }
             let modes = Modes { input, output, input_mode, output_mode };
-            super::restore_terminal();
             let raw = super::raw_input_mode(input_mode);
             if SetConsoleMode(input, raw) == 0 {
                 let error = std::io::Error::last_os_error();
@@ -354,13 +361,20 @@ mod tests {
             let (program, args) = attach_argv(&plan).expect("argv");
             assert_eq!(program, "ssh");
             assert_eq!(&args[..5], ["-t", "-o", "BatchMode=yes", "--", "crew@kiwi-alias"]);
-            let command = args.last().expect("remote command").replace("'\\''", "'");
-            assert!(command.contains("--host 'kiwi'"));
-            assert!(command.contains("--transient"));
-            assert!(command.contains("'crew session'"));
-            for candidate in ["--watch", "--strict", "--take"] {
-                assert_eq!(command.contains(candidate), flag == Some(candidate));
-            }
+            let [flotilla_protocol::ResolvedAttachAction::Command(argv)] = plan.0.as_slice() else { panic!("single command") };
+            let Arg::NestedCommand(shell) = argv.last().expect("remote command") else { panic!("login shell") };
+            assert_eq!(&shell[..3], [Arg::Literal("${SHELL:-/bin/sh}".into()), Arg::Literal("-l".into()), Arg::Literal("-c".into())]);
+            let Arg::NestedCommand(command) = shell.last().expect("attach command") else { panic!("attach argv") };
+            assert_eq!(&command[..5], [
+                Arg::Literal("flotilla".into()),
+                Arg::Literal("attach".into()),
+                Arg::Literal("--transient".into()),
+                Arg::Literal("--host".into()),
+                Arg::Quoted("kiwi".into())
+            ]);
+            assert_eq!(&command[command.len() - 2..], [Arg::Literal("--".into()), Arg::Quoted("crew session".into())]);
+            let seat_args = &command[5..command.len() - 2];
+            assert_eq!(seat_args, &flag.map(|flag| vec![Arg::Literal(flag.into())]).unwrap_or_default());
         }
         assert!(super::remote_attach_plan(&hosts, &HostName::new("missing"), "s", AttachMode::Default).is_err());
         let duplicate: HostsConfig = serde_json::from_value(serde_json::json!({"hosts": {
