@@ -469,6 +469,9 @@ impl DockerEnvironmentProviderInner {
             // Docker supplies HOME for the container user at exec time even when
             // Config.Env omits it. Read only that vessel-local default, without
             // login-shell mutations; an explicitly configured HOME always wins.
+            // Probe errors fail discovery rather than silently launching crew tools
+            // with an unknown HOME. Images without a shell can declare HOME
+            // explicitly and avoid this probe.
             let home = self
                 .runner
                 .run("docker", &["exec", container_name, "sh", "-c", "printf %s \"${HOME-}\""], Path::new("/"), &ChannelLabel::Default)

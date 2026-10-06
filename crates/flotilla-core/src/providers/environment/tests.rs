@@ -1130,7 +1130,11 @@ async fn env_vars_reads_configured_container_environment() {
         let handle = provider.create(id, &image, opts).await.expect("create");
         let vars = handle.env_vars().await.expect("env_vars");
 
-        if !null_environment {
+        if null_environment {
+            // A null configuration contributes no variables; only the vessel's
+            // resolved HOME is added, never host or previously queried values.
+            assert_eq!(vars, std::collections::HashMap::from([("HOME".to_string(), "/home/crew".to_string())]));
+        } else {
             assert_eq!(vars.get("FOO"), Some(&"bar".to_string()));
             assert_eq!(vars.get("BAZ"), Some(&"qux".to_string()));
             assert_eq!(vars.get("TEXT").map(String::as_str), Some("line one\nline two=tail"));

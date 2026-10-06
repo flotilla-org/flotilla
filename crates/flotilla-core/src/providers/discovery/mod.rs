@@ -220,6 +220,7 @@ impl EnvironmentBag {
     }
 
     /// Create a new bag containing assertions from both `self` and `other`.
+    /// The first provisioned baseline wins: use `self`'s, or `other`'s if absent.
     pub fn merge(&self, other: &EnvironmentBag) -> EnvironmentBag {
         let mut merged = self.clone();
         merged.assertions.extend(other.assertions.clone());
