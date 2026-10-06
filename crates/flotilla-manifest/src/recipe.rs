@@ -119,12 +119,10 @@ impl RecipeMint for FlotillaRecipes {
     }
 
     fn attach(&self, attach_ref: &str, host: &HostName) -> Option<Recipe> {
-        if host.as_str().contains('/') {
-            return None;
-        }
+        let target = host_target("session", host, attach_ref)?;
         Some(Recipe::address(
             "attach",
-            format!("session:{host}/{attach_ref}"),
+            target,
             LegacyRecipe::Attach(vec![
                 self.flotilla_bin.clone(),
                 "attach".to_owned(),
@@ -136,9 +134,7 @@ impl RecipeMint for FlotillaRecipes {
     }
 
     fn checkout_terminal(&self, path: &str, host: &HostName) -> Option<Recipe> {
-        if host.as_str().contains('/') {
-            return None;
-        }
+        let target = host_target("checkout", host, path)?;
         // Transient checkout terminals are genuine CLI commands, not live sessions.
         let argv = vec![
             self.flotilla_bin.clone(),
@@ -148,7 +144,7 @@ impl RecipeMint for FlotillaRecipes {
             host.to_string(),
             path.to_owned(),
         ];
-        Some(Recipe::checkout_command(format!("checkout:{host}/{path}"), argv))
+        Some(Recipe::checkout_command(target, argv))
     }
 
     fn scoped_view(&self, target: &ViewAddress) -> Option<Recipe> {
@@ -158,4 +154,12 @@ impl RecipeMint for FlotillaRecipes {
             LegacyRecipe::View(vec![self.flotilla_bin.clone(), "view".to_owned(), target.to_string()]),
         ))
     }
+}
+
+/// The first slash delimits the host; refs and paths keep their remaining slashes.
+fn host_target(kind: &str, host: &HostName, reference: &str) -> Option<String> {
+    if host.as_str().contains('/') {
+        return None;
+    }
+    Some(format!("{kind}:{host}/{reference}"))
 }
