@@ -1,17 +1,17 @@
 use std::{collections::HashMap, future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use chrono::Utc;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 use flotilla_core::daemon::DaemonHandle;
 use flotilla_core::in_process::InProcessDaemon;
 use flotilla_protocol::NodeId;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 use flotilla_protocol::{Command, CommandAction, CommandValue, DaemonEvent, ResourceReadEnvelope, ResourceReadRecord, ResourceRecordType};
 use flotilla_resources::{
     DigestQuery, HttpBackend, PartitionDigest, ReadWatchEvent, ReplicationClass, Resource, ResourceBackend, ResourceProvenance, WatchEvent,
     WatchStart,
 };
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 use flotilla_resources::{K8sWatchEvent, ResourceList, ResourceObject};
 use futures::StreamExt;
 use tokio::sync::watch;
@@ -42,7 +42,7 @@ impl ReplicationStore {
         }
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     fn kind<T: Resource>(self) -> String {
         match self {
             Self::Durable => T::API_PATHS.plural.to_string(),
@@ -77,20 +77,20 @@ struct RetryBackoff {
 /// Production keeps full-fleet replication and periodic digest scheduling.
 #[derive(Clone, Default)]
 pub(super) struct ReplicationTestOptions {
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     kinds: Option<&'static [&'static str]>,
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) digest_driver: Option<super::test_support::DigestDriver>,
 }
 
 impl ReplicationTestOptions {
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn new(kinds: Option<&'static [&'static str]>) -> Self {
         Self { kinds, digest_driver: None }
     }
 
     fn includes<T: Resource>(&self) -> bool {
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         if self.kinds.is_some_and(|kinds| !kinds.contains(&T::API_PATHS.kind)) {
             return false;
         }
@@ -172,9 +172,9 @@ impl PeerReplicatorSupervisors {
         daemon.begin_peer_resource_replication(&peer).await;
         let transport = match resource_socket_path {
             Some(_) => ReplicationTransport::Http(socket_path_source),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             None => ReplicationTransport::Routed(_router),
-            #[cfg(not(feature = "test-support"))]
+            #[cfg(not(any(test, feature = "test-support")))]
             None => {
                 debug!(%peer, generation, "peer has no forwarded resource socket; replication waits for an outbound SSH connection");
                 ReplicationTransport::Http(socket_path_source)
@@ -269,7 +269,7 @@ impl PeerReplicatorSupervisors {
 #[derive(Clone)]
 enum ReplicationTransport {
     Http(SocketPathSource),
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     Routed(RemoteCommandRouter),
 }
 
@@ -318,7 +318,7 @@ fn spawn_kind<T: Resource>(
                 .await;
             });
         }
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         ReplicationTransport::Routed(router) => {
             let relay_daemon = Arc::clone(daemon);
             let relay_peer = peer.clone();
@@ -347,7 +347,7 @@ fn spawn_kind<T: Resource>(
     let daemon = Arc::clone(daemon);
     let peer = peer.clone();
     let transport = transport.clone();
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     let digest_control = test_options.digest_driver.map(|driver| driver.control(daemon.node_id(), &peer, &store.kind::<T>()));
     let cancellation = cancellation.clone();
     tokio::spawn(async move {
@@ -380,7 +380,7 @@ fn spawn_kind<T: Resource>(
                 )
                 .await;
             }
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             ReplicationTransport::Routed(router) => {
                 let run_daemon = Arc::clone(&daemon);
                 let run_peer = peer.clone();
@@ -709,7 +709,7 @@ where
     Ok(true)
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 async fn fetch_routed_digest<T: Resource>(
     router: &RemoteCommandRouter,
     peer: &NodeId,
@@ -754,7 +754,7 @@ fn check_sequence<T: Resource>(version: &mut Option<String>, event: &WatchEvent<
     Ok(())
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 async fn replicate_kind_over_routed_watch<T: Resource>(
     router: &RemoteCommandRouter,
     daemon: &Arc<InProcessDaemon>,
@@ -787,7 +787,7 @@ async fn replicate_kind_over_routed_watch<T: Resource>(
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 async fn run_routed_watch<T: Resource>(
     router: &RemoteCommandRouter,
     daemon: &Arc<InProcessDaemon>,
@@ -928,7 +928,7 @@ async fn run_routed_watch<T: Resource>(
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 async fn replicate_relay_over_routed_watch<T: Resource>(
     router: &RemoteCommandRouter,
     daemon: &Arc<InProcessDaemon>,
@@ -985,7 +985,7 @@ async fn replicate_relay_over_routed_watch<T: Resource>(
     }
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 async fn apply_relay_response<T: Resource>(
     daemon: &Arc<InProcessDaemon>,
     peer: &NodeId,
@@ -1063,7 +1063,7 @@ async fn apply_relay_response<T: Resource>(
     Ok(())
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 async fn apply_response<T: Resource>(
     writer: &flotilla_resources::ReplicaWriter<T>,
     initial: &mut Vec<ResourceObject<T>>,
@@ -1102,7 +1102,7 @@ async fn apply_response<T: Resource>(
     Ok(())
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 fn record_watch_event<T: Resource>(record: ResourceReadRecord) -> Result<Option<WatchEvent<T>>, String> {
     let event_type = match record.record_type {
         ResourceRecordType::Current | ResourceRecordType::Added => "ADDED",

@@ -183,13 +183,13 @@ impl PeerRuntime {
         }
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn with_replication_kinds(mut self, kinds: Option<&'static [&'static str]>) -> Self {
         self.replication_test_options = ReplicationTestOptions::new(kinds);
         self
     }
 
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn with_digest_driver(mut self, driver: Option<super::test_support::DigestDriver>) -> Self {
         self.replication_test_options.digest_driver = driver;
         self

@@ -95,11 +95,17 @@ test -z "$(find target -path '*/incremental/*' -print -quit)"
 
 Current Cargo may create the empty `target/debug/incremental/` container even when incremental compilation is disabled; the verification checks that it contains no generated state.
 
-### Crew and CI debuginfo
+### Development debuginfo
+
+The workspace `[profile.dev]` defaults to `debug = "line-tables-only"` on desks, crews and CI. Test builds inherit this default.
 
 Contained `rust-build-limits` tools export `CARGO_PROFILE_DEV_DEBUG=line-tables-only` and prepend a staged Cargo shim to `PATH`. The shim supplies `--config 'profile.dev.package."*".debug=0'`, so workspace crates retain file and line information in backtraces while third-party dependencies emit no debuginfo. CI supplies the same Cargo dependency override and workspace environment setting. Test builds inherit the dev profile. The override targets dev; test and custom profiles inheriting dev inherit these defaults. Release, bench, and independently configured custom profiles retain their existing Cargo settings.
 
-For a build requiring workspace variables and types in a debugger, use `CARGO_PROFILE_DEV_DEBUG=full cargo test --workspace --locked`. This explicit override wins over the tool environment's default; dependency debuginfo remains disabled. Desk builds without the contained tool environment keep Cargo's full workspace debuginfo. The shim forwards `+toolchain` selectors and other arguments to the next Cargo executable on `PATH`, preserving repository Cargo config and Rust flags.
+For a build requiring workspace variables and types in a debugger, use `CARGO_PROFILE_DEV_DEBUG=full cargo test --workspace --locked`. This explicit override wins over the workspace profile and the tool environment's default. In crews and CI, dependency debuginfo remains disabled. Desk builds use the same line-table default and can use the same explicit full-debuginfo override. The shim forwards `+toolchain` selectors and other arguments to the next Cargo executable on `PATH`, preserving repository Cargo config and Rust flags.
+
+### Executable build identity
+
+The root build script generates `FLOTILLA_BUILD_ID` for `flotilla` and `flotillad`; both inject it into libraries before parsing CLI arguments or starting tasks. Fleet and candidate builds can still set `FLOTILLA_BUILD_ID` explicitly. Otherwise it includes the Git revision and a fingerprint of workspace sources, including dirty changes. Library-only embeddings report `unknown` unless they call `flotilla_core::build_info::initialize_build_id`. Repeating the same identity is safe; empty or conflicting identities are rejected. This diagnostic identity does not gate compatibility: the protocol-source fingerprint still controls client and peer admission and `fleet check`.
 
 ### Size-cap backstop
 

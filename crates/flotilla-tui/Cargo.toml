@@ -47,3 +47,11 @@ flotilla-daemon = { path = "../flotilla-daemon", features = ["test-support"] }
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
 insta = "1"
 tempfile = "3"
+
+[[example]]
+name = "splash-fixture"
+test = false
+
+[[example]]
+name = "splash_probe"
+test = false

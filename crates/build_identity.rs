@@ -7,9 +7,10 @@ use std::{
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
-// Git revision alone does not identify binaries built from dirty or otherwise
-// divergent source trees. Both halves of the socket protocol use this shared
-// helper so their advertised generation covers the actual compiled inputs too.
+// Generate diagnostic identity only for the final binaries. Libraries receive
+// it through flotilla_core::build_info at startup, so workspace edits do not
+// invalidate unrelated library crates.
+// Protocol compatibility remains governed by the separate protocol fingerprint.
 
 fn git_output(workspace_root: &Path, args: &[&str]) -> Option<String> {
     Command::new("git")
@@ -74,12 +75,13 @@ fn hash_file(mut hash: u64, path: &str, contents: &[u8]) -> u64 {
 
 fn source_fingerprint(workspace_root: &Path) -> Result<String, String> {
     // Deliberately fingerprint the whole compiled workspace rather than a
-    // hand-maintained dependency subset: over-invalidation is safe under the
-    // no-compat policy, while omitting an indirect wire input is not.
+    // hand-maintained dependency subset: dirty inputs must change diagnostics,
+    // while only the final executables are invalidated by this fingerprint.
     let crates_dir = workspace_root.join("crates");
     let mut inputs = vec![
         workspace_root.join("Cargo.lock"),
         workspace_root.join("Cargo.toml"),
+        workspace_root.join("build.rs"),
         workspace_root.join("src"),
         workspace_root.join("assets"),
         crates_dir.join("build_identity.rs"),
@@ -123,7 +125,7 @@ fn main() {
     println!("cargo::rerun-if-env-changed=FLOTILLA_BUILD_ID");
 
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir.parent().and_then(Path::parent).expect("crate is nested directly beneath workspace crates/");
+    let workspace_root = manifest_dir.as_path();
     if let Some(head) = git_output(workspace_root, &["rev-parse", "--git-path", "HEAD"]) {
         println!("cargo::rerun-if-changed={head}");
     }
@@ -135,7 +137,8 @@ fn main() {
 
     let build_id = std::env::var("FLOTILLA_BUILD_ID").ok().filter(|value| !value.is_empty()).unwrap_or_else(|| {
         let revision = git_output(workspace_root, &["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
-        let fingerprint = source_fingerprint(workspace_root).unwrap_or_else(|error| panic!("cannot fingerprint wire sources: {error}"));
+        let fingerprint =
+            source_fingerprint(workspace_root).unwrap_or_else(|error| panic!("cannot fingerprint executable sources: {error}"));
         format!("{revision}+{fingerprint}")
     });
     println!("cargo::rustc-env=FLOTILLA_BUILD_ID={build_id}");
