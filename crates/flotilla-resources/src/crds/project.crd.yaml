@@ -21,6 +21,10 @@ spec:
               type: object
               required: [display_name, default_workflow_ref, repositories]
               properties:
+                parent:
+                  type: string
+                  nullable: true
+                  minLength: 1
                 display_name:
                   type: string
                   minLength: 1

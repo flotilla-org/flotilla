@@ -36,6 +36,7 @@ mod environment;
 mod error;
 mod event;
 mod field_ownership;
+mod fleet_designation;
 mod forge;
 mod fulfilment_kind;
 mod host;
@@ -53,6 +54,7 @@ mod prepared_snapshot;
 mod presentation;
 mod principal_attention;
 mod project;
+mod project_hierarchy;
 mod provisioning_identity;
 mod registry;
 #[cfg(test)]
@@ -130,6 +132,7 @@ pub use environment::{
 pub use error::{FinalizerWaitReason, ResourceError};
 pub use event::{Event, EventRecorder, EventRegarding, EventSpec, ObjectEvent, DEFAULT_EVENT_TTL_SECONDS};
 pub use field_ownership::{FieldOwnedResource, FieldOwnership, FieldOwnershipViolation, OwnershipEnforcement, WriterIdentity, WriterRole};
+pub use fleet_designation::{FleetDesignation, FleetDesignationSpec, FLEET_DESIGNATION_NAME};
 pub use flotilla_protocol::{PrincipalRef, ResourceRef};
 pub use forge::{Forge, ForgeKind, ForgeSpec};
 pub use fulfilment_kind::{FulfilmentCostClass, FulfilmentGrant, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation};
@@ -179,6 +182,7 @@ pub use project::{
     IssueSourceUnavailable, OperationalEntriesCondition, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatus,
     ProjectStatusPatch, ResolvedIssueSourceBinding, DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
 };
+pub use project_hierarchy::ProjectHierarchy;
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, forge_clone_key, forge_repo_key, repo_key};
 pub use registry::{
     apply_manifest_resource_document, apply_resource_document, collect_resource_replica_kind, current_resource_kind_position,
@@ -247,6 +251,7 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::Demand>($($argument),*);
         $callback::<$crate::DispatchObservation>($($argument),*);
         $callback::<$crate::Environment>($($argument),*);
+        $callback::<$crate::FleetDesignation>($($argument),*);
         $callback::<$crate::Forge>($($argument),*);
         $callback::<$crate::Event>($($argument),*);
         $callback::<$crate::Host>($($argument),*);

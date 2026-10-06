@@ -69,3 +69,7 @@ roll, then checks a crew of each role. Empty declarations select no skills.
 Catalog-producing build jobs require injected read access to private sources.
 This is distinct from a crew's repository write token and from the live-host
 checks. The operator must arrange that credential before producing candidates.
+
+## Amendment
+
+[ADR 0054](0054-the-fleet-is-the-root-project.md) extends crew skill selection with the fleet-root and ancestor layers of the Project defaults cascade.

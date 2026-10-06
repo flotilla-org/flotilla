@@ -126,6 +126,19 @@ pub trait Resource: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Named sibling view for graph invariants, checked under the local store lock.
+    fn validate_spec_with_named_siblings(
+        meta: &InputMeta,
+        spec: &Self::Spec,
+        siblings: &[ResourceObject<Self>],
+    ) -> Result<(), ResourceError>
+    where
+        Self: Sized,
+    {
+        let _ = meta;
+        Self::validate_spec_with_siblings(spec, &siblings.iter().map(|object| object.spec.clone()).collect::<Vec<_>>())
+    }
+
     fn validate_spec(_meta: &InputMeta, _spec: &Self::Spec) -> Result<(), ResourceError> {
         Ok(())
     }

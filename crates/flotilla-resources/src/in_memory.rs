@@ -32,6 +32,8 @@ pub struct InMemoryBackend {
     generation: Option<String>,
     event_retention: EventRetention,
     local_root: Option<NodeId>,
+    // Serialize cross-kind Project/FleetDesignation admission across clones.
+    pub(crate) hierarchy_admission: Arc<tokio::sync::Mutex<()>>,
     ownership_violations: Arc<Mutex<Vec<FieldOwnershipViolation>>>,
 }
 
@@ -128,6 +130,7 @@ impl InMemoryBackend {
             generation: Some(uuid::Uuid::new_v4().to_string()),
             event_retention: EventRetention::default(),
             local_root: None,
+            hierarchy_admission: Arc::default(),
             ownership_violations: Arc::default(),
         }
     }
@@ -154,6 +157,7 @@ impl InMemoryBackend {
             generation: None,
             event_retention,
             local_root: None,
+            hierarchy_admission: Arc::default(),
             ownership_violations: Arc::default(),
         }
     }
@@ -166,6 +170,7 @@ impl InMemoryBackend {
             generation: Some(uuid::Uuid::new_v4().to_string()),
             event_retention,
             local_root: None,
+            hierarchy_admission: Arc::default(),
             ownership_violations: Arc::default(),
         }
     }
@@ -792,9 +797,8 @@ impl InMemoryBackend {
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .filter(|object| object.metadata.name != meta.name && object.metadata.deletion_timestamp.is_none())
-            .map(|object| object.spec)
             .collect::<Vec<_>>();
-        T::validate_spec_with_siblings(spec, &siblings)
+        T::validate_spec_with_named_siblings(meta, spec, &siblings)
     }
 
     async fn create_typed_with_merge<T: Resource>(

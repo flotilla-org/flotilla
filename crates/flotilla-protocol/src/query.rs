@@ -212,6 +212,11 @@ pub struct ProjectListResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ProjectListEntry {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[builder(default)]
+    pub is_fleet: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declaration_refused: Option<String>,
     #[builder(default)]
@@ -440,6 +445,8 @@ pub enum FleetObservationAgreement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetListResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_project: Option<crate::ResourceRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declaration_attention: Vec<DeclarationAttentionRow>,
     pub rows: Vec<FleetListRow>,

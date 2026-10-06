@@ -67,6 +67,7 @@ pub struct AggregatorResolvers {
     durable_presentations: TypedResolver<Presentation>,
     durable_sessions: ReplicaReadResolver<TerminalSession>,
     durable_projects: ReplicaReadResolver<Project>,
+    durable_fleet_designation: Option<ReplicaReadResolver<flotilla_resources::FleetDesignation>>,
     durable_repositories: ReplicaReadResolver<Repository>,
     durable_regards: TypedResolver<Regard>,
     durable_vessels: ReplicaReadResolver<Vessel>,
@@ -88,6 +89,7 @@ struct AggregatorSourceRefs<'a> {
     durable_presentations: &'a dyn AggregatorWatchSource<Presentation>,
     durable_sessions: &'a dyn AggregatorReplicaWatchSource<TerminalSession>,
     durable_projects: &'a dyn AggregatorReplicaWatchSource<Project>,
+    durable_fleet_designation: Option<&'a dyn AggregatorReplicaWatchSource<flotilla_resources::FleetDesignation>>,
     durable_repositories: &'a dyn AggregatorReplicaWatchSource<Repository>,
     durable_regards: &'a dyn AggregatorWatchSource<Regard>,
     durable_vessels: &'a dyn AggregatorReplicaWatchSource<Vessel>,
@@ -227,6 +229,8 @@ pub struct Aggregator {
     origin_hosts: HashMap<flotilla_protocol::NodeId, HostName>,
     projects: HashMap<(String, String), ResourceObject<Project>>,
     #[builder(skip)]
+    fleet_projects: BTreeMap<String, String>,
+    #[builder(skip)]
     convoy_ensures: BTreeMap<EnsureKey, ResourceObject<ConvoyEnsure>>,
     repositories: HashMap<RepositoryKey, ResourceObject<Repository>>,
     repository_sources: BTreeMap<RepositorySourceKey, ReadResourceObject<Repository>>,
@@ -322,6 +326,7 @@ impl Aggregator {
             attachable_sessions: HashSet::new(),
             origin_hosts: HashMap::new(),
             projects: HashMap::new(),
+            fleet_projects: BTreeMap::new(),
             convoy_ensures: BTreeMap::new(),
             repositories: HashMap::new(),
             repository_sources: BTreeMap::new(),
@@ -389,6 +394,7 @@ impl Aggregator {
             durable_presentations,
             durable_sessions,
             durable_projects,
+            durable_fleet_designation,
             durable_repositories,
             durable_regards,
             durable_vessels,
@@ -408,6 +414,11 @@ impl Aggregator {
             .durable_presentations(&durable_presentations)
             .durable_sessions(&durable_sessions)
             .durable_projects(&durable_projects)
+            .maybe_durable_fleet_designation(
+                durable_fleet_designation
+                    .as_ref()
+                    .map(|resolver| resolver as &dyn AggregatorReplicaWatchSource<flotilla_resources::FleetDesignation>),
+            )
             .durable_repositories(&durable_repositories)
             .durable_regards(&durable_regards)
             .durable_vessels(&durable_vessels)
@@ -431,6 +442,7 @@ impl Aggregator {
             durable_presentations,
             durable_sessions,
             durable_projects,
+            durable_fleet_designation,
             durable_repositories,
             durable_regards,
             durable_vessels,
@@ -467,6 +479,11 @@ impl Aggregator {
         let mut durable_environment_stream = self.recover_environment_watch(durable_environments).await?;
         let mut durable_presentation_stream = self.recover_presentation_watch(LocalSource::Durable, durable_presentations).await?;
         let mut durable_session_stream = self.recover_replica_session_watch(durable_sessions).await?;
+        let mut durable_fleet_stream = match durable_fleet_designation {
+            Some(source) => self.recover_fleet_designation_watch(source).await?,
+            None => Box::pin(futures::stream::pending())
+                as BoxStream<'static, Result<ReadWatchEvent<flotilla_resources::FleetDesignation>, ResourceError>>,
+        };
         let mut durable_project_stream = self.recover_project_watch(durable_projects).await?;
         let mut durable_ensure_stream = self.recover_convoy_ensure_watch(durable_convoy_ensures).await?;
         let mut durable_repository_stream = self.recover_repository_watch(durable_repositories).await?;
@@ -659,6 +676,34 @@ impl Aggregator {
                     Some(Err(err)) => return Err(err),
                     None => return Err(ResourceError::other("aggregator durable terminal session watch ended")),
                 },
+                event = durable_fleet_stream.next() => match event {
+                    Some(Ok(event)) => {
+                        if matches!(event, ReadWatchEvent::DeletedByName { .. }) {
+                            if let Some(source) = durable_fleet_designation {
+                                durable_fleet_stream = self.recover_fleet_designation_watch(source).await?;
+                            }
+                            continue;
+                        }
+                        let (deleted, read) = match event {
+                            ReadWatchEvent::Added(read) | ReadWatchEvent::Modified(read) => (false, read),
+                            ReadWatchEvent::Deleted(read) => (true, read),
+                            ReadWatchEvent::DeletedByName { .. } => unreachable!("handled above"),
+                        };
+                        if deleted {
+                            self.fleet_projects.remove(&read.object.metadata.namespace);
+                        } else {
+                            self.fleet_projects.insert(read.object.metadata.namespace, read.object.spec.project);
+                        }
+                        self.rebuild_store_catalog().await;
+                    }
+                    Some(Err(ResourceError::WatchExpired { .. })) => {
+                        if let Some(source) = durable_fleet_designation {
+                            durable_fleet_stream = self.recover_fleet_designation_watch(source).await?;
+                        }
+                    }
+                    Some(Err(error)) => return Err(error),
+                    None => return Err(ResourceError::other("aggregator fleet designation watch ended")),
+                },
                 event = durable_project_stream.next() => match event {
                     Some(Ok(event)) => self.apply_project_event(event).await,
                     Some(Err(ResourceError::WatchExpired { .. })) => {
@@ -829,6 +874,16 @@ impl Aggregator {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    async fn recover_fleet_designation_watch(
+        &mut self,
+        resolver: &dyn AggregatorReplicaWatchSource<flotilla_resources::FleetDesignation>,
+    ) -> Result<BoxStream<'static, Result<ReadWatchEvent<flotilla_resources::FleetDesignation>, ResourceError>>, ResourceError> {
+        let (items, watch) = Self::recover_replica_watch(resolver).await?;
+        self.fleet_projects = items.into_iter().map(|read| (read.object.metadata.namespace, read.object.spec.project)).collect();
+        self.rebuild_store_catalog().await;
+        Ok(watch)
     }
 
     async fn recover_project_watch(
@@ -1748,10 +1803,33 @@ impl Aggregator {
             })
             .collect();
         let mut deltas = self.state.replace_store_catalog(repositories, projects).await;
+        let namespaces = self.projects.keys().map(|(namespace, _)| namespace).collect::<BTreeSet<_>>();
+        let hierarchies = namespaces
+            .into_iter()
+            .filter_map(|namespace| {
+                let declared = self
+                    .projects
+                    .iter()
+                    .filter(|((ns, _), _)| ns == namespace)
+                    .map(|((_, name), project)| (name.clone(), project.spec.parent.clone()))
+                    .collect();
+                match flotilla_resources::ProjectHierarchy::new(declared, self.fleet_projects.get(namespace).cloned()) {
+                    Ok(hierarchy) => Some((namespace, hierarchy)),
+                    Err(error) => {
+                        tracing::warn!(%namespace, %error, "Project hierarchy unavailable during federation");
+                        None
+                    }
+                }
+            })
+            .collect::<BTreeMap<_, _>>();
         let rows = self
             .projects
             .values()
             .map(|project| ProjectRepositoriesRow {
+                parent: hierarchies
+                    .get(&project.metadata.namespace)
+                    .and_then(|hierarchy| hierarchy.parent(&project.metadata.name).ok().flatten())
+                    .map(|name| ResourceRef::new("flotilla.work/v1", "Project", &project.metadata.namespace, name)),
                 resource: ResourceRef::new(
                     api_version(Project::API_PATHS),
                     Project::API_PATHS.kind,
@@ -6449,5 +6527,55 @@ mod tests {
             ConvoyStatus { phase: ResourceConvoyPhase::Failed, message: Some("missing input 'topic'".into()), ..Default::default() };
 
         assert!(!convoy_is_initializing(Some(&status)));
+    }
+}
+
+#[cfg(test)]
+mod project_parent_tests {
+    use flotilla_resources::{FleetDesignation, FleetDesignationSpec, InMemoryBackend, InputMeta, ProjectSpec, ResourceBackend};
+
+    use super::*;
+
+    // #2718: a fleet designation watch projects implicit parents, and an
+    // explicit intermediate Project is published using the shared resolver.
+    #[tokio::test]
+    async fn designation_watch_rebuilds_project_parents() {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        for (name, parent) in [("root", None), ("group", None), ("child", Some("group"))] {
+            backend
+                .definitions::<Project>("flotilla")
+                .apply(
+                    &InputMeta::builder().name(name.into()).build(),
+                    &ProjectSpec::builder()
+                        .display_name(name.into())
+                        .default_workflow_ref("work".into())
+                        .maybe_parent(parent.map(str::to_string))
+                        .build(),
+                )
+                .await
+                .expect("project");
+        }
+        backend
+            .definitions::<FleetDesignation>("flotilla")
+            .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec { project: "root".into() })
+            .await
+            .expect("designation");
+        let state = AggregatorProjectionState::new();
+        let (tx, _) = broadcast::channel(32);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), tx);
+        let _project_watch = aggregator.recover_project_watch(&backend.including_replicas::<Project>("flotilla")).await.expect("projects");
+        let _fleet_watch = aggregator
+            .recover_fleet_designation_watch(&backend.including_replicas::<FleetDesignation>("flotilla"))
+            .await
+            .expect("designation watch");
+        let query = QueryId::ProjectRepositories { scope: None };
+        let set = state.result_set_for(&query).await.expect("result set");
+        let rows = set.rows.as_project_repositories().expect("rows");
+        let root = rows.iter().find(|row| row.resource.name == "root").expect("root");
+        let group = rows.iter().find(|row| row.resource.name == "group").expect("group");
+        let child = rows.iter().find(|row| row.resource.name == "child").expect("child");
+        assert!(root.parent.is_none());
+        assert_eq!(group.parent.as_ref().map(|parent| parent.name.as_str()), Some("root"));
+        assert_eq!(child.parent.as_ref().map(|parent| parent.name.as_str()), Some("group"));
     }
 }

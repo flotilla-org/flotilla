@@ -14,6 +14,8 @@ pub const DECLARATION_FILE_ANNOTATION: &str = "flotilla.work/project-declaration
 #[serde(deny_unknown_fields)]
 pub struct ProjectDeclaration {
     pub name: String,
+    #[serde(default)]
+    pub parent: Option<String>,
     pub default_workflow: Option<String>,
     #[serde(default)]
     pub role_needs: BTreeMap<String, BTreeSet<CapabilityNeed>>,

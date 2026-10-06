@@ -39,6 +39,20 @@ pub enum ResourceBackend {
 }
 
 impl ResourceBackend {
+    pub(crate) async fn hierarchy_admission(&self, kind: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if !crate::project_hierarchy::is_hierarchy_kind(kind) {
+            return None;
+        }
+        let lock = match self {
+            Self::InMemory(backend) => &backend.hierarchy_admission,
+            Self::Sqlite(backend) => &backend.hierarchy_admission,
+            // DefinitionResolver rejects HTTP authoring; no admission lock is
+            // needed for this read-only Definitions backend.
+            Self::Http(_) => return None,
+        };
+        Some(lock.clone().lock_owned().await)
+    }
+
     pub fn with_local_root(self, local_root: NodeId) -> Self {
         match self {
             Self::InMemory(backend) => Self::InMemory(backend.with_local_root(local_root)),

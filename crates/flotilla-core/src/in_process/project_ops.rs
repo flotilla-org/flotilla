@@ -76,6 +76,7 @@ fn normalize_project_name(name: &str) -> Result<String, String> {
 
 fn whole_repository_project_spec(repository_key: RepositoryKey, display_name: String) -> Result<ProjectSpec, String> {
     normalize_project_spec(ProjectSpec {
+        parent: None,
         platform_matrix: Vec::new(),
         display_name,
         default_workflow_ref: "single-agent".to_string(),
@@ -490,6 +491,7 @@ impl ProjectService<'_> {
             });
         }
         let spec = normalize_project_spec(ProjectSpec {
+            parent: declaration.parent.clone(),
             display_name: declaration.name.clone(),
             default_workflow_ref: declaration.default_workflow.unwrap_or_else(|| "single-agent".to_string()),
             role_needs: declaration.role_needs,

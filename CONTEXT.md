@@ -12,7 +12,9 @@ Flotilla is one member of a product family that communicates over HTTP-over-UDS
 
 **Fleet**:
 The whole set of development resources Flotilla coordinates across hosts. The
-boats are the dev resources; the islands are the repositories/projects.
+boats are the dev resources; the islands are the repositories/projects. One
+Project is designated as the fleet root and stewards the fleet itself; the
+Flotilla product Project is an ordinary member of that fleet.
 
 **Island**:
 The guiding metaphor for a repository/project as a stewarded place where work
@@ -28,6 +30,17 @@ default; that Project remains user-editable. The concrete form of the **Island**
 metaphor. Not a monorepo manifest — closer to a set of source roots modified
 together (see ADR 0020).
 _Avoid_: Repo (a Project may span more than the bare git remote), Workspace.
+
+**Parent**:
+The Project that supervises a Project and supplies inherited defaults. An
+undeclared parent is the fleet Project; the fleet has no parent. Intermediate
+parents group Projects under a shared roadmap. Parent relationships form a tree;
+code dependencies form a separate graph.
+
+**Charter**:
+A Project's declared contents, defaults and prose, supplied inline or by a
+delegated repository source. Charter prose is delivered to role holders through
+briefs and superseding Messages.
 
 **Repository**:
 The machine-independent identity of one source repository, shared by every

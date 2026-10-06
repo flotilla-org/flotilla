@@ -803,6 +803,8 @@ pub struct CleatEndpoint {
 /// `repositories` list known-empty; absence means the definition is unavailable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectRepositoriesRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ResourceRef>,
     pub resource: ResourceRef,
     pub display_name: String,
     pub repositories: Vec<ProjectRepositoryMembership>,
