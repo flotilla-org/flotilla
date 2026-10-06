@@ -1757,21 +1757,36 @@ async fn run_attach(
         .map_err(|e| color_eyre::eyre::eyre!(e))?;
 
     match result {
-        CommandValue::AttachCommandResolved { plan, binding } => match format {
-            OutputFormat::Json => {
-                println!("{}", flotilla_protocol::output::json_pretty(&CommandValue::AttachCommandResolved { plan, binding }));
-                Ok(())
-            }
-            OutputFormat::Human => {
-                if let Some(phase) = binding.as_ref().and_then(|binding| binding.convoy_phase) {
-                    eprintln!("Convoy phase: {phase}");
+        CommandValue::AttachCommandResolved { plan, binding } => {
+            let plan = if cli.remote_daemon().map_err(color_eyre::eyre::Report::msg)?.is_some() {
+                let binding = binding.as_ref().ok_or_else(|| color_eyre::eyre::eyre!("remote attach response has no host binding"))?;
+                let config = ConfigStore::with_base(&cli.client_paths().map_err(color_eyre::eyre::Report::msg)?.config_dir);
+                flotilla_tui::terminal::remote_attach_plan(
+                    &config.load_hosts().map_err(color_eyre::eyre::Report::msg)?,
+                    &binding.host,
+                    binding.session.as_deref().unwrap_or(reference),
+                    mode,
+                )
+                .map_err(color_eyre::eyre::Report::msg)?
+            } else {
+                plan
+            };
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", flotilla_protocol::output::json_pretty(&CommandValue::AttachCommandResolved { plan, binding }));
+                    Ok(())
                 }
-                if !transient {
-                    stamp_pane_identity(reference, binding.as_ref()).await;
+                OutputFormat::Human => {
+                    if let Some(phase) = binding.as_ref().and_then(|binding| binding.convoy_phase) {
+                        eprintln!("Convoy phase: {phase}");
+                    }
+                    if !transient {
+                        stamp_pane_identity(reference, binding.as_ref()).await;
+                    }
+                    run_attach_plan(&plan)
                 }
-                run_attach_plan(&plan)
             }
-        },
+        }
         CommandValue::Error { message } => match format {
             OutputFormat::Json => {
                 println!("{}", flotilla_protocol::output::json_pretty(&CommandValue::Error { message: message.clone() }));

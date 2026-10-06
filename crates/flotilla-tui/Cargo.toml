@@ -37,16 +37,21 @@ clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
 indexmap = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
 async-trait = { workspace = true }
 flotilla-core = { path = "../flotilla-core", features = ["test-support"] }
-flotilla-daemon = { path = "../flotilla-daemon", features = ["test-support"] }
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
 insta = "1"
 tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+flotilla-daemon = { path = "../flotilla-daemon", features = ["test-support"] }
 
 [[example]]
 name = "splash-fixture"

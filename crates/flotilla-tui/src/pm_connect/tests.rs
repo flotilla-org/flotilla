@@ -1099,3 +1099,17 @@ async fn reconnect_loop_backs_off_transient_sessions_and_resets_after_health() {
         }
     }
 }
+
+// A remote-daemon connector identifies the viewer using its physical hostname,
+// even if its local configuration carries the remote daemon's identity.
+#[test]
+fn remote_connector_keeps_viewer_locality() {
+    use flotilla_protocol::HostName;
+    for configured in [None, Some("kiwi".to_string()), Some("custom-local".to_string())] {
+        assert_eq!(super::connector_local_host(true, configured.clone(), HostName::new("beaufort")), HostName::new("beaufort"));
+        assert_eq!(
+            super::connector_local_host(false, configured.clone(), HostName::new("beaufort")),
+            configured.map(HostName::new).unwrap_or_else(|| HostName::new("beaufort"))
+        );
+    }
+}

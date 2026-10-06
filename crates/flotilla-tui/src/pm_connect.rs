@@ -534,6 +534,15 @@ async fn run_connector_subscribed(
     }
 }
 
+// A remote daemon's configured identity cannot establish viewer locality.
+fn connector_local_host(remote: bool, configured: Option<String>, viewer: HostName) -> HostName {
+    if remote {
+        viewer
+    } else {
+        configured.map(HostName::new).unwrap_or(viewer)
+    }
+}
+
 /// CLI entry: detect the PM, then keep a connector running against the local
 /// daemon, reconnecting on failure. Catalog facts fade by TTL while the
 /// daemon is away and re-assert on return.
@@ -554,7 +563,7 @@ pub async fn run(
         .try_init();
     let sink = resolve_pm(&options, &|key| std::env::var(key).ok())?.sink();
     let config = ConfigStore::with_base(config_dir);
-    let local_host = config.load_daemon_config()?.host_name.map(HostName::new).unwrap_or_else(HostName::local);
+    let local_host = connector_local_host(remote.is_some(), config.load_daemon_config()?.host_name, HostName::local());
     let hosts = config.load_hosts()?;
     let mut ssh_hosts = BTreeMap::new();
     let mut ambiguous = HashSet::new();
