@@ -30,6 +30,10 @@ pub(crate) const HOST_ENVIRONMENT_KEYS: &[&str] = &[
     "DYLD_LIBRARY_PATH",
 ];
 const CLEAT_CLIENT_KEYS: &[&str] = &["CLEAT_RUNTIME_DIR", "CLEAT_DAEMON"];
+// Cleat sets these session coordinates itself and refuses them as launch
+// `--env` values (cleat `AMBIENT_COORDINATE_ENV_NAMES`, matched ignoring case).
+// They stay in the client environment, where they locate the daemon.
+const CLEAT_MANAGED_KEYS: &[&str] = &["CLEAT_RUNTIME_DIR", "CLEAT_DAEMON", "CLEAT_SESSION", "CLEAT_OUTPUT_DAEMON"];
 // Environment-tool requirements installed during contained provisioning.
 // These keep daemon access and Rust limits usable after clearing inheritance;
 // they are not a wildcard import of the container's environment.
@@ -80,8 +84,17 @@ impl ControlledTerminalEnvironment {
     /// Explicit session/adapter entries override baseline values. Cleat owns
     /// its VT identity and fresh session coordinates (cleat#318); outer TERM,
     /// COLORTERM and session coordinates are absent from the host-direct baseline.
+    /// Cleat-managed coordinates are dropped: a provisioned vessel baseline
+    /// carries `CLEAT_RUNTIME_DIR` for the client, but cleat refuses it at launch.
     pub(crate) fn session_environment(&self, declared: &TerminalEnvVars) -> TerminalEnvVars {
-        self.host.iter().chain(declared).cloned().collect::<BTreeMap<_, _>>().into_iter().collect()
+        self.host
+            .iter()
+            .chain(declared)
+            .filter(|(key, _)| !CLEAT_MANAGED_KEYS.iter().any(|managed| key.eq_ignore_ascii_case(managed)))
+            .cloned()
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .collect()
     }
 
     /// Clearing at the execution-environment runner seam works for local,
