@@ -5731,8 +5731,9 @@ impl InProcessDaemon {
             .clone()
     }
 
-    /// Returns the canonical admitted record. Suppression returns its delivered
-    /// predecessor; the submitted successor name is not created.
+    /// Returns the canonical admitted record. Suppression before creation does
+    /// not create the successor ID. A recovered partial creation stays as a
+    /// superseded audit record and durably forwards admission to its predecessor.
     async fn apply_intent_document(
         &self,
         namespace: &str,

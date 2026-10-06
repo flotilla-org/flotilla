@@ -458,3 +458,84 @@ async fn contextual_admission_qualifies_both_roles() {
     assert_eq!(record.spec.sender, "project/convoy/work/reviewer");
     assert_eq!(record.spec.receiver, "project/convoy/work/coder");
 }
+
+// Suppression during recovery must keep returning its canonical predecessor,
+// including after the predecessor's expectation closes.
+#[tokio::test]
+async fn replay_of_suppressed_partial_admission_returns_canonical_predecessor() {
+    use flotilla_resources::{apply_status_patch, MessageAdmission, MessageInbox};
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let inbox = MessageInbox::new(backend.clone(), "flotilla");
+    let messages = backend.using::<Message>("flotilla");
+    let first = spec(None, MessageExpectation::Reply);
+    inbox.accept(&InputMeta::builder().name("first".into()).build(), &first, at(10)).await.unwrap();
+    let mut next = first.clone();
+    next.supersedes = Some("first".into());
+    messages.create(&InputMeta::builder().name("partial".into()).build(), &next).await.unwrap();
+    apply_status_patch(&messages, "first", &MessageStatusPatch::Delivered {
+        receiver: ResolvedMessageReceiver::builder()
+            .crew_id("crew".into())
+            .session("session".into())
+            .delivered_at(at(20))
+            .evidence("receipt".into())
+            .build(),
+        at: at(20),
+    })
+    .await
+    .unwrap();
+    for now in [21, 22] {
+        let restarted = MessageInbox::new(backend.clone(), "flotilla");
+        let admission = restarted.accept(&InputMeta::builder().name("partial".into()).build(), &next, at(now)).await.unwrap();
+        assert!(matches!(admission, MessageAdmission::Suppressed { predecessor } if predecessor.metadata.name == "first"));
+    }
+    apply_status_patch(&messages, "first", &MessageStatusPatch::Finish {
+        phase: MessagePhase::Answered,
+        reason: "reply received".into(),
+        at: at(23),
+    })
+    .await
+    .unwrap();
+    let admission = inbox.accept(&InputMeta::builder().name("partial".into()).build(), &next, at(24)).await.unwrap();
+    assert!(matches!(admission, MessageAdmission::Suppressed { predecessor } if predecessor.metadata.name == "first"));
+    assert_eq!(messages.get("partial").await.unwrap().status.unwrap().phase, MessagePhase::Superseded);
+}
+
+#[tokio::test]
+async fn four_part_addresses_select_the_role_within_a_shared_vessel() {
+    use std::collections::BTreeMap;
+
+    use flotilla_resources::{resolve_message_receiver, Convoy, ConvoySpec, TerminalSession, CONVOY_LABEL, ROLE_LABEL, VESSEL_LABEL};
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    backend
+        .using::<Convoy>("flotilla")
+        .create(
+            &InputMeta::builder().name("convoy".into()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("flotilla".into()).build(),
+        )
+        .await
+        .unwrap();
+    for role in ["coder", "reviewer"] {
+        let mut intent = holder_spec("convoy");
+        intent.role = role.into();
+        backend
+            .using::<TerminalSession>("flotilla")
+            .create(
+                &InputMeta::builder()
+                    .name(role.into())
+                    .labels(BTreeMap::from([
+                        (CONVOY_LABEL.into(), "convoy".into()),
+                        (VESSEL_LABEL.into(), "work".into()),
+                        (ROLE_LABEL.into(), role.into()),
+                    ]))
+                    .build(),
+                &intent,
+            )
+            .await
+            .unwrap();
+    }
+    for role in ["coder", "reviewer"] {
+        let receiver = resolve_message_receiver(&backend, "flotilla", &format!("flotilla/convoy/work/{role}")).await.unwrap().unwrap();
+        assert_eq!(receiver.object.metadata.name, role);
+    }
+    assert!(resolve_message_receiver(&backend, "flotilla", "flotilla/convoy/work/absent").await.unwrap().is_none());
+}

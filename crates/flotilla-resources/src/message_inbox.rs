@@ -104,6 +104,8 @@ impl MessageInbox {
         self.accept(meta, &qualified, now).await
     }
 
+    /// Admit an immutable intent. Bare senders require `accept_in_context`; a fully
+    /// qualified sender supplies context for a relative receiver.
     pub async fn accept(&self, meta: &InputMeta, spec: &MessageSpec, now: DateTime<Utc>) -> Result<MessageAdmission, ResourceError> {
         let _guard = self.admission.lock().await;
         Message::validate_spec(meta, spec)?;
@@ -111,6 +113,13 @@ impl MessageInbox {
             Ok(existing) if existing.spec == *spec => {
                 // Status is written only after predecessor cleanup. A missing
                 // status is an unfinished admission, so replay must repair it.
+                if let Some(reference) = existing.status.as_ref().and_then(|status| status.canonical_predecessor.as_ref()) {
+                    if reference.namespace != self.messages.namespace {
+                        return Err(ResourceError::invalid("canonical predecessor is outside the receiver inbox"));
+                    }
+                    let predecessor = self.messages.get(&reference.name).await?;
+                    return Ok(MessageAdmission::Suppressed { predecessor });
+                }
                 if existing.status.is_some() {
                     return Ok(MessageAdmission::Accepted(existing));
                 }
@@ -140,9 +149,13 @@ impl MessageInbox {
             .collect();
         if let Some(predecessor) = predecessors.iter().find(|message| message_expectation_open(message)) {
             if let Some(partial) = &partial {
-                apply_status_patch(&self.messages, &partial.metadata.name, &MessageStatusPatch::Finish {
-                    phase: MessagePhase::Superseded,
-                    reason: format!("suppressed by {}", predecessor.metadata.name),
+                apply_status_patch(&self.messages, &partial.metadata.name, &MessageStatusPatch::Suppressed {
+                    predecessor: flotilla_protocol::ResourceRef::new(
+                        "flotilla.work/v1",
+                        "Message",
+                        &self.messages.namespace,
+                        &predecessor.metadata.name,
+                    ),
                     at: now,
                 })
                 .await?;
@@ -241,6 +254,8 @@ pub async fn resolve_message_receiver(
         .filter(|source| {
             let object = &source.object;
             object.metadata.labels.get(CONVOY_LABEL) == Some(&convoy.object.metadata.name)
+                // Four-part addresses constrain both vessel and role. A project role
+                // names the declared standing convoy's unique agent holder.
                 && (vessel.is_none() || object.metadata.labels.get(ROLE_LABEL).is_some_and(|value| value == role))
                 && vessel.is_none_or(|vessel| object.metadata.labels.get(VESSEL_LABEL).is_some_and(|value| value == vessel))
                 && matches!(object.spec.source, TerminalSessionSource::Agent { .. })

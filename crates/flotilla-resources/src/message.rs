@@ -48,6 +48,14 @@ impl Resource for Message {
         {
             return Err(ResourceError::invalid("delivered message requires a resolved receiver and transport evidence"));
         }
+        if requested.canonical_predecessor.as_ref().is_some_and(|reference| {
+            requested.phase != MessagePhase::Superseded
+                || reference.kind != "Message"
+                || reference.namespace.is_empty()
+                || reference.name.is_empty()
+        }) {
+            return Err(ResourceError::invalid("canonical suppression requires a superseded Message reference"));
+        }
         if let Some(current) = current {
             if current.phase.is_terminal() && current != requested {
                 return Err(ResourceError::invalid("terminal message status is immutable"));
@@ -168,6 +176,9 @@ pub struct MessageStatus {
     pub since: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// A recovered partial creation remains an audit record but replays its canonical admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_predecessor: Option<ResourceRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_receiver: Option<ResolvedMessageReceiver>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,6 +196,7 @@ impl Default for MessageStatus {
             // An absent status has no evidence timestamp. Writers provide their clock.
             since: DateTime::<Utc>::UNIX_EPOCH,
             reason: Some("waiting for receiver resolution".into()),
+            canonical_predecessor: None,
             resolved_receiver: None,
             retry: None,
             submission: None,
@@ -205,6 +217,7 @@ pub enum MessageStatusPatch {
     Wait { phase: MessagePhase, reason: String, at: DateTime<Utc> },
     Delivered { receiver: ResolvedMessageReceiver, at: DateTime<Utc> },
     Finish { phase: MessagePhase, reason: String, at: DateTime<Utc> },
+    Suppressed { predecessor: ResourceRef, at: DateTime<Utc> },
 }
 
 impl StatusPatch<MessageStatus> for MessageStatusPatch {
@@ -226,6 +239,13 @@ impl StatusPatch<MessageStatus> for MessageStatusPatch {
                 status.resolved_receiver = Some(receiver.clone());
                 status.retry = None;
                 (MessagePhase::Delivered, None, *at)
+            }
+            Self::Suppressed { predecessor, at } => {
+                if status.resolved_receiver.is_some() {
+                    return;
+                }
+                status.canonical_predecessor = Some(predecessor.clone());
+                (MessagePhase::Superseded, Some(format!("suppressed by {}", predecessor.name)), *at)
             }
             Self::Finish { phase, reason, at } => (*phase, Some(reason.clone()), *at),
         };
