@@ -2,8 +2,10 @@
 //! source acquisition stays behind the checkout-scoped VCS seam.
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -46,16 +48,6 @@ fn hash_context(directory: &Path) -> Result<Vec<String>, String> {
                 continue;
             }
             let relative = path.strip_prefix(root).map_err(|error| error.to_string())?.to_str().ok_or("image context path is not UTF-8")?;
-            let bytes = if meta.is_symlink() {
-                std::fs::read_link(&path)
-                    .map_err(|error| error.to_string())?
-                    .to_str()
-                    .ok_or("image symlink is not UTF-8")?
-                    .as_bytes()
-                    .to_vec()
-            } else {
-                std::fs::read(&path).map_err(|error| error.to_string())?
-            };
             #[cfg(unix)]
             let mode = {
                 use std::os::unix::fs::PermissionsExt;
@@ -68,7 +60,20 @@ fn hash_context(directory: &Path) -> Result<Vec<String>, String> {
             hash.update([0]);
             hash.update(mode.to_be_bytes());
             hash.update([u8::from(meta.is_symlink())]);
-            hash.update(bytes);
+            if meta.is_symlink() {
+                let target = std::fs::read_link(&path).map_err(|error| error.to_string())?;
+                hash.update(target.to_str().ok_or("image symlink is not UTF-8")?.as_bytes());
+            } else {
+                let mut file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let length = file.read(&mut buffer).map_err(|error| error.to_string())?;
+                    if length == 0 {
+                        break;
+                    }
+                    hash.update(&buffer[..length]);
+                }
+            }
             hashes.push(format!("sha256:{:x}", hash.finalize()));
         }
         Ok(())
@@ -78,7 +83,7 @@ fn hash_context(directory: &Path) -> Result<Vec<String>, String> {
     Ok(hashes)
 }
 
-fn hash_layer_inputs(context: &Path, layer: &FrozenImageLayer) -> Result<Vec<String>, String> {
+fn hash_layer_inputs_blocking(context: &Path, layer: &FrozenImageLayer) -> Result<Vec<String>, String> {
     let mut hashes = hash_context(context)?;
     let verification = serde_json::to_vec(&(&layer.spec.fragment, &layer.spec.provides, &layer.spec.requires, &layer.spec.probes))
         .map_err(|error| error.to_string())?;
@@ -86,22 +91,48 @@ fn hash_layer_inputs(context: &Path, layer: &FrozenImageLayer) -> Result<Vec<Str
     Ok(hashes)
 }
 
+const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+const CLI_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_REASON_CHARS: usize = 2048;
+
+async fn hash_layer_inputs(context: &Path, layer: &FrozenImageLayer) -> Result<Vec<String>, String> {
+    let context = context.to_path_buf();
+    let layer = layer.clone();
+    tokio::task::spawn_blocking(move || hash_layer_inputs_blocking(&context, &layer)).await.map_err(|error| error.to_string())?
+}
+
+// Status holds a bounded diagnostic, while the Artifact retains the full output.
+// BuildKit's final ERROR summary follows the progress stream. Never classify
+// arbitrary Dockerfile/probe output as infrastructure evidence.
+fn failure_summary(stderr: &str, exit_code: Option<i32>) -> String {
+    let tail = stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("").trim();
+    let summary = if tail.is_empty() { format!("Docker process exited with {exit_code:?}") } else { tail.to_string() };
+    summary.chars().take(MAX_REASON_CHARS).collect()
+}
+
 fn classify_build_failure(exit_code: Option<i32>, reason: &str) -> ImageBuildFailureClass {
-    let reason = reason.to_ascii_lowercase();
+    let reason = failure_summary(reason, exit_code).to_ascii_lowercase();
+    if exit_code.is_some() && exit_code != Some(137) && reason.contains("did not complete successfully") && reason.contains("exit code:") {
+        return ImageBuildFailureClass::Deterministic;
+    }
     let infrastructure = [
-        "timeout",
         "connection reset",
         "connection refused",
-        "no space left",
-        "429",
-        "temporary failure",
+        "no space left on device",
+        "temporary failure in name resolution",
         "no such host",
-        "tls handshake",
+        "tls handshake timeout",
         "cannot connect to the docker daemon",
         "network is unreachable",
         "service unavailable",
         "code = unavailable",
         "unexpected eof",
+        "i/o timeout",
+        "context deadline exceeded",
+        "http 429",
+        "status code: 429",
+        "429 too many requests",
     ];
     if exit_code.is_none() || exit_code == Some(137) || infrastructure.iter().any(|signal| reason.contains(signal)) {
         ImageBuildFailureClass::Transient
@@ -111,20 +142,31 @@ fn classify_build_failure(exit_code: Option<i32>, reason: &str) -> ImageBuildFai
 }
 
 impl BuildxRunner {
+    async fn output_with_timeout(
+        &self,
+        args: &[&str],
+        context: &Path,
+        timeout: Duration,
+    ) -> Result<flotilla_core::providers::CommandOutput, String> {
+        tokio::time::timeout(timeout, self.runner.run_output("docker", args, context, &ChannelLabel::Default))
+            .await
+            .map_err(|_| format!("Docker process exceeded wall-clock deadline of {} seconds", timeout.as_secs()))?
+    }
+
     async fn context(&self, layer: &FrozenImageLayer) -> Result<PathBuf, String> {
         let directory =
             self.directory.join(format!("source-{:x}", Sha256::digest(format!("{}\0{}", layer.spec.repository, layer.spec.revision))));
         let lock = flotilla_core::charter_store::reconciliation_lock(&directory.to_string_lossy());
         let _guard = lock.lock().await;
-        if !directory.join("complete").exists() {
+        if !tokio::fs::try_exists(directory.join("complete")).await.map_err(|error| error.to_string())? {
             let _ = tokio::fs::remove_dir_all(directory.join("context")).await;
             self.vcs.image_build_context(&directory, &layer.spec.repository, &layer.spec.revision).await?;
             tokio::fs::write(directory.join("complete"), b"complete").await.map_err(|error| error.to_string())?;
         }
         let context = directory.join("context");
         let fragment = context.join(&layer.spec.fragment);
-        let canonical = fragment.canonicalize().map_err(|error| error.to_string())?;
-        if !canonical.starts_with(context.canonicalize().map_err(|error| error.to_string())?) {
+        let canonical = tokio::fs::canonicalize(fragment).await.map_err(|error| error.to_string())?;
+        if !canonical.starts_with(tokio::fs::canonicalize(&context).await.map_err(|error| error.to_string())?) {
             return Err("Dockerfile fragment escapes immutable build context".into());
         }
         Ok(context)
@@ -140,7 +182,7 @@ impl BuildxRunner {
         let deterministic = |reason| ImageBuildFailure { class: ImageBuildFailureClass::Deterministic, reason };
         let transient = |reason| ImageBuildFailure { class: ImageBuildFailureClass::Transient, reason };
         let context = self.context(&spec.layer).await.map_err(transient)?;
-        let hashes = hash_layer_inputs(&context, &spec.layer).map_err(deterministic)?;
+        let hashes = hash_layer_inputs(&context, &spec.layer).await.map_err(deterministic)?;
         if hashes != spec.inputs.content_hashes {
             return Err(deterministic("image context differs from frozen input hashes".into()));
         }
@@ -177,7 +219,13 @@ impl BuildxRunner {
                 // record the ID, never this label, as the parent identity.
                 let label = format!("flotilla-parent:{:x}", Sha256::digest(parent_digest));
                 self.runner
-                    .run("docker", &["--config", config_arg, "image", "tag", parent_digest, &label], &context, &ChannelLabel::Default)
+                    .run_with_timeout(
+                        "docker",
+                        &["--config", config_arg, "image", "tag", parent_digest, &label],
+                        &context,
+                        &ChannelLabel::Default,
+                        CLI_TIMEOUT,
+                    )
                     .await
                     .map_err(transient)?;
                 label
@@ -192,29 +240,28 @@ impl BuildxRunner {
         args.push(".".into());
         let args = args.iter().map(String::as_str).collect::<Vec<_>>();
         let cached = self
-            .runner
-            .run_output(
-                "docker",
-                &["--config", config_arg, "image", "inspect", "--format", "{{.Id}}", &tag],
-                &context,
-                &ChannelLabel::Default,
-            )
+            .output_with_timeout(&["--config", config_arg, "image", "inspect", "--format", "{{.Id}}", &tag], &context, CLI_TIMEOUT)
             .await
             .map_err(transient)?;
         if !cached.success() {
-            let output = self.runner.run_output("docker", &args, &context, &ChannelLabel::Default).await.map_err(transient)?;
+            let output = self.output_with_timeout(&args, &context, BUILD_TIMEOUT).await.map_err(transient)?;
             log.push_str(&output.stdout);
             log.push_str(&output.stderr);
             if !output.success() {
-                let reason =
-                    if output.stderr.is_empty() { format!("docker buildx exited with {:?}", output.exit_code) } else { output.stderr };
+                let reason = failure_summary(&output.stderr, output.exit_code);
                 let class = classify_build_failure(output.exit_code, &reason);
                 return Err(ImageBuildFailure { class, reason });
             }
         }
         let identity = self
             .runner
-            .run("docker", &["--config", config_arg, "image", "inspect", "--format", "{{.Id}}", &tag], &context, &ChannelLabel::Default)
+            .run_with_timeout(
+                "docker",
+                &["--config", config_arg, "image", "inspect", "--format", "{{.Id}}", &tag],
+                &context,
+                &ChannelLabel::Default,
+                CLI_TIMEOUT,
+            )
             .await
             .map_err(transient)?;
         let identity = PlacedImageIdentity { local_image_id: identity.trim().into(), registry_digest: None };
@@ -228,11 +275,21 @@ impl BuildxRunner {
                 .get(provide)
                 .filter(|command| !command.is_empty())
                 .ok_or_else(|| deterministic(format!("no verification probe declared for {provide}")))?;
+            let probe_name = format!("flotilla-probe-{:x}", Sha256::digest(format!("{name}\0{provide}")));
+            let cpus = spec.reservation.cpu.to_string();
             let mut args = vec![
                 "--config",
                 config_arg,
                 "run",
                 "--rm",
+                "--name",
+                &probe_name,
+                "--cpus",
+                &cpus,
+                "--memory",
+                "512m",
+                "--pids-limit",
+                "128",
                 "--pull=never",
                 "--network=none",
                 "--entrypoint",
@@ -240,11 +297,38 @@ impl BuildxRunner {
                 &identity.local_image_id,
             ];
             args.extend(command.iter().skip(1).map(String::as_str));
-            let output = self.runner.run_output("docker", &args, &context, &ChannelLabel::Default).await.map_err(transient)?;
+            let output = match self.output_with_timeout(&args, &context, PROBE_TIMEOUT).await {
+                Ok(output) => output,
+                Err(reason) => {
+                    // Dropping the Docker CLI alone does not stop its container.
+                    let _ = self
+                        .runner
+                        .run_with_timeout(
+                            "docker",
+                            &["--config", config_arg, "rm", "--force", &probe_name],
+                            &context,
+                            &ChannelLabel::Default,
+                            CLI_TIMEOUT,
+                        )
+                        .await;
+                    return Err(transient(reason));
+                }
+            };
             log.push_str(&output.stdout);
             log.push_str(&output.stderr);
             if !output.success() {
-                return Err(deterministic(format!("provide verification failed: {provide}")));
+                let reason = failure_summary(&output.stderr, output.exit_code);
+                // 125 is Docker's own failure, 126/127 are an unusable probe
+                // command, and other nonzero codes belong to the probe itself.
+                let class = if output.exit_code == Some(125) || output.exit_code.is_none() || output.exit_code == Some(137) {
+                    classify_build_failure(output.exit_code, &reason)
+                } else {
+                    ImageBuildFailureClass::Deterministic
+                };
+                return Err(ImageBuildFailure {
+                    class,
+                    reason: format!("provide verification failed: {provide}: {reason}").chars().take(MAX_REASON_CHARS).collect(),
+                });
             }
             verified.insert(provide.clone());
         }
@@ -257,7 +341,7 @@ impl ImageBuildInputResolver for BuildxRunner {
     async fn resolve(&self, layer: &FrozenImageLayer, architecture: &str) -> Result<ImageBuildSourceInputs, String> {
         let context = self.context(layer).await?;
         Ok(ImageBuildSourceInputs::builder()
-            .content_hashes(hash_layer_inputs(&context, layer)?)
+            .content_hashes(hash_layer_inputs(&context, layer).await?)
             .architecture(architecture.into())
             .args(layer.spec.args.clone())
             .pins(layer.spec.pins.iter().map(|(name, pin)| (name.clone(), pin.value.clone())).collect::<BTreeMap<_, _>>())
@@ -270,10 +354,11 @@ impl ImageBuildInputResolver for BuildxRunner {
 impl ImageBuildRunner for BuildxRunner {
     async fn build(&self, name: &str, spec: &ImageBuildSpec, parent_digest: &str) -> Result<ImageBuildResult, String> {
         let mut log = String::new();
-        let result = self.execute(name, spec, parent_digest, &mut log).await;
+        let mut result = self.execute(name, spec, parent_digest, &mut log).await;
         let _ = tokio::fs::remove_dir_all(self.directory.join(format!("config-{:x}", Sha256::digest(name)))).await;
-        if let Err(failure) = &result {
+        if let Err(failure) = &mut result {
             log.push_str(&format!("\n{}\n", failure.reason));
+            failure.reason = failure.reason.chars().take(MAX_REASON_CHARS).collect();
         }
         let artifact_name = format!("image-build-log-{name}");
         let saved: Result<(), String> = async {
@@ -292,7 +377,10 @@ impl ImageBuildRunner for BuildxRunner {
             let artifacts = self.backend.using::<Artifact>(&self.namespace);
             match artifacts.create(&InputMeta::builder().name(artifact_name.clone()).build(), &artifact).await {
                 Ok(_) => Ok(()),
-                Err(flotilla_resources::ResourceError::Conflict { .. }) => Ok(()),
+                Err(flotilla_resources::ResourceError::Conflict { .. }) => {
+                    tracing::debug!(artifact = %artifact_name, "preserving original execution log during recovery");
+                    Ok(())
+                }
                 Err(error) => Err(error.to_string()),
             }
         }
@@ -328,7 +416,8 @@ pub(crate) async fn project_builds(
         match builds.get(&obj.metadata.name).await {
             Ok(current) => {
                 if current.spec.inputs != obj.spec.inputs || current.spec.recipe_key != obj.spec.recipe_key {
-                    return Err(flotilla_resources::ResourceError::invalid("image build execution name collision"));
+                    tracing::error!(role = "infra", image_build = %obj.metadata.name, "image build execution name collision; skipping demand");
+                    continue;
                 }
             }
             Err(flotilla_resources::ResourceError::NotFound { .. }) => {
@@ -386,6 +475,18 @@ mod tests {
             .build();
         home.using::<ImageBuild>("test").create(&InputMeta::builder().name("build".into()).build(), &spec).await.expect("demand");
         builder
+            .using::<ImageBuild>("test")
+            .create(&InputMeta::builder().name("bad".into()).build(), &spec)
+            .await
+            .expect("existing collision");
+        let mut conflicting = spec.clone();
+        conflicting.inputs.args.insert("DIFFERENT".into(), "yes".into());
+        conflicting.recipe_key = conflicting.inputs.recipe_key().expect("different key");
+        home.using::<ImageBuild>("test")
+            .create(&InputMeta::builder().name("bad".into()).build(), &conflicting)
+            .await
+            .expect("colliding demand");
+        builder
             .replica_writer::<ImageBuild>(NodeId::new("home"), "test")
             .replace(&home.using::<ImageBuild>("test").list().await.expect("demand snapshot"), Utc::now())
             .await
@@ -394,7 +495,7 @@ mod tests {
             project_builds(&builder, "test", "builder").await.expect("project");
         }
         let builds = builder.using::<ImageBuild>("test");
-        assert_eq!(builds.list().await.expect("list").items.len(), 1);
+        assert_eq!(builds.list().await.expect("list").items.len(), 2);
         apply_status_patch(&builds, "build", &ImageBuildStatusPatch::Start {
             at: Utc::now(),
             parent_digest: spec.inputs.parent_digest.clone(),
@@ -440,6 +541,11 @@ mod runner_contract {
     #[derive(Default)]
     struct DockerProcess {
         builds: std::sync::atomic::AtomicUsize,
+        removed: std::sync::atomic::AtomicUsize,
+        build_failure: Option<CommandOutput>,
+        probe_failure: Option<CommandOutput>,
+        hang_build: bool,
+        hang_probe: bool,
     }
     #[async_trait]
     impl CommandRunner for DockerProcess {
@@ -448,6 +554,12 @@ mod runner_contract {
         }
         async fn run(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<String, String> {
             assert_eq!(cmd, "docker");
+            if args[2] == "rm" {
+                assert_eq!(args[3], "--force");
+                assert!(args[4].starts_with("flotilla-probe-"));
+                self.removed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Ok(String::new());
+            }
             assert_eq!(&args[2..6], &["image", "inspect", "--format", "{{.Id}}"]);
             assert_eq!(args[0], "--config");
             Ok(format!("sha256:{}\n", "3".repeat(64)))
@@ -465,6 +577,16 @@ mod runner_contract {
                     }
                     assert!(args.contains(&"--load"));
                     assert!(!args.contains(&"--push"));
+                    if self.hang_build {
+                        std::future::pending::<()>().await;
+                    }
+                    if let Some(output) = &self.build_failure {
+                        return Ok(CommandOutput {
+                            stdout: output.stdout.clone(),
+                            stderr: output.stderr.clone(),
+                            exit_code: output.exit_code,
+                        });
+                    }
                     Ok(CommandOutput { stdout: "build log\n".into(), stderr: String::new(), exit_code: Some(0) })
                 }
                 "image" => {
@@ -480,6 +602,19 @@ mod runner_contract {
                     assert!(args.windows(2).any(|window| window == ["--entrypoint", "probe"]));
                     assert!(args.contains(&"--pull=never"));
                     assert!(args.contains(&"--network=none"));
+                    for pair in [["--cpus", "1"], ["--memory", "512m"], ["--pids-limit", "128"]] {
+                        assert!(args.windows(2).any(|window| window == pair));
+                    }
+                    if self.hang_probe {
+                        std::future::pending::<()>().await;
+                    }
+                    if let Some(output) = &self.probe_failure {
+                        return Ok(CommandOutput {
+                            stdout: output.stdout.clone(),
+                            stderr: output.stderr.clone(),
+                            exit_code: output.exit_code,
+                        });
+                    }
                     assert_eq!(args.last(), Some(&"--version"));
                     Ok(CommandOutput { stdout: "probe log\n".into(), stderr: String::new(), exit_code: Some(0) })
                 }
@@ -488,23 +623,20 @@ mod runner_contract {
         }
     }
 
-    // Process loss and infrastructure outages retry; recipe and probe errors do
-    // not. Docker's daemon-unreachable error has no "connection refused" text.
+    // Generated digest-heavy progress and arbitrary failing command text must
+    // never turn a recipe exit into an infrastructure retry.
     #[hegel::test]
-    fn infrastructure_errors_retry_without_retrying_recipe_errors(tc: hegel::TestCase) {
-        let uppercase = tc.draw(hegel::generators::booleans());
-        for reason in [
-            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?",
-            "TLS handshake timeout",
-            "connection reset by peer",
-            "no space left on device",
-            "rpc error: code = Unavailable",
-        ] {
-            let reason = if uppercase { reason.to_uppercase() } else { reason.into() };
-            assert_eq!(classify_build_failure(Some(1), &reason), ImageBuildFailureClass::Transient);
-        }
-        for reason in ["Dockerfile parse error line 2: unknown instruction", "process exited with code 1", "provide verification failed"] {
-            assert_eq!(classify_build_failure(Some(1), reason), ImageBuildFailureClass::Deterministic);
+    fn progress_digests_and_command_text_do_not_trigger_retries(tc: hegel::TestCase) {
+        let offset = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(61));
+        let lines = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(100));
+        let digest = format!("{}429{}", "a".repeat(offset), "b".repeat(61 - offset));
+        let stderr = format!("{}ERROR: failed to solve: process \"/bin/sh -c echo timeout HTTP 429 connection refused\" did not complete successfully: exit code: 1\n",
+            format!("#1 sha256:{digest} timeout test output\n").repeat(lines));
+        assert_eq!(classify_build_failure(Some(1), &stderr), ImageBuildFailureClass::Deterministic);
+        for reason in
+            ["Cannot connect to the Docker daemon", "TLS handshake timeout", "HTTP 429 Too Many Requests", "rpc error: code = Unavailable"]
+        {
+            assert_eq!(classify_build_failure(Some(1), reason), ImageBuildFailureClass::Transient);
         }
         assert_eq!(classify_build_failure(None, ""), ImageBuildFailureClass::Transient);
         assert_eq!(classify_build_failure(Some(137), ""), ImageBuildFailureClass::Transient);
@@ -512,8 +644,7 @@ mod runner_contract {
 
     // Buildx loads the host-local image without a registry, overrides arbitrary
     // image ENTRYPOINTs to run each declared probe, and stores the actual log.
-    #[tokio::test]
-    async fn buildx_verifies_provides_and_persists_its_process_log() {
+    async fn fixture(processes: Arc<DockerProcess>) -> (tempfile::TempDir, BuildxRunner, ImageBuildSpec) {
         let temp = tempfile::tempdir().expect("state directory");
         let directory = temp.path().join("image-builds");
         let layer = FrozenImageLayer {
@@ -533,7 +664,6 @@ mod runner_contract {
         std::fs::create_dir_all(source.join("context")).expect("context directory");
         std::fs::write(source.join("context/Dockerfile"), "ARG BASE\nFROM ${BASE}\n").expect("immutable source");
         std::fs::write(source.join("complete"), b"complete").expect("cached source marker");
-        let processes = Arc::new(DockerProcess::default());
         let runner: Arc<dyn CommandRunner> = processes.clone();
         let vcs = Arc::new(FlotillaVcs::new(
             ExecutionEnvironmentPath::new(temp.path()),
@@ -561,18 +691,116 @@ mod runner_contract {
             .attempt(0)
             .reason(ImageBuildReason { description: "demand".into(), old_inputs: BTreeMap::new(), new_inputs: BTreeMap::new() })
             .build();
+        (temp, builder, spec)
+    }
+
+    #[tokio::test]
+    async fn buildx_verifies_provides_and_persists_its_process_log() {
+        let processes = Arc::new(DockerProcess::default());
+        let (_temp, builder, spec) = fixture(processes.clone()).await;
         let result = builder.build("operation", &spec, &spec.inputs.parent_digest).await.expect("build and log");
         let ImageBuildResult::Built { identity, verified_provides, log_ref } = result else { panic!("successful build expected") };
         assert_eq!(identity.local_image_id, format!("sha256:{}", "3".repeat(64)));
         assert_eq!(verified_provides, BTreeSet::from(["test:probe".into()]));
-        let artifact = backend.using::<Artifact>("test").get(&log_ref).await.expect("log artifact");
+        let artifact = builder.backend.using::<Artifact>("test").get(&log_ref).await.expect("log artifact");
         assert_eq!(
-            blobs.get(&BlobDigest::parse(&artifact.spec.digest).expect("digest")).await.expect("log body").expect("stored log"),
+            builder.blobs.get(&BlobDigest::parse(&artifact.spec.digest).expect("digest")).await.expect("log body").expect("stored log"),
             b"build log\nprobe log\n"
         );
+        let service = crate::artifact::ArtifactService { backend: &builder.backend, blobs: &*builder.blobs, namespace: "test" };
+        assert!(artifact.spec.convoy.is_empty());
+        assert_eq!(service.list(None, Some("build-log"), None).await.expect("execution logs").len(), 1);
+        assert!(service.list(Some("a-convoy"), None, None).await.expect("convoy logs").is_empty());
+        assert!(service.reap_expired().await.expect("retention").contains(&BlobDigest::parse(&artifact.spec.digest).expect("digest")));
         assert!(!builder.directory.join(format!("config-{:x}", Sha256::digest("operation"))).exists());
         let again = builder.build("operation", &spec, &spec.inputs.parent_digest).await.expect("idempotent recovery");
         assert!(matches!(again, ImageBuildResult::Built { .. }));
         assert_eq!(processes.builds.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    // Real source hashes and Artifact storage surround injected Docker failures.
+    #[tokio::test]
+    async fn failures_keep_full_logs_but_bound_status_and_classify_probe_infrastructure() {
+        let stderr = format!("{}\nERROR: failed to solve: recipe error", "#1 sha256:429 timeout test output\n".repeat(50_000));
+        let processes = Arc::new(DockerProcess {
+            build_failure: Some(CommandOutput { stdout: String::new(), stderr: stderr.clone(), exit_code: Some(1) }),
+            ..Default::default()
+        });
+        let (_temp, builder, spec) = fixture(processes).await;
+        let ImageBuildResult::Failed { failure, log_ref } =
+            builder.build("failure", &spec, &spec.inputs.parent_digest).await.expect("failure log")
+        else {
+            panic!("expected failure")
+        };
+        assert_eq!(failure.class, ImageBuildFailureClass::Deterministic);
+        assert!(failure.reason.chars().count() <= MAX_REASON_CHARS);
+        let artifact = builder.backend.using::<Artifact>("test").get(&log_ref).await.expect("artifact");
+        let body = builder.blobs.get(&BlobDigest::parse(&artifact.spec.digest).expect("digest")).await.expect("blob").expect("log");
+        assert!(body.starts_with(stderr.as_bytes()));
+        for (code, reason, expected) in [
+            (125, "Cannot connect to the Docker daemon", ImageBuildFailureClass::Transient),
+            (125, "no space left on device", ImageBuildFailureClass::Transient),
+            (1, "HTTP 429 in a failing version check", ImageBuildFailureClass::Deterministic),
+            (127, "probe executable is missing", ImageBuildFailureClass::Deterministic),
+        ] {
+            let processes = Arc::new(DockerProcess {
+                probe_failure: Some(CommandOutput { stdout: String::new(), stderr: reason.into(), exit_code: Some(code) }),
+                ..Default::default()
+            });
+            let (_temp, builder, spec) = fixture(processes).await;
+            let ImageBuildResult::Failed { failure, .. } =
+                builder.build("probe", &spec, &spec.inputs.parent_digest).await.expect("probe log")
+            else {
+                panic!("expected probe failure")
+            };
+            assert_eq!(failure.class, expected);
+            assert!(failure.reason.contains(reason));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hung_processes_release_the_execution_and_remove_timed_out_probes() {
+        for probe in [false, true] {
+            let processes = Arc::new(DockerProcess { hang_build: !probe, hang_probe: probe, ..Default::default() });
+            let (_temp, builder, spec) = fixture(processes.clone()).await;
+            let started = tokio::time::Instant::now();
+            let ImageBuildResult::Failed { failure, .. } =
+                builder.build("hung", &spec, &spec.inputs.parent_digest).await.expect("timeout log")
+            else {
+                panic!("expected timeout")
+            };
+            assert_eq!(failure.class, ImageBuildFailureClass::Transient);
+            assert!(failure.reason.contains("wall-clock deadline"));
+            assert!(started.elapsed() >= if probe { PROBE_TIMEOUT } else { BUILD_TIMEOUT });
+            assert_eq!(processes.removed.load(std::sync::atomic::Ordering::SeqCst), usize::from(probe));
+        }
+    }
+
+    #[tokio::test]
+    async fn frozen_context_mismatch_stops_before_any_docker_process() {
+        let processes = Arc::new(DockerProcess::default());
+        let (_temp, builder, mut spec) = fixture(processes.clone()).await;
+        spec.inputs.content_hashes = vec![format!("sha256:{}", "f".repeat(64))];
+        let ImageBuildResult::Failed { failure, .. } =
+            builder.build("mismatch", &spec, &spec.inputs.parent_digest).await.expect("mismatch log")
+        else {
+            panic!("expected mismatch")
+        };
+        assert_eq!(failure.class, ImageBuildFailureClass::Deterministic);
+        assert_eq!(failure.reason, "image context differs from frozen input hashes");
+        assert_eq!(processes.builds.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn bounded_reasons_preserve_unicode_and_hashes_stream_binary_inputs() {
+        let reason = "λ".repeat(MAX_REASON_CHARS * 4);
+        let summary = failure_summary(&reason, Some(1));
+        assert_eq!(summary.chars().count(), MAX_REASON_CHARS);
+        let temp = tempfile::tempdir().expect("context");
+        let bytes = (0..200_000).map(|index| (index % 256) as u8).collect::<Vec<_>>();
+        std::fs::write(temp.path().join("binary"), &bytes).expect("binary context");
+        let first = hash_context(temp.path()).expect("stream hashes");
+        std::fs::write(temp.path().join("binary"), &bytes).expect("same bytes, new timestamp");
+        assert_eq!(first, hash_context(temp.path()).expect("same contents"));
+        std::fs::write(temp.path().join("binary"), b"changed").expect("changed contents");
+        assert_ne!(first, hash_context(temp.path()).expect("changed hash"));
     }
 }

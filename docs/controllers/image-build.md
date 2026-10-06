@@ -66,3 +66,23 @@ A local successful build provisions the Environment using its image ID with
 pulling disabled. A remote successful build continues waiting for digest transfer;
 registry publication, host inventory, transfer, and final identity freezing belong
 to #2729. Build garbage collection belongs to #2733.
+
+Build args and pin values must be non-secret: they appear in Docker argv and may
+appear in build output. Credentials require a separate secret-delivery mechanism;
+never put them in these fields. Buildx has a 30-minute wall-clock deadline and
+probes have a 60-second deadline. Timed-out probes are explicitly removed because
+terminating the Docker CLI alone does not terminate the container. Probes use the
+reservation's CPU count, a 512 MiB memory limit, and a 128-process limit. Disk
+reservation remains a planning floor; portable Docker disk quotas are not implied.
+
+Resource failure reasons are capped at 2,048 characters; full output remains in the
+Artifact. Classification uses the last error summary, recognises explicit HTTP
+rate-limit errors, and treats a recipe process's own exit as deterministic.
+Source hashes stream file contents on the blocking pool. VCS acquisition uses
+`git archive` into `context/`; its bare object cache, archive file, and completion
+marker are sibling entries outside the hashed Docker context.
+
+Build logs are shared by executions rather than owned by one convoy. Their empty
+`convoy` field deliberately excludes them from convoy-specific lists; unfiltered
+artifact listing and expiry/pinning-based retention still apply. Recovery preserves
+the first immutable execution log and emits a debug diagnostic for that reuse.
