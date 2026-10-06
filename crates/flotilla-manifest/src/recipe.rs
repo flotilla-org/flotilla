@@ -119,6 +119,9 @@ impl RecipeMint for FlotillaRecipes {
     }
 
     fn attach(&self, attach_ref: &str, host: &HostName) -> Option<Recipe> {
+        if host.as_str().contains('/') {
+            return None;
+        }
         Some(Recipe::address(
             "attach",
             format!("session:{host}/{attach_ref}"),
@@ -133,6 +136,9 @@ impl RecipeMint for FlotillaRecipes {
     }
 
     fn checkout_terminal(&self, path: &str, host: &HostName) -> Option<Recipe> {
+        if host.as_str().contains('/') {
+            return None;
+        }
         // Transient checkout terminals are genuine CLI commands, not live sessions.
         let argv = vec![
             self.flotilla_bin.clone(),

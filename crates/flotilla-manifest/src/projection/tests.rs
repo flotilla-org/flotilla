@@ -2898,7 +2898,8 @@ fn structured_action_facts_preserve_addresses_and_raw_arguments(tc: hegel::TestC
 
     // Empty, whitespace, quoting, Unicode, Windows paths, and shell syntax;
     // zero to twelve arguments crosses single-digit indices and permits duplicates.
-    let values = ["", "plain", "with spaces", "quote's\"", "$HOME;$(exit)", "C:\\Program Files\\flotilla.exe", "雪\nline"];
+    let values =
+        ["", "plain", "with spaces", "quote's\"", "$HOME;$(exit)", "C:\\Program Files\\flotilla.exe", "雪\nline", "refs/heads/topic"];
     let executable = values[tc.draw(gs::integers::<usize>().min_value(0).max_value(values.len() - 1))];
     let reference = values[tc.draw(gs::integers::<usize>().min_value(0).max_value(values.len() - 1))];
     let host = HostName::new("feta");
@@ -2991,4 +2992,13 @@ fn structured_action_diff_retracts_obsolete_arguments() {
     assert!(diff.unset.contains(&"action.primary.argv.0".to_owned()));
     assert_eq!(text(diff, KEY_PRIMARY_ACTION_KIND), "attach");
     assert_eq!(text(diff, KEY_PRIMARY_ACTION_TARGET), "session:feta/test");
+}
+
+// Canonical targets keep host/ref and host/path boundaries unambiguous even
+// though HostName itself is permissive: slash-containing hosts get no recipe.
+#[test]
+fn structured_recipe_mint_refuses_ambiguous_hosts() {
+    let host = HostName::new("host/ambiguous");
+    assert!(mint().attach("refs/heads/topic", &host).is_none());
+    assert!(mint().checkout_terminal("/work/repo", &host).is_none());
 }

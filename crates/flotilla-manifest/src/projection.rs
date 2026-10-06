@@ -1231,12 +1231,10 @@ fn action_facts(recipe: &Recipe, vehicle: &'static str) -> Vec<(String, Metadata
     .into_iter()
     .map(|(key, value)| (key.to_owned(), value))
     .collect();
-    if recipe.kind() == "command" {
-        if let Some(argv) = recipe.argv() {
-            facts.extend(
-                argv.iter().enumerate().map(|(index, argument)| (format!("action.primary.argv.{index}"), MetadataValue::text(argument))),
-            );
-        }
+    if let Some(argv) = recipe.argv() {
+        facts.extend(
+            argv.iter().enumerate().map(|(index, argument)| (format!("action.primary.argv.{index}"), MetadataValue::text(argument))),
+        );
     }
     facts
 }

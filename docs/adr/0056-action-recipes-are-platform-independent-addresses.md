@@ -11,7 +11,12 @@ only for genuine `command` kinds, contiguous zero-based
 `action.<key>.argv.<n>` text facts. Arguments include the executable at index
 zero and retain their exact contents; they are never shell strings.
 Live attachment addresses are `session:<host>/<attach-ref>` and scoped
-views are `view:<address>`. Transient checkout terminals use `command`,
+views are `view:<address>`. Parse session and checkout addresses by splitting
+on the first `/` after the kind prefix: the mint refuses hosts containing `/`,
+while the remaining attach reference or path may contain arbitrary slashes.
+Read argv from index zero until the first missing index, applying catalog-diff
+retractions before use so shrinking commands leave no stale arguments.
+Transient checkout terminals use `command`,
 a `checkout:<host>/<path>` target, and the raw CLI argument vector.
 This command's `argv[0]` is the configured connector-local executable,
 which need not exist on a different viewer host or platform. Unlike attach

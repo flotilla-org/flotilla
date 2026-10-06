@@ -72,6 +72,11 @@
 //! | `action.primary.direct.session` | Cleat session id on that daemon. |
 //! | `action.primary.direct.reason` | Why only the command recipe is available. |
 //!
+//! In session/checkout action targets, split on the first `/` after the kind:
+//! the mint refuses hosts containing `/`; the remaining ref/path may contain it.
+//! Consumers read command argv from index zero and stop at the first missing
+//! index, applying catalog-diff unsets so a shorter command retains no stale tail.
+//!
 //! Display-label companions are stable producer-derived facts, not identities.
 //! Missing tiers are legal and consumers fall back toward `display.label`.
 //! Flotilla does not guarantee that abbreviated labels are unique in any
