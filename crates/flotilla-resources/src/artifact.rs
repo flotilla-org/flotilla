@@ -51,7 +51,9 @@ impl StatusPatch<ArtifactStatus> for ArtifactStatusPatch {
 }
 
 /// Only the winner of the authority's compare-and-swap may attempt POST.
-/// Reservations never expire: an absent comment cannot distinguish a refused
+/// Reservations do not expire while the artifact envelope exists. Deleting it
+/// removes its reservations; retention must be considered before reconciliation.
+/// An absent comment cannot distinguish a refused
 /// POST from an accepted request still in flight. Retry by looking up the marker,
 /// never by granting another creation attempt. Revisions use PATCH instead.
 pub async fn reserve_ledger_comment_creation(
