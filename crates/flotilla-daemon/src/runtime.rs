@@ -3799,6 +3799,7 @@ async fn projection_parity_condition(
     // `using` lists only this root's durable rows, never replicas. Creation time
     // (rather than last update or first parity observation) bounds the grace
     // even if controllers keep updating the row or the daemon restarts.
+    // Sort missing names for stable diagnostics, independent of backend list order.
     let missing = stored
         .items
         .into_iter()
@@ -3813,6 +3814,8 @@ async fn projection_parity_condition(
     if missing.is_empty() {
         return Ok(None);
     }
+    // Totals include every row in each snapshot; the missing list omits rows
+    // still within grace, preserving the existing diagnostic counts.
     let message = format!(
         "durable store has {} convoys but the local aggregator projection has {}; missing: {}",
         expected.len(),
