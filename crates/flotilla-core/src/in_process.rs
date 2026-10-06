@@ -3399,9 +3399,7 @@ impl InProcessDaemon {
         }
     }
 
-    /// Creation requires a fresh forge lookup: a cached absence must not
-    /// authorize reusing a branch whose earlier request has since closed.
-    pub async fn validate_new_checkout_branch(&self, checkout: &ResourceObject<ResourceCheckout>) -> Result<(), String> {
+    async fn checkout_has_network_forge(&self, checkout: &ResourceObject<ResourceCheckout>) -> Result<bool, String> {
         let namespace = self.provisioning_namespace().await;
         let repository = self
             .resource_backend
@@ -3410,12 +3408,17 @@ impl InProcessDaemon {
             .await
             .map_err(|error| error.to_string())?
             .object;
-        if repository
+        Ok(!repository
             .spec
             .forge()
-            .is_none_or(|forge| !forge.service_url.starts_with("https://") && !forge.service_url.starts_with("http://"))
-        {
-            return Ok(());
+            .is_none_or(|forge| !forge.service_url.starts_with("https://") && !forge.service_url.starts_with("http://")))
+    }
+
+    /// Creation requires a fresh forge lookup: a cached absence must not
+    /// authorize reusing a branch whose earlier request has since closed.
+    pub async fn validate_new_checkout_branch(&self, checkout: &ResourceObject<ResourceCheckout>) -> Result<Option<String>, String> {
+        if !self.checkout_has_network_forge(checkout).await? {
+            return Ok(None);
         }
         let (candidates, failures) =
             self.convoy_admission.repository_change_request_candidates(std::slice::from_ref(checkout.spec.repo_ref())).await;
@@ -3426,15 +3429,15 @@ impl InProcessDaemon {
             if let Some((id, request)) =
                 provider.find_change_request_by_branch(checkout.spec.branch()).await.map_err(|error| error.to_string())?
             {
-                return Err(format!(
+                return Ok(Some(format!(
                     "checkout branch {} conflicts with {:?} change request #{}; choose a fresh branch name",
                     checkout.spec.branch(),
                     request.status,
                     id
-                ));
+                )));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Resolve a checkout's PR from live VCS facts rather than its provisioning ref.
@@ -3447,19 +3450,7 @@ impl InProcessDaemon {
         vcs: &dyn crate::vcs::Vcs,
         path: &Path,
     ) -> Result<Option<String>, String> {
-        let namespace = self.provisioning_namespace().await;
-        let repository = self
-            .resource_backend
-            .including_replicas::<Repository>(&namespace)
-            .get(&checkout.spec.repo_ref().to_string())
-            .await
-            .map_err(|error| error.to_string())?
-            .object;
-        if repository
-            .spec
-            .forge()
-            .is_none_or(|forge| !forge.service_url.starts_with("https://") && !forge.service_url.starts_with("http://"))
-        {
+        if !self.checkout_has_network_forge(checkout).await? {
             return Ok(None);
         }
         let branch = vcs.read_repository(path, crate::vcs::RepositoryRead::CurrentBranch).await?;
@@ -3467,6 +3458,7 @@ impl InProcessDaemon {
         if let Ok(upstream) = vcs.read_repository(path, crate::vcs::RepositoryRead::UpstreamOf("@{upstream}")).await {
             let remote = vcs.read_repository(path, crate::vcs::RepositoryRead::TrackedRemote(branch.trim())).await?;
             let upstream = upstream.trim();
+            // Git uses remote "." for a local upstream; its full branch name has no remote prefix.
             let upstream_branch =
                 if remote.trim() == "." { upstream } else { upstream.strip_prefix(&format!("{}/", remote.trim())).unwrap_or(upstream) };
             if !branches.iter().any(|candidate| candidate == upstream_branch) {

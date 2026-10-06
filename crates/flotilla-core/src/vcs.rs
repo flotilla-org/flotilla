@@ -1637,8 +1637,11 @@ impl VcsBackend for GitCliBackend<'_> {
             }
         }
         let remote_exists = self.ref_exists(&remote_ref).await;
-        if local_exists || remote_exists {
-            return Err(format!("checkout branch {branch} already exists; choose a fresh branch name"));
+        if local_exists {
+            return Err(existing_checkout_branch_error(branch, None));
+        }
+        if remote_exists {
+            return Err(existing_checkout_branch_error(branch, Some(&remote_ref)));
         }
         let provenance = if !local_exists && !remote_exists && base_ref.is_some() {
             CheckoutBranchProvenance::CreatedForConvoy
@@ -1895,6 +1898,13 @@ fn non_empty_output_or(fallback: &str, output: &str) -> String {
     }
 }
 
+pub(crate) fn existing_checkout_branch_error(branch: &str, tracking_ref: Option<&str>) -> String {
+    match tracking_ref {
+        Some(reference) => format!("checkout branch {branch} conflicts with remote-tracking ref {reference} (possibly stale); inspect with git branch -r and git fetch --prune, or choose a fresh branch name"),
+        None => format!("checkout branch {branch} already exists locally; choose a fresh branch name"),
+    }
+}
+
 fn bootstrap_branch_ref(branch: &str) -> String {
     format!("refs/flotilla/bootstrap/{branch}")
 }
@@ -1987,6 +1997,39 @@ mod tests {
             assert!(error.contains("reused"), "conflict must name the branch: {error}");
             assert!(!target.exists(), "refusal must not create a checkout");
         }
+    }
+
+    // New Checkouts refuse reused branch names even without a base, but detached
+    // snapshots of HEAD or a commit do not adopt a branch and remain supported.
+    #[tokio::test]
+    async fn detached_checkout_supports_commits_without_reusing_branches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git(dir.path(), &["init", "-b", "main"]);
+        git(dir.path(), &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+        let runner = crate::providers::ProcessCommandRunner;
+        let backend = GitCliBackend::new(dir.path(), &runner);
+        let commit = backend.head_commit_text().await.expect("commit");
+        for (index, branch) in ["HEAD", commit.trim()].into_iter().enumerate() {
+            let target = dir.path().join(format!("detached-{index}"));
+            let result = backend.create_worktree(branch, None, target.to_str().expect("path")).await.expect("detached snapshot");
+            assert_eq!(result.provenance, CheckoutBranchProvenance::PreExisting);
+            let detached = GitCliBackend::checkout_root(&target, &runner);
+            assert!(detached.current_branch().await.is_err(), "detached snapshot has no symbolic branch");
+            assert_eq!(detached.head_commit_text().await.expect("snapshot commit").trim(), commit.trim());
+        }
+        assert!(backend
+            .create_worktree("main", None, dir.path().join("reused").to_str().expect("path"))
+            .await
+            .err()
+            .expect("branch reuse")
+            .contains("main"));
+        backend.update_ref("refs/remotes/origin/stale", commit.trim()).await.expect("stale tracking ref");
+        let error = backend
+            .create_worktree("stale", Some("main"), dir.path().join("stale").to_str().expect("path"))
+            .await
+            .err()
+            .expect("stale ref refusal");
+        assert!(error.contains("refs/remotes/origin/stale") && error.contains("possibly stale"), "{error}");
     }
 
     #[tokio::test]

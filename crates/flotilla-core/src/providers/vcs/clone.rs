@@ -8,7 +8,7 @@ use tracing::info;
 use crate::{
     path_context::ExecutionEnvironmentPath,
     providers::{types::Checkout, ChannelLabel, CommandRunner},
-    vcs::{CheckoutMaterialisation, EnumeratedCheckout, GitCliBackend, VcsBackend},
+    vcs::{existing_checkout_branch_error, CheckoutMaterialisation, EnumeratedCheckout, GitCliBackend, VcsBackend},
 };
 
 /// A `CheckoutManager` for sandbox/container environments that uses
@@ -107,8 +107,11 @@ impl ReferenceCloneStrategy {
             )
             .await
             .is_ok();
-        if local_exists || remote_exists {
-            return Err(format!("checkout branch {branch} already exists; choose a fresh branch name"));
+        if local_exists {
+            return Err(existing_checkout_branch_error(branch, None));
+        }
+        if remote_exists {
+            return Err(existing_checkout_branch_error(branch, Some(&remote_ref)));
         }
         if !GitCliBackend::new(std::path::Path::new("/"), &*self.runner).remote_heads(&remote_url, &local_ref).await?.trim().is_empty() {
             return Err(format!("checkout branch {branch} already exists on remote; choose a fresh branch name"));
@@ -130,20 +133,17 @@ impl ReferenceCloneStrategy {
                 &ChannelLabel::Default,
             )
             .await?;
-        let provenance = CheckoutBranchProvenance::CreatedForConvoy;
         let backend = GitCliBackend::checkout_root(target_path, &*self.runner);
         let commit = backend.head_commit_text().await?.trim().to_string();
-        if provenance == CheckoutBranchProvenance::CreatedForConvoy {
-            self.runner
-                .run(
-                    "git",
-                    &["-C", target, "update-ref", &format!("refs/flotilla/bootstrap/{branch}"), &commit],
-                    std::path::Path::new("/"),
-                    &ChannelLabel::Default,
-                )
-                .await?;
-        }
-        Ok(CheckoutMaterialisation { commit: Some(commit), provenance })
+        self.runner
+            .run(
+                "git",
+                &["-C", target, "update-ref", &format!("refs/flotilla/bootstrap/{branch}"), &commit],
+                std::path::Path::new("/"),
+                &ChannelLabel::Default,
+            )
+            .await?;
+        Ok(CheckoutMaterialisation { commit: Some(commit), provenance: CheckoutBranchProvenance::CreatedForConvoy })
     }
 
     pub(crate) async fn validate_target(

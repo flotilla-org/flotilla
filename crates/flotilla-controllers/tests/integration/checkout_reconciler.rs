@@ -48,10 +48,21 @@ struct RecordingCheckoutRuntime {
     archive_path: Option<String>,
     path_exists: Option<bool>,
     protection_error: Option<String>,
+    validation_failures: Mutex<usize>,
 }
 
 #[async_trait]
 impl CheckoutRuntime for RecordingCheckoutRuntime {
+    // Forge boundary: a transient lookup failure must leave creation retryable.
+    async fn validate_new_branch(&self, _checkout: &ResourceObject<Checkout>) -> Result<Option<String>, String> {
+        let mut remaining = self.validation_failures.lock().expect("validation failure counter");
+        if *remaining > 0 {
+            *remaining -= 1;
+            Err("forge rate limit".into())
+        } else {
+            Ok(None)
+        }
+    }
     // Boundary fake: records the environment-scoped VCS registration request.
     async fn protect_worktree_in(&self, env_ref: &str, clone_path: &str, target: &str, reason: &str) -> Result<(), String> {
         self.protections.lock().expect("protections").push((env_ref.into(), clone_path.into(), target.into(), reason.into()));
@@ -1176,7 +1187,13 @@ async fn convoy_checkout_refuses_branch_held_by_checkout() {
             .repo_ref(RepositoryKey(repo_key(REPO_URL)))
             .build(),
     );
-    checkouts.create(&meta("old"), &spec).await.expect("existing checkout");
+    let old = checkouts
+        .create(
+            &InputMeta::builder().name("old".into()).labels(BTreeMap::from([(CONVOY_LABEL.into(), "old-convoy".into())])).build(),
+            &spec,
+        )
+        .await
+        .expect("existing checkout");
     let checkout = checkouts
         .create(
             &InputMeta::builder().name("new".into()).labels(BTreeMap::from([(CONVOY_LABEL.into(), "new-convoy".into())])).build(),
@@ -1184,7 +1201,44 @@ async fn convoy_checkout_refuses_branch_held_by_checkout() {
         )
         .await
         .expect("new checkout");
-    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend, NAMESPACE);
+    let reconciler = CheckoutReconciler::new(Arc::new(RecordingCheckoutRuntime::default()), backend.clone(), NAMESPACE);
     let prepared = reconciler.prepare(&checkout).await.expect("prepare");
-    assert!(matches!(prepared, CheckoutPrepared::Failed(message) if message.contains("reused") && message.contains("old")));
+    assert!(matches!(prepared, CheckoutPrepared::Failed(ref message) if message.contains("reused") && message.contains("old")));
+    assert!(matches!(reconciler.prepare(&old).await.expect("oldest reservation"), CheckoutPrepared::Waiting));
+    checkouts
+        .update_status("new", &checkout.metadata.resource_version, &CheckoutStatus { phase: CheckoutPhase::Failed, ..Default::default() })
+        .await
+        .expect("record loser failure");
+    assert!(matches!(reconciler.prepare(&old).await.expect("failed loser does not reserve"), CheckoutPrepared::Waiting));
+    checkouts.delete("new").await.expect("remove loser");
+    let retrying = CheckoutReconciler::new(
+        Arc::new(RecordingCheckoutRuntime { validation_failures: Mutex::new(2), ..Default::default() }),
+        backend,
+        NAMESPACE,
+    );
+    let unavailable = retrying.prepare(&old).await.expect("transient lookup");
+    assert!(matches!(unavailable, CheckoutPrepared::ValidationUnavailable(ref message) if message == "forge rate limit"));
+    let outcome = retrying.reconcile(&old, &unavailable, chrono::Utc::now());
+    let patch = outcome.patch.expect("visible validation failure");
+    apply_status_patch(&checkouts, "old", &patch).await.expect("record validation diagnostic");
+    let old = checkouts.get("old").await.expect("diagnostic checkout");
+    assert_eq!(old.status.as_ref().and_then(|status| status.message.as_deref()), Some("forge rate limit"));
+    assert!(
+        retrying.reconcile(&old, &unavailable, chrono::Utc::now()).requeue_after.is_some(),
+        "transient lookup must requeue, not mark Failed"
+    );
+    assert_eq!(
+        checkouts.get("old").await.expect("unchanged checkout").status.map(|status| status.phase).unwrap_or(CheckoutPhase::Pending),
+        CheckoutPhase::Pending
+    );
+    let repeated = retrying.prepare(&old).await.expect("continued rate limit");
+    assert!(matches!(repeated, CheckoutPrepared::ValidationUnavailable(_)));
+    let repeated_outcome = retrying.reconcile(&old, &repeated, chrono::Utc::now());
+    assert!(repeated_outcome.patch.is_none(), "identical lookup errors do not rewrite status");
+    assert!(repeated_outcome.requeue_after.is_some());
+    let recovered = retrying.prepare(&old).await.expect("recovered forge");
+    assert!(matches!(recovered, CheckoutPrepared::Waiting), "recovery proceeds past validation to missing-clone wait");
+    let clear = retrying.reconcile(&old, &recovered, chrono::Utc::now()).patch.expect("clear validation diagnostic");
+    apply_status_patch(&checkouts, "old", &clear).await.expect("clear error");
+    assert!(checkouts.get("old").await.expect("recovered checkout").status.expect("status").message.is_none());
 }

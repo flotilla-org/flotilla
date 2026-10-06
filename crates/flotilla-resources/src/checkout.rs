@@ -243,6 +243,7 @@ pub enum ChangeRequestMergeability {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutStatusPatch {
     ObserveCloneRetry { retry: Option<crate::ControllerRetry> },
+    ObserveValidation { message: Option<String> },
     MarkPreparing,
     MarkReady { path: String, commit: Option<String>, branch_provenance: CheckoutBranchProvenance },
     MarkTerminating,
@@ -271,6 +272,7 @@ impl StatusPatch<CheckoutStatus> for CheckoutStatusPatch {
     fn apply(&self, status: &mut CheckoutStatus) {
         match self {
             Self::ObserveCloneRetry { retry } => status.clone_retry = retry.clone(),
+            Self::ObserveValidation { message } => status.message = message.clone(),
             Self::MarkPreparing => {
                 status.phase = CheckoutPhase::Preparing;
                 status.message = None;
