@@ -206,6 +206,9 @@ const fn default_dispatch_queue_stale_after_seconds() -> u64 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ProjectRepositorySpec {
+    /// Explicit ops source. Missing on previous-generation project records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charter_store: Option<crate::CharterStoreBinding>,
     pub repo: RepositoryKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
@@ -386,6 +389,15 @@ pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, Stri
         if repository.repo.0.trim().is_empty() {
             return Err("project repository ref cannot be empty".to_string());
         }
+        if let Some(binding) = &repository.charter_store {
+            if binding.host.trim().is_empty() {
+                return Err("charter store host must be nonempty".into());
+            }
+            binding.source.validate()?;
+            if !repository.roles.contains(&ProjectRepositoryRole::Ops) {
+                return Err("charter store requires the ops role".into());
+            }
+        }
         repository.subpath = repository.subpath.take().map(normalize_subpath).transpose()?;
         repository.default_branch =
             repository.default_branch.take().map(|branch| required_value(branch, "repositories[].default_branch")).transpose()?;
@@ -393,6 +405,14 @@ pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, Stri
         if repository.alias.is_some() && repository.roles.is_empty() {
             return Err("project repository roles cannot be empty when alias is declared".to_string());
         }
+    }
+    let charter_hosts = spec
+        .repositories
+        .iter()
+        .filter_map(|repository| repository.charter_store.as_ref().map(|binding| &binding.host))
+        .collect::<BTreeSet<_>>();
+    if charter_hosts.len() > 1 {
+        return Err("a project's ops stores must reconcile on the same home host".into());
     }
     let aliases = spec.repositories.iter().filter_map(|repository| repository.alias.as_deref()).collect::<BTreeSet<_>>();
     if aliases.len() != spec.repositories.iter().filter(|repository| repository.alias.is_some()).count() {
@@ -528,6 +548,7 @@ mod tests {
             supervision: None,
             issue_source_bindings: vec![IssueSource { service: "https://github.com".to_string(), scope: "acme/widgets".to_string() }.into()],
             repositories: vec![ProjectRepositorySpec {
+                charter_store: None,
                 repo: RepositoryKey("acme/widgets".to_string()),
                 alias: None,
                 roles: BTreeSet::new(),
@@ -547,6 +568,7 @@ mod tests {
     fn duplicate_repository_refusal_names_aliases_and_repository_key() {
         let key = RepositoryKey("repo-key".to_string());
         let member = |alias: &str| ProjectRepositorySpec {
+            charter_store: None,
             repo: key.clone(),
             alias: Some(alias.to_string()),
             roles: BTreeSet::from([ProjectRepositoryRole::Code]),

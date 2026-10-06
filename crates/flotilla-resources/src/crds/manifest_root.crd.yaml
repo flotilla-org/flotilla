@@ -31,6 +31,21 @@ spec:
                   type: string
                 source:
                   type: string
+                binding:
+                  type: object
+                  required: [kind]
+                  properties:
+                    kind:
+                      type: string
+                      enum: [repository, local_directory]
+                    repo:
+                      type: string
+                    branch:
+                      type: string
+                    path:
+                      type: string
+                    directory:
+                      type: string
                 suspended:
                   type: array
                   items:

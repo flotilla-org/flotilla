@@ -9,7 +9,7 @@ use flotilla_resources::{ForgeSpec, Project, ProjectRepositoryRole, RepositoryKe
 
 use crate::{
     ops_entry::OperationalEntryFile,
-    providers::{ChannelLabel, CommandRunner},
+    providers::{vcs::git_worktree::GitWorktreeStrategy, ChannelLabel, CommandRunner},
     vcs::{CheckoutVcsResolver, RepositoryRead, Vcs},
 };
 
@@ -38,8 +38,9 @@ pub struct ProjectDeclarationInspection {
     pub commit: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct OperationalEntriesInspection {
+    pub source_root: Option<String>,
     pub repository: RepositoryInspection,
     pub commit: String,
     pub files: Vec<OperationalEntryFile>,
@@ -59,6 +60,13 @@ impl RepositoryInspection {
 
 #[async_trait]
 pub trait RepositoryInspector: Send + Sync {
+    fn owns_charter(&self, _host: &str) -> bool {
+        true
+    }
+    async fn charter_snapshot(&self, _source: &flotilla_resources::CharterSource) -> Result<crate::charter_store::CharterSnapshot, String> {
+        Err("bound charter inspection is unavailable".into())
+    }
+
     async fn inspect_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String>;
 
     /// Enumerate every local checkout that belongs to an inspected repository.
@@ -88,7 +96,7 @@ pub trait RepositoryInspector: Send + Sync {
     async fn inspect_operational_entries(&self, path: &Path) -> Result<OperationalEntriesInspection, String> {
         let repository = self.inspect_path(path, None).await?;
         let (commit, files) = self.operational_entry_files_at(&repository.checkout.path).await?;
-        Ok(OperationalEntriesInspection { commit, repository, files })
+        Ok(OperationalEntriesInspection { source_root: None, commit, repository, files })
     }
 
     /// Read the committed operational entry candidates of a checkout whose
@@ -128,6 +136,17 @@ pub async fn inspect_project_ops_entries(
     let mut inventory = OperationalEntryInventory::default();
     for project in projects {
         for member in project.spec.repositories.iter().filter(|member| member.roles.contains(&ProjectRepositoryRole::Ops)) {
+            if let Some(binding) = &member.charter_store {
+                if !inspector.owns_charter(&binding.host) {
+                    continue;
+                }
+                let snapshot = inspector.charter_snapshot(&binding.source).await?;
+                inventory.entries.extend(snapshot.files.into_iter().map(|(path, contents)| OperationalEntryFile {
+                    path: format!("{}/{}/{}/{}", project.metadata.namespace, project.metadata.name, member.repo, path),
+                    contents,
+                }));
+                continue;
+            }
             let mut candidates = paths.get(&member.repo).cloned().unwrap_or_default();
             candidates.sort();
             candidates.dedup();
@@ -215,11 +234,24 @@ pub struct GitRepositoryInspector {
     vcs_cache: tokio::sync::Mutex<HashMap<PathBuf, Arc<dyn Vcs>>>,
     host_ref: String,
     forges: Vec<ForgeSpec>,
+    charter_cache: PathBuf,
 }
 
 impl GitRepositoryInspector {
     pub fn new(runner: Arc<dyn CommandRunner>, vcs: Arc<dyn CheckoutVcsResolver>, host_ref: impl Into<String>) -> Self {
-        Self { runner, vcs, vcs_cache: tokio::sync::Mutex::new(HashMap::new()), host_ref: host_ref.into(), forges: Vec::new() }
+        Self {
+            charter_cache: std::env::temp_dir().join("flotilla-charter-cache"),
+            runner,
+            vcs,
+            vcs_cache: tokio::sync::Mutex::new(HashMap::new()),
+            host_ref: host_ref.into(),
+            forges: Vec::new(),
+        }
+    }
+
+    pub fn with_charter_cache(mut self, cache: PathBuf) -> Self {
+        self.charter_cache = cache;
+        self
     }
 
     pub fn with_forges(mut self, forges: Vec<ForgeSpec>) -> Self {
@@ -352,6 +384,19 @@ impl GitRepositoryInspector {
 
 #[async_trait]
 impl RepositoryInspector for GitRepositoryInspector {
+    fn owns_charter(&self, host: &str) -> bool {
+        self.host_ref == host
+    }
+
+    async fn charter_snapshot(&self, source: &flotilla_resources::CharterSource) -> Result<crate::charter_store::CharterSnapshot, String> {
+        let vcs = crate::vcs::FlotillaVcs::new(
+            crate::path_context::ExecutionEnvironmentPath::new("/"),
+            self.runner.clone(),
+            crate::vcs::GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new("unused".into(), self.runner.clone()))),
+        );
+        crate::charter_store::read_charter_source(source, &self.charter_cache, Some(&vcs)).await
+    }
+
     async fn inspect_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
         let path =
             std::fs::canonicalize(path).map_err(|error| format!("repository path {} cannot be resolved: {error}", path.display()))?;

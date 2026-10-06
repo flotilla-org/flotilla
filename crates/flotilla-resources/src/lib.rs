@@ -6,6 +6,8 @@
 mod artifact;
 mod backend;
 mod change_request;
+mod charter_store;
+pub use charter_store::{CharterSource, CharterStoreBinding};
 mod checkout;
 mod clock;
 mod clone;

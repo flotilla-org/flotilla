@@ -81,6 +81,19 @@ pub(super) async fn serve_resource_http_with_daemon(
     // same trusted local resource socket. Return raw bytes so only the candidate
     // applies its parser. The optional daemon is solely a resource-handler test
     // seam; production always supplies it.
+    if kind == "charterinputs" && name.is_none() {
+        let Some(daemon) = daemon else {
+            return write_error(&mut stream, 404, "charter inventory unavailable").await;
+        };
+        return match daemon
+            .charter_input_inventory(namespace)
+            .await
+            .and_then(|inventory| serde_json::to_value(inventory).map_err(|error| error.to_string()))
+        {
+            Ok(inventory) => write_json(&mut stream, 200, &inventory).await,
+            Err(error) => write_error(&mut stream, 422, &error).await,
+        };
+    }
     if kind == "operationalentries" && name.is_none() {
         let Some(daemon) = daemon else {
             return write_error(&mut stream, 404, "ops inventory unavailable").await;

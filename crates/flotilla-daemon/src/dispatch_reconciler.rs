@@ -488,6 +488,7 @@ mod tests {
                     .alias("widgets".to_string())
                     .build()],
                 repositories: vec![flotilla_resources::ProjectRepositorySpec {
+                    charter_store: None,
                     repo: RepositoryKey("acme/widgets".to_string()),
                     alias: None,
                     roles: Default::default(),

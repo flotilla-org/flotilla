@@ -327,31 +327,97 @@ Output remains JSONL so it can be piped directly to `jq`.
 
 ## Resource manifests
 
-A daemon can continuously apply a directory of JSON and YAML resource
-documents as additive desired state:
+The fleet charter store binds a repository, branch and path to a home host:
 
 ```toml
 [manifests]
-dir = "/home/alice/dev/project-map/flotilla"
-source = "https://github.com/example/project-map"
+dir = "/home/alice/.local/state/flotilla/charter-stores" # private Git object cache
+source = "https://github.com/example/project-map" # stable provenance identity
 reconciler_root = "01J..." # stable Host resource name
+
+[manifests.binding]
+kind = "repository"
+repo = "https://github.com/example/project-map"
+branch = "main"
+path = "flotilla"
 ```
 
-Each file contains one or more full resource envelopes (`apiVersion`, `kind`,
-`metadata`, and `spec`). Only the daemon whose Host identity matches
-`reconciler_root` starts the loop; other daemons apply nothing even if a stale
-clone remains on disk. Remove `[manifests]` entirely from hosts that are not the
-declared root. The daemon labels created objects as managed by the manifest
-reconciler and records the declared source, relative source path, clean Git
-revision, reconciling root, and last-applied spec digest. It fast-forwards a
-changed manifest only while the live spec still
-matches that digest; live drift and collisions with unmanaged objects are
-reported and left untouched. The manifest directory must be tracked and clean;
-files with changes not represented by `HEAD` are not applied.
+Only the home host fetches and reconciles the bound branch head. It reads blobs
+at the fetched commit, so an operator never needs to fast-forward a project-map
+checkout. Other hosts receive authored definitions through federation. The
+cache is private to the daemon and must be outside development checkouts.
+`path` is relative to the repository; omit it to read the repository root.
 
-This first manifest-reconciliation slice is deliberately additive: removing a
-file does not delete its object, and existing unmanaged objects are never
-adopted. Omit `[manifests]` to disable the loop.
+A single laptop can bind an ordinary local directory instead:
+
+```toml
+[manifests]
+dir = "/home/alice/.local/state/flotilla/charter-stores"
+source = "laptop-charter"
+reconciler_root = "01J..."
+
+[manifests.binding]
+kind = "local_directory"
+directory = "/home/alice/flotilla-charter"
+```
+
+Local revisions are SHA-256 hashes of the ordered paths and contents actually
+read. No remote or clean Git checkout is required. Source readers include
+Markdown, YAML, JSON, TOML and text files; fleet manifests consume JSON/YAML
+resource envelopes (`apiVersion`, `kind`, `metadata`, `spec`). Symlinked charter
+inputs are refused. Local directories reject every symlink to avoid following
+paths outside the source, including symlinked directories. Git ignores entries
+whose names are not charter files, including gitlinks and symlinked directories;
+charter-named non-regular entries are refused. Both sources require UTF-8 charter
+contents, and refusal reasons identify the file.
+
+Ops members use the same reader. Declare their source in `project.yaml`, or in
+`Project.spec.repositories[].charter_store`:
+
+```yaml
+name: app
+members:
+  - alias: app
+    url: https://github.com/example/app
+    roles: [code]
+  - alias: ops
+    url: https://github.com/example/app-ops
+    roles: [ops]
+    charter_store:
+      host: "01J..."
+      source:
+        kind: repository
+        repo: https://github.com/example/app-ops
+        branch: main
+        path: operations
+```
+
+The designated host reconciles these ops stores periodically without an ops
+checkout. Use `kind: local_directory` and an absolute `directory` for local ops
+inputs. A project's ops stores must share one home host so the operational
+materializer can validate their combined declarations before writing.
+
+Every authored record carries its input revision as provenance. Run
+`flotilla resource explain <kind> <name>` to inspect its source, path and commit
+(or local revision). `flotilla manifest status` includes each source's last
+applied revision and refusal reason; source refusals also raise fleet-health
+attention. Fetch and parse failures retain the last applied revision and its
+records. Pre-roll `resource validate --from-daemon` reads the same bound heads,
+using raw inputs and the candidate binary's parser.
+
+Reconciliation remains additive for fleet resource envelopes: removing a file
+does not delete its object. Live drift and unmanaged objects remain subject to
+the existing explicit sync/adopt controls. Repository-bound adoption refuses to
+write into the private cache: commit changes to the bound branch instead.
+Write-through and branch promotion remain future work; the repository/branch
+binding identifies their eventual destination.
+
+Previous-generation `[manifests]` configurations without `binding`, and ops
+members without `charter_store`, remain readable for one roll under ADR 0047.
+They retain their previous clean-checkout behavior. Add explicit bindings to
+project-map and ops configurations when rolling this change; the new reader
+then removes the manual working-tree update step. Omit `[manifests]` to disable
+the fleet store.
 
 ## Credential grant permissions
 

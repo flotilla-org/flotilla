@@ -553,6 +553,7 @@ fn project_spec(display_name: &str, workflow: &str) -> ProjectSpec {
         .display_name(display_name.to_string())
         .default_workflow_ref(workflow.to_string())
         .repositories(vec![ProjectRepositorySpec {
+            charter_store: None,
             repo: RepositoryKey("github.com/acme/widgets".to_string()),
             alias: None,
             roles: Default::default(),

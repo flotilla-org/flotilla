@@ -931,6 +931,7 @@ async fn resource_list_and_get_queries_return_wire_json() {
             supervision: None,
             issue_source_bindings: Vec::new(),
             repositories: vec![ProjectRepositorySpec {
+                charter_store: None,
                 repo: RepositoryKey("missing".into()),
                 alias: None,
                 roles: Default::default(),
@@ -1937,6 +1938,7 @@ async fn create_test_convoy_project(backend: &flotilla_resources::ResourceBacken
             issue_source_bindings: issue_source_bindings.into_iter().map(Into::into).collect(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
+                charter_store: None,
                 repo: repository.key(),
                 alias: None,
                 roles: Default::default(),
@@ -2019,6 +2021,7 @@ async fn fork_stance_refuses_reviewless_dispatch_and_admits_implement_review() {
                 .build()],
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
+                charter_store: None,
                 repo: repository.key(),
                 alias: None,
                 roles: Default::default(),
@@ -2149,6 +2152,7 @@ async fn convoy_start_adopts_pr_identity_and_defaults_to_shepherd_workflow() {
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
+                charter_store: None,
                 repo: repository_key.clone(),
                 alias: None,
                 roles: Default::default(),
@@ -3209,6 +3213,7 @@ async fn host_direct_convoy_start_uses_minimal_available_kind() {
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
+                charter_store: None,
                 repo: repository.key(),
                 alias: None,
                 roles: Default::default(),
@@ -3338,6 +3343,7 @@ async fn convoy_start_rejects_agent_adapter_missing_from_docker_placement() {
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
+                charter_store: None,
                 repo: repository.key(),
                 alias: None,
                 roles: Default::default(),
@@ -3469,6 +3475,7 @@ async fn convoy_start_accepts_project_list_identifier() {
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
+                charter_store: None,
                 repo: repository.key(),
                 alias: None,
                 roles: Default::default(),
@@ -3627,6 +3634,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             dispatch_policy: None,
             repositories: vec![
                 ProjectRepositorySpec {
+                    charter_store: None,
                     repo: repository.key(),
                     alias: None,
                     roles: Default::default(),
@@ -3634,6 +3642,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
                     default_branch: Some("main".into()),
                 },
                 ProjectRepositorySpec {
+                    charter_store: None,
                     repo: secondary_repository.key(),
                     alias: None,
                     roles: Default::default(),
@@ -3951,6 +3960,7 @@ async fn convoy_start_admits_fully_specified_issue_intent_as_one_persisted_snaps
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
+                charter_store: None,
                 repo: repository.key(),
                 alias: None,
                 roles: Default::default(),
@@ -4144,6 +4154,7 @@ async fn convoy_start_completes_both_names_with_one_ai_call() {
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![ProjectRepositorySpec {
+                charter_store: None,
                 repo: repository.key(),
                 alias: None,
                 roles: Default::default(),
@@ -6070,8 +6081,22 @@ async fn tracking_does_not_materialize_when_project_name_is_occupied() {
             issue_source_bindings: Vec::new(),
             dispatch_policy: None,
             repositories: vec![
-                ProjectRepositorySpec { repo: tracked.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
-                ProjectRepositorySpec { repo: other.key(), alias: None, roles: Default::default(), subpath: None, default_branch: None },
+                ProjectRepositorySpec {
+                    charter_store: None,
+                    repo: tracked.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: None,
+                },
+                ProjectRepositorySpec {
+                    charter_store: None,
+                    repo: other.key(),
+                    alias: None,
+                    roles: Default::default(),
+                    subpath: None,
+                    default_branch: None,
+                },
             ],
         })
         .await
@@ -6310,6 +6335,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
             dispatch_policy: None,
             repositories: vec![
                 ProjectRepositorySpec {
+                    charter_store: None,
                     repo: front.key(),
                     alias: None,
                     roles: [ProjectRepositoryRole::Code].into(),
@@ -6317,6 +6343,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
                     default_branch: Some("main".to_string()),
                 },
                 ProjectRepositorySpec {
+                    charter_store: None,
                     repo: ssh.key(),
                     alias: None,
                     roles: [ProjectRepositoryRole::Ops].into(),
@@ -6324,6 +6351,7 @@ async fn forge_identity_sweep_merges_split_repositories_and_project_members() {
                     default_branch: Some("main".to_string()),
                 },
                 ProjectRepositorySpec {
+                    charter_store: None,
                     repo: alias.key(),
                     alias: None,
                     roles: [ProjectRepositoryRole::Ops].into(),
@@ -6551,6 +6579,7 @@ async fn forge_identity_sweep_reports_conflicting_aliases_before_changing_reposi
             dispatch_policy: None,
             repositories: vec![
                 ProjectRepositorySpec {
+                    charter_store: None,
                     repo: front.key(),
                     alias: Some("front".to_string()),
                     roles: [ProjectRepositoryRole::Code].into(),
@@ -6558,6 +6587,7 @@ async fn forge_identity_sweep_reports_conflicting_aliases_before_changing_reposi
                     default_branch: None,
                 },
                 ProjectRepositorySpec {
+                    charter_store: None,
                     repo: ssh.key(),
                     alias: Some("ssh".to_string()),
                     roles: [ProjectRepositoryRole::Ops].into(),

@@ -28,6 +28,9 @@ pub struct ProjectDeclaration {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectDeclarationMember {
+    // Previous-generation ops members omit the explicit store binding (ADR 0047).
+    #[serde(default)]
+    pub charter_store: Option<flotilla_resources::CharterStoreBinding>,
     pub alias: String,
     pub url: String,
     pub roles: BTreeSet<ProjectRepositoryRole>,
@@ -49,6 +52,12 @@ pub fn parse_project_declaration(yaml: &str) -> Result<ProjectDeclaration, Strin
     for member in &mut declaration.members {
         member.alias = required(std::mem::take(&mut member.alias), "members[].alias")?;
         member.url = canonicalize_repo_url(&member.url)?;
+        if let Some(binding) = &member.charter_store {
+            binding.source.validate()?;
+            if binding.host.trim().is_empty() || !member.roles.contains(&ProjectRepositoryRole::Ops) {
+                return Err("a charter binding needs a nonempty host and the ops role".into());
+            }
+        }
         if member.roles.is_empty() {
             return Err(format!("project member `{}` must declare at least one role", member.alias));
         }

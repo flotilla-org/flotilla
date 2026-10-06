@@ -42,6 +42,9 @@ impl<'de> Deserialize<'de> for DocumentKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ManifestRootSpec {
+    /// Absent for previous-generation directory declarations (ADR 0047).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<crate::CharterSource>,
     pub host: String,
     pub path: String,
     pub source: String,
@@ -69,6 +72,10 @@ pub enum ResolutionAction {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestRootStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_error: Option<String>,
     #[serde(default)]
     pub documents: BTreeMap<DocumentKey, DocumentState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

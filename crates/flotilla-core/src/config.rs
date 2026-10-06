@@ -483,6 +483,9 @@ fn default_blob_store_region() -> String {
 /// additive desired state.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ResourceManifestsConfig {
+    /// Bound source; absent only for pre-bound-store config (ADR 0047, one roll).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<flotilla_resources::CharterSource>,
     pub dir: PathBuf,
     /// Stable identity of the manifest tree (normally its forge repository URL).
     pub source: String,

@@ -4,8 +4,9 @@
 //! inside a provisioned environment, and across command transports.
 
 use std::{
+    collections::BTreeMap,
     fmt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
     sync::Arc,
     time::Duration,
@@ -14,9 +15,11 @@ use std::{
 use async_trait::async_trait;
 use flotilla_protocol::CheckoutIntent;
 use flotilla_resources::{canonicalize_repo_url, CheckoutBranchProvenance};
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::{
+    charter_store::{is_charter_file, reconciliation_lock, CharterSnapshot},
     path_context::ExecutionEnvironmentPath,
     providers::{
         command_channel_label,
@@ -649,6 +652,11 @@ pub enum CheckoutRegistration<'a> {
 /// Flotilla operations bound to one checkout, independent of its VCS or storage medium.
 #[async_trait]
 pub trait Vcs: Send + Sync {
+    /// Fetch a bound branch and read its immutable blobs from a private object cache.
+    async fn charter_snapshot(&self, _cache: &Path, _repo: &str, _branch: &str, _path: &str) -> Result<CharterSnapshot, String> {
+        Err("bound charter inspection is unavailable".into())
+    }
+
     async fn read_repository(&self, _path: &Path, _read: RepositoryRead<'_>) -> Result<String, String> {
         Err("repository inspection is unavailable".into())
     }
@@ -834,6 +842,63 @@ impl FlotillaVcs {
 
 #[async_trait]
 impl Vcs for FlotillaVcs {
+    async fn charter_snapshot(&self, cache: &Path, repo: &str, branch: &str, path: &str) -> Result<CharterSnapshot, String> {
+        // Serialise fetch+resolve: overlapping reconciliation and candidate reads
+        // must never observe another fetch's FETCH_HEAD.
+        let source = flotilla_resources::CharterSource::Repository { repo: repo.into(), branch: branch.into(), path: path.into() };
+        source.validate()?;
+        let digest = Sha256::digest(format!("{repo}\0{branch}").as_bytes());
+        let directory = cache.join(format!("{:x}", digest));
+        let lock = reconciliation_lock(&format!("cache:{}", directory.display()));
+        let _guard = lock.lock().await;
+        tokio::fs::create_dir_all(&directory).await.map_err(|error| error.to_string())?;
+        let backend = GitCliBackend::new(&directory, &*self.runner);
+        backend.run(&["init", "--bare", "."]).await?;
+        backend.run(&["check-ref-format", &format!("refs/heads/{branch}")]).await?;
+        tokio::time::timeout(Duration::from_secs(60), backend.run(&["fetch", "--no-tags", "--", repo, &format!("refs/heads/{branch}")]))
+            .await
+            .map_err(|_| format!("fetch charter branch {branch}: timed out after 60s"))??;
+        let revision = backend.resolve_ref("FETCH_HEAD^{commit}").await?.trim().to_string();
+        let tree = backend.run(&["ls-tree", "-r", "-z", &revision]).await?;
+        let normalized_path: PathBuf = Path::new(path).components().filter(|part| matches!(part, Component::Normal(_))).collect();
+        let prefix = normalized_path.to_str().ok_or("charter path is not UTF-8")?;
+        let mut files = BTreeMap::new();
+        let mut found_path = prefix.is_empty();
+        for entry in tree.split('\0').filter(|entry| !entry.is_empty()) {
+            let (meta, name) = entry.split_once('\t').ok_or("invalid charter tree entry")?;
+            let relative = if prefix.is_empty() {
+                name
+            } else {
+                let Some(relative) = name.strip_prefix(prefix).and_then(|name| name.strip_prefix('/')) else {
+                    continue;
+                };
+                relative
+            };
+            found_path = true;
+            if !is_charter_file(Path::new(relative)) {
+                continue;
+            }
+            if !meta.starts_with("100644 blob ") && !meta.starts_with("100755 blob ") {
+                return Err(format!("charter path {name} is not a regular file"));
+            }
+            // String command output is lossy. Stream the blob bytes first so
+            // invalid UTF-8 is refused with its source path, like local files.
+            let output = directory.join("flotilla-charter-blob");
+            let contents = async {
+                self.runner.run_to_file("git", &["show", &format!("{revision}:{name}")], &directory, &output).await?;
+                tokio::fs::read_to_string(&output).await.map_err(|error| error.to_string())
+            }
+            .await;
+            let _ = tokio::fs::remove_file(&output).await;
+            let contents = contents.map_err(|error| format!("read charter {name}: {error}"))?;
+            files.insert(relative.to_string(), contents);
+        }
+        if !found_path {
+            return Err(format!("charter path {path} has no files at {revision}"));
+        }
+        Ok(CharterSnapshot { revision, files })
+    }
+
     async fn read_repository(&self, path: &Path, read: RepositoryRead<'_>) -> Result<String, String> {
         let backend = GitCliBackend::new(path, &*self.runner);
         let query = match read {

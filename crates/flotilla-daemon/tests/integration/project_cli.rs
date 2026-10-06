@@ -937,6 +937,7 @@ async fn project_replica_does_not_materialize_operational_entries_on_refresh() {
                 .default_workflow_ref("single-agent".to_string())
                 .repositories(vec![
                     flotilla_resources::ProjectRepositorySpec {
+                        charter_store: None,
                         repo: app.key(),
                         alias: Some("app".to_string()),
                         roles: [ProjectRepositoryRole::Code].into_iter().collect(),
@@ -944,6 +945,7 @@ async fn project_replica_does_not_materialize_operational_entries_on_refresh() {
                         default_branch: None,
                     },
                     flotilla_resources::ProjectRepositorySpec {
+                        charter_store: None,
                         repo: ops_spec.key(),
                         alias: Some("operations".to_string()),
                         roles: [ProjectRepositoryRole::Ops].into_iter().collect(),
@@ -1153,6 +1155,7 @@ async fn tracked_repo_labels_materialized_project_without_overwriting_user_field
         .default_workflow_ref("single-agent".to_string())
         .issue_source_bindings(vec![IssueSource { service: "https://linear.app".to_string(), scope: "TRACK".to_string() }.into()])
         .repositories(vec![flotilla_resources::ProjectRepositorySpec {
+            charter_store: None,
             repo: repository_key,
             alias: None,
             roles: Default::default(),
@@ -1293,6 +1296,7 @@ async fn tracked_repo_labels_matching_unlabelled_project_once() {
                 .display_name("tracked".to_string())
                 .default_workflow_ref("single-agent".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec {
+                    charter_store: None,
                     repo: repository_key,
                     alias: None,
                     roles: Default::default(),
@@ -1757,6 +1761,7 @@ async fn tracking_repo_does_not_widen_project_name_or_overwrite_custom_project()
         issue_source_bindings: Vec::new(),
         dispatch_policy: None,
         repositories: vec![flotilla_resources::ProjectRepositorySpec {
+            charter_store: None,
             repo: RepositoryKey("other-repository".to_string()),
             alias: None,
             roles: Default::default(),
@@ -1787,6 +1792,7 @@ async fn tracking_repo_does_not_use_naming_cascade_when_slug_candidates_collide(
                 issue_source_bindings: Vec::new(),
                 dispatch_policy: None,
                 repositories: vec![flotilla_resources::ProjectRepositorySpec {
+                    charter_store: None,
                     repo: RepositoryKey(repo_ref.to_string()),
                     alias: None,
                     roles: Default::default(),
@@ -1825,6 +1831,7 @@ async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_p
     assert_eq!(project.spec.display_name, "My Project");
     assert_eq!(project.spec.default_workflow_ref, "single-agent");
     assert_eq!(project.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
+        charter_store: None,
         repo: repository_key,
         alias: None,
         roles: Default::default(),
@@ -2091,6 +2098,7 @@ async fn project_apply_preserves_existing_metadata() {
                 .display_name("Before".to_string())
                 .default_workflow_ref("single-agent".to_string())
                 .repositories(vec![flotilla_resources::ProjectRepositorySpec {
+                    charter_store: None,
                     repo: RepositoryKey("repository".to_string()),
                     alias: None,
                     roles: Default::default(),
