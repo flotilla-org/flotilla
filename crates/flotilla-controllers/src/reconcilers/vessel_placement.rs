@@ -1,12 +1,19 @@
-use std::collections::{btree_map::Entry, BTreeMap, HashMap};
+use std::{
+    collections::{btree_map::Entry, BTreeMap, HashMap},
+    time::Duration,
+};
 
 use flotilla_protocol::CanonicalHostId;
 use flotilla_resources::{
-    Convoy, InputMeta, LifecycleAuthority, ReadWatchEvent, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
-    Vessel, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    Convoy, InputMeta, LifecycleAuthority, OwnerReference, ReadResourceObject, ReadWatchEvent, Resource, ResourceBackend, ResourceError,
+    ResourceObject, ResourceProvenance, Vessel, VesselSpec, ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION,
+    VESSEL_PLACEMENTS_ANNOTATION,
 };
 use futures::StreamExt;
 use tracing::{debug, info, warn};
+
+const PLACEMENT_COALESCE_INTERVAL: Duration = Duration::from_millis(25);
+const PLACEMENT_RESYNC_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VesselPlacementSync {
@@ -38,17 +45,48 @@ impl VesselPlacementProjector {
     }
 
     pub async fn run(&self) -> Result<(), ResourceError> {
-        let mut convoy_watch = self.backend.including_replicas::<Convoy>(&self.namespace).watch().await?;
-        let mut vessel_watch = self.backend.including_replicas::<Vessel>(&self.namespace).watch().await?;
+        let convoys = self.backend.including_replicas::<Convoy>(&self.namespace);
+        let vessels = self.backend.including_replicas::<Vessel>(&self.namespace);
+        let mut convoy_watch = convoys.watch().await?;
+        let mut vessel_watch = vessels.watch().await?;
+        // Watch before listing so changes during bootstrap remain queued.
+        let mut convoy_inputs = ReplicaInputs::default();
+        for source in convoys.list().await?.items {
+            convoy_inputs.update(source, convoy_input);
+        }
+        let mut vessel_inputs = ReplicaInputs::default();
+        for source in vessels.list().await?.items {
+            vessel_inputs.update(source, vessel_input);
+        }
         self.sync_once().await?;
-
+        let mut resync = tokio::time::interval_at(tokio::time::Instant::now() + PLACEMENT_RESYNC_INTERVAL, PLACEMENT_RESYNC_INTERVAL);
+        resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut deadline = None;
         loop {
-            let replica_changed = tokio::select! {
-                event = convoy_watch.next() => replica_changed(event, Convoy::API_PATHS.kind)?,
-                event = vessel_watch.next() => replica_changed(event, Vessel::API_PATHS.kind)?,
+            let flush = async move {
+                match deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => futures::future::pending().await,
+                }
             };
-            if replica_changed {
-                self.sync_once().await?;
+            tokio::pin!(flush);
+            let changed = tokio::select! {
+                event = convoy_watch.next() => convoy_inputs.event(event, Convoy::API_PATHS.kind, convoy_input)?,
+                event = vessel_watch.next() => vessel_inputs.event(event, Vessel::API_PATHS.kind, vessel_input)?,
+                _ = resync.tick() => {
+                    self.sync_once().await?;
+                    deadline = None;
+                    false
+                }
+                () = &mut flush => {
+                    self.sync_once().await?;
+                    deadline = None;
+                    false
+                }
+            };
+            if changed {
+                // A fixed deadline coalesces bursts without starving continuous changes.
+                deadline.get_or_insert_with(|| tokio::time::Instant::now() + PLACEMENT_COALESCE_INTERVAL);
             }
         }
     }
@@ -185,6 +223,7 @@ impl VesselPlacementProjector {
         }
 
         debug!(
+            placement_sync_completed = true,
             host_ref = %self.local_host_ref,
             created = result.created,
             updated = result.updated,
@@ -195,11 +234,92 @@ impl VesselPlacementProjector {
     }
 }
 
-fn replica_changed<T: Resource>(event: Option<Result<ReadWatchEvent<T>, ResourceError>>, kind: &str) -> Result<bool, ResourceError> {
-    let event = event.ok_or_else(|| ResourceError::invalid(format!("{kind} replica watch ended")))?;
-    let provenance = match event? {
-        ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) | ReadWatchEvent::Deleted(source) => source.provenance,
-        ReadWatchEvent::DeletedByName { provenance, .. } => provenance,
-    };
-    Ok(matches!(provenance, ResourceProvenance::Replica { .. }))
+#[derive(Debug, PartialEq, Eq)]
+struct ConvoyInput {
+    placements: Option<String>,
+    target_host: Option<CanonicalHostId>,
+}
+
+fn convoy_input(object: &ResourceObject<Convoy>) -> Option<ConvoyInput> {
+    Some(ConvoyInput {
+        placements: object.metadata.annotations.get(VESSEL_PLACEMENTS_ANNOTATION).cloned(),
+        target_host: object
+            .status
+            .as_ref()
+            .and_then(|status| status.placement_decision.as_ref())
+            .map(|decision| decision.target_host.reference.clone()),
+    })
+}
+
+#[derive(Debug, PartialEq, Eq, bon::Builder)]
+struct VesselInput {
+    spec: VesselSpec,
+    labels: BTreeMap<String, String>,
+    annotations: BTreeMap<String, String>,
+    owners: Vec<OwnerReference>,
+}
+
+fn vessel_input(object: &ResourceObject<Vessel>) -> Option<VesselInput> {
+    if object.metadata.annotations.contains_key(ACTUATOR_SOURCE_ROOT_ANNOTATION) || object.metadata.deletion_timestamp.is_some() {
+        return None;
+    }
+    Some(
+        VesselInput::builder()
+            .spec(object.spec.clone())
+            .labels(object.metadata.labels.clone())
+            .annotations(object.metadata.annotations.clone())
+            .owners(object.metadata.owner_references.clone())
+            .build(),
+    )
+}
+
+struct ReplicaInputs<I> {
+    by_origin: HashMap<(String, String), I>,
+}
+
+impl<I> Default for ReplicaInputs<I> {
+    fn default() -> Self {
+        Self { by_origin: HashMap::new() }
+    }
+}
+
+impl<I: PartialEq> ReplicaInputs<I> {
+    // Inputs are recorded before reconciliation. Sync errors terminate run(); if
+    // retries are added, failed inputs must remain dirty until reconciliation succeeds.
+    fn update<T: Resource>(&mut self, source: ReadResourceObject<T>, input: impl Fn(&ResourceObject<T>) -> Option<I>) -> bool {
+        let ResourceProvenance::Replica { origin_root, .. } = source.provenance else { return false };
+        let key = (origin_root.to_string(), source.object.metadata.name.clone());
+        match input(&source.object) {
+            Some(value) if self.by_origin.get(&key) != Some(&value) => {
+                self.by_origin.insert(key, value);
+                true
+            }
+            Some(_) => false,
+            None => self.by_origin.remove(&key).is_some(),
+        }
+    }
+
+    fn event<T: Resource>(
+        &mut self,
+        event: Option<Result<ReadWatchEvent<T>, ResourceError>>,
+        kind: &str,
+        input: impl Fn(&ResourceObject<T>) -> Option<I>,
+    ) -> Result<bool, ResourceError> {
+        let event = event.ok_or_else(|| ResourceError::invalid(format!("{kind} replica watch ended")))??;
+        match event {
+            ReadWatchEvent::Added(source) | ReadWatchEvent::Modified(source) => Ok(self.update(source, input)),
+            ReadWatchEvent::Deleted(source) => Ok(match source.provenance {
+                ResourceProvenance::Replica { origin_root, .. } => {
+                    self.by_origin.remove(&(origin_root.to_string(), source.object.metadata.name)).is_some()
+                }
+                ResourceProvenance::Local => false,
+            }),
+            ReadWatchEvent::DeletedByName { tombstone, provenance } => Ok(match provenance {
+                ResourceProvenance::Replica { origin_root, .. } => {
+                    self.by_origin.remove(&(origin_root.to_string(), tombstone.name)).is_some()
+                }
+                ResourceProvenance::Local => false,
+            }),
+        }
+    }
 }

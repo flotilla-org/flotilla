@@ -144,6 +144,10 @@ pub struct AggregatorProjectionState {
     /// rows lets rebuilds suppress notifications for unrelated projects.
     #[builder(skip)]
     scoped_convoy_snapshots: Arc<Mutex<HashMap<QueryId, ResultSet>>>,
+    /// Fleet rows at the previous delivery boundary. Diff once per batch,
+    /// then evaluate only subscriptions in the old or new project scope.
+    #[builder(skip)]
+    scoped_convoy_rows: Arc<Mutex<Option<HashMap<ResourceRef, ConvoyRow>>>>,
     /// Subscriber ownership and demand-backed materializations belong to the
     /// Aggregator state, shared with the daemon's subscription transport.
     demand_backed: QueryRegistry,
@@ -163,10 +167,31 @@ impl AggregatorProjectionState {
     }
 
     pub async fn convoy_result_set(&self, scope: &Option<QueryScope>) -> ResultSet {
-        let set = self.result_set().await;
-        let Rows::Convoys { rows, .. } = set.rows else { unreachable!("convoy projection must produce convoy rows") };
-        let rows = rows.into_iter().filter(|row| scope.as_ref().is_none_or(|scope| convoy_matches_scope(row, scope))).collect();
-        ResultSet { seq: set.seq, rows: Rows::Convoys { scope: scope.clone(), rows }, state: set.state }
+        let view = self.convoys.read().await;
+        if scope.is_some() {
+            // Establish the diff baseline during the first replay, while it
+            // shares the same read lock as the snapshot. The first subsequent
+            // change must not treat the entire existing fleet as newly added.
+            let mut previous = self.scoped_convoy_rows.lock().expect("scoped convoy rows lock poisoned");
+            previous.get_or_insert_with(|| {
+                view.local_rows
+                    .values()
+                    .chain(view.replica_rows.values().flat_map(|rows| rows.values()))
+                    .map(|row| (row.resource.clone(), row.clone()))
+                    .collect()
+            });
+        }
+        let rows = view
+            .local_rows
+            .values()
+            .chain(view.replica_rows.values().flat_map(|rows| rows.values()))
+            .filter(|row| scope.as_ref().is_none_or(|scope| convoy_matches_scope(row, scope)))
+            .cloned()
+            .collect();
+        let mut set = view.to_result_set(rows);
+        let Rows::Convoys { scope: result_scope, .. } = &mut set.rows else { unreachable!("convoy rows") };
+        *result_scope = scope.clone();
+        set
     }
 
     pub async fn seq(&self) -> u64 {
@@ -336,8 +361,50 @@ impl AggregatorProjectionState {
     /// Return only live scoped Convoys snapshots whose projected rows changed
     /// since subscription replay or the previous live delivery.
     pub async fn changed_scoped_convoy_result_sets(&self) -> Vec<ResultSet> {
-        let queries =
-            self.subscribed_queries().into_iter().filter(|query| matches!(query, QueryId::Convoys { scope: Some(_) })).collect::<Vec<_>>();
+        let subscribed = self.subscribed_queries();
+        if !subscribed.iter().any(|query| matches!(query, QueryId::Convoys { scope: Some(_) })) {
+            self.scoped_convoy_rows.lock().expect("scoped convoy rows lock poisoned").take();
+            return Vec::new();
+        }
+        let affected = {
+            let view = self.convoys.read().await;
+            let current = view
+                .local_rows
+                .values()
+                .chain(view.replica_rows.values().flat_map(|rows| rows.values()))
+                .map(|row| (&row.resource, row))
+                .collect::<HashMap<_, _>>();
+            let mut previous = self.scoped_convoy_rows.lock().expect("scoped convoy rows lock poisoned");
+            let previous = previous.get_or_insert_with(HashMap::new);
+            let mut affected = HashSet::new();
+            previous.retain(|reference, row| {
+                if current.contains_key(reference) {
+                    true
+                } else {
+                    affected.extend(convoy_scopes(row));
+                    false
+                }
+            });
+            for (reference, row) in current {
+                if previous.get(reference) != Some(row) {
+                    affected.extend(convoy_scopes(row));
+                    if let Some(old) = previous.insert(reference.clone(), row.clone()) {
+                        affected.extend(convoy_scopes(&old));
+                    }
+                }
+            }
+            affected
+        };
+        let queries = {
+            let snapshots = self.scoped_convoy_snapshots.lock().expect("scoped convoy snapshot lock poisoned");
+            subscribed
+                .into_iter()
+                .filter(|query| match query {
+                    QueryId::Convoys { scope: Some(scope) } => affected.contains(scope) || !snapshots.contains_key(query),
+                    _ => false,
+                })
+                .collect::<Vec<_>>()
+        };
         let mut changed = Vec::new();
         for query in queries {
             let QueryId::Convoys { scope } = &query else { unreachable!("queries were filtered to scoped Convoys") };
@@ -462,6 +529,15 @@ fn sorted_project_scopes(projects: &HashMap<QueryScope, Vec<RepositoryKey>>) -> 
 
 fn convoy_phase_represents_issues(phase: ConvoyPhase) -> bool {
     matches!(phase, ConvoyPhase::Pending | ConvoyPhase::Active | ConvoyPhase::Interrupted | ConvoyPhase::Anchored | ConvoyPhase::Landing)
+}
+
+fn convoy_scopes(row: &ConvoyRow) -> Vec<QueryScope> {
+    let Some(project) = row.project_ref.as_deref() else { return Vec::new() };
+    let mut scopes = vec![QueryScope::new(&row.resource.namespace, project)];
+    if let Some(name) = project.strip_prefix(&format!("{}/", row.resource.namespace)) {
+        scopes.push(QueryScope::new(&row.resource.namespace, name));
+    }
+    scopes
 }
 
 fn convoy_matches_scope(row: &ConvoyRow, scope: &QueryScope) -> bool {
@@ -763,6 +839,115 @@ mod tests {
         let removed = state.changed_scoped_convoy_result_sets().await;
         assert_eq!(removed.len(), 1);
         assert!(removed[0].rows.is_empty());
+    }
+
+    // #2775: scoped delivery agrees with filtering the complete fleet after
+    // inserts, updates, project moves, deletions and bursts returning to prior state.
+    #[hegel::test]
+    fn scoped_convoy_changes_match_fleet_filtering(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let steps = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
+        // Cross empty/duplicate and project boundaries; alternate local/replica rows.
+        let ops = (0..steps)
+            .map(|_| {
+                (
+                    tc.draw(gs::integers::<usize>().min_value(0).max_value(5)),
+                    tc.draw(gs::integers::<usize>().min_value(0).max_value(2)),
+                    tc.draw(gs::integers::<usize>().min_value(0).max_value(3)),
+                    tc.draw(gs::booleans()),
+                )
+            })
+            .collect::<Vec<_>>();
+        tokio::runtime::Builder::new_current_thread().enable_all().build().expect("projection test runtime").block_on(async {
+            let state = AggregatorProjectionState::new();
+            let queries = (0..3).map(|index| QueryId::Convoys { scope: Some(scope(&format!("project-{index}"))) }).collect::<Vec<_>>();
+            state.replace_subscriber(
+                Uuid::new_v4(),
+                &queries.iter().map(|query| QueryCursor { query: query.clone(), since: None }).collect::<Vec<_>>(),
+            );
+            let mut previous = HashMap::new();
+            for query in &queries {
+                previous.insert(query.clone(), state.result_set_for(query).await.expect("initial scoped snapshot").rows);
+            }
+            state.changed_scoped_convoy_result_sets().await;
+            for (index, project, action, replica) in ops {
+                let mut row = convoy_row("flotilla", &format!("work-{index}"), &format!("project-{project}"));
+                if action == 3 {
+                    row.project_ref = Some(format!("flotilla/project-{project}"));
+                }
+                if replica {
+                    row.resource.host = Some(HostName::new("remote"));
+                }
+                {
+                    let mut view = state.write().await;
+                    let rows = if replica { view.replica_rows.entry(HostName::new("remote")).or_default() } else { &mut view.local_rows };
+                    if action == 0 {
+                        rows.remove(&row.resource);
+                    } else {
+                        if action == 2 {
+                            row.workflow_ref = "review".into();
+                        }
+                        rows.insert(row.resource.clone(), row);
+                    }
+                    view.seq += 1;
+                }
+                let mut expected = HashMap::new();
+                for query in &queries {
+                    let QueryId::Convoys { scope } = query else { unreachable!() };
+                    let set = state.convoy_result_set(scope).await;
+                    if previous.get(query) != Some(&set.rows) {
+                        expected.insert(query.clone(), set.rows.clone());
+                    }
+                    previous.insert(query.clone(), set.rows);
+                }
+                let actual = state
+                    .changed_scoped_convoy_result_sets()
+                    .await
+                    .into_iter()
+                    .map(|set| (set.query(), set.rows))
+                    .collect::<HashMap<_, _>>();
+                assert_eq!(actual, expected);
+            }
+        });
+    }
+
+    // #2775: one project change must not evaluate unrelated presentation scopes.
+    // Fixed load: 32 scopes, two presentation subscribers per scope, 512 convoys,
+    // and 100 sequential updates. Cache sequence advancement measures evaluations.
+    #[tokio::test]
+    async fn scoped_convoy_subscription_load() {
+        let state = AggregatorProjectionState::new();
+        {
+            let mut view = state.write().await;
+            for index in 0..512 {
+                let row = convoy_row("flotilla", &format!("work-{index}"), &format!("project-{}", index % 32));
+                view.local_rows.insert(row.resource.clone(), row);
+            }
+            view.seq = 1;
+        }
+        for project in 0..32 {
+            let query = QueryId::Convoys { scope: Some(scope(&format!("project-{project}"))) };
+            for _ in 0..2 {
+                state.replace_subscriber(Uuid::new_v4(), &[QueryCursor { query: query.clone(), since: None }]);
+            }
+            state.result_set_for(&query).await.expect("initial scoped snapshot");
+        }
+        let started = std::time::Instant::now();
+        let mut evaluations = 0;
+        for update in 0..100 {
+            {
+                let mut view = state.write().await;
+                let row = view.local_rows.values_mut().find(|row| row.name == "work-0").expect("loaded convoy");
+                row.workflow_ref = format!("workflow-{update}");
+                view.seq += 1;
+            }
+            assert_eq!(state.changed_scoped_convoy_result_sets().await.len(), 1);
+            let seq = state.seq().await;
+            evaluations +=
+                state.scoped_convoy_snapshots.lock().expect("scoped snapshot cache").values().filter(|set| set.seq == seq).count();
+        }
+        eprintln!("scoped load: 64 subscriptions, 512 convoys, 100 updates: {evaluations} evaluations, {:?}", started.elapsed());
+        assert_eq!(evaluations, 100, "only the affected scope should be evaluated");
     }
 
     #[tokio::test]

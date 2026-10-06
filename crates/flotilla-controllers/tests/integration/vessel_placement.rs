@@ -181,3 +181,119 @@ async fn owning_daemon_projects_a_vessel_placed_on_its_agentless_ssh_host() {
     let actuator = owner.using::<Vessel>(NAMESPACE).get("ssh-placement-work").await.expect("owned actuator");
     assert_eq!(actuator.metadata.annotations.get(ACTUATOR_HOST_REF_ANNOTATION).map(String::as_str), Some("ssh-host"));
 }
+
+// #2775: replicated status churn must not cause repeated no-op placement scans.
+// Observe the existing sync event with a task-local subscriber; no global tracing state.
+#[tokio::test(start_paused = true)]
+async fn placement_status_churn_does_not_spin() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::{layer::SubscriberExt, Layer};
+
+    struct SyncCounter(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> Layer<S> for SyncCounter {
+        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            struct SyncCompleted(bool);
+            impl tracing::field::Visit for SyncCompleted {
+                fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                    if field.name() == "placement_sync_completed" {
+                        self.0 = value;
+                    }
+                }
+
+                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            }
+            let mut message = SyncCompleted(false);
+            event.record(&mut message);
+            if message.0 {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+    let origin = NodeId::new("admitting");
+    let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(origin.clone());
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("actuator"));
+    let convoys = source.using::<Convoy>(NAMESPACE);
+    let mut convoy = convoys
+        .create(
+            &InputMeta::builder().name("status-churn".to_string()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".to_string()).build(),
+        )
+        .await
+        .expect("placement scenario operation");
+    let writer = backend.replica_writer::<Convoy>(origin, NAMESPACE);
+    writer.replace(&convoys.list().await.expect("placement scenario operation"), Utc::now()).await.expect("placement scenario operation");
+    let scans = Arc::new(AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(SyncCounter(scans.clone()));
+    let projector = VesselPlacementProjector::new(backend, NAMESPACE, CanonicalHostId::resolved("local"));
+    let task = tokio::spawn(async move { projector.run().await }.with_subscriber(subscriber));
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(scans.load(Ordering::SeqCst), 1, "initial reconciliation");
+    for update in 0..100 {
+        convoy = convoys
+            .update_status("status-churn", &convoy.metadata.resource_version, &ConvoyStatus {
+                message: Some(format!("progress-{update}")),
+                ..ConvoyStatus::default()
+            })
+            .await
+            .expect("placement scenario operation");
+        writer
+            .replace(&convoys.list().await.expect("placement scenario operation"), Utc::now())
+            .await
+            .expect("placement scenario operation");
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(std::time::Duration::from_millis(30)).await;
+    }
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    eprintln!("placement load: 100 replicated status updates: {} scans", scans.load(Ordering::SeqCst));
+    assert_eq!(scans.load(Ordering::SeqCst), 1, "status-only updates must not rescan placement");
+    // Real placement changes still reconcile, with one scan for a queued burst.
+    for update in 0..100 {
+        convoy = convoys
+            .update_status("status-churn", &convoy.metadata.resource_version, &ConvoyStatus {
+                placement_decision: Some(PlacementDecision {
+                    minimal_alternatives: Vec::new(),
+                    escalation_reason: None,
+                    policy_name: "host-direct".into(),
+                    target_host: PlacementTargetHost {
+                        reference: CanonicalHostId::resolved(format!("host-{update}")),
+                        display_name: "target".into(),
+                    },
+                    refused_candidates: Vec::new(),
+                    viable_not_selected: Vec::new(),
+                    allocation: None,
+                }),
+                ..ConvoyStatus::default()
+            })
+            .await
+            .expect("placement scenario operation");
+        writer
+            .replace(&convoys.list().await.expect("placement scenario operation"), Utc::now())
+            .await
+            .expect("placement scenario operation");
+    }
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(std::time::Duration::from_millis(30)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(scans.load(Ordering::SeqCst), 2, "placement burst should reconcile once");
+    tokio::time::advance(std::time::Duration::from_secs(60)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(scans.load(Ordering::SeqCst), 3, "bounded resync should repair drift even without watch changes");
+    task.abort();
+}
