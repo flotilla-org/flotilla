@@ -346,7 +346,18 @@ mod tests {
             .build();
         projects.apply(&InputMeta::builder().name("parent".into()).build(), &parent).await.expect("parent");
         child.parent = Some("parent".into());
+        // #2721's source pointer and #2719's delivered prose coexist; the
+        // cascade must neither reinterpret nor overwrite source authority.
+        child.charter = Some(crate::CharterPointer::Repository {
+            repo: "https://github.com/example/ops".into(),
+            branch: "main".into(),
+            path: "charters/child".into(),
+        });
         child.charter_prose.insert("governor".into(), "Child charter".into());
+        let encoded = serde_json::to_value(&child).expect("serialize Project");
+        let decoded: ProjectSpec = serde_json::from_value(encoded).expect("decode Project");
+        assert_eq!(decoded.charter, child.charter);
+        assert_eq!(decoded.charter_prose, child.charter_prose);
         let meta = InputMeta::builder()
             .name("child".into())
             .annotations(BTreeMap::from([("flotilla.work/project-bootstrap-commit".into(), "abc123".into())]))
@@ -357,6 +368,9 @@ mod tests {
         assert_eq!(inherited.roles["governor"].model.as_deref(), Some("parent"));
         assert_eq!(inherited.settings["roles.governor.model"].layer, "project:parent");
         assert_eq!(inherited.charter["governor"], "Child charter");
+        let stored = projects.get("child").await.expect("stored Project");
+        assert_eq!(stored.spec.charter, child.charter);
+        assert_eq!(stored.spec.charter_prose, child.charter_prose);
         assert_eq!(inherited.charter_commit.as_deref(), Some("abc123"));
         child.role_definitions.insert("governor".into(), RoleDefinition { model: Some("child".into()), ..Default::default() });
         projects.apply(&meta, &child).await.expect("override");

@@ -86,6 +86,9 @@ Admission brief artifact identities use `(convoy, role, "brief", convoy)`.
 Agent roles must be unique across allocated vessels; admission refuses repeated
 roles before any brief write rather than allowing one vessel's body to replace
 another's. Handoffs use a separate unique subject.
+`Project.spec.charter` retains the charter-delegation source pointer;
+`charter_prose` contains only local text delivered to roles. Both may coexist.
+
 Bound-store authority, charter delegation, subscriptions, address books and
 superseding-charter messages belong to #2720, #2721 and #2722 respectively.
 
