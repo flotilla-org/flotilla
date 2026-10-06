@@ -45,6 +45,7 @@ pub mod ops_entry;
 pub mod path_context;
 pub mod path_policy;
 pub mod placement_policy;
+pub mod probe;
 pub mod project_declaration;
 mod project_repositories;
 pub mod provider_data;

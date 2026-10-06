@@ -105,7 +105,7 @@ impl ConvoyAdmission {
     pub(super) async fn free_space_bytes(&self) -> Result<Option<u64>, String> {
         let path = self.admission_free_space_path.read().expect("admission free-space path lock poisoned").clone();
         let probe = Arc::clone(&self.discovery.available_space_probe);
-        tokio::task::spawn_blocking(move || probe.measure(&path)).await.map_err(|error| format!("measure available disk space: {error}"))
+        crate::probe::blocking("available disk space", crate::probe::PROBE_TIMEOUT, move || Ok(probe.measure(&path))).await
     }
 
     async fn provisioning_namespace(&self) -> String {
@@ -1590,7 +1590,7 @@ impl ConvoyAdmission {
         let available_space_probe = Arc::clone(&self.discovery.available_space_probe);
         let admission_free_space_path = self.admission_free_space_path.read().expect("admission free-space path lock poisoned").clone();
         let host_name = self.host_name.to_string();
-        tokio::task::spawn_blocking(move || {
+        crate::probe::blocking("free-space admission", crate::probe::PROBE_TIMEOUT, move || {
             let daemon_config = config.load_daemon_config()?;
             crate::admission::check_free_space_floor(
                 &*available_space_probe,
@@ -1600,7 +1600,7 @@ impl ConvoyAdmission {
             )
         })
         .await
-        .map_err(|error| format!("free-space check failed on host `{}`: {error}", self.host_name))?
+        .map_err(|error| format!("free-space check failed on host `{}`: {error}", self.host_name))
     }
 
     pub(super) fn admission_free_space_floor_bytes(&self) -> Result<u64, String> {

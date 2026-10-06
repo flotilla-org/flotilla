@@ -19,7 +19,7 @@ pub struct ClaudeDetector;
 impl HostDetector for ClaudeDetector {
     async fn detect(&self, runner: &dyn CommandRunner, env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
         // 1. Check PATH, then retain the exact executable that satisfied the probe.
-        if let Ok(output) = run!(runner, "claude", &["--version"], Path::new(".")) {
+        if let Ok(output) = run!(runner, "claude", &["--version"], Path::new("/")) {
             if let Some(path) = resolve_binary_path(runner, "claude").await {
                 return match parse_first_dotted_version(&output) {
                     Some(version) => vec![EnvironmentAssertion::versioned_binary("claude", path, version)],
@@ -32,7 +32,7 @@ impl HostDetector for ClaudeDetector {
         if let Some(home) = env.get("HOME") {
             let path = PathBuf::from(home).join(".claude/local/claude");
             let path_str = path.to_str().unwrap_or("");
-            if let Ok(output) = run!(runner, path_str, &["--version"], Path::new(".")) {
+            if let Ok(output) = run!(runner, path_str, &["--version"], Path::new("/")) {
                 return match parse_first_dotted_version(&output) {
                     Some(version) => {
                         vec![EnvironmentAssertion::versioned_binary("claude", &path, version)]

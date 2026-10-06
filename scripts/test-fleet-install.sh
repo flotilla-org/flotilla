@@ -871,7 +871,26 @@ grep -Fxq "Environment=\"FLOTILLA_CODEX_HOME_TEMPLATE=$custom_root/current/share
 darwin_home="$test_root/darwin-home"
 mkdir -p "$darwin_home/.config/flotilla"
 cp "$test_root/home/.config/flotilla/fleet-reader-token" "$darwin_home/.config/flotilla/fleet-reader-token"
+# A stable TCC client must be a regular copy at the same real path across
+# installs, automatic rollback, reinstall and explicit rollback. Compare exact
+# signed payload bytes, including the executable-relative dynamic library.
+assert_darwin_tcc_payload() {
+  local generation="$1"
+  local stable="$darwin_home/.local/opt/flotilla-fleet/tcc"
+  local release="$darwin_home/.local/opt/flotilla-fleet/releases/$generation"
+  local relative
+  for relative in bin/flotilla bin/flotillad bin/cleat lib/libghostty-vt.dylib; do
+    test -f "$stable/$relative" && test ! -L "$stable/$relative" || fail "TCC payload is not a regular copy: $relative"
+    cmp "$stable/$relative" "$release/$relative" || fail "TCC payload differs from selected generation: $relative"
+  done
+  for relative in flotilla flotillad cleat; do
+    test -x "$stable/bin/$relative" || fail "TCC binary lost executable mode: $relative"
+    grep -Fq "$stable/bin/$relative" "$darwin_home/.local/bin/$relative" || fail "launcher bypasses stable TCC path: $relative"
+  done
+}
+
 run_darwin_installer "$darwin_home" "$generation_one" >"$test_root/darwin-install-one.out"
+assert_darwin_tcc_payload "$generation_one"
 # Refusing validation leaves the old service untouched and available.
 if FLEET_VALIDATE_FAIL_FOR="$generation_two" run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-validation.out" 2>&1; then
   fail 'Darwin validation refusal was accepted'
@@ -946,9 +965,15 @@ grep -Eq "^kickstart -k gui/[0-9]+/work\\.flotilla\\.flotillad\\|releases/$gener
   || fail 'Darwin health failure did not restart the restored generation'
 grep -Fq "generation $generation_two failed health confirmation; rolled back to $generation_one" \
   "$test_root/darwin-health-rollback.out" || fail 'Darwin automatic rollback was not reported loudly'
+assert_darwin_tcc_payload "$generation_one"
 : >"$test_root/codesign.log"
 : >"$test_root/launchctl.log"
+# Refresh must prune obsolete libraries and recursively copy nested payloads.
+mkdir -p "$darwin_home/.local/opt/flotilla-fleet/tcc/lib/nested"
+printf stale >"$darwin_home/.local/opt/flotilla-fleet/tcc/lib/nested/obsolete.dylib"
 run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-install.out"
+test ! -e "$darwin_home/.local/opt/flotilla-fleet/tcc/lib/nested/obsolete.dylib" || fail 'obsolete TCC library survived refresh'
+assert_darwin_tcc_payload "$generation_two"
 test "$(link_generation "$darwin_home/.local/opt/flotilla-fleet/current")" = "$generation_two" \
   || fail 'signed Darwin generation was not selected'
 test -f "$darwin_home/.local/opt/flotilla-fleet/releases/$generation_two/lib/libghostty-vt.dylib" \
@@ -967,7 +992,7 @@ with open(sys.argv[1], "rb") as source:
 home = sys.argv[2]
 assert agent["Label"] == "work.flotilla.flotillad"
 assert agent["ProgramArguments"] == [
-    f"{home}/.local/opt/flotilla-fleet/current/bin/flotillad",
+    f"{home}/.local/opt/flotilla-fleet/tcc/bin/flotillad",
     "--timeout",
     "0",
     "--config-dir",
@@ -1009,6 +1034,7 @@ test "$(grep -Ec '^kickstart -k gui/[0-9]+/work\.flotilla\.flotillad\|' "$test_r
 
 : >"$test_root/launchctl.log"
 LAUNCHD_AGENT_DISABLED=true run_darwin_installer "$darwin_home" "$generation_two" >"$test_root/darwin-dev-mode-install.out"
+assert_darwin_tcc_payload "$generation_two"
 grep -Fq 'preserving flotillad dev mode' "$test_root/darwin-dev-mode-install.out" \
   || fail 'Darwin install did not report preserved dev mode'
 if grep -Eq '^(enable|bootstrap|kickstart) ' "$test_root/launchctl.log"; then
@@ -1018,6 +1044,7 @@ fi
 darwin_previous_target="releases/$generation_one"
 : >"$test_root/launchctl.log"
 run_darwin_installer "$darwin_home" rollback >"$test_root/darwin-rollback.out"
+assert_darwin_tcc_payload "$generation_one"
 grep -Eq "^bootstrap gui/[0-9]+ $launch_agent\\|$darwin_previous_target$" "$test_root/launchctl.log" \
   || fail 'Darwin rollback did not bootstrap after selecting the previous generation'
 grep -Eq "^kickstart -k gui/[0-9]+/work\\.flotilla\\.flotillad\\|$darwin_previous_target$" "$test_root/launchctl.log" \
@@ -1126,5 +1153,28 @@ grep -Fq 'fleet prune --fleet-root ' "$prune_log" || fail 'prune did not delegat
 grep -Fq -- '--keep-others 0' "$prune_log" || fail 'prune lost retention argument'
 grep -Fq -- '--keep-others 9 --dry-run' "$prune_log" || fail 'dry-run lost arguments'
 grep -Fq '/current/bin/flotilla|' "$prune_log" || fail 'prune did not use active binary'
+
+# Exercise the production copy boundary with a nested library and stale payload.
+python3 - "$installer" <<'PYTHON'
+from pathlib import Path
+import sys
+import tempfile
+script = Path(sys.argv[1]).read_text()
+marker = "python3 - \"$CURRENT_LINK\" \"$DARWIN_TCC_ROOT\" <<'PYTHON'\n"
+body = script.split(marker, 1)[1].split('\nPYTHON', 1)[0]
+with tempfile.TemporaryDirectory() as root:
+    source, destination = Path(root) / "source", Path(root) / "destination"
+    (source / "bin").mkdir(parents=True)
+    for name in ("flotilla", "flotillad", "cleat"):
+        (source / "bin" / name).write_text(name)
+    (source / "lib" / "nested").mkdir(parents=True)
+    (source / "lib" / "nested" / "data").write_text("nested")
+    (destination / "lib").mkdir(parents=True)
+    (destination / "lib" / "obsolete").write_text("stale")
+    sys.argv = ["refresh", str(source), str(destination)]
+    exec(compile(body, "fleet-install copy boundary", "exec"))
+    assert (destination / "lib" / "nested" / "data").read_text() == "nested"
+    assert not (destination / "lib" / "obsolete").exists()
+PYTHON
 
 echo 'fleet-install contract passed'

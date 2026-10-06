@@ -427,7 +427,7 @@ impl RuntimeHealth {
             .value(ConditionValue::False)
             .reason("RestartBudgetExhausted")
             .message(format!(
-                "{} controller stopped after {} consecutive failures: {}",
+                "{} controller exhausted its budget after {} consecutive failures; retrying after long backoff: {}",
                 exhausted.controller, exhausted.attempts, exhausted.error
             ))
             .observed_at(Utc::now())
@@ -483,11 +483,10 @@ impl RuntimeHealth {
         let mut conditions = self.failures.lock().expect("runtime health lock poisoned").values().cloned().collect::<Vec<_>>();
         conditions.extend(self.issue_polling.condition());
         if let Some(state_dir) = self.restart_history_dir.clone() {
-            let frequency =
-                tokio::task::spawn_blocking(move || crate::restart_history::recent_abnormal_restarts(state_dir.as_path(), Utc::now()))
-                    .await
-                    .map_err(|error| format!("restart history task failed: {error}"))
-                    .and_then(|result| result);
+            let frequency = flotilla_core::probe::blocking("restart history", flotilla_core::probe::PROBE_TIMEOUT, move || {
+                crate::restart_history::recent_abnormal_restarts(state_dir.as_path(), Utc::now())
+            })
+            .await;
             let condition = match frequency {
                 Ok(frequency) if frequency.count > 0 => Some(
                     HostCondition::builder()
@@ -3045,13 +3044,44 @@ async fn observe_fulfilment_facts(
     Ok(facts)
 }
 
-async fn supervise_controller<F, Fut>(name: &'static str, supervision: ControllerSupervision, runtime_health: RuntimeHealth, make_run: F)
-where
+async fn supervise_controller<F, Fut>(
+    name: &'static str,
+    supervision: ControllerSupervision,
+    runtime_health: RuntimeHealth,
+    mut make_run: F,
+) where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<(), ResourceError>>,
 {
-    if let Err(exhausted) = supervise(name, supervision, make_run).await {
-        runtime_health.report_restart_budget_exhausted(exhausted);
+    loop {
+        let result = supervise(name, supervision.clone(), || {
+            let run = make_run();
+            let health = runtime_health.clone();
+            // Use the supervisor's same healthy duration for alarm recovery.
+            // A run failing before this window leaves the exhaustion alarm set.
+            let healthy_after = supervision.success_reset_after;
+            async move {
+                tokio::pin!(run);
+                tokio::select! {
+                    result = &mut run => result,
+                    () = tokio::time::sleep(healthy_after) => {
+                        health.failures.lock().expect("runtime health lock poisoned").remove(&format!("Controller/{name}"));
+                        run.await
+                    }
+                }
+            }
+        })
+        .await;
+        match result {
+            Ok(()) => {
+                runtime_health.failures.lock().expect("runtime health lock poisoned").remove(&format!("Controller/{name}"));
+                return;
+            }
+            Err(exhausted) => {
+                runtime_health.report_restart_budget_exhausted(exhausted);
+                tokio::time::sleep(supervision.recovery_backoff).await;
+            }
+        }
     }
 }
 
@@ -3957,10 +3987,24 @@ async fn apply_host_heartbeat_with_credentials(
         Some(store) => (store.held_credentials().await?, store.credential_expiry().await),
         None => (BTreeSet::new(), BTreeMap::new()),
     };
-    let disk_free_bytes = daemon.admission_free_space_bytes().await?;
+    let (disk_free_bytes, disk_probe_error) = match daemon.admission_free_space_bytes().await {
+        Ok(bytes) => (bytes, None),
+        Err(error) => (None, Some(error)),
+    };
     let admission_free_space_floor_bytes = daemon.admission_free_space_floor_bytes()?;
     migrate_live_placement_policies(&backend, namespace, &profile.host_id, std::env::consts::OS).await?;
     let mut conditions = runtime_health.conditions().await;
+    if let Some(error) = disk_probe_error {
+        conditions.push(
+            HostCondition::builder()
+                .condition_type("Filesystem/AvailableSpace")
+                .value(ConditionValue::False)
+                .reason("ProbeFailed")
+                .message(error)
+                .observed_at(Utc::now())
+                .build(),
+        );
+    }
     let build_records = backend.using::<flotilla_resources::ImageBuild>(namespace).list().await.map_err(|error| error.to_string())?;
     for build in &build_records.items {
         if build.spec.host_ref == profile.host_id
@@ -13414,29 +13458,92 @@ mod tests {
         );
     }
 
+    // Fleet health consumes the persisted Host heartbeat. Exhaustion must be
+    // visible through that public query, and recovery must remove the diagnosis.
     #[tokio::test]
-    async fn resource_controller_restart_budget_exhaustion_is_recorded_under_its_kind() {
+    async fn controller_exhaustion_alarm_is_visible_in_fleet_health() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("daemon.toml"), "machine_id = \"controller-exhaustion-health-test\"\n").expect("daemon config");
+        let daemon = in_memory_daemon(Vec::new(), Arc::new(ConfigStore::with_base(temp.path()))).await;
+        let host_id = daemon.local_host_id().expect("local host").to_string();
+        let profile = manual_profile(&host_id, false);
+        let health = RuntimeHealth::default();
+        health.report_restart_budget_exhausted(RestartBudgetExhausted {
+            controller: "Convoy",
+            error: ResourceError::other("read deadline exceeded"),
+            attempts: 10,
+        });
+        apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &test_health_identity(), &health)
+            .await
+            .expect("publish degraded heartbeat");
+        let fleet = daemon.fleet_health_internal().await.expect("fleet health");
+        let local = fleet.hosts.iter().find(|host| host.is_local).expect("local fleet row");
+        assert!(local
+            .degraded_conditions
+            .iter()
+            .any(|condition| condition.contains("Convoy") && condition.contains("read deadline exceeded")));
+        health.failures.lock().expect("health lock").remove("Controller/Convoy");
+        apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &test_health_identity(), &health)
+            .await
+            .expect("publish recovered heartbeat");
+        let fleet = daemon.fleet_health_internal().await.expect("recovered fleet health");
+        let local = fleet.hosts.iter().find(|host| host.is_local).expect("local fleet row");
+        assert!(!local.degraded_conditions.iter().any(|condition| condition.contains("Convoy")));
+    }
+
+    // Exhaustion remains visible during long backoff, retries automatically,
+    // and clears only after the restarted controller survives the health window.
+    #[tokio::test(start_paused = true)]
+    async fn resource_controller_restart_budget_exhaustion_recovers() {
         let runtime_health = RuntimeHealth::default();
-        spawn_resource_controller::<Checkout, _, _>(
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (recovered, recovery) = tokio::sync::oneshot::channel();
+        let signal = Arc::new(StdMutex::new(Some(recovered)));
+        let task = spawn_resource_controller::<Checkout, _, _>(
             ResourceBackend::InMemory(Default::default()),
             NAMESPACE.to_string(),
             ControllerSupervision {
                 max_consecutive_failures: 1,
                 initial_backoff: Duration::ZERO,
                 max_backoff: Duration::ZERO,
-                success_reset_after: Duration::from_secs(60),
+                success_reset_after: Duration::from_millis(20),
+                recovery_backoff: Duration::from_millis(100),
             },
             runtime_health.clone(),
-            |_, _| async { Err(ResourceError::other("root-owned debris")) },
-        )
-        .await
-        .expect("controller supervisor task should finish");
-
+            {
+                let attempts = Arc::clone(&attempts);
+                move |_, _| {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    let signal = Arc::clone(&signal);
+                    async move {
+                        if attempt == 0 {
+                            Err(ResourceError::other("pending privacy prompt"))
+                        } else {
+                            if let Some(signal) = signal.lock().expect("signal lock").take() {
+                                let _ = signal.send(());
+                            }
+                            std::future::pending().await
+                        }
+                    }
+                }
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
         let conditions = runtime_health.conditions().await;
         assert_eq!(conditions.len(), 1);
         assert_eq!(conditions[0].condition_type, format!("Controller/{}", Checkout::API_PATHS.kind));
         assert_eq!(conditions[0].reason, "RestartBudgetExhausted");
-        assert!(conditions[0].message.contains("root-owned debris"));
+        assert!(conditions[0].message.contains("pending privacy prompt"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "long backoff prevents a busy restart loop");
+        let retry = tokio::time::timeout(Duration::from_secs(1), recovery).await;
+        if retry.is_err() {
+            task.abort();
+        }
+        retry.expect("retry without daemon restart").expect("recovery signal");
+        assert!(!runtime_health.conditions().await.is_empty(), "starting a run does not prove recovery");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        task.abort();
+        assert!(runtime_health.conditions().await.is_empty(), "healthy run clears alarm");
     }
 
     #[tokio::test]

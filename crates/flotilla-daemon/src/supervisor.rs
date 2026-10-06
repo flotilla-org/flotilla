@@ -18,6 +18,8 @@ pub struct RestartBudgetExhausted {
 pub struct ControllerSupervision {
     /// Maximum number of consecutive failed runs before the supervisor gives up.
     pub max_consecutive_failures: usize,
+    /// Long backoff before replenishing an exhausted budget.
+    pub recovery_backoff: Duration,
     /// Backoff applied after the first failure; doubles each consecutive failure.
     pub initial_backoff: Duration,
     /// Cap on the doubled backoff.
@@ -32,6 +34,7 @@ impl Default for ControllerSupervision {
     fn default() -> Self {
         Self {
             max_consecutive_failures: 10,
+            recovery_backoff: Duration::from_secs(300),
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(30),
             success_reset_after: Duration::from_secs(60),
@@ -65,7 +68,7 @@ where
                         controller = name,
                         %err,
                         attempts = consecutive_failures,
-                        "controller exhausted restart budget; provisioning disabled until daemon restart",
+                        "controller exhausted restart budget; caller must report health and schedule recovery",
                     );
                     return Err(RestartBudgetExhausted { controller: name, error: err, attempts: consecutive_failures });
                 }
@@ -95,6 +98,7 @@ mod tests {
     fn fast_config(max_consecutive_failures: usize) -> ControllerSupervision {
         ControllerSupervision {
             max_consecutive_failures,
+            recovery_backoff: Duration::from_secs(300),
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(4),
             success_reset_after: Duration::from_secs(60),
@@ -171,6 +175,7 @@ mod tests {
         // would have given up after call 2.
         let config = ControllerSupervision {
             max_consecutive_failures: 2,
+            recovery_backoff: Duration::from_secs(300),
             initial_backoff: Duration::from_millis(1),
             max_backoff: Duration::from_millis(1),
             success_reset_after: Duration::from_millis(20),

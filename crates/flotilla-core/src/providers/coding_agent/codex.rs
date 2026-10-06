@@ -232,12 +232,21 @@ impl CodexCodingAgent {
         None
     }
 
-    fn refresh_auth(&self) -> Option<CodexAuth> {
-        let auth = read_auth(&self.auth_path);
+    async fn refresh_auth(&self) -> Result<Option<CodexAuth>, String> {
+        let path = self.auth_path.clone();
+        let result = crate::probe::blocking("Codex auth", crate::probe::PROBE_TIMEOUT, move || Ok(read_auth(&path))).await;
+        self.cache_auth_probe(result)
+    }
+
+    fn cache_auth_probe(&self, result: Result<Option<CodexAuth>, String>) -> Result<Option<CodexAuth>, String> {
+        let auth = result.map_err(|error| {
+            warn!(provider = "codex", %error, "Codex auth probe failed; retaining cached auth");
+            error
+        })?;
         let mut cache = self.auth_cache.lock().expect("auth_cache lock poisoned");
         cache.auth = auth.clone();
         cache.loaded_at = Some(Instant::now());
-        auth
+        Ok(auth)
     }
 
     fn build_request(&self, method: &str, url: &str, auth: &CodexAuth) -> Result<reqwest::Request, String> {
@@ -316,7 +325,7 @@ impl CodexCodingAgent {
         let env_ids = match self.fetch_env_ids_from_all(&auth).await {
             Ok(ids) => ids,
             Err(e) if is_auth_error(&e) => {
-                let fresh_auth = match self.refresh_auth() {
+                let fresh_auth = match self.refresh_auth().await? {
                     Some(a) => a,
                     None => {
                         if !self.auth_warned.swap(true, Ordering::Relaxed) {
@@ -433,7 +442,7 @@ impl super::CloudAgentService for CodexCodingAgent {
         // Mutable so we can update it after an env-lookup auth retry.
         let mut auth = match self.get_cached_auth() {
             Some(a) => a,
-            None => match self.refresh_auth() {
+            None => match self.refresh_auth().await? {
                 Some(a) => a,
                 None => {
                     if !self.auth_warned.swap(true, Ordering::Relaxed) {
@@ -469,7 +478,7 @@ impl super::CloudAgentService for CodexCodingAgent {
                     }
                     Err(e) if is_auth_error(&e) => {
                         // Retry with refreshed auth
-                        let fresh_auth = match self.refresh_auth() {
+                        let fresh_auth = match self.refresh_auth().await? {
                             Some(a) => a,
                             None => {
                                 if !self.auth_warned.swap(true, Ordering::Relaxed) {
@@ -518,7 +527,7 @@ impl super::CloudAgentService for CodexCodingAgent {
                 }
                 Err(e) if is_auth_error(&e) => {
                     // Retry once with fresh auth
-                    let fresh_auth = match self.refresh_auth() {
+                    let fresh_auth = match self.refresh_auth().await? {
                         Some(a) => a,
                         None => {
                             if !self.auth_warned.swap(true, Ordering::Relaxed) {
@@ -562,6 +571,26 @@ impl super::CloudAgentService for CodexCodingAgent {
 mod tests {
     use super::*;
     use crate::providers::{coding_agent::CloudAgentService, replay};
+
+    // A transient probe failure preserves prior credentials and cache age,
+    // and must not consume the separate missing-auth warning.
+    #[tokio::test]
+    async fn failed_auth_probe_preserves_cache() {
+        let fixture = crate::providers::testing::fixture_path("coding_agent", "codex_fallback_auth_retry.yaml");
+        let session = replay::test_session(&fixture, replay::Masks::new());
+        let agent = CodexCodingAgent::new(
+            "codex".into(),
+            ExecutionEnvironmentPath::new(std::path::PathBuf::from("/unused")),
+            replay::test_http_client(&session),
+        );
+        agent.cache_auth_probe(Ok(Some(CodexAuth { bearer_token: "cached".into(), account_id: None }))).unwrap();
+        let loaded_at = agent.auth_cache.lock().unwrap().loaded_at;
+        assert!(agent.cache_auth_probe(Err("probe capacity exhausted".into())).is_err());
+        let cache = agent.auth_cache.lock().unwrap();
+        assert_eq!(cache.loaded_at, loaded_at);
+        assert_eq!(cache.auth.as_ref().unwrap().bearer_token, "cached");
+        assert!(!agent.auth_warned.load(Ordering::Relaxed));
+    }
 
     #[tokio::test]
     async fn fallback_retries_environment_list_with_refreshed_auth() {

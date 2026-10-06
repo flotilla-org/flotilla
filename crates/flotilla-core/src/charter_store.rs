@@ -56,7 +56,7 @@ pub async fn read_charter_source(source: &CharterSource, cache: &Path, vcs: Opti
             }
             CharterSource::LocalDirectory { directory } => {
                 let directory = PathBuf::from(directory);
-                tokio::task::spawn_blocking(move || local_snapshot(&directory)).await.map_err(|error| error.to_string())?
+                crate::probe::blocking("local charter", crate::probe::PROBE_TIMEOUT, move || local_snapshot(&directory)).await
             }
         }
     })
