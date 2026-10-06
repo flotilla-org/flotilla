@@ -1849,6 +1849,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         runtime.block_on(async {
             let temp = tempfile::tempdir().expect("checkout paths");
+            let root = temp.path().canonicalize().expect("physical checkout paths");
             for facts in cases {
                 let backend = ResourceBackend::InMemory(InMemoryBackend::default());
                 let observed = ResourceBackend::InMemory(InMemoryBackend::observed());
@@ -1861,7 +1862,7 @@ mod tests {
                             &InputMeta::builder().name(format!("checkout-{index}")).build(),
                             &CheckoutSpec::Observed(
                                 ObservedCheckoutSpec::builder()
-                                    .path(temp.path().join(index.to_string()).to_string_lossy().into_owned())
+                                    .path(root.join(index.to_string()).to_string_lossy().into_owned())
                                     .host_ref(if *local { "local-host" } else { "foreign-host" }.to_string())
                                     .repo_ref(if *member { key.clone() } else { RepositoryKey("other-repository".into()) })
                                     .r#ref(if *main { "main" } else { "convoy/work" }.to_string())
@@ -1887,7 +1888,7 @@ mod tests {
                     CheckoutSelection::Ambiguous => assert!(!local.is_empty() && selected.is_none(), "a unique checkout must be usable"),
                     CheckoutSelection::Selected(checkout) => {
                         let expected = selected.expect("ambiguous facts must never select an arbitrary checkout");
-                        assert_eq!(checkout.path, temp.path().join(expected.to_string()));
+                        assert_eq!(checkout.path, root.join(expected.to_string()));
                         assert_eq!(checkout.is_main, facts[expected].1);
                         assert_eq!(checkout.git_ref, if facts[expected].1 { "main" } else { "convoy/work" });
                     }

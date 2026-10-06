@@ -2596,14 +2596,26 @@ mod tests {
     #[tokio::test]
     async fn worktree_metadata_resolves_colliding_admin_names() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let source = dir.path().join("source");
+        // Git reports physical paths. Exercise an aliased temp root on Linux
+        // too, then build expectations from the same canonical fixture root.
+        #[cfg(unix)]
+        let root = {
+            let physical = dir.path().join("physical");
+            std::fs::create_dir(&physical).expect("physical root");
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&physical, &alias).expect("aliased temp root");
+            alias.canonicalize().expect("physical temp root")
+        };
+        #[cfg(not(unix))]
+        let root = dir.path().canonicalize().expect("physical temp root");
+        let source = root.join("source");
         std::fs::create_dir(&source).expect("source");
         git(&source, &["init", "-b", "main"]);
         git(&source, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
         let vcs = test_fl(&source, Arc::new(crate::providers::ProcessCommandRunner), true);
         let mut admins = Vec::new();
         for index in 0..2 {
-            let parent = dir.path().join(format!("vessel-{index}"));
+            let parent = root.join(format!("vessel-{index}"));
             std::fs::create_dir(&parent).expect("parent");
             let target = parent.join("checkout");
             vcs.materialise_checkout(&format!("branch-{index}"), Some("main"), target.to_str().expect("target"), "managed")
@@ -2623,7 +2635,7 @@ mod tests {
         }
         assert_ne!(admins[0], admins[1], "same basename must not alias admin overlays");
         assert!(vcs.worktree_metadata(&source).await.is_err(), "independent clone has no linked registration");
-        assert!(vcs.worktree_metadata(&dir.path().join("absent")).await.is_err(), "missing checkout fails closed");
+        assert!(vcs.worktree_metadata(&root.join("absent")).await.is_err(), "missing checkout fails closed");
     }
 
     // #2688: a post-add protection failure leaves a locked registration,
@@ -2714,9 +2726,10 @@ mod tests {
     #[tokio::test]
     async fn managed_registration_survives_prune_and_reconcile_then_teardown() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let source = dir.path().join("source");
-        let target = dir.path().join("managed");
-        let sibling = dir.path().join("sibling");
+        let root = dir.path().canonicalize().expect("physical temp root");
+        let source = root.join("source");
+        let target = root.join("managed");
+        let sibling = root.join("sibling");
         std::fs::create_dir(&source).expect("source");
         git(&source, &["init", "-b", "main"]);
         git(&source, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
@@ -2727,7 +2740,7 @@ mod tests {
         assert!(admin.join("locked").exists(), "creation protects registration");
         assert_eq!(std::fs::read_to_string(admin.join("locked")).expect("lock reason").trim(), "flotilla-managed: convoy/work");
         git(&source, &["worktree", "add", "-b", "sibling", sibling.to_str().expect("sibling")]);
-        let hidden = dir.path().join("unmounted");
+        let hidden = root.join("unmounted");
         std::fs::rename(&target, &hidden).expect("simulate missing sibling mount");
         git(&sibling, &["worktree", "prune", "--expire", "now"]);
         assert!(admin.exists(), "prune preserves unavailable managed registration");
@@ -2746,8 +2759,8 @@ mod tests {
         }
         #[cfg(unix)]
         {
-            let alias = dir.path().join("alias");
-            std::os::unix::fs::symlink(dir.path(), &alias).expect("parent alias");
+            let alias = root.join("alias");
+            std::os::unix::fs::symlink(&root, &alias).expect("parent alias");
             let aliased_target = alias.join("managed");
             vcs.checkout_registration(aliased_target.to_str().expect("aliased path"), CheckoutRegistration::Release)
                 .await
@@ -2854,11 +2867,11 @@ mod tests {
     #[tokio::test]
     async fn forced_convoy_worktree_removal_archives_dirty_and_unpushed_state() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path();
+        let root = dir.path().canonicalize().expect("physical temp root");
         let remote = root.join("remote.git");
         let source = root.join("source");
         let target = root.join("checkout");
-        git(root, &["init", "--bare", remote.to_str().expect("remote path")]);
+        git(&root, &["init", "--bare", remote.to_str().expect("remote path")]);
         std::fs::create_dir(&source).expect("source directory");
         git(&source, &["init", "-b", "main"]);
         git(&source, &["config", "user.email", "test@example.com"]);
