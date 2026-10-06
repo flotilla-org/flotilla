@@ -76,8 +76,14 @@ reservation's CPU count, a 512 MiB memory limit, and a 128-process limit. Disk
 reservation remains a planning floor; portable Docker disk quotas are not implied.
 
 Resource failure reasons are capped at 2,048 characters; full output remains in the
-Artifact. Classification uses the last error summary, recognises explicit HTTP
-rate-limit errors, and treats a recipe process's own exit as deterministic.
+Artifact. Classification uses the final non-empty diagnostic line, recognises
+explicit HTTP rate-limit errors, and treats a recipe process's own exit as
+deterministic. Trailing BuildKit output can make that short status less informative;
+consult the full Artifact for the preceding error summary. A `RUN` step reporting
+`exit code: 137` with an outer Docker exit of 1 remains a deterministic recipe
+failure under this policy: identical inputs are not automatically retried. An outer
+Docker exit of 137 or a runner deadline is transient. Recipe OOM remediation
+requires changing the recipe or builder capacity rather than expecting a retry.
 Source hashes stream file contents on the blocking pool. VCS acquisition uses
 `git archive` into `context/`; its bare object cache, archive file, and completion
 marker are sibling entries outside the hashed Docker context.
