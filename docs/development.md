@@ -37,7 +37,7 @@ to `~/.config/flotilla/daemon-panic.log` instead.
 
 A checkout's `target/` is managed cache state. The fleet uses two complementary controls: a daily, per-host mtime-based sweep for old Cargo artifact families and a per-checkout size-cap backstop for unusually large targets.
 
-### Daily mtime-based sweep
+### Daily mtime sweep and size caps
 
 Install and immediately verify the schedule on each fleet host from a Flotilla checkout:
 
@@ -45,18 +45,24 @@ Install and immediately verify the schedule on each fleet host from a Flotilla c
 scripts/install-cargo-sweep-schedule.sh
 ```
 
-The installer pins `cargo-sweep` 0.8.0 when the command is absent, copies the runner to `~/.local/libexec/flotilla/`, installs a systemd user timer on Linux or the checked-in launchd agent on macOS, enables the daily schedule, and starts one observed run. The installed policy runs `cargo-sweep --time 3` once a day. This is an mtime-based three-day retention policy.
+The installer pins `cargo-sweep` 0.8.0 when the command is absent, copies the runner, `prune-target.sh`, and their shared cargo-sweep compatibility helper to `~/.local/libexec/flotilla/`, installs a systemd user timer on Linux or the checked-in launchd agent on macOS, enables the daily schedule, and starts one observed run. The installed policy runs `cargo-sweep --time 3` once a day. After that mtime-based three-day retention step, it applies `prune-target.sh` to the same root: oldest incremental generations are capped at 10 GiB and the complete target at 20 GiB. Re-run the installer to update existing schedules.
 
 Each run sweeps:
 
 - every immediate directory under `~/dev/` that has its own `target/`; and
 - every checkout with a `target/` beneath `~/dev/flotilla-repos`, covering that convoy root until lifecycle teardown owns checkout removal under #1113.
 
-The runner records reclaimed bytes for every root and the whole run in:
+The schedule explicitly operates on each discovered checkout's `target/`, overriding any custom `build.target-dir` setting; custom target locations are outside its discovery scope.
+
+The runner records reclaimed bytes separately for the mtime and size-cap steps for every root, plus their combined total for the whole run, in:
 
 ```text
 ~/.local/state/flotilla/cargo-sweep-mtime.log
 ```
+
+Reclaimed-byte figures use before/after disk usage and are approximate if builds run concurrently.
+
+Targets that remain over either cap log a warning (for example, artifacts that cargo-sweep cannot remove). Command failures are logged and make the scheduled run fail, while other roots are still processed. The same `FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE` and `FLOTILLA_TARGET_MAX_SIZE` overrides apply to both scheduled and manual pruning when supplied in their environment.
 
 Inspect the scheduler and the most recent result with:
 
@@ -70,6 +76,8 @@ tail -n 50 ~/.local/state/flotilla/cargo-sweep-mtime.log
 launchctl print "gui/$UID/org.flotilla.cargo-sweep-mtime"
 tail -n 50 ~/.local/state/flotilla/cargo-sweep-mtime.log
 ```
+
+Run the policy regression tests with `scripts/test-prune-target.sh` and `scripts/test-cargo-sweep-mtime.sh`; they require Cargo and provision cargo-sweep 0.8.0 in their temporary test directory when the command is absent. Offline hosts must have that binary installed before running these tests.
 
 An identity-based artifact policy remains a candidate for future evaluation; it is not part of the installed policy.
 
@@ -95,7 +103,7 @@ For a build requiring workspace variables and types in a debugger, use `CARGO_PR
 
 ### Size-cap backstop
 
-The daily host sweep owns age-based removal. `scripts/prune-target.sh` only caps a single checkout when its target grows unusually large: it removes the oldest incremental generations until their total is at most 10 GiB, then asks `cargo-sweep` to reduce the complete target to at most 20 GiB.
+The daily host job applies age-based removal followed by the size caps. `scripts/prune-target.sh` also caps a single checkout on demand: it removes the oldest incremental generations until their total is at most 10 GiB, then asks `cargo-sweep` to reduce the complete target to at most 20 GiB.
 
 Preview the size decisions, then apply them when no build or test is running:
 
@@ -114,7 +122,7 @@ FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE=15GiB \
   scripts/prune-target.sh
 ```
 
-With Cargo's default configuration the script acts only on that checkout's `target/`. When `CARGO_TARGET_DIR` is set, the command intentionally honors it. Relative values are anchored to this checkout's root, so use an absolute value if Cargo is normally invoked elsewhere.
+Use `scripts/prune-target.sh --root /path/to/checkout` to cap another checkout; the installed runner uses this explicit root so it does not depend on a source checkout beside the installed scripts. With Cargo's default configuration the script acts only on that checkout's `target/`. When `CARGO_TARGET_DIR` is set, the command intentionally honors it. Relative values are anchored to this checkout's root, so use an absolute value if Cargo is normally invoked elsewhere.
 
 ### CI cache decision
 

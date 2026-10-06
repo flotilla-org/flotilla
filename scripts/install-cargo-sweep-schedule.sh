@@ -11,6 +11,9 @@ if [[ ! -x $HOME/.cargo/bin/cargo-sweep ]] && ! command -v cargo-sweep >/dev/nul
 fi
 
 install -d "$libexec_dir"
+# Deploy dependencies before the entry point in case an existing schedule fires.
+install -m 0644 "$repo_root/scripts/cargo-sweep-support.sh" "$libexec_dir/cargo-sweep-support.sh"
+install -m 0755 "$repo_root/scripts/prune-target.sh" "$libexec_dir/prune-target.sh"
 install -m 0755 "$repo_root/scripts/cargo-sweep-mtime.sh" "$libexec_dir/cargo-sweep-mtime.sh"
 
 case $(uname -s) in
@@ -40,5 +43,5 @@ case $(uname -s) in
     ;;
 esac
 
-echo "Installed daily mtime-based cargo sweep. Inspect reclaimed bytes in:"
+echo "Installed daily mtime-based cargo sweep and size caps. Inspect reclaimed bytes in:"
 echo "  ${XDG_STATE_HOME:-"$HOME/.local/state"}/flotilla/cargo-sweep-mtime.log"

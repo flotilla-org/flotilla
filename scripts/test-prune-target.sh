@@ -25,6 +25,13 @@ fail() {
 
 trap cleanup EXIT
 
+# Real regression coverage needs the pinned subprocess; provision it in the test
+# directory on fresh CI hosts rather than requiring a scheduler or global install.
+if ! command -v cargo-sweep >/dev/null 2>&1; then
+  cargo install cargo-sweep --version 0.8.0 --locked --root "$test_root/tools"
+  export PATH="$test_root/tools/bin:$PATH"
+fi
+
 mkdir -p "$stub_bin" "$target_dir/debug/deps"
 for generation in old middle new; do
   generation_dir=$target_dir/debug/incremental/probe/s-$generation
@@ -122,5 +129,21 @@ run_cap >/dev/null
 [[ -d $target_dir/debug/incremental/probe/s-new ]] || fail "apply removed the newest generation"
 [[ ! -e $final_cap_dependency ]] || fail "apply retained the final-cap dependency"
 ! grep -Fq -- "--time" "$stub_log" || fail "size-cap backstop invoked age-based cargo-sweep"
+
+# Real cargo-sweep 0.8.0 must tolerate profiles without build-script directories.
+# Its exit status alone misses this error, so assert on its diagnostic output too.
+command -v cargo-sweep >/dev/null || fail "install cargo-sweep 0.8.0 to run the regression test"
+real_repo=$test_root/real-[ERROR]-repo
+mkdir -p "$real_repo/src" "$real_repo/target/debug/deps" "$real_repo/target/debug/.fingerprint/probe-0123456789abcdef"
+printf '[package]\nname="prune-regression"\nversion="0.1.0"\nedition="2021"\n' > "$real_repo/Cargo.toml"
+: > "$real_repo/src/lib.rs"
+printf '{}' > "$real_repo/target/debug/.fingerprint/probe-0123456789abcdef/lib-probe.json"
+dd if=/dev/zero of="$real_repo/target/debug/deps/libprobe-0123456789abcdef.rlib" bs=1048576 count=2 >/dev/null 2>&1
+preview_output=$(CARGO_TARGET_DIR="$real_repo/target" FLOTILLA_TARGET_MAX_SIZE=1MiB "$repo_root/scripts/prune-target.sh" --root "$real_repo" --dry-run 2>&1)
+! grep -Fq 'Failed to clean' <<< "$preview_output" || fail "preview failed on a profile without build/"
+[[ ! -e $real_repo/target/debug/build ]] || fail "preview created build/ in the real target"
+[[ -f $real_repo/target/debug/deps/libprobe-0123456789abcdef.rlib ]] || fail "preview removed a real artifact"
+real_output=$(CARGO_TARGET_DIR="$real_repo/target" FLOTILLA_TARGET_MAX_SIZE=1MiB "$repo_root/scripts/prune-target.sh" --root "$real_repo" 2>&1)
+! grep -Fq 'Failed to clean' <<< "$real_output" || fail "cargo-sweep failed on a profile without build/"
 
 echo "target size-cap behavior tests passed"
