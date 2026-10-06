@@ -38,7 +38,8 @@ or manifest-revision annotation. The revision stamp is resolved in that order:
 | `flotilla.work/manifest-revision` | The daemon's resource manifest reconciler stamps the applied source revision. Bound Git sources resolve the branch-head commit; legacy/fixed sources can use an opaque revision such as `unversioned`. |
 
 `charter_commit` is the compatibility name of this revision stamp in the
-rendered brief and artifact summary; the manifest fallback is not guaranteed
+snapshot and artifact summary. The rendered brief labels it “Charter revision”
+to cover commits and opaque revisions accurately; the manifest fallback is not guaranteed
 to be a Git hash. Missing provenance leaves the stamp absent. Admission takes
 local prose and annotations from one listed Project definition, so the two
 cannot come from separate Project reads. Charter contents do not cascade. An agent

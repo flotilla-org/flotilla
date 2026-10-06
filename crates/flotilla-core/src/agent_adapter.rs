@@ -242,7 +242,7 @@ fn build_crew_brief_with_options(
     if !options.charter_prose.is_empty() || options.charter_commit.is_some() {
         content.push_str("\n\n## Project charter\n\n");
         if let Some(commit) = &options.charter_commit {
-            content.push_str(&format!("Charter commit: `{commit}`\n\n"));
+            content.push_str(&format!("Charter revision: `{commit}`\n\n"));
         }
         content.push_str(&options.charter_prose);
     }

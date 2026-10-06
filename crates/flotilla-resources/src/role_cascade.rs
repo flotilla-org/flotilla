@@ -42,7 +42,7 @@ pub struct ResolvedSetting {
     pub layer: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedCascade {
     #[serde(default)]
     pub project_chain: Vec<String>,
@@ -52,6 +52,19 @@ pub struct ResolvedCascade {
     /// Local content, not inherited from ancestors.
     pub charter: BTreeMap<String, String>,
     pub charter_commit: Option<String>,
+}
+
+impl Default for ResolvedCascade {
+    fn default() -> Self {
+        Self {
+            project_chain: Vec::new(),
+            settings: BTreeMap::from([("workflow".into(), ResolvedSetting { value: "single-agent".into(), layer: "builtin".into() })]),
+            roles: BTreeMap::new(),
+            skill_layers: Vec::new(),
+            charter: BTreeMap::new(),
+            charter_commit: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, bon::Builder)]
@@ -65,7 +78,6 @@ pub struct RoleCascadeLayer {
 impl ResolvedCascade {
     pub fn resolve(layers: &[RoleCascadeLayer]) -> Self {
         let mut resolved = Self::default();
-        resolved.set("workflow", "single-agent", "builtin");
         for layer in layers {
             if let Some(workflow) = &layer.workflow {
                 resolved.set("workflow", workflow, &layer.name);
@@ -227,6 +239,8 @@ pub fn validate_cascade_skills(
     defaults: &[(String, CrewDefaultsSpec)],
     fleet: Option<String>,
 ) -> Result<(), String> {
+    // Bound defaults require a real declared owner, even before bootstrap.
+    // The synthetic pre-roll Project below is only for unbound fleet defaults.
     for (name, defaults) in defaults {
         if defaults.project_ref.as_ref().is_some_and(|bound| !projects.contains_key(bound)) {
             return Err(format!("CrewDefaults/{name} references an undeclared Project {:?}", defaults.project_ref));
@@ -447,6 +461,7 @@ mod tests {
     // multiple defaults bound to the same project are refused, never order-selected.
     #[tokio::test]
     async fn duplicate_defaults_are_refused_and_empty_cascade_has_builtin() {
+        assert_eq!(ResolvedCascade::default().workflow(None).value, "single-agent", "Default also seeds the builtin workflow");
         assert_eq!(ResolvedCascade::resolve(&[]).workflow(None).value, "single-agent");
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let project = ProjectSpec::builder().display_name("Local".into()).build();

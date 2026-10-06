@@ -9792,7 +9792,7 @@ async fn standing_presence_inherits_role_shape_and_delivers_charter_artifact() {
     let rendered = String::from_utf8_lossy(body);
     assert!(rendered.contains("Fleet governor template"));
     assert!(rendered.contains("Govern the child project from this delivered charter."));
-    assert!(rendered.contains("Charter commit: `charter-2719`"));
+    assert!(rendered.contains("Charter revision: `charter-2719`"));
     let explanation = daemon.explain_convoy_internal(Some("flotilla"), &writes[0].0).await.expect("explain");
     assert_eq!(explanation.cascade.as_ref().expect("cascade")["charter_commit"], "charter-2719");
     project.spec.charter_prose.insert("governor".into(), "Later prose".into());
