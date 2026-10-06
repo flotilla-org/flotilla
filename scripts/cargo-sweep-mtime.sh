@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 
-# Daily per-host mtime-based Cargo artifact sweep. cargo-sweep decides which
-# artifact families are older than the configured three-day threshold.
+# Daily per-host Cargo maintenance: sweep artifact families older than the
+# three-day threshold, then apply the checkout size caps to the same roots.
 
 set -euo pipefail
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly retention_days=3
 state_dir=${XDG_STATE_HOME:-"$HOME/.local/state"}/flotilla
 log_file=${FLOTILLA_SWEEP_LOG:-"$state_dir/cargo-sweep-mtime.log"}
@@ -26,7 +27,14 @@ else
   exit 1
 fi
 
+# prune-target uses the same selected executable, including ~/.cargo/bin fallback.
+export PATH="$(dirname -- "$cargo_sweep"):$PATH"
+
 size_kib() {
+  if [[ ! -d $1 ]]; then
+    echo 0
+    return
+  fi
   du -sk "$1" 2>/dev/null | awk '{ print $1 }'
 }
 
@@ -69,17 +77,17 @@ fi
 
   if (( ${#sweep_roots[@]} > 0 )); then
     for root in "${sweep_roots[@]}"; do
-      if ! before_kib=$(size_kib "$root"); then
+      if ! before_kib=$(size_kib "$root/target"); then
         failed_roots=$((failed_roots + 1))
         echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root failed: could not measure before sweep"
         continue
       fi
       root_failed=0
-      if ! "$cargo_sweep" sweep --time "$retention_days" "$root"; then
+      if ! CARGO_TARGET_DIR="$root/target" "$cargo_sweep" sweep --time "$retention_days" "$root"; then
         root_failed=1
         echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root failed"
       fi
-      if ! after_kib=$(size_kib "$root"); then
+      if ! after_kib=$(size_kib "$root/target"); then
         root_failed=1
         echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root failed: could not measure after sweep"
       else
@@ -87,6 +95,23 @@ fi
         reclaimed_bytes=$((reclaimed_kib * 1024))
         total_reclaimed_bytes=$((total_reclaimed_bytes + reclaimed_bytes))
         echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root reclaimed_bytes=$reclaimed_bytes"
+      fi
+      if ! before_kib=$(size_kib "$root/target"); then
+        root_failed=1
+        echo "$(date '+%Y-%m-%dT%H:%M:%S%z') size-cap cargo prune root=$root failed: could not measure before pruning"
+      else
+        if ! CARGO_TARGET_DIR="$root/target" "$script_dir/prune-target.sh" --root "$root"; then
+          root_failed=1
+          echo "$(date '+%Y-%m-%dT%H:%M:%S%z') size-cap cargo prune root=$root failed"
+        fi
+        if ! after_kib=$(size_kib "$root/target"); then
+          root_failed=1
+          echo "$(date '+%Y-%m-%dT%H:%M:%S%z') size-cap cargo prune root=$root failed: could not measure after pruning"
+        else
+          reclaimed_bytes=$(((before_kib > after_kib ? before_kib - after_kib : 0) * 1024))
+          total_reclaimed_bytes=$((total_reclaimed_bytes + reclaimed_bytes))
+          echo "$(date '+%Y-%m-%dT%H:%M:%S%z') size-cap cargo prune root=$root reclaimed_bytes=$reclaimed_bytes"
+        fi
       fi
       failed_roots=$((failed_roots + root_failed))
     done

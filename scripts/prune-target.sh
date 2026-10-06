@@ -2,7 +2,7 @@
 
 # Size-cap backstop for one checkout's Cargo target. The daily, per-host
 # cargo-sweep mtime job owns age-based pruning; this script only enforces size
-# ceilings when a target grows unusually large.
+# ceilings after the scheduled mtime sweep or on demand.
 
 set -euo pipefail
 
@@ -11,40 +11,45 @@ readonly default_max_size=20GiB
 
 incremental_max_size=${FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE:-$default_incremental_max_size}
 max_size=${FLOTILLA_TARGET_MAX_SIZE:-$default_max_size}
+checkout_root=
 mode=apply
 preview_target_dir=
 candidate_file=
 
 usage() {
-  echo "Usage: scripts/prune-target.sh [--dry-run]"
+  echo "Usage: scripts/prune-target.sh [--dry-run] [--root CHECKOUT]"
   echo
   echo "Apply the size-cap backstop to this checkout's Cargo target."
+  echo "  --root CHECKOUT  select another checkout (default: this source checkout)"
   echo "Environment overrides:"
   echo "  FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE  incremental ceiling (default: $default_incremental_max_size)"
   echo "  FLOTILLA_TARGET_MAX_SIZE              target ceiling (default: $default_max_size)"
 }
 
-case ${1:-} in
-  "")
-    ;;
-  --dry-run)
-    mode=preview
-    shift
-    ;;
-  -h | --help)
-    usage
-    exit 0
-    ;;
-  *)
-    usage >&2
-    exit 2
-    ;;
-esac
-
-if (( $# != 0 )); then
-  usage >&2
-  exit 2
-fi
+while (( $# > 0 )); do
+  case $1 in
+    --dry-run)
+      mode=preview
+      shift
+      ;;
+    --root)
+      if (( $# < 2 )) || [[ -z $2 ]]; then
+        usage >&2
+        exit 2
+      fi
+      checkout_root=$2
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
 
 if ! command -v cargo-sweep >/dev/null 2>&1; then
   echo "cargo-sweep is required. Install the tested version with:" >&2
@@ -53,7 +58,7 @@ if ! command -v cargo-sweep >/dev/null 2>&1; then
 fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-repo_root=$(cd -- "$script_dir/.." && pwd)
+repo_root=$(cd -- "${checkout_root:-$script_dir/..}" && pwd)
 target_dir=${CARGO_TARGET_DIR:-"$repo_root/target"}
 
 if [[ $target_dir != /* ]]; then
@@ -103,7 +108,7 @@ incremental_max_kib=$(size_to_kib "$incremental_max_size") || {
   echo "FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE must use whole MiB or GiB units; got '$incremental_max_size'." >&2
   exit 2
 }
-size_to_kib "$max_size" >/dev/null || {
+max_kib=$(size_to_kib "$max_size") || {
   echo "FLOTILLA_TARGET_MAX_SIZE must use whole MiB or GiB units; got '$max_size'." >&2
   exit 2
 }
@@ -204,23 +209,41 @@ cap_target() {
   local after_kib
   local before_kib
   local sweep_output
+  local fingerprint_dir
 
-  if [[ $mode == apply ]]; then
-    cargo sweep --maxsize "$max_size" "$repo_root"
-    return
-  fi
+  # cargo-sweep 0.8.0 unconditionally reads build/ and deps/ for every profile
+  # with fingerprints, even when Cargo never needed a build script there.
+  # In preview mode these directories are created only in the temporary clone.
+  while IFS= read -r -d '' fingerprint_dir; do
+    mkdir -p "${fingerprint_dir%/.fingerprint}/build" "${fingerprint_dir%/.fingerprint}/deps"
+  done < <(find "$target_dir" -type d -name .fingerprint -prune -print0)
 
   before_kib=$(size_kib "$target_dir")
-  if ! sweep_output=$(cargo sweep --maxsize "$max_size" "$repo_root" 2>&1); then
+  if ! sweep_output=$(cargo-sweep sweep --maxsize "$max_size" "$repo_root" 2>&1); then
+    printf '%s\n' "$sweep_output" >&2
+    return 1
+  fi
+  # This version logs cleanup errors but exits zero; do not report them as success.
+  if [[ $sweep_output == *'[ERROR]'* ]]; then
     printf '%s\n' "$sweep_output" >&2
     return 1
   fi
   after_kib=$(size_kib "$target_dir")
 
-  if (( before_kib > after_kib )); then
+  if [[ $mode == apply ]]; then
+    printf '%s\n' "$sweep_output"
+  elif (( before_kib > after_kib )); then
     echo "Would remove Cargo artifact families to reach $max_size ($(format_kib "$((before_kib - after_kib))"))"
   else
     echo "Would remove no Cargo artifact families to reach $max_size"
+  fi
+
+  if (( after_kib > max_kib )); then
+    echo "WARNING: target remains over cap: target=$display_target_dir size_bytes=$((after_kib * 1024)) cap=$max_size"
+  fi
+  after_kib=$(incremental_size_kib)
+  if (( after_kib > incremental_max_kib )); then
+    echo "WARNING: incremental state remains over cap: target=$display_target_dir size_bytes=$((after_kib * 1024)) cap=$incremental_max_size"
   fi
 }
 

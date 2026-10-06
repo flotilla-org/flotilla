@@ -13,6 +13,8 @@ fi
 install -d "$libexec_dir"
 install -m 0755 "$repo_root/scripts/cargo-sweep-mtime.sh" "$libexec_dir/cargo-sweep-mtime.sh"
 
+install -m 0755 "$repo_root/scripts/prune-target.sh" "$libexec_dir/prune-target.sh"
+
 case $(uname -s) in
   Linux)
     unit_dir=${XDG_CONFIG_HOME:-"$HOME/.config"}/systemd/user
@@ -40,5 +42,5 @@ case $(uname -s) in
     ;;
 esac
 
-echo "Installed daily mtime-based cargo sweep. Inspect reclaimed bytes in:"
+echo "Installed daily mtime-based cargo sweep and size caps. Inspect reclaimed bytes in:"
 echo "  ${XDG_STATE_HOME:-"$HOME/.local/state"}/flotilla/cargo-sweep-mtime.log"
