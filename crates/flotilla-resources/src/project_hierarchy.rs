@@ -28,16 +28,35 @@ impl ProjectHierarchy {
             Err(ResourceError::NotFound { .. }) => None,
             Err(error) => return Err(error),
         };
-        let parents = projects
+        let declared = projects.into_iter().map(|project| (project.metadata.name, project.spec.parent)).collect();
+        let hierarchy = Self::from_declared(declared, fleet);
+        if let Some(fleet) = &hierarchy.fleet {
+            if !hierarchy.parents.contains_key(fleet) {
+                tracing::warn!(namespace, fleet_project = %fleet, "FleetDesignation references an undeclared Project");
+            }
+        }
+        Ok(hierarchy)
+    }
+
+    pub(crate) fn from_declared(declared: BTreeMap<String, Option<String>>, fleet: Option<String>) -> Self {
+        let parents = declared
             .into_iter()
-            .map(|project| {
-                let name = project.metadata.name;
-                let parent =
-                    if fleet.as_ref() == Some(&name) { project.spec.parent } else { project.spec.parent.or_else(|| fleet.clone()) };
+            .map(|(name, parent)| {
+                let parent = if fleet.as_ref() == Some(&name) { parent } else { parent.or_else(|| fleet.clone()) };
                 (name, parent)
             })
             .collect();
-        Ok(Self { parents, fleet })
+        Self { parents, fleet }
+    }
+
+    /// Authoring a Project requires its resulting ancestry to be valid, even if
+    /// independent chains remain broken by federation. This permits incremental
+    /// repairs without introducing dangling edges or closing a cycle.
+    pub(crate) fn validate_project_chain(&self, name: &str) -> Result<(), ResourceError> {
+        if self.fleet.as_deref() == Some(name) && self.parent(name)?.is_some() {
+            return Err(ResourceError::invalid(format!("fleet Project `{name}` cannot have a parent")));
+        }
+        self.ancestors(name).map(|_| ())
     }
 
     /// Build and validate a snapshot of declared parents. The fleet must be
@@ -49,16 +68,9 @@ impl ProjectHierarchy {
                 return Err(ResourceError::invalid(format!("fleet Project `{fleet}` cannot have a parent")));
             }
         }
-        let parents = declared
-            .into_iter()
-            .map(|(name, parent)| {
-                let parent = if fleet.as_ref() == Some(&name) { None } else { parent.or_else(|| fleet.clone()) };
-                (name, parent)
-            })
-            .collect();
-        let hierarchy = Self { parents, fleet };
+        let hierarchy = Self::from_declared(declared, fleet);
         for name in hierarchy.parents.keys() {
-            hierarchy.ancestors(name)?;
+            hierarchy.validate_project_chain(name)?;
         }
         Ok(hierarchy)
     }
@@ -133,6 +145,7 @@ pub(crate) async fn validate_hierarchy_write(
     if kind == "Project" {
         let spec: ProjectSpec = serde_json::from_value(spec).map_err(|error| ResourceError::decode(error.to_string()))?;
         declared.insert(name.to_string(), spec.parent);
+        return ProjectHierarchy::from_declared(declared, fleet).validate_project_chain(name);
     } else {
         let spec: crate::FleetDesignationSpec = serde_json::from_value(spec).map_err(|error| ResourceError::decode(error.to_string()))?;
         fleet = Some(spec.project);

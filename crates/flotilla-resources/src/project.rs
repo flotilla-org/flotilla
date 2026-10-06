@@ -40,7 +40,7 @@ impl Resource for Project {
                 *parent = None;
             }
         }
-        ProjectHierarchy::new(declared, None).map(|_| ())
+        ProjectHierarchy::from_declared(declared, None).validate_project_chain(&meta.name)
     }
 }
 

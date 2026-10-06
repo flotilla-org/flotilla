@@ -266,3 +266,88 @@ async fn designation_reassignment_and_deletion() {
         projects.delete("new").await.expect("former fleet is deletable");
     }
 }
+
+// Federation can leave independent dangling edges. Each valid reparent repair
+// must be admitted without requiring every other broken chain to be fixed first.
+#[tokio::test]
+async fn apply_repairs_independent_invalid_edges_incrementally() {
+    for backend in
+        [ResourceBackend::InMemory(InMemoryBackend::default()), ResourceBackend::Sqlite(SqliteBackend::open_in_memory().unwrap())]
+    {
+        let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("source"));
+        for name in ["parent-a", "parent-b"] {
+            source.definitions::<Project>("test").apply(&InputMeta::builder().name(name.into()).build(), &project(None)).await.unwrap();
+        }
+        for (name, parent) in [("a", "parent-a"), ("b", "parent-b")] {
+            source
+                .definitions::<Project>("test")
+                .apply(&InputMeta::builder().name(name.into()).build(), &project(Some(parent)))
+                .await
+                .unwrap();
+        }
+        // The replica snapshot arrives before either parent declaration.
+        let mut incoming = source.using::<Project>("test").list().await.unwrap();
+        incoming.items.retain(|object| object.metadata.name == "a" || object.metadata.name == "b");
+        backend.replica_writer::<Project>(NodeId::new("source"), "test").replace(&incoming, chrono::Utc::now()).await.unwrap();
+        let projects = backend.definitions::<Project>("test");
+        let a = InputMeta::builder().name("a".into()).build();
+        let b = InputMeta::builder().name("b".into()).build();
+        projects.apply(&a, &project(None)).await.expect("first independent repair");
+        let inspection = ProjectHierarchy::load_for_inspection(&backend, "test").await.unwrap();
+        assert!(inspection.ancestors("a").unwrap().is_empty());
+        assert!(inspection.ancestors("b").is_err());
+        assert!(projects.apply(&a, &project(Some("missing"))).await.is_err(), "new dangling edge is refused");
+        assert!(projects.apply(&a, &project(Some("b"))).await.is_err(), "written ancestry must be valid");
+        projects.apply(&b, &project(None)).await.expect("second independent repair");
+        ProjectHierarchy::load(&backend, "test").await.expect("repaired namespace");
+    }
+}
+
+// A designation may arrive before its Project during bootstrap. Inspection
+// preserves it and emits a warning identifying the namespace and missing root.
+#[tokio::test]
+async fn inspection_warns_about_undeclared_fleet_project() {
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    use tracing::instrument::WithSubscriber;
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let source = ResourceBackend::InMemory(InMemoryBackend::default());
+    source.definitions::<Project>("bootstrap").apply(&InputMeta::builder().name("root".into()).build(), &project(None)).await.unwrap();
+    source
+        .definitions::<FleetDesignation>("bootstrap")
+        .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec { project: "root".into() })
+        .await
+        .unwrap();
+    let target = ResourceBackend::InMemory(InMemoryBackend::default());
+    target
+        .replica_writer::<FleetDesignation>(NodeId::new("source"), "bootstrap")
+        .replace(&source.using::<FleetDesignation>("bootstrap").list().await.unwrap(), chrono::Utc::now())
+        .await
+        .unwrap();
+    let captured = Capture(Arc::new(Mutex::new(Vec::new())));
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    let hierarchy = ProjectHierarchy::load_for_inspection(&target, "bootstrap").with_subscriber(subscriber).await.unwrap();
+    assert_eq!(hierarchy.fleet(), Some("root"));
+    let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(output.contains("WARN") && output.contains("FleetDesignation references an undeclared Project"), "{output}");
+    assert!(output.contains("bootstrap") && output.contains("root"), "{output}");
+}
