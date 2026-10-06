@@ -9685,3 +9685,43 @@ async fn image_layer_admission_freezes_inputs_and_keeps_baseline_authoritative()
         daemon.resolve_convoy_placement("flotilla", None, &[], &missing, Some("crew-policy"), false).await.expect_err("missing need");
     assert!(error.contains("display:missing"));
 }
+
+// #2767: address-taking commands share this resolver. Terminal history must
+// never displace a live governor; an exact record ID still addresses history.
+#[test]
+fn convoy_address_prefers_live_over_two_terminal_namesakes() {
+    // Exhaustive finite contract: both project-scoped/projectless addresses and
+    // all six input orders. Terminal phases share this boolean resolver input.
+    for project in [None, Some("p")] {
+        let scoped_address = format!("governor@{}", project.unwrap_or_default());
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            let names = ["old-a", "old-b", "live"];
+            let identities = order.map(|index| ConvoyAddressIdentity {
+                record_name: names[index],
+                role: Some("governor"),
+                project,
+                terminal: index < 2,
+            });
+            for address in [scoped_address.as_str(), "governor"] {
+                let indices = resolve_convoy_candidate_indices(&identities, address).expect("unique live governor");
+                assert_eq!(indices.iter().map(|index| identities[*index].record_name).collect::<Vec<_>>(), ["live"]);
+            }
+            let indices = resolve_convoy_candidate_indices(&identities, "old-a").expect("explicit history ID");
+            assert_eq!(indices.iter().map(|index| identities[*index].record_name).collect::<Vec<_>>(), ["old-a"]);
+
+            // A second live match must refuse and name both resource IDs.
+            let mut ambiguous = Vec::from(identities);
+            ambiguous.push(ConvoyAddressIdentity { record_name: "another-live", role: Some("governor"), project, terminal: false });
+            let error = resolve_convoy_candidate_indices(&ambiguous, &scoped_address).expect_err("ambiguous live address");
+            // Refusal must identify the live candidates, without pinning its prose.
+            let named_records = error.split(|c: char| !c.is_ascii_alphanumeric() && c != '-').collect::<BTreeSet<_>>();
+            for record in ["another-live", "live"] {
+                assert!(named_records.contains(record), "missing {record} in refusal: {error}");
+            }
+            for record in ["old-a", "old-b"] {
+                assert!(!named_records.contains(record), "terminal history is not an ambiguous live candidate: {error}");
+            }
+        }
+    }
+    assert!(resolve_convoy_candidate_indices(&[], "governor@p").expect("empty candidates").is_empty());
+}
