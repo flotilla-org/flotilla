@@ -112,7 +112,8 @@ impl RepositoryInspector for DeclarationInspector {
         Ok(RepositoryInspection {
             spec: self.bootstrap.clone(),
             checkout: LocalCheckoutInspection {
-                path: path.to_path_buf(),
+                // Match GitRepositoryInspector: local checkout facts use physical paths.
+                path: flotilla_core::path_context::canonical_or_original(path),
                 host_ref: self.host_ref.clone(),
                 git_ref: "main".to_string(),
                 is_main: true,
@@ -555,7 +556,9 @@ async fn project_refresh_accepts_every_declared_lab_forge_url_for_an_observed_ch
         .create(&InputMeta::builder().name("flotilla-lab".to_string()).build(), &forge)
         .await
         .expect("declare lab forge");
-    let checkout = tmp.path().join("ghostty-ops");
+    // Registration through a filesystem alias must retain one bootstrap checkout.
+    // This also exercises macOS-style aliased TMPDIR on Linux.
+    let checkout = symlinked_fixture(&tmp).join("ghostty-ops");
     std::fs::create_dir(&checkout).expect("checkout dir");
     let observed = RepositorySpec::remote("https://manchego.lab.flotilla.work/robert/ghostty-ops.git").expect("observed repository");
     daemon
@@ -589,6 +592,13 @@ async fn project_refresh_accepts_every_declared_lab_forge_url_for_an_observed_ch
             execute_project_command(&daemon, &mut rx, CommandAction::ProjectRefresh { name: "ghostty".to_string() }).await
         };
         assert!(matches!(result, CommandValue::ProjectRegistered { .. } | CommandValue::ProjectRefreshed { .. }), "{result:?}");
+        // Each spelling describes the same physical main checkout, so refresh
+        // must never see two bootstrap candidates for the aliased directory.
+        let checkouts = daemon.observed_resource_backend().using::<Checkout>("flotilla").list().await.expect("observed checkouts");
+        assert_eq!(checkouts.items.len(), 1);
+        let CheckoutSpec::Observed(observed) = &checkouts.items[0].spec else { panic!("observed checkout") };
+        assert_eq!(Path::new(&observed.path), checkout.canonicalize().expect("physical checkout"));
+        assert!(observed.is_main);
         let project = backend.definitions::<Project>("flotilla").get("ghostty").await.expect("project");
         assert_eq!(project.spec.repositories.len(), 1);
         assert_eq!(project.spec.repositories[0].repo, observed_key);
