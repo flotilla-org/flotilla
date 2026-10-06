@@ -146,4 +146,29 @@ preview_output=$(CARGO_TARGET_DIR="$real_repo/target" FLOTILLA_TARGET_MAX_SIZE=1
 real_output=$(CARGO_TARGET_DIR="$real_repo/target" FLOTILLA_TARGET_MAX_SIZE=1MiB "$repo_root/scripts/prune-target.sh" --root "$real_repo" 2>&1)
 ! grep -Fq 'Failed to clean' <<< "$real_output" || fail "cargo-sweep failed on a profile without build/"
 
+# Reserved convoy ancestors protect live and terminal roots, including nested
+# multi-repository layouts and aliases. No metadata or cleanup may touch them.
+for suffix in convoy-live/flotilla convoy-terminal/branch/flotilla; do
+  protected_repo=$test_root/$suffix
+  mkdir -p "$protected_repo/target/debug/incremental/probe/s-old"
+  dd if=/dev/zero of="$protected_repo/target/debug/incremental/probe/s-old/artifact.o" bs=1048576 count=2 >/dev/null 2>&1
+  protected_output=$(PATH="$stub_bin:$PATH" CARGO_TARGET_DIR="$protected_repo/target" \
+    FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE=1MiB \
+    "$repo_root/scripts/prune-target.sh" --root "$protected_repo" 2>&1)
+  grep -Fq 'skipped: convoy checkout' <<< "$protected_output" || fail "convoy root was not skipped"
+  [[ -f $protected_repo/target/debug/incremental/probe/s-old/artifact.o ]] || fail "convoy incremental was deleted"
+done
+ln -s "$protected_repo" "$test_root/desk-alias"
+protected_output=$("$repo_root/scripts/prune-target.sh" --root "$test_root/desk-alias" 2>&1)
+grep -Fq 'skipped: convoy checkout' <<< "$protected_output" || fail "alias bypassed convoy protection"
+
+# Invalid metadata must be logged and skipped before the incremental cap.
+broken_repo=$test_root/broken
+mkdir -p "$broken_repo/target/debug/incremental/probe/s-old"
+printf 'invalid manifest' > "$broken_repo/Cargo.toml"
+dd if=/dev/zero of="$broken_repo/target/debug/incremental/probe/s-old/artifact.o" bs=1048576 count=2 >/dev/null 2>&1
+broken_output=$(FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE=1MiB "$repo_root/scripts/prune-target.sh" --root "$broken_repo" 2>&1)
+grep -Fq 'cargo metadata failed:' <<< "$broken_output" || fail "metadata reason was not logged"
+[[ -f $broken_repo/target/debug/incremental/probe/s-old/artifact.o ]] || fail "metadata rejection still deleted incrementals"
+
 echo "target size-cap behavior tests passed"

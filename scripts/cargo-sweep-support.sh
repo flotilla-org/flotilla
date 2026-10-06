@@ -33,3 +33,29 @@ checked_cargo_sweep() {
   fi
   return "$status"
 }
+
+# Checkout provisioning reserves convoy-* ancestors for convoy-owned roots.
+# Treat that lifecycle-maintained directory name as an ownership marker. Keep
+# terminal and orphaned convoy caches too: teardown/GC owns their removal, so
+# daemon availability and a crew starting during this run cannot weaken safety.
+convoy_checkout_root() {
+  local root
+  root=$(cd -- "$1" && pwd -P) || return
+  while [[ $root != / ]]; do
+    [[ ${root##*/} == convoy-* ]] && return 0
+    root=${root%/*}
+    [[ -n $root ]] || root=/
+  done
+  return 1
+}
+
+# Validate before any incremental removal or cargo-sweep compatibility writes.
+# Preserve Cargo's diagnostic so the scheduled job can explain a skipped root.
+check_cargo_metadata() {
+  local root=$1
+  local output
+  if ! output=$(cargo metadata --format-version 1 --no-deps --manifest-path "$root/Cargo.toml" 2>&1); then
+    printf 'cargo metadata failed: %s\n' "$output" >&2
+    return 1
+  fi
+}

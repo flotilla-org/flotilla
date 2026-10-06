@@ -23,8 +23,23 @@ if ! command -v cargo-sweep >/dev/null 2>&1; then
   export PATH="$test_root/tools/bin:$PATH"
 fi
 
-mkdir -p "$test_home/.cargo/bin" "$test_home/dev/desk/target" "$test_home/dev/no-target" "$test_home/dev/flotilla-repos/convoy/target"
-: > "$test_home/dev/flotilla-repos/convoy/Cargo.toml"
+# Process boundary: Cargo metadata accepts desk roots and rejects the broken root.
+stub_cargo_bin=$test_root/cargo-bin
+mkdir -p "$stub_cargo_bin"
+cat > "$stub_cargo_bin/cargo" <<'STUB'
+#!/usr/bin/env bash
+if [[ $* == *broken* ]]; then
+  echo 'invalid manifest: fixture metadata failure' >&2
+  exit 1
+fi
+printf '{}\n'
+STUB
+chmod +x "$stub_cargo_bin/cargo"
+export PATH="$stub_cargo_bin:$PATH"
+mkdir -p "$test_home/dev/broken/target" "$test_home/dev/other-desk/target"
+: > "$test_home/dev/broken/target/stale"
+mkdir -p "$test_home/.cargo/bin" "$test_home/dev/desk/target" "$test_home/dev/no-target" "$test_home/dev/flotilla-repos/convoy-live/flotilla/target"
+: > "$test_home/dev/flotilla-repos/convoy-live/flotilla/Cargo.toml"
 # Recently used incremental generations must be capped after the age sweep.
 for generation in old middle new; do
   generation_dir=$test_home/dev/desk/target/debug/incremental/probe/s-$generation
@@ -33,7 +48,7 @@ for generation in old middle new; do
 done
 touch -t 202001010000 "$test_home/dev/desk/target/debug/incremental/probe/s-old"
 dd if=/dev/zero of="$test_home/dev/desk/target/stale" bs=1048576 count=1 >/dev/null 2>&1
-dd if=/dev/zero of="$test_home/dev/flotilla-repos/convoy/target/stale" bs=1048576 count=1 >/dev/null 2>&1
+dd if=/dev/zero of="$test_home/dev/flotilla-repos/convoy-live/flotilla/target/stale" bs=1048576 count=1 >/dev/null 2>&1
 
 cat > "$test_home/.cargo/bin/cargo-sweep" <<'STUB'
 #!/usr/bin/env bash
@@ -62,12 +77,25 @@ HOME="$test_home" XDG_STATE_HOME="$test_home/.local/state" \
   "$repo_root/scripts/cargo-sweep-mtime.sh"
 
 grep -Fxq "sweep --time 3 $test_home/dev/desk" "$stub_log"
-grep -Fxq "sweep --time 3 $test_home/dev/flotilla-repos/convoy" "$stub_log"
+# Convoy-owned checkouts are untouched by both policies; desk roots stay capped.
+if grep -Fq "$test_home/dev/flotilla-repos/convoy-live" "$stub_log"; then
+  echo "scheduled sweep touched a convoy checkout" >&2
+  exit 1
+fi
+[[ -f $test_home/dev/flotilla-repos/convoy-live/flotilla/target/stale ]]
+[[ -f $test_home/dev/broken/target/stale ]]
+if grep -Fq "$test_home/dev/broken" "$stub_log"; then
+  echo "scheduled sweep touched a root rejected by metadata" >&2
+  exit 1
+fi
+grep -Fq 'invalid manifest: fixture metadata failure' "$sweep_log"
+grep -Eq 'completed: reclaimed_bytes=[0-9]+ failed_roots=0 skipped_roots=2' "$sweep_log"
+grep -Fq "root=$test_home/dev/flotilla-repos/convoy-live/flotilla skipped: convoy checkout" "$sweep_log"
 [[ $(wc -l < "$stub_log") == 4 ]]
 ! grep -Fq "$test_home/dev/no-target" "$stub_log"
 # Both stages report per-root reclaimed bytes; size caps apply to the same roots.
 grep -Fxq "sweep --maxsize 5MiB $test_home/dev/desk" "$stub_log"
-grep -Fxq "sweep --maxsize 5MiB $test_home/dev/flotilla-repos/convoy" "$stub_log"
+grep -Fxq "sweep --maxsize 5MiB $test_home/dev/other-desk" "$stub_log"
 [[ ! -e $test_home/dev/desk/target/debug/incremental/probe/s-old ]]
 [[ $(du -sk "$test_home/dev/desk/target" | awk '{print $1}') -le 5120 ]]
 grep -Fq "mtime-based cargo sweep root=$test_home/dev/desk reclaimed_bytes=1048576" "$sweep_log"
@@ -98,7 +126,7 @@ if HOME="$test_home" XDG_STATE_HOME="$test_home/.local/state" \
   echo "scheduled pruning ignored a failed cap" >&2
   exit 1
 fi
-grep -Fq "size-cap cargo prune root=$test_home/dev/flotilla-repos/convoy failed" "$sweep_log"
+grep -Fq "size-cap cargo prune root=$test_home/dev/other-desk failed" "$sweep_log"
 grep -Eq 'completed: reclaimed_bytes=[0-9]+ failed_roots=2' "$sweep_log"
 
 # cargo-sweep's zero-exit error diagnostics must fail both scheduled stages.
@@ -134,6 +162,7 @@ done
 
 # The deployed entry point uses real cargo-sweep and caps a recently used target.
 # A fresh incremental fixture crosses both ceilings without age-eligible artifacts.
+export PATH="${PATH#"$stub_cargo_bin:"}"
 real_sweep=$(command -v cargo-sweep)
 test_rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
 test_cargo_home=${CARGO_HOME:-$HOME/.cargo}

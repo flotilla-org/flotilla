@@ -74,10 +74,21 @@ fi
   started_at=$(date '+%Y-%m-%dT%H:%M:%S%z')
   total_reclaimed_bytes=0
   failed_roots=0
+  skipped_roots=0
   echo "$started_at mtime-based cargo sweep started: retention_days=$retention_days roots=${#sweep_roots[@]}"
 
   if (( ${#sweep_roots[@]} > 0 )); then
     for root in "${sweep_roots[@]}"; do
+      if convoy_checkout_root "$root"; then
+        skipped_roots=$((skipped_roots + 1))
+        echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root skipped: convoy checkout (teardown/GC owns cleanup)"
+        continue
+      fi
+      if ! metadata_error=$(CARGO_TARGET_DIR="$root/target" check_cargo_metadata "$root" 2>&1); then
+        skipped_roots=$((skipped_roots + 1))
+        echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root skipped: $metadata_error"
+        continue
+      fi
       if ! before_kib=$(size_kib "$root/target"); then
         failed_roots=$((failed_roots + 1))
         echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep root=$root failed: could not measure before sweep"
@@ -118,6 +129,6 @@ fi
     done
   fi
 
-  echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep completed: reclaimed_bytes=$total_reclaimed_bytes failed_roots=$failed_roots"
+  echo "$(date '+%Y-%m-%dT%H:%M:%S%z') mtime-based cargo sweep completed: reclaimed_bytes=$total_reclaimed_bytes failed_roots=$failed_roots skipped_roots=$skipped_roots"
   (( failed_roots == 0 ))
 } >> "$log_file" 2>&1
