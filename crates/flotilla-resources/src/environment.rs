@@ -174,8 +174,9 @@ impl StatusPatch<EnvironmentStatus> for EnvironmentStatusPatch {
     }
 }
 
-/// Placement-authored budget. Half of host RAM is shared by four crews by
-/// default, reserving the rest for host services and interactive workloads.
+/// Placement-authored budget. 80% of host RAM is divided by four for each
+/// crew's cap (about 12 GiB on a 61 GiB host). Caps are limits, not
+/// reservations: a 7.7 GiB cap OOM-killed workspace test builds (#2751).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnvironmentMemoryPolicy {
@@ -187,7 +188,7 @@ pub struct EnvironmentMemoryPolicy {
 
 impl Default for EnvironmentMemoryPolicy {
     fn default() -> Self {
-        Self { host_memory_percent: 50, expected_concurrent_crews: 4, swap_bytes: 0 }
+        Self { host_memory_percent: 80, expected_concurrent_crews: 4, swap_bytes: 0 }
     }
 }
 
