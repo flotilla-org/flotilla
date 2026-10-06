@@ -1,6 +1,6 @@
 # Wider lines, fewer chain/arg explosions.
 # Requires nightly rustfmt: `cargo +nightly-2026-03-12 fmt`
-# Temporary formatter and Dylint nightly are pinned to nightly-2026-03-12.
+# Temporary formatter is pinned to nightly-2026-03-12 until #2794 lands.
 # Compilation, Clippy, and coverage use the stable rust-toolchain.toml pin.
 # Stable silently ignores the unstable keys below.
 
