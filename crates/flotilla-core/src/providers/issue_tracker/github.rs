@@ -260,6 +260,8 @@ impl super::IssueProvider for GitHubIssueProvider {
     }
 
     async fn dispatch_facts(&self, reference: &IssueRef) -> Result<flotilla_protocol::DispatchIssueFacts, String> {
+        // Deliberately uncached until #2806 supplies bulk native facts with
+        // dependency/PR freshness guarantees; issue updatedAt alone is insufficient.
         // Closing PR references use the injected gh runner. Native dependencies
         // use the paginated REST seam, including cross-repository identities.
         let raw = run!(

@@ -175,9 +175,16 @@ impl DispatchReconciler {
                 continue;
             }
             let facts = self.issues.dispatch_facts(&issue.reference).await?;
-            let ideation = facts.issue_type.iter().chain(issue.labels.iter()).any(|kind| {
+            let is_ideation = |kind: &str| {
                 matches!(kind.rsplit(':').next().unwrap_or(kind).to_ascii_lowercase().as_str(), "grill" | "grilling" | "map" | "brainstorm")
-            });
+            };
+            let ideation = facts.issue_type.iter().chain(issue.labels.iter()).any(|kind| is_ideation(kind));
+            if issue.labels.iter().any(|label| label.eq_ignore_ascii_case("map"))
+                && !facts.issue_type.iter().any(|kind| is_ideation(kind))
+                && !issue.labels.iter().any(|label| !label.eq_ignore_ascii_case("map") && is_ideation(label))
+            {
+                warn!(project = %project.metadata.name, issue = %issue.reference.id, "dispatch excluded by reserved plain map label");
+            }
             if ideation || facts.has_open_pull_request {
                 blocked += 1;
                 continue;
