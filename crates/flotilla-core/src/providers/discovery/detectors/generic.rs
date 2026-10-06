@@ -53,7 +53,7 @@ impl CommandDetector {
 #[async_trait]
 impl HostDetector for CommandDetector {
     async fn detect(&self, runner: &dyn CommandRunner, _env: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
-        let Ok(output) = run!(runner, self.command, self.args, Path::new(".")) else {
+        let Ok(output) = run!(runner, self.command, self.args, Path::new("/")) else {
             return Vec::new();
         };
         let path = match self.path_mode {
@@ -79,7 +79,7 @@ pub(super) async fn resolve_binary_path(runner: &dyn CommandRunner, command: &st
         .run(
             "sh",
             &["-c", "command -v \"$1\"", "flotilla-binary-discovery", command],
-            Path::new("."),
+            Path::new("/"),
             &crate::providers::ChannelLabel::Default,
         )
         .await

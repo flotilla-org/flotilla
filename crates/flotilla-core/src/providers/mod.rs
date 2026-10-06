@@ -589,15 +589,11 @@ impl CommandRunner for ProcessCommandRunner {
     }
 
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
-        tokio::process::Command::new(cmd)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+        tokio::time::timeout(crate::probe::PROBE_TIMEOUT, Self::command_output(cmd, args, Path::new("/")))
             .await
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .ok()
+            .and_then(Result::ok)
+            .is_some_and(|output| output.status.success())
     }
 
     async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {

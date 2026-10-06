@@ -99,6 +99,9 @@ flotilla hook <harness> <event>                   # receive a hook event (called
 
 ## Quickstart
 
+For managed fleet installs, rollback, and macOS privacy grants, see
+[the fleet install guide](docs/fleet-install.md).
+
 ```
 cargo install --git https://github.com/flotilla-org/flotilla
 cd your-repo

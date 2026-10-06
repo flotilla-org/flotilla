@@ -107,8 +107,13 @@ pub trait RepositoryInspector: Send + Sync {
     /// overrides this to read blobs at `HEAD`.
     async fn operational_entry_files_at(&self, checkout: &Path) -> Result<(String, Vec<OperationalEntryFile>), String> {
         let repository = self.inspect_path(checkout, None).await?;
-        let mut files = Vec::new();
-        collect_operational_entry_files(&repository.checkout.path, &repository.checkout.path, &mut files)?;
+        let path = repository.checkout.path.clone();
+        let mut files = crate::probe::blocking("operational entries", crate::probe::PROBE_TIMEOUT, move || {
+            let mut files = Vec::new();
+            collect_operational_entry_files(&path, &path, &mut files)?;
+            Ok(files)
+        })
+        .await?;
         files.sort_by(|left, right| left.path.cmp(&right.path));
         Ok((repository.checkout.git_ref, files))
     }
@@ -398,11 +403,9 @@ impl RepositoryInspector for GitRepositoryInspector {
     }
 
     async fn inspect_path(&self, path: &Path, remote: Option<&str>) -> Result<RepositoryInspection, String> {
-        let path =
-            std::fs::canonicalize(path).map_err(|error| format!("repository path {} cannot be resolved: {error}", path.display()))?;
+        let path = crate::probe::canonicalize(path).await?;
         let top_level = PathBuf::from(self.read(&path, RepositoryRead::CheckoutRoot).await?);
-        let top_level = std::fs::canonicalize(&top_level)
-            .map_err(|error| format!("repository root {} cannot be resolved: {error}", top_level.display()))?;
+        let top_level = crate::probe::canonicalize(&top_level).await?;
         let provider = self.provider(&path).await?;
         self.vcs_cache.lock().await.insert(top_level.clone(), provider);
         // `rev-parse HEAD` can fail before the first commit, while the symbolic
@@ -423,8 +426,7 @@ impl RepositoryInspector for GitRepositoryInspector {
             None => {
                 let common_dir = PathBuf::from(self.read(&top_level, RepositoryRead::SharedMetadataDir).await?);
                 let common_dir = if common_dir.is_absolute() { common_dir } else { top_level.join(common_dir) };
-                let common_dir = std::fs::canonicalize(&common_dir)
-                    .map_err(|error| format!("git common directory {} cannot be resolved: {error}", common_dir.display()))?;
+                let common_dir = crate::probe::canonicalize(&common_dir).await?;
                 (RepositorySpec::local(&self.host_ref, common_dir.to_string_lossy())?, None)
             }
         };

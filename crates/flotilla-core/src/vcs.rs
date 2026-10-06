@@ -213,12 +213,11 @@ pub(crate) async fn guard_host_git_config_async(cmd: &str, args: &[&str], cwd: &
     let cmd = cmd.to_string();
     let args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
     let cwd = cwd.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    crate::probe::blocking("shared Git config", crate::probe::PROBE_TIMEOUT, move || {
         let args = args.iter().map(String::as_str).collect::<Vec<_>>();
         guard_host_git_config(&cmd, &args, &cwd)
     })
     .await
-    .map_err(|error| format!("inspect shared Git config task failed: {error}"))?
 }
 
 #[cfg(test)]

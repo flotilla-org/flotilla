@@ -232,8 +232,9 @@ impl CodexCodingAgent {
         None
     }
 
-    fn refresh_auth(&self) -> Option<CodexAuth> {
-        let auth = read_auth(&self.auth_path);
+    async fn refresh_auth(&self) -> Option<CodexAuth> {
+        let path = self.auth_path.clone();
+        let auth = crate::probe::blocking("Codex auth", crate::probe::PROBE_TIMEOUT, move || Ok(read_auth(&path))).await.ok().flatten();
         let mut cache = self.auth_cache.lock().expect("auth_cache lock poisoned");
         cache.auth = auth.clone();
         cache.loaded_at = Some(Instant::now());
@@ -316,7 +317,7 @@ impl CodexCodingAgent {
         let env_ids = match self.fetch_env_ids_from_all(&auth).await {
             Ok(ids) => ids,
             Err(e) if is_auth_error(&e) => {
-                let fresh_auth = match self.refresh_auth() {
+                let fresh_auth = match self.refresh_auth().await {
                     Some(a) => a,
                     None => {
                         if !self.auth_warned.swap(true, Ordering::Relaxed) {
@@ -433,7 +434,7 @@ impl super::CloudAgentService for CodexCodingAgent {
         // Mutable so we can update it after an env-lookup auth retry.
         let mut auth = match self.get_cached_auth() {
             Some(a) => a,
-            None => match self.refresh_auth() {
+            None => match self.refresh_auth().await {
                 Some(a) => a,
                 None => {
                     if !self.auth_warned.swap(true, Ordering::Relaxed) {
@@ -469,7 +470,7 @@ impl super::CloudAgentService for CodexCodingAgent {
                     }
                     Err(e) if is_auth_error(&e) => {
                         // Retry with refreshed auth
-                        let fresh_auth = match self.refresh_auth() {
+                        let fresh_auth = match self.refresh_auth().await {
                             Some(a) => a,
                             None => {
                                 if !self.auth_warned.swap(true, Ordering::Relaxed) {
@@ -518,7 +519,7 @@ impl super::CloudAgentService for CodexCodingAgent {
                 }
                 Err(e) if is_auth_error(&e) => {
                     // Retry once with fresh auth
-                    let fresh_auth = match self.refresh_auth() {
+                    let fresh_auth = match self.refresh_auth().await {
                         Some(a) => a,
                         None => {
                             if !self.auth_warned.swap(true, Ordering::Relaxed) {

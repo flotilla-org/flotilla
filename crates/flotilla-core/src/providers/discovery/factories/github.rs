@@ -71,7 +71,7 @@ impl Factory for GitHubChangeRequestFactory {
         let repo_slug = github_repo_slug(env)?;
         let api = Arc::new(GhApiClient::new(runner.clone()));
         let mut provider = GitHubChangeRequest::new("github".into(), repo_slug, api, runner);
-        let settings = config.load_config().change_request;
+        let settings = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?.change_request;
         if let Some(login) = settings.review_bot_login {
             provider = provider.with_review_bot_login(login);
         }
@@ -134,8 +134,8 @@ impl Factory for ForgejoIssueProviderFactory {
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn IssueProvider>, Vec<UnmetRequirement>> {
-        let settings = config.load_config();
-        let provider_config = forgejo_provider_config(env, config, &settings)?;
+        let settings = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
+        let provider_config = bounded_forgejo_provider_config(env, config, &settings).await?;
         Ok(Arc::new(ForgejoIssueProvider::new(Arc::new(ReqwestHttpClient::new()), runner, provider_config)))
     }
 }
@@ -168,8 +168,8 @@ impl Factory for ForgejoChangeRequestFactory {
         if !env.find_origin_forge().is_some_and(|forge| forge.kind == ForgeKind::Forgejo) {
             return Err(vec![UnmetRequirement::MissingRemoteHost("Forgejo origin".into())]);
         }
-        let settings = config.load_config();
-        let provider_config = forgejo_provider_config(env, config, &settings)?;
+        let settings = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
+        let provider_config = bounded_forgejo_provider_config(env, config, &settings).await?;
         let slug = env.repo_slug().ok_or_else(|| vec![UnmetRequirement::MissingRemoteHost("origin".into())])?;
         let mut provider = ForgejoChangeRequestProvider::new(Arc::new(ReqwestHttpClient::new()), runner, provider_config, slug);
         if let Some(login) = settings.change_request.operator_login {
@@ -177,6 +177,19 @@ impl Factory for ForgejoChangeRequestFactory {
         }
         Ok(Arc::new(provider))
     }
+}
+
+async fn bounded_forgejo_provider_config(
+    env: &EnvironmentBag,
+    config: &ConfigStore,
+    settings: &FlotillaConfig,
+) -> Result<ForgejoIssueProviderConfig, Vec<UnmetRequirement>> {
+    let env = env.clone();
+    let settings = settings.clone();
+    let config = ConfigStore::with_base(config.base_path().as_path());
+    crate::probe::blocking("Forgejo credential", crate::probe::PROBE_TIMEOUT, move || Ok(forgejo_provider_config(&env, &config, &settings)))
+        .await
+        .map_err(|error| vec![UnmetRequirement::MissingAuth(error)])?
 }
 
 fn forgejo_provider_config(

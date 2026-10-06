@@ -904,8 +904,7 @@ async fn create_adopted_checkout_resource(
     request: AdoptedCheckoutRequest<'_>,
 ) -> Result<(String, String, String), String> {
     let AdoptedCheckoutRequest { namespace, convoy_name, checkout_path, repository_spec, repository_url, git_ref, host_ref } = request;
-    let path = std::fs::canonicalize(checkout_path)
-        .map_err(|err| format!("adopted checkout path {} cannot be resolved: {err}", checkout_path.display()))?;
+    let path = crate::probe::canonicalize(checkout_path).await?;
     let path_str = path.to_string_lossy().to_string();
     let checkout_ref = adopted_checkout_name(convoy_name);
     let repository_key = repository_spec.key();
@@ -2496,8 +2495,7 @@ impl InProcessDaemon {
     ) -> Result<RepositoryInspection, String> {
         if let (Some(repository_url), Some(git_ref)) = (repository_url, git_ref) {
             if let Ok(spec) = RepositorySpec::remote(repository_url) {
-                let path = std::fs::canonicalize(path)
-                    .map_err(|error| format!("adopted checkout path {} cannot be resolved: {error}", path.display()))?;
+                let path = crate::probe::canonicalize(path).await?;
                 let (spec, replaces_prior_repository) = self.configure_inspected_repository(&path, spec).await?;
                 let host_ref = self.local_host_id().ok_or_else(|| "local Host identity is unavailable".to_string())?.to_string();
                 return Ok(RepositoryInspection {
@@ -4658,8 +4656,8 @@ impl InProcessDaemon {
             Some(repo_root) => {
                 let repo_root_raw = repo_root.into_path_buf();
                 // Canonicalize to handle symlinks (e.g. /var -> /private/var on macOS).
-                let canonical_root = std::fs::canonicalize(&repo_root_raw).unwrap_or(repo_root_raw);
-                let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                let canonical_root = crate::probe::canonicalize(&repo_root_raw).await.unwrap_or(repo_root_raw);
+                let canonical_path = crate::probe::canonicalize(path).await.unwrap_or_else(|_| path.to_path_buf());
                 if canonical_root != canonical_path {
                     debug!(
                         worktree = %path.display(),

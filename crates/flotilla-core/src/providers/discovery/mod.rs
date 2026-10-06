@@ -472,7 +472,7 @@ impl FactoryRegistry {
         ) -> Vec<(ProviderDescriptor, Arc<T>)> {
             let mut results = Vec::new();
             for factory in factories {
-                if let Ok(provider) = factory.probe(env, config, repo_root, runner.clone()).await {
+                if let Ok(provider) = probe_factory(factory.as_ref(), env, config, repo_root, runner.clone()).await {
                     results.push((factory.descriptor(), provider));
                 }
             }
@@ -595,7 +595,7 @@ async fn probe_host_category<T: ?Sized + Send + Sync + 'static>(
         if providers.iter().any(|(existing, _): &(ProviderDescriptor, Arc<T>)| existing.implementation == descriptor.implementation) {
             continue;
         }
-        match factory.probe(host_bag, config, probe_root, Arc::clone(runner)).await {
+        match probe_factory(factory.as_ref(), host_bag, config, probe_root, Arc::clone(runner)).await {
             Ok(provider) => providers.push((descriptor, wrap(provider))),
             Err(requirements) => {
                 unmet.extend(requirements.into_iter().map(|requirement| (descriptor.implementation.clone(), requirement)));
@@ -716,8 +716,60 @@ impl DiscoveryResult {
     }
 }
 
+/// Bound each independent provider probe; one inaccessible credential or hung
+/// tool degrades that capability while discovery continues with the others.
+async fn probe_factory<T: ?Sized + Send + Sync + 'static>(
+    factory: &dyn Factory<Descriptor = ProviderDescriptor, Output = T>,
+    env: &EnvironmentBag,
+    config: &ConfigStore,
+    repo_root: &ExecutionEnvironmentPath,
+    runner: Arc<dyn CommandRunner>,
+) -> Result<Arc<T>, Vec<UnmetRequirement>> {
+    config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?;
+    tokio::time::timeout(crate::probe::PROBE_TIMEOUT, factory.probe(env, config, repo_root, runner))
+        .await
+        .map_err(|_| vec![UnmetRequirement::MissingConfig(format!("{} discovery probe timed out", factory.descriptor().implementation))])?
+}
+
+async fn bounded_detection<T>(future: impl std::future::Future<Output = Vec<T>>) -> Vec<T> {
+    match tokio::time::timeout(crate::probe::PROBE_TIMEOUT, future).await {
+        Ok(assertions) => assertions,
+        Err(_) => {
+            tracing::warn!("discovery detector timed out; skipping probe");
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    // The process boundary double simulates a pending privacy prompt. Other
+    // detectors must still contribute capabilities after its deadline expires.
+    struct PendingDetector;
+    #[async_trait]
+    impl HostDetector for PendingDetector {
+        async fn detect(&self, _: &dyn CommandRunner, _: &dyn EnvVars) -> Vec<EnvironmentAssertion> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn detector_timeout_preserves_other_capabilities() {
+        let detectors: Vec<Box<dyn HostDetector>> =
+            vec![Box::new(PendingDetector), Box::new(detectors::generic::EnvVarDetector::new("HOME"))];
+        let runner = test_support::DiscoveryMockRunner::builder().build();
+        let env = test_support::TestEnvVars::new([("HOME", "/safe/home")]);
+        let bag = run_host_detectors(&detectors, &runner, &env).await;
+        assert_eq!(bag.find_env_var("HOME"), Some("/safe/home"));
+    }
+}
+
 pub async fn run_host_detectors(detectors: &[Box<dyn HostDetector>], runner: &dyn CommandRunner, env: &dyn EnvVars) -> EnvironmentBag {
-    stream::iter(detectors).fold(EnvironmentBag::new(), |bag, det| async move { bag.extend(det.detect(runner, env).await) }).await
+    stream::iter(detectors)
+        .fold(EnvironmentBag::new(), |bag, det| async move { bag.extend(bounded_detection(det.detect(runner, env)).await) })
+        .await
 }
 
 /// Build a provisioned environment's host bag from its complete environment,
@@ -784,7 +836,7 @@ async fn discover_providers_inner(
     let runner_ref = &*runner;
     // Phase 1: run repo detectors
     let repo_bag = stream::iter(repo_detectors)
-        .fold(EnvironmentBag::new(), |bag, det| async move { bag.extend(det.detect(repo_root, runner_ref, env).await) })
+        .fold(EnvironmentBag::new(), |bag, det| async move { bag.extend(bounded_detection(det.detect(repo_root, runner_ref, env)).await) })
         .await;
     let combined = host_bag.merge(&repo_bag);
 
@@ -804,7 +856,7 @@ async fn discover_providers_inner(
         F: FnMut(ProviderDescriptor, Arc<T>),
     {
         for factory in factories {
-            match factory.probe(env, config, repo_root, runner.clone()).await {
+            match probe_factory(factory.as_ref(), env, config, repo_root, runner.clone()).await {
                 Ok(provider) => insert(factory.descriptor(), provider),
                 Err(reqs) => {
                     let name = factory.descriptor().implementation.clone();
@@ -864,7 +916,13 @@ async fn discover_providers_inner(
     }
 
     // Apply provider preferences from config, tracking unresolved preferences.
-    let flotilla_config = config.load_config();
+    let flotilla_config = match config.load_config_for_probe().await {
+        Ok(config) => config,
+        Err(error) => {
+            unmet.push(("discovery".into(), UnmetRequirement::MissingConfig(error)));
+            Default::default()
+        }
+    };
 
     fn apply_backend_pref(
         set: &mut ProviderSet<impl ?Sized>,

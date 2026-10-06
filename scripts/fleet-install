@@ -17,6 +17,7 @@ readonly DAEMON_SOCKET="$DAEMON_CONFIG_DIR/run/flotilla.sock"
 readonly LAUNCH_LOG_DIR="$HOME/Library/Logs/flotilla"
 readonly RELEASES_DIR="$FLEET_ROOT/releases"
 readonly CURRENT_LINK="$FLEET_ROOT/current"
+readonly DARWIN_TCC_ROOT="$FLEET_ROOT/tcc"
 readonly PREVIOUS_LINK="$FLEET_ROOT/previous"
 readonly PENDING_CONFIRMATION="$FLEET_ROOT/.pending-confirmation"
 readonly TRUSTED_APPLE_TEAM_ID="973L4GV58R"
@@ -379,7 +380,9 @@ write_launcher() {
   fi
   local temporary
   temporary="$(mktemp "$FLEET_BIN_DIR/.$name.fleet-install.XXXXXX")"
-  printf '#!/usr/bin/env bash\n# managed by fleet-install\nexec %q/current/bin/%q "$@"\n' "$FLEET_ROOT" "$name" >"$temporary"
+  local executable_root="$CURRENT_LINK"
+  [[ "$PLATFORM" != darwin-* ]] || executable_root="$DARWIN_TCC_ROOT"
+  printf '#!/usr/bin/env bash\n# managed by fleet-install\nexec %q/bin/%q "$@"\n' "$executable_root" "$name" >"$temporary"
   chmod 0755 "$temporary"
   mv -f "$temporary" "$launcher"
 }
@@ -515,7 +518,7 @@ write_launchd_agent() {
   [[ "$PLATFORM" == darwin-* ]] || return 0
   local plist="$LAUNCH_AGENT_DIR/$LAUNCH_AGENT_LABEL.plist"
   local temporary daemon_path daemon_path_value skills_path codex_home_path stderr_path stdout_path
-  daemon_path="$FLEET_ROOT/current/bin/flotillad"
+  daemon_path="$DARWIN_TCC_ROOT/bin/flotillad"
   daemon_path_value="$FLEET_BIN_DIR:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   skills_path="$FLEET_ROOT/current/share/flotilla/skills"
   codex_home_path="$FLEET_ROOT/current/share/flotilla/codex-home"
@@ -575,8 +578,40 @@ prepare_darwin_daemon_service() {
   write_launchd_agent
 }
 
+# Copy, never symlink: TCC resolves symlinks to the generation's changing path.
+# Keep the signed executable's ../lib layout and replace files atomically; running
+# cleat processes retain their old mapped images. Called on activation, recovery,
+# and rollback so the stable identity always contains the selected generation.
+refresh_darwin_tcc_payload() {
+  [[ "$PLATFORM" == darwin-* ]] || return 0
+  [[ -n "$(current_generation)" ]] || return 0
+  python3 - "$CURRENT_LINK" "$DARWIN_TCC_ROOT" <<'PYTHON'
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+
+source, destination = map(Path, sys.argv[1:])
+files = [Path("bin") / name for name in ("flotilla", "flotillad", "cleat")]
+files += [path.relative_to(source) for path in (source / "lib").glob("*") if path.is_file()]
+for relative in files:
+    target = destination / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".fleet-install-", dir=target.parent)
+    os.close(fd)
+    try:
+        shutil.copy2(source / relative, temporary)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+PYTHON
+}
+
 restart_darwin_daemon_service() {
   [[ "$PLATFORM" == darwin-* ]] || return 0
+  refresh_darwin_tcc_payload || return 1
   if ((DAEMON_SERVICE_DISABLED)); then
     printf 'fleet-install: preserving flotillad dev mode; launchd agent remains disabled\n'
     return 0
@@ -840,8 +875,13 @@ activate_staged_generation() {
   fi
   # Always use the incoming generation: the previous CLI may not have this
   # post-install step. Cleat alias turnover is outside the health rollback.
-  if ! "$release/bin/flotilla" --socket "$DAEMON_SOCKET" --json fleet post-install \
-      --cleat-bin "$release/bin/cleat" --generation "$generation" \
+  local post_install_cli="$release/bin/flotilla" post_install_cleat="$release/bin/cleat"
+  if [[ "$PLATFORM" == darwin-* ]]; then
+    post_install_cli="$DARWIN_TCC_ROOT/bin/flotilla"
+    post_install_cleat="$DARWIN_TCC_ROOT/bin/cleat"
+  fi
+  if ! "$post_install_cli" --socket "$DAEMON_SOCKET" --json fleet post-install \
+      --cleat-bin "$post_install_cleat" --generation "$generation" \
       --diagnostics-dir "$FLEET_ROOT/diagnostics"; then
     die "post-install cleat drain failed or warned; installed generation $generation remains active; inspect diagnostics and retry (no rollback)"
   fi
