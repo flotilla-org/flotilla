@@ -1435,8 +1435,8 @@ async fn create_bounds_memory_and_swap() {
         .expect("create");
     let calls = runner.calls();
     let args = &calls.iter().find(|(cmd, args, _)| cmd == "docker" && args.first().is_some_and(|arg| arg == "run")).expect("docker run").1;
-    assert!(args.windows(2).any(|pair| pair == ["--memory", "8589934592"]));
-    assert!(args.windows(2).any(|pair| pair == ["--memory-swap", "8589934592"]));
+    assert!(args.windows(2).any(|pair| pair == ["--memory", "13743895347"]));
+    assert!(args.windows(2).any(|pair| pair == ["--memory-swap", "13743895347"]));
 }
 
 // Subprocess boundary: replay the operator's real inspect/journal recordings.

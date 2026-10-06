@@ -3924,7 +3924,9 @@ mod tests {
         // A same-named caller record makes using the wrong store observable.
         if target == 2 {
             let mut decoy = spec.clone();
-            decoy.docker_per_vessel.as_mut().expect("docker").host_ref = topology.leader.local_host_id().expect("caller id").to_string();
+            let decoy_docker = decoy.docker_per_vessel.as_mut().expect("docker");
+            decoy_docker.host_ref = topology.leader.local_host_id().expect("caller id").to_string();
+            decoy_docker.memory_policy.host_memory_percent = decoy_percent(percent);
             topology
                 .leader
                 .resource_backend()
@@ -3967,7 +3969,7 @@ mod tests {
                         .expect("docker")
                         .memory_policy
                         .host_memory_percent,
-                    50
+                    decoy_percent(percent)
                 );
             }
         }
@@ -3985,6 +3987,17 @@ mod tests {
             &flotilla_resources::FulfilmentKindSpec::from_policy(&spec, "linux").expect("fulfilment kind"),
         )
         .await;
+    }
+
+    /// A caller-store percentage that always differs from the applied one, so a
+    /// write to the wrong store is observable for every drawn percentage.
+    #[cfg(unix)]
+    fn decoy_percent(applied: u8) -> u8 {
+        if applied == 50 {
+            51
+        } else {
+            50
+        }
     }
 
     #[cfg(unix)]
