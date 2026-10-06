@@ -29,7 +29,7 @@ Tools are auto-detected from your environment, with configurable overrides.
 | Issue tracking | [GitHub Issues](https://github.com/features/issues) | | [Linear](https://linear.app/) (#51), [Jira](https://www.atlassian.com/software/jira) (#50) |
 | Cloud agents | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | [Codex](https://openai.com/index/introducing-codex/) (#52), [Cursor](https://www.cursor.com/) | others (#53) |
 | Agent hooks | Claude Code | Codex, Gemini | |
-| Terminal persistence | [cleat](https://github.com/flotilla-org/cleat), [shpool](https://github.com/shell-pool/shpool) | | [zmx](https://zmx.sh/) |
+| Terminal persistence | [cleat](https://github.com/flotilla-org/cleat) | | [zmx](https://zmx.sh/) |
 | Multiplexers | [cmux](https://cmux.com), [tmux](https://tmux.github.io/) | [zellij](https://zellij.dev/) (#55) | |
 | AI utilities | Claude Code, [Anthropic API](https://docs.anthropic.com/en/docs/api) | | LLM APIs (#56), [ollama](https://ollama.com/) (#56) |
 

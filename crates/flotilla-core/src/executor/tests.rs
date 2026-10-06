@@ -1060,7 +1060,7 @@ async fn teleport_session_persists_workspace_binding() {
     let mut registry = empty_registry();
     registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&workspace_manager) as Arc<dyn PresentationManager>);
-    registry.terminal_pools.insert("shpool", desc("shpool"), terminal_pool);
+    registry.terminal_pools.insert("cleat", desc("cleat"), terminal_pool);
     let mut data = empty_data();
     data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
     let checkout_key = QualifiedPath::host(HostId::new("test-local-host-id"), "/repo/wt-feat");
@@ -1458,7 +1458,7 @@ async fn remove_checkout_succeeds_with_terminal_pool() {
 
     let mut registry = empty_registry();
     registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.terminal_pools.insert("shpool", desc("shpool"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>);
+    registry.terminal_pools.insert("cleat", desc("cleat"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>);
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-feat-x").into(), TestCheckout::new("feat-x").build());
 
@@ -2025,7 +2025,7 @@ async fn teleport_session_with_branch_creates_checkout() {
     registry.cloud_agents.insert("claude", desc("claude"), Arc::new(MockCloudAgent::succeeding()));
     registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat", "/repo/wt-feat")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::new(MockWorkspaceManager::succeeding()));
-    registry.terminal_pools.insert("shpool", desc("shpool"), terminal_pool);
+    registry.terminal_pools.insert("cleat", desc("cleat"), terminal_pool);
     let mut data = empty_data();
     data.sessions.insert("sess-1".to_string(), TestSession::new("test session").with_session_ref("claude", "sess-1").build());
     let runner = runner_ok();
@@ -2266,7 +2266,7 @@ async fn remove_checkout_cascades_attachable_set_deletion() {
         store.ensure_terminal_attachable(
             &set_id,
             "terminal_pool",
-            "shpool",
+            "cleat",
             "flotilla/feat-x/shell/0",
             crate::attachable::TerminalPurpose { checkout: "feat-x".into(), role: "shell".into(), index: 0 },
             "bash",
@@ -2278,7 +2278,7 @@ async fn remove_checkout_cascades_attachable_set_deletion() {
     let mock_pool = Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) });
     let mut registry = empty_registry();
     registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
-    registry.terminal_pools.insert("shpool", desc("shpool"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>);
+    registry.terminal_pools.insert("cleat", desc("cleat"), Arc::clone(&mock_pool) as Arc<dyn TerminalPool>);
     let mut data = empty_data();
     data.checkouts.insert(hp("/repo/wt-feat-x").into(), TestCheckout::new("feat-x").build());
 
@@ -2597,7 +2597,7 @@ async fn checkout_plan_end_to_end_creates_workspace() {
     let mut registry = ProviderRegistry::new();
     registry.vcs.insert("wt", desc("wt"), Arc::new(MockCheckoutManager::succeeding("feat-x", "/repo/wt-feat-x")));
     registry.presentation_managers.insert("cmux", desc("cmux"), Arc::clone(&ws_mgr) as Arc<dyn PresentationManager>);
-    registry.terminal_pools.insert("shpool", desc("shpool"), Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) }));
+    registry.terminal_pools.insert("cleat", desc("cleat"), Arc::new(MockTerminalPool { killed: tokio::sync::Mutex::new(vec![]) }));
     let registry = Arc::new(registry);
     let runner: Arc<dyn CommandRunner> = Arc::new(MockRunner::new(vec![Err("missing".into()), Err("missing".into())]));
     let providers_data = Arc::new(empty_data());

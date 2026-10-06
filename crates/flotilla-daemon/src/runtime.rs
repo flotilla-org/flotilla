@@ -1300,10 +1300,10 @@ async fn discover_agentless_ssh_profile(
     let registry = Arc::new(
         daemon.discovery_runtime().factories.probe_all(&direct.env_bag, &remote_config, &probe_root, Arc::clone(&direct.runner)).await,
     );
-    let pool = ["cleat", "shpool"]
+    let pool = ["cleat"]
         .into_iter()
         .find(|name| registry.terminal_pools.contains_key(name))
-        .ok_or_else(|| format!("SSH host {host_id} has no persistent terminal pool (cleat or shpool)"))?
+        .ok_or_else(|| format!("SSH host {host_id} has no persistent terminal pool (cleat)"))?
         .to_string();
     let available_pools = registry.terminal_pools.iter().map(|(description, _)| description.implementation.clone()).collect();
     let provisioning = LocalProvisioningProfile {

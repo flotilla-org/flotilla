@@ -1,7 +1,6 @@
 pub mod cleat;
 pub(crate) mod environment;
 pub mod passthrough;
-pub mod shpool;
 
 use async_trait::async_trait;
 use flotilla_protocol::{arg::Arg, commands::AttachMode, result_set::CleatEndpoint, AttachableId, AttachableSetId, TerminalStatus};
@@ -67,6 +66,7 @@ pub struct ManagedSessionMetadata {
     pub working_directory: ExecutionEnvironmentPath,
 }
 
+#[cfg(test)]
 pub(crate) fn managed_session_name(metadata: &ManagedSessionMetadata) -> String {
     let encode = |value: &str| urlencoding::encode(value).into_owned();
     format!(

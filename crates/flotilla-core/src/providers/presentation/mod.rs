@@ -106,9 +106,9 @@ mod tests {
             ],
         };
         let resolved = vec![
-            ("shell".into(), "shpool attach flotilla/feat/shell/0".into()),
-            ("agent".into(), "shpool attach flotilla/feat/agent/0".into()),
-            ("agent".into(), "shpool attach flotilla/feat/agent/1".into()),
+            ("shell".into(), "cleat attach flotilla/feat/shell/0".into()),
+            ("agent".into(), "cleat attach flotilla/feat/agent/0".into()),
+            ("agent".into(), "cleat attach flotilla/feat/agent/1".into()),
         ];
 
         let layout = build_pane_layout(&tmpl, &resolved);

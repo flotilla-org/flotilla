@@ -7,25 +7,10 @@ pub mod docker;
 pub mod git;
 pub mod github;
 pub mod passthrough;
-pub mod shpool;
 pub mod tmux;
 pub mod zellij;
 
-use super::{EnvironmentBag, FactoryRegistry};
-use crate::providers::terminal::TerminalEnvVars;
-
-/// Extract TERM/COLORTERM defaults from discovery for shpool session creation.
-/// When the daemon runs without a TTY (e.g. remote SSH), these provide fallback values
-/// so sessions get color support. Uses xterm-256color as the safe universal default.
-pub(super) fn terminal_env_defaults_from_bag(env: &EnvironmentBag) -> TerminalEnvVars {
-    let mut defaults = Vec::new();
-    let term = env.find_env_var("TERM").unwrap_or("xterm-256color");
-    defaults.push(("TERM".to_string(), term.to_string()));
-    if let Some(colorterm) = env.find_env_var("COLORTERM") {
-        defaults.push(("COLORTERM".to_string(), colorterm.to_string()));
-    }
-    defaults
-}
+use super::FactoryRegistry;
 
 fn presentation_factories() -> Vec<Box<super::PresentationManagerFactory>> {
     vec![
@@ -37,11 +22,7 @@ fn presentation_factories() -> Vec<Box<super::PresentationManagerFactory>> {
 }
 
 fn terminal_pool_factories() -> Vec<Box<super::TerminalPoolFactory>> {
-    vec![
-        Box::new(cleat::CleatTerminalPoolFactory),
-        Box::new(shpool::ShpoolTerminalPoolFactory),
-        Box::new(passthrough::PassthroughTerminalPoolFactory),
-    ]
+    vec![Box::new(cleat::CleatTerminalPoolFactory), Box::new(passthrough::PassthroughTerminalPoolFactory)]
 }
 
 fn vcs_factories() -> Vec<Box<super::VcsFactory>> {

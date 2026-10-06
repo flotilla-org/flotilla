@@ -344,6 +344,11 @@ the repo. (ADR 0034.)
 _Avoid_: Audit (that is the future independent completeness check),
 decision log (too close to ADR), changelog.
 
+**Terminal Pool**:
+The provider of persistent terminals that survive viewer disconnection. Cleat
+provides persistence; passthrough runs commands directly when persistence is
+unavailable.
+
 **Independent**:
 A terminal session with no **Convoy** association — sailing alone, per the
 convoy-era term. Adopted attachables, persistent agents, loose work sessions.

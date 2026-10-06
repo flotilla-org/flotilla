@@ -577,3 +577,16 @@ async fn probe_config_errors_use_cached_defaults() {
         assert!(store.global_config.get().is_some());
     }
 }
+
+// Issue #2829: previous-generation pool preferences load without selecting shpool.
+// Glue: parsing the retired preference through the real config decoder is the contract.
+#[test]
+fn retired_shpool_preference_is_ignored() {
+    let config: FlotillaConfig = toml::from_str("[terminal_pool]\nbackend = 'shpool'\n").expect("legacy config loads");
+    assert_eq!(config.terminal_pool.preference.backend, None);
+    assert!(!toml::to_string(&config).expect("config serializes").contains("shpool"));
+    for backend in ["cleat", "passthrough", "unknown"] {
+        let config: FlotillaConfig = toml::from_str(&format!("[terminal_pool]\nbackend = '{backend}'\n")).expect("config loads");
+        assert_eq!(config.terminal_pool.preference.backend.as_deref(), Some(backend));
+    }
+}

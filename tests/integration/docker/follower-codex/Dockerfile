@@ -1,8 +1,3 @@
-# --- Install shpool via cargo-binstall ---
-FROM rust:slim-bookworm AS cargo-installer
-RUN cargo install cargo-binstall
-RUN cargo binstall --no-confirm shpool
-
 # --- Install codex CLI ---
 FROM node:20-slim AS npm-installer
 RUN npm install -g @openai/codex
@@ -19,5 +14,3 @@ RUN mkdir -p /home/flotilla/.codex \
     && echo '{"auth_mode":"placeholder"}' > /home/flotilla/.codex/auth.json \
     && chown -R flotilla:flotilla /home/flotilla/.codex
 
-# shpool from cargo-installer stage
-COPY --from=cargo-installer /usr/local/cargo/bin/shpool /usr/local/bin/shpool

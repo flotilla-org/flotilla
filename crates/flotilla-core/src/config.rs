@@ -73,10 +73,22 @@ pub struct PresentationManagerConfig {
     pub preference: ProviderPreference,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct TerminalPoolConfig {
     #[serde(flatten)]
     pub preference: ProviderPreference,
+}
+
+// N→N+1 compatibility for the shpool retirement: remove after the next fleet roll.
+impl<'de> Deserialize<'de> for TerminalPoolConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut preference = ProviderPreference::deserialize(deserializer)?;
+        if preference.backend.as_deref() == Some("shpool") {
+            tracing::warn!("shpool terminal pool is retired; ignoring its preference");
+            preference.backend = None;
+        }
+        Ok(Self { preference })
+    }
 }
 
 /// Global flotilla config from ~/.config/flotilla/config.toml
@@ -634,7 +646,7 @@ impl ConfigStore {
         Self::new(DaemonHostPath::new(p.clone()), DaemonHostPath::new(p))
     }
 
-    /// The runtime state directory (workspace state, shpool sockets, etc.).
+    /// The runtime state directory (workspace state, cleat sockets, etc.).
     pub fn state_dir(&self) -> &DaemonHostPath {
         &self.state_dir
     }
