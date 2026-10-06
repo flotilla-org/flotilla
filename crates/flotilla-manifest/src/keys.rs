@@ -130,6 +130,9 @@ pub const KEY_PRIMARY_ACTION_TARGET: &str = "action.primary.target";
 pub const KEY_PRIMARY_ACTION_KEY: &str = "action.primary.key";
 pub const KEY_PRIMARY_ACTION_LABEL: &str = "action.primary.label";
 pub const KEY_PRIMARY_ACTION_VEHICLE: &str = "action.primary.vehicle";
+/// Open recipe kind: attach, view, command, or a future address kind.
+pub const KEY_PRIMARY_ACTION_KIND: &str = "action.primary.kind";
+/// Compatibility for recipe-shape v1 (#2818): remove after the next fleet roll.
 pub const KEY_PRIMARY_ACTION_RECIPE: &str = "action.primary.recipe";
 /// Direct Cleat packet endpoint; all five facts appear or disappear together.
 pub const KEY_PRIMARY_DIRECT_TRANSPORT: &str = "action.primary.direct.transport";

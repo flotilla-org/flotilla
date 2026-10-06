@@ -25,6 +25,7 @@
 
 pub mod entity;
 pub mod keys;
+mod legacy_recipe;
 pub mod pm;
 pub mod projection;
 pub mod recipe;

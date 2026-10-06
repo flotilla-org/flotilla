@@ -400,10 +400,10 @@ fn raw_catalog_is_entities_only_with_canonical_flat_facts() {
     assert_eq!(text(vessel_patch, KEY_VESSEL), "dev/cutover/coder@feta");
     assert_eq!(
         text(convoy_patch, KEY_PRIMARY_ACTION_TARGET),
-        vessel_entity.action_target(),
+        "session:feta/terminal-cutover-coder",
         "the one-vessel convoy and vessel point at the same live target"
     );
-    assert_eq!(text(vessel_patch, KEY_PRIMARY_ACTION_TARGET), vessel_entity.action_target());
+    assert_eq!(text(vessel_patch, KEY_PRIMARY_ACTION_TARGET), "session:feta/terminal-cutover-coder");
     assert_eq!(text(vessel_patch, KEY_PRIMARY_ACTION_RECIPE), "'flotilla' attach --host 'feta' 'terminal-cutover-coder'");
     assert!(patches.iter().all(|patch| text(patch, KEY_SOURCE) == "flotilla"), "every entity carries producer provenance");
 }
@@ -715,7 +715,7 @@ fn standing_checkout_mints_a_transient_terminal_action_but_convoy_checkout_does_
     .reassert_patches();
     let standing = find_entity(&patches, &entity::checkout("standing"));
     assert_eq!(text(standing, KEY_PRIMARY_ACTION_RECIPE), "'flotilla' attach --transient --host 'kiwi' '/work/standing'");
-    assert_eq!(text(standing, KEY_PRIMARY_ACTION_TARGET), entity::checkout("standing").action_target());
+    assert_eq!(text(standing, KEY_PRIMARY_ACTION_TARGET), "checkout:kiwi//work/standing");
 
     let convoy_owned = find_entity(&patches, &entity::checkout("convoy-owned"));
     assert!(!convoy_owned.set.contains_key(KEY_PRIMARY_ACTION_RECIPE));
@@ -862,7 +862,7 @@ fn independent_session_uses_the_canonical_session_ref() {
     let session = entity::session("feta/dev/scratch");
     let patch = find_entity(&patches, &session);
     assert_eq!(text(patch, KEY_SESSION), session.id);
-    assert_eq!(text(patch, KEY_PRIMARY_ACTION_TARGET), session.action_target());
+    assert_eq!(text(patch, KEY_PRIMARY_ACTION_TARGET), "session:feta/scratch");
 }
 
 #[test]
@@ -1107,8 +1107,8 @@ fn raw_role_generations_keep_vessel_identity_and_activation_targets_distinct() {
         let vessel_patch = find_entity(&patches, &vessel);
         assert_eq!(text(convoy_patch, KEY_DISPLAY_LABEL), "governor");
         assert_eq!(text(vessel_patch, KEY_CONVOY), convoy.id);
-        assert_eq!(text(convoy_patch, KEY_PRIMARY_ACTION_TARGET), vessel.action_target());
-        assert_eq!(text(vessel_patch, KEY_PRIMARY_ACTION_TARGET), vessel.action_target());
+        assert_eq!(text(convoy_patch, KEY_PRIMARY_ACTION_TARGET), format!("session:feta/terminal-{}", row.resource.name));
+        assert_eq!(text(vessel_patch, KEY_PRIMARY_ACTION_TARGET), format!("session:feta/terminal-{}", row.resource.name));
         for patch in [convoy_patch, vessel_patch] {
             assert_eq!(patch.set["flotilla.convoy.superseded"].value, MetadataValue::Bool(row.generation == 1));
         }
@@ -1173,7 +1173,7 @@ fn live_standing_role_resolves_its_current_vessel_behind_a_stable_intent() {
     assert_eq!(text(facts, KEY_ENTITY_KIND), "role");
     assert_eq!(text(facts, SEGMENT_PROJECT), entity::project("dev", "p", "fleet").id);
     assert_eq!(text(facts, KEY_ROLE_NAME), "governor");
-    assert_eq!(text(facts, KEY_PRIMARY_ACTION_TARGET), entity.action_target());
+    assert_eq!(text(facts, KEY_PRIMARY_ACTION_TARGET), "session:feta/terminal-convoy-a-0");
     assert_eq!(text(facts, KEY_WORKSPACE_PRIMARY_STATE), "ready");
     assert_eq!(text(facts, KEY_WORKSPACE_PRIMARY_TARGET), vessel.action_target());
     assert!(text(facts, KEY_PRIMARY_ACTION_RECIPE).contains("terminal-convoy-a-0"));
@@ -1208,7 +1208,8 @@ fn replacement_generation_changes_the_resolved_target_but_not_the_intent() {
     let diff = after.diff_patches(&before);
     let role_diff = find_entity(&diff, &entity);
     assert!(role_diff.set.contains_key(KEY_WORKSPACE_PRIMARY_TARGET));
-    assert!(!role_diff.set.contains_key(KEY_PRIMARY_ACTION_TARGET), "the stable intent is unchanged");
+    // Recipe targets track the current session; the role entity retains its stable identity.
+    assert_eq!(text(role_diff, KEY_PRIMARY_ACTION_TARGET), "session:feta/terminal-convoy-b-0");
 }
 
 #[test]
@@ -2887,4 +2888,117 @@ fn running_governor_survives_two_abandoned_namesakes(tc: hegel::TestCase) {
             );
         }
     }
+}
+
+// Recipe-shape v1 preserves raw addresses and arguments (including shell and
+// Windows metacharacters); only commands expose argv, and legacy strings remain.
+#[hegel::test]
+fn structured_action_facts_preserve_addresses_and_raw_arguments(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+
+    // Empty, whitespace, quoting, Unicode, Windows paths, and shell syntax;
+    // zero to twelve arguments crosses single-digit indices and permits duplicates.
+    let values =
+        ["", "plain", "with spaces", "quote's\"", "$HOME;$(exit)", "C:\\Program Files\\flotilla.exe", "雪\nline", "refs/heads/topic"];
+    let executable = values[tc.draw(gs::integers::<usize>().min_value(0).max_value(values.len() - 1))];
+    let reference = values[tc.draw(gs::integers::<usize>().min_value(0).max_value(values.len() - 1))];
+    let host = HostName::new("feta");
+    let mint = FlotillaRecipes::new(executable);
+    let view = ViewAddress::Project { namespace: "dev".to_owned(), name: "platform".to_owned() };
+    let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(12));
+    let argv: Vec<String> =
+        (0..count).map(|_| values[tc.draw(gs::integers::<usize>().min_value(0).max_value(values.len() - 1))].to_owned()).collect();
+    let cases = [
+        (mint.attach(reference, &host).expect("attach"), "attach", format!("session:feta/{reference}"), None),
+        (mint.scoped_view(&view).expect("view"), "view", "view:project/dev/platform".to_owned(), None),
+        (
+            mint.checkout_terminal(reference, &host).expect("checkout"),
+            "command",
+            format!("checkout:feta/{reference}"),
+            Some(vec![
+                executable.to_owned(),
+                "attach".to_owned(),
+                "--transient".to_owned(),
+                "--host".to_owned(),
+                "feta".to_owned(),
+                reference.to_owned(),
+            ]),
+        ),
+        (Recipe::command("command:test", argv.clone()), "command", "command:test".to_owned(), Some(argv)),
+    ];
+    for (recipe, kind, target, expected_argv) in cases {
+        let entity = entity::session("feta/dev/test");
+        let mut catalog = Catalog::default();
+        catalog.assert_entity(entity.clone(), action_facts(&recipe, "pane"), None);
+        let patches = catalog.reassert_patches();
+        let facts = find_entity(&patches, &entity);
+        assert_eq!(text(facts, KEY_PRIMARY_ACTION_KIND), kind);
+        assert_eq!(text(facts, KEY_PRIMARY_ACTION_TARGET), target);
+        assert!(facts.set.contains_key(KEY_PRIMARY_ACTION_RECIPE), "legacy recipe survives for one generation");
+        let arguments: BTreeMap<_, _> = facts.set.iter().filter(|(key, _)| key.starts_with("action.primary.argv.")).collect();
+        assert_eq!(arguments.len(), expected_argv.as_ref().map_or(0, Vec::len));
+        if let Some(argv) = expected_argv {
+            for (index, argument) in argv.iter().enumerate() {
+                assert_eq!(text(facts, &format!("action.primary.argv.{index}")), *argument);
+            }
+        }
+        assert!(facts.set.values().all(|update| update.ttl_ms == Some(CATALOG_TTL_MS)));
+    }
+}
+
+// Glue: legacy formatting must retain the exact pre-roll POSIX spelling for all
+// three built-in recipes, including quotes in paths and executable names.
+#[test]
+fn structured_actions_keep_legacy_recipe_spelling() {
+    let mint = FlotillaRecipes::new("/opt/$current;flotilla's build");
+    let host = HostName::new("feta");
+    let cases = [
+        (mint.attach("session", &host).expect("attach"), "'/opt/$current;flotilla'\\''s build' attach --host 'feta' 'session'"),
+        (
+            mint.scoped_view(&ViewAddress::Project { namespace: "dev".to_owned(), name: "p".to_owned() }).expect("view"),
+            "'/opt/$current;flotilla'\\''s build' view 'project/dev/p'",
+        ),
+        (
+            mint.checkout_terminal("/work/repo's path", &host).expect("command"),
+            "'/opt/$current;flotilla'\\''s build' attach --transient --host 'feta' '/work/repo'\\''s path'",
+        ),
+    ];
+    for (recipe, expected) in cases {
+        let facts: BTreeMap<_, _> = action_facts(&recipe, "pane").into_iter().collect();
+        assert_eq!(facts[KEY_PRIMARY_ACTION_RECIPE], MetadataValue::text(expected));
+    }
+}
+
+// Catalog replacement retracts obsolete argv facts when a command shrinks or
+// becomes an address-only action; viewers must never retain stale arguments.
+#[test]
+fn structured_action_diff_retracts_obsolete_arguments() {
+    let entity = entity::session("feta/dev/test");
+    let catalog_for = |recipe: Recipe| {
+        let mut catalog = Catalog::default();
+        catalog.assert_entity(entity.clone(), action_facts(&recipe, "pane"), None);
+        catalog
+    };
+    let long = catalog_for(Recipe::command("command:test", vec!["flotilla".to_owned(), "one".to_owned(), "two".to_owned()]));
+    let short = catalog_for(Recipe::command("command:test", vec!["flotilla".to_owned()]));
+    let patches = short.diff_patches(&long);
+    let diff = find_entity(&patches, &entity);
+    assert!(diff.unset.contains(&"action.primary.argv.1".to_owned()));
+    assert!(diff.unset.contains(&"action.primary.argv.2".to_owned()));
+    assert!(!diff.unset.contains(&"action.primary.argv.0".to_owned()));
+    let attach = catalog_for(mint().attach("test", &HostName::new("feta")).expect("attach"));
+    let patches = attach.diff_patches(&short);
+    let diff = find_entity(&patches, &entity);
+    assert!(diff.unset.contains(&"action.primary.argv.0".to_owned()));
+    assert_eq!(text(diff, KEY_PRIMARY_ACTION_KIND), "attach");
+    assert_eq!(text(diff, KEY_PRIMARY_ACTION_TARGET), "session:feta/test");
+}
+
+// Canonical targets keep host/ref and host/path boundaries unambiguous even
+// though HostName itself is permissive: slash-containing hosts get no recipe.
+#[test]
+fn structured_recipe_mint_refuses_ambiguous_hosts() {
+    let host = HostName::new("host/ambiguous");
+    assert!(mint().attach("refs/heads/topic", &host).is_none());
+    assert!(mint().checkout_terminal("/work/repo", &host).is_none());
 }

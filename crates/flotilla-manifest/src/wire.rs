@@ -61,14 +61,21 @@
 //! | `action.primary.key` | Stable verb for the primary action. |
 //! | `action.primary.label` | Human label for the primary action. |
 //! | `action.primary.vehicle` | Execution vehicle for the action. |
-//! | `action.primary.target` | Stable focus/deduplication target. |
-//! | `action.primary.recipe` | Command address used to materialize an entry, when known. |
+//! | `action.primary.kind` | Open recipe kind (`attach`, `view`, `command`, …). |
+//! | `action.primary.target` | Canonical recipe address and focus-if-live key. |
+//! | `action.primary.argv.<n>` | Raw command arguments, zero-based and contiguous; command kinds only. |
+//! | `action.primary.recipe` | Legacy POSIX command; removed after the recipe-shape v1 fleet roll. |
 //! | `action.primary.direct.transport` | `local` or `ssh` packet transport for the same live terminal. |
 //! | `action.primary.direct.host` | Local host name or the viewer's SSH destination alias. |
 //! | `action.primary.direct.runtime_root` | Cleat runtime root on the hosting machine. |
 //! | `action.primary.direct.daemon` | Physical Cleat daemon generation, not its logical alias. |
 //! | `action.primary.direct.session` | Cleat session id on that daemon. |
 //! | `action.primary.direct.reason` | Why only the command recipe is available. |
+//!
+//! In session/checkout action targets, split on the first `/` after the kind:
+//! the mint refuses hosts containing `/`; the remaining ref/path may contain it.
+//! Consumers read command argv from index zero and stop at the first missing
+//! index, applying catalog-diff unsets so a shorter command retains no stale tail.
 //!
 //! Display-label companions are stable producer-derived facts, not identities.
 //! Missing tiers are legal and consumers fall back toward `display.label`.
