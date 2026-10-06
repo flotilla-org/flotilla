@@ -30,16 +30,19 @@ jobs:
         run: |
           source ci/toolchain/pin.sh
           echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      # Stable is only needed here for the pin assertion; fmt runs on the
+      # temporary nightly until the stable rustfmt switch (#2794).
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.rust-pin.outputs.version }}
-          components: rustfmt, clippy, llvm-tools-preview
       - name: Assert compiler pin
         shell: bash
         run: ci/toolchain/assert.sh
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: ci/git-boundary/requirements.txt
       - name: Check Git operation boundary
         run: |
           python -m pip install -r ci/git-boundary/requirements.txt
