@@ -9,7 +9,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/cleat-toolchain.sh"
 toolchain_root="$PWD/.fleet-cache/toolchains"
 export CARGO_HOME="$PWD/.fleet-cache/cargo"
 export RUSTUP_HOME="$toolchain_root/rustup"
-rust_toolchain="1.97.1"
+source "$(dirname "${BASH_SOURCE[0]}")/../toolchain/pin.sh"
+rust_toolchain="$(read_rust_pin "$(dirname "${BASH_SOURCE[0]}")/../../rust-toolchain.toml")"
 rustup_version="1.28.2"
 rustup_sha256="20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"
 mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$toolchain_root"
@@ -55,5 +56,5 @@ if [[ ! -x "$zig_root/zig" ]]; then
   tar -xJf "$zig_archive" --strip-components=1 -C "$zig_root"
 fi
 
-test "$(rustc --version)" = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+assert_rust_pin "$(dirname "${BASH_SOURCE[0]}")/../../rust-toolchain.toml"
 test "$(zig version)" = "$zig_version"
