@@ -20,9 +20,6 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: read
-
 concurrency:
   group: fleet-candidates-${{ inputs.flotilla_sha }}-${{ inputs.cleat_sha }}-${{ inputs.mattpocock_skills_sha }}-${{ inputs.rjw_skills_sha }}
   cancel-in-progress: false
