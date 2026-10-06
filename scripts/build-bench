@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""Paired Cargo experiments. Only disposable source copies and targets are modified."""
+import argparse
+import concurrent.futures
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import statistics
+import subprocess
+import tempfile
+import threading
+import time
+
+
+def output(command, cwd=None):
+    return subprocess.check_output(command, cwd=cwd, text=True).strip()
+
+
+def size(path):
+    return int(output(['du', '-s', '-B1', str(path)]).split()[0]) if path.exists() else 0
+
+
+def schedule(names, baseline, rounds):
+    for round_number in range(rounds):
+        for name in names:
+            if name != baseline:
+                pair = [baseline, name] if round_number % 2 == 0 else [name, baseline]
+                for variant in pair:
+                    yield round_number + 1, name, variant
+
+
+def summary(runs, baseline):
+    groups = {}
+    for run in runs:
+        key = (run['profile'], run['scenario'], run['pair'], run['variant'])
+        groups.setdefault(key, []).append(run)
+    lines = ['| Profile | Scenario | Pair | Variant | Successful / runs | Median seconds | vs baseline | Median target bytes |',
+             '|---|---|---|---|---:|---:|---:|---:|']
+    for key, rows in sorted(groups.items()):
+        good = [r for r in rows if r['exit_code'] == 0]
+        base = [r for r in groups.get((*key[:3], baseline), []) if r['exit_code'] == 0]
+        median = statistics.median(r['wall_seconds'] for r in good) if good else None
+        reference = statistics.median(r['wall_seconds'] for r in base) if base else None
+        delta = f'{100 * (median / reference - 1):+.1f}%' if median is not None and reference else 'n/a'
+        seconds = f'{median:.3f}' if median is not None else 'n/a'
+        disk = str(int(statistics.median(r['target_bytes'] for r in good))) if good else 'n/a'
+        lines.append('| ' + ' | '.join([*key, f'{len(good)} / {len(rows)}', seconds, delta, disk]) + ' |')
+    return '\n'.join(lines) + '\n'
+
+
+def command(variant, action, toolchain, jobs=None):
+    args = ['cargo', '+' + toolchain, '--config', 'profile.dev.package."*".debug=0']
+    for config in variant.get('config', []):
+        args += ['--config', config]
+    if jobs is not None:
+        args += ['--config', f'build.jobs={jobs}']
+    if action in variant.get('commands', {}):
+        return args + variant['commands'][action]
+    if action == 'clippy':
+        args += ['clippy', '--workspace', '--all-targets', '--locked', '--', '-D', 'warnings']
+    elif action == 'check':
+        args += ['check', '--workspace', '--all-targets', '--locked']
+    elif action in ('test', 'no-run'):
+        args += ['test', '--workspace', '--locked']
+        if action == 'no-run':
+            args.append('--no-run')
+    else:
+        raise ValueError(f'unknown Cargo action: {action}')
+    return args
+
+
+def run_commands(commands, cwd, env, cpus, log):
+    loads = [os.getloadavg()]
+    stop = threading.Event()
+    def sample():
+        while not stop.wait(1):
+            loads.append(os.getloadavg())
+    monitor = threading.Thread(target=sample)
+    monitor.start()
+    steps = []
+    started = time.monotonic()
+    code = 0
+    try:
+        with log.open('w') as stream:
+            for args in commands:
+                actual = ['taskset', '-c', cpus, *args] if cpus else args
+                step_start = time.monotonic()
+                code = subprocess.call(actual, cwd=cwd, env=env, stdout=stream, stderr=subprocess.STDOUT)
+                steps.append({'command': actual, 'wall_seconds': time.monotonic() - step_start, 'exit_code': code})
+                if code:
+                    break
+    finally:
+        stop.set()
+        monitor.join()
+    return {'log': str(log), 'wall_seconds': time.monotonic() - started, 'exit_code': code, 'steps': steps,
+            'load_before': loads[0], 'load_samples': loads, 'load_mean': [statistics.mean(x) for x in zip(*loads)]}
+
+
+def workload(scenario, variant):
+    if scenario in ('cold', 'leaf-edit', 'core-edit', 'primed'):
+        return ['no-run']
+    if scenario == 'test-runtime':
+        return ['test']
+    gate = variant.get('gate', 'clippy')
+    return [gate, 'test'] if variant.get('gate_first', False) else ['test', gate]
+
+
+def build_environment(config, variant, target, jobs, ambient):
+    env = ambient.copy()
+    env.update(config.get('env', {}))
+    env.update(variant.get('env', {}))
+    if jobs is not None:
+        env['CARGO_BUILD_JOBS'] = str(jobs)
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    env.setdefault('GIT_SSH_COMMAND', 'ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5')
+    env['CARGO_TARGET_DIR'] = str(target)
+    encoded = env.get('CARGO_ENCODED_RUSTFLAGS')
+    flags = (encoded.split('\x1f') if encoded else []) if encoded is not None else env.get('RUSTFLAGS', '').split()
+    flags += config.get('rustflags', '').split() + variant.get('rustflags', '').split()
+    env['RUSTFLAGS'] = ' '.join(flags)
+    env['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(flags)
+    return env
+
+
+def measure(root, scratch, config, variant_name, scenario, profile, cpus, worker, run_id, logs, toolchain, revision='HEAD', jobs=None, keep=False):
+    variant = config['variants'][variant_name]
+    home = scratch / f'run-{run_id}-worker-{worker}'
+    source, target = home / 'source', home / 'target'
+    fresh = not source.exists()
+    if fresh:
+        source.mkdir(parents=True)
+        # Archive the recorded commit, never the vessel's mutable working tree.
+        archive = subprocess.Popen(['git', 'archive', revision], cwd=root, stdout=subprocess.PIPE)
+        subprocess.run(['tar', '-x', '-C', str(source)], stdin=archive.stdout, check=True)
+        archive.stdout.close()
+        if archive.wait():
+            raise RuntimeError('git archive failed')
+    env = build_environment(config, variant, target, jobs, os.environ)
+    actions = workload(scenario, variant)
+    prefix = f'{run_id}-{worker}-{variant_name}-{scenario}'
+    warmup = None
+    identity = {'started_at': datetime.now(timezone.utc).isoformat(), 'source_state': 'fresh' if fresh else 'reuse-prime', 'variant': variant_name, 'scenario': scenario, 'profile': profile, 'worker': worker,
+                'variant_config': variant, 'env': {k: env.get(k) for k in sorted(set(config.get('env', {})) | set(variant.get('env', {})) |
+                    {'CARGO_INCREMENTAL', 'CARGO_BUILD_JOBS', 'CARGO_PROFILE_DEV_DEBUG', 'RUSTFLAGS', 'CARGO_TARGET_DIR',
+                     'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'FLOTILLA_LINKER_THREADS', 'RUSTUP_TOOLCHAIN',
+                     'GIT_TERMINAL_PROMPT', 'GIT_SSH_COMMAND', 'CARGO_ENCODED_RUSTFLAGS'})}}
+    try:
+        if scenario != 'cold':
+            warm_actions = actions if scenario == 'crew-cycle' else ['no-run']
+            warmup = run_commands([command(variant, a, toolchain, jobs) for a in warm_actions], source, env, cpus, logs / (prefix + '-warmup.log'))
+            if warmup['exit_code']:
+                return {**identity,
+                        'warmup': warmup, **warmup, 'target_bytes': size(target), 'failed_phase': 'warmup'}
+        if scenario in ('leaf-edit', 'core-edit', 'crew-cycle'):
+            path = source / config['edits']['leaf' if scenario == 'leaf-edit' else 'core']
+            if not path.is_file() or not path.resolve().is_relative_to(source.resolve()):
+                raise ValueError('edit must name a file inside the disposable source')
+            with path.open('a') as stream:
+                stream.write('\n// build-bench: one-line source fix\n')
+        result = run_commands([command(variant, a, toolchain, jobs) for a in actions], source, env, cpus, logs / (prefix + '.log'))
+        if scenario == 'crew-cycle':
+            result['second_round_seconds'] = result['wall_seconds']
+            result['wall_seconds'] += warmup['wall_seconds']
+        return {**identity,
+                'warmup': warmup, **result, 'target_bytes': size(target), 'log': str(logs / (prefix + '.log'))}
+    finally:
+        if not keep:
+            shutil.rmtree(home)
+
+
+def measure_suite(scenarios, record, root, scratch, config, variant_name, profile, cpus, worker,
+                  run_id, logs, toolchain, revision='HEAD', jobs=None):
+    # A worker retains only its own prime; failed primes cannot yield edit timings.
+    home = scratch / f'run-{run_id}-worker-{worker}'
+    try:
+        for scenario in scenarios:
+            result = measure(root, scratch, config, variant_name, scenario, profile, cpus, worker,
+                             run_id, logs, toolchain, revision, jobs, keep=True)
+            record(result)
+            if result['exit_code']:
+                break
+    finally:
+        if home.exists():
+            shutil.rmtree(home)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', type=Path, default=Path(__file__).with_name('build-bench.json'))
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--profiles', nargs='+', choices=['quiet', 'limited', 'contended'], default=['limited', 'contended'])
+    parser.add_argument('--cpus', type=int, default=4)
+    parser.add_argument('--contenders', type=int, default=2)
+    parser.add_argument('--rounds', type=int, default=3)
+    parser.add_argument('--variants', nargs='+')
+    parser.add_argument('--jobs', type=int, help='uniform Cargo job count, overriding every variant')
+    parser.add_argument('--reuse-prime', action='store_true', help='reuse private targets across sequential scenarios in each pair')
+    parser.add_argument('--scenarios', nargs='+', choices=['cold', 'leaf-edit', 'core-edit', 'crew-cycle', 'primed', 'test-runtime'], default=['cold', 'leaf-edit', 'core-edit', 'crew-cycle', 'primed', 'test-runtime'])
+    parser.add_argument('--toolchain', default='nightly-2026-03-12')
+    args = parser.parse_args()
+    config = json.loads(args.config.read_text())
+    names = args.variants or list(config['variants'])
+    baseline = config['baseline']
+    if min(args.rounds, args.cpus, args.contenders) < 1 or len(names) < 1 or len(set(names)) != len(names) or any(n not in config['variants'] for n in names):
+        parser.error('counts must be positive and variants must exist')
+    if not any(n != baseline for n in names):
+        parser.error('select at least one non-baseline variant')
+    if args.jobs is not None and args.jobs < 1:
+        parser.error('--jobs must be positive')
+    if len(set(args.scenarios)) != len(args.scenarios) or ('cold' in args.scenarios and args.scenarios[0] != 'cold'):
+        parser.error('scenarios must be unique and cold must come first')
+    root = Path(output(['git', 'rev-parse', '--show-toplevel']))
+    allowed = sorted(os.sched_getaffinity(0))
+    if args.cpus > len(allowed):
+        parser.error('--cpus exceeds available affinity')
+    cpus = ','.join(map(str, allowed[:args.cpus]))
+    args.output.mkdir(parents=True, exist_ok=True)
+    if (args.output / 'results.json').exists():
+        parser.error('output already contains results.json; choose a new directory')
+    logs = args.output.resolve() / 'logs'
+    logs.mkdir()
+    sysroot = Path(output(['rustc', '+' + args.toolchain, '--print', 'sysroot']))
+    host_triple = next(line.split(': ', 1)[1] for line in output(['rustc', '+' + args.toolchain, '-vV']).splitlines() if line.startswith('host: '))
+    lld = sysroot / 'lib' / 'rustlib' / host_triple / 'bin' / 'rust-lld'
+    metadata = {'revision': output(['git', 'rev-parse', 'HEAD']), 'host': platform.node(), 'platform': platform.platform(),
+                'cores': os.cpu_count(), 'affinity': allowed, 'cpu_quota': Path('/sys/fs/cgroup/cpu.max').read_text().strip() if Path('/sys/fs/cgroup/cpu.max').exists() else None,
+                'rustc': output(['rustc', '+' + args.toolchain, '-vV']), 'cargo': output(['cargo', '+' + args.toolchain, '-V']),
+                'linker_driver': output(['cc', '--version']),
+                'rust_lld': output([str(lld), '-flavor', 'gnu', '--version']) if lld.exists() else None,
+                'memory_limit': Path('/sys/fs/cgroup/memory.max').read_text().strip() if Path('/sys/fs/cgroup/memory.max').exists() else None, 'config': config, 'arguments': vars(args) | {'config': str(args.config), 'output': str(args.output)}}
+    runs = []
+    def save():
+        for name, content in [('results.json', json.dumps({'metadata': metadata, 'runs': runs}, indent=2) + '\n'),
+                              ('medians.md', summary(runs, baseline))]:
+            pending = args.output / (name + '.tmp')
+            pending.write_text(content)
+            pending.replace(args.output / name)
+    save()
+    with tempfile.TemporaryDirectory(prefix='flotilla-build-bench-') as temp:
+        scratch = Path(temp)
+        batches = [args.scenarios] if args.reuse_prime else [[s] for s in args.scenarios]
+        for profile in args.profiles:
+            for scenarios in batches:
+                for round_number, pair, variant in schedule(names, baseline, args.rounds):
+                    run_id = len(runs)
+                    print(f'{profile} {",".join(scenarios)} round {round_number} {pair}: {variant}', flush=True)
+                    workers = args.contenders if profile == 'contended' else 1
+                    lock = threading.Lock()
+                    def record(result):
+                        with lock:
+                            runs.append(result | {'round': round_number, 'pair': pair, 'run_id': run_id})
+                            save()
+                            print(f'  worker {result["worker"]} {result["scenario"]}: '
+                                  f'{result["wall_seconds"]:.3f}s exit={result["exit_code"]}', flush=True)
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                        futures = [pool.submit(measure_suite, scenarios, record, root, scratch, config, variant, profile,
+                                               cpus if profile != 'quiet' else None, worker, run_id, logs, args.toolchain,
+                                               metadata['revision'], args.jobs)
+                                   for worker in range(workers)]
+                        for future in futures:
+                            future.result()
+    return int(any(r['exit_code'] for r in runs))
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

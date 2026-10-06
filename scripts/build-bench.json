@@ -1,0 +1,55 @@
+{
+  "baseline": "baseline",
+  "env": {
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_BUILD_JOBS": "4",
+    "CARGO_PROFILE_DEV_DEBUG": "line-tables-only"
+  },
+  "edits": {
+    "leaf": "crates/flotilla-tui/src/lib.rs",
+    "core": "crates/flotilla-core/src/lib.rs"
+  },
+  "variants": {
+    "baseline": {},
+    "incremental": {
+      "env": {
+        "CARGO_INCREMENTAL": "1"
+      }
+    },
+    "threads-4": {
+      "rustflags": "-Zthreads=4"
+    },
+    "threads-8": {
+      "rustflags": "-Zthreads=8"
+    },
+    "build-opt-3": {
+      "config": [
+        "profile.dev.build-override.opt-level=3"
+      ]
+    },
+    "deps-opt-1": {
+      "config": [
+        "profile.dev.package.\"*\".opt-level=1"
+      ]
+    },
+    "sqlite-opt-1": {
+      "config": [
+        "profile.dev.package.libsqlite3-sys.opt-level=1"
+      ]
+    },
+    "share-generics": {
+      "rustflags": "-Zshare-generics=y"
+    },
+    "unpacked": {
+      "config": [
+        "profile.dev.split-debuginfo=\"unpacked\""
+      ]
+    },
+    "clippy-first": {
+      "gate_first": true
+    },
+    "check-gate": {
+      "gate": "check"
+    }
+  }
+}

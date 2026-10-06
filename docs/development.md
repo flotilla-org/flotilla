@@ -300,3 +300,69 @@ Escalation warnings now distinguish `supervisor_lookup_failed`,
 `operator_rung_selected`, and `supervision_policy_exhausted`, and include the policy
 cursor and lookup evidence. A live governor can coexist with an exhausted policy;
 its existence alone does not mean that an escalation lookup failed.
+
+### Reproducible build experiments
+
+`scripts/build-bench` (Python 3, Linux `taskset`, `cc`, `du`, and Cargo) runs
+paired, interleaved baseline/challenger rounds from the **committed HEAD**.
+Commit source changes before measuring. Variants live in `scripts/build-bench.json`;
+each has optional Cargo `config`, `env`, `rustflags`, and crew gate ordering.
+Optional `commands` maps action names (`test`, `no-run`, `clippy`, `check`) to
+Cargo argument arrays. For example, `"commands": {"test": ["nextest", "run",
+"--workspace", "--locked"]}` supplies a test runner without changing the harness;
+include a `no-run` override too when comparing nextest binary selection. Linker
+variants can set `rustflags` or Cargo target linker config. These are extension
+points for #2750; those tools are not required by the default variant map.
+
+Ambient or config `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` are preserved, with
+encoded flags taking Cargo’s usual precedence; declared `rustflags` are appended.
+Effective flags are recorded in each run.
+
+The baseline explicitly uses line tables, dependency `debug=0`, four Cargo jobs,
+and incremental off. All variants use the same pinned nightly, including those
+without unstable flags, to avoid mixing compiler versions into comparisons.
+
+```bash
+scripts/build-bench --output /tmp/build-bench-4cpu --profiles limited contended \
+  --cpus 4 --contenders 2 --jobs 4 --reuse-prime --rounds 2
+scripts/build-bench --output /tmp/build-bench-quiet --profiles quiet --jobs "$(nproc)" --reuse-prime --rounds 5
+python3 -m pip install -r scripts/tests/build-bench-requirements.txt
+python3 -m unittest scripts.tests.test_build_bench
+```
+
+Use `--jobs N` to enforce a uniform job count over config and variant environment
+values. The four-job default is the crew vessel baseline; full host parallelism
+is an operator run. `--reuse-prime` keeps each worker’s private target across the
+selected scenarios in a pair and deletes it at the end. Edits accumulate in the
+disposable source, and the first crew round then starts primed by prior scenarios;
+`source_state` records this distinction. Omit it for independent fresh scenario
+primes, including a crew cycle starting from a cold target. A failed prime stops
+that worker’s suite because later edit timings would be invalid.
+
+Use `--variants incremental threads-4` and `--scenarios cold core-edit` for a
+smaller experiment. The quiet profile uses the vessel's available affinity;
+it cannot remove an inherited CPU quota. Limited runs pin to the first N allowed
+CPUs; contended runs launch K independent builds on that same CPU set. Record
+both the requested affinity and inherited quota when interpreting results.
+
+Every worker gets a disposable source archive and isolated target, removed after
+its scenario or scenario suite even on build failure. Dependency downloads share Cargo's registry;
+run `cargo fetch --locked` first to avoid timing downloads. `results.json` records
+flags, selected environment, host/toolchain/linker, affinity/quota, phase times,
+load samples and final target bytes; `medians.md` compares each challenger with
+its paired baseline. Logs survive beside those files. Choose a new output directory
+for each invocation. Git prompts are disabled; SSH defaults to batch mode, strict
+host-key checking, and a five-second connection timeout so test fixtures cannot
+hang on an interactive prompt. An explicit caller `GIT_SSH_COMMAND` is preserved. Failed runs are shown and excluded from timing medians, and
+the command exits unsuccessfully if any build fails.
+
+Cold measures `cargo test --workspace --no-run --locked`. Leaf/core edit probes
+prime the target, then append one comment line to the disposable TUI/core source.
+Primed measures the no-change rebuild after that same prime. Crew-cycle measures
+both a full test/gate round and a second round after a core fix; individual phase
+and second-round times remain in JSON. Optimization variants can therefore be
+compared for test execution as well as build time. `--scenarios test-runtime`
+primes with `--no-run` and times just the subsequent test invocation. The `check-gate` variant is a
+cost probe, not a recommendation to drop lint coverage. A primed private target is
+only a phase-2 probe, not a shared-cache implementation. Load averages are sampled
+once per second; they describe the whole host, rather than only the vessel.

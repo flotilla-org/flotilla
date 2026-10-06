@@ -1,0 +1,2731 @@
+{
+  "metadata": {
+    "revision": "76a34ccde9b1b11828d9e250326dfa389ff81052",
+    "host": "3c2eb4ae9b7c",
+    "platform": "Linux-7.2.8-1-cachyos-x86_64-with-glibc2.39",
+    "cores": 32,
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31
+    ],
+    "cpu_quota": "800000 100000",
+    "rustc": "rustc 1.96.0-nightly (3b1b0ef4d 2026-03-11)\nbinary: rustc\ncommit-hash: 3b1b0ef4d80d3117924d91352c8b6ca528708b3c\ncommit-date: 2026-03-11\nhost: x86_64-unknown-linux-gnu\nrelease: 1.96.0-nightly\nLLVM version: 22.1.0",
+    "cargo": "cargo 1.96.0-nightly (90ed291a5 2026-03-05)",
+    "linker_driver": "cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0\nCopyright (C) 2023 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+    "rust_lld": "LLD 22.1.0 (/checkout/src/llvm-project/llvm 41f177ed26a5252a30ea6090a4da66ce0a96bf44) (compatible with GNU linkers)",
+    "memory_limit": "8309227520",
+    "config": {
+      "baseline": "baseline",
+      "env": {
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only"
+      },
+      "edits": {
+        "leaf": "crates/flotilla-tui/src/lib.rs",
+        "core": "crates/flotilla-core/src/lib.rs"
+      },
+      "variants": {
+        "baseline": {},
+        "incremental": {
+          "env": {
+            "CARGO_INCREMENTAL": "1"
+          }
+        },
+        "threads-4": {
+          "rustflags": "-Zthreads=4"
+        },
+        "threads-8": {
+          "rustflags": "-Zthreads=8"
+        },
+        "build-opt-3": {
+          "config": [
+            "profile.dev.build-override.opt-level=3"
+          ]
+        },
+        "deps-opt-1": {
+          "config": [
+            "profile.dev.package.\"*\".opt-level=1"
+          ]
+        },
+        "sqlite-opt-1": {
+          "config": [
+            "profile.dev.package.libsqlite3-sys.opt-level=1"
+          ]
+        },
+        "share-generics": {
+          "rustflags": "-Zshare-generics=y"
+        },
+        "unpacked": {
+          "config": [
+            "profile.dev.split-debuginfo=\"unpacked\""
+          ]
+        },
+        "clippy-first": {
+          "gate_first": true
+        },
+        "check-gate": {
+          "gate": "check"
+        }
+      }
+    },
+    "arguments": {
+      "config": "/workspace/scripts/build-bench.json",
+      "output": "/tmp/build-bench-2751-final",
+      "profiles": [
+        "limited",
+        "contended"
+      ],
+      "cpus": 4,
+      "contenders": 2,
+      "rounds": 2,
+      "variants": null,
+      "jobs": 4,
+      "reuse_prime": true,
+      "scenarios": [
+        "cold",
+        "leaf-edit",
+        "core-edit",
+        "crew-cycle",
+        "primed",
+        "test-runtime"
+      ],
+      "toolchain": "nightly-2026-03-12"
+    }
+  },
+  "campaign_status": "stopped by operator: accept failed and unavailable rows",
+  "runs": [
+    {
+      "started_at": "2026-10-06T12:46:35.682055+00:00",
+      "source_state": "fresh",
+      "variant": "baseline",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {},
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-0-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/0-0-baseline-cold.log",
+      "wall_seconds": 291.4883956789854,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 291.4881585999974,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        11.236328125,
+        11.236328125,
+        12.07763671875
+      ],
+      "load_mean": [
+        20.865003611943493,
+        15.51502468161387,
+        13.62883601776541
+      ],
+      "target_bytes": 6524080128,
+      "round": 1,
+      "pair": "incremental",
+      "run_id": 0,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 292,
+      "load_min": [
+        11.236328125,
+        11.236328125,
+        12.07763671875
+      ],
+      "load_max": [
+        26.96923828125,
+        18.75048828125,
+        15.0400390625
+      ]
+    },
+    {
+      "started_at": "2026-10-06T12:51:27.942429+00:00",
+      "source_state": "fresh",
+      "variant": "incremental",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "env": {
+          "CARGO_INCREMENTAL": "1"
+        }
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "1",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-1-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/1-0-incremental-cold.log",
+      "wall_seconds": 318.6306829969981,
+      "exit_code": 0,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 318.6303177140071,
+          "exit_code": 0
+        }
+      ],
+      "load_before": [
+        20.91455078125,
+        18.42236328125,
+        14.99560546875
+      ],
+      "load_mean": [
+        17.11766506661442,
+        17.5763387171826,
+        15.188917393221002
+      ],
+      "target_bytes": 19173605376,
+      "round": 1,
+      "pair": "incremental",
+      "run_id": 1,
+      "outcome": "pass",
+      "load_sample_count": 319,
+      "load_min": [
+        13.712890625,
+        16.4990234375,
+        14.97412109375
+      ],
+      "load_max": [
+        22.55517578125,
+        18.89501953125,
+        15.44677734375
+      ]
+    },
+    {
+      "started_at": "2026-10-06T12:56:46.800070+00:00",
+      "source_state": "reuse-prime",
+      "variant": "incremental",
+      "scenario": "leaf-edit",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "env": {
+          "CARGO_INCREMENTAL": "1"
+        }
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "1",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-1-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": {
+        "log": "/tmp/build-bench-2751-final/logs/1-0-incremental-leaf-edit-warmup.log",
+        "wall_seconds": 0.6286731549771503,
+        "exit_code": 0,
+        "steps": [
+          {
+            "command": [
+              "taskset",
+              "-c",
+              "0,1,2,3",
+              "cargo",
+              "+nightly-2026-03-12",
+              "--config",
+              "profile.dev.package.\"*\".debug=0",
+              "test",
+              "--workspace",
+              "--locked",
+              "--no-run"
+            ],
+            "wall_seconds": 0.6285192730138078,
+            "exit_code": 0
+          }
+        ],
+        "load_before": [
+          17.05908203125,
+          17.14892578125,
+          15.40478515625
+        ],
+        "load_mean": [
+          17.05908203125,
+          17.14892578125,
+          15.40478515625
+        ],
+        "load_sample_count": 1
+      },
+      "log": "/tmp/build-bench-2751-final/logs/1-0-incremental-leaf-edit.log",
+      "wall_seconds": 12.248585505993105,
+      "exit_code": 0,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 12.24835459899623,
+          "exit_code": 0
+        }
+      ],
+      "load_before": [
+        17.05908203125,
+        17.14892578125,
+        15.40478515625
+      ],
+      "load_mean": [
+        17.155987079326923,
+        17.165452223557693,
+        15.420748197115385
+      ],
+      "target_bytes": 19560243200,
+      "round": 1,
+      "pair": "incremental",
+      "run_id": 1,
+      "outcome": "pass",
+      "load_sample_count": 13,
+      "load_min": [
+        16.73388671875,
+        17.07958984375,
+        15.3916015625
+      ],
+      "load_max": [
+        17.63623046875,
+        17.26123046875,
+        15.45947265625
+      ]
+    },
+    {
+      "started_at": "2026-10-06T12:56:59.720474+00:00",
+      "source_state": "reuse-prime",
+      "variant": "incremental",
+      "scenario": "core-edit",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "env": {
+          "CARGO_INCREMENTAL": "1"
+        }
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "1",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-1-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": {
+        "log": "/tmp/build-bench-2751-final/logs/1-0-incremental-core-edit-warmup.log",
+        "wall_seconds": 0.4558469449984841,
+        "exit_code": 0,
+        "steps": [
+          {
+            "command": [
+              "taskset",
+              "-c",
+              "0,1,2,3",
+              "cargo",
+              "+nightly-2026-03-12",
+              "--config",
+              "profile.dev.package.\"*\".debug=0",
+              "test",
+              "--workspace",
+              "--locked",
+              "--no-run"
+            ],
+            "wall_seconds": 0.45572030497714877,
+            "exit_code": 0
+          }
+        ],
+        "load_before": [
+          17.63623046875,
+          17.26123046875,
+          15.45947265625
+        ],
+        "load_mean": [
+          17.63623046875,
+          17.26123046875,
+          15.45947265625
+        ],
+        "load_sample_count": 1
+      },
+      "log": "/tmp/build-bench-2751-final/logs/1-0-incremental-core-edit.log",
+      "wall_seconds": 37.07172358594835,
+      "exit_code": 0,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 37.0714557080064,
+          "exit_code": 0
+        }
+      ],
+      "load_before": [
+        17.90576171875,
+        17.32373046875,
+        15.4892578125
+      ],
+      "load_mean": [
+        19.734182257401315,
+        17.76864463404605,
+        15.668662623355264
+      ],
+      "target_bytes": 22635089920,
+      "round": 1,
+      "pair": "incremental",
+      "run_id": 1,
+      "outcome": "pass",
+      "load_sample_count": 38,
+      "load_min": [
+        17.90576171875,
+        17.32373046875,
+        15.4892578125
+      ],
+      "load_max": [
+        21.82177734375,
+        18.3369140625,
+        15.896484375
+      ]
+    },
+    {
+      "started_at": "2026-10-06T12:57:37.316504+00:00",
+      "source_state": "reuse-prime",
+      "variant": "incremental",
+      "scenario": "crew-cycle",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "env": {
+          "CARGO_INCREMENTAL": "1"
+        }
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "1",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-1-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": {
+        "log": "/tmp/build-bench-2751-final/logs/1-0-incremental-crew-cycle-warmup.log",
+        "wall_seconds": 238.7555282600224,
+        "exit_code": 0,
+        "steps": [
+          {
+            "command": [
+              "taskset",
+              "-c",
+              "0,1,2,3",
+              "cargo",
+              "+nightly-2026-03-12",
+              "--config",
+              "profile.dev.package.\"*\".debug=0",
+              "test",
+              "--workspace",
+              "--locked"
+            ],
+            "wall_seconds": 97.25200772995595,
+            "exit_code": 0
+          },
+          {
+            "command": [
+              "taskset",
+              "-c",
+              "0,1,2,3",
+              "cargo",
+              "+nightly-2026-03-12",
+              "--config",
+              "profile.dev.package.\"*\".debug=0",
+              "clippy",
+              "--workspace",
+              "--all-targets",
+              "--locked",
+              "--",
+              "-D",
+              "warnings"
+            ],
+            "wall_seconds": 141.50336470495677,
+            "exit_code": 0
+          }
+        ],
+        "load_before": [
+          21.755859375,
+          18.3369140625,
+          15.896484375
+        ],
+        "load_mean": [
+          14.710602445083682,
+          16.523363951359833,
+          15.499417739932008
+        ],
+        "load_sample_count": 239
+      },
+      "log": "/tmp/build-bench-2751-final/logs/1-0-incremental-crew-cycle.log",
+      "wall_seconds": 389.7254615450511,
+      "exit_code": 0,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked"
+          ],
+          "wall_seconds": 129.37027502799174,
+          "exit_code": 0
+        },
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--locked",
+            "--",
+            "-D",
+            "warnings"
+          ],
+          "wall_seconds": 21.599430936039425,
+          "exit_code": 0
+        }
+      ],
+      "load_before": [
+        11.37451171875,
+        14.77392578125,
+        15.0087890625
+      ],
+      "load_mean": [
+        11.900765728476822,
+        14.357030603269868,
+        14.850563301945364
+      ],
+      "second_round_seconds": 150.96993328502867,
+      "target_bytes": 27428253696,
+      "round": 1,
+      "pair": "incremental",
+      "run_id": 1,
+      "outcome": "pass",
+      "load_sample_count": 151,
+      "load_min": [
+        9.79931640625,
+        13.25830078125,
+        14.43701171875
+      ],
+      "load_max": [
+        14.90185546875,
+        15.23681640625,
+        15.15234375
+      ]
+    },
+    {
+      "started_at": "2026-10-06T13:04:07.113194+00:00",
+      "source_state": "reuse-prime",
+      "variant": "incremental",
+      "scenario": "primed",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "env": {
+          "CARGO_INCREMENTAL": "1"
+        }
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "1",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-1-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": {
+        "log": "/tmp/build-bench-2751-final/logs/1-0-incremental-primed-warmup.log",
+        "wall_seconds": 0.37893707398325205,
+        "exit_code": 0,
+        "steps": [
+          {
+            "command": [
+              "taskset",
+              "-c",
+              "0,1,2,3",
+              "cargo",
+              "+nightly-2026-03-12",
+              "--config",
+              "profile.dev.package.\"*\".debug=0",
+              "test",
+              "--workspace",
+              "--locked",
+              "--no-run"
+            ],
+            "wall_seconds": 0.37881948199355975,
+            "exit_code": 0
+          }
+        ],
+        "load_before": [
+          9.9794921875,
+          13.25830078125,
+          14.43701171875
+        ],
+        "load_mean": [
+          9.9794921875,
+          13.25830078125,
+          14.43701171875
+        ],
+        "load_sample_count": 1
+      },
+      "log": "/tmp/build-bench-2751-final/logs/1-0-incremental-primed.log",
+      "wall_seconds": 0.2766738469945267,
+      "exit_code": 0,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 0.2765172600047663,
+          "exit_code": 0
+        }
+      ],
+      "load_before": [
+        9.9794921875,
+        13.25830078125,
+        14.43701171875
+      ],
+      "load_mean": [
+        9.9794921875,
+        13.25830078125,
+        14.43701171875
+      ],
+      "target_bytes": 27428253696,
+      "round": 1,
+      "pair": "incremental",
+      "run_id": 1,
+      "outcome": "pass",
+      "load_sample_count": 1,
+      "load_min": [
+        9.9794921875,
+        13.25830078125,
+        14.43701171875
+      ],
+      "load_max": [
+        9.9794921875,
+        13.25830078125,
+        14.43701171875
+      ]
+    },
+    {
+      "started_at": "2026-10-06T13:04:07.829737+00:00",
+      "source_state": "reuse-prime",
+      "variant": "incremental",
+      "scenario": "test-runtime",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "env": {
+          "CARGO_INCREMENTAL": "1"
+        }
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "1",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-1-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": {
+        "log": "/tmp/build-bench-2751-final/logs/1-0-incremental-test-runtime-warmup.log",
+        "wall_seconds": 0.28046358498977497,
+        "exit_code": 0,
+        "steps": [
+          {
+            "command": [
+              "taskset",
+              "-c",
+              "0,1,2,3",
+              "cargo",
+              "+nightly-2026-03-12",
+              "--config",
+              "profile.dev.package.\"*\".debug=0",
+              "test",
+              "--workspace",
+              "--locked",
+              "--no-run"
+            ],
+            "wall_seconds": 0.2803239509812556,
+            "exit_code": 0
+          }
+        ],
+        "load_before": [
+          9.9794921875,
+          13.25830078125,
+          14.43701171875
+        ],
+        "load_mean": [
+          9.9794921875,
+          13.25830078125,
+          14.43701171875
+        ],
+        "load_sample_count": 1
+      },
+      "log": "/tmp/build-bench-2751-final/logs/1-0-incremental-test-runtime.log",
+      "wall_seconds": 94.68553413200425,
+      "exit_code": 0,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked"
+          ],
+          "wall_seconds": 94.68538226396777,
+          "exit_code": 0
+        }
+      ],
+      "load_before": [
+        9.9794921875,
+        13.25830078125,
+        14.43701171875
+      ],
+      "load_mean": [
+        10.751696134868421,
+        13.010587993421053,
+        14.29153988486842
+      ],
+      "target_bytes": 27428253696,
+      "round": 1,
+      "pair": "incremental",
+      "run_id": 1,
+      "outcome": "pass",
+      "load_sample_count": 95,
+      "load_min": [
+        9.1298828125,
+        12.43310546875,
+        14.037109375
+      ],
+      "load_max": [
+        13.76904296875,
+        13.54541015625,
+        14.46337890625
+      ]
+    },
+    {
+      "started_at": "2026-10-06T13:05:44.548034+00:00",
+      "source_state": "fresh",
+      "variant": "baseline",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {},
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-7-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/7-0-baseline-cold.log",
+      "wall_seconds": 231.08114998502424,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 231.08099481201498,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        9.45703125,
+        12.43310546875,
+        14.037109375
+      ],
+      "load_mean": [
+        12.921898151266165,
+        12.812975653286639,
+        13.978429333917026
+      ],
+      "target_bytes": 5749108736,
+      "round": 1,
+      "pair": "threads-4",
+      "run_id": 7,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 232,
+      "load_min": [
+        9.45703125,
+        12.0224609375,
+        13.79248046875
+      ],
+      "load_max": [
+        17.40283203125,
+        13.8857421875,
+        14.23486328125
+      ]
+    },
+    {
+      "started_at": "2026-10-06T13:09:36.267457+00:00",
+      "source_state": "fresh",
+      "variant": "threads-4",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "rustflags": "-Zthreads=4"
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-8-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "-Zthreads=4",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/8-0-threads-4-cold.log",
+      "wall_seconds": 355.64272939797956,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 355.64255520899314,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        14.64404296875,
+        13.548828125,
+        14.09765625
+      ],
+      "load_mean": [
+        18.967219320575843,
+        15.970044768258427,
+        14.96338713570927
+      ],
+      "target_bytes": 6123298816,
+      "round": 1,
+      "pair": "threads-4",
+      "run_id": 8,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 356,
+      "load_min": [
+        14.35205078125,
+        13.50634765625,
+        14.08056640625
+      ],
+      "load_max": [
+        25.42236328125,
+        18.53125,
+        15.9521484375
+      ]
+    },
+    {
+      "started_at": "2026-10-06T13:15:32.714838+00:00",
+      "source_state": "fresh",
+      "variant": "baseline",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {},
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-9-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/9-0-baseline-cold.log",
+      "wall_seconds": 368.0606862080167,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 368.06046572100604,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        16.7822265625,
+        17.53125,
+        15.7705078125
+      ],
+      "load_mean": [
+        16.61600450965447,
+        16.896043730945124,
+        15.787966844512194
+      ],
+      "target_bytes": 5784088576,
+      "round": 1,
+      "pair": "threads-8",
+      "run_id": 9,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 369,
+      "load_min": [
+        13.76953125,
+        16.01611328125,
+        15.486328125
+      ],
+      "load_max": [
+        20.78466796875,
+        17.98876953125,
+        16.3583984375
+      ]
+    },
+    {
+      "started_at": "2026-10-06T13:21:41.679912+00:00",
+      "source_state": "fresh",
+      "variant": "threads-8",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "rustflags": "-Zthreads=8"
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-10-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "-Zthreads=8",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/10-0-threads-8-cold.log",
+      "wall_seconds": 297.5950929559767,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 297.59493489703164,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        20.71728515625,
+        17.98876953125,
+        16.3583984375
+      ],
+      "load_mean": [
+        18.25773057361577,
+        18.013789848993287,
+        16.61947160759228
+      ],
+      "target_bytes": 10446905344,
+      "round": 1,
+      "pair": "threads-8",
+      "run_id": 10,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 298,
+      "load_min": [
+        13.63037109375,
+        16.80712890625,
+        16.34912109375
+      ],
+      "load_max": [
+        21.73974609375,
+        18.6572265625,
+        16.86083984375
+      ]
+    },
+    {
+      "started_at": "2026-10-06T13:26:40.233232+00:00",
+      "source_state": "fresh",
+      "variant": "baseline",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {},
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-11-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/11-0-baseline-cold.log",
+      "wall_seconds": 229.8486275280011,
+      "exit_code": 0,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 229.84489067801042,
+          "exit_code": 0
+        }
+      ],
+      "load_before": [
+        13.63037109375,
+        16.80712890625,
+        16.42236328125
+      ],
+      "load_mean": [
+        12.274012822690217,
+        15.206135360054347,
+        15.852846891983695
+      ],
+      "target_bytes": 11345498112,
+      "round": 1,
+      "pair": "build-opt-3",
+      "run_id": 11,
+      "outcome": "pass",
+      "load_sample_count": 230,
+      "load_min": [
+        10.90673828125,
+        14.2666015625,
+        15.44091796875
+      ],
+      "load_max": [
+        13.97705078125,
+        16.80712890625,
+        16.42236328125
+      ]
+    },
+    {
+      "started_at": "2026-10-06T13:30:30.142612+00:00",
+      "source_state": "reuse-prime",
+      "variant": "baseline",
+      "scenario": "leaf-edit",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {},
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-11-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": {
+        "log": "/tmp/build-bench-2751-final/logs/11-0-baseline-leaf-edit-warmup.log",
+        "wall_seconds": 0.49519634299213067,
+        "exit_code": 0,
+        "steps": [
+          {
+            "command": [
+              "taskset",
+              "-c",
+              "0,1,2,3",
+              "cargo",
+              "+nightly-2026-03-12",
+              "--config",
+              "profile.dev.package.\"*\".debug=0",
+              "test",
+              "--workspace",
+              "--locked",
+              "--no-run"
+            ],
+            "wall_seconds": 0.49492433696286753,
+            "exit_code": 0
+          }
+        ],
+        "load_before": [
+          12.2919921875,
+          14.2666015625,
+          15.44091796875
+        ],
+        "load_mean": [
+          12.2919921875,
+          14.2666015625,
+          15.44091796875
+        ],
+        "load_sample_count": 1
+      },
+      "log": "/tmp/build-bench-2751-final/logs/11-0-baseline-leaf-edit.log",
+      "wall_seconds": 16.615634849003982,
+      "exit_code": 0,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 16.61508016701555,
+          "exit_code": 0
+        }
+      ],
+      "load_before": [
+        12.1884765625,
+        14.2119140625,
+        15.4169921875
+      ],
+      "load_mean": [
+        12.202550551470589,
+        14.1728515625,
+        15.396168428308824
+      ],
+      "target_bytes": 11345821696,
+      "round": 1,
+      "pair": "build-opt-3",
+      "run_id": 11,
+      "outcome": "pass",
+      "load_sample_count": 17,
+      "load_min": [
+        12.01318359375,
+        14.1416015625,
+        15.3779296875
+      ],
+      "load_max": [
+        12.38623046875,
+        14.2119140625,
+        15.4169921875
+      ]
+    },
+    {
+      "started_at": "2026-10-06T13:30:47.282104+00:00",
+      "source_state": "reuse-prime",
+      "variant": "baseline",
+      "scenario": "core-edit",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {},
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-11-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": {
+        "log": "/tmp/build-bench-2751-final/logs/11-0-baseline-core-edit-warmup.log",
+        "wall_seconds": 0.359750111005269,
+        "exit_code": 0,
+        "steps": [
+          {
+            "command": [
+              "taskset",
+              "-c",
+              "0,1,2,3",
+              "cargo",
+              "+nightly-2026-03-12",
+              "--config",
+              "profile.dev.package.\"*\".debug=0",
+              "test",
+              "--workspace",
+              "--locked",
+              "--no-run"
+            ],
+            "wall_seconds": 0.35952468297909945,
+            "exit_code": 0
+          }
+        ],
+        "load_before": [
+          12.38623046875,
+          14.1533203125,
+          15.3779296875
+        ],
+        "load_mean": [
+          12.38623046875,
+          14.1533203125,
+          15.3779296875
+        ],
+        "load_sample_count": 1
+      },
+      "log": "/tmp/build-bench-2751-final/logs/11-0-baseline-core-edit.log",
+      "wall_seconds": 361.6821136029903,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 361.68186217703624,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        12.38623046875,
+        14.1533203125,
+        15.3779296875
+      ],
+      "load_mean": [
+        15.940835689312845,
+        15.127839315003452,
+        15.533382521149862
+      ],
+      "target_bytes": 11345543168,
+      "round": 1,
+      "pair": "build-opt-3",
+      "run_id": 11,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 362,
+      "load_min": [
+        10.26904296875,
+        13.38525390625,
+        15.0166015625
+      ],
+      "load_max": [
+        22.00439453125,
+        17.0126953125,
+        16.12060546875
+      ]
+    },
+    {
+      "started_at": "2026-10-06T13:36:50.820066+00:00",
+      "source_state": "fresh",
+      "variant": "build-opt-3",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "config": [
+          "profile.dev.build-override.opt-level=3"
+        ]
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-14-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/14-0-build-opt-3-cold.log",
+      "wall_seconds": 404.41212046402507,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "--config",
+            "profile.dev.build-override.opt-level=3",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 404.41194377996726,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        12.42529296875,
+        15.115234375,
+        15.5263671875
+      ],
+      "load_mean": [
+        13.253574701003087,
+        14.231650270061728,
+        15.058153694058642
+      ],
+      "target_bytes": 4627849216,
+      "round": 1,
+      "pair": "build-opt-3",
+      "run_id": 14,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 405,
+      "load_min": [
+        10.9033203125,
+        13.31689453125,
+        14.72509765625
+      ],
+      "load_max": [
+        16.81640625,
+        15.193359375,
+        15.54541015625
+      ]
+    },
+    {
+      "started_at": "2026-10-06T13:43:36.014847+00:00",
+      "source_state": "fresh",
+      "variant": "baseline",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {},
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-15-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/15-0-baseline-cold.log",
+      "wall_seconds": 332.90768745704554,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 332.90569335996406,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        12.2998046875,
+        13.7646484375,
+        14.72265625
+      ],
+      "load_mean": [
+        13.49122266798048,
+        13.4184643628003,
+        14.393836219031531
+      ],
+      "target_bytes": 6059270144,
+      "round": 1,
+      "pair": "deps-opt-1",
+      "run_id": 15,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 333,
+      "load_min": [
+        9.732421875,
+        12.4619140625,
+        14.15087890625
+      ],
+      "load_max": [
+        19.94873046875,
+        15.03662109375,
+        14.77783203125
+      ]
+    },
+    {
+      "started_at": "2026-10-06T13:49:09.637866+00:00",
+      "source_state": "fresh",
+      "variant": "deps-opt-1",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "config": [
+          "profile.dev.package.\"*\".opt-level=1"
+        ]
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-16-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/16-0-deps-opt-1-cold.log",
+      "wall_seconds": 232.3599190529785,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "--config",
+            "profile.dev.package.\"*\".opt-level=1",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 232.35798438999336,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        16.5751953125,
+        14.7099609375,
+        14.67626953125
+      ],
+      "load_mean": [
+        14.863107312902361,
+        14.506213536078326,
+        14.593913458959227
+      ],
+      "target_bytes": 5015633920,
+      "round": 1,
+      "pair": "deps-opt-1",
+      "run_id": 16,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 233,
+      "load_min": [
+        13.56591796875,
+        14.19580078125,
+        14.49853515625
+      ],
+      "load_max": [
+        16.5751953125,
+        14.90283203125,
+        14.7138671875
+      ]
+    },
+    {
+      "started_at": "2026-10-06T13:53:02.817479+00:00",
+      "source_state": "fresh",
+      "variant": "baseline",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {},
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-17-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/17-0-baseline-cold.log",
+      "wall_seconds": 474.08860358200036,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 474.08827355800895,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        14.92431640625,
+        14.6611328125,
+        14.6376953125
+      ],
+      "load_mean": [
+        17.051186266447367,
+        15.985907689144737,
+        15.180111019736842
+      ],
+      "target_bytes": 5839831040,
+      "round": 1,
+      "pair": "sqlite-opt-1",
+      "run_id": 17,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 475,
+      "load_min": [
+        12.51416015625,
+        13.84375,
+        14.33837890625
+      ],
+      "load_max": [
+        22.53759765625,
+        17.75830078125,
+        15.873046875
+      ]
+    },
+    {
+      "started_at": "2026-10-06T14:00:57.819627+00:00",
+      "source_state": "fresh",
+      "variant": "sqlite-opt-1",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "config": [
+          "profile.dev.package.libsqlite3-sys.opt-level=1"
+        ]
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-18-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/18-0-sqlite-opt-1-cold.log",
+      "wall_seconds": 202.3538845370058,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "--config",
+            "profile.dev.package.libsqlite3-sys.opt-level=1",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 202.35369594901567,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        13.29052734375,
+        16.01904296875,
+        15.48388671875
+      ],
+      "load_mean": [
+        11.715611049107142,
+        14.6720289408867,
+        15.035204356527094
+      ],
+      "target_bytes": 5420044288,
+      "round": 1,
+      "pair": "sqlite-opt-1",
+      "run_id": 18,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 203,
+      "load_min": [
+        10.201171875,
+        13.7021484375,
+        14.6591796875
+      ],
+      "load_max": [
+        13.29052734375,
+        16.01904296875,
+        15.48388671875
+      ]
+    },
+    {
+      "started_at": "2026-10-06T14:04:21.192934+00:00",
+      "source_state": "fresh",
+      "variant": "baseline",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {},
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-19-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/19-0-baseline-cold.log",
+      "wall_seconds": 245.6955354939564,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 245.69537500099977,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        11.8701171875,
+        13.71142578125,
+        14.65185546875
+      ],
+      "load_mean": [
+        13.479867330411585,
+        13.916102959857724,
+        14.622763036712398
+      ],
+      "target_bytes": 6634983424,
+      "round": 1,
+      "pair": "share-generics",
+      "run_id": 19,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 246,
+      "load_min": [
+        10.25390625,
+        13.11474609375,
+        14.28076171875
+      ],
+      "load_max": [
+        16.28759765625,
+        14.53759765625,
+        14.7998046875
+      ]
+    },
+    {
+      "started_at": "2026-10-06T14:08:27.996119+00:00",
+      "source_state": "fresh",
+      "variant": "share-generics",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "rustflags": "-Zshare-generics=y"
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-20-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "-Zshare-generics=y",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/20-0-share-generics-cold.log",
+      "wall_seconds": 459.5482237889664,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 459.54800975398393,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        11.31103515625,
+        13.244140625,
+        14.3115234375
+      ],
+      "load_mean": [
+        17.020955757472827,
+        15.679240616508153,
+        15.149112601902173
+      ],
+      "target_bytes": 6600953856,
+      "round": 1,
+      "pair": "share-generics",
+      "run_id": 20,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 460,
+      "load_min": [
+        11.31103515625,
+        13.1923828125,
+        14.23486328125
+      ],
+      "load_max": [
+        21.39990234375,
+        16.9599609375,
+        15.66259765625
+      ]
+    },
+    {
+      "started_at": "2026-10-06T14:16:08.478500+00:00",
+      "source_state": "fresh",
+      "variant": "baseline",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {},
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-21-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/21-0-baseline-cold.log",
+      "wall_seconds": 234.5660460239742,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 234.56284008303192,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        14.79052734375,
+        16.01123046875,
+        15.47021484375
+      ],
+      "load_mean": [
+        15.16382770944149,
+        15.77130776263298,
+        15.44315782912234
+      ],
+      "target_bytes": 8282734592,
+      "round": 1,
+      "pair": "unpacked",
+      "run_id": 21,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 235,
+      "load_min": [
+        13.0673828125,
+        15.171875,
+        15.26416015625
+      ],
+      "load_max": [
+        18.6982421875,
+        16.43408203125,
+        15.63623046875
+      ]
+    },
+    {
+      "started_at": "2026-10-06T14:20:04.330553+00:00",
+      "source_state": "fresh",
+      "variant": "unpacked",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "config": [
+          "profile.dev.split-debuginfo=\"unpacked\""
+        ]
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-22-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/22-0-unpacked-cold.log",
+      "wall_seconds": 498.8127993850503,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "--config",
+            "profile.dev.split-debuginfo=\"unpacked\"",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 498.81262146902736,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        17.955078125,
+        16.17236328125,
+        15.60400390625
+      ],
+      "load_mean": [
+        13.593065036322646,
+        14.602748465681362,
+        15.046920990418336
+      ],
+      "target_bytes": 4535787520,
+      "round": 1,
+      "pair": "unpacked",
+      "run_id": 22,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 499,
+      "load_min": [
+        9.41064453125,
+        12.76025390625,
+        14.25830078125
+      ],
+      "load_max": [
+        18.6796875,
+        16.3525390625,
+        15.66552734375
+      ]
+    },
+    {
+      "started_at": "2026-10-06T14:28:23.874638+00:00",
+      "source_state": "fresh",
+      "variant": "baseline",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {},
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-23-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/23-0-baseline-cold.log",
+      "wall_seconds": 293.52561449300265,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 293.5254114490235,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        9.41064453125,
+        12.76025390625,
+        14.25830078125
+      ],
+      "load_mean": [
+        11.011798469387756,
+        12.208858152636054,
+        13.81338189572704
+      ],
+      "target_bytes": 5710041088,
+      "round": 1,
+      "pair": "clippy-first",
+      "run_id": 23,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 294,
+      "load_min": [
+        8.8037109375,
+        11.4638671875,
+        13.388671875
+      ],
+      "load_max": [
+        13.90087890625,
+        12.76025390625,
+        14.25830078125
+      ]
+    },
+    {
+      "started_at": "2026-10-06T14:33:18.088106+00:00",
+      "source_state": "fresh",
+      "variant": "clippy-first",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "gate_first": true
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-24-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/24-0-clippy-first-cold.log",
+      "wall_seconds": 396.821094739018,
+      "exit_code": 0,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 396.82087895000586,
+          "exit_code": 0
+        }
+      ],
+      "load_before": [
+        9.8642578125,
+        11.6630859375,
+        13.388671875
+      ],
+      "load_mean": [
+        13.463532647197733,
+        12.5468614707966,
+        13.40950315845403
+      ],
+      "target_bytes": 11345887232,
+      "round": 1,
+      "pair": "clippy-first",
+      "run_id": 24,
+      "outcome": "pass",
+      "load_sample_count": 397,
+      "load_min": [
+        9.8642578125,
+        11.6416015625,
+        13.1884765625
+      ],
+      "load_max": [
+        17.72802734375,
+        14.12548828125,
+        13.8046875
+      ]
+    },
+    {
+      "started_at": "2026-10-06T14:39:54.977102+00:00",
+      "source_state": "reuse-prime",
+      "variant": "clippy-first",
+      "scenario": "leaf-edit",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "gate_first": true
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-24-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": {
+        "log": "/tmp/build-bench-2751-final/logs/24-0-clippy-first-leaf-edit-warmup.log",
+        "wall_seconds": 0.5087287179776467,
+        "exit_code": 0,
+        "steps": [
+          {
+            "command": [
+              "taskset",
+              "-c",
+              "0,1,2,3",
+              "cargo",
+              "+nightly-2026-03-12",
+              "--config",
+              "profile.dev.package.\"*\".debug=0",
+              "test",
+              "--workspace",
+              "--locked",
+              "--no-run"
+            ],
+            "wall_seconds": 0.5086079589673318,
+            "exit_code": 0
+          }
+        ],
+        "load_before": [
+          15.4130859375,
+          14.00341796875,
+          13.771484375
+        ],
+        "load_mean": [
+          15.4130859375,
+          14.00341796875,
+          13.771484375
+        ],
+        "load_sample_count": 1
+      },
+      "log": "/tmp/build-bench-2751-final/logs/24-0-clippy-first-leaf-edit.log",
+      "wall_seconds": 16.34528958098963,
+      "exit_code": 0,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 16.34516278002411,
+          "exit_code": 0
+        }
+      ],
+      "load_before": [
+        15.4130859375,
+        14.00341796875,
+        13.771484375
+      ],
+      "load_mean": [
+        15.442095588235293,
+        14.047995174632353,
+        13.787827435661764
+      ],
+      "target_bytes": 11345928192,
+      "round": 1,
+      "pair": "clippy-first",
+      "run_id": 24,
+      "outcome": "pass",
+      "load_sample_count": 17,
+      "load_min": [
+        14.6669921875,
+        13.8876953125,
+        13.73583984375
+      ],
+      "load_max": [
+        17.79345703125,
+        14.5830078125,
+        13.9638671875
+      ]
+    },
+    {
+      "started_at": "2026-10-06T14:40:11.866577+00:00",
+      "source_state": "reuse-prime",
+      "variant": "clippy-first",
+      "scenario": "core-edit",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {
+        "gate_first": true
+      },
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-24-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": {
+        "log": "/tmp/build-bench-2751-final/logs/24-0-clippy-first-core-edit-warmup.log",
+        "wall_seconds": 0.30328929802635685,
+        "exit_code": 0,
+        "steps": [
+          {
+            "command": [
+              "taskset",
+              "-c",
+              "0,1,2,3",
+              "cargo",
+              "+nightly-2026-03-12",
+              "--config",
+              "profile.dev.package.\"*\".debug=0",
+              "test",
+              "--workspace",
+              "--locked",
+              "--no-run"
+            ],
+            "wall_seconds": 0.3031452659633942,
+            "exit_code": 0
+          }
+        ],
+        "load_before": [
+          17.79345703125,
+          14.5830078125,
+          13.9638671875
+        ],
+        "load_mean": [
+          17.79345703125,
+          14.5830078125,
+          13.9638671875
+        ],
+        "load_sample_count": 1
+      },
+      "log": "/tmp/build-bench-2751-final/logs/24-0-clippy-first-core-edit.log",
+      "wall_seconds": 203.6036630560411,
+      "exit_code": 101,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 203.60345605300972,
+          "exit_code": 101
+        }
+      ],
+      "load_before": [
+        17.79345703125,
+        14.5830078125,
+        13.9638671875
+      ],
+      "load_mean": [
+        14.552605124080882,
+        14.073984183517156,
+        13.821916168811274
+      ],
+      "target_bytes": 11345817600,
+      "round": 1,
+      "pair": "clippy-first",
+      "run_id": 24,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 204,
+      "load_min": [
+        12.86865234375,
+        13.69970703125,
+        13.69091796875
+      ],
+      "load_max": [
+        17.79345703125,
+        14.5830078125,
+        13.9638671875
+      ]
+    },
+    {
+      "started_at": "2026-10-06T14:43:37.239042+00:00",
+      "source_state": "fresh",
+      "variant": "baseline",
+      "scenario": "cold",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {},
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-27-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": null,
+      "log": "/tmp/build-bench-2751-final/logs/27-0-baseline-cold.log",
+      "wall_seconds": 312.1807246259996,
+      "exit_code": 0,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 312.1805229849997,
+          "exit_code": 0
+        }
+      ],
+      "load_before": [
+        15.2529296875,
+        14.3828125,
+        13.95361328125
+      ],
+      "load_mean": [
+        21.70966297673722,
+        17.903501272963258,
+        15.450997154552716
+      ],
+      "target_bytes": 11345399808,
+      "round": 1,
+      "pair": "check-gate",
+      "run_id": 27,
+      "outcome": "pass",
+      "load_sample_count": 313,
+      "load_min": [
+        15.2529296875,
+        14.3828125,
+        13.95361328125
+      ],
+      "load_max": [
+        28.720703125,
+        21.06103515625,
+        16.93603515625
+      ]
+    },
+    {
+      "started_at": "2026-10-06T14:48:49.603008+00:00",
+      "source_state": "reuse-prime",
+      "variant": "baseline",
+      "scenario": "leaf-edit",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {},
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-27-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": {
+        "log": "/tmp/build-bench-2751-final/logs/27-0-baseline-leaf-edit-warmup.log",
+        "wall_seconds": 2.5650792110245675,
+        "exit_code": 0,
+        "steps": [
+          {
+            "command": [
+              "taskset",
+              "-c",
+              "0,1,2,3",
+              "cargo",
+              "+nightly-2026-03-12",
+              "--config",
+              "profile.dev.package.\"*\".debug=0",
+              "test",
+              "--workspace",
+              "--locked",
+              "--no-run"
+            ],
+            "wall_seconds": 2.5648110440233722,
+            "exit_code": 0
+          }
+        ],
+        "load_before": [
+          28.720703125,
+          21.06103515625,
+          16.93603515625
+        ],
+        "load_mean": [
+          29.368815104166668,
+          21.23779296875,
+          17.000651041666668
+        ],
+        "load_sample_count": 3
+      },
+      "log": "/tmp/build-bench-2751-final/logs/27-0-baseline-leaf-edit.log",
+      "wall_seconds": 26.805502302013338,
+      "exit_code": 0,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 26.805240485991817,
+          "exit_code": 0
+        }
+      ],
+      "load_before": [
+        30.6650390625,
+        21.59130859375,
+        17.1298828125
+      ],
+      "load_mean": [
+        34.917209201388886,
+        22.873914930555557,
+        17.60380497685185
+      ],
+      "target_bytes": 11345551360,
+      "round": 1,
+      "pair": "check-gate",
+      "run_id": 27,
+      "outcome": "pass",
+      "load_sample_count": 27,
+      "load_min": [
+        30.6650390625,
+        21.59130859375,
+        17.1298828125
+      ],
+      "load_max": [
+        38.58447265625,
+        24.2177734375,
+        18.1201171875
+      ]
+    },
+    {
+      "started_at": "2026-10-06T14:49:19.153273+00:00",
+      "source_state": "reuse-prime",
+      "variant": "baseline",
+      "scenario": "core-edit",
+      "profile": "limited",
+      "worker": 0,
+      "variant_config": {},
+      "env": {
+        "CARGO_BUILD_JOBS": "4",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_PROFILE_DEV_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/tmp/flotilla-build-bench-iiayb_81/run-27-worker-0/target",
+        "FLOTILLA_LINKER_THREADS": "8",
+        "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oStrictHostKeyChecking=yes -oConnectTimeout=5",
+        "GIT_TERMINAL_PROMPT": "0",
+        "RUSTC_WORKSPACE_WRAPPER": "/usr/local/bin/flotilla-rustc-wrapper",
+        "RUSTC_WRAPPER": null,
+        "RUSTFLAGS": "",
+        "RUSTUP_TOOLCHAIN": null
+      },
+      "warmup": {
+        "log": "/tmp/build-bench-2751-final/logs/27-0-baseline-core-edit-warmup.log",
+        "wall_seconds": 1.1653584159794264,
+        "exit_code": 0,
+        "steps": [
+          {
+            "command": [
+              "taskset",
+              "-c",
+              "0,1,2,3",
+              "cargo",
+              "+nightly-2026-03-12",
+              "--config",
+              "profile.dev.package.\"*\".debug=0",
+              "test",
+              "--workspace",
+              "--locked",
+              "--no-run"
+            ],
+            "wall_seconds": 1.1648902089800686,
+            "exit_code": 0
+          }
+        ],
+        "load_before": [
+          38.58447265625,
+          24.2177734375,
+          18.1201171875
+        ],
+        "load_mean": [
+          38.58447265625,
+          24.2177734375,
+          18.1201171875
+        ],
+        "load_sample_count": 2
+      },
+      "log": "/tmp/build-bench-2751-final/logs/27-0-baseline-core-edit.log",
+      "wall_seconds": 174.06868793303147,
+      "exit_code": -2,
+      "steps": [
+        {
+          "command": [
+            "taskset",
+            "-c",
+            "0,1,2,3",
+            "cargo",
+            "+nightly-2026-03-12",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+            "test",
+            "--workspace",
+            "--locked",
+            "--no-run"
+          ],
+          "wall_seconds": 174.0685056479997,
+          "exit_code": -2
+        }
+      ],
+      "load_before": [
+        38.58447265625,
+        24.2177734375,
+        18.1201171875
+      ],
+      "load_mean": [
+        36.65415736607143,
+        27.023895089285713,
+        19.690968191964284
+      ],
+      "target_bytes": 11538739200,
+      "round": 1,
+      "pair": "check-gate",
+      "run_id": 27,
+      "outcome": "OOM/SIGKILL",
+      "load_sample_count": 175,
+      "load_min": [
+        30.3994140625,
+        24.2177734375,
+        18.1201171875
+      ],
+      "load_max": [
+        41.98779296875,
+        29.73876953125,
+        21.23828125
+      ]
+    }
+  ]
+}
