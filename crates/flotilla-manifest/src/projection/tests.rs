@@ -2880,6 +2880,7 @@ fn running_governor_survives_two_abandoned_namesakes(tc: hegel::TestCase) {
             assert_eq!(text(standing, KEY_STATUS_STATE), "active");
             assert_eq!(text(standing, KEY_CONVOY_PHASE), "active");
             assert_eq!(standing.set[KEY_ROLE_CURRENT_ATTEMPT].value, MetadataValue::EntityRefs(vec![live_entity]));
+            // History edges intentionally sort by generation, independent of input order.
             assert_eq!(
                 standing.set[KEY_ROLE_ATTEMPTS].value,
                 MetadataValue::EntityRefs(["old-a", "old-b", "live"].map(|name| entity::convoy("dev", name, "kiwi")).to_vec())
