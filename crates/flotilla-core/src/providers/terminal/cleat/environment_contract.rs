@@ -58,7 +58,7 @@ impl Harness {
                 let harness = Self { runner, fake: None, binary, root, daemon_pids: Mutex::new(Vec::new()) };
                 let version = harness.raw(&["version", "--json"]).await.expect("real version");
                 let version: serde_json::Value = serde_json::from_str(&version).expect("version JSON");
-                let pins = include_str!("../../../../../../ci/cleat-environment/revisions.sh");
+                let pins = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../ci/cleat-environment/revisions.sh"));
                 let prefix = if supports_clear { "CLEAT_NEW_REVISION=" } else { "CLEAT_OLD_REVISION=" };
                 let revision = pins.lines().find_map(|line| line.strip_prefix(prefix)).expect("revision pin");
                 assert_eq!(version["client"]["git_sha"].as_str(), Some(revision), "wrong binary source revision");
@@ -136,6 +136,13 @@ impl Drop for Harness {
     fn drop(&mut self) {
         // Retain the discovered PIDs so removal of metadata cannot turn cleanup into a no-op.
         for &pid in self.daemon_pids.lock().expect("daemon PIDs").iter() {
+            // A daemon may already have exited. Avoid signalling a reused PID
+            // unless its current command still identifies this pinned daemon.
+            let Ok(command) = std::fs::read(format!("/proc/{pid}/cmdline")) else { continue };
+            let mut args = command.split(|byte| *byte == 0);
+            if args.next() != Some(self.binary.as_bytes()) || !args.any(|arg| arg == b"serve") {
+                continue;
+            }
             // SAFETY: positive PIDs were read from this fixture's private runtime
             // after a real launch. kill takes scalar arguments, with no pointer access.
             let result = unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -303,6 +310,20 @@ mod fake_launch_environment_contract {
 mod real_launch_environment_contract {
     use super::*;
     launch_cases!(true);
+}
+
+// A retained PID can outlive its daemon. Cleanup must leave another process alone.
+#[tokio::test]
+async fn cleanup_does_not_signal_an_unrelated_process() {
+    let mut child = tokio::process::Command::new("/bin/sleep").arg("30").kill_on_drop(true).spawn().expect("unrelated process");
+    let harness = Harness::new(true, Scenario::HostBaseline, false).await;
+    harness.daemon_pids.lock().expect("daemon PIDs").push(child.id().expect("child PID") as i32);
+    drop(harness);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), child.wait()).await.is_err(),
+        "cleanup signalled an unrelated process"
+    );
+    child.kill().await.expect("stop unrelated fixture process");
 }
 
 // Inventory uses the controlled client envelope even when no discovery facts exist.

@@ -19,6 +19,9 @@ FLOTILLA_TEST_CLEAT_NEW="$scratch/bin/new/cleat" \
   cargo test -p flotilla-core --locked --lib --features cleat-environment-contract launch_environment_contract -- --nocapture
 ```
 
+The build checks out both pins in the caller's scratch clone and leaves it detached
+at the new revision. Use a disposable clone as shown above.
+
 The build uses each source revision's Rust, Zig and Ghostty pins, verifies Zig's
 checksum, and records binary revision/version/hash. Each scenario uses a private
 short runtime directory beneath `/tmp`, subprocess-local environment pollution,
