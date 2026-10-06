@@ -1,0 +1,2 @@
+# Property tests only; the benchmark CLI uses the Python standard library.
+hypothesis==6.140.2
