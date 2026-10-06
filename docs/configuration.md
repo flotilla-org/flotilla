@@ -541,3 +541,8 @@ remote account's Flotilla executable. Attach consumes `hostname` and optional
 viewer's native OpenSSH config under that hostname/alias. `hosts.toml` has no
 port, identity-file or jump-host fields. Viewer attaches do not use daemon-side
 SSH multiplex settings.
+
+For a remote endpoint, `flotilla --json attach --host kiwi <reference>` resolves
+and prints the **viewer-side SSH plan**, rather than the daemon-relative
+terminal-pool command. It does not start the attachment. With a local daemon,
+JSON output retains the daemon-relative plan.
