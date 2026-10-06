@@ -9976,6 +9976,7 @@ async fn message_routing_refuses_unknown_homes_and_finished_convoys() {
     let mut status = status;
     status.phase = ConvoyPhase::Active;
     status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+        cascade: None,
         exit: None,
         turn_delivery: Default::default(),
         stall_nudges: Default::default(),
