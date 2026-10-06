@@ -71,7 +71,10 @@ impl StatusPatch<DispatchHoldStatus> for DispatchHoldStatusPatch {
     }
 }
 
-/// Successful deployment receipt, authored by the installation's deploy driver.
+/// Successful deployment receipt, authored by the installation's deploy driver
+/// or an operator authorized to certify its deployed state. Resource writers and
+/// their replicated origins are trusted; this kind adds no separate signature or
+/// Project boundary. Each receipt certifies an issue at an installation.
 /// #2787 can publish this same evidence from its installation-state observer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchDeployment;

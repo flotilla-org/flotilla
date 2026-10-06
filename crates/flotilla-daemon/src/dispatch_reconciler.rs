@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -8,10 +11,10 @@ use flotilla_protocol::{
     DispatchIssueFacts, Issue, IssueRef, IssueState, QueryScope,
 };
 use flotilla_resources::{
-    apply_status_patch, content_hash, pinned_workflow_ref, Clock, Convoy, DispatchDeployment, DispatchHold, DispatchHoldStatusPatch,
-    DispatchObservation, DispatchObservationSpec, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, HoldClearWhen, InputMeta,
-    Project, ProjectStatusPatch, ResolvedIssueSourceBinding, ResourceBackend, ResourceError, ResourceObject, SystemClock, WorkflowTemplate,
-    DISPATCH_RECONCILER_PROVENANCE,
+    apply_status_patch, content_hash, pinned_workflow_ref, Clock, Convoy, ConvoyPhase, DispatchDeployment, DispatchHold,
+    DispatchHoldStatusPatch, DispatchObservation, DispatchObservationSpec, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry,
+    HoldClearWhen, InputMeta, Project, ProjectStatusPatch, ResolvedIssueSourceBinding, ResourceBackend, ResourceError, ResourceObject,
+    SystemClock, WorkflowTemplate, DISPATCH_RECONCILER_PROVENANCE,
 };
 use tracing::{info, warn};
 
@@ -110,14 +113,11 @@ impl DispatchReconciler {
                 }
                 Err(error) => {
                     warn!(project = %project.metadata.name, %error, "dispatch reconciliation failed for project; continuing pass");
-                    self.replace_queue(&project, Vec::new(), None).await?;
-                    apply_status_patch(
-                        &self.backend.clone().using::<Project>(&self.namespace),
-                        &project.metadata.name,
-                        &ProjectStatusPatch::DispatchQueueError { message: Some(error) },
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
+                    // Retain readiness history and its attention clock while readers
+                    // mark this scope unavailable; recovery must not reset aging.
+                    if let Err(write_error) = self.set_queue_error(&project, Some(error)).await {
+                        warn!(project = %project.metadata.name, %write_error, "could not publish dispatch source error; continuing pass");
+                    }
                     total.project_errors += 1;
                 }
             }
@@ -125,18 +125,24 @@ impl DispatchReconciler {
         Ok(total)
     }
 
+    async fn set_queue_error(&self, project: &ResourceObject<Project>, message: Option<String>) -> Result<(), String> {
+        if project.status.as_ref().and_then(|status| status.dispatch_queue_error.as_ref()) == message.as_ref() {
+            return Ok(());
+        }
+        apply_status_patch(
+            &self.backend.clone().using::<Project>(&self.namespace),
+            &project.metadata.name,
+            &ProjectStatusPatch::DispatchQueueError { message },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
     async fn reconcile_project(&self, project: &ResourceObject<Project>, now: DateTime<Utc>) -> Result<ReconcilePass, String> {
         let Some(policy) = project.spec.dispatch_policy.as_ref().filter(|policy| policy.enabled) else {
             self.replace_queue(project, Vec::new(), None).await?;
-            if project.status.as_ref().is_some_and(|status| status.dispatch_queue_error.is_some()) {
-                apply_status_patch(
-                    &self.backend.clone().using::<Project>(&self.namespace),
-                    &project.metadata.name,
-                    &ProjectStatusPatch::DispatchQueueError { message: None },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            }
+            self.set_queue_error(project, None).await?;
             return Ok(ReconcilePass::default());
         };
 
@@ -150,7 +156,7 @@ impl DispatchReconciler {
             .iter()
             .filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
             .flat_map(|convoy| convoy.spec.issues.iter().map(|issue| issue.reference.clone()))
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<HashSet<_>>();
         let previous_by_issue = previous_queue.iter().map(|entry| (entry.issue.clone(), entry)).collect::<BTreeMap<_, _>>();
 
         let mut ready = self.issues.ready_issues(project).await?;
@@ -238,7 +244,7 @@ impl DispatchReconciler {
         project: &ResourceObject<Project>,
         convoys: &[ResourceObject<Convoy>],
         now: DateTime<Utc>,
-    ) -> Result<std::collections::HashSet<IssueRef>, String> {
+    ) -> Result<HashSet<IssueRef>, String> {
         let holds =
             self.backend.definitions::<DispatchHold>(&project.metadata.namespace).list().await.map_err(|error| error.to_string())?;
         let deployments = self
@@ -248,7 +254,7 @@ impl DispatchReconciler {
             .list()
             .await
             .map_err(|error| error.to_string())?;
-        let mut active = std::collections::HashSet::new();
+        let mut active = HashSet::new();
         for hold in holds {
             if hold.spec.project_ref != project.metadata.name || hold.status.as_ref().is_some_and(|status| status.cleared_at.is_some()) {
                 continue;
@@ -256,7 +262,7 @@ impl DispatchReconciler {
             let cleared = match &hold.spec.clear_when {
                 HoldClearWhen::Landed => {
                     let convoy_landed = convoys.iter().any(|convoy| {
-                        convoy.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ConvoyPhase::Landed)
+                        convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed)
                             && convoy.spec.issues.iter().any(|issue| issue.reference == hold.spec.land_after)
                     });
                     convoy_landed || self.issues.dispatch_facts(&hold.spec.land_after).await.map(|facts| facts.landed).unwrap_or(false)
@@ -269,10 +275,14 @@ impl DispatchReconciler {
                 // Clear only on the authoring store; replicas can project the satisfied
                 // relationship immediately and receive its durable latch on replication.
                 let local = self.backend.clone().using::<DispatchHold>(&project.metadata.namespace);
-                if local.get(&hold.metadata.name).await.is_ok() {
-                    apply_status_patch(&local, &hold.metadata.name, &DispatchHoldStatusPatch::Clear { at: now })
-                        .await
-                        .map_err(|error| error.to_string())?;
+                match local.get(&hold.metadata.name).await {
+                    Ok(_) => {
+                        apply_status_patch(&local, &hold.metadata.name, &DispatchHoldStatusPatch::Clear { at: now })
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Err(ResourceError::NotFound { .. }) => {}
+                    Err(error) => return Err(error.to_string()),
                 }
             } else {
                 active.insert(hold.spec.issue);
@@ -418,8 +428,8 @@ mod tests {
         by_ref: Mutex<HashMap<IssueRef, Issue>>,
         ready_calls: Mutex<usize>,
         facts: Mutex<HashMap<IssueRef, DispatchIssueFacts>>,
-        failing_projects: Mutex<std::collections::HashSet<String>>,
-        failing_refs: Mutex<std::collections::HashSet<IssueRef>>,
+        failing_projects: Mutex<HashSet<String>>,
+        failing_refs: Mutex<HashSet<IssueRef>>,
     }
 
     #[async_trait]
@@ -799,6 +809,33 @@ mod tests {
 
         let second = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project");
         assert_eq!(second.metadata.resource_version, first.metadata.resource_version);
+    }
+
+    #[tokio::test]
+    async fn source_outage_preserves_aging_and_deduplicates_errors_then_recovers() {
+        let (backend, issues, clock, reconciler) =
+            harness(vec![issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open)], vec![], policy(60)).await;
+        let projects = backend.using::<Project>(NAMESPACE);
+        reconciler.reconcile_once().await.expect("initial pass");
+        clock.advance(Duration::seconds(120));
+        reconciler.reconcile_once().await.expect("attention pass");
+        let before = projects.get("widgets").await.expect("project").status.expect("status");
+        issues.failing_projects.lock().expect("failures").insert("widgets".into());
+        assert_eq!(reconciler.reconcile_once().await.expect("outage").project_errors, 1);
+        let failed = projects.get("widgets").await.expect("project");
+        let status = failed.status.as_ref().expect("status");
+        assert_eq!(status.dispatch_queue, before.dispatch_queue);
+        assert_eq!(status.dispatch_queue_attention, before.dispatch_queue_attention);
+        assert!(status.dispatch_queue_error.is_some());
+        clock.advance(Duration::seconds(120));
+        reconciler.reconcile_once().await.expect("persistent outage");
+        assert_eq!(projects.get("widgets").await.expect("project").metadata.resource_version, failed.metadata.resource_version);
+        issues.failing_projects.lock().expect("failures").clear();
+        reconciler.reconcile_once().await.expect("recovery");
+        let recovered = projects.get("widgets").await.expect("project").status.expect("status");
+        assert_eq!(recovered.dispatch_queue, before.dispatch_queue);
+        assert_eq!(recovered.dispatch_queue_attention, before.dispatch_queue_attention);
+        assert!(recovered.dispatch_queue_error.is_none());
     }
 
     #[tokio::test]

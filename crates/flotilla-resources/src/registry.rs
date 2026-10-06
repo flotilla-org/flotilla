@@ -200,44 +200,50 @@ const fn kind<T: Resource>(resource: RegisteredResource, aliases: &'static [&'st
     }
 }
 
+macro_rules! poll_typed_resource {
+    ($future:expr) => {
+        Box::pin(async { Box::pin($future).await }).await
+    };
+}
+
 // Isolate each typed future’s construction and poll frame. Resource additions
 // must not accumulate large debug frames on cross-host request stacks.
 macro_rules! dispatch_resource_kind {
     ($resource:expr, $body:ident($($arg:expr),*).await) => {
         match $resource {
-            RegisteredResource::Artifact => Box::pin(async { Box::pin($body::<Artifact>($($arg),*)).await }).await,
-            RegisteredResource::ChangeRequest => Box::pin(async { Box::pin($body::<ChangeRequest>($($arg),*)).await }).await,
-            RegisteredResource::Issue => Box::pin(async { Box::pin($body::<Issue>($($arg),*)).await }).await,
-            RegisteredResource::Checkout => Box::pin(async { Box::pin($body::<Checkout>($($arg),*)).await }).await,
-            RegisteredResource::Clone => Box::pin(async { Box::pin($body::<CloneResource>($($arg),*)).await }).await,
-            RegisteredResource::Convoy => Box::pin(async { Box::pin($body::<Convoy>($($arg),*)).await }).await,
-            RegisteredResource::ConvoyEnsure => Box::pin(async { Box::pin($body::<ConvoyEnsure>($($arg),*)).await }).await,
-            RegisteredResource::CredentialGrant => Box::pin(async { Box::pin($body::<CredentialGrant>($($arg),*)).await }).await,
-            RegisteredResource::CredentialSpec => Box::pin(async { Box::pin($body::<CredentialSpec>($($arg),*)).await }).await,
-            RegisteredResource::CrewDefaults => Box::pin(async { Box::pin($body::<CrewDefaults>($($arg),*)).await }).await,
-            RegisteredResource::CrewImageBaseline => Box::pin(async { Box::pin($body::<CrewImageBaseline>($($arg),*)).await }).await,
-            RegisteredResource::ImageBuild => Box::pin(async { Box::pin($body::<ImageBuild>($($arg),*)).await }).await,
-            RegisteredResource::ImageLayer => Box::pin(async { Box::pin($body::<ImageLayer>($($arg),*)).await }).await,
-            RegisteredResource::Demand => Box::pin(async { Box::pin($body::<Demand>($($arg),*)).await }).await,
-            RegisteredResource::DispatchHold => Box::pin(async { Box::pin($body::<DispatchHold>($($arg),*)).await }).await,
-            RegisteredResource::DispatchDeployment => Box::pin(async { Box::pin($body::<DispatchDeployment>($($arg),*)).await }).await,
-            RegisteredResource::DispatchObservation => Box::pin(async { Box::pin($body::<DispatchObservation>($($arg),*)).await }).await,
-            RegisteredResource::Environment => Box::pin(async { Box::pin($body::<Environment>($($arg),*)).await }).await,
-            RegisteredResource::Event => Box::pin(async { Box::pin($body::<Event>($($arg),*)).await }).await,
-            RegisteredResource::FleetDesignation => Box::pin(async { Box::pin($body::<FleetDesignation>($($arg),*)).await }).await,
-            RegisteredResource::Forge => Box::pin(async { Box::pin($body::<Forge>($($arg),*)).await }).await,
-            RegisteredResource::ManifestRoot => Box::pin(async { Box::pin($body::<ManifestRoot>($($arg),*)).await }).await,
-            RegisteredResource::Host => Box::pin(async { Box::pin($body::<Host>($($arg),*)).await }).await,
-            RegisteredResource::PlacementPolicy => Box::pin(async { Box::pin($body::<PlacementPolicy>($($arg),*)).await }).await,
-            RegisteredResource::FulfilmentKind => Box::pin(async { Box::pin($body::<FulfilmentKind>($($arg),*)).await }).await,
-            RegisteredResource::Presentation => Box::pin(async { Box::pin($body::<Presentation>($($arg),*)).await }).await,
-            RegisteredResource::Project => Box::pin(async { Box::pin($body::<Project>($($arg),*)).await }).await,
-            RegisteredResource::Regard => Box::pin(async { Box::pin($body::<Regard>($($arg),*)).await }).await,
-            RegisteredResource::Repository => Box::pin(async { Box::pin($body::<Repository>($($arg),*)).await }).await,
-            RegisteredResource::TerminalSession => Box::pin(async { Box::pin($body::<TerminalSession>($($arg),*)).await }).await,
-            RegisteredResource::Usage => Box::pin(async { Box::pin($body::<Usage>($($arg),*)).await }).await,
-            RegisteredResource::Vessel => Box::pin(async { Box::pin($body::<Vessel>($($arg),*)).await }).await,
-            RegisteredResource::WorkflowTemplate => Box::pin(async { Box::pin($body::<WorkflowTemplate>($($arg),*)).await }).await,
+            RegisteredResource::Artifact => poll_typed_resource!($body::<Artifact>($($arg),*)),
+            RegisteredResource::ChangeRequest => poll_typed_resource!($body::<ChangeRequest>($($arg),*)),
+            RegisteredResource::Issue => poll_typed_resource!($body::<Issue>($($arg),*)),
+            RegisteredResource::Checkout => poll_typed_resource!($body::<Checkout>($($arg),*)),
+            RegisteredResource::Clone => poll_typed_resource!($body::<CloneResource>($($arg),*)),
+            RegisteredResource::Convoy => poll_typed_resource!($body::<Convoy>($($arg),*)),
+            RegisteredResource::ConvoyEnsure => poll_typed_resource!($body::<ConvoyEnsure>($($arg),*)),
+            RegisteredResource::CredentialGrant => poll_typed_resource!($body::<CredentialGrant>($($arg),*)),
+            RegisteredResource::CredentialSpec => poll_typed_resource!($body::<CredentialSpec>($($arg),*)),
+            RegisteredResource::CrewDefaults => poll_typed_resource!($body::<CrewDefaults>($($arg),*)),
+            RegisteredResource::CrewImageBaseline => poll_typed_resource!($body::<CrewImageBaseline>($($arg),*)),
+            RegisteredResource::ImageBuild => poll_typed_resource!($body::<ImageBuild>($($arg),*)),
+            RegisteredResource::ImageLayer => poll_typed_resource!($body::<ImageLayer>($($arg),*)),
+            RegisteredResource::Demand => poll_typed_resource!($body::<Demand>($($arg),*)),
+            RegisteredResource::DispatchHold => poll_typed_resource!($body::<DispatchHold>($($arg),*)),
+            RegisteredResource::DispatchDeployment => poll_typed_resource!($body::<DispatchDeployment>($($arg),*)),
+            RegisteredResource::DispatchObservation => poll_typed_resource!($body::<DispatchObservation>($($arg),*)),
+            RegisteredResource::Environment => poll_typed_resource!($body::<Environment>($($arg),*)),
+            RegisteredResource::Event => poll_typed_resource!($body::<Event>($($arg),*)),
+            RegisteredResource::FleetDesignation => poll_typed_resource!($body::<FleetDesignation>($($arg),*)),
+            RegisteredResource::Forge => poll_typed_resource!($body::<Forge>($($arg),*)),
+            RegisteredResource::ManifestRoot => poll_typed_resource!($body::<ManifestRoot>($($arg),*)),
+            RegisteredResource::Host => poll_typed_resource!($body::<Host>($($arg),*)),
+            RegisteredResource::PlacementPolicy => poll_typed_resource!($body::<PlacementPolicy>($($arg),*)),
+            RegisteredResource::FulfilmentKind => poll_typed_resource!($body::<FulfilmentKind>($($arg),*)),
+            RegisteredResource::Presentation => poll_typed_resource!($body::<Presentation>($($arg),*)),
+            RegisteredResource::Project => poll_typed_resource!($body::<Project>($($arg),*)),
+            RegisteredResource::Regard => poll_typed_resource!($body::<Regard>($($arg),*)),
+            RegisteredResource::Repository => poll_typed_resource!($body::<Repository>($($arg),*)),
+            RegisteredResource::TerminalSession => poll_typed_resource!($body::<TerminalSession>($($arg),*)),
+            RegisteredResource::Usage => poll_typed_resource!($body::<Usage>($($arg),*)),
+            RegisteredResource::Vessel => poll_typed_resource!($body::<Vessel>($($arg),*)),
+            RegisteredResource::WorkflowTemplate => poll_typed_resource!($body::<WorkflowTemplate>($($arg),*)),
         }
     };
     ($resource:expr, $body:ident()) => {

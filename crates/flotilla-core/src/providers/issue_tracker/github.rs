@@ -14,6 +14,7 @@ use crate::providers::{
 };
 
 const INCREMENTAL_PAGE_SIZE: usize = 100;
+const DISPATCH_BOARD_LIMIT: usize = 10_000;
 
 pub struct GitHubIssueProvider {
     api: Arc<dyn GhApi>,
@@ -157,14 +158,14 @@ impl super::IssueProvider for GitHubIssueProvider {
                 "--state",
                 "all",
                 "--limit",
-                "10000",
+                &DISPATCH_BOARD_LIMIT.to_string(),
                 "--json",
                 "number,title,state,url,updatedAt,closedAt,labels,blockedBy,closedByPullRequestsReferences"
             ],
             &self.host_root
         )?;
         let issues: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
-        if issues.len() >= 10000 {
+        if issues.len() >= DISPATCH_BOARD_LIMIT {
             return Err("board issue window is truncated".into());
         }
         let issues = issues
@@ -231,14 +232,14 @@ impl super::IssueProvider for GitHubIssueProvider {
                 "--state",
                 "all",
                 "--limit",
-                "10000",
+                &DISPATCH_BOARD_LIMIT.to_string(),
                 "--json",
                 "number,state,url,mergedAt,mergeStateStatus,statusCheckRollup"
             ],
             &self.host_root
         )?;
         let prs: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
-        if prs.len() >= 10000 {
+        if prs.len() >= DISPATCH_BOARD_LIMIT {
             return Err("board PR window is truncated".into());
         }
         let pull_requests = prs

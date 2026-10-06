@@ -1928,6 +1928,7 @@ impl Aggregator {
         let rows = self
             .projects
             .values()
+            .filter(|project| project.status.as_ref().is_none_or(|status| status.dispatch_queue_error.is_none()))
             .flat_map(|project| {
                 let attention = project.status.as_ref().is_some_and(|status| status.dispatch_queue_attention.is_some());
                 project.status.as_ref().into_iter().flat_map(|status| status.dispatch_queue.iter()).map(move |entry| {
