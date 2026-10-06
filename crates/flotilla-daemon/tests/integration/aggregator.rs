@@ -674,28 +674,43 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         .await
         .expect("mark terminal session running");
 
+    // Resource rows publish before terminal capability I/O finishes. Wait for
+    // the enrichment event, then read a full snapshot: a delta only carries
+    // changed recipes and need not repeat the unresolvable session.
     let rows = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            match rx.recv().await {
+            let ready = match rx.recv().await {
                 Ok(DaemonEvent::ResultSet(result_set)) if result_set.query() == (QueryId::Independents { scope: None }) => {
-                    let rows = independent_rows(&result_set);
-                    if !rows.is_empty() {
-                        return rows.to_vec();
-                    }
+                    independent_rows(&result_set).iter().any(|row| row.attach.as_deref() == Some("terminal-yeoman"))
                 }
-                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == (QueryId::Independents { scope: None }) => {
-                    let rows = delta.changes.as_independents().expect("independent rows");
-                    if !rows.is_empty() {
-                        return rows.to_vec();
-                    }
-                }
-                Ok(_) => continue,
+                Ok(DaemonEvent::ResultDelta(delta)) if delta.query() == (QueryId::Independents { scope: None }) => delta
+                    .changes
+                    .as_independents()
+                    .expect("independent rows")
+                    .iter()
+                    .any(|row| row.attach.as_deref() == Some("terminal-yeoman")),
+                Ok(_) => false,
                 Err(err) => panic!("broadcast receive error: {err}"),
+            };
+            if ready {
+                let replay = daemon
+                    .subscribe_queries(uuid::Uuid::new_v4(), &[QueryCursor { query: QueryId::Independents { scope: None }, since: None }])
+                    .await
+                    .expect("read enriched independents");
+                return replay
+                    .iter()
+                    .find_map(|event| match event {
+                        DaemonEvent::ResultSet(set) if set.query() == (QueryId::Independents { scope: None }) => {
+                            Some(independent_rows(set).to_vec())
+                        }
+                        _ => None,
+                    })
+                    .expect("full independents snapshot");
             }
         }
     })
     .await
-    .expect("timed out waiting for independents result rows");
+    .expect("timed out waiting for independent attach capability");
 
     assert!(
         rows.iter().all(|row| row.name != "terminal-convoy-coder"),
