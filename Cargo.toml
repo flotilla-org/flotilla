@@ -80,6 +80,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 flotilla-daemon = { path = "crates/flotilla-daemon" }
 
 [dev-dependencies]
+hegeltest = "=0.48.1"
 async-trait = { workspace = true }
 tempfile = "3"
 flotilla-core = { path = "crates/flotilla-core", features = ["test-support"] }
@@ -94,3 +95,6 @@ absolute_paths = "warn"
 
 [lints]
 workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+flotilla-daemon = { path = "crates/flotilla-daemon", features = ["test-support"] }
