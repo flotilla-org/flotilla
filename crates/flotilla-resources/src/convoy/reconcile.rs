@@ -445,7 +445,7 @@ fn evaluate_declared_completion_condition(
                 let discovery_expired =
                     now.signed_duration_since(convoy.metadata.creation_timestamp).to_std().is_ok_and(|age| age >= discovery_grace);
                 if checkouts_expected && !discovery_complete && discovery_expired {
-                    tracing::info!(
+                    tracing::debug!(
                         convoy = %convoy.metadata.name,
                         discovery_grace_seconds = discovery_grace.as_secs(),
                         discovery_failed = convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_error.is_some()),
