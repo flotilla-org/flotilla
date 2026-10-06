@@ -211,6 +211,15 @@ impl AttachCapabilityResolver for InProcessDaemon {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+enum ConvoyProjectionDelivery {
+    #[default]
+    Immediate,
+    Coalesced {
+        deadline: Option<Instant>,
+    },
+}
+
 #[derive(bon::Builder)]
 pub struct Aggregator {
     state: AggregatorProjectionState,
@@ -248,6 +257,8 @@ pub struct Aggregator {
     #[builder(skip)]
     checkout_replicas: HashMap<(String, String, flotilla_protocol::NodeId), ReadResourceObject<Checkout>>,
     bootstrapping: bool,
+    #[builder(skip)]
+    projection_delivery: ConvoyProjectionDelivery,
     emitted_queries: HashSet<QueryId>,
     #[builder(skip)]
     attach_resolver: Option<Arc<dyn AttachCapabilityResolver>>,
@@ -357,6 +368,7 @@ impl Aggregator {
             readiness_clones: BTreeMap::new(),
             checkout_replicas: HashMap::new(),
             bootstrapping: false,
+            projection_delivery: ConvoyProjectionDelivery::Immediate,
             emitted_queries: HashSet::new(),
             attach_resolver: None,
             attach_refresh_tasks: tokio::task::JoinSet::new(),
@@ -523,9 +535,13 @@ impl Aggregator {
         self.refresh_origin_hosts().await;
         self.rebuild_local_projection().await;
         self.bootstrapping = false;
+        self.projection_delivery = ConvoyProjectionDelivery::Coalesced { deadline: None };
         self.emitted_queries.extend(QueryId::ALWAYS_MATERIALIZED.iter().cloned());
         self.event_sink.emit(DaemonEvent::ResultSet(Box::new(self.state.result_set().await)));
         self.event_sink.emit(DaemonEvent::ResultSet(Box::new(self.state.independents_result_set(&None).await)));
+        // Publish/bootstrap scoped demand now, rather than charging the first
+        // unrelated resource change for every existing project scope.
+        self.emit_scoped_convoy_result_sets().await;
         self.emit_awareness_result_sets().await;
 
         let mut change_request_sweep =
@@ -549,7 +565,23 @@ impl Aggregator {
                 }
             };
             tokio::pin!(attention_expiry);
+            let projection_deadline = match self.projection_delivery {
+                ConvoyProjectionDelivery::Immediate => None,
+                ConvoyProjectionDelivery::Coalesced { deadline } => deadline,
+            };
+            let projection_flush = async move {
+                match projection_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => futures::future::pending().await,
+                }
+            };
+            tokio::pin!(projection_flush);
             tokio::select! {
+                () = &mut projection_flush => {
+                    self.projection_delivery = ConvoyProjectionDelivery::Coalesced { deadline: None };
+                    self.flush_local_projection().await;
+                    tokio::task::yield_now().await;
+                }
                 _ = change_request_sweep.tick() => {
                     self.sweep_active_change_request_subjects();
                 }
@@ -1539,6 +1571,15 @@ impl Aggregator {
     }
 
     async fn rebuild_local_projection(&mut self) {
+        if let ConvoyProjectionDelivery::Coalesced { deadline } = &mut self.projection_delivery {
+            // Keep the first deadline: a continuous stream cannot postpone delivery.
+            deadline.get_or_insert_with(|| Instant::now() + Duration::from_millis(25));
+            return;
+        }
+        self.flush_local_projection().await;
+    }
+
+    async fn flush_local_projection(&mut self) {
         self.refresh_origin_hosts().await;
         // A deletion timestamp begins finalizer-driven reaping; it does not
         // mean the Convoy or its child resources have left the store yet.
@@ -2054,13 +2095,11 @@ impl Aggregator {
     }
 
     async fn emit_scoped_convoy_result_sets(&self) {
-        let fleet_rows = self.state.result_set().await.rows.len();
         let subscribed_scopes =
             self.state.subscribed_queries().into_iter().filter(|query| matches!(query, QueryId::Convoys { scope: Some(_) })).count();
         let result_sets = self.state.changed_scoped_convoy_result_sets().await;
         let scoped_row_counts = result_sets.iter().map(|result_set| (result_set.query(), result_set.rows.len())).collect::<Vec<_>>();
         debug!(
-            fleet_rows,
             subscribed_scopes,
             changed_scopes = result_sets.len(),
             scoped_row_counts = ?scoped_row_counts,
@@ -5002,6 +5041,67 @@ mod tests {
         assert!(rows.iter().all(|row| row.attach.as_deref() == Some(row.name.as_str())));
     }
 
+    // #2775: a burst is one delivery boundary even with many presentation clients.
+    #[tokio::test(start_paused = true)]
+    async fn convoy_subscription_burst_load_is_coalesced() {
+        let state = AggregatorProjectionState::new();
+        let queries = (0..32)
+            .map(|index| QueryId::Convoys { scope: Some(QueryScope::new("flotilla", format!("project-{index}"))) })
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            state.replace_subscriber(
+                Uuid::new_v4(),
+                &queries.iter().map(|query| flotilla_protocol::QueryCursor { query: query.clone(), since: None }).collect::<Vec<_>>(),
+            );
+        }
+        let mut initial = Vec::new();
+        for index in 0..512 {
+            let mut convoy = convoy_with_branch(&format!("work-{index}")).await;
+            convoy.spec.project_ref = Some(format!("project-{}", index % 32));
+            initial.push(convoy);
+        }
+        let events = (0..100)
+            .map(|index| {
+                let mut convoy = initial[0].clone();
+                convoy.status.get_or_insert_with(Default::default).message = Some(format!("progress-{index}"));
+                WatchEvent::Modified(convoy)
+            })
+            .collect();
+        let durable_convoys = ScriptedSource::new(
+            vec![ResourceList { items: initial, resource_version: "1".into(), generation: None }],
+            vec![Ok(watch_events(events))],
+        );
+        let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
+        let (tx, mut rx) = broadcast::channel(1024);
+        let run = run_with_test_sources(
+            Aggregator::new(state.clone(), HostName::new("local"), tx),
+            &durable_convoys,
+            &durable_presentations,
+            &observed_convoys,
+            &observed_presentations,
+        );
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => panic!("aggregator stopped: {result:?}"),
+            () = async {
+                recv_query_event(&mut rx, QueryId::Convoys { scope: None }, "initial load").await;
+                for query in &queries { state.result_set_for(query).await.expect("initial scoped snapshot"); }
+                let delta = recv_query_event(&mut rx, QueryId::Convoys { scope: None }, "burst delivery").await;
+                let DaemonEvent::ResultDelta(delta) = delta else { panic!("burst delta") };
+                let QueryChanges::Convoys { changed, .. } = &delta.changes else { panic!("convoy changes") };
+                assert_eq!(changed.len(), 1);
+                assert_eq!(changed[0].message.as_deref(), Some("progress-99"));
+                assert_eq!(delta.seq, 2, "100 updates must produce one projection rebuild");
+                let scoped = recv_query_event(&mut rx, queries[0].clone(), "affected scope").await;
+                let DaemonEvent::ResultSet(scoped) = scoped else { panic!("scoped snapshot") };
+                assert_eq!(scoped.seq, 2);
+                assert_eq!(scoped.rows.len(), 16);
+            } => {}
+        }
+    }
+
     #[tokio::test]
     async fn convoy_row_insert_and_removal_update_global_and_scoped_queries_without_waiting_for_change_request_enrichment() {
         let state = AggregatorProjectionState::new();
@@ -5014,12 +5114,24 @@ mod tests {
         unrelated_convoy.spec.project_ref = Some("other".into());
         let mut deleting_convoy = convoy.clone();
         deleting_convoy.metadata.deletion_timestamp = Some(Utc::now());
-        let durable_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(watch_events(vec![
-            WatchEvent::Added(convoy),
-            WatchEvent::Added(unrelated_convoy),
-            WatchEvent::Modified(deleting_convoy.clone()),
-            WatchEvent::Deleted(deleting_convoy),
-        ]))]);
+        let durable_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(WatchStream::new(
+            None,
+            Box::pin(
+                stream::iter(vec![
+                    WatchEvent::Added(convoy),
+                    WatchEvent::Added(unrelated_convoy),
+                    WatchEvent::Modified(deleting_convoy.clone()),
+                    WatchEvent::Deleted(deleting_convoy),
+                ])
+                .then(|event| async move {
+                    // Distinct lifecycle observations need separate delivery windows;
+                    // an insert and delete inside one burst intentionally coalesce.
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    Ok(event)
+                })
+                .chain(stream::pending()),
+            ),
+        ))]);
         let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);

@@ -4104,6 +4104,99 @@ async fn handle_client_session_dispatches_request_messages() {
 }
 
 #[tokio::test]
+async fn hello_and_shutdown_remain_responsive_under_scoped_convoy_load() {
+    let (_tmp, daemon) = empty_daemon().await;
+    let (peer_data_tx, _peer_data_rx) = mpsc::channel(16);
+    let peer_manager = Arc::new(Mutex::new(PeerManager::new(NodeId::new("local"))));
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_request_tx, mut shutdown_request_rx) = mpsc::unbounded_channel();
+    let client_count = Arc::new(AtomicUsize::new(0));
+    let client_notify = Arc::new(Notify::new());
+    let (peer_connected_tx, _peer_connected_rx) = mpsc::unbounded_channel::<PeerConnectionEvent>();
+    let (client_session, server_session) = message_session_pair();
+
+    let daemon_for_task = Arc::clone(&daemon);
+    let pm = Arc::clone(&peer_manager);
+    let count_ref = Arc::clone(&client_count);
+    let notify_ref = Arc::clone(&client_notify);
+    let handle = tokio::spawn(async move {
+        let remote_command_router = empty_remote_command_router(&daemon_for_task, &pm);
+        handle_client_session(
+            server_session,
+            daemon_for_task,
+            shutdown_request_tx,
+            shutdown_rx,
+            peer_data_tx,
+            pm,
+            remote_command_router,
+            count_ref,
+            notify_ref,
+            peer_connected_tx,
+            flotilla_core::agents::shared_in_memory_agent_state_store(),
+            None,
+        )
+        .await;
+    });
+
+    // #2775: serve the first Hello and shutdown while the same runtime is
+    // projecting 512 convoys for 64 presentation subscriptions across 32 scopes.
+    // In-memory MessageSessions exercise the real client handler and dispatcher.
+    let state = daemon.aggregator_projection_state().await;
+    {
+        let mut view = state.write().await;
+        for index in 0..512 {
+            let resource = flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", format!("work-{index}"));
+            let row = flotilla_protocol::ConvoyRow::builder()
+                .resource(resource)
+                .name(format!("work-{index}"))
+                .workflow_ref("scratch")
+                .phase(flotilla_protocol::ConvoyPhase::Pending)
+                .project_ref(format!("project-{}", index % 32))
+                .build();
+            view.local_rows.insert(row.resource.clone(), row);
+        }
+        view.seq = 1;
+    }
+    for index in 0..32 {
+        let query = QueryId::Convoys { scope: Some(flotilla_protocol::QueryScope::new("flotilla", format!("project-{index}"))) };
+        for _ in 0..2 {
+            state.replace_subscriber(uuid::Uuid::new_v4(), &[QueryCursor { query: query.clone(), since: None }]);
+        }
+        state.result_set_for(&query).await.expect("initial scoped snapshot");
+    }
+    state.changed_scoped_convoy_result_sets().await;
+    let (started_tx, started_rx) = oneshot::channel();
+    let load = tokio::spawn(async move {
+        started_tx.send(()).expect("load observer");
+        for update in 0..1000 {
+            {
+                let mut view = state.write().await;
+                let row = view.local_rows.values_mut().find(|row| row.name == "work-0").expect("loaded convoy");
+                row.workflow_ref = format!("update-{update}");
+                view.seq += 1;
+            }
+            state.changed_scoped_convoy_result_sets().await;
+            tokio::task::yield_now().await;
+        }
+    });
+    started_rx.await.expect("projection load starts");
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_millis(250), async {
+        complete_client_hello(&client_session).await;
+        client_session.write(Message::Request { id: 1, request: Request::Shutdown }).await.expect("send first shutdown request");
+        assert!(matches!(ok_response(read_session_message(&client_session).await, 1), Response::Shutdown));
+        assert_eq!(shutdown_request_rx.recv().await, Some(()));
+    })
+    .await
+    .expect("Hello and first shutdown must stay responsive under load");
+    let elapsed = started.elapsed();
+    eprintln!("Hello + first shutdown under scoped load: {elapsed:?}");
+    assert!(elapsed < Duration::from_millis(250), "runtime was starved for {elapsed:?}");
+    load.abort();
+    handle.await.expect("shutdown client handler");
+}
+
+#[tokio::test]
 async fn shutdown_request_is_acknowledged_before_the_connection_closes() {
     let (_tmp, client_stream, handle, client_count, mut shutdown_requests) = spawn_test_client_handler().await;
     let (read_half, write_half) = client_stream.into_split();

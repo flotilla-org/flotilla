@@ -716,18 +716,42 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         rows.iter().all(|row| row.name != "terminal-convoy-coder"),
         "convoy-bound terminal sessions surface on vessel rows, never in independents",
     );
-    let convoy_replay = daemon
-        .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys { scope: None }, since: None }])
-        .await
-        .expect("subscribe to convoys query");
-    let convoy_rows = convoy_replay
-        .iter()
-        .find_map(|event| match event {
-            DaemonEvent::ResultSet(result_set) if result_set.query() == QueryId::Convoys { scope: None } => Some(convoy_rows(result_set)),
-            _ => None,
-        })
-        .expect("convoys replay result set");
-    let convoy = convoy_rows.iter().find(|row| row.name == "convoy-a").expect("convoy row for bound terminal session");
+    // Independents and Convoys have separate delivery boundaries. Wait for the
+    // coalesced convoy enrichment too, rather than assuming the independent
+    // capability event has already advanced every query family.
+    let materialized_convoy = |rows: &[ConvoyRow]| {
+        rows.iter()
+            .find(|row| row.name == "convoy-a")
+            .filter(|row| {
+                row.vessels.iter().any(|vessel| vessel.name == "coder" && vessel.materialize.as_deref() == Some("terminal-convoy-coder"))
+            })
+            .cloned()
+    };
+    let convoy = tokio::time::timeout(Duration::from_secs(5), async {
+        let replay = daemon
+            .subscribe_queries(uuid::Uuid::nil(), &[QueryCursor { query: QueryId::Convoys { scope: None }, since: None }])
+            .await
+            .expect("subscribe to convoys query");
+        for event in replay {
+            if let DaemonEvent::ResultSet(set) = event {
+                if let Some(row) = set.rows.as_convoys().and_then(materialized_convoy) {
+                    return row;
+                }
+            }
+        }
+        loop {
+            let ready = match rx.recv().await.expect("convoy enrichment event") {
+                DaemonEvent::ResultSet(set) => set.rows.as_convoys().and_then(materialized_convoy),
+                DaemonEvent::ResultDelta(delta) => delta.changes.as_convoys().and_then(materialized_convoy),
+                _ => None,
+            };
+            if let Some(row) = ready {
+                return row;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for convoy materialization capability");
     let vessel = convoy.vessels.iter().find(|vessel| vessel.name == "coder").expect("convoy-bound session vessel row");
     assert_eq!(vessel.materialize.as_deref(), Some("terminal-convoy-coder"));
     assert_eq!(vessel.attach, None, "materialization must not pretend an observed PM workspace already exists");
