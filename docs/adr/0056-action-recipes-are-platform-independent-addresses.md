@@ -13,6 +13,14 @@ zero and retain their exact contents; they are never shell strings.
 Live attachment addresses are `session:<host>/<attach-ref>` and scoped
 views are `view:<address>`. Transient checkout terminals use `command`,
 a `checkout:<host>/<path>` target, and the raw CLI argument vector.
+This command's `argv[0]` is the configured connector-local executable,
+which need not exist on a different viewer host or platform. Unlike attach
+and view address resolution, direct command execution requires a compatible
+execution environment; an unsupported viewer must decline it. This keeps
+the existing transient command behaviour explicit rather than promising
+cross-platform checkout opening. Viewers must execute `command` recipes
+only from trusted connectors: raw argv removes shell parsing, not the trust
+required to run a supplied executable.
 Repeated actions for the same session share a target, including a standing
 role and its current backing vessel; replacing that session changes the
 recipe target while preserving the role entity's identity.
@@ -23,5 +31,6 @@ open a browser terminal. Direct Cleat endpoint facts remain available.
 The server's structured minting does no shell quoting. The isolated legacy
 formatter continues emitting `action.<key>.recipe` with the prior POSIX
 spelling for one generation; remove it after the next fleet roll following
-recipe-shape v1 (#2818). Andamento owns scalar fact consumption and
-wheelhouse owns platform-specific address resolution in companion tickets.
+recipe-shape v1 (#2818). [Andamento #134](https://github.com/flotilla-org/andamento/issues/134) owns
+scalar fact consumption and [wheelhouse #222](https://github.com/flotilla-org/wheelhouse/issues/222)
+owns platform-specific address resolution.

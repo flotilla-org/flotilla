@@ -9,8 +9,9 @@ use crate::recipe::{LegacyRecipe, Recipe};
 pub(crate) fn command(recipe: &Recipe) -> String {
     // Only the known old CLI verbs/options are literal. Genuine commands quote
     // every argument, even when they happen to contain an attach/view verb.
-    let (argv, literal_end) = match &recipe.legacy {
-        LegacyRecipe::Address(argv) => (argv, if recipe.kind() == "attach" { 3 } else { 2 }),
+    let (argv, literal_end) = match recipe.legacy() {
+        LegacyRecipe::Attach(argv) => (argv, 3),
+        LegacyRecipe::View(argv) => (argv, 2),
         LegacyRecipe::Checkout(argv) => (argv, 4),
         LegacyRecipe::Command(argv) => (argv, 1),
     };

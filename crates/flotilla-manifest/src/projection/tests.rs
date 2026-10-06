@@ -2949,17 +2949,17 @@ fn structured_action_facts_preserve_addresses_and_raw_arguments(tc: hegel::TestC
 // three built-in recipes, including quotes in paths and executable names.
 #[test]
 fn structured_actions_keep_legacy_recipe_spelling() {
-    let mint = FlotillaRecipes::new("/opt/flotilla's build");
+    let mint = FlotillaRecipes::new("/opt/$current;flotilla's build");
     let host = HostName::new("feta");
     let cases = [
-        (mint.attach("session", &host).expect("attach"), "'/opt/flotilla'\\''s build' attach --host 'feta' 'session'"),
+        (mint.attach("session", &host).expect("attach"), "'/opt/$current;flotilla'\\''s build' attach --host 'feta' 'session'"),
         (
             mint.scoped_view(&ViewAddress::Project { namespace: "dev".to_owned(), name: "p".to_owned() }).expect("view"),
-            "'/opt/flotilla'\\''s build' view 'project/dev/p'",
+            "'/opt/$current;flotilla'\\''s build' view 'project/dev/p'",
         ),
         (
             mint.checkout_terminal("/work/repo's path", &host).expect("command"),
-            "'/opt/flotilla'\\''s build' attach --transient --host 'feta' '/work/repo'\\''s path'",
+            "'/opt/$current;flotilla'\\''s build' attach --transient --host 'feta' '/work/repo'\\''s path'",
         ),
     ];
     for (recipe, expected) in cases {

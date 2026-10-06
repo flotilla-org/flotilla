@@ -333,6 +333,8 @@ impl Catalog {
         ordinal: Option<i64>,
     ) {
         let target = MetadataTarget::Entity(entity.clone());
+        // Action facts and main entity facts are asserted separately, with the
+        // same ordinal. Merge into one entry so neither assertion replaces the other.
         let entry = self.facts.entry(target).or_default();
         let base = [
             (KEY_ENTITY_KIND, MetadataValue::text(entity.kind.clone())),

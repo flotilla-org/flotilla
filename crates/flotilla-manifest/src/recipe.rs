@@ -17,7 +17,7 @@ pub enum DirectTransport {
 pub struct Recipe {
     shape: RecipeShape,
     // Compatibility for recipe-shape v1 (#2818): remove after the next fleet roll.
-    pub(crate) legacy: LegacyRecipe,
+    legacy: LegacyRecipe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +28,8 @@ enum RecipeShape {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LegacyRecipe {
-    Address(Vec<String>),
+    Attach(Vec<String>),
+    View(Vec<String>),
     Command(Vec<String>),
     Checkout(Vec<String>),
 }
@@ -58,8 +59,16 @@ impl Recipe {
         Self { legacy: LegacyRecipe::Command(argv.clone()), shape: RecipeShape::Command { target: target.into(), argv } }
     }
 
-    fn address(kind: &str, target: String, legacy_argv: Vec<String>) -> Self {
-        Self { shape: RecipeShape::Address { kind: kind.to_owned(), target }, legacy: LegacyRecipe::Address(legacy_argv) }
+    fn checkout_command(target: String, argv: Vec<String>) -> Self {
+        Self { legacy: LegacyRecipe::Checkout(argv.clone()), shape: RecipeShape::Command { target, argv } }
+    }
+
+    fn address(kind: &str, target: String, legacy: LegacyRecipe) -> Self {
+        Self { shape: RecipeShape::Address { kind: kind.to_owned(), target }, legacy }
+    }
+
+    pub(crate) fn legacy(&self) -> &LegacyRecipe {
+        &self.legacy
     }
 }
 
@@ -110,13 +119,17 @@ impl RecipeMint for FlotillaRecipes {
     }
 
     fn attach(&self, attach_ref: &str, host: &HostName) -> Option<Recipe> {
-        Some(Recipe::address("attach", format!("session:{host}/{attach_ref}"), vec![
-            self.flotilla_bin.clone(),
-            "attach".to_owned(),
-            "--host".to_owned(),
-            host.to_string(),
-            attach_ref.to_owned(),
-        ]))
+        Some(Recipe::address(
+            "attach",
+            format!("session:{host}/{attach_ref}"),
+            LegacyRecipe::Attach(vec![
+                self.flotilla_bin.clone(),
+                "attach".to_owned(),
+                "--host".to_owned(),
+                host.to_string(),
+                attach_ref.to_owned(),
+            ]),
+        ))
     }
 
     fn checkout_terminal(&self, path: &str, host: &HostName) -> Option<Recipe> {
@@ -129,12 +142,14 @@ impl RecipeMint for FlotillaRecipes {
             host.to_string(),
             path.to_owned(),
         ];
-        let mut recipe = Recipe::command(format!("checkout:{host}/{path}"), argv.clone());
-        recipe.legacy = LegacyRecipe::Checkout(argv);
-        Some(recipe)
+        Some(Recipe::checkout_command(format!("checkout:{host}/{path}"), argv))
     }
 
     fn scoped_view(&self, target: &ViewAddress) -> Option<Recipe> {
-        Some(Recipe::address("view", format!("view:{target}"), vec![self.flotilla_bin.clone(), "view".to_owned(), target.to_string()]))
+        Some(Recipe::address(
+            "view",
+            format!("view:{target}"),
+            LegacyRecipe::View(vec![self.flotilla_bin.clone(), "view".to_owned(), target.to_string()]),
+        ))
     }
 }
