@@ -1091,13 +1091,16 @@ async fn status_returns_running() {
     assert!(args.contains(&"--format".to_string()));
 }
 
+// #2790: read the container configuration, without login-shell mutations or
+// truncating empty, multiline, or equals-containing values. One example
+// suffices for the Docker query and JSON decoding glue.
 #[tokio::test]
-async fn env_vars_parses_output() {
+async fn env_vars_reads_configured_container_environment() {
     use flotilla_protocol::ImageId;
     let runner = Arc::new(QueuedRunner::new([
         Ok("container-id".into()), // docker run
         Ok("sha256:test-image".into()),
-        Ok("FOO=bar\nBAZ=qux\n".into()), // docker exec sh -lc env
+        Ok(r#"["FOO=bar", "BAZ=qux", "TEXT=line one\nline two=tail", "EMPTY="]"#.into()), // docker inspect Config.Env
     ]));
     let provider = DockerEnvironmentProvider::new(runner.clone());
     let image = ImageId::new("ubuntu:22.04");
@@ -1118,13 +1121,13 @@ async fn env_vars_parses_output() {
 
     assert_eq!(vars.get("FOO"), Some(&"bar".to_string()));
     assert_eq!(vars.get("BAZ"), Some(&"qux".to_string()));
+    assert_eq!(vars.get("TEXT").map(String::as_str), Some("line one\nline two=tail"));
+    assert_eq!(vars.get("EMPTY").map(String::as_str), Some(""));
 
     let calls = runner.calls();
     let (cmd, args, _) = &calls[2];
     assert_eq!(cmd, "docker");
-    assert_eq!(args[0], "exec");
-    assert!(args.contains(&"sh".to_string()));
-    assert!(args.contains(&"env".to_string()));
+    assert_eq!(args, &["inspect", "--format", "{{json .Config.Env}}", "flotilla-env-test-env-vars"]);
 }
 
 #[tokio::test]

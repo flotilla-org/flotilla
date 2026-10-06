@@ -448,18 +448,18 @@ impl DockerEnvironmentProviderInner {
     }
 
     async fn env_vars(&self, container_name: &str) -> Result<HashMap<String, String>, String> {
-        let output =
-            self.runner.run("docker", &["exec", container_name, "sh", "-lc", "env"], Path::new("/"), &ChannelLabel::Default).await?;
-
-        // Note: `sh -lc env` output is line-delimited. Values containing newlines
-        // (e.g. PEM certificates) will be silently truncated. Acceptable for now;
-        // a structured query (docker inspect) could provide the full picture if needed.
-        Ok(output
-            .lines()
-            .filter_map(|line| {
-                let (key, value) = line.split_once('=')?;
-                Some((key.to_string(), value.to_string()))
-            })
+        // Config.Env includes image defaults and docker-run declarations, without
+        // importing host ambient values or running a login shell inside the vessel.
+        let output = self
+            .runner
+            .run("docker", &["inspect", "--format", "{{json .Config.Env}}", container_name], Path::new("/"), &ChannelLabel::Default)
+            .await?;
+        let entries: Option<Vec<String>> = serde_json::from_str(output.trim())
+            .map_err(|error| format!("docker returned invalid environment for container {container_name}: {error}"))?;
+        Ok(entries
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| entry.split_once('=').map(|(key, value)| (key.to_string(), value.to_string())))
             .collect())
     }
 

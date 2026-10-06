@@ -1,8 +1,8 @@
-//! Declared host baseline for terminal children and Cleat clients.
+//! Declared execution-environment baseline for terminal children and Cleat clients.
 //!
 //! Resolve values from discovery in the execution environment, never from the
-//! daemon process. Only this allowlist crosses from host facts into a launch;
-//! credentials and harness settings must be explicitly declared by the caller.
+//! daemon process. Host-direct launches use an allowlist; provisioned launches
+//! use the vessel configuration, with session/adapter declarations on top.
 
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
@@ -52,6 +52,11 @@ pub(crate) struct ControlledTerminalEnvironment {
 impl ControlledTerminalEnvironment {
     pub(crate) fn from_bag(bag: &EnvironmentBag) -> Self {
         let mut host = BTreeMap::from([("PATH".to_string(), DEFAULT_PATH.to_string())]);
+        if let Some(configured) = bag.provisioned_environment() {
+            host.extend(configured.iter().map(|(key, value)| (key.clone(), value.clone())));
+            let host: TerminalEnvVars = host.into_iter().collect();
+            return Self { client: host.clone(), host };
+        }
         for &key in HOST_ENVIRONMENT_KEYS {
             if let Some(value) = bag.find_env_var(key) {
                 host.insert(key.to_string(), value.to_string());
@@ -74,7 +79,7 @@ impl ControlledTerminalEnvironment {
 
     /// Explicit session/adapter entries override baseline values. Cleat owns
     /// its VT identity and fresh session coordinates (cleat#318); outer TERM,
-    /// COLORTERM and session coordinates are deliberately absent here.
+    /// COLORTERM and session coordinates are absent from the host-direct baseline.
     pub(crate) fn session_environment(&self, declared: &TerminalEnvVars) -> TerminalEnvVars {
         self.host.iter().chain(declared).cloned().collect::<BTreeMap<_, _>>().into_iter().collect()
     }
@@ -151,6 +156,10 @@ mod tests {
         let value = values[tc.draw(gs::integers::<usize>().min_value(0).max_value(values.len() - 1))];
         let mut bag = EnvironmentBag::new()
             .with(EnvironmentAssertion::env_var("NO_COLOR", "1"))
+            .with(EnvironmentAssertion::env_var("RUSTUP_HOME", "/host-rustup"))
+            .with(EnvironmentAssertion::env_var("CARGO_HOME", "/host-cargo"))
+            .with(EnvironmentAssertion::env_var("GIT_CONFIG_COUNT", "1"))
+            .with(EnvironmentAssertion::env_var("FLOTILLA_CREW_SKILLS", "host-skills"))
             .with(EnvironmentAssertion::env_var("CLAUDE_CODE_MESSAGING_TOKEN", "fake-unrelated-token"))
             .with(EnvironmentAssertion::env_var("ARBITRARY_AMBIENT", value))
             .with(EnvironmentAssertion::env_var("TERM", "dumb"))
@@ -164,7 +173,17 @@ mod tests {
         }
         let environment =
             ControlledTerminalEnvironment::from_bag(&bag).session_environment(&declared).into_iter().collect::<BTreeMap<_, _>>();
-        for ambient in ["NO_COLOR", "CLAUDE_CODE_MESSAGING_TOKEN", "ARBITRARY_AMBIENT", "TERM", "CLEAT_DAEMON"] {
+        for ambient in [
+            "NO_COLOR",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "ARBITRARY_AMBIENT",
+            "TERM",
+            "CLEAT_DAEMON",
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "GIT_CONFIG_COUNT",
+            "FLOTILLA_CREW_SKILLS",
+        ] {
             assert!(!environment.contains_key(ambient));
         }
         assert_eq!(environment.get("CLAUDE_CODE_ENTRYPOINT").map(String::as_str), Some(value));
