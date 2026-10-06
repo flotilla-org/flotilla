@@ -15,7 +15,7 @@ Development fleet management. Agents, branches, PRs, and workspaces — across e
 
 Flotilla correlates your branches, PRs, issues, cloud and terminal agents into unified work items — one row per unit of work. It auto-detects tools from your environment, works across multiple repos (each a tab), and coordinates across multiple development hosts via a daemon with peer networking over SSH (using your existing keys).
 
-The TUI dashboard and an agent-friendly CLI let you query state, trigger actions, and manage source checkouts. Quickly find and attach to your terminal agents wherever they are running in your preferred multiplexer (tmux, zellij, cmux).
+The TUI dashboard and an agent-friendly CLI let you query state, trigger actions, and manage source checkouts. Quickly find and attach to your terminal agents wherever they are running in your preferred multiplexer (zellij, cmux).
 
 ## Integrations
 
@@ -30,7 +30,7 @@ Tools are auto-detected from your environment, with configurable overrides.
 | Cloud agents | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | [Codex](https://openai.com/index/introducing-codex/) (#52), [Cursor](https://www.cursor.com/) | others (#53) |
 | Agent hooks | Claude Code | Codex, Gemini | |
 | Terminal persistence | [cleat](https://github.com/flotilla-org/cleat) | | [zmx](https://zmx.sh/) |
-| Multiplexers | [cmux](https://cmux.com), [tmux](https://tmux.github.io/) | [zellij](https://zellij.dev/) (#55) | |
+| Multiplexers | [cmux](https://cmux.com) | [zellij](https://zellij.dev/) (#55) | |
 | AI utilities | Claude Code, [Anthropic API](https://docs.anthropic.com/en/docs/api) | | LLM APIs (#56), [ollama](https://ollama.com/) (#56) |
 
 ## CLI

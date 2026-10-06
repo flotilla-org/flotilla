@@ -590,3 +590,16 @@ fn retired_shpool_preference_is_ignored() {
         assert_eq!(config.terminal_pool.preference.backend.as_deref(), Some(backend));
     }
 }
+
+// Issue #2830: old presentation preferences load without selecting tmux.
+// Glue: the real config decoder drops only the retired backend.
+#[test]
+fn retired_tmux_preference_is_ignored() {
+    let config: FlotillaConfig = toml::from_str("[presentation_manager]\nbackend = 'tmux'\n").expect("legacy config loads");
+    assert_eq!(config.presentation_manager.preference.backend, None);
+    assert!(!toml::to_string(&config).expect("config serializes").contains("tmux"));
+    for backend in ["cmux", "zellij", "unknown"] {
+        let config: FlotillaConfig = toml::from_str(&format!("[presentation_manager]\nbackend = '{backend}'\n")).expect("config loads");
+        assert_eq!(config.presentation_manager.preference.backend.as_deref(), Some(backend));
+    }
+}

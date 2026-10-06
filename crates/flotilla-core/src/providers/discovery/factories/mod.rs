@@ -7,18 +7,12 @@ pub mod docker;
 pub mod git;
 pub mod github;
 pub mod passthrough;
-pub mod tmux;
 pub mod zellij;
 
 use super::FactoryRegistry;
 
 fn presentation_factories() -> Vec<Box<super::PresentationManagerFactory>> {
-    vec![
-        Box::new(cmux::CmuxInsideFactory),
-        Box::new(zellij::ZellijPresentationManagerFactory),
-        Box::new(tmux::TmuxPresentationManagerFactory),
-        Box::new(cmux::CmuxBinaryFallbackFactory),
-    ]
+    vec![Box::new(cmux::CmuxInsideFactory), Box::new(zellij::ZellijPresentationManagerFactory), Box::new(cmux::CmuxBinaryFallbackFactory)]
 }
 
 fn terminal_pool_factories() -> Vec<Box<super::TerminalPoolFactory>> {
@@ -41,7 +35,7 @@ impl FactoryRegistry {
                 Box::new(codex::CodexCodingAgentFactory),
             ],
             ai_utilities: vec![Box::new(claude::ClaudeApiAiUtilityFactory), Box::new(claude::ClaudeCliAiUtilityFactory)],
-            // Priority: inside-cmux > inside-zellij > inside-tmux > cmux-binary-fallback
+            // Priority: inside-cmux > inside-zellij > cmux-binary-fallback
             presentation_managers: presentation_factories(),
             terminal_pools: terminal_pool_factories(),
             environment_providers: vec![Box::new(docker::DockerEnvironmentFactory)],

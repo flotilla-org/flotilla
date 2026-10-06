@@ -14,7 +14,7 @@ Near-term extension surfaces include:
 - VCS and checkout backends such as `jj`, libgit2-backed git, and local clones
 - remote platforms such as GitLab, Jira, and Linear
 - coding agents and AI utilities such as Codex/OpenAI and generic LLM APIs
-- deeper tmux and zellij workspace support
+- deeper zellij workspace support
 
 Relevant issues: `#43`, `#44`, `#45`, `#49`, `#50`, `#51`, `#52`, `#53`,
 `#54`, `#55`, `#56`.

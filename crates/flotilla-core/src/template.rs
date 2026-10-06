@@ -3,7 +3,7 @@ use serde::Deserialize;
 /// Internal pane layout consumed by workspace managers.
 ///
 /// Built from a `WorkspaceTemplate` after resolving through the terminal pool.
-/// Each pane becomes a window split in the workspace manager (tmux pane, zellij
+/// Each pane becomes a window split in the workspace manager (zellij
 /// pane, cmux surface group, etc.).
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaneLayout {
@@ -39,10 +39,34 @@ pub struct SurfaceTemplate {
 /// Defines what terminal sessions to create and how to arrange them.
 /// Resolved through the terminal pool to produce a `PaneLayout`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(from = "WorkspaceTemplateRecord")]
 pub struct WorkspaceTemplate {
     pub content: Vec<ContentEntry>,
     #[serde(default)]
     pub layout: Vec<LayoutSlot>,
+}
+
+// N→N+1 compatibility for tmux-specific template options; remove after the next fleet roll.
+#[derive(Deserialize)]
+struct WorkspaceTemplateRecord {
+    content: Vec<ContentEntry>,
+    #[serde(default)]
+    layout: Vec<LayoutSlot>,
+    #[serde(default, deserialize_with = "ignore_retired_tmux_options")]
+    tmux: (),
+}
+
+fn ignore_retired_tmux_options<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer)?;
+    tracing::warn!("tmux presentation manager is retired; ignoring tmux template options");
+    Ok(())
+}
+
+impl From<WorkspaceTemplateRecord> for WorkspaceTemplate {
+    fn from(record: WorkspaceTemplateRecord) -> Self {
+        let WorkspaceTemplateRecord { content, layout, tmux: () } = record;
+        Self { content, layout }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -224,5 +248,22 @@ layout:
         assert_eq!(template.layout.len(), 1);
         assert_eq!(template.layout[0].slot, "main");
         assert!(template.layout[0].focus);
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::WorkspaceTemplate;
+
+    // Issue #2830: legacy tmux options do not prevent the portable template from loading.
+    // Glue: the real YAML decoder accepts and drops the retired provider section.
+    #[test]
+    fn retired_tmux_template_options_are_ignored() {
+        let template: WorkspaceTemplate = serde_yml::from_str(
+            "content:\n  - role: shell\n    command: echo ready\nlayout: []\ntmux:\n  session: old-session\n  options: [remain-on-exit]\n",
+        )
+        .expect("legacy template loads");
+        assert_eq!(template.content[0].command, "echo ready");
+        assert!(template.layout.is_empty());
     }
 }

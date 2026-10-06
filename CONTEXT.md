@@ -355,7 +355,7 @@ convoy-era term. Adopted attachables, persistent agents, loose work sessions.
 Appears in the `independents` query and nowhere else; joining a Convoy removes
 it there (convoy-bound sessions surface on vessel rows instead), so nothing is
 ever double-listed.
-_Avoid_: Session (maximally overloaded — cloud agents, cleat, tmux, zellij all
+_Avoid_: Session (maximally overloaded — cloud agents, cleat, zellij all
 claim it), free-floating session, loose session. Do not use for ensure-declared
 services — that is a **Standing Convoy**.
 

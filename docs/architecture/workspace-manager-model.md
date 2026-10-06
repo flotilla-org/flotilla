@@ -35,23 +35,19 @@ formats can still be layered on later.
 Detection is based primarily on the current shell environment so Flotilla
 prefers the terminal multiplexer it is actually running inside.
 
-| Flotilla concept | cmux | tmux | zellij |
-|---|---|---|---|
-| **Workspace** | workspace | window | tab |
-| **Pane** | pane (split) | pane (split) | pane (split) |
-| **Surface** | surface (tab in pane) | extra split (degraded) | stacked pane |
-| **Multi-surface** | native tabs | becomes additional splits (warning logged) | native stacking |
-| **Detection** | `CMUX_SOCKET_PATH` | `TMUX` | `ZELLIJ` |
-| **Version req** | none | none | >= 0.40 |
-| **State file** | none | `~/.config/flotilla/tmux/{session}/state.toml` | `~/.config/flotilla/zellij/{session}/state.toml` |
-
-tmux has no tabbed or stacked pane concept, so multiple surfaces in a single
-pane degrade to additional splits. This is a known mismatch, not the desired
-behavior.
+| Flotilla concept | cmux | zellij |
+|---|---|---|
+| **Workspace** | workspace | tab |
+| **Pane** | pane (split) | pane (split) |
+| **Surface** | surface (tab in pane) | stacked pane |
+| **Multi-surface** | native tabs | native stacking |
+| **Detection** | `CMUX_SOCKET_PATH` | `ZELLIJ` |
+| **Version req** | none | >= 0.40 |
+| **State file** | none | `~/.config/flotilla/zellij/{session}/state.toml` |
 
 ## Multi-Checkout Gap
 
-A workspace manager (cmux, tmux, zellij) reports its workspaces with a list of directories. Each directory becomes a `CorrelationKey::CheckoutPath`, which the correlation engine uses to merge items into groups.
+A workspace manager (cmux, zellij) reports its workspaces with a list of directories. Each directory becomes a `CorrelationKey::CheckoutPath`, which the correlation engine uses to merge items into groups.
 
 When a workspace references multiple checkout paths, those paths can pull multiple distinct checkouts into a single correlation group. The resulting `WorkItem` can only represent one checkout (one `CheckoutRef`). Today we pick the first checkout encountered and discard others.
 
@@ -67,9 +63,9 @@ A workspace manager that understands its purpose would:
 
 ## Current Limitations
 
-None of cmux, tmux, or zellij directly model the concept of a "primary working directory" for a workspace. We infer it from the directory list. This is a fundamental mismatch between the workspace manager abstraction and the tools available today.
+None of cmux or zellij directly model the concept of a "primary working directory" for a workspace. We infer it from the directory list. This is a fundamental mismatch between the workspace manager abstraction and the tools available today.
 
-`tmux` and `zellij` also currently rely on fixed sleeps while building pane
+`zellij` also currently relies on fixed sleeps while building pane
 layouts. That is a practical adapter workaround, not the desired contract.
 
 Detached daemon mode creates another pressure point for `cmux`: access control
