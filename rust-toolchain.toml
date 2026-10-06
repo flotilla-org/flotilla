@@ -1,0 +1,6 @@
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+# Relay Workers CI and local checks use this target on the pinned compiler.
+targets = ["wasm32-unknown-unknown"]

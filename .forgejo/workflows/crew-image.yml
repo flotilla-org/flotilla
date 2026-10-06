@@ -152,8 +152,9 @@ jobs:
             set -eu
             test -w "$RUSTUP_HOME/toolchains"
             mkdir -p /tmp/pinned && cd /tmp/pinned
-            printf "[toolchain]\nchannel = \"1.98.1\"\ncomponents = [\"clippy\"]\n" > rust-toolchain.toml
-            cargo --version | grep -F " 1.98.1 "
+            cp /opt/flotilla/rust-toolchain.toml rust-toolchain.toml
+            . /opt/flotilla/pin.sh
+            assert_rust_pin rust-toolchain.toml
             cargo clippy --version
           '
 

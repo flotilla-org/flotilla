@@ -24,10 +24,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Read stable compiler pin
+        id: rust-pin
+        shell: bash
+        run: |
+          source ci/toolchain/pin.sh
+          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-03-12
-          components: rustfmt
+          toolchain: ${{ steps.rust-pin.outputs.version }}
+          components: rustfmt, clippy, llvm-tools-preview
+      - name: Assert compiler pin
+        shell: bash
+        run: ci/toolchain/assert.sh
       - name: Test target cache policies
         run: |
           scripts/test-prune-target.sh
@@ -48,6 +57,10 @@ jobs:
           python -m pip install -r ci/git-boundary/requirements.txt
           python -m unittest discover -s ci/git-boundary -p test_check.py
           python ci/git-boundary/check.py
+      - name: Install temporary nightly formatter
+        run: rustup toolchain install nightly-2026-03-12 --profile minimal --component rustfmt
+      - name: Test Rust compiler pin contract
+        run: ci/toolchain/test-pin.sh
       - name: Check Rust formatting
         run: cargo +nightly-2026-03-12 fmt --check
 
@@ -73,9 +86,19 @@ jobs:
     needs: fmt
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read stable compiler pin
+        id: rust-pin
+        shell: bash
+        run: |
+          source ci/toolchain/pin.sh
+          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
         with:
-          components: clippy
+          toolchain: ${{ steps.rust-pin.outputs.version }}
+          components: rustfmt, clippy, llvm-tools-preview
+      - name: Assert compiler pin
+        shell: bash
+        run: ci/toolchain/assert.sh
       # Caches dependency artifacts only (workspace-member artifacts are
       # pruned before save) — the previous whole-target cache reached 4.5GB
       # and thrashed the repo's 10GB cache pool against compose's blobs.
@@ -89,10 +112,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read stable compiler pin
+        id: rust-pin
+        shell: bash
+        run: |
+          source ci/toolchain/pin.sh
+          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.rust-pin.outputs.version }}
+          components: rustfmt, clippy, llvm-tools-preview
           targets: wasm32-unknown-unknown
-          components: clippy
+      - name: Assert compiler pin
+        shell: bash
+        run: ci/toolchain/assert.sh
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "relay-wasm"
@@ -105,7 +138,19 @@ jobs:
     needs: fmt
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read stable compiler pin
+        id: rust-pin
+        shell: bash
+        run: |
+          source ci/toolchain/pin.sh
+          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-pin.outputs.version }}
+          components: rustfmt, clippy, llvm-tools-preview
+      - name: Assert compiler pin
+        shell: bash
+        run: ci/toolchain/assert.sh
       # Caches dependency artifacts only (workspace-member artifacts are
       # pruned before save) — the previous whole-target cache reached 4.5GB
       # and thrashed the repo's 10GB cache pool against compose's blobs.
@@ -162,9 +207,19 @@ jobs:
     if: needs.changes.outputs.windows == 'true'
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read stable compiler pin
+        id: rust-pin
+        shell: bash
+        run: |
+          source ci/toolchain/pin.sh
+          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
         with:
-          components: clippy
+          toolchain: ${{ steps.rust-pin.outputs.version }}
+          components: rustfmt, clippy, llvm-tools-preview
+      - name: Assert compiler pin
+        shell: bash
+        run: ci/toolchain/assert.sh
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "windows-client"
@@ -199,7 +254,19 @@ jobs:
     if: needs.changes.outputs.macos == 'true'
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read stable compiler pin
+        id: rust-pin
+        shell: bash
+        run: |
+          source ci/toolchain/pin.sh
+          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-pin.outputs.version }}
+          components: rustfmt, clippy, llvm-tools-preview
+      - name: Assert compiler pin
+        shell: bash
+        run: ci/toolchain/assert.sh
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "macos-peer-identity"

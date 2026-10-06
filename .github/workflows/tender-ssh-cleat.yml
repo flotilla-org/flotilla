@@ -6,12 +6,16 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - "rust-toolchain.toml"
+      - "ci/toolchain/**"
       - "crates/tender/**"
       - "ci/tender/**"
       - ".github/workflows/tender-ssh-cleat.yml"
   push:
     branches: [main]
     paths:
+      - "rust-toolchain.toml"
+      - "ci/toolchain/**"
       - "crates/tender/**"
       - "ci/tender/**"
       - ".github/workflows/tender-ssh-cleat.yml"
@@ -37,7 +41,19 @@ jobs:
           ref: 00c072b207dc943f6c93fe3b6b09abaa257695a6
           path: cleat-source
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read stable compiler pin
+        id: rust-pin
+        shell: bash
+        run: |
+          source ci/toolchain/pin.sh
+          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-pin.outputs.version }}
+          components: rustfmt, clippy, llvm-tools-preview
+      - name: Assert compiler pin
+        shell: bash
+        run: ci/toolchain/assert.sh
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: tender-ssh-cleat

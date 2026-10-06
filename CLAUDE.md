@@ -46,7 +46,10 @@ Before pushing, run the Git check and its tests plus the exact CI commands: `car
 
 Desk builds keep Cargo incrementals enabled. Crew vessel and CI builds set `CARGO_INCREMENTAL=0`. Each fleet host runs an mtime-based `cargo-sweep --time 3` daily, while `scripts/prune-target.sh` remains a size-cap backstop. See [docs/development.md](docs/development.md) for installation, scope, logs, and thresholds.
 
-**Nightly toolchain:** Nightly-dependent tools (rustfmt, llvm-cov) are pinned to `nightly-2026-03-12`. Install with `rustup toolchain install nightly-2026-03-12 --component rustfmt llvm-tools-preview`.
+**Stable toolchain:** `rust-toolchain.toml` is the single compiler pin (currently Rust 1.99.0). Rustup selects it automatically and installs rustfmt, Clippy, llvm-tools, and the Relay Workers WebAssembly target. CI installs that pin and runs `ci/toolchain/assert.sh` to reject a mismatched compiler. Coverage uses stable with line coverage only. Release candidates and the crew image read the same file.
+
+**Temporary nightly tooling:** Formatting retains `nightly-2026-03-12` until #2794 lands. Install the formatter with `rustup toolchain install nightly-2026-03-12 --profile minimal --component rustfmt`.
+
 
 Only when `CODEX_SANDBOX` is set, use `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests` so native dependencies can create temp files and socket-bind tests stay skipped. Everywhere else, use the default `TMPDIR` and run `cargo test --workspace --locked`. Unix-socket tests use the shared harness's SUN_LEN-safe directory directly beneath `/tmp`, independent of `TMPDIR`; do not change this command to work around socket-path length errors.
 

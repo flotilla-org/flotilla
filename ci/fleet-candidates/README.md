@@ -11,6 +11,13 @@ run-scoped bundles for seven days. It does not fetch the private skill fork:
 Forgejo run tokens are repository-scoped, while each contained crew receives a
 scoped GitHub credential during provisioning.
 
+Linux bootstrap reads the orchestration checkout's `rust-toolchain.toml`.
+After fetching the selected Flotilla revision, both Linux and Darwin install
+that revision's stable pin, select it for both program builds, and assert the
+running compiler matches. A compiler update requires a branch candidate build
+on a fleet build host before merge; a local release binary build does not
+exercise the full candidate packaging and runtime proofs.
+
 The build workers receive no durable release credential or signing identity.
 Forgejo's per-run artifact token expires with the workflow. These candidates
 are therefore useful for investigation and rehearsal, but they are not a

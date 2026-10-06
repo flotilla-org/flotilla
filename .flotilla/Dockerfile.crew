@@ -64,13 +64,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Language toolchains used to verify crew work.
-ARG RUST_VERSION=1.94.1
+# Temporary formatter until #2794 lands.
 ARG RUST_NIGHTLY=nightly-2026-03-12
-# Toolchains that fleet repositories pin in rust-toolchain.toml (cleat's
-# channel; flotilla builds with RUST_VERSION and RUST_NIGHTLY above). Baking
-# them keeps the common case from downloading per crew; other pins install on
-# demand into the writable RUSTUP_HOME.
-ARG RUST_PINNED_TOOLCHAINS="1.98.1"
+COPY rust-toolchain.toml /opt/flotilla/rust-toolchain.toml
+COPY ci/toolchain/pin.sh /opt/flotilla/pin.sh
 ARG NODE_VERSION=24.18.0
 ARG ZIG_VERSION
 ARG TARGETARCH
@@ -108,14 +105,13 @@ RUN apt-get update \
         pkg-config \
         xz-utils \
     && rm -rf /var/lib/apt/lists/* \
+    && . /opt/flotilla/pin.sh \
+    && RUST_VERSION="$(read_rust_pin /opt/flotilla/rust-toolchain.toml)" \
     && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
         | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}" \
-    && rustup component add clippy \
+    && (cd /opt/flotilla && rustup show active-toolchain) \
     && rustup toolchain install "${RUST_NIGHTLY}" --profile minimal \
-        --component rustfmt --component llvm-tools-preview \
-    && for toolchain in ${RUST_PINNED_TOOLCHAINS}; do \
-        rustup toolchain install "${toolchain}" --profile minimal --component clippy || exit 1; \
-    done \
+        --component rustfmt \
     && rm -rf "${RUSTUP_HOME}/downloads" "${RUSTUP_HOME}/tmp" \
     && chmod -R a+rwX "${RUSTUP_HOME}"
 
@@ -233,12 +229,10 @@ RUN claude --version \
 RUN setpriv --reuid=12345 --regid=12345 --clear-groups sh -euc ' \
         test -w "${RUSTUP_HOME}/toolchains" \
         && test -w "${RUSTUP_HOME}/update-hashes" \
-        && for toolchain in ${RUST_PINNED_TOOLCHAINS}; do \
-            dir="$(mktemp -d)" \
-            && printf "[toolchain]\nchannel = \"%s\"\n" "${toolchain}" > "${dir}/rust-toolchain.toml" \
-            && (cd "${dir}" && cargo --version | grep -F " ${toolchain} " && cargo clippy --version) \
-            && rm -rf "${dir}" || exit 1; \
-        done'
+        && dir="$(mktemp -d)" \
+        && cp /opt/flotilla/rust-toolchain.toml "${dir}/rust-toolchain.toml" \
+        && (cd "${dir}" && . /opt/flotilla/pin.sh && assert_rust_pin rust-toolchain.toml && cargo clippy --version) \
+        && rm -rf "${dir}"'
 
 WORKDIR /workspace
 CMD ["sleep", "infinity"]

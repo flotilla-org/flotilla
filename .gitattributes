@@ -1,1 +1,5 @@
 lints/raw_git_outside_vcs/ui/*.stderr whitespace=-blank-at-eof
+
+# Compiler setup is executed by Bash on Windows as well as POSIX hosts.
+ci/toolchain/*.sh text eol=lf
+rust-toolchain.toml text eol=lf
