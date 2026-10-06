@@ -127,6 +127,7 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr(tc: hegel::
     unbound.spec.change_request = None;
     // #2734: a PR-less coder with a ledger can complete after bounded discovery,
     // even when checkout work is expected. A later binding must still gate.
+    // Discovery grace intentionally equals the observation freshness window.
     for elapsed in [0, grace.saturating_sub(1), grace, grace + 1] {
         let unmet = evaluate_crew_completion(
             &unbound,
