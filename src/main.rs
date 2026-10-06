@@ -2127,7 +2127,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                     })
                 });
             }
-            print_resource_read(daemon.as_ref(), node_id, response, format).await
+            print_resource_read(response)
         }
         ResourceSubCommand::Get(args) | ResourceSubCommand::Explain(args) => {
             let node_id = resolve_optional_host_node(cli, args.host.as_deref()).await?;
@@ -2155,7 +2155,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 }
                 Ok(())
             } else {
-                print_resource_read(daemon.as_ref(), node_id, response, format).await
+                print_resource_read(response)
             }
         }
         ResourceSubCommand::ReconcileNow(args) => {
@@ -2324,71 +2324,16 @@ async fn resolve_optional_host_node(cli: &Cli, host: Option<&str>) -> Result<Opt
     }
 }
 
-async fn print_resource_read(
-    daemon: &dyn DaemonHandle,
-    node_id: Option<flotilla_protocol::NodeId>,
-    response: flotilla_protocol::ResourceReadEnvelope,
-    format: OutputFormat,
-) -> Result<()> {
+fn print_resource_read(response: flotilla_protocol::ResourceReadEnvelope) -> Result<()> {
     let value = serde_json::to_value(response).map_err(|error| color_eyre::eyre::eyre!("encode resource read: {error}"))?;
-    println!("{}", format_resource_value(daemon, node_id, value, format).await?);
+    println!("{}", format_resource_value(&value));
     Ok(())
 }
 
-async fn format_resource_value(
-    daemon: &dyn DaemonHandle,
-    node_id: Option<flotilla_protocol::NodeId>,
-    value: serde_json::Value,
-    format: OutputFormat,
-) -> Result<String> {
-    if format == OutputFormat::Json {
-        return Ok(flotilla_protocol::output::json_pretty(&value));
-    }
-    let hosts = daemon
-        .execute_query(
-            Command { node_id, provisioning_target: None, context_repo: None, action: CommandAction::QueryHostList {} },
-            uuid::Uuid::new_v4(),
-        )
-        .await;
-    Ok(format_human_resource_value(value, hosts))
-}
-
-fn format_human_resource_value<E>(mut value: serde_json::Value, hosts: std::result::Result<CommandValue, E>) -> String {
-    let Ok(CommandValue::HostList(hosts)) = hosts else {
-        return flotilla_protocol::output::json_pretty(&value);
-    };
-    let names = hosts
-        .hosts
-        .iter()
-        .filter_map(|host| {
-            let host_id = host.environment_id.as_ref()?.host_id()?.to_string();
-            let display_name = host.node.as_ref().map(|node| node.display_name.clone()).unwrap_or_else(|| host.host_name.to_string());
-            Some((host_id, display_name))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
-    replace_host_ids(&mut value, &names);
-    flotilla_protocol::output::json_pretty(&value)
-}
-
-fn replace_host_ids(value: &mut serde_json::Value, names: &std::collections::HashMap<String, String>) {
-    match value {
-        serde_json::Value::String(text) => {
-            if let Some(display_name) = names.get(text) {
-                *text = format!("{display_name} ({text})");
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                replace_host_ids(value, names);
-            }
-        }
-        serde_json::Value::Object(fields) => {
-            for value in fields.values_mut() {
-                replace_host_ids(value, names);
-            }
-        }
-        _ => {}
-    }
+fn format_resource_value(value: &serde_json::Value) -> String {
+    // Resource JSON is an editable document in both modes. Display labels must
+    // never replace canonical references or other stored values (#2803).
+    flotilla_protocol::output::json_pretty(value)
 }
 
 async fn run_resource_watch(cli: &Cli, args: ResourceWatchArgs, format: OutputFormat) -> Result<()> {
@@ -3143,13 +3088,13 @@ mod tests {
 
     use super::{
         attach_mode, cli_surface_from, client_dirs_from, confirm_command, daemon_paths_from, default_project_landing,
-        format_human_resource_value, host_daemon_socket_required, incompatible_daemon_reexec_failure, install_codex_hook,
-        provisioning_target_for_environment, remote_daemon_from, replace_host_ids, resolve_pm_flotilla_bin, select_host_target,
-        select_startup_repo_roots, should_exec_convoy_attach, should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from,
-        topology_output_format, uninstall_codex_hook, ArtifactSubCommand, AttachArgs, Cli, CliPaths, CommandValue, DaemonArgs,
-        DaemonSubCommand, DevModeSubCommand, DomainCommand, EventsArgs, LogsArgs, LsArgs, PmSubCommand, ResourceApplyArgs,
-        ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs, ResourceManifestResolutionArgs, ResourceReconcileNowArgs,
-        ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs, SubCommand, TopologyArgs, WaitArgs,
+        host_daemon_socket_required, incompatible_daemon_reexec_failure, install_codex_hook, provisioning_target_for_environment,
+        remote_daemon_from, resolve_pm_flotilla_bin, select_host_target, select_startup_repo_roots, should_exec_convoy_attach,
+        should_reexec_for_incompatible_daemon, show_startup_splash, socket_path_from, topology_output_format, uninstall_codex_hook,
+        ArtifactSubCommand, AttachArgs, Cli, CliPaths, CommandValue, DaemonArgs, DaemonSubCommand, DevModeSubCommand, DomainCommand,
+        EventsArgs, LogsArgs, LsArgs, PmSubCommand, ResourceApplyArgs, ResourceDeleteArgs, ResourceGetArgs, ResourceListArgs,
+        ResourceManifestResolutionArgs, ResourceReconcileNowArgs, ResourceStatusPatchArgs, ResourceSubCommand, ResourceWatchArgs,
+        SubCommand, TopologyArgs, WaitArgs,
     };
 
     // `--daemon` wins over FLOTILLA_DAEMON; an empty variable selects this host.
@@ -3843,31 +3788,227 @@ mod tests {
         }
     }
 
-    #[test]
-    fn human_resource_rendering_replaces_exact_host_ids_but_not_embedded_object_names() {
-        let mut value = serde_json::json!({
-            "spec": {"host_ref": "01HXYZ"},
-            "metadata": {"name": "01HXYZ", "related_name": "host-direct-01HXYZ"},
-            "status": {"placement_decision": {"target_host": {"ref": "01HXYZ", "display_name": "kiwi"}}}
-        });
-        replace_host_ids(&mut value, &std::collections::HashMap::from([("01HXYZ".to_string(), "kiwi".to_string())]));
-
-        assert_eq!(value["spec"]["host_ref"], "kiwi (01HXYZ)");
-        assert_eq!(value["status"]["placement_decision"]["target_host"]["ref"], "kiwi (01HXYZ)");
-        assert_eq!(value["metadata"]["name"], "kiwi (01HXYZ)");
-        assert_eq!(value["metadata"]["related_name"], "host-direct-01HXYZ");
+    #[cfg(unix)]
+    async fn cli_resource_document(
+        daemon: &dyn flotilla_core::daemon::DaemonHandle,
+        node_id: Option<NodeId>,
+        kind: &str,
+        name: &str,
+    ) -> serde_json::Value {
+        let result = daemon
+            .execute_query(
+                flotilla_protocol::Command::builder()
+                    .maybe_node_id(node_id)
+                    .action(flotilla_protocol::CommandAction::QueryResourceGet {
+                        namespace: "flotilla".into(),
+                        kind: kind.into(),
+                        name: name.into(),
+                    })
+                    .build(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("resource get");
+        let CommandValue::ResourceRead(response) = result else { panic!("resource read: {result:?}") };
+        let value = serde_json::to_value(response).expect("read envelope");
+        let output = super::format_resource_value(&value);
+        let rendered: serde_json::Value = serde_yml::from_str(&output).expect("parse CLI get output");
+        // All fields, including metadata, status and nested references, stay canonical.
+        assert_eq!(rendered, value);
+        let object = &rendered["records"][0]["object"];
+        serde_json::json!({
+            "apiVersion": object["apiVersion"], "kind": object["kind"],
+            "metadata": { "name": object["metadata"]["name"], "namespace": object["metadata"]["namespace"] },
+            "spec": object["spec"]
+        })
     }
 
-    #[test]
-    fn human_resource_rendering_falls_back_to_raw_json_when_host_lookup_fails() {
-        let value = serde_json::json!({
-            "spec": {"host_ref": "01HXYZ"},
-            "metadata": {"name": "demo"}
-        });
+    #[cfg(unix)]
+    async fn cli_apply_document(
+        daemon: &dyn flotilla_core::daemon::DaemonHandle,
+        node_id: Option<NodeId>,
+        document: serde_json::Value,
+    ) -> CommandValue {
+        use flotilla_protocol::{Command, CommandAction, DaemonEvent};
+        // Match resource apply's file parser: JSON is decoded through serde_yml.
+        let raw = serde_json::to_string(&document).expect("doc.json");
+        let document = serde_yml::from_str(&raw).expect("CLI apply file parser");
+        let mut events = daemon.subscribe();
+        let id = daemon
+            .execute(
+                Command::builder()
+                    .maybe_node_id(node_id)
+                    .action(CommandAction::ResourceApply { namespace: "flotilla".into(), document })
+                    .build(),
+            )
+            .await
+            .expect("dispatch resource apply");
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if let DaemonEvent::CommandFinished { command_id, result, .. } = events.recv().await.expect("command event") {
+                    if command_id == id {
+                        break result;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("apply result")
+    }
 
-        let rendered = format_human_resource_value(value.clone(), Err::<CommandValue, _>("transient host lookup failure"));
+    #[cfg(unix)]
+    async fn cli_round_trip_host_reference<T: flotilla_resources::Resource>(
+        backend: &flotilla_resources::ResourceBackend,
+        daemon: &dyn flotilla_core::daemon::DaemonHandle,
+        node_id: Option<NodeId>,
+        spec: &T::Spec,
+    ) {
+        let name = format!("round-trip-{}", T::API_PATHS.kind);
+        let resources = backend.using::<T>("flotilla");
+        resources
+            .create(&flotilla_resources::InputMeta::builder().name(name.clone()).build(), spec)
+            .await
+            .expect("seed host-reference resource");
+        let document = cli_resource_document(daemon, node_id.clone(), T::API_PATHS.kind, &name).await;
+        let result = cli_apply_document(daemon, node_id, document).await;
+        assert!(matches!(result, CommandValue::ResourceObject(_)), "round trip {}: {result:?}", T::API_PATHS.kind);
+        assert_eq!(
+            serde_json::to_value(resources.get(&name).await.expect("read back").spec).expect("stored spec"),
+            serde_json::to_value(spec).expect("original spec")
+        );
+    }
 
-        assert_eq!(rendered, flotilla_protocol::output::json_pretty(&value));
+    // #2803: get output is an editable resource document. Changing only memory
+    // policy must retain canonical host_ref and its loop owner, locally and routed.
+    #[cfg(unix)]
+    async fn placement_policy_cli_apply_scenario(target: u8, percent: u8) {
+        use std::sync::Arc;
+
+        use flotilla_core::{config::ConfigStore, in_process::InProcessDaemon, providers::discovery::test_support::fake_discovery};
+        use flotilla_daemon::server::test_support::spawn_in_memory_request_topology_stateful;
+        use flotilla_resources::{
+            Environment, EnvironmentSpec, FulfilmentKind, HostDirectEnvironmentSpec, InputMeta, PlacementPolicy, PlacementPolicySpec,
+        };
+        let leader_temp = tempfile::tempdir().expect("leader config");
+        let follower_temp = tempfile::tempdir().expect("follower config");
+        std::fs::write(leader_temp.path().join("daemon.toml"), "machine_id = \"cli-apply-leader\"\n").expect("leader identity");
+        std::fs::write(follower_temp.path().join("daemon.toml"), "machine_id = \"cli-apply-follower\"\n").expect("follower identity");
+        let leader = InProcessDaemon::new(
+            vec![],
+            Arc::new(ConfigStore::with_base(leader_temp.path())),
+            fake_discovery(false),
+            HostName::new(if target == 2 { "kiwi" } else { "feta" }),
+        )
+        .await;
+        let follower = InProcessDaemon::new(
+            vec![],
+            Arc::new(ConfigStore::with_base(follower_temp.path())),
+            fake_discovery(false),
+            HostName::new("feta"),
+        )
+        .await;
+        let topology = spawn_in_memory_request_topology_stateful(leader, follower).await.expect("router");
+        let home = if target == 2 { &topology.follower } else { &topology.leader };
+        let node_id = (target != 0).then(|| home.node_id().clone());
+        let host_ref = home.local_host_id().expect("host id").to_string();
+        let name = "docker-crew-image-feta";
+        let spec: PlacementPolicySpec = serde_json::from_value(serde_json::json!({
+            "pool": "cleat", "docker_per_vessel": {
+                "host_ref": host_ref, "image": "crew:latest", "agent_adapters": ["codex"],
+                "checkout": { "worktree_on_host_and_mount": { "mount_path": "/workspace" } }
+            }
+        }))
+        .expect("policy");
+        let policies = home.resource_backend().using::<PlacementPolicy>("flotilla");
+        policies.create(&InputMeta::builder().name(name.into()).build(), &spec).await.expect("seed policy");
+        // A same-named caller record makes using the wrong store observable.
+        if target == 2 {
+            let mut decoy = spec.clone();
+            decoy.docker_per_vessel.as_mut().expect("docker").host_ref = topology.leader.local_host_id().expect("caller id").to_string();
+            topology
+                .leader
+                .resource_backend()
+                .using::<PlacementPolicy>("flotilla")
+                .create(&InputMeta::builder().name(name.into()).build(), &decoy)
+                .await
+                .expect("caller policy");
+        }
+        let mut document = cli_resource_document(&*topology.client, node_id.clone(), "placementpolicy", name).await;
+        document["spec"]["docker_per_vessel"]["memory_policy"]["host_memory_percent"] = percent.into();
+        for change_host in [false, true] {
+            let mut attempted = document.clone();
+            if change_host {
+                attempted["spec"]["docker_per_vessel"]["host_ref"] = "other-host".into();
+            }
+            let result = cli_apply_document(&*topology.client, node_id.clone(), attempted).await;
+            if change_host {
+                assert!(
+                    matches!(result, CommandValue::Error { ref message }
+                    if message.contains("spec.docker_per_vessel.host_ref") && message.contains("ReconcileLoop")),
+                    "{result:?}"
+                );
+            } else {
+                assert!(matches!(result, CommandValue::ResourceObject(_)), "unchanged host_ref must be accepted: {result:?}");
+            }
+            let stored = policies.get(name).await.expect("stored policy").spec.docker_per_vessel.expect("docker");
+            assert_eq!(stored.host_ref, host_ref);
+            assert_eq!(stored.memory_policy.host_memory_percent, percent);
+            if target == 2 {
+                assert_eq!(
+                    topology
+                        .leader
+                        .resource_backend()
+                        .using::<PlacementPolicy>("flotilla")
+                        .get(name)
+                        .await
+                        .expect("caller policy")
+                        .spec
+                        .docker_per_vessel
+                        .expect("docker")
+                        .memory_policy
+                        .host_memory_percent,
+                    50
+                );
+            }
+        }
+        // Other kinds carrying host refs must also round-trip through the same
+        // read envelope, CLI renderer and local/routed apply-command handler.
+        cli_round_trip_host_reference::<Environment>(&home.resource_backend(), &*topology.client, node_id.clone(), &EnvironmentSpec {
+            host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.clone(), repo_default_dir: "/workspace".into() }),
+            docker: None,
+        })
+        .await;
+        cli_round_trip_host_reference::<FulfilmentKind>(
+            &home.resource_backend(),
+            &*topology.client,
+            node_id,
+            &flotilla_resources::FulfilmentKindSpec::from_policy(&spec, "linux").expect("fulfilment kind"),
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn placement_policy_cli_apply_pinned_rows() {
+        for target in 0..=2 {
+            placement_policy_cli_apply_scenario(target, 80).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[hegel::test]
+    fn generated_placement_policy_cli_apply(tc: hegel::TestCase) {
+        // The repo's hegel.toml budgets 12 cases in development/CI, 40 nightly.
+        // Hostless local, explicit local, routed peer; valid percentages including
+        // min/max, unchanged 50, and the live request 80. Both CLI modes share the
+        // same format-independent renderer, so no separate format dimension remains.
+        let target = tc.draw(hegel::generators::integers::<u8>().min_value(0).max_value(2));
+        let percent = tc.draw(hegel::generators::integers::<u8>().min_value(1).max_value(100));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(placement_policy_cli_apply_scenario(target, percent));
     }
 
     #[test]

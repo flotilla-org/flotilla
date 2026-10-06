@@ -81,9 +81,10 @@ flotilla-daemon = { path = "crates/flotilla-daemon" }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-tempfile = "3"
 flotilla-core = { path = "crates/flotilla-core", features = ["test-support"] }
 flotilla-test-support = { path = "crates/flotilla-test-support" }
+hegeltest = "=0.48.1"
+tempfile = "3"
 
 [[example]]
 name = "glyph_showcase"
@@ -94,3 +95,7 @@ absolute_paths = "warn"
 
 [lints]
 workspace = true
+
+# The daemon and its request-session test harness are Unix-only, like the tests.
+[target.'cfg(unix)'.dev-dependencies]
+flotilla-daemon = { path = "crates/flotilla-daemon", features = ["test-support"] }

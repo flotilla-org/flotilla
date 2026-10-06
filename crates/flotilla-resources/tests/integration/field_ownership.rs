@@ -113,6 +113,40 @@ async fn operator_apply_preserves_loop_fields_while_updating_priority() {
     assert_eq!(updated.spec.host_direct.expect("host-direct").host_ref, "owned-host");
 }
 
+// A full operator document may echo loop-owned host_ref while editing memory_policy.
+// Echoing a protected field does not transfer its static owner; changing it is refused.
+#[tokio::test]
+async fn resource_apply_updates_memory_policy_with_unchanged_host_ref() {
+    for backend in [
+        ResourceBackend::InMemory(InMemoryBackend::default()),
+        ResourceBackend::Sqlite(flotilla_resources::SqliteBackend::open_in_memory().expect("sqlite")),
+    ] {
+        let policies = backend.using::<PlacementPolicy>("flotilla");
+        let original = docker("docker", 4, "feta", "image:old");
+        policies.create(&InputMeta::builder().name("policy".to_string()).build(), &original).await.expect("create policy");
+        let mut requested = original.clone();
+        requested.docker_per_vessel.as_mut().expect("docker").memory_policy.host_memory_percent = 80;
+        let document = |spec: &PlacementPolicySpec| {
+            json!({
+                "apiVersion": "flotilla.work/v1", "kind": "PlacementPolicy",
+                "metadata": { "name": "policy" }, "spec": spec
+            })
+        };
+        apply_resource_document(&backend, "flotilla", document(&requested)).await.expect("unchanged loop-owned fields must be accepted");
+        assert_eq!(policies.get("policy").await.expect("stored policy").spec, requested);
+        assert!(backend.diagnostics().await.expect("diagnostics").expect("embedded diagnostics").field_ownership_violations.is_empty());
+        let mut forbidden = requested.clone();
+        forbidden.docker_per_vessel.as_mut().expect("docker").host_ref = "other-host".into();
+        let error = apply_resource_document(&backend, "flotilla", document(&forbidden))
+            .await
+            .expect_err("echoing host_ref must not transfer its owner");
+        assert!(matches!(error, ResourceError::FieldOwnership { ref violations }
+            if violations.len() == 1 && violations[0].field == "spec.docker_per_vessel.host_ref"
+                && violations[0].rule.contains("ReconcileLoop")));
+        assert_eq!(policies.get("policy").await.expect("stored policy after refusal").spec, requested);
+    }
+}
+
 #[tokio::test]
 async fn resource_apply_reports_rejected_field_and_owner() {
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());

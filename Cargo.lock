@@ -1162,6 +1162,7 @@ dependencies = [
  "flotilla-resources",
  "flotilla-test-support",
  "flotilla-tui",
+ "hegeltest",
  "humantime",
  "libc",
  "ratatui",
