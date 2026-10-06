@@ -673,7 +673,7 @@ impl ProjectService<'_> {
                 Err(source_error) => format!("{source_error}; publish ManifestRoot/{name} status: {error}"),
                 Ok(_) => format!("publish ManifestRoot/{name} status: {error}"),
             };
-            let root = roots.get(&name).await.map_err(&publication_error)?;
+            let root = roots.get(&name).await.map_err(publication_error)?;
             let status = crate::charter_store::source_status(
                 root.status.clone().unwrap_or_default(),
                 revisions.remove(&name),
