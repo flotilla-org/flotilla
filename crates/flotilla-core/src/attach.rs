@@ -1282,6 +1282,11 @@ mod tests {
             let resolved = resolver.resolve_attach(reference, None, false, AttachMode::Default, None).await.expect(reference);
             assert_eq!(resolved.binding.as_ref().and_then(|binding| binding.convoy_phase), Some(flotilla_protocol::ConvoyPhase::Failed));
             assert_eq!(serde_json::to_value(&resolved.binding).expect("binding JSON")["convoy_phase"], "failed");
+            // Recursive transient hops accept every durable reference kind
+            // and retain the viewer's phase/identity information unchanged.
+            let transient = resolver.resolve_transient(reference, None).await.expect("transient session resolution");
+            assert_eq!(transient.plan, resolved.plan);
+            assert_eq!(transient.binding, resolved.binding);
             assert_eq!(resolved.binding.and_then(|binding| binding.session), Some("coder-session".to_string()));
         }
         let rows = daemon.fleet_list_internal().await.expect("fleet list").rows;

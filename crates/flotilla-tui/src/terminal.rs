@@ -67,6 +67,9 @@ pub fn remote_attach_plan(
     if routes.next().is_some() {
         return Err(format!("host {host} has ambiguous SSH routes from this viewer"));
     }
+    // The foreground viewer prints phase and stamps its own PM pane. The
+    // recursive hop traverses transport only; transient also accepts durable
+    // session/convoy/role references without stamping a remote PM pane.
     let mut command = vec![
         Arg::Literal("flotilla".into()),
         Arg::Literal("attach".into()),
@@ -142,11 +145,14 @@ mod windows_console {
     };
 
     pub(super) const COOKED_INPUT: u32 = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT;
+    const _: () = assert!(COOKED_INPUT == 0x0007);
 
     pub(super) struct Modes {
         input: HANDLE,
         output: HANDLE,
         input_mode: u32,
+        // Native SSH inherits this handle and may change its console mode;
+        // restore the captured output state even though we only alter input.
         output_mode: u32,
     }
 
