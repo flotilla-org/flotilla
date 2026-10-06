@@ -50,7 +50,9 @@ The installer pins `cargo-sweep` 0.8.0 when the command is absent, copies the ru
 Each run sweeps:
 
 - every immediate directory under `~/dev/` that has its own `target/`; and
-- every checkout with a `target/` beneath `~/dev/flotilla-repos`, covering that convoy root until lifecycle teardown owns checkout removal under #1113.
+- non-convoy checkouts with a `target/` beneath `~/dev/flotilla-repos`.
+
+Both scheduled and manual pruning skip roots with a `convoy-*` ancestor after resolving symlinks. Checkout provisioning maintains this reserved directory convention (`<repository root>/<convoy name>/<branch>[/<repository>]`), so it serves as the ownership marker without depending on daemon availability. Live, terminal, and orphaned convoy checkouts are left to lifecycle teardown and GC. This also covers nested multi-repository checkouts and convoy roots outside the default repository directory.
 
 The schedule explicitly operates on each discovered checkout's `target/`, overriding any custom `build.target-dir` setting; custom target locations are outside its discovery scope.
 
@@ -62,7 +64,7 @@ The runner records reclaimed bytes separately for the mtime and size-cap steps f
 
 Reclaimed-byte figures use before/after disk usage and are approximate if builds run concurrently.
 
-Targets that remain over either cap log a warning (for example, artifacts that cargo-sweep cannot remove). Command failures are logged and make the scheduled run fail, while other roots are still processed. The same `FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE` and `FLOTILLA_TARGET_MAX_SIZE` overrides apply to both scheduled and manual pruning when supplied in their environment.
+Targets that remain over either cap log a warning (for example, artifacts that cargo-sweep cannot remove). Before touching a non-convoy target, each policy validates its manifest with `cargo metadata --no-deps --locked`. This preflight cannot create or update a lockfile. Root-resolution failures also refuse cleanup. Metadata failures log Cargo's reason on one line and skip that root without failing the job; other roots continue. Cleanup command failures are logged and make the scheduled run fail, while other roots are still processed. The same `FLOTILLA_TARGET_INCREMENTAL_MAX_SIZE` and `FLOTILLA_TARGET_MAX_SIZE` overrides apply to both scheduled and manual pruning when supplied in their environment.
 
 Inspect the scheduler and the most recent result with:
 

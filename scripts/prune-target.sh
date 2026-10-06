@@ -60,6 +60,14 @@ fi
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$script_dir/cargo-sweep-support.sh"
 repo_root=$(cd -- "${checkout_root:-$script_dir/..}" && pwd)
+if skip_reason=$(cargo_cleanup_skip_reason "$repo_root"); then
+  echo "Cargo prune root=$repo_root skipped: $skip_reason"
+  exit 0
+fi
+if ! check_cargo_metadata "$repo_root"; then
+  echo "Cargo prune root=$repo_root skipped: cargo metadata failed" >&2
+  exit 0
+fi
 target_dir=${CARGO_TARGET_DIR:-"$repo_root/target"}
 
 if [[ $target_dir != /* ]]; then
