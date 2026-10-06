@@ -3180,6 +3180,51 @@ mod tests {
         assert_eq!(result, daemon_plan);
     }
 
+    // A checkout binding has no durable session. Remote clients must route
+    // to the selected checkout host and retain its path and requested seat.
+    // Glue cases cover all seat modes and paths requiring shell quoting.
+    #[test]
+    fn remote_attach_checkout_routes_host_only_binding() {
+        use flotilla_protocol::{arg::Arg, commands::AttachMode, AttachBinding, ResolvedAttachAction, ResolvedAttachPlan};
+        let cli = Cli::try_parse_from(["flotilla", "--daemon", "ssh://hub", "attach", "--transient", "--host", "kiwi", "/work/checkout"])
+            .expect("checkout CLI");
+        let binding = AttachBinding::builder().host(HostName::new("kiwi")).namespace("checkout-ns").build();
+        for path in ["/work/checkout", "/work/space and 'quote'", "-checkout"] {
+            for (mode, flag) in [
+                (AttachMode::Default, Some("--watch")),
+                (AttachMode::PreferTake, None),
+                (AttachMode::Strict, Some("--strict")),
+                (AttachMode::Take, Some("--take")),
+            ] {
+                let plan = super::client_attach_plan(
+                    &cli.daemon_endpoint().expect("endpoint"),
+                    ResolvedAttachPlan::shell_command("daemon-only"),
+                    Some(&binding),
+                    path,
+                    mode,
+                    || {
+                        serde_json::from_value(serde_json::json!({"hosts": {"route": {
+                            "hostname": "viewer-kiwi", "expected_host_name": "kiwi"
+                        }}}))
+                        .map_err(|error| error.to_string())
+                    },
+                )
+                .expect("checkout viewer route");
+                let [ResolvedAttachAction::Command(args)] = plan.0.as_slice() else { panic!("one SSH hop") };
+                assert!(args.contains(&Arg::Quoted("viewer-kiwi".into())));
+                let Arg::NestedCommand(shell) = args.last().expect("shell") else { panic!("shell") };
+                let Arg::NestedCommand(command) = shell.last().expect("command") else { panic!("attach") };
+                assert!(command.windows(2).any(|pair| pair == [Arg::Literal("--host".into()), Arg::Quoted("kiwi".into())]));
+                assert!(command.contains(&Arg::Literal("--transient".into())));
+                assert_eq!(command.last(), Some(&Arg::Quoted(path.into())));
+                assert_eq!(command[command.len() - 2], Arg::Literal("--".into()));
+                for seat in ["--watch", "--strict", "--take"] {
+                    assert_eq!(command.contains(&Arg::Literal(seat.into())), flag == Some(seat));
+                }
+            }
+        }
+    }
+
     #[test]
     fn remote_daemon_prefers_flag_and_ignores_empty_environment() {
         let flag = remote_daemon_from(Some("ssh://udder"), Some("ssh://kiwi"), false).expect("valid").expect("remote");

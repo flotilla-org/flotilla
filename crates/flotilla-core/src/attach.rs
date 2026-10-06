@@ -941,7 +941,12 @@ impl AttachTarget {
                 } else {
                     resolver.recursive_attach_plan_for_remote(&row.host, reference, seat).await?
                 };
-                Ok(ResolvedAttach { plan, binding: None })
+                // The viewer needs the selected checkout host to build its
+                // own SSH route. A transient checkout has no durable session
+                // identity, so preserve the checkout reference rather than
+                // exposing its terminal-pool session name.
+                let binding = AttachBinding::builder().host(row.host.clone()).namespace(row.resource.namespace.clone()).build();
+                Ok(ResolvedAttach { plan, binding: Some(binding) })
             }
         }
     }
@@ -1064,6 +1069,47 @@ mod tests {
         daemon::DaemonHandle,
         in_process::tests::{create_identity_convoy, create_running_session, create_test_environment, standing_ensure_fixture, test_meta},
     };
+
+    // Transient checkout resolution must retain its selected host without
+    // claiming a durable TerminalSession identity, including cross-host hops.
+    #[tokio::test]
+    async fn transient_checkout_preserves_host_binding() {
+        let (daemon, _backend, _clock, temp) = standing_ensure_fixture().await;
+        std::fs::write(temp.path().join("hosts.toml"), "[hosts.kiwi]\nhostname = \"daemon-route\"\nexpected_host_name = \"kiwi\"\n")
+            .expect("host routes");
+        let resolver = daemon.attach_resolver();
+        for host in [daemon.host_name.clone(), HostName::new("kiwi")] {
+            let row = CheckoutRow::builder()
+                .resource(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Checkout", "checkout-ns", "checkout"))
+                .repo(flotilla_protocol::RepositoryKey("repo".into()))
+                .repo_label("repo")
+                .path(temp.path().to_string_lossy().into_owned())
+                .branch("main")
+                .host(host.clone())
+                .authority(flotilla_protocol::LifecycleAuthority::Observed)
+                .build();
+            let target = AttachTarget::Checkout(Box::new(row.clone()));
+            assert!(target.resolve(&resolver, &row.path, false, AttachMode::Default).await.is_err());
+            for mode in [AttachMode::Default, AttachMode::PreferTake, AttachMode::Strict, AttachMode::Take] {
+                let result = target.resolve(&resolver, &row.path, true, mode).await;
+                // The fixture's local passthrough pool supports watch/default
+                // seats only; remote routing defers seat checks to the owner.
+                if host == daemon.host_name && matches!(mode, AttachMode::Strict | AttachMode::Take) {
+                    assert_eq!(
+                        result.expect_err("unsupported local seat"),
+                        "terminal pool does not support controller-seat attach options"
+                    );
+                    continue;
+                }
+                let resolved = result.expect("transient checkout");
+                let binding = resolved.binding.expect("checkout host binding");
+                assert_eq!(binding.host, host);
+                assert_eq!(binding.namespace, "checkout-ns");
+                assert_eq!(binding.session, None);
+                assert_eq!(binding.resource_ref(), None);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn placed_session_requires_an_unambiguous_cross_origin_convoy_address() {

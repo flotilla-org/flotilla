@@ -992,7 +992,13 @@ async fn observed_resources_replicate_checkout_queries_and_independent_attach_ta
     assert_eq!(resolved.binding.as_ref().map(|binding| &binding.host), Some(&HostName::new("feta")));
     let checkout_attach =
         kiwi.resolve_transient_attach_command_internal("/srv/widgets", Some(&HostName::new("feta"))).await.expect("remote checkout attach");
-    assert!(checkout_attach.binding.is_none());
+    // A replicated checkout keeps its owning host for viewer-side routing,
+    // without claiming a durable terminal session or resource identity.
+    let binding = checkout_attach.binding.as_ref().expect("checkout routing binding");
+    assert_eq!(binding.host, HostName::new("feta"));
+    assert_eq!(binding.namespace, "flotilla");
+    assert_eq!(binding.session, None);
+    assert_eq!(binding.resource_ref(), None);
     assert!(serde_json::to_string(&checkout_attach.plan).expect("attach plan").contains("/srv/widgets"));
     assert!(kiwi.resource_backend().including_replicas::<Checkout>("flotilla").list().await.expect("durable checkouts").items.is_empty());
     checkouts.delete("checkout").await.expect("delete remote checkout");
