@@ -529,6 +529,9 @@ impl<'a> RequestDispatcher<'a> {
                 }
                 .await;
                 spec.summary = decision_ledger_projection_summary(projection);
+                // A crash between the initial envelope write and this diagnostic
+                // write can leave an empty or stale summary. The durable creation
+                // reservation survives; the next put rechecks the forge marker.
                 store(&spec).await?;
             }
             Ok(Response::ArtifactPut {
@@ -1376,6 +1379,13 @@ mod ledger_projection_tests {
                 let round_trip: flotilla_resources::ResourceObject<flotilla_resources::Artifact> =
                     serde_json::from_value(serde_json::to_value(&stored).expect("serialize")).expect("decode");
                 assert_eq!(round_trip.status, stored.status);
+                // Previous-generation unit statuses serialize as null. Decode the
+                // full stored envelope without regenerating the golden corpus.
+                let mut previous = serde_json::to_value(&stored).expect("serialize prior envelope");
+                previous["status"] = serde_json::Value::Null;
+                let previous: flotilla_resources::ResourceObject<flotilla_resources::Artifact> =
+                    serde_json::from_value(previous).expect("decode previous unit status");
+                assert!(previous.status.is_none());
                 assert!(matches!(
                     resolver
                         .update_status(&authority.name, &stored.metadata.resource_version, &flotilla_resources::ArtifactStatus::default())
