@@ -42,6 +42,17 @@ pub struct ImageLayerSpec {
     #[builder(default)]
     #[serde(default)]
     pub requires: BTreeSet<String>,
+    /// Capability checks run in the completed stage with an empty Docker config.
+    /// ADR 0047: remove the decoder default one roll after probes land.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub probes: BTreeMap<String, Vec<String>>,
+    /// Authored testimony that every external build input is pinned. Unknown
+    /// inputs get a non-shareable execution key. ADR 0047: default old layers
+    /// for one roll rather than assuming their package/network inputs are pinned.
+    #[builder(default)]
+    #[serde(default)]
+    pub input_stability: ImageInputStability,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -151,6 +162,11 @@ pub struct ImageComposition {
     /// Bound only when placed, never inferred from an admission-time tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<PlacedImageIdentity>,
+    /// ADR 0047: previous-generation compositions omit build dependencies;
+    /// remove the decoder default after one fleet roll.
+    #[builder(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_refs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,14 +423,34 @@ pub struct ResolvedImageInputs {
     pub stability: ImageInputStability,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageInputStability {
     Pinned,
+    #[default]
     Unpinned,
 }
 
 impl ResolvedImageInputs {
+    /// Unpinned recipes are executable but cannot make a fleet cache claim.
+    pub fn execution_key(&self, nonce: Option<&str>) -> Result<String, String> {
+        match (self.stability, nonce) {
+            (ImageInputStability::Pinned, None) => self.recipe_key(),
+            (ImageInputStability::Unpinned, Some(nonce)) if !nonce.is_empty() => {
+                let mut validated = self.clone();
+                validated.stability = ImageInputStability::Pinned;
+                let resolved = validated.recipe_key()?;
+                Ok(format!(
+                    "sha256:{:x}",
+                    Sha256::digest(
+                        serde_json::to_vec(&("flotilla-unshared-image-v1", resolved, nonce)).map_err(|error| error.to_string())?
+                    )
+                ))
+            }
+            _ => Err("unpinned image inputs require a non-shareable execution nonce".into()),
+        }
+    }
+
     /// Only resolved, pinned inputs have a shareable Merkle key. Callers must
     /// refuse unresolved inputs rather than manufacture a cache identity.
     pub fn recipe_key(&self) -> Result<String, String> {

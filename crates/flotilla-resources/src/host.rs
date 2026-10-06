@@ -62,6 +62,9 @@ pub struct HostSpec {
     /// silently remove the build cap.
     #[serde(default = "default_expected_concurrent_rust_crews")]
     pub expected_concurrent_rust_crews: u32,
+    /// ADR 0047: absent means placement-host builds; retain default for one roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_build_capacity: Option<crate::ImageBuildCapacity>,
 }
 
 const fn default_expected_concurrent_rust_crews() -> u32 {
@@ -70,7 +73,12 @@ const fn default_expected_concurrent_rust_crews() -> u32 {
 
 impl Default for HostSpec {
     fn default() -> Self {
-        Self { display_name: String::new(), connection: HostConnection::default(), expected_concurrent_rust_crews: 4 }
+        Self {
+            display_name: String::new(),
+            connection: HostConnection::default(),
+            expected_concurrent_rust_crews: 4,
+            image_build_capacity: None,
+        }
     }
 }
 

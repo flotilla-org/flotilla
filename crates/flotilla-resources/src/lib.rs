@@ -22,6 +22,11 @@ pub use crew_defaults::{
     SkillLayer, SkillOutcome, SkillRefusal,
 };
 mod crew_image_baseline;
+mod image_build;
+pub use image_build::{
+    read_image_build, ImageBuild, ImageBuildCapacity, ImageBuildFailure, ImageBuildFailureClass, ImageBuildPhase, ImageBuildReason,
+    ImageBuildReservation, ImageBuildSpec, ImageBuildStatus, ImageBuildStatusPatch,
+};
 mod image_layer;
 pub use image_layer::{
     capability_satisfies, compose_image, validate_capability, FrozenImageLayer, FrozenImageLayers, ImageComposition, ImageInputAdoption,
@@ -245,6 +250,7 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::CredentialGrant>($($argument),*);
         $callback::<$crate::CredentialSpec>($($argument),*);
         $callback::<$crate::CrewImageBaseline>($($argument),*);
+        $callback::<$crate::ImageBuild>($($argument),*);
         $callback::<$crate::ImageLayer>($($argument),*);
         $callback::<$crate::CrewDefaults>($($argument),*);
         $callback::<$crate::FulfilmentKind>($($argument),*);

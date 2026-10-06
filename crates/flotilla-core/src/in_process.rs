@@ -2704,6 +2704,10 @@ impl InProcessDaemon {
         self.aggregator_projection_state.clone()
     }
 
+    pub async fn set_image_build_input_resolver(&self, resolver: Arc<dyn crate::image_build::ImageBuildInputResolver>) {
+        *self.convoy_admission.image_build_inputs.write().await = Some(resolver);
+    }
+
     pub fn resource_backend(&self) -> ResourceBackend {
         self.resource_backend.clone()
     }

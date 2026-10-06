@@ -114,6 +114,8 @@ async fn environment_and_checkout_specs_serialize_through_in_memory_backend() {
     let env_spec = EnvironmentSpec {
         host_direct: None,
         docker: Some(DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
             memory_policy: Default::default(),
             host_ref: "01HXYZ".to_string(),
             image: "ghcr.io/flotilla/dev:latest".to_string(),

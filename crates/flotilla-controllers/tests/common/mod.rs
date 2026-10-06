@@ -222,6 +222,7 @@ pub async fn create_ready_host_direct_environment(
         .expect("environment create should succeed");
     environments
         .update_status(&name, &created.metadata.resource_version, &EnvironmentStatus {
+            image_build_refs: Vec::new(),
             configured_limits: None,
             runtime_observation: None,
             phase: EnvironmentPhase::Ready,
@@ -253,6 +254,7 @@ pub async fn create_ready_docker_environment(
         .expect("docker env create should succeed");
     environments
         .update_status(name, &created.metadata.resource_version, &EnvironmentStatus {
+            image_build_refs: Vec::new(),
             configured_limits: None,
             runtime_observation: None,
             phase: EnvironmentPhase::Ready,

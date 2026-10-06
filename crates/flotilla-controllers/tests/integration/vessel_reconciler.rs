@@ -1136,6 +1136,8 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
     )
     .await;
     create_ready_docker_environment(&backend, NAMESPACE, "env-workspace-multi-fresh", DockerEnvironmentSpec {
+        image_composition: None,
+        image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
@@ -1375,6 +1377,8 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
     .await;
     let environment_ref = "env-workspace-docker-stance";
     create_ready_docker_environment(&backend, NAMESPACE, environment_ref, DockerEnvironmentSpec {
+        image_composition: None,
+        image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
@@ -1864,7 +1868,7 @@ memory_policy: Default::default(),
         .build(),
     "/Users/alice/dev/flotilla-repos/github-com-flotilla-org-flotilla.workspace-docker-worktree",
     "/workspace",
-    Some(DockerEnvironmentSpec {
+    Some(DockerEnvironmentSpec { image_composition: None, image_build_ref: None,
 memory_policy: Default::default(),
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
@@ -1923,7 +1927,7 @@ memory_policy: Default::default(),
         .build(),
     "/workspace",
     "/app",
-    Some(DockerEnvironmentSpec {
+    Some(DockerEnvironmentSpec { image_composition: None, image_build_ref: None,
 memory_policy: Default::default(),
         host_ref: HOST_REF.to_string(),
         image: "ghcr.io/flotilla/dev:latest".to_string(),
@@ -3224,6 +3228,8 @@ async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: 
     )
     .await;
     create_ready_docker_environment(&backend, NAMESPACE, "env-vessel", DockerEnvironmentSpec {
+        image_composition: None,
+        image_build_ref: None,
         memory_policy: Default::default(),
         host_ref: HOST_REF.to_string(),
         image: "crew:v1".to_string(),

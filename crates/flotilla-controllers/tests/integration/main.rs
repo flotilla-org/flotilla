@@ -6,6 +6,7 @@ mod clone_reconciler;
 #[path = "../common/mod.rs"]
 mod common;
 mod environment_reconciler;
+mod image_build;
 mod liveness_contract;
 mod presentation_reconciler;
 mod provisioning_in_memory;

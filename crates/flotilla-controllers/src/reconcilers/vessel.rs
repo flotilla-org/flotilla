@@ -593,7 +593,11 @@ impl Reconciler for VesselReconciler {
                         }
                     }
                     Err(ResourceError::NotFound { .. }) => {
-                        let image = match image.resolve(&self.image_baselines).await {
+                        let image_ref = match image {
+                            DockerImageSource::Composition { composition } if !composition.build_refs.is_empty() => Ok(String::new()),
+                            _ => image.resolve(&self.image_baselines).await,
+                        };
+                        let image_ref = match image_ref {
                             Ok(image) => image,
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
@@ -602,6 +606,16 @@ impl Reconciler for VesselReconciler {
                             spec: EnvironmentSpec {
                                 host_direct: None,
                                 docker: Some(DockerEnvironmentSpec {
+                                    image_composition: match image {
+                                        DockerImageSource::Composition { composition } if !composition.build_refs.is_empty() => {
+                                            Some(composition.clone())
+                                        }
+                                        _ => None,
+                                    },
+                                    image_build_ref: match image {
+                                        DockerImageSource::Composition { composition } => composition.build_refs.last().cloned(),
+                                        _ => None,
+                                    },
                                     memory_policy: placement_policy
                                         .spec
                                         .docker_per_vessel
@@ -610,7 +624,7 @@ impl Reconciler for VesselReconciler {
                                         .memory_policy
                                         .clone(),
                                     host_ref: host_ref.clone(),
-                                    image: image.clone(),
+                                    image: image_ref.clone(),
                                     declared_agent_adapters: declared_agent_adapters.clone(),
                                     required_agent_adapters: required_adapters.clone(),
                                     pull_policy: *pull_policy,
@@ -1014,7 +1028,11 @@ impl Reconciler for VesselReconciler {
                         if let Err(message) = configure_contained_tracking(&mut env, &contained_branches) {
                             return Ok(VesselPrepared::failed(message));
                         }
-                        let image = match image.resolve(&self.image_baselines).await {
+                        let image_ref = match image {
+                            DockerImageSource::Composition { composition } if !composition.build_refs.is_empty() => Ok(String::new()),
+                            _ => image.resolve(&self.image_baselines).await,
+                        };
+                        let image_ref = match image_ref {
                             Ok(image) => image,
                             Err(message) => return Ok(VesselPrepared::failed(message)),
                         };
@@ -1023,6 +1041,16 @@ impl Reconciler for VesselReconciler {
                             spec: EnvironmentSpec {
                                 host_direct: None,
                                 docker: Some(DockerEnvironmentSpec {
+                                    image_composition: match image {
+                                        DockerImageSource::Composition { composition } if !composition.build_refs.is_empty() => {
+                                            Some(composition.clone())
+                                        }
+                                        _ => None,
+                                    },
+                                    image_build_ref: match image {
+                                        DockerImageSource::Composition { composition } => composition.build_refs.last().cloned(),
+                                        _ => None,
+                                    },
                                     memory_policy: placement_policy
                                         .spec
                                         .docker_per_vessel
@@ -1031,7 +1059,7 @@ impl Reconciler for VesselReconciler {
                                         .memory_policy
                                         .clone(),
                                     host_ref: host_ref.clone(),
-                                    image: image.clone(),
+                                    image: image_ref.clone(),
                                     declared_agent_adapters: declared_agent_adapters.clone(),
                                     required_agent_adapters: required_adapters.clone(),
                                     pull_policy: *pull_policy,

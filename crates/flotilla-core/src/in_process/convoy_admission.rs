@@ -74,6 +74,8 @@ pub(super) struct ConvoyAdmission {
     host_name: HostName,
     clock: Arc<dyn Clock>,
     fulfilment_decider: Arc<dyn FulfilmentDecider>,
+    #[builder(default)]
+    pub(super) image_build_inputs: RwLock<Option<Arc<dyn crate::image_build::ImageBuildInputResolver>>>,
     /// Serializes the identity selector check with Convoy creation on the owner host.
     #[builder(default)]
     guard: Mutex<()>,
@@ -1159,6 +1161,20 @@ impl ConvoyAdmission {
         Ok((selected.placement, alternatives))
     }
 
+    async fn join_placement_builds(&self, namespace: &str, placement: &mut PlacementResolution) -> Result<(), String> {
+        if let Some(docker) = placement.selected.as_mut().and_then(|policy| policy.spec.docker_per_vessel.as_mut()) {
+            if let flotilla_resources::DockerImageSource::Composition { composition } = &mut docker.image {
+                if composition.baseline_image.is_none() && composition.identity.is_none() {
+                    let inputs = self.image_build_inputs.read().await.clone().ok_or("image build input resolver is unavailable")?;
+                    composition.build_refs = crate::image_build::ImageBuildAdmission::new(self.backend.clone(), namespace, inputs)
+                        .join(&docker.host_ref, composition)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn decide_vessel_placements(
         &self,
         context: &PlacementContext<'_>,
@@ -1175,7 +1191,7 @@ impl ConvoyAdmission {
                 let vessel = workflow.vessels[index].clone();
                 let needs = vessel.crew.iter().flat_map(|crew| crew.needs.iter().cloned()).collect::<BTreeSet<_>>();
                 let mut one = WorkflowTemplateSpec { vessels: vec![vessel.clone()], ..workflow.clone() };
-                let (resolution, alternatives) = match self.decide_capability_placement(context, &one, &needs).await {
+                let (mut resolution, alternatives) = match self.decide_capability_placement(context, &one, &needs).await {
                     Ok(result) => result,
                     Err(error) if vessel.crew.len() > 1 => {
                         let split = vessel
@@ -1246,6 +1262,9 @@ impl ConvoyAdmission {
                     )
                     .await?;
                 }
+                if purpose == PlacementPurpose::Admission {
+                    self.join_placement_builds(namespace, &mut resolution).await?;
+                }
                 workflow.vessels[index] = one.vessels.remove(0);
                 if let Some(selected) = resolution.selected.as_ref() {
                     let decision = PlacementDecision {
@@ -1267,7 +1286,7 @@ impl ConvoyAdmission {
             first.expect("nonempty vessels")
         } else {
             let needs = workflow.vessels.iter().flat_map(|vessel| vessel.crew.iter()).flat_map(|crew| crew.needs.iter().cloned()).collect();
-            let result = self.decide_capability_placement(context, workflow, &needs).await?;
+            let mut result = self.decide_capability_placement(context, workflow, &needs).await?;
             if purpose == PlacementPurpose::Admission {
                 if has_kinds {
                     resolve_and_validate_workflow_credentials_for_capability_admission(
@@ -1290,6 +1309,9 @@ impl ConvoyAdmission {
                     )
                     .await?;
                 }
+            }
+            if purpose == PlacementPurpose::Admission {
+                self.join_placement_builds(namespace, &mut result.0).await?;
             }
             result
         };
@@ -3064,7 +3086,7 @@ pub(super) async fn validate_workflow_agent_adapters(
     allow_unready: bool,
 ) -> Result<(), String> {
     let required_adapters = required_workflow_agent_adapters(workflow)?;
-    // Resolve each candidate's image once, even for tool-only workflows.
+    // Validate each candidate's image or composition once, even for tool-only workflows.
     let capabilities = match placement {
         Some(policy) if !required_adapters.is_empty() || policy.spec.docker_per_vessel.is_some() => {
             Some(placement_agent_adapters(backend, namespace, policy, allow_unready).await?)
@@ -3528,6 +3550,7 @@ async fn freeze_admission_image(
     composition.baseline_image = baseline_image;
     if let DockerImageSource::Composition { composition: previous } = image {
         if composition.layers == previous.layers {
+            composition.build_refs = previous.build_refs.clone();
             if let Some(identity) = &previous.identity {
                 composition.bind(identity.clone())?;
             }
@@ -3543,8 +3566,17 @@ pub(super) async fn placement_agent_adapters(
     allow_unready: bool,
 ) -> Result<(BTreeSet<String>, String), String> {
     if let Some(docker) = &placement.spec.docker_per_vessel {
-        let image = docker.image.resolve(&backend.definitions(namespace)).await?;
-        Ok((docker.agent_adapters.clone(), format!("image `{image}`")))
+        // Adapter testimony is structural. Unbound compositions acquire their
+        // image identity after admission, through ImageBuild and verification.
+        let detail = match &docker.image {
+            flotilla_resources::DockerImageSource::Composition { composition }
+                if composition.identity.is_none() && composition.baseline_image.is_none() =>
+            {
+                format!("image composition based on `{}`", composition.selection.base)
+            }
+            _ => format!("image `{}`", docker.image.resolve(&backend.definitions(namespace)).await?),
+        };
+        Ok((docker.agent_adapters.clone(), detail))
     } else if placement.spec.host_direct.is_some() {
         let target_host = placement_target_host(backend, namespace, placement).await?;
         let host = authoritative_placement_host(backend, namespace, &target_host, &placement.metadata.name).await?;
