@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{FleetDesignation, Project, ProjectSpec, ResourceBackend, ResourceError, FLEET_DESIGNATION_NAME};
 
-/// One validated namespace snapshot shared by cascade, supervision and selectors.
+/// A namespace snapshot shared by cascade, supervision and selectors.
+/// `new` and `load` validate; `load_for_inspection` permits repair of invalid graphs.
 /// Ancestors are nearest-first; descendants are sorted and exclude the parent.
-/// Before bootstrap, absent designation leaves undeclared parents as roots.
+/// Before bootstrap, absent designation leaves omitted parents as roots.
 #[derive(Debug, Clone)]
 pub struct ProjectHierarchy {
     parents: BTreeMap<String, Option<String>>,
@@ -13,13 +14,30 @@ pub struct ProjectHierarchy {
 
 impl ProjectHierarchy {
     pub async fn load(backend: &ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
+        let hierarchy = Self::load_for_inspection(backend, namespace).await?;
+        Self::new(hierarchy.parents, hierarchy.fleet)
+    }
+
+    /// Read resolved edges without global validation, so operators can inspect
+    /// and repair a graph made invalid by concurrent federation. Ancestors still
+    /// report cycles or missing parents; descendants follow edges safely.
+    pub async fn load_for_inspection(backend: &ResourceBackend, namespace: &str) -> Result<Self, ResourceError> {
         let projects = backend.definitions::<Project>(namespace).list().await?;
         let fleet = match backend.definitions::<FleetDesignation>(namespace).get(FLEET_DESIGNATION_NAME).await {
             Ok(designation) => Some(designation.spec.project),
             Err(ResourceError::NotFound { .. }) => None,
             Err(error) => return Err(error),
         };
-        Self::new(projects.into_iter().map(|project| (project.metadata.name, project.spec.parent)).collect(), fleet)
+        let parents = projects
+            .into_iter()
+            .map(|project| {
+                let name = project.metadata.name;
+                let parent =
+                    if fleet.as_ref() == Some(&name) { project.spec.parent } else { project.spec.parent.or_else(|| fleet.clone()) };
+                (name, parent)
+            })
+            .collect();
+        Ok(Self { parents, fleet })
     }
 
     /// Build and validate a snapshot of declared parents. The fleet must be
@@ -72,19 +90,32 @@ impl ProjectHierarchy {
 
     pub fn descendants(&self, parent: &str) -> Result<Vec<String>, ResourceError> {
         self.parent(parent)?;
-        self.parents
-            .keys()
-            .filter(|name| name.as_str() != parent)
-            .filter_map(|name| match self.ancestors(name) {
-                Ok(ancestors) if ancestors.iter().any(|ancestor| ancestor == parent) => Some(Ok(name.clone())),
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect()
+        let mut children = BTreeMap::<&str, Vec<&str>>::new();
+        for (name, declared_parent) in &self.parents {
+            if let Some(parent) = declared_parent {
+                children.entry(parent).or_default().push(name);
+            }
+        }
+        let mut descendants = BTreeSet::new();
+        let mut pending = vec![parent.to_string()];
+        while let Some(current) = pending.pop() {
+            for name in children.get(current.as_str()).into_iter().flatten() {
+                if *name != parent && descendants.insert((*name).to_string()) {
+                    pending.push((*name).to_string());
+                }
+            }
+        }
+        Ok(descendants.into_iter().collect())
     }
 }
 
+pub(crate) fn is_hierarchy_kind(kind: &str) -> bool {
+    matches!(kind, "Project" | "FleetDesignation")
+}
+
 /// Validate the candidate against merged definitions before any authoring write.
+/// The generic DefinitionResolver erases the concrete spec through serde, as it
+/// already does for causal field merging; only these two registered kinds enter.
 pub(crate) async fn validate_hierarchy_write(
     backend: &ResourceBackend,
     namespace: &str,
@@ -92,9 +123,6 @@ pub(crate) async fn validate_hierarchy_write(
     name: &str,
     spec: serde_json::Value,
 ) -> Result<(), ResourceError> {
-    if kind != "Project" && kind != "FleetDesignation" {
-        return Ok(());
-    }
     let projects = backend.definitions::<Project>(namespace).list().await?;
     let mut declared = projects.into_iter().map(|project| (project.metadata.name, project.spec.parent)).collect::<BTreeMap<_, _>>();
     let mut fleet = match backend.definitions::<FleetDesignation>(namespace).get(FLEET_DESIGNATION_NAME).await {

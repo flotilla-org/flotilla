@@ -96,7 +96,7 @@ impl<T: Resource> DefinitionResolver<T> {
         ensure_definitions::<T>()?;
         let _hierarchy_admission = self.backend.hierarchy_admission(T::API_PATHS.kind).await;
         T::validate_spec(meta, spec)?;
-        if matches!(T::API_PATHS.kind, "Project" | "FleetDesignation") {
+        if crate::project_hierarchy::is_hierarchy_kind(T::API_PATHS.kind) {
             crate::project_hierarchy::validate_hierarchy_write(
                 &self.backend,
                 &self.namespace,
@@ -106,7 +106,9 @@ impl<T: Resource> DefinitionResolver<T> {
             )
             .await?;
         }
-        if T::VALIDATE_NAMESPACE_SPEC {
+        // Project hierarchy validation above already includes merged siblings;
+        // the embedded store still repeats local cycle checks atomically.
+        if T::VALIDATE_NAMESPACE_SPEC && !crate::project_hierarchy::is_hierarchy_kind(T::API_PATHS.kind) {
             // This pass includes merged replicas. Embedded stores repeat the local
             // check under their lock/transaction to serialize local admissions.
             // No-op reapplies intentionally refuse legacy overlaps until repaired.
@@ -219,7 +221,7 @@ impl<T: Resource> DefinitionResolver<T> {
         ensure_definitions::<T>()?;
         let _hierarchy_admission = self.backend.hierarchy_admission(T::API_PATHS.kind).await;
         if T::API_PATHS.kind == "Project" {
-            let hierarchy = crate::ProjectHierarchy::load(&self.backend, &self.namespace).await?;
+            let hierarchy = crate::ProjectHierarchy::load_for_inspection(&self.backend, &self.namespace).await?;
             if hierarchy.fleet() == Some(name) || !hierarchy.descendants(name)?.is_empty() {
                 return Err(ResourceError::invalid(format!("Project `{name}` is the fleet or has descendants; reparent before deleting")));
             }
@@ -282,6 +284,8 @@ impl<T: Resource> DefinitionResolver<T> {
     pub async fn update_metadata(&self, meta: &InputMeta) -> Result<ResourceObject<T>, ResourceError> {
         ensure_definitions::<T>()?;
         let _hierarchy_admission = self.backend.hierarchy_admission(T::API_PATHS.kind).await;
+        // The backend writes the read spec along with metadata. Serialize this
+        // read/write pair with reparenting to avoid restoring a stale parent.
         let current = self.get(&meta.name).await?;
         let merge = current.metadata.merge.clone().unwrap_or_else(|| MergeMetadata {
             fields: BTreeMap::new(),

@@ -541,7 +541,8 @@ impl ReadProjections<'_> {
         namespace: &str,
         now: DateTime<Utc>,
     ) -> Result<ProjectListResponse, String> {
-        let hierarchy = flotilla_resources::ProjectHierarchy::load(backend, namespace).await.map_err(|error| error.to_string())?;
+        let hierarchy =
+            flotilla_resources::ProjectHierarchy::load_for_inspection(backend, namespace).await.map_err(|error| error.to_string())?;
 
         let projects = backend.clone().definitions::<Project>(namespace).list().await.map_err(|error| error.to_string())?;
         let repositories = backend.clone().using::<Repository>(namespace).list().await.map_err(|error| error.to_string())?;
@@ -785,7 +786,8 @@ impl ReadProjections<'_> {
                 &right.resource.name,
             ))
         });
-        let hierarchy = flotilla_resources::ProjectHierarchy::load(self.backend, namespace).await.map_err(|error| error.to_string())?;
+        let hierarchy =
+            flotilla_resources::ProjectHierarchy::load_for_inspection(self.backend, namespace).await.map_err(|error| error.to_string())?;
         let fleet_project = hierarchy.fleet().map(|name| ResourceRef::new("flotilla.work/v1", "Project", namespace, name));
         Ok(FleetListResponse { fleet_project, rows, replicas, declaration_attention })
     }
@@ -2663,5 +2665,34 @@ mod project_hierarchy_projection_tests {
         assert!(root.parent.is_none());
         assert!(!product.is_fleet);
         assert_eq!(product.parent.as_deref(), Some("root"));
+        // An invalid incoming replica must stay visible so operators can repair
+        // it; one dangling edge must not suppress every Project list row.
+        let remote = ResourceBackend::InMemory(InMemoryBackend::default());
+        remote
+            .definitions::<Project>("flotilla")
+            .apply(
+                &InputMeta::builder().name("missing".into()).build(),
+                &ProjectSpec::builder().display_name("Missing".into()).default_workflow_ref("work".into()).build(),
+            )
+            .await
+            .unwrap();
+        remote
+            .using::<Project>("flotilla")
+            .create(
+                &InputMeta::builder().name("broken".into()).build(),
+                &ProjectSpec::builder().display_name("Broken".into()).default_workflow_ref("work".into()).parent("missing".into()).build(),
+            )
+            .await
+            .expect("incoming record");
+        let mut incoming = remote.using::<Project>("flotilla").list().await.unwrap();
+        incoming.items.retain(|project| project.metadata.name == "broken");
+        backend
+            .replica_writer::<Project>(flotilla_protocol::NodeId::new("remote"), "flotilla")
+            .replace(&incoming, chrono::Utc::now())
+            .await
+            .unwrap();
+        let response = ReadProjections::list_projects(&backend, "flotilla", chrono::Utc::now()).await.expect("repairable list");
+        assert_eq!(response.projects.len(), 3);
+        assert_eq!(response.projects.iter().find(|project| project.name == "broken").unwrap().parent.as_deref(), Some("missing"));
     }
 }

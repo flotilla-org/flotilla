@@ -1,4 +1,4 @@
-# 53. The fleet is the root Project: parent chain, three inheritance categories, repo-bound charter stores with bounded delegation, subscription-routed roles
+# 54. The fleet is the root Project: parent chain, three inheritance categories, repo-bound charter stores with bounded delegation, subscription-routed roles
 
 Date: 2026-10-05
 

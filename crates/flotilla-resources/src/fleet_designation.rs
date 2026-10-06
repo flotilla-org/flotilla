@@ -17,7 +17,7 @@ impl Resource for FleetDesignation {
 
     fn validate_spec(meta: &InputMeta, spec: &Self::Spec) -> Result<(), ResourceError> {
         if meta.name != FLEET_DESIGNATION_NAME || spec.project.trim().is_empty() {
-            return Err(ResourceError::invalid("FleetDesignation must be named fleet and reference a declared Project"));
+            return Err(ResourceError::invalid("FleetDesignation must be named fleet and have a nonempty Project name"));
         }
         Ok(())
     }

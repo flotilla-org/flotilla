@@ -56,4 +56,4 @@ responsibilities. This does not introduce image recipe resolution or rebuilds.
 
 ## Amendment
 
-[ADR 0053](0053-the-fleet-is-the-root-project.md) binds Definition charter authoring to a repository and branch head, with commit provenance and bounded delegation.
+[ADR 0054](0054-the-fleet-is-the-root-project.md) binds Definition charter authoring to a repository and branch head, with commit provenance and bounded delegation.

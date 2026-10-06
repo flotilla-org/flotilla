@@ -197,3 +197,72 @@ async fn designation_and_parent_writes_share_admission() {
         ProjectHierarchy::load(&backend, "flotilla").await.expect("valid hierarchy after race");
     }
 }
+
+// Federated admission is host-local: concurrent edits may form a merged cycle.
+// Strict loads surface it, while inspection and unrelated deletion remain usable;
+// reparenting one member repairs the graph. Exercise both embedded stores.
+#[tokio::test]
+async fn federated_invalid_graph_can_be_inspected_and_repaired() {
+    for target in [ResourceBackend::InMemory(InMemoryBackend::default()), ResourceBackend::Sqlite(SqliteBackend::open_in_memory().unwrap())]
+    {
+        let source = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("source"));
+        let target = target.with_local_root(NodeId::new("target"));
+        let a = InputMeta::builder().name("a".into()).build();
+        let b = InputMeta::builder().name("b".into()).build();
+        source.definitions::<Project>("test").apply(&a, &project(None)).await.unwrap();
+        target.definitions::<Project>("test").apply(&b, &project(None)).await.unwrap();
+        async fn replicate(from: &ResourceBackend, to: &ResourceBackend, root: &str) {
+            to.replica_writer::<Project>(NodeId::new(root), "test")
+                .replace(&from.using::<Project>("test").list().await.unwrap(), chrono::Utc::now())
+                .await
+                .unwrap();
+        }
+        replicate(&source, &target, "source").await;
+        replicate(&target, &source, "target").await;
+        target.definitions::<Project>("test").apply(&InputMeta::builder().name("unrelated".into()).build(), &project(None)).await.unwrap();
+        source.definitions::<Project>("test").apply(&a, &project(Some("b"))).await.unwrap();
+        target.definitions::<Project>("test").apply(&b, &project(Some("a"))).await.unwrap();
+        replicate(&source, &target, "source").await;
+        assert!(ProjectHierarchy::load(&target, "test").await.unwrap_err().to_string().contains("cycle"));
+        let inspection = ProjectHierarchy::load_for_inspection(&target, "test").await.unwrap();
+        assert_eq!(inspection.parent("a").unwrap(), Some("b"));
+        assert_eq!(inspection.descendants("a").unwrap(), ["b"]);
+        target.definitions::<Project>("test").delete("unrelated").await.expect("unrelated deletion remains available");
+        target.definitions::<Project>("test").apply(&b, &project(None)).await.expect("repair cycle");
+        assert_eq!(ProjectHierarchy::load(&target, "test").await.unwrap().ancestors("a").unwrap(), ["b"]);
+        // A remote disappearance leaves a dangling local child. It can be deleted
+        // without traversing the missing ancestor, restoring a valid graph.
+        source.definitions::<Project>("test").apply(&a, &project(None)).await.unwrap();
+        replicate(&source, &target, "source").await;
+        source.definitions::<Project>("test").delete("a").await.unwrap();
+        target.definitions::<Project>("test").apply(&b, &project(Some("a"))).await.unwrap();
+        replicate(&source, &target, "source").await;
+        assert!(ProjectHierarchy::load(&target, "test").await.unwrap_err().to_string().contains("not declared"));
+        target.definitions::<Project>("test").delete("b").await.expect("delete dangling child");
+        ProjectHierarchy::load(&target, "test").await.expect("repaired graph");
+    }
+}
+
+// Designation can be changed to another parentless Project or removed. Implicit
+// edges follow the new designation, and removal returns to the bootstrap forest.
+#[tokio::test]
+async fn designation_reassignment_and_deletion() {
+    for backend in
+        [ResourceBackend::InMemory(InMemoryBackend::default()), ResourceBackend::Sqlite(SqliteBackend::open_in_memory().unwrap())]
+    {
+        let projects = backend.definitions::<Project>("test");
+        for name in ["old", "new", "child"] {
+            projects.apply(&InputMeta::builder().name(name.into()).build(), &project(None)).await.unwrap();
+        }
+        let fleets = backend.definitions::<FleetDesignation>("test");
+        let meta = InputMeta::builder().name("fleet".into()).build();
+        for root in ["old", "new"] {
+            fleets.apply(&meta, &FleetDesignationSpec { project: root.into() }).await.unwrap();
+            assert_eq!(ProjectHierarchy::load(&backend, "test").await.unwrap().ancestors("child").unwrap(), [root]);
+            assert!(projects.delete(root).await.is_err());
+        }
+        fleets.delete("fleet").await.unwrap();
+        assert!(ProjectHierarchy::load(&backend, "test").await.unwrap().ancestors("child").unwrap().is_empty());
+        projects.delete("new").await.expect("former fleet is deletable");
+    }
+}
