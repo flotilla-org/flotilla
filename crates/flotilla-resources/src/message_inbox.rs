@@ -6,8 +6,8 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 
 use crate::{
-    apply_status_patch, InputMeta, Message, MessageExpectation, MessagePhase, MessageRelation, MessageSpec, MessageStatusPatch, Resource,
-    ResourceBackend, ResourceError, ResourceObject, TypedResolver,
+    apply_status_patch, InputMeta, Message, MessageExpectation, MessagePhase, MessageSpec, MessageStatusPatch, Resource, ResourceBackend,
+    ResourceError, ResourceObject, TypedResolver,
 };
 
 /// Creation context for convoy-relative role addresses.
@@ -54,6 +54,21 @@ pub fn qualify_message_address(address: &str, context: &MessageAddressContext) -
     Ok(qualified)
 }
 
+/// Ordinary resource mutations can qualify a relative receiver when the sender
+/// already carries its convoy context. Bare sender roles require accept_in_context.
+pub fn qualify_message_spec(mut spec: MessageSpec) -> Result<MessageSpec, ResourceError> {
+    validate_message_address(&spec.sender)?;
+    if let [project, convoy, vessel, _] = spec.sender.split('/').collect::<Vec<_>>().as_slice() {
+        spec.receiver = qualify_message_address(&spec.receiver, &MessageAddressContext {
+            project: (*project).into(),
+            convoy: (*convoy).into(),
+            vessel: (*vessel).into(),
+        })?;
+    }
+    validate_message_address(&spec.receiver)?;
+    Ok(spec)
+}
+
 #[derive(Debug, Clone)]
 pub enum MessageAdmission {
     Accepted(ResourceObject<Message>),
@@ -61,7 +76,9 @@ pub enum MessageAdmission {
 }
 
 /// Clones share the admission lock. The host keeps one inbox per namespace;
-/// cross-host senders call that home's ordinary resource mutation path.
+/// cross-host senders call that home's ordinary resource mutation path. The
+/// routing authority must have a single writer; this lock is process-local.
+/// Namespace inboxes live for the daemon lifetime and are reused by mutations.
 #[derive(Debug, Clone)]
 pub struct MessageInbox {
     messages: TypedResolver<Message>,
@@ -73,18 +90,36 @@ impl MessageInbox {
         Self { messages: backend.using::<Message>(namespace), admission: Arc::new(Mutex::new(())) }
     }
 
+    /// Qualify relative addresses with the sender's explicit creation context.
+    pub async fn accept_in_context(
+        &self,
+        meta: &InputMeta,
+        spec: &MessageSpec,
+        context: &MessageAddressContext,
+        now: DateTime<Utc>,
+    ) -> Result<MessageAdmission, ResourceError> {
+        let mut qualified = spec.clone();
+        qualified.sender = qualify_message_address(&qualified.sender, context)?;
+        qualified.receiver = qualify_message_address(&qualified.receiver, context)?;
+        self.accept(meta, &qualified, now).await
+    }
+
     pub async fn accept(&self, meta: &InputMeta, spec: &MessageSpec, now: DateTime<Utc>) -> Result<MessageAdmission, ResourceError> {
         let _guard = self.admission.lock().await;
         Message::validate_spec(meta, spec)?;
-        if spec.interrupting && spec.relation != MessageRelation::Supervisor {
-            return Err(ResourceError::invalid("only supervisor messages may interrupt an active turn"));
-        }
-        match self.messages.get(&meta.name).await {
-            Ok(existing) if existing.spec == *spec => return Ok(MessageAdmission::Accepted(existing)),
+        let partial = match self.messages.get(&meta.name).await {
+            Ok(existing) if existing.spec == *spec => {
+                // Status is written only after predecessor cleanup. A missing
+                // status is an unfinished admission, so replay must repair it.
+                if existing.status.is_some() {
+                    return Ok(MessageAdmission::Accepted(existing));
+                }
+                Some(existing)
+            }
             Ok(_) => return Err(ResourceError::conflict(&meta.name, "message ID already names different intent")),
-            Err(ResourceError::NotFound { .. }) => {}
+            Err(ResourceError::NotFound { .. }) => None,
             Err(error) => return Err(error),
-        }
+        };
         let existing = self.messages.list().await?.items;
         if let Some(id) = &spec.supersedes {
             let predecessor = existing
@@ -95,17 +130,29 @@ impl MessageInbox {
                 return Err(ResourceError::invalid("explicit supersession requires the same sender and receiver"));
             }
         }
-        let predecessors: Vec<_> = existing.iter().filter(|message| message_supersedes(spec, message)).collect();
+        let predecessors: Vec<_> = existing
+            .iter()
+            .filter(|message| {
+                message.metadata.name != meta.name
+                    && message_supersedes(spec, message)
+                    && partial.as_ref().is_none_or(|partial| message.metadata.creation_timestamp <= partial.metadata.creation_timestamp)
+            })
+            .collect();
         if let Some(predecessor) = predecessors.iter().find(|message| message_expectation_open(message)) {
+            if let Some(partial) = &partial {
+                apply_status_patch(&self.messages, &partial.metadata.name, &MessageStatusPatch::Finish {
+                    phase: MessagePhase::Superseded,
+                    reason: format!("suppressed by {}", predecessor.metadata.name),
+                    at: now,
+                })
+                .await?;
+            }
             return Ok(MessageAdmission::Suppressed { predecessor: (*predecessor).clone() });
         }
-        let message = self.messages.create(meta, spec).await?;
-        let status = crate::MessageStatus::builder()
-            .phase(MessagePhase::Accepted)
-            .since(message.metadata.creation_timestamp)
-            .reason("waiting for receiver resolution".into())
-            .build();
-        let message = self.messages.update_status(&meta.name, &message.metadata.resource_version, &status).await?;
+        let message = match partial {
+            Some(message) => message,
+            None => self.messages.create(meta, spec).await?,
+        };
         for predecessor in predecessors {
             let phase = predecessor.status.as_ref().map_or(MessagePhase::Accepted, |status| status.phase);
             if !phase.has_delivery_evidence() && !phase.is_terminal() {
@@ -117,6 +164,12 @@ impl MessageInbox {
                 .await?;
             }
         }
+        let status = crate::MessageStatus::builder()
+            .phase(MessagePhase::Accepted)
+            .since(message.metadata.creation_timestamp)
+            .reason("waiting for receiver resolution".into())
+            .build();
+        let message = self.messages.update_status(&meta.name, &message.metadata.resource_version, &status).await?;
         Ok(MessageAdmission::Accepted(message))
     }
 }
@@ -152,26 +205,43 @@ pub async fn resolve_message_receiver(
         // an address with no declared holder waits; never guess a terminal.
         _ => return Ok(None),
     };
+    let declared_convoy = if convoy.is_none() {
+        let declarations = backend.including_replicas::<crate::ConvoyEnsure>(namespace).list().await?.items;
+        let mut holders = declarations
+            .iter()
+            .filter(|declaration| declaration.object.spec.project_ref == project && declaration.object.spec.role == role);
+        let Some(declaration) = holders.next() else { return Ok(None) };
+        if holders.next().is_some() {
+            return Err(ResourceError::invalid("project role has multiple holder declarations"));
+        }
+        let Some(name) = declaration.object.status.as_ref().and_then(|status| status.convoy_ref.clone()) else { return Ok(None) };
+        Some(name)
+    } else {
+        None
+    };
     let mut candidates: Vec<_> = convoys
         .into_iter()
         .filter(|source| {
             let object = &source.object;
-            object.spec.project_ref.as_deref() == Some(project)
+            object.spec.project_ref.as_deref().unwrap_or(namespace) == project
                 && object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
-                && convoy.map_or(object.spec.role == role, |name| object.metadata.name == name)
+                && convoy.map_or_else(|| declared_convoy.as_ref() == Some(&object.metadata.name), |name| object.metadata.name == name)
         })
         .collect();
     candidates.sort_by_key(|source| std::cmp::Reverse(source.object.spec.generation));
     let Some(convoy) = candidates.first() else {
         return Ok(None);
     };
+    if candidates.get(1).is_some_and(|other| other.object.spec.generation == convoy.object.spec.generation) {
+        return Err(ResourceError::invalid("role address has multiple current convoy holders"));
+    }
     let terminals = backend.including_replicas::<TerminalSession>(namespace).list().await?.items;
     let mut holders = terminals
         .into_iter()
         .filter(|source| {
             let object = &source.object;
             object.metadata.labels.get(CONVOY_LABEL) == Some(&convoy.object.metadata.name)
-                && object.metadata.labels.get(ROLE_LABEL).is_some_and(|value| value == role)
+                && (vessel.is_none() || object.metadata.labels.get(ROLE_LABEL).is_some_and(|value| value == role))
                 && vessel.is_none_or(|vessel| object.metadata.labels.get(VESSEL_LABEL).is_some_and(|value| value == vessel))
                 && matches!(object.spec.source, TerminalSessionSource::Agent { .. })
         })

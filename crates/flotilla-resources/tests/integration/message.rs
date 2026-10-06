@@ -167,50 +167,60 @@ fn subject_supersession_follows_identity_and_expectation(tc: hegel::TestCase) {
     let same_receiver = tc.draw(gs::booleans());
     let has_subject = tc.draw(gs::booleans());
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    // The complete six-bit product guarantees identity collisions and open
+    // expectations in every generated run; draws vary their traversal order.
     runtime.block_on(async {
-        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
-        let resolver = backend.using::<Message>("flotilla");
-        let inbox = MessageInbox::new(backend, "flotilla");
-        let subject = has_subject.then(|| MessageReference::ChangeRequest {
-            service: "github".into(),
-            scope: "org/repo".into(),
-            number: 1,
-            revision: "head".into(),
-        });
-        let first_spec = spec(subject, if open { MessageExpectation::Reply } else { MessageExpectation::None });
-        inbox.accept(&InputMeta::builder().name("first".into()).build(), &first_spec, at(10)).await.expect("first");
-        if delivered {
-            flotilla_resources::apply_status_patch(&resolver, "first", &MessageStatusPatch::Delivered {
-                receiver: ResolvedMessageReceiver::builder()
-                    .crew_id("crew".into())
-                    .session("session".into())
-                    .delivered_at(at(20))
-                    .evidence("accepted".into())
-                    .build(),
-                at: at(20),
-            })
-            .await
-            .expect("deliver first");
+        for case in 0..64 {
+            let delivered = delivered ^ (case & 1 != 0);
+            let open = open ^ (case & 2 != 0);
+            let same_revision = same_revision ^ (case & 4 != 0);
+            let same_sender = same_sender ^ (case & 8 != 0);
+            let same_receiver = same_receiver ^ (case & 16 != 0);
+            let has_subject = has_subject ^ (case & 32 != 0);
+            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            let resolver = backend.using::<Message>("flotilla");
+            let inbox = MessageInbox::new(backend, "flotilla");
+            let subject = has_subject.then(|| MessageReference::ChangeRequest {
+                service: "github".into(),
+                scope: "org/repo".into(),
+                number: 1,
+                revision: "head".into(),
+            });
+            let first_spec = spec(subject, if open { MessageExpectation::Reply } else { MessageExpectation::None });
+            inbox.accept(&InputMeta::builder().name("first".into()).build(), &first_spec, at(10)).await.expect("first");
+            if delivered {
+                flotilla_resources::apply_status_patch(&resolver, "first", &MessageStatusPatch::Delivered {
+                    receiver: ResolvedMessageReceiver::builder()
+                        .crew_id("crew".into())
+                        .session("session".into())
+                        .delivered_at(at(20))
+                        .evidence("accepted".into())
+                        .build(),
+                    at: at(20),
+                })
+                .await
+                .expect("deliver first");
+            }
+            let mut second_spec = first_spec.clone();
+            second_spec.body = "replacement".into();
+            if !same_revision && has_subject {
+                let Some(MessageReference::ChangeRequest { revision, .. }) = &mut second_spec.subject else { unreachable!() };
+                *revision = "new-head".into();
+                second_spec.references = second_spec.subject.clone().into_iter().collect();
+            }
+            if !same_sender {
+                second_spec.sender = "flotilla/review".into();
+            }
+            if !same_receiver {
+                second_spec.receiver = "flotilla/convoy/work/reviewer".into();
+            }
+            let admission = inbox.accept(&InputMeta::builder().name("second".into()).build(), &second_spec, at(30)).await.expect("second");
+            let matches = has_subject && same_revision && same_sender && same_receiver;
+            assert_eq!(matches!(admission, MessageAdmission::Suppressed { .. }), matches && delivered && open);
+            let first = resolver.get("first").await.expect("first record");
+            assert_eq!(first.status.as_ref().is_some_and(|status| status.phase == MessagePhase::Superseded), matches && !delivered);
+            assert_eq!(resolver.list().await.expect("records").items.len(), if matches && delivered && open { 1 } else { 2 });
         }
-        let mut second_spec = first_spec.clone();
-        second_spec.body = "replacement".into();
-        if !same_revision && has_subject {
-            let Some(MessageReference::ChangeRequest { revision, .. }) = &mut second_spec.subject else { unreachable!() };
-            *revision = "new-head".into();
-            second_spec.references = second_spec.subject.clone().into_iter().collect();
-        }
-        if !same_sender {
-            second_spec.sender = "flotilla/review".into();
-        }
-        if !same_receiver {
-            second_spec.receiver = "flotilla/convoy/work/reviewer".into();
-        }
-        let admission = inbox.accept(&InputMeta::builder().name("second".into()).build(), &second_spec, at(30)).await.expect("second");
-        let matches = has_subject && same_revision && same_sender && same_receiver;
-        assert_eq!(matches!(admission, MessageAdmission::Suppressed { .. }), matches && delivered && open);
-        let first = resolver.get("first").await.expect("first record");
-        assert_eq!(first.status.as_ref().is_some_and(|status| status.phase == MessagePhase::Superseded), matches && !delivered);
-        assert_eq!(resolver.list().await.expect("records").items.len(), if matches && delivered && open { 1 } else { 2 });
     });
 }
 
@@ -373,6 +383,78 @@ async fn addresses_resolve_current_holders_after_replication() {
         )
         .await
         .expect("new holder");
+    assert!(resolve_message_receiver(&backend, "flotilla", "flotilla/coder").await.expect("undeclared role").is_none());
+    let declarations = backend.using::<flotilla_resources::ConvoyEnsure>("flotilla");
+    let declaration = declarations
+        .create(
+            &InputMeta::builder().name("coder-holder".into()).build(),
+            &flotilla_resources::ConvoyEnsureSpec::builder()
+                .project_ref("flotilla".into())
+                .role("coder".into())
+                .workflow_ref("workflow".into())
+                .repositories(Vec::new())
+                .build(),
+        )
+        .await
+        .expect("holder declaration");
+    let declaration = declarations.get(&declaration.metadata.name).await.expect("current declaration");
+    declarations
+        .update_status("coder-holder", &declaration.metadata.resource_version, &flotilla_resources::ConvoyEnsureStatus {
+            convoy_ref: Some("next-convoy".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("declared current holder");
     let holder = resolve_message_receiver(&backend, "flotilla", "flotilla/coder").await.expect("project role").expect("holder");
     assert_eq!(holder.object.metadata.name, "new-terminal");
+}
+
+// A crash after creating immutable intent must be repaired by retrying its ID:
+// initialise status and supersede the older pending subject exactly once.
+#[tokio::test]
+async fn retry_repairs_partial_admission_without_reviving_older_intent() {
+    use flotilla_resources::{MessageAdmission, MessageInbox};
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let messages = backend.using::<Message>("flotilla");
+    let inbox = MessageInbox::new(backend.clone(), "flotilla");
+    let intent = spec(
+        Some(MessageReference::ChangeRequest { service: "github".into(), scope: "owner/repo".into(), number: 1, revision: "head".into() }),
+        MessageExpectation::None,
+    );
+    inbox.accept(&InputMeta::builder().name("old".into()).build(), &intent, at(1)).await.unwrap();
+    messages.create(&InputMeta::builder().name("next".into()).build(), &intent).await.unwrap();
+    let MessageAdmission::Accepted(repaired) =
+        inbox.accept(&InputMeta::builder().name("next".into()).build(), &intent, at(2)).await.unwrap()
+    else {
+        panic!("accepted")
+    };
+    assert!(repaired.status.is_some());
+    assert_eq!(messages.get("old").await.unwrap().status.unwrap().phase, MessagePhase::Superseded);
+    inbox.accept(&InputMeta::builder().name("third".into()).build(), &intent, at(3)).await.unwrap();
+    inbox.accept(&InputMeta::builder().name("next".into()).build(), &intent, at(4)).await.unwrap();
+    assert_eq!(messages.get("third").await.unwrap().status.unwrap().phase, MessagePhase::Accepted);
+}
+
+// Explicit sender context qualifies both partial roles before persisting intent.
+#[tokio::test]
+async fn contextual_admission_qualifies_both_roles() {
+    use flotilla_resources::{MessageAddressContext, MessageAdmission, MessageInbox};
+    let inbox = MessageInbox::new(ResourceBackend::InMemory(InMemoryBackend::default()), "flotilla");
+    let mut intent = spec(None, MessageExpectation::None);
+    intent.sender = "reviewer".into();
+    intent.receiver = "coder".into();
+    let MessageAdmission::Accepted(record) = inbox
+        .accept_in_context(
+            &InputMeta::builder().name("relative".into()).build(),
+            &intent,
+            &MessageAddressContext { project: "project".into(), convoy: "convoy".into(), vessel: "work".into() },
+            at(1),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("admitted")
+    };
+    assert_eq!(record.spec.sender, "project/convoy/work/reviewer");
+    assert_eq!(record.spec.receiver, "project/convoy/work/coder");
 }

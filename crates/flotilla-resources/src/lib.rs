@@ -286,8 +286,8 @@ pub use message::{
     MessageSubmission, ResolvedMessageReceiver,
 };
 pub use message_inbox::{
-    message_expectation_open, message_supersedes, qualify_message_address, resolve_message_receiver, validate_message_address,
-    MessageAddressContext, MessageAdmission, MessageInbox,
+    message_expectation_open, message_supersedes, qualify_message_address, qualify_message_spec, resolve_message_receiver,
+    validate_message_address, MessageAddressContext, MessageAdmission, MessageInbox,
 };
 pub use workflow_template::{
     current_builtin_workflow_name, implement_review_workflow_spec, interactive_single_workflow_spec, single_agent_shepherd_workflow_spec,

@@ -5491,10 +5491,39 @@ impl InProcessDaemon {
     }
 
     async fn message_creation_origin(&self, namespace: &str, document: &serde_json::Value) -> Result<Option<NodeId>, String> {
-        let receiver = document
-            .pointer("/spec/receiver")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "Message requires a receiver address".to_string())?;
+        let namespace = document.pointer("/metadata/namespace").and_then(serde_json::Value::as_str).unwrap_or(namespace);
+        let spec = flotilla_resources::qualify_message_spec(
+            serde_json::from_value(document.get("spec").cloned().unwrap_or_default()).map_err(|error| format!("Message spec: {error}"))?,
+        )
+        .map_err(|error| error.to_string())?;
+        let receiver = spec.receiver.as_str();
+        let parts = receiver.split('/').collect::<Vec<_>>();
+        let receiver_convoy = if let [project, convoy_name, vessel, _role] = parts.as_slice() {
+            let convoy = self
+                .resource_backend
+                .including_replicas::<ResourceConvoy>(namespace)
+                .get(convoy_name)
+                .await
+                .map_err(|error| format!("receiver `{receiver}` has no admitted convoy: {error}"))?;
+            if convoy.object.spec.project_ref.as_deref().unwrap_or(namespace) != *project {
+                return Err(format!("receiver `{receiver}` does not belong to the convoy's project"));
+            }
+            if let Some(status) = &convoy.object.status {
+                if status.phase.is_terminal() {
+                    return Err(format!("receiver `{receiver}` names a terminal convoy"));
+                }
+                if status
+                    .workflow_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| !snapshot.vessels.iter().any(|declared| declared.name == *vessel))
+                {
+                    return Err(format!("receiver `{receiver}` names an undeclared vessel"));
+                }
+            }
+            Some(convoy)
+        } else {
+            None
+        };
         if let Some(holder) = flotilla_resources::resolve_message_receiver(&self.resource_backend, namespace, receiver)
             .await
             .map_err(|error| error.to_string())?
@@ -5506,17 +5535,7 @@ impl InProcessDaemon {
         }
         // An admitted vessel has a home before its agent starts. This lets its
         // messages wait at the receiver while a holder is absent or provisioning.
-        let parts = receiver.split('/').collect::<Vec<_>>();
-        if let [project, convoy_name, vessel, _role] = parts.as_slice() {
-            let convoy = self
-                .resource_backend
-                .including_replicas::<ResourceConvoy>(namespace)
-                .get(convoy_name)
-                .await
-                .map_err(|error| error.to_string())?;
-            if convoy.object.spec.project_ref.as_deref() != Some(*project) {
-                return Err(format!("receiver `{receiver}` does not belong to the convoy's project"));
-            }
+        if let (Some(convoy), [_, _, vessel, _]) = (receiver_convoy, parts.as_slice()) {
             if let Some(pin) = flotilla_resources::vessel_placement_pin(&convoy.object, vessel) {
                 let actuator = placement_actuator_host_ref(&self.resource_backend, namespace, &pin.decision.target_host).await?;
                 if self.canonical_local_host_id().as_ref() == Some(&actuator) {
@@ -5537,7 +5556,7 @@ impl InProcessDaemon {
                 ResourceProvenance::Replica { origin_root, .. } => origin_root,
             }));
         }
-        Ok(None)
+        Err(format!("receiver `{receiver}` has no declared home yet"))
     }
 
     pub async fn route_remote_attach_binding(&self, binding: &AttachBinding) -> Result<ResolvedAttachPlan, String> {
@@ -5712,6 +5731,8 @@ impl InProcessDaemon {
             .clone()
     }
 
+    /// Returns the canonical admitted record. Suppression returns its delivered
+    /// predecessor; the submitted successor name is not created.
     async fn apply_intent_document(
         &self,
         namespace: &str,
@@ -5727,6 +5748,7 @@ impl InProcessDaemon {
             .map_err(|error| ResourceError::decode(format!("message metadata: {error}")))?;
         let spec: MessageSpec = serde_json::from_value(document.get("spec").cloned().unwrap_or_default())
             .map_err(|error| ResourceError::decode(format!("message spec: {error}")))?;
+        let spec = flotilla_resources::qualify_message_spec(spec)?;
         let admission = self.message_inbox(namespace).await.accept(&meta, &spec, self.clock.now()).await?;
         let record = match admission {
             MessageAdmission::Accepted(record) => record,

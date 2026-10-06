@@ -22,9 +22,6 @@ impl Resource for Message {
         if spec.interrupting && spec.relation != MessageRelation::Supervisor {
             return Err(ResourceError::invalid("only supervisor messages may interrupt an active turn"));
         }
-        if spec.sender.is_empty() || spec.receiver.is_empty() {
-            return Err(ResourceError::invalid("message sender and receiver must be nonempty addresses"));
-        }
         if spec.subject.as_ref().is_some_and(|subject| !spec.references.contains(subject)) {
             return Err(ResourceError::invalid("message subject must be one of its references"));
         }
@@ -185,7 +182,8 @@ impl Default for MessageStatus {
     fn default() -> Self {
         Self {
             phase: MessagePhase::Accepted,
-            since: Utc::now(),
+            // An absent status has no evidence timestamp. Writers provide their clock.
+            since: DateTime::<Utc>::UNIX_EPOCH,
             reason: Some("waiting for receiver resolution".into()),
             resolved_receiver: None,
             retry: None,
