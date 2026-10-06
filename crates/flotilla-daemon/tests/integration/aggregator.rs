@@ -606,6 +606,7 @@ async fn running_convoyless_session_emits_attachable_independent_row() {
         .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
             phase: ResourceConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,

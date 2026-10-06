@@ -7134,6 +7134,7 @@ mod tests {
             .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Active,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
                     stall_nudges: Default::default(),
                     supervision: None,
                     exit: None,
@@ -9920,6 +9921,7 @@ mod tests {
             .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &flotilla_resources::ConvoyStatus {
                 provisioning: Some(ConvoyProvisioningState::Started { started_at: Utc::now() }),
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
                     vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
                     exit: None,
                     turn_delivery: Default::default(),
@@ -12034,6 +12036,7 @@ mod tests {
             .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Active,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
                     stall_nudges: Default::default(),
                     supervision: None,
                     exit: None,
@@ -12177,6 +12180,7 @@ mod tests {
             .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Active,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
                     stall_nudges: Default::default(),
                     supervision: None,
                     exit: None,
@@ -12265,6 +12269,7 @@ mod tests {
             .update_status(&unavailable_convoy.metadata.name, &unavailable_convoy.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Active,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
                     stall_nudges: Default::default(),
                     supervision: None,
                     exit: None,
@@ -12342,6 +12347,7 @@ mod tests {
             .update_status(&conflicting_convoy.metadata.name, &conflicting_convoy.metadata.resource_version, &ConvoyStatus {
                 phase: ConvoyPhase::Active,
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
                     stall_nudges: Default::default(),
                     supervision: None,
                     exit: None,
@@ -13563,6 +13569,7 @@ mod tests {
         let mut landing_status = ConvoyStatus {
             phase: ConvoyPhase::Landing,
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: Some(flotilla_resources::ExitDeclaration::standard_table()),

@@ -1394,6 +1394,7 @@ fn bootstrap_outcome(
     }
 
     let workflow_snapshot = WorkflowSnapshot {
+        cascade: template.spec.cascade.clone(),
         stall_nudges: template.spec.stall_nudges.clone(),
         supervision: template.spec.supervision.clone(),
         exit: template.spec.exit.clone(),

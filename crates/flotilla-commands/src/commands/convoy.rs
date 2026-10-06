@@ -398,6 +398,7 @@ impl ConvoyNoun {
                         context_repo: None,
                         action: CommandAction::ConvoyStart {
                             intent: Box::new(ConvoyStartIntent {
+                                standing_role: None,
                                 namespace: None,
                                 project_ref: project,
                                 change_request,
@@ -443,6 +444,7 @@ impl ConvoyNoun {
                             context_repo: None,
                             action: CommandAction::ConvoyStart {
                                 intent: Box::new(ConvoyStartIntent {
+                                    standing_role: None,
                                     namespace: None,
                                     project_ref: project_ref.clone(),
                                     change_request: None,
@@ -895,6 +897,7 @@ mod tests {
             resolved,
             CommandAction::ConvoyStart {
                 intent: Box::new(ConvoyStartIntent {
+                    standing_role: None,
                     namespace: None,
                     project_ref: "widgets".into(),
                     change_request: None,
@@ -930,6 +933,7 @@ mod tests {
             resolved,
             CommandAction::ConvoyStart {
                 intent: Box::new(ConvoyStartIntent {
+                    standing_role: None,
                     namespace: None,
                     project_ref: "flotilla".into(),
                     change_request: None,
@@ -960,6 +964,7 @@ mod tests {
             resolved,
             CommandAction::ConvoyStart {
                 intent: Box::new(ConvoyStartIntent {
+                    standing_role: None,
                     namespace: None,
                     project_ref: "flotilla".into(),
                     change_request: None,
@@ -999,6 +1004,7 @@ mod tests {
             resolved,
             CommandAction::ConvoyStart {
                 intent: Box::new(ConvoyStartIntent {
+                    standing_role: None,
                     namespace: None,
                     project_ref: "flotilla".into(),
                     change_request: Some("1071".into()),
@@ -1113,6 +1119,7 @@ mod tests {
         let Resolved::NeedsContext { command, .. } = resolved else { panic!("expected daemon command") };
         assert_eq!(command.action, CommandAction::ConvoyStart {
             intent: Box::new(ConvoyStartIntent {
+                standing_role: None,
                 namespace: None,
                 project_ref: "widgets".into(),
                 change_request: None,

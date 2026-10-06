@@ -105,6 +105,7 @@ impl InProcessDaemon {
             | A::RepositoryRemoteRemove { .. } => (TargetReason::RecordHome, RemoteDelivery::Command),
             A::ArchiveSession { .. } | A::TeleportSession { .. } => (TargetReason::CrewSessionHome, RemoteDelivery::Steps),
             A::QueryHostList { .. }
+            | A::QueryExplainProject { .. }
             | A::QueryProjectList { .. }
             | A::QueryCliList { .. }
             | A::QueryDispatchQueue { .. }

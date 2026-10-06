@@ -405,6 +405,7 @@ pub async fn build_plan(
         | CommandAction::QueryResolveRepository { .. }
         | CommandAction::QueryRepoProviders { .. }
         | CommandAction::QueryHostList {}
+        | CommandAction::QueryExplainProject { .. }
         | CommandAction::QueryProjectList {}
         | CommandAction::QueryCliList { .. }
         | CommandAction::QueryDispatchQueue { .. }

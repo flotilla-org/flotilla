@@ -63,6 +63,7 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
             phase: ConvoyPhase::Active,
             observed_workflow_ref: Some("scratch".into()),
             workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                cascade: None,
                 exit: None,
                 turn_delivery: Default::default(),
                 stall_nudges: Default::default(),

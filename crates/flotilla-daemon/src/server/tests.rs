@@ -1253,6 +1253,7 @@ async fn managed_hook_turns_update_attention_through_terminal_session() {
                     )]),
                 )]),
                 workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
                     vessels: workflow.vessels,
                     exit: None,
                     turn_delivery: Default::default(),
@@ -5194,6 +5195,7 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
         .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
             phase: ConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,

@@ -57,6 +57,8 @@ async fn declared_issue_source_does_not_hide_an_unavailable_member_repository() 
     let override_source = IssueSource { service: "linear".into(), scope: "WIDGET".into() };
     let project = ProjectSpec {
         charter: None,
+        role_definitions: BTreeMap::new(),
+        charter_prose: BTreeMap::new(),
         parent: None,
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
@@ -93,6 +95,8 @@ async fn project_issue_bindings_add_exclude_and_filter_derived_sources() {
     let forgejo_source = IssueSource { service: "https://forgejo.lab.flotilla.work".into(), scope: "fork-issues/zellij".into() };
     let project = ProjectSpec {
         charter: None,
+        role_definitions: BTreeMap::new(),
+        charter_prose: BTreeMap::new(),
         parent: None,
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
@@ -139,6 +143,8 @@ fn creatable_issue_binding_must_create_values_matching_its_filter() {
         .build();
     let spec = ProjectSpec {
         charter: None,
+        role_definitions: BTreeMap::new(),
+        charter_prose: BTreeMap::new(),
         parent: None,
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
@@ -160,6 +166,8 @@ fn creatable_issue_binding_must_create_values_matching_its_filter() {
 fn issue_bindings_reject_state_as_band_semantics() {
     let spec = ProjectSpec {
         charter: None,
+        role_definitions: BTreeMap::new(),
+        charter_prose: BTreeMap::new(),
         parent: None,
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
@@ -190,6 +198,8 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
     let repositories = backend.including_replicas::<Repository>("flotilla");
     let project = ProjectSpec {
         charter: None,
+        role_definitions: BTreeMap::new(),
+        charter_prose: BTreeMap::new(),
         parent: None,
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
@@ -255,6 +265,8 @@ async fn project_issue_source_uses_canonical_service_for_a_live_remote_alias() {
     let repositories = backend.including_replicas::<Repository>("flotilla");
     let project = ProjectSpec {
         charter: None,
+        role_definitions: BTreeMap::new(),
+        charter_prose: BTreeMap::new(),
         parent: None,
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
@@ -284,6 +296,8 @@ async fn project_issue_source_resolution_reports_typed_unavailability() {
     let repositories = backend.including_replicas::<Repository>("flotilla");
     let local_only = ProjectSpec {
         charter: None,
+        role_definitions: BTreeMap::new(),
+        charter_prose: BTreeMap::new(),
         parent: None,
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
@@ -310,6 +324,8 @@ async fn project_issue_source_resolution_reports_typed_unavailability() {
     let missing = RepositoryKey("missing".into());
     let unresolved = ProjectSpec {
         charter: None,
+        role_definitions: BTreeMap::new(),
+        charter_prose: BTreeMap::new(),
         parent: None,
         platform_matrix: Vec::new(),
         repositories: vec![ProjectRepositorySpec {
@@ -490,6 +506,8 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
     let repo_b = RepositoryKey("b".to_string());
     let normalized = normalize_project_spec(ProjectSpec {
         charter: None,
+        role_definitions: BTreeMap::new(),
+        charter_prose: BTreeMap::new(),
         parent: None,
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
@@ -528,6 +546,8 @@ fn project_normalization_sorts_entries_omits_whole_repo_subpath_and_rejects_dupl
 
     let duplicate = ProjectSpec {
         charter: None,
+        role_definitions: BTreeMap::new(),
+        charter_prose: BTreeMap::new(),
         parent: None,
         platform_matrix: Vec::new(),
         role_needs: Default::default(),
@@ -568,6 +588,8 @@ fn project_subpaths_reject_absolute_and_parent_traversal() {
     for subpath in ["/tmp/app", "apps/../../secret", "."] {
         let spec = ProjectSpec {
             charter: None,
+            role_definitions: BTreeMap::new(),
+            charter_prose: BTreeMap::new(),
             parent: None,
             platform_matrix: Vec::new(),
             role_needs: Default::default(),

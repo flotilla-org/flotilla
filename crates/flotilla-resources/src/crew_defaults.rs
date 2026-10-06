@@ -17,6 +17,12 @@ impl Resource for CrewDefaults {
     const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "crewdefaults", kind: "CrewDefaults" };
     const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Definitions;
     fn validate_spec(_meta: &InputMeta, spec: &Self::Spec) -> Result<(), ResourceError> {
+        crate::role_cascade::validate_role_definitions(&spec.roles)?;
+        for value in [&spec.project_ref, &spec.default_workflow_ref].into_iter().flatten() {
+            if value.trim().is_empty() {
+                return Err(ResourceError::invalid("CrewDefaults project/workflow must be nonempty"));
+            }
+        }
         for (role, refs) in &spec.skills {
             if role.is_empty() {
                 return Err(ResourceError::decode("skill role must be nonempty"));
@@ -30,10 +36,19 @@ impl Resource for CrewDefaults {
 }
 
 /// `*` applies to every role; named roles add to that fleet layer.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 #[serde(deny_unknown_fields)]
 pub struct CrewDefaultsSpec {
+    /// Omission is the legacy fleet-root layer. A name binds an ancestor layer.
     #[serde(default)]
+    pub project_ref: Option<String>,
+    #[serde(default)]
+    pub default_workflow_ref: Option<String>,
+    #[serde(default)]
+    #[builder(default)]
+    pub roles: BTreeMap<String, crate::RoleDefinition>,
+    #[serde(default)]
+    #[builder(default)]
     pub skills: BTreeMap<String, Vec<String>>,
 }
 
@@ -60,7 +75,7 @@ pub struct SkillDecision {
 }
 
 /// Closed cascade positions; serialized names preserve the explain contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkillLayer {
     #[serde(rename = "fleet")]
     Fleet,
@@ -72,6 +87,9 @@ pub enum SkillLayer {
     ProjectRole,
     #[serde(rename = "dispatch")]
     Dispatch,
+    /// Named parent-chain layer, including wildcard/role selection.
+    #[serde(rename = "cascade")]
+    Cascade { project: String, role: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,7 +149,7 @@ pub fn resolve_skills(catalog: &[SkillCatalogEntry], layers: &[(SkillLayer, Vec<
     for (layer, refs) in layers {
         for reference in refs {
             if validate_skill_ref(reference).is_err() {
-                return Err(SkillRefusal::Invalid { reference: reference.clone(), layer: *layer });
+                return Err(SkillRefusal::Invalid { reference: reference.clone(), layer: layer.clone() });
             }
             if let Some(removal) = reference.strip_prefix('-') {
                 let name = removal.rsplit('@').next().expect("nonempty reference");
@@ -142,7 +160,7 @@ pub fn resolve_skills(catalog: &[SkillCatalogEntry], layers: &[(SkillLayer, Vec<
                     selected.remove(name);
                 }
                 provenance.push(SkillDecision {
-                    layer: *layer,
+                    layer: layer.clone(),
                     reference: reference.clone(),
                     outcome: if removed { SkillOutcome::Removed } else { SkillOutcome::RemovalNotSelected },
                 });
@@ -153,21 +171,21 @@ pub fn resolve_skills(catalog: &[SkillCatalogEntry], layers: &[(SkillLayer, Vec<
                 .filter(|entry| reference == &entry.name || reference == &format!("{}@{}", entry.repository, entry.name))
                 .collect::<Vec<_>>();
             let entry = match matches.as_slice() {
-                [] => return Err(SkillRefusal::Missing { reference: reference.clone(), layer: *layer, sources: sources.clone() }),
+                [] => return Err(SkillRefusal::Missing { reference: reference.clone(), layer: layer.clone(), sources: sources.clone() }),
                 [entry] => (*entry).clone(),
-                _ => return Err(SkillRefusal::Ambiguous { reference: reference.clone(), layer: *layer, sources: sources.clone() }),
+                _ => return Err(SkillRefusal::Ambiguous { reference: reference.clone(), layer: layer.clone(), sources: sources.clone() }),
             };
             if let Some(previous) = selected.get(&entry.name) {
                 if previous != &entry {
                     return Err(SkillRefusal::Collision {
                         name: entry.name.clone(),
-                        layer: *layer,
+                        layer: layer.clone(),
                         references: vec![format!("{}@{}", previous.repository, previous.name), reference.clone()],
                     });
                 }
             }
             selected.insert(entry.name.clone(), entry);
-            provenance.push(SkillDecision { layer: *layer, reference: reference.clone(), outcome: SkillOutcome::Selected });
+            provenance.push(SkillDecision { layer: layer.clone(), reference: reference.clone(), outcome: SkillOutcome::Selected });
         }
     }
     Ok(ResolvedSkills { selected: selected.into_values().collect(), provenance })
@@ -288,6 +306,9 @@ mod tests {
         // Intended: roles share the fleet baseline, but code and governor differ;
         // a project can remove testing and dispatch can add review independently.
         let defaults = CrewDefaultsSpec {
+            project_ref: None,
+            default_workflow_ref: None,
+            roles: BTreeMap::new(),
             skills: BTreeMap::from([
                 ("*".into(), vec!["research".into()]),
                 ("coder".into(), vec!["implement".into(), "testing".into()]),
@@ -384,10 +405,23 @@ mod tests {
         let resolver = backend.definitions::<CrewDefaults>("flotilla");
         let meta = crate::InputMeta::builder().name("fleet".to_string()).build();
         assert!(resolver
-            .apply(&meta, &CrewDefaultsSpec { skills: BTreeMap::from([("*".into(), vec!["a/b@testing".into()])]) })
+            .apply(&meta, &CrewDefaultsSpec {
+                project_ref: None,
+                default_workflow_ref: None,
+                roles: BTreeMap::new(),
+                skills: BTreeMap::from([("*".into(), vec!["a/b@testing".into()])])
+            })
             .await
             .is_ok());
-        assert!(resolver.apply(&meta, &CrewDefaultsSpec { skills: BTreeMap::from([("*".into(), vec!["../bad".into()])]) }).await.is_err());
+        assert!(resolver
+            .apply(&meta, &CrewDefaultsSpec {
+                project_ref: None,
+                default_workflow_ref: None,
+                roles: BTreeMap::new(),
+                skills: BTreeMap::from([("*".into(), vec!["../bad".into()])])
+            })
+            .await
+            .is_err());
         let document = serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"CrewDefaults", "metadata":{"name":"fleet"}, "spec":{"skills":{"*": ["a/b@testing"]}}});
         crate::apply_manifest_resource_document(&backend, "flotilla", document).await.expect("manifest reconciler applies new kind");
         assert_eq!(resolver.get("fleet").await.expect("stored definition").spec.skills["*"], ["a/b@testing"]);
@@ -396,7 +430,12 @@ mod tests {
     fn every_registered_project_and_default_role_is_checked() {
         // Intended: a valid baseline does not mask an invalid project, nor does
         // an empty project list mask an invalid fleet role.
-        let defaults = CrewDefaultsSpec { skills: BTreeMap::from([("governor".into(), vec!["missing".into()])]) };
+        let defaults = CrewDefaultsSpec {
+            project_ref: None,
+            default_workflow_ref: None,
+            roles: BTreeMap::new(),
+            skills: BTreeMap::from([("governor".into(), vec!["missing".into()])]),
+        };
         assert!(
             matches!(check_skill_declarations(&[], &defaults, &[]), Err(SkillRefusal::Missing { layer, .. }) if layer == SkillLayer::Role)
         );

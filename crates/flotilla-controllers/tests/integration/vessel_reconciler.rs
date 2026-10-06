@@ -230,6 +230,7 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
         .using::<Convoy>(NAMESPACE)
         .update_status("convoy-scratch", &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,
@@ -617,6 +618,7 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         .using::<Convoy>(NAMESPACE)
         .update_status("convoy-multi", &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,
@@ -806,6 +808,7 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
         .using::<Convoy>(NAMESPACE)
         .update_status("convoy-multi-docker", &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,
@@ -1098,6 +1101,7 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
         .using::<Convoy>(NAMESPACE)
         .update_status("convoy-multi-fresh", &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,
@@ -1236,6 +1240,7 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         .using::<Convoy>(NAMESPACE)
         .update_status("convoy-scoped", &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,
@@ -2450,6 +2455,7 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
         .using::<Convoy>(NAMESPACE)
         .update_status("convoy-issue-brief", &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,
@@ -2863,6 +2869,7 @@ async fn create_convoy_with_labeled_processes(
     convoys
         .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,

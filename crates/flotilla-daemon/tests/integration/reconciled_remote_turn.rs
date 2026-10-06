@@ -99,6 +99,7 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
         .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
             phase: ConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 exit: Some(ExitDeclaration::Claim(ClaimExit)),
                 turn_delivery: Default::default(),
                 stall_nudges: Default::default(),

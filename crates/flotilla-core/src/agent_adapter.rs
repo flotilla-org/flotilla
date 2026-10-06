@@ -105,7 +105,7 @@ impl CrewBriefTemplateResolver {
         for repo_root in repo_roots {
             push_template_override(&mut overrides, repo_root.join(".flotilla").join(BRIEF_TEMPLATE_DIR).join(override_filename));
         }
-        CrewBriefRenderOptions { template: template.to_string(), overrides, fork_stance, has_credential_scope: false, is_standing: false }
+        CrewBriefRenderOptions { template: template.to_string(), overrides, fork_stance, ..CrewBriefRenderOptions::default() }
     }
 }
 
@@ -119,6 +119,9 @@ fn push_template_override(overrides: &mut Vec<CrewBriefTemplateOverride>, path: 
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrewBriefRenderOptions {
+    pub declared_template: Option<String>,
+    pub charter_prose: String,
+    pub charter_commit: Option<String>,
     pub template: String,
     pub overrides: Vec<CrewBriefTemplateOverride>,
     pub fork_stance: bool,
@@ -127,6 +130,24 @@ pub struct CrewBriefRenderOptions {
 }
 
 impl CrewBriefRenderOptions {
+    pub fn apply_cascade(&mut self, cascade: Option<&flotilla_resources::ResolvedCascade>, role: &str) {
+        let Some(cascade) = cascade else { return };
+        self.declared_template = cascade.roles.get(role).and_then(|definition| definition.brief_template.clone());
+        self.charter_prose = cascade
+            .charter
+            .get("*")
+            .into_iter()
+            .chain((role != "*").then(|| cascade.charter.get(role)).flatten())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.charter_commit = cascade.charter_commit.clone();
+        // Declared templates are authoritative over checkout/config overrides.
+        if self.declared_template.is_some() {
+            self.overrides.clear();
+        }
+    }
+
     /// The pinned exit declaration is the same signal used by convoy exit
     /// instantiation: an absent declaration keeps the convoy standing.
     fn for_convoy(mut self, convoy: &ResourceObject<Convoy>) -> Self {
@@ -139,6 +160,9 @@ impl CrewBriefRenderOptions {
 impl Default for CrewBriefRenderOptions {
     fn default() -> Self {
         Self {
+            declared_template: None,
+            charter_prose: String::new(),
+            charter_commit: None,
             template: DEFAULT_CREW_BRIEF_TEMPLATE.to_string(),
             overrides: Vec::new(),
             fork_stance: false,
@@ -161,6 +185,8 @@ struct CrewBriefTemplateContext<'a> {
     vessel: &'a str,
     vessel_ref: &'a str,
     assignment_text: &'a str,
+    charter_prose: &'a str,
+    charter_commit: Option<&'a str>,
     members: &'a [CrewBriefMember],
     handoff_members: Vec<&'a CrewBriefMember>,
     has_credential_scope: bool,
@@ -205,12 +231,21 @@ fn build_crew_brief_with_options(
         vessel,
         vessel_ref: &context.vessel_ref,
         assignment_text,
+        charter_prose: &options.charter_prose,
+        charter_commit: options.charter_commit.as_deref(),
         members,
         handoff_members: members.iter().filter(|member| member.is_agent && member.role != role).collect(),
         has_credential_scope: options.has_credential_scope,
         has_in_crew_reviewer: members.iter().any(|member| member.is_agent && member.role == "reviewer"),
         is_standing: options.is_standing,
     })?;
+    if !options.charter_prose.is_empty() || options.charter_commit.is_some() {
+        content.push_str("\n\n## Project charter\n\n");
+        if let Some(commit) = &options.charter_commit {
+            content.push_str(&format!("Charter revision: `{commit}`\n\n"));
+        }
+        content.push_str(&options.charter_prose);
+    }
     if !content.ends_with('\n') {
         content.push('\n');
     }
@@ -267,6 +302,12 @@ fn render_crew_brief_template(options: &CrewBriefRenderOptions, context: &CrewBr
         env.add_template_owned(name.clone(), source)
             .map_err(|err| format!("load crew brief template {}: {err}", template_override.path.display()))?;
         current_template = name;
+    }
+    if let Some(source) = &options.declared_template {
+        let name = "declared/role.md";
+        env.add_template_owned(name.to_string(), layered_override_source(&current_template, source))
+            .map_err(|err| format!("load declared role brief template: {err}"))?;
+        current_template = name.to_string();
     }
     if options.fork_stance {
         let name = format!("builtin/fork-stance/{}", options.template);
@@ -1452,6 +1493,9 @@ mod tests {
                 fork_stance: false,
                 has_credential_scope: false,
                 is_standing: false,
+                declared_template: None,
+                charter_prose: String::new(),
+                charter_commit: None,
             },
         )
         .expect("render selected template")
@@ -1485,6 +1529,9 @@ mod tests {
                 fork_stance: true,
                 has_credential_scope: false,
                 is_standing: false,
+                declared_template: None,
+                charter_prose: String::new(),
+                charter_commit: None,
             },
         )
         .expect("render fork review brief")
@@ -1517,6 +1564,9 @@ mod tests {
                 fork_stance: false,
                 has_credential_scope: true,
                 is_standing: false,
+                declared_template: None,
+                charter_prose: String::new(),
+                charter_commit: None,
             },
         )
         .expect("render shepherd brief")
@@ -1632,6 +1682,9 @@ mod tests {
                 fork_stance: false,
                 has_credential_scope: false,
                 is_standing: false,
+                declared_template: None,
+                charter_prose: String::new(),
+                charter_commit: None,
             },
         )
         .expect("render custom block-only template");
@@ -1769,6 +1822,7 @@ mod tests {
         let mut declared_exit = convoy.clone();
         declared_exit.status = Some(ConvoyStatus {
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: Some(ExitDeclaration::Claim(ClaimExit)),

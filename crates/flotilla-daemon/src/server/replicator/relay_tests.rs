@@ -206,6 +206,12 @@ async fn governor_relay_contract(storage: TestBackend) {
     assert_eq!(first_snapshot.allocation.len(), 1);
     let mut expected_snapshot = workflow.clone();
     expected_snapshot.allocation = first_snapshot.allocation.clone();
+    // Admission freezes local cascade inputs alongside the relayed workflow.
+    let cascade = first_snapshot.cascade.as_ref().expect("frozen cascade");
+    assert_eq!(cascade.project_chain, ["andamento"]);
+    assert_eq!(cascade.settings["workflow"].value, "governor");
+    assert_eq!(cascade.settings["workflow"].layer, "dispatch");
+    expected_snapshot.cascade = first_snapshot.cascade.clone();
     assert_eq!(first_snapshot, expected_snapshot);
 
     workflow.vessels[0].crew[0].source = CrewSource::Tool { command: "echo revised-governor".to_string() };
@@ -218,6 +224,7 @@ async fn governor_relay_contract(storage: TestBackend) {
     let result = admit_governor(udder).await;
     assert!(matches!(result, CommandValue::ConvoyStarted { .. }), "re-admission failed: {result:?}");
     expected_snapshot = workflow.clone();
+    expected_snapshot.cascade = first_snapshot.cascade.clone();
     expected_snapshot.allocation = first_snapshot.allocation;
     assert_eq!(governor_snapshot(udder).await.1, expected_snapshot, "re-admission must capture the newly relayed merge view");
 

@@ -74,7 +74,15 @@ pub struct SystemBriefArtifactWriter {
 
 #[async_trait]
 impl BriefArtifactWriter for SystemBriefArtifactWriter {
-    async fn put_brief(&self, namespace: &str, convoy: &str, role: &str, subject: &str, content: &[u8]) -> Result<String, String> {
+    async fn put_brief(
+        &self,
+        namespace: &str,
+        convoy: &str,
+        role: &str,
+        subject: &str,
+        content: &[u8],
+        charter_commit: Option<&str>,
+    ) -> Result<String, String> {
         let digest = self.blobs.put_with_media_type(content, "text/markdown").await?;
         let name = artifact_record_name(convoy, role, "brief", subject);
         let resolver = self.backend.using::<Artifact>(namespace);
@@ -92,6 +100,9 @@ impl BriefArtifactWriter for SystemBriefArtifactWriter {
             .convoy(convoy.to_string())
             .producer(role.to_string())
             .kind("brief".to_string())
+            .summary(
+                charter_commit.map(|commit| BTreeMap::from([("charter_commit".into(), serde_json::json!(commit))])).unwrap_or_default(),
+            )
             .subject(subject.to_string())
             .digest(digest.as_str().to_string())
             .size(content.len() as u64)
@@ -329,6 +340,7 @@ mod tests {
     use crate::blob_store::MemoryBlobStore;
 
     #[tokio::test]
+    // #2719: charter revision survives with the rendered artifact across homes.
     async fn brief_reprovisions_from_fleet_digest_after_convoy_reap() {
         let home_dir = tempfile::tempdir().expect("home state");
         let remote_dir = tempfile::tempdir().expect("remote state");
@@ -348,12 +360,14 @@ mod tests {
             .expect("create convoy");
         let writer = SystemBriefArtifactWriter { backend: backend.clone(), blobs: Arc::clone(&home_blobs), retention_days: 3650 };
         let body = b"# crew brief\nExact bytes survive another host.\n";
-        let digest = writer.put_brief(namespace, convoy, "coder", convoy, body).await.expect("write admission brief");
+        let digest =
+            writer.put_brief(namespace, convoy, "coder", convoy, body, Some("charter-revision")).await.expect("write admission brief");
         let artifact = backend
             .using::<Artifact>(namespace)
             .get(&artifact_record_name(convoy, "coder", "brief", convoy))
             .await
             .expect("brief envelope");
+        assert_eq!(artifact.spec.summary["charter_commit"], "charter-revision");
         assert_eq!(artifact.spec.subject, convoy);
         assert_eq!(artifact.spec.digest, digest);
         assert!(!artifact.metadata.owner_references[0].controller);

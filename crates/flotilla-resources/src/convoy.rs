@@ -1085,6 +1085,9 @@ pub struct TargetMismatch {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowSnapshot {
+    // Decode snapshots stored before #2719; remove default after one fleet roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cascade: Option<Box<crate::ResolvedCascade>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit: Option<ExitDeclaration>,
     #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]

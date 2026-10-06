@@ -428,6 +428,8 @@ pub struct ExplainedSettlement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyExplanation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cascade: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub environment_observations: std::collections::BTreeMap<String, crate::environment::EnvironmentRuntimeObservation>,
     pub namespace: String,
@@ -632,6 +634,9 @@ impl From<ConvoyAutoAttach> for ConvoyDispatchRegard {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ConvoyStartIntent {
+    /// Local standing-role presence selects its inherited workflow shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     pub project_ref: String,
@@ -1032,6 +1037,9 @@ pub enum CommandAction {
     },
     QueryHostList {},
     QueryProjectList {},
+    QueryExplainProject {
+        name: String,
+    },
     QueryCliList {
         kind: CliListKind,
     },
@@ -1148,6 +1156,7 @@ impl CommandAction {
             CommandAction::QueryResolveRepository { .. }
                 | CommandAction::QueryRepoProviders { .. }
                 | CommandAction::QueryHostList {}
+                | CommandAction::QueryExplainProject { .. }
                 | CommandAction::QueryProjectList {}
                 | CommandAction::QueryCliList { .. }
                 | CommandAction::QueryDispatchQueue { .. }
@@ -1225,6 +1234,7 @@ impl Command {
             CommandAction::QueryResolveRepository { .. } => "resolve repository identity",
             CommandAction::QueryRepoProviders { .. } => "query repo providers",
             CommandAction::QueryHostList {} => "query host list",
+            CommandAction::QueryExplainProject { .. } => "explain project",
             CommandAction::QueryProjectList {} => "query project list",
             CommandAction::QueryCliList { .. } => "query cli list",
             CommandAction::QueryDispatchQueue { .. } => "query dispatch queue",
@@ -1406,6 +1416,7 @@ pub enum CommandValue {
         lines: Vec<String>,
     },
     ConvoyExplanation(Box<ConvoyExplanation>),
+    ProjectExplanation(serde_json::Value),
     ResourceRead(Box<ResourceReadEnvelope>),
     ResourceObject(Box<ResourceJsonResponse>),
     ResourceDeleted(Box<ResourceJsonResponse>),

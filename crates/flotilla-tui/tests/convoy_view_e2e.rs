@@ -190,6 +190,7 @@ async fn generated_table_action_completes_work() {
         placement: None,
     });
     let snapshot = WorkflowSnapshot {
+        cascade: None,
         stall_nudges: Default::default(),
         supervision: None,
         exit: None,

@@ -147,18 +147,12 @@ impl ConvoyAdmission {
 impl ConvoyAdmission {
     async fn resolve_convoy_skills(
         &self,
-        namespace: &str,
-        project: &ProjectSpec,
+        cascade: &flotilla_resources::ResolvedCascade,
         intent: &flotilla_protocol::ConvoyStartIntent,
         workflow: &mut WorkflowTemplateSpec,
     ) -> Result<(), String> {
-        use flotilla_resources::{resolve_skills, skill_layers, CrewDefaults, CrewDefaultsSpec, SkillCatalogEntry};
-        let definitions = self.backend.definitions::<CrewDefaults>(namespace).list().await.map_err(|error| error.to_string())?;
-        if definitions.len() > 1 {
-            return Err("skill admission requires at most one CrewDefaults per namespace".to_string());
-        }
-        let defaults = definitions.first().map(|object| object.spec.clone()).unwrap_or_else(CrewDefaultsSpec::default);
-        let required = !defaults.skills.is_empty() || !project.skills.is_empty() || !intent.skills.is_empty();
+        use flotilla_resources::{resolve_skills, SkillCatalogEntry};
+        let required = cascade.skill_layers.iter().any(|(_, refs)| !refs.is_empty()) || !intent.skills.is_empty();
         let catalog: Vec<SkillCatalogEntry> = if required {
             let bundle =
                 self.discovery.env.get("FLOTILLA_SKILLS_DIR").ok_or_else(|| "skill admission requires FLOTILLA_SKILLS_DIR".to_string())?;
@@ -180,8 +174,8 @@ impl ConvoyAdmission {
         };
         for crew in workflow.roles.iter_mut().chain(workflow.vessels.iter_mut().flat_map(|vessel| &mut vessel.crew)) {
             if matches!(crew.source, CrewSource::Agent { .. }) {
-                crew.skills = resolve_skills(&catalog, &skill_layers(&defaults, &project.skills, &crew.role, &intent.skills))
-                    .map_err(|error| error.to_string())?;
+                crew.skills =
+                    resolve_skills(&catalog, &cascade.skills_for(&crew.role, &intent.skills)).map_err(|error| error.to_string())?;
             }
         }
         Ok(())
@@ -666,32 +660,95 @@ impl ConvoyAdmission {
         intent: &flotilla_protocol::ConvoyStartIntent,
         purpose: PlacementPurpose,
     ) -> Result<(String, WorkflowTemplateSpec), String> {
+        let mut cascade = flotilla_resources::ResolvedCascade::load(&self.backend, namespace, project_ref, project)
+            .await
+            .map_err(|error| error.to_string())?;
+        let inherited = cascade.workflow(intent.standing_role.as_deref()).clone();
         let mut workflow_ref = match intent.workflow_ref.as_deref() {
             Some(workflow_ref) => required_admission_value(workflow_ref, "workflow")?.to_string(),
             None if intent.change_request.is_some() => "single-agent-shepherd".to_string(),
-            None => project.default_workflow_ref.clone(),
+            None => inherited.value.clone(),
         };
+        let override_layer = if intent.standing_role.is_some() { "convoy:ensure" } else { "dispatch" };
+        cascade.set(
+            "workflow",
+            &workflow_ref,
+            if intent.workflow_ref.is_some() {
+                override_layer
+            } else if intent.change_request.is_some() {
+                "change-request"
+            } else {
+                &inherited.layer
+            },
+        );
         let templates = self.backend.definitions::<WorkflowTemplate>(namespace);
-        let scoped_workflow_ref = crate::ops_entry::materialized_workflow_name(project_ref, &workflow_ref);
-        let mut workflow = match templates.get(&scoped_workflow_ref).await {
-            Ok(workflow) => workflow,
-            Err(ResourceError::NotFound { .. }) => {
+        let owners = cascade.project_chain.iter().rev();
+        let mut found = None;
+        for owner in owners {
+            let scoped = crate::ops_entry::materialized_workflow_name(owner, &workflow_ref);
+            match templates.get(&scoped).await {
+                Ok(workflow) => {
+                    if workflow.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).is_some_and(|declared| declared != owner) {
+                        return Err(format!("workflow template {scoped} is materialized by another project"));
+                    }
+                    found = Some(workflow);
+                    break;
+                }
+                Err(ResourceError::NotFound { .. }) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        let mut workflow = match found {
+            Some(workflow) => workflow,
+            None => {
                 workflow_ref = flotilla_resources::current_builtin_workflow_name(&workflow_ref).to_string();
                 templates
                     .get(&workflow_ref)
                     .await
                     .map_err(|error| format!("workflow template {workflow_ref} for project {project_ref}: {error}"))?
             }
-            Err(error) => return Err(format!("workflow template {workflow_ref} for project {project_ref}: {error}")),
         };
-        if workflow.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).is_some_and(|owner| owner != project_ref) {
+        if workflow.metadata.annotations.get(MATERIALIZED_PROJECT_ANNOTATION).is_some_and(|owner| !cascade.project_chain.contains(owner)) {
             return Err(format!("workflow template {workflow_ref} is materialized by another project"));
         }
+        for crew in workflow.spec.roles.iter_mut().chain(workflow.spec.vessels.iter_mut().flat_map(|vessel| &mut vessel.crew)) {
+            if let CrewSource::Agent { selector, brief_template, .. } = &mut crew.source {
+                let definition = cascade.roles.get(&crew.role).cloned().unwrap_or_default();
+                for (field, target, default) in
+                    [("agent", &mut selector.adapter, &definition.agent), ("model", &mut selector.model, &definition.model)]
+                {
+                    if let Some(value) = target.as_ref() {
+                        cascade.set(&format!("roles.{}.{field}", crew.role), value, "convoy:workflow");
+                    } else {
+                        *target = default.clone();
+                    }
+                }
+                if let Some(template) = brief_template {
+                    cascade.set(&format!("roles.{}.brief_template", crew.role), template, "convoy:workflow");
+                    cascade.roles.entry(crew.role.clone()).or_default().brief_template = None;
+                }
+            }
+        }
         apply_agent_overrides(&mut workflow.spec, &intent.agent_overrides)?;
+        for crew in workflow.spec.roles.iter().chain(workflow.spec.vessels.iter().flat_map(|vessel| &vessel.crew)) {
+            if let CrewSource::Agent { selector, .. } = &crew.source {
+                if intent.agent_overrides.iter().any(|choice| choice.capability == selector.capability) {
+                    if let Some(agent) = &selector.adapter {
+                        cascade.set(&format!("roles.{}.agent", crew.role), agent, override_layer);
+                    }
+                    if let Some(model) = &selector.model {
+                        cascade.set(&format!("roles.{}.model", crew.role), model, override_layer);
+                    } else {
+                        cascade.settings.remove(&format!("roles.{}.model", crew.role));
+                    }
+                }
+            }
+        }
         if purpose == PlacementPurpose::Admission {
-            self.resolve_convoy_skills(namespace, project, intent, &mut workflow.spec).await?;
+            self.resolve_convoy_skills(&cascade, intent, &mut workflow.spec).await?;
             validate_fork_workflow_admission(&self.backend, namespace, repositories, &workflow_ref, &workflow.spec).await?;
         }
+        workflow.spec.cascade = Some(Box::new(cascade));
         Ok((workflow_ref, workflow.spec))
     }
 
@@ -1747,6 +1804,7 @@ impl ConvoyAdmission {
                     roots.clone(),
                     fork_stance,
                 );
+                options.apply_cascade(workflow.cascade.as_deref(), &process.role);
                 options.has_credential_scope = !requirement.credential_scopes.is_empty();
                 let context = TerminalCrewContext {
                     namespace: namespace.to_string(),
@@ -1768,7 +1826,7 @@ impl ConvoyAdmission {
                     &repository_refs,
                     &requirement.credential_scopes,
                 );
-                writer.put_brief(namespace, name, &process.role, name, brief.content.as_bytes()).await?;
+                writer.put_brief(namespace, name, &process.role, name, brief.content.as_bytes(), options.charter_commit.as_deref()).await?;
             }
         }
         Ok(true)
@@ -3473,7 +3531,7 @@ pub(super) fn apply_agent_overrides(
             }
         }
         let mut matched = false;
-        for crew in workflow.vessels.iter_mut().flat_map(|vessel| &mut vessel.crew) {
+        for crew in workflow.roles.iter_mut().chain(workflow.vessels.iter_mut().flat_map(|vessel| &mut vessel.crew)) {
             if let CrewSource::Agent { selector, .. } = &mut crew.source {
                 if selector.capability == choice.capability {
                     selector.adapter = Some(choice.adapter.clone());
@@ -3484,9 +3542,9 @@ pub(super) fn apply_agent_overrides(
         }
         if !matched {
             let available = workflow
-                .vessels
+                .roles
                 .iter()
-                .flat_map(|vessel| &vessel.crew)
+                .chain(workflow.vessels.iter().flat_map(|vessel| &vessel.crew))
                 .filter_map(|crew| match &crew.source {
                     CrewSource::Agent { selector, .. } => Some(selector.capability.as_str()),
                     CrewSource::Tool { .. } => None,
@@ -3786,6 +3844,9 @@ mod tests {
         )
         .await;
         let defaults = CrewDefaultsSpec {
+            project_ref: None,
+            default_workflow_ref: None,
+            roles: BTreeMap::new(),
             skills: BTreeMap::from([
                 ("*".into(), vec!["research".into()]),
                 ("coder".into(), vec!["testing".into(), "implement".into()]),
@@ -3839,6 +3900,82 @@ mod tests {
             .await
             .expect_err("missing import refuses admission");
         assert!(error.contains("missing") && error.contains("dispatch") && error.contains("owner/repo"), "{error}");
+    }
+
+    // #2719: real admission applies fleet/parent/project defaults before
+    // convoy selectors and dispatch; explain provenance names the winner.
+    #[tokio::test]
+    async fn admission_cascade_precedence_and_dispatch_are_frozen() {
+        use flotilla_resources::{FleetDesignation, FleetDesignationSpec, RoleDefinition};
+        let temp = tempfile::tempdir().expect("config");
+        std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"cascade-test\"\n").expect("machine identity");
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let daemon = InProcessDaemon::new_with_resource_backend(
+            Vec::new(),
+            Arc::new(ConfigStore::with_base(temp.path())),
+            fake_discovery(false),
+            HostName::new("cascade"),
+            backend.clone(),
+        )
+        .await;
+        let projects = backend.definitions::<Project>("flotilla");
+        let shape = |model: &str| {
+            BTreeMap::from([("coder".into(), RoleDefinition {
+                agent: Some("claude-code".into()),
+                model: Some(model.into()),
+                ..Default::default()
+            })])
+        };
+        let fleet = ProjectSpec::builder()
+            .display_name("Fleet".into())
+            .default_workflow_ref("shared-work".into())
+            .role_definitions(shape("fleet"))
+            .build();
+        projects.apply(&InputMeta::builder().name("fleet".into()).build(), &fleet).await.expect("fleet");
+        backend
+            .definitions::<FleetDesignation>("flotilla")
+            .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec { project: "fleet".into() })
+            .await
+            .expect("designation");
+        let templates = backend.definitions::<WorkflowTemplate>("flotilla");
+        let mut template = flotilla_resources::single_agent_workflow_spec();
+        let meta = InputMeta::builder()
+            .name("fleet--shared-work".into())
+            .annotations(BTreeMap::from([(MATERIALIZED_PROJECT_ANNOTATION.into(), "fleet".into())]))
+            .build();
+        templates.apply(&meta, &template).await.expect("inherited workflow");
+        for position in 0..5 {
+            let parent = ProjectSpec::builder()
+                .display_name("Parent".into())
+                .role_definitions(if position >= 1 { shape("parent") } else { BTreeMap::new() })
+                .build();
+            projects.apply(&InputMeta::builder().name("parent".into()).build(), &parent).await.expect("parent");
+            let child = ProjectSpec::builder()
+                .display_name("Child".into())
+                .parent("parent".into())
+                .role_definitions(if position >= 2 { shape("project") } else { BTreeMap::new() })
+                .build();
+            projects.apply(&InputMeta::builder().name("child".into()).build(), &child).await.expect("child");
+            if let CrewSource::Agent { selector, .. } = &mut template.vessels[0].crew[0].source {
+                selector.model = (position >= 3).then(|| "convoy".into());
+            }
+            templates.apply(&meta, &template).await.expect("convoy layer");
+            let intent = flotilla_protocol::ConvoyStartIntent::builder()
+                .project_ref("child".into())
+                .agent_overrides(if position == 4 { vec!["code=codex:dispatch".parse().expect("override")] } else { Vec::new() })
+                .build();
+            let (_, frozen) = daemon
+                .convoy_admission
+                .resolve_convoy_admission_workflow("flotilla", "child", &child, &[], &intent)
+                .await
+                .expect("admission");
+            let expected = ["fleet", "parent", "project", "convoy", "dispatch"][position];
+            let layer = ["project:fleet", "project:parent", "project:child", "convoy:workflow", "dispatch"][position];
+            let CrewSource::Agent { selector, .. } = &frozen.vessels[0].crew[0].source else { panic!("agent") };
+            assert_eq!(selector.model.as_deref(), Some(expected));
+            assert_eq!(frozen.cascade.as_ref().expect("provenance").settings["roles.coder.model"].layer, layer);
+            assert_eq!(selector.adapter.as_deref(), Some(if position == 4 { "codex" } else { "claude-code" }));
+        }
     }
 
     struct FakeQueryPort {

@@ -4586,6 +4586,7 @@ mod tests {
         let status = ConvoyStatus {
             phase: ResourceConvoyPhase::Active,
             workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
                 stall_nudges: Default::default(),
                 supervision: None,
                 exit: None,
@@ -5958,6 +5959,7 @@ mod tests {
             status: Some(ConvoyStatus {
                 phase: convoy_phase,
                 workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
                     stall_nudges: Default::default(),
                     supervision: None,
                     exit: None,

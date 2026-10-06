@@ -20,6 +20,8 @@ pub struct ProjectNoun {
 pub enum ProjectVerb {
     /// List projects and their view addresses
     List,
+    /// Explain inherited settings and their winning parent-chain layers
+    Explain { name: String },
     /// Add a whole-repository project from a local path or repository catalog slug
     Add {
         /// Local checkout path or repository catalog slug
@@ -57,6 +59,7 @@ pub enum ProjectVerb {
 impl ProjectNoun {
     pub fn resolve(self) -> Result<Resolved, String> {
         let action = match self.verb {
+            ProjectVerb::Explain { name } => CommandAction::QueryExplainProject { name },
             ProjectVerb::List => CommandAction::QueryProjectList {},
             ProjectVerb::Add { target, name, display_name, remote } => CommandAction::ProjectAdd { target, name, display_name, remote },
             ProjectVerb::Apply { name, file } => {
@@ -78,6 +81,7 @@ impl std::fmt::Display for ProjectNoun {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "project")?;
         match &self.verb {
+            ProjectVerb::Explain { name } => write!(f, " explain {}", quote_value(name))?,
             ProjectVerb::List => write!(f, " list")?,
             ProjectVerb::Add { target, name, display_name, remote } => {
                 write!(f, " add {}", quote_value(target))?;
@@ -152,6 +156,19 @@ mod tests {
     fn project_list_resolves_to_a_local_query() {
         let resolved = parse(&["project", "list"]).resolve().expect("resolve");
         crate::test_utils::assert_needs_context(resolved, CommandAction::QueryProjectList {}, RepoContext::None, HostResolution::Local);
+    }
+
+    // Glue: project explain is a local query with no repository context.
+    #[test]
+    fn project_explain_resolves_to_a_local_query() {
+        let noun = parse(&["project", "explain", "child"]);
+        assert_round_trip::<ProjectNoun>(&["project", "explain", "child"]);
+        crate::test_utils::assert_needs_context(
+            noun.resolve().expect("resolve"),
+            CommandAction::QueryExplainProject { name: "child".into() },
+            RepoContext::None,
+            HostResolution::Local,
+        );
     }
 
     #[test]

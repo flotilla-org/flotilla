@@ -63,6 +63,7 @@ struct EnsureBody {
     // Remove after the roll following this compatibility repair.
     #[serde(default, rename = "stance")]
     _retired_stance: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
     workflow: String,
     #[serde(default)]
     placement: Option<String>,
@@ -144,7 +145,8 @@ pub fn parse_operational_entry(contents: &str) -> Result<Option<OperationalEntry
             OperationalEntryDefinition::VerificationCommand { command: required(body.command, "command")? }
         }
         EntryKind::Ensure => {
-            let body: EnsureBody = serde_yml::from_str(body).map_err(|error| format!("invalid ensure entry `{name}`: {error}"))?;
+            let body: EnsureBody = serde_yml::from_str(if body.trim().is_empty() { "{}" } else { body })
+                .map_err(|error| format!("invalid ensure entry `{name}`: {error}"))?;
             let mut body = EnsureEntry {
                 driver: frontmatter.driver.map(|value| required(value, "driver")).transpose()?,
                 workflow: body.workflow,
@@ -153,7 +155,9 @@ pub fn parse_operational_entry(contents: &str) -> Result<Option<OperationalEntry
                 presents_as: body.presents_as,
                 agent_overrides: body.agents.into_iter().map(|token| token.parse()).collect::<Result<Vec<_>, _>>()?,
             };
-            body.workflow = required(body.workflow, "workflow")?;
+            if !body.workflow.is_empty() {
+                body.workflow = required(body.workflow, "workflow")?;
+            }
             body.placement = body.placement.map(|value| required(value, "placement")).transpose()?;
             body.escalation_reason = body.escalation_reason.map(|value| required(value, "escalation_reason")).transpose()?;
             body.presents_as = body.presents_as.map(|value| required(value, "presents_as")).transpose()?;
@@ -265,6 +269,19 @@ mod tests {
                 && presents_as == "fleet"
                 && agent_overrides.is_empty()
         ));
+    }
+
+    // #2719: standing declarations state presence and optional overrides.
+    #[test]
+    fn standing_presence_omits_workflow_but_preserves_explicit_overrides() {
+        for body in ["", "{}\n", "agents: [codex]\n"] {
+            let entry = parse_operational_entry(&format!("---\nkind: ensure\nrole: governor\n---\n{body}"))
+                .expect("parse presence")
+                .expect("entry");
+            let OperationalEntryDefinition::Ensure(ensure) = entry.definition else { panic!("ensure") };
+            assert!(ensure.workflow.is_empty());
+            assert_eq!(ensure.agent_overrides.len(), usize::from(body.contains("agents")));
+        }
     }
 
     #[test]

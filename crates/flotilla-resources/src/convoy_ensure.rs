@@ -29,6 +29,9 @@ pub struct ConvoyEnsureSpec {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver_ref: Option<String>,
+    /// Empty means resolve the standing role workflow through its parent chain.
+    #[builder(default)]
+    #[serde(default)]
     pub workflow_ref: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement_policy: Option<String>,
