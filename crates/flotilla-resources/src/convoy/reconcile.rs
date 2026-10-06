@@ -426,8 +426,35 @@ fn evaluate_declared_completion_condition(
         }
         CompletionCondition::ChangeRequest { field_path, operator, literal, optional_when_absent } => {
             let leaves = change_request_leaves()?;
-            if leaves.is_empty() && *optional_when_absent && expected_checkout_refs(convoy)?.is_empty() {
-                return Ok(None);
+            if leaves.is_empty() && *optional_when_absent {
+                let checkouts_expected = !expected_checkout_refs(convoy)?.is_empty();
+                // Discovery gets one observation freshness window by policy;
+                // keep its grace named separately from bound-record freshness.
+                let discovery_grace = stale_after;
+                let discovery_complete = convoy.status.as_ref().is_some_and(|status| {
+                    status.branch_subject_scan_error.is_none()
+                        && status.branch_subject_scan_at.is_some_and(|at| {
+                            at >= convoy.metadata.creation_timestamp
+                                && now.signed_duration_since(at).to_std().is_ok_and(|age| age <= stale_after)
+                        })
+                });
+                // An empty subject set is pending discovery only for one freshness
+                // window after admission. Do not reset this deadline on retries:
+                // failed or missing discovery must not make optional PRs mandatory.
+                // A subject discovered later always takes the ordinary bound path.
+                let discovery_expired =
+                    now.signed_duration_since(convoy.metadata.creation_timestamp).to_std().is_ok_and(|age| age >= discovery_grace);
+                if checkouts_expected && !discovery_complete && discovery_expired {
+                    tracing::debug!(
+                        convoy = %convoy.metadata.name,
+                        discovery_grace_seconds = discovery_grace.as_secs(),
+                        discovery_failed = convoy.status.as_ref().is_some_and(|status| status.branch_subject_scan_error.is_some()),
+                        "optional change-request completion condition satisfied after discovery grace expired"
+                    );
+                }
+                if !checkouts_expected || discovery_complete || discovery_expired {
+                    return Ok(None);
+                }
             }
             if leaves.is_empty() {
                 return Ok(Some(UnmetSettlementExpectation::CompletionConditionUnsatisfied {

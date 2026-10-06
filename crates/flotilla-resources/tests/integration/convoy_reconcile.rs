@@ -54,8 +54,12 @@ fn convoy_finalizer_renders_multiple_typed_waits_at_the_status_boundary() {
     assert!(reconciler.finalizer_error_patch(&convoy, &error).is_none(), "unchanged waits do not rewrite status");
 }
 
-#[test]
-fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr() {
+// Completion requires the role's ledger and every bound PR's readiness;
+// optional unbound PRs only hold completion during the discovery grace period.
+#[hegel::test]
+fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr(tc: hegel::TestCase) {
+    // Cover zero-length grace and both sides of variable discovery deadlines.
+    let grace = tc.draw(hegel::generators::integers::<i64>().min_value(0).max_value(600));
     let now = timestamp(100);
     let mut spec = task_provisioning_convoy_spec();
     spec.repositories[0].url = "https://github.com/flotilla-org/flotilla.git".to_string();
@@ -121,23 +125,107 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr() {
     artifacts.insert(ledger("coder").0, ledger("coder").1);
     let mut unbound = convoy.clone();
     unbound.spec.change_request = None;
-    let missing_binding = evaluate_crew_completion(
-        &unbound,
+    // #2734: a PR-less coder with a ledger can complete after bounded discovery,
+    // even when checkout work is expected. A later binding must still gate.
+    // Discovery grace intentionally equals the observation freshness window.
+    for elapsed in [0, grace.saturating_sub(1), grace, grace + 1] {
+        let unmet = evaluate_crew_completion(
+            &unbound,
+            flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
+            &checkouts,
+            &change_requests,
+            &artifacts,
+            Duration::from_secs(grace as u64),
+            timestamp(1 + elapsed),
+        )
+        .expect("evaluate unbound PR");
+        assert_eq!(unmet.is_empty(), elapsed >= grace, "discovery elapsed {elapsed}: {unmet:?}");
+    }
+    // No checkout work means no branch discovery is needed.
+    let mut no_checkouts = unbound.clone();
+    no_checkouts.spec.adopted_checkout_refs.clear();
+    assert!(evaluate_crew_completion(
+        &no_checkouts,
         flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
         &checkouts,
         &change_requests,
         &artifacts,
         Duration::from_secs(300),
-        now,
+        timestamp(1),
     )
-    .expect("evaluate unbound PR");
-    assert!(
-        missing_binding.iter().any(|expectation| matches!(
-            expectation,
-            UnmetSettlementExpectation::CompletionConditionUnsatisfied { subject, .. } if subject == "cr/unbound"
-        )),
-        "stock PR condition still requires a PR when checkout work is expected"
+    .expect("no checkout discovery")
+    .is_empty());
+    // A successful, fresh empty discovery scan establishes absence immediately;
+    // failed, stale, and future scans do not shorten the grace period.
+    for (scan_at, scan_error, absent) in [
+        (Some(timestamp(100)), None, true),
+        (Some(timestamp(100)), Some("discovery failed".to_string()), false),
+        (Some(timestamp(-300)), None, false),
+        (Some(timestamp(102)), None, false),
+    ] {
+        let mut scanned = unbound.clone();
+        let status = scanned.status.as_mut().expect("status");
+        status.branch_subject_scan_at = scan_at;
+        status.branch_subject_scan_error = scan_error;
+        assert_eq!(
+            evaluate_crew_completion(
+                &scanned,
+                flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
+                &checkouts,
+                &change_requests,
+                &artifacts,
+                Duration::from_secs(300),
+                timestamp(101),
+            )
+            .expect("scan evidence")
+            .is_empty(),
+            absent
+        );
+    }
+    // Discovery after absence was accepted still installs the ordinary PR gate.
+    let mut discovered = unbound.clone();
+    let address =
+        flotilla_protocol::LeafAddress::ChangeRequest { service: "github.com".into(), scope: "flotilla-org/flotilla".into(), number: 42 };
+    discovered.status.as_mut().expect("status").discover_subject(
+        flotilla_protocol::Subject::from_leaf(&address).expect("PR subject"),
+        flotilla_protocol::Relationship::Produces,
+        flotilla_resources::SubjectDiscoverySource::Branch,
+        timestamp(1000),
     );
+    assert!(!evaluate_crew_completion(
+        &discovered,
+        flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
+        &checkouts,
+        &change_requests,
+        &artifacts,
+        Duration::from_secs(300),
+        timestamp(1000),
+    )
+    .expect("late discovery")
+    .is_empty());
+    // An explicitly required unbound PR remains required after the deadline.
+    let mut required = unbound.clone();
+    let snapshot = required.status.as_mut().expect("status").workflow_snapshot.as_mut().expect("snapshot");
+    for condition in &mut snapshot.vessels[0].crew[0].completion_conditions {
+        if let flotilla_resources::CrewCompletionExpectation::Condition(flotilla_resources::CompletionCondition::ChangeRequest {
+            optional_when_absent,
+            ..
+        }) = condition
+        {
+            *optional_when_absent = false;
+        }
+    }
+    assert!(!evaluate_crew_completion(
+        &required,
+        flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
+        &checkouts,
+        &change_requests,
+        &artifacts,
+        Duration::from_secs(300),
+        timestamp(1000),
+    )
+    .expect("required unbound PR")
+    .is_empty());
     artifacts.insert(ledger("reviewer").0, ledger("reviewer").1);
     let reviewer = evaluate("reviewer", &change_requests, &artifacts);
     assert!(reviewer.is_empty(), "reviewer does not carry the coder's PR readiness obligation");
@@ -162,6 +250,31 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr() {
             mergeable: Observation::known(ObservedMergeability::Mergeable, now),
         }),
     };
+    // Late discovery gates on fresh readiness, rather than on discovery time.
+    for (state, ready) in [(ObservedChangeRequestState::Draft, false), (ObservedChangeRequestState::Open, true)] {
+        let mut late = record(state, ObservedChecks::Pass);
+        let status = late.status.as_mut().expect("late status");
+        status.state.observed_at = timestamp(1000);
+        status.head_sha.observed_at = timestamp(1000);
+        status.checks.observed_at = timestamp(1000);
+        status.review.actionable_at_head.observed_at = timestamp(1000);
+        status.mergeable.observed_at = timestamp(1000);
+        let late_records = BTreeMap::from([(record_name.clone(), late)]);
+        assert_eq!(
+            evaluate_crew_completion(
+                &discovered,
+                flotilla_resources::CrewCompletionClaim { vessel: "work", role: "coder" },
+                &checkouts,
+                &late_records,
+                &artifacts,
+                Duration::from_secs(300),
+                timestamp(1000),
+            )
+            .expect("late readiness")
+            .is_empty(),
+            ready
+        );
+    }
     change_requests.insert(record_name.clone(), record(ObservedChangeRequestState::Draft, ObservedChecks::Pass));
     assert!(evaluate("coder", &change_requests, &artifacts)
         .iter()
