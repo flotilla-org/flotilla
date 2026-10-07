@@ -1791,6 +1791,7 @@ mod tests {
                 merge: None,
             },
             spec: ConvoySpec {
+                continuation: None,
                 workflow_ref: "workflow".to_string(),
                 role: "work".to_string(),
                 generation: 1,

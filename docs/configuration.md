@@ -589,3 +589,29 @@ or treat the absence of a terminal as proof of non-submission. All hosts must pa
 keep stale authorities stopped so they cannot republish old queues. The crew's
 injected tests prove the gate and storage behavior; these host checks remain the
 operator's live acceptance step. Historical golden fixtures remain unchanged.
+
+## Continuing an existing branch or PR
+
+New convoys refuse occupied branch names by default. To deliberately continue
+existing work, opt in when starting its replacement convoy:
+
+```bash
+flotilla convoy start --project flotilla --continue-pr 2866 --workflow single-agent
+flotilla convoy start --project flotilla --continue-branch fix/wip --workflow single-agent
+```
+
+Continuation fetches the existing remote branch at its current tip, sets its
+upstream so crew pushes update it, and binds any existing open PR as `produces`.
+The crew must update that PR rather than opening a replacement; settlement
+waits for the existing PR. `--continue-pr` resolves the head and base from the
+forge. `--continue-branch` requires a single-repository Project and also works
+when the branch has no PR. Use `--workflow` to choose implementation work;
+PR-first starts otherwise select the shepherd workflow.
+
+Both options conflict with `--branch`, `--pr`, and each other. A live convoy
+holding the branch or PR refuses continuation. Terminal or deleted convoys
+release the binding. Merged/closed PRs refuse continuation; reopen a closed PR
+explicitly on the forge first. Continuation requires a remote branch: push WIP
+before dispatch. Git refuses an occupied physical worktree or local commits
+outside the remote history; preserve that work before retiring its checkout.
+See [recovery](development.md#rehydrating-work-after-host-loss).

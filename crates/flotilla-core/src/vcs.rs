@@ -727,6 +727,18 @@ pub trait Vcs: Send + Sync {
     ) -> Result<CheckoutMaterialisation, CheckoutMaterialisationError> {
         Err("checkout materialisation is unavailable".to_string().into())
     }
+    /// Explicitly continue the current remote tip; never create a fresh branch.
+    async fn continue_checkout(
+        &self,
+        _branch: &str,
+        _target: &str,
+        _reason: &str,
+    ) -> Result<CheckoutMaterialisation, CheckoutMaterialisationError> {
+        Err("branch continuation is unavailable".to_string().into())
+    }
+    async fn continue_fresh_clone(&self, _url: &str, _branch: &str, _target: &str) -> Result<CheckoutMaterialisation, String> {
+        Err("branch continuation is unavailable".into())
+    }
     async fn remove_materialised_checkout(&self, _branch: &str, _target: &str) -> Result<CheckoutRemoval, String> {
         Err("checkout removal is unavailable".into())
     }
@@ -1053,6 +1065,90 @@ impl Vcs for FlotillaVcs {
                 strategy.materialise_checkout(branch, base_ref, target).await.map_err(Into::into)
             }
         }
+    }
+
+    async fn continue_checkout(
+        &self,
+        branch: &str,
+        target: &str,
+        reason: &str,
+    ) -> Result<CheckoutMaterialisation, CheckoutMaterialisationError> {
+        if let GitCheckoutStrategy::ReferenceClone(strategy) = &self.strategy {
+            return self.continue_fresh_clone(strategy.remote_url().await?.trim(), branch, target).await.map_err(Into::into);
+        }
+        let cli = self.controller_cli();
+        if self.runner.path_exists(Path::new(target)).await? {
+            let mut recovered = cli.create_worktree(branch, None, target, reason).await?;
+            GitCliBackend::checkout_root(Path::new(target), &*self.runner)
+                .run(&["branch", "--set-upstream-to", &format!("origin/{branch}"), branch])
+                .await
+                .map_err(CheckoutMaterialisationError::Protection)?;
+            cli.delete_ref(&bootstrap_branch_ref(branch)).await.map_err(CheckoutMaterialisationError::Protection)?;
+            self.checkout_registration(target, CheckoutRegistration::Protect { reason })
+                .await
+                .map_err(CheckoutMaterialisationError::Protection)?;
+            recovered.provenance = CheckoutBranchProvenance::PreExisting;
+            return Ok(recovered);
+        }
+        // Fetch failure is fatal: continuation must never fall back to a stale tip.
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        cli.fetch("origin", &format!("+refs/heads/{branch}:{remote_ref}")).await?;
+        let local_ref = format!("refs/heads/{branch}");
+        if cli.ref_exists(&local_ref).await {
+            let ancestry = cli.output(&["merge-base", "--is-ancestor", &local_ref, &remote_ref]).await?;
+            if !ancestry.success() {
+                return Err(
+                    format!("local branch {branch} has commits outside the remote tip; preserve or push them before continuing").into()
+                );
+            }
+        }
+        // -B moves a stale, unoccupied local branch forward. Git still refuses
+        // any physical worktree holding it; never override that safety check.
+        cli.run(&["worktree", "add", "--lock", "--reason", reason, "-B", branch, target, &remote_ref]).await?;
+        let target_cli = GitCliBackend::checkout_root(Path::new(target), &*self.runner);
+        target_cli
+            .run(&["branch", "--set-upstream-to", &format!("origin/{branch}"), branch])
+            .await
+            .map_err(CheckoutMaterialisationError::Protection)?;
+        cli.delete_ref(&bootstrap_branch_ref(branch)).await.map_err(CheckoutMaterialisationError::Protection)?;
+        self.checkout_registration(target, CheckoutRegistration::Protect { reason })
+            .await
+            .map_err(CheckoutMaterialisationError::Protection)?;
+        Ok(CheckoutMaterialisation {
+            commit: Some(target_cli.head_commit_text().await?.trim().to_string()),
+            provenance: CheckoutBranchProvenance::PreExisting,
+        })
+    }
+
+    async fn continue_fresh_clone(&self, url: &str, branch: &str, target: &str) -> Result<CheckoutMaterialisation, String> {
+        if self.runner.path_exists(Path::new(target)).await? {
+            // Reuse validates origin and branch, preserving the crew's unpushed work.
+            return self.materialise_fresh_clone(url, branch, None, target).await;
+        }
+        let staging = format!("{target}.flotilla-clone-partial");
+        remove_worktree_path(&*self.runner, &staging).await?;
+        let prepare = async {
+            GitCliBackend::new(Path::new("/"), &*self.runner).clone_repo(url, &staging, Some(branch)).await?;
+            let cli = GitCliBackend::checkout_root(Path::new(&staging), &*self.runner);
+            // --branch can also select a tag; a continued branch must be remote-tracked.
+            let remote_ref = format!("refs/remotes/origin/{branch}");
+            if !cli.ref_exists(&remote_ref).await {
+                return Err(format!("remote branch {branch} does not exist"));
+            }
+            cli.run(&["branch", "--set-upstream-to", &format!("origin/{branch}"), branch]).await?;
+            cli.head_commit_text().await.map(|commit| commit.trim().to_string())
+        }
+        .await;
+        let commit = match prepare {
+            Ok(commit) => commit,
+            Err(error) => return Err(cleanup_clone_path(&*self.runner, &staging, error).await),
+        };
+        if let Err(error) =
+            self.runner.run("mv", &[&staging, target], Path::new("/"), &command_channel_label("mv", &[&staging, target])).await
+        {
+            return Err(cleanup_clone_path(&*self.runner, &staging, error).await);
+        }
+        Ok(CheckoutMaterialisation { commit: Some(commit), provenance: CheckoutBranchProvenance::PreExisting })
     }
 
     async fn remove_materialised_checkout(&self, branch: &str, target: &str) -> Result<CheckoutRemoval, String> {
@@ -2132,6 +2228,93 @@ mod tests {
         let mut vcs = FlotillaVcs::new(ExecutionEnvironmentPath::new(cwd), runner, strategy);
         vcs.explicit_checkout = explicit;
         vcs
+    }
+
+    // #2873: explicit continuation follows the current remote tip, configures
+    // pushes onto that branch, and preserves the branch on retry and teardown.
+    #[tokio::test]
+    async fn explicit_continuation_tracks_remote_tip_and_pushes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote");
+        std::fs::create_dir(&remote).expect("remote dir");
+        git(&remote, &["init", "--bare", "-b", "main"]);
+        let root = dir.path().join("clone");
+        git(dir.path(), &["clone", remote.to_str().expect("remote"), root.to_str().expect("clone")]);
+        git(&root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "initial"]);
+        git(&root, &["push", "origin", "main"]);
+        git(&root, &["switch", "-c", "continued"]);
+        git(&root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "old convoy"]);
+        git(&root, &["push", "origin", "continued"]);
+        git(&root, &["switch", "main"]);
+        // Advance the forge after the shared clone's tracking ref was cached.
+        let writer = dir.path().join("writer");
+        git(dir.path(), &["clone", "--branch", "continued", remote.to_str().expect("remote"), writer.to_str().expect("writer")]);
+        git(&writer, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "new remote tip"]);
+        git(&writer, &["push"]);
+        let runner: Arc<dyn CommandRunner> = Arc::new(crate::providers::ProcessCommandRunner);
+        let vcs = test_fl(&root, runner.clone(), true);
+        for fresh in [false, true] {
+            let advertised = GitCliBackend::new(&root, &*runner).remote_heads("origin", "refs/heads/continued").await.expect("tip");
+            let expected = advertised.split_whitespace().next().expect("remote SHA");
+            let target = dir.path().join(if fresh { "fresh" } else { "worktree" });
+            let target_str = target.to_str().expect("target");
+            let materialised = if fresh {
+                vcs.continue_fresh_clone(remote.to_str().expect("remote"), "continued", target_str).await.expect("continue clone")
+            } else {
+                vcs.continue_checkout("continued", target_str, "managed continuation").await.expect("continue worktree")
+            };
+            assert_eq!(materialised.commit.as_deref().map(str::trim), Some(expected.trim()));
+            assert_eq!(materialised.provenance, CheckoutBranchProvenance::PreExisting);
+            let backend = GitCliBackend::checkout_root(&target, &*runner);
+            assert_eq!(backend.head_upstream().await.expect("upstream").stdout.trim(), "origin/continued");
+            git(&target, &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "replacement crew",
+            ]);
+            git(&target, &["push"]);
+            let pushed = backend.head_commit_text().await.expect("pushed tip");
+            let remote_tip = backend.remote_heads("origin", "refs/heads/continued").await.expect("remote tip");
+            assert!(remote_tip.starts_with(pushed.trim()));
+            if !fresh {
+                let retry = vcs.continue_checkout("continued", target_str, "managed continuation").await.expect("retry");
+                assert_eq!(retry.commit.as_deref(), Some(pushed.trim()));
+                assert_eq!(retry.provenance, CheckoutBranchProvenance::PreExisting);
+            }
+            // Advance the expected tip for the next replacement checkout.
+            git(&root, &["fetch", "origin"]);
+        }
+        let occupied_target = dir.path().join("occupied-replacement");
+        assert!(
+            vcs.continue_checkout("continued", occupied_target.to_str().expect("path"), "managed").await.is_err(),
+            "a physical holder must be preserved"
+        );
+        assert!(!occupied_target.exists());
+        let missing = dir.path().join("missing");
+        assert!(vcs.continue_checkout("missing", missing.to_str().expect("path"), "managed").await.is_err());
+        assert!(!missing.exists(), "missing remote branch must not create local work");
+        let worktree = dir.path().join("worktree");
+        assert!(
+            matches!(
+                vcs.remove_materialised_checkout("continued", worktree.to_str().expect("path")).await.expect("cleanup"),
+                CheckoutRemoval::PreservedBranch { .. }
+            ),
+            "continued branches must survive teardown"
+        );
+        assert!(GitCliBackend::new(&root, &*runner).ref_exists("refs/heads/continued").await);
+        git(&root, &["switch", "continued"]);
+        git(&root, &["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "unpushed rescue"]);
+        git(&root, &["switch", "main"]);
+        let divergent = dir.path().join("divergent");
+        let error =
+            vcs.continue_checkout("continued", divergent.to_str().expect("path"), "managed").await.err().expect("preserve divergence");
+        assert!(error.to_string().contains("commits outside the remote tip"));
+        assert!(!divergent.exists());
     }
 
     // #2698: a new convoy checkout must refuse an existing branch, whether

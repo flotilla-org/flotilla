@@ -1320,6 +1320,7 @@ mod tests {
             .clone()
             .using::<Convoy>(NAMESPACE)
             .create(&InputMeta::builder().name("human-dispatch".to_string()).build(), &ConvoySpec {
+                continuation: None,
                 subjects: Vec::new(),
                 role: String::new(),
                 generation: 1,
@@ -1405,6 +1406,7 @@ mod tests {
             .clone()
             .using::<Convoy>(NAMESPACE)
             .create(&InputMeta::builder().name("missing-workflow-dispatch".to_string()).build(), &ConvoySpec {
+                continuation: None,
                 subjects: Vec::new(),
                 role: String::new(),
                 generation: 1,

@@ -631,6 +631,7 @@ mod tests {
 
     fn convoy_spec() -> ConvoySpec {
         ConvoySpec {
+            continuation: None,
             subjects: Vec::new(),
             role: String::new(),
             generation: 1,

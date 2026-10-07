@@ -42,6 +42,8 @@ pub fn vessel_placement_pin(convoy: &ResourceObject<Convoy>, vessel: &str) -> Op
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct ConvoySpec {
+    /// Repository explicitly continued at admission. Other members use fresh branches.
+    pub continuation: Option<RepositoryKey>,
     pub workflow_ref: String,
     /// Stable human-facing role within `project_ref`.
     #[builder(default)]
@@ -202,6 +204,10 @@ pub fn subject_relationship_conflicts(convoy: &ResourceObject<Convoy>) -> Vec<Su
 /// fields. Remove those two read-only fields after the next fleet roll.
 #[derive(Serialize, Deserialize)]
 struct ConvoySpecRecord {
+    // N→N+1: this decoder default can be removed one roll after #2873.
+    // The optional intent is absent for fresh provisioning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continuation: Option<RepositoryKey>,
     workflow_ref: String,
     #[serde(default)]
     role: String,
@@ -262,13 +268,10 @@ impl ConvoySpec {
                 .ok_or_else(|| format!("bound change request repository {} is absent from convoy", bound.repository_ref))?;
             let subject =
                 Subject::from_leaf(&change_request_address(&repository.url, &bound.id)?).expect("change request address is a subject");
-            if !subjects.iter().any(|entry| entry.subject == subject && entry.relationship == Relationship::Adopts) {
-                subjects.push(DeclaredSubject {
-                    subject,
-                    relationship: Relationship::Adopts,
-                    issue: None,
-                    change_request: Some(bound.clone()),
-                });
+            let relationship =
+                if self.continuation.as_ref() == Some(&bound.repository_ref) { Relationship::Produces } else { Relationship::Adopts };
+            if !subjects.iter().any(|entry| entry.subject == subject && entry.relationship == relationship) {
+                subjects.push(DeclaredSubject { subject, relationship, issue: None, change_request: Some(bound.clone()) });
             }
         }
         Ok(subjects)
@@ -279,6 +282,7 @@ impl Serialize for ConvoySpec {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::Error as _;
         ConvoySpecRecord {
+            continuation: self.continuation.clone(),
             workflow_ref: self.workflow_ref.clone(),
             role: self.role.clone(),
             generation: self.generation,
@@ -302,6 +306,7 @@ impl<'de> Deserialize<'de> for ConvoySpec {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let record = ConvoySpecRecord::deserialize(deserializer)?;
         let mut spec = Self {
+            continuation: record.continuation,
             workflow_ref: record.workflow_ref,
             role: record.role,
             generation: record.generation,

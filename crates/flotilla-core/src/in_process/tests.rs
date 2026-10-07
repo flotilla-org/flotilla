@@ -10628,3 +10628,53 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     assert_eq!(providers[0].issue_calls.load(Ordering::SeqCst), 6);
     assert_eq!(providers[1..].iter().map(|p| p.issue_calls.load(Ordering::SeqCst)).sum::<usize>(), 3);
 }
+
+// #2873: fresh forge facts accept only open/draft continuation; a PR-free
+// branch is valid, terminal requests require explicit reopening on the forge.
+#[tokio::test]
+async fn continuation_resolves_branch_without_pr_and_refuses_terminal_pr() {
+    use flotilla_protocol::{ChangeRequestStatus, ConvoyContinuation};
+    let fixture = rest_admission_fixture([RestAdmissionReply::Absent; 2], RestAdmissionLookup::Branch).await;
+    let repository = ConvoyRepositorySpec {
+        repo_ref: fixture.keys[0].clone(),
+        url: "https://github.com/team/repo0".into(),
+        source_ref: "main".into(),
+        target_ref: "main".into(),
+        workspace_slug: "repo0".into(),
+        subpaths: vec![],
+    };
+    let (key, branch, request) = fixture
+        .daemon
+        .convoy_admission
+        .resolve_continuation(std::slice::from_ref(&repository), &ConvoyContinuation::Branch("wip".into()))
+        .await
+        .expect("WIP continuation");
+    assert_eq!(key, fixture.keys[0]);
+    assert_eq!(branch, "wip");
+    assert!(request.is_none());
+    for status in [ChangeRequestStatus::Merged, ChangeRequestStatus::Closed] {
+        let provider = Arc::new(FakeChangeRequest::new());
+        provider
+            .add_change_requests(vec![("7".into(), ChangeRequest {
+                title: "Old PR".into(),
+                branch: "wip".into(),
+                status,
+                body: None,
+                provider_name: "fake".into(),
+                provider_display_name: "Fake".into(),
+            })])
+            .await;
+        fixture.daemon.convoy_admission.repository_change_requests.write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
+            provider;
+        for input in [ConvoyContinuation::Branch("wip".into()), ConvoyContinuation::ChangeRequest("7".into())] {
+            let error = fixture
+                .daemon
+                .convoy_admission
+                .resolve_continuation(std::slice::from_ref(&repository), &input)
+                .await
+                .err()
+                .expect("terminal refusal");
+            assert!(error.contains("reopen"), "{error}");
+        }
+    }
+}
