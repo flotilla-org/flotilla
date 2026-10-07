@@ -156,6 +156,17 @@ class Contract(unittest.TestCase):
                 self.assertIn('stdout: ' + stdout, str(error.exception))
                 self.assertIn('stderr: ' + stderr, str(error.exception))
 
+    # An early setup failure must remain visible even before daemon.log exists.
+    def test_real_setup_failure_preserves_original_error(self):
+        spec = importlib.util.spec_from_file_location('real_canary', Path(__file__).with_name('test-fleet-canary-real.py'))
+        real = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(real)
+        with patch.object(os.sys, 'argv', ['test', '/unused/flotilla', '/unused/flotillad']), \
+                patch.object(real.canary.Canary, 'prepare', side_effect=OSError('original setup failure')), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(OSError, 'original setup failure'):
+                real.main()
+
     # No active daemon, service or generation link may be used by the probe.
     # A successful run observes Running before completion and reaps only its own resources.
     def test_isolated_launch_baseline_completion_and_reaping(self):

@@ -14,7 +14,7 @@ spec.loader.exec_module(canary)
 
 
 def main():
-    binaries = Path(sys.argv[1]).resolve()
+    binaries = dict(zip(('flotilla', 'flotillad'), map(lambda path: Path(path).resolve(), sys.argv[1:])))
     source = Path(__file__).resolve().parent.parent
     # The production socket uses a short /tmp path regardless of TMPDIR.
     with tempfile.TemporaryDirectory(prefix='canary-test.', dir='/tmp') as directory:
@@ -22,7 +22,7 @@ def main():
         release = root / 'release'
         (release / 'bin').mkdir(parents=True)
         for binary in ('flotilla', 'flotillad'):
-            (release / 'bin' / binary).symlink_to(binaries / binary)
+            (release / 'bin' / binary).symlink_to(binaries[binary])
         # Refuse the Docker process boundary if reconciliation races admission.
         # CI may have Docker installed; this test must never launch a container.
         docker = release / 'bin/docker'
@@ -60,16 +60,27 @@ def main():
                 gate.prepare()
                 convoys = gate.list('convoys')
                 assert len(convoys) == 1, convoys
+                # The daemon materializes the shared Rust default for a reference
+                # policy with no memory override. Compare all fields, without a Python literal.
+                gate.apply('PlacementPolicy', 'memory-default', {
+                    'pool': 'cleat', 'docker_per_vessel': {
+                        'host_ref': gate.list('hosts')[0]['metadata']['name'],
+                        'image': {'image_baseline_ref': 'fleet-crew'},
+                        'checkout': {'worktree_on_host_and_mount': {'mount_path': '/workspace'}}}})
                 policy = gate.list('placementpolicies')
                 authored = next(item for item in policy if item['metadata']['name'] == 'fleet-canary')
-                assert authored['spec']['docker_per_vessel']['memory_policy']['host_memory_percent'] > 0
+                default = next(item for item in policy if item['metadata']['name'] == 'memory-default')
+                assert authored['spec']['docker_per_vessel']['memory_policy'] == default['spec']['docker_per_vessel']['memory_policy']
                 # A real clone proves the recorded transport is usable, not just syntactically accepted.
                 remote = subprocess.check_output(['git', '-C', str(probe / 'repository'),
                                                   'remote', 'get-url', 'origin'], text=True).strip()
                 commands.run(['git', 'clone', remote, str(root / 'clone')])
                 assert (root / 'clone/.flotilla/fleet-canary-agent.sh').is_file()
             except Exception:
-                print((probe / 'daemon.log').read_text(), file=sys.stderr)
+                try:
+                    print((probe / 'daemon.log').read_text(), file=sys.stderr)
+                except OSError as error:
+                    print(f'canary daemon log unavailable: {error}', file=sys.stderr)
                 raise
             finally:
                 gate.stop()
