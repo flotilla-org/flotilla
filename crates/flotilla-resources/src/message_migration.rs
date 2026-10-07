@@ -1,10 +1,10 @@
 //! Translate ephemeral crew-command inputs into receiver-homed Message intents.
+#[cfg(any(test, feature = "test-support"))]
 use chrono::{DateTime, Utc};
 
-use crate::{
-    Convoy, CrewMessageSender, InputMeta, MessageInbox, MessageRelation, MessageSpec, ResourceError, ResourceObject, TerminalCrewMessage,
-    TerminalSession, TypedResolver, CONVOY_LABEL, VESSEL_LABEL,
-};
+#[cfg(any(test, feature = "test-support"))]
+use crate::{Convoy, InputMeta, MessageInbox, ResourceError, ResourceObject, TerminalSession, TypedResolver, CONVOY_LABEL, VESSEL_LABEL};
+use crate::{CrewMessageSender, MessageRelation, MessageSpec, TerminalCrewMessage};
 
 /// Map crew-command sender attribution to a Message address and relation.
 pub fn legacy_message_sender(sender: &CrewMessageSender) -> (String, MessageRelation) {
@@ -63,6 +63,7 @@ pub fn legacy_message_spec(receiver: &str, message: &TerminalCrewMessage) -> Mes
     MessageSpec::builder().sender(sender).receiver(receiver.into()).relation(relation).body(message.text.clone()).build()
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl TypedResolver<TerminalSession> {
     /// Test-only fixture entry point for previous-generation sender envelopes.
     /// Production producers construct MessageSpec directly.
