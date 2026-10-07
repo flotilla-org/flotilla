@@ -983,7 +983,6 @@ impl ReadProjections<'_> {
             .collect::<BTreeSet<_>>();
         let bound_name = bound_change_request_record_name(&convoy).map_err(|error| format!("derive bound change request: {error}"))?;
         let mut observation_errors = BTreeMap::new();
-        let projection_expected = !expected_change_request_leaves.is_empty();
         for leaf in expected_change_request_leaves {
             if let flotilla_protocol::LeafAddress::ChangeRequest { service, scope, number } = leaf.address {
                 let subject = crate::change_request_observer::ChangeRequestRef { namespace: namespace.to_string(), service, scope, number };
@@ -1189,8 +1188,7 @@ impl ReadProjections<'_> {
             .into_iter()
             .filter(|item| item.object.spec.convoy == convoy.metadata.name)
             .collect::<Vec<_>>();
-        let decision_ledgers =
-            explained_decision_ledgers(&convoy.metadata.name, convoy.status.as_ref(), &artifact_sources, projection_expected);
+        let decision_ledgers = explained_decision_ledgers(&convoy.metadata.name, convoy.status.as_ref(), &artifact_sources);
         let mut artifacts = artifact_sources
             .into_iter()
             .map(|item| ExplainedArtifact {
@@ -1210,6 +1208,17 @@ impl ReadProjections<'_> {
             })
             .collect();
         Ok(ConvoyExplanation {
+            holds: convoy
+                .status
+                .as_ref()
+                .into_iter()
+                .flat_map(|status| status.turn_delivery_holds())
+                .map(|hold| flotilla_protocol::commands::ExplainedTurnDeliveryHold {
+                    source: hold.source,
+                    reason: hold.reason,
+                    raised_at: hold.raised_at.to_rfc3339(),
+                })
+                .collect(),
             cascade: convoy
                 .status
                 .as_ref()
@@ -1351,7 +1360,6 @@ fn explained_decision_ledgers(
     convoy_name: &str,
     status: Option<&ConvoyStatus>,
     artifacts: &[ReadResourceObject<flotilla_resources::Artifact>],
-    projection_expected: bool,
 ) -> Vec<ExplainedDecisionLedger> {
     status
         .into_iter()
@@ -1410,7 +1418,7 @@ fn explained_decision_ledgers(
                         role: role.clone(),
                         claimed_at: claim.finished_at.map(|at| at.to_rfc3339()),
                         artifact_address: artifact.map(|source| format!("artifact/{}", source.object.metadata.name)),
-                        projection_missing: projection_expected && (comment_url.is_none() || projection_error.is_some()),
+                        projection_missing: false,
                         projection_error,
                         comment_url,
                         missing: artifact.is_none(),
@@ -2565,7 +2573,7 @@ mod tests {
         assert!(!ledger.missing, "artifact must satisfy the ledger expectation");
         assert!(ledger.artifact_address.is_some());
         assert_eq!(ledger.comment_url.is_some(), comment);
-        assert_eq!(ledger.projection_missing, pr_bound && (projection_failure || !comment));
+        assert!(!ledger.projection_missing, "forge projection is retired");
         assert_eq!(ledger.projection_error.as_deref(), projection_failure.then_some("forge unavailable"));
     }
 
@@ -2613,7 +2621,7 @@ mod tests {
                 crew_work: BTreeMap::from([("work".into(), BTreeMap::from([("coder".into(), claim)]))]),
                 ..Default::default()
             };
-            let ledgers = explained_decision_ledgers("claimed", Some(&status), &artifacts, true);
+            let ledgers = explained_decision_ledgers("claimed", Some(&status), &artifacts);
             let present = if known_digest { matching } else { !later };
             assert_eq!(ledgers[0].missing, !present);
             assert_eq!(ledgers[0].artifact_address.is_some(), present);
@@ -2644,7 +2652,7 @@ mod tests {
             ..Default::default()
         };
 
-        let ledgers = explained_decision_ledgers("test", Some(&status), &[], true);
+        let ledgers = explained_decision_ledgers("test", Some(&status), &[]);
         assert_eq!(ledgers.len(), 2);
         assert!(ledgers.iter().any(|ledger| ledger.role == "coder" && ledger.missing && ledger.comment_url.is_none()));
         assert!(ledgers.iter().any(|ledger| {

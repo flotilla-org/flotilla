@@ -1169,6 +1169,12 @@ impl LeafSubscriptionTable {
         {
             return Ok(());
         }
+        // A hold remains latched across new observations.
+        if status.turn_deliveries.get(source).is_some_and(|delivery| {
+            delivery.episodes.iter().any(|episode| matches!(episode.outcome, TurnDeliveryOutcome::Refused { hold_executed: true, .. }))
+        }) {
+            return Ok(());
+        }
         // Active checks/review turns require evidence newer than this work's start;
         // an already-green adopted PR waits for a fresh observation.
         let judged_at = claim_at
@@ -1209,13 +1215,6 @@ impl LeafSubscriptionTable {
             let reason =
                 format!("turn delivery refused after {} consecutive episodes for condition source `{source}`", self.inner.episode_limit);
             let actuator = self.inner.turn_delivery.lock().await.clone();
-            if request.subject.as_ref().is_none_or(|subject| subject.kind != flotilla_protocol::SubjectKind::ChangeRequest) {
-                match flotilla_resources::active_change_request_subjects(&convoy)?.len() {
-                    0 => return Err(DeliveryError::permanent("turn-delivery convoy has no bound change request for hold")),
-                    1 => {}
-                    _ => return Err(DeliveryError::permanent("turn-delivery hold has ambiguous change request subjects")),
-                }
-            }
             actuator.hold(&request, &rule.hold, &reason).await?;
             external_patches::refuse_turn_delivery(
                 source.to_string(),
@@ -5228,8 +5227,8 @@ mod tests {
     #[test]
     fn delivery_failures_are_durable_and_log_once() {
         for kind in 0..5 {
-            // Pending convoy, missing observation, permanent hold failure, and timed retry.
-            let permanent = kind == 2;
+            // Pending convoy, missing observation, transient hold failure, and timed retry.
+            let permanent = false;
             let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
             let subscriber = captured_subscriber(logs.clone(), tracing::Level::WARN);
             tracing::subscriber::with_default(subscriber, || {
@@ -5257,7 +5256,7 @@ mod tests {
                             .expect("tracing scenario"))
                         .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".into()).role("coder".into()).build())
                         .brief("continue".into())
-                        .hold(HoldAct::ChangeRequestComment { body: "paused".into() })
+                        .hold(HoldAct::State)
                         .build();
                     let mut leaf = Leaf {
                         address: LeafAddress::ChangeRequest { service: "github.com".into(), scope: "team/repo".into(), number: 1 },
@@ -5330,9 +5329,6 @@ mod tests {
                         let status = convoys.get("stalled-work").await.expect("tracing scenario").status.expect("tracing scenario");
                         let failure = status.turn_deliveries["checks"].failure.as_ref().expect("tracing scenario");
                         assert_eq!(failure.kind == flotilla_resources::TurnDeliveryFailureKind::Permanent, permanent);
-                        if kind == 2 {
-                            assert!(failure.reason.contains("no bound change request"));
-                        }
                         assert_eq!(failure.attempts, 1);
                         assert!(failure.retry_at > Utc::now());
                     }
@@ -6553,7 +6549,7 @@ mod tests {
                         tokio::time::timeout(Duration::from_secs(2), async {
                             loop {
                                 let current = convoys.get("checks-wake").await.expect("convoy").status.expect("status");
-                                if current.turn_deliveries.get(source).is_some_and(|state| state.episodes.len() == index + 1) {
+                                if current.turn_deliveries.get(source).is_some_and(|state| state.episodes.len() == (index + 1).min(4)) {
                                     break;
                                 }
                                 convoy_watch.next().await.expect("delivery watch open").expect("delivery event");
@@ -6568,7 +6564,10 @@ mod tests {
                 }
                 let status = convoys.get("checks-wake").await.expect("convoy").status.expect("status");
                 let settled = checks.is_some_and(|value| value != ObservedChecks::Pending);
-                assert_eq!(status.turn_deliveries.get(source).map_or(0, |state| state.episodes.len()), index + usize::from(settled));
+                assert_eq!(
+                    status.turn_deliveries.get(source).map_or(0, |state| state.episodes.len()),
+                    (index + usize::from(settled)).min(4)
+                );
                 assert_eq!(actuator.requests.lock().expect("requests").len(), (index + usize::from(settled)).min(3));
                 if settled && index < 3 {
                     // Agent-facing observations use the same plain status words
@@ -6580,7 +6579,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(actuator.holds.load(Ordering::SeqCst), outcomes.len().saturating_sub(3));
+        assert_eq!(actuator.holds.load(Ordering::SeqCst), usize::from(outcomes.len() > 3));
         {
             let requests = actuator.requests.lock().expect("requests");
             assert!(requests[0].brief.contains("Head SHA: `head-0`"));
@@ -6743,7 +6742,7 @@ mod tests {
             .on(condition.parse().expect("wake leaf"))
             .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".to_string()).role("coder".to_string()).build())
             .brief(brief.to_string())
-            .hold(HoldAct::ChangeRequestComment { body: "Automatic delivery paused.".to_string() })
+            .hold(HoldAct::State)
             .build();
         let repo_ref = RepositoryKey("repo".to_string());
         let convoy_spec = ConvoySpec::builder()
@@ -8133,7 +8132,7 @@ mod tests {
             .on("$issue.state == closed".parse().expect("issue rule"))
             .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("work".into()).role("coder".into()).build())
             .brief("Respond to the issue change.".into())
-            .hold(HoldAct::ChangeRequestComment { body: "Paused".into() })
+            .hold(HoldAct::State)
             .build();
         let reference = flotilla_protocol::IssueRef {
             source: flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },

@@ -1347,7 +1347,7 @@ mod tests {
         assert!(content.contains("**If asking were free:**"));
         assert!(content.contains("Optionally append a `### Friction` section after all numbered decisions"));
         assert!(content.contains("flotilla artifact put --kind decision-ledger <path>"));
-        // #2596: settlement projects the ledger only after a clean final shepherd snapshot.
+        // Settlement admits the ledger only after a clean final shepherd snapshot.
         let settlement = content.split("\n## Decision ledger\n").nth(1).expect("ledger section");
         // #2690: settlement gives pending checks a yield path before the clean snapshot gate.
         // Glue: fixed brief wording is checked through the real template renderer.
@@ -1358,7 +1358,7 @@ mod tests {
         assert!(clean < put && put < complete);
         assert!(settlement.contains("checks settled green, every review item answered, and no conflict"));
         assert!(settlement.contains("You may draft the ledger file while working"));
-        assert!(settlement.contains("The projected ledger comment is settlement evidence, not an unanswered review finding"));
+        assert!(settlement.contains("The ledger artifact is settlement evidence"));
         assert!(settlement.contains("take a new clean final snapshot before resubmitting the ledger"));
         assert_eq!(content.matches("follows the settlement order in `## Decision ledger`").count(), 1);
         assert!(content.contains("Follow the settlement order in `## Decision ledger`, then complete your assignment"));

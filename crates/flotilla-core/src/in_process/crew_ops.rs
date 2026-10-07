@@ -46,10 +46,8 @@ use crate::{
     change_request_observer::ChangeRequestRef,
     checkout_integration::{change_request_subjects_from_claim, convoy_change_request_id_for_checkout, LANDING_EVIDENCE_TTL},
     config::ConfigStore,
-    environment_manager::EnvironmentManager,
     fleet::crew_attention,
     leaf_engine::{LeafSubscriptionTable, TurnDeliveryActuator},
-    providers::{ChannelLabel, CommandRunner},
     resource_explain::explain_unmet_expectation,
 };
 
@@ -77,7 +75,6 @@ pub(super) struct CrewService {
     config: Arc<ConfigStore>,
     host_name: HostName,
     brief_artifact_writer: Arc<RwLock<Option<Arc<dyn BriefArtifactWriter>>>>,
-    environment_manager: Arc<EnvironmentManager>,
     checkout_providers: Arc<CheckoutProviders>,
     local_environment_id: EnvironmentId,
 }
@@ -121,25 +118,6 @@ impl crate::leaf_engine::TurnDeliveryActuator for CrewTurnDeliveryActuator {
             .execute_turn_delivery_hold(request, act, reason)
             .await
     }
-}
-
-fn turn_hold_subject(
-    convoy: &ResourceObject<ResourceConvoy>,
-    firing_subject: Option<&flotilla_protocol::Subject>,
-) -> Result<flotilla_protocol::Subject, String> {
-    let subject = if let Some(subject) = firing_subject.filter(|subject| subject.kind == flotilla_protocol::SubjectKind::ChangeRequest) {
-        subject.clone()
-    } else {
-        let subjects = flotilla_resources::active_change_request_subjects(convoy)?;
-        let [subject] = subjects.as_slice() else {
-            return Err("turn-delivery hold needs one change request subject".into());
-        };
-        subject.clone()
-    };
-    if subject.kind != flotilla_protocol::SubjectKind::ChangeRequest {
-        return Err("turn-delivery hold subject is not a change request".into());
-    }
-    Ok(subject)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,10 +441,6 @@ impl CrewService {
 
     async fn provisioning_namespace(&self) -> String {
         self.provisioning_namespace.read().expect("provisioning namespace lock poisoned").clone()
-    }
-
-    fn local_command_runner(&self) -> Option<Arc<dyn CommandRunner>> {
-        self.environment_manager.environment_runner(&self.local_environment_id)
     }
 
     async fn local_vcs_for_checkout(&self, path: &Path) -> Result<Arc<dyn crate::vcs::Vcs>, String> {
@@ -2845,18 +2819,135 @@ impl CrewService {
         reason: &str,
     ) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace);
+        let _ = act; // Every admitted hold is state-only, including previous-generation snapshots.
+        let attention =
+            flotilla_resources::ConvoyAttention { source: request.source.clone(), reason: reason.into(), raised_at: self.clock.now() };
+        flotilla_resources::apply_status_patch(
+            &convoys,
+            &request.convoy,
+            &ConvoyStatusPatch::HoldTurnDelivery { source: request.source.clone(), hold: attention.clone() },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         let convoy = convoys.get(&request.convoy).await.map_err(|error| error.to_string())?;
-        // Turn producers use the typed subject set. A produced PR need not be an
-        // adopted PR in the legacy spec field; keep the firing subject for holds.
-        let subject = turn_hold_subject(&convoy, request.subject.as_ref())?;
-        let repository_name = &subject.source.scope;
-        let HoldAct::ChangeRequestComment { body } = act;
-        let comment = format!("{}\n\n{}", body.trim(), reason);
-        let runner = self.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?;
-        runner
-            .run("gh", &["pr", "comment", &subject.id, "-R", repository_name, "--body", &comment], Path::new("/"), &ChannelLabel::Default)
+        let status = convoy.status.as_ref().ok_or("hold convoy has no status")?;
+        let Some(attention) = status.turn_deliveries.get(&request.source).and_then(|delivery| delivery.hold.clone()) else {
+            // Landing may win the compare-and-swap while a late hold is being applied.
+            if status.phase.is_terminal() {
+                return Ok(());
+            }
+            return Err("turn-delivery hold was cleared before supervisor publication".into());
+        };
+        let sessions = self.resource_backend.using::<ResourceTerminalSession>(&request.namespace);
+        let sources = self
+            .resource_backend
+            .including_replicas::<ResourceTerminalSession>(&request.namespace)
+            .list_matching_labels(&BTreeMap::from([
+                (CONVOY_LABEL.into(), request.convoy.clone()),
+                (VESSEL_LABEL.into(), request.vessel.clone()),
+                (ROLE_LABEL.into(), request.role.clone()),
+            ]))
             .await
-            .map(|_| ())
+            .map_err(|error| error.to_string())?;
+        for source in sources.items {
+            let session = source.object;
+            let patch = TerminalSessionStatusPatch::HoldTurnDelivery { hold: attention.clone() };
+            if matches!(source.provenance, ResourceProvenance::Local) {
+                flotilla_resources::apply_status_patch(&sessions, &session.metadata.name, &patch)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            } else {
+                let mut next = session.status.clone().unwrap_or_default();
+                flotilla_resources::StatusPatch::apply(&patch, &mut next);
+                let publisher = self
+                    .resource_intent_publisher
+                    .read()
+                    .expect("publisher lock")
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .ok_or("resource status mutation router unavailable")?;
+                publisher
+                    .patch_status(
+                        &request.namespace,
+                        "TerminalSession",
+                        &session.metadata.name,
+                        serde_json::to_value(next).expect("session hold"),
+                        &session.metadata.resource_version,
+                    )
+                    .await?;
+            }
+        }
+        let project = convoy.spec.project_ref.as_deref().unwrap_or(&request.namespace);
+        let project_policy =
+            match self.resource_backend.including_replicas::<flotilla_resources::Project>(&request.namespace).get(project).await {
+                Ok(source) => source.object.spec.supervision,
+                Err(ResourceError::NotFound { .. }) => None,
+                Err(error) => return Err(error.to_string()),
+            };
+        let policy =
+            status.workflow_snapshot.as_ref().and_then(|snapshot| snapshot.supervision.clone()).or(project_policy).unwrap_or_else(|| {
+                vec![
+                    flotilla_resources::SupervisionTarget::ConvoyCrew { vessel: String::new(), role: "bosun".into() },
+                    flotilla_resources::SupervisionTarget::ProjectCrew {
+                        convoy_role: "governor".into(),
+                        vessel: String::new(),
+                        role: "governor".into(),
+                    },
+                ]
+            });
+        let receiver = policy
+            .iter()
+            .find_map(|target| match target {
+                flotilla_resources::SupervisionTarget::ConvoyCrew { vessel, role } => status
+                    .crew_work
+                    .iter()
+                    .find(|(name, crew)| {
+                        (vessel.is_empty() || *name == vessel)
+                            && crew.contains_key(role)
+                            && !(**name == request.vessel && *role == request.role)
+                    })
+                    .map(|(vessel, _)| crate::leaf_engine::crew_role_address(project, &request.convoy, vessel, role)),
+                flotilla_resources::SupervisionTarget::ProjectCrew { convoy_role, .. } => Some(format!("{project}/{convoy_role}")),
+                flotilla_resources::SupervisionTarget::Operator => Some("principal:operator".into()),
+            })
+            .unwrap_or_else(|| "principal:operator".into());
+        let sender = "system:turn-rules";
+        // Producer identity follows the persisted hold, independent of receiver changes
+        // or new observations racing a lost acceptance response.
+        let name = flotilla_resources::message_record_name(
+            "system:hold",
+            sender,
+            &format!(
+                "hold:{}:{}:{}:{}:{}",
+                request.convoy,
+                request.vessel,
+                request.role,
+                request.source,
+                attention.raised_at.timestamp_micros()
+            ),
+        );
+        match self.resource_backend.including_replicas::<flotilla_resources::Message>(&request.namespace).get(&name).await {
+            Ok(_) => return Ok(()),
+            Err(ResourceError::NotFound { .. }) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        let mut references = request.references.clone();
+        references.push(flotilla_resources::MessageReference::ControlRecord {
+            resource: ResourceRef::new("flotilla.work/v1", "Convoy", &request.namespace, &request.convoy),
+            revision: convoy.metadata.resource_version.clone(),
+        });
+        let intent = flotilla_resources::MessageSpec::builder()
+            .sender(sender.into())
+            .receiver(receiver.clone())
+            .relation(flotilla_resources::MessageRelation::System)
+            .body(format!(
+                "Automatic turn delivery is held for {}/{}/{} ({})\n\n{reason}",
+                request.convoy, request.vessel, request.role, request.source
+            ))
+            .references(references)
+            .maybe_subject(request.message_subject.clone())
+            .build();
+        self.publish_message_intent(&request.namespace, &name, &intent).await.map(|_| ())
     }
 
     async fn reconcile_resumed_work_credentials(&self, namespace: &str, environment_ref: &str) -> Result<(), String> {

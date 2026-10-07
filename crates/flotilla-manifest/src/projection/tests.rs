@@ -1881,6 +1881,7 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
         forges: vec![gh, lab],
         references: references.clone(),
         now: Some(now),
+        ..Default::default()
     };
     let remote_observations = SubjectCatalogInput {
         change_requests: replica
@@ -1912,6 +1913,7 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
             .collect(),
         references: references.clone(),
         now: Some(now),
+        ..Default::default()
     };
     let remote_convoy = replica.including_replicas::<Convoy>("flotilla").get("ship-it").await.expect("replicated convoy").object;
     let local = project(&convoy, &local_observations);
@@ -3003,4 +3005,144 @@ fn structured_recipe_mint_refuses_ambiguous_hosts() {
     let host = HostName::new("host/ambiguous");
     assert!(mint().attach("refs/heads/topic", &host).is_none());
     assert!(mint().checkout_terminal("/work/repo", &host).is_none());
+}
+
+// #2758: the catalog exposes raw holds, latest ledger and pending/stuck messages;
+// empty input retracts the facts. Generate absent/present hold and ledger, every
+// message phase, duplicate observation order and unrelated convoy/namespace records.
+#[hegel::test]
+fn convoy_inbox_facts_are_raw_and_retractable(tc: hegel::TestCase) {
+    use crate::keys::{KEY_CONVOY_HELD, KEY_CONVOY_HOLDS, KEY_CONVOY_LEDGER, KEY_CONVOY_PENDING_MESSAGES, KEY_CONVOY_STUCK_MESSAGES};
+    use flotilla_resources::{
+        Artifact, ArtifactSpec, Convoy, ConvoyAttention, ConvoySpec, ConvoyStatus, InMemoryBackend, InputMeta, Message, MessagePhase,
+        MessageRelation, MessageSpec, MessageStatus, ResourceBackend,
+    };
+    use hegel::generators as gs;
+    let held = tc.draw(gs::booleans());
+    let ledger = tc.draw(gs::booleans());
+    let waiting_reason = tc.draw(gs::booleans());
+    let phases = [
+        MessagePhase::Accepted,
+        MessagePhase::WaitingOnReferences,
+        MessagePhase::Deliverable,
+        MessagePhase::Delivered,
+        MessagePhase::Satisfied,
+        MessagePhase::Answered,
+        MessagePhase::OutcomeMet,
+        MessagePhase::Expired,
+        MessagePhase::Superseded,
+        MessagePhase::DeadLettered,
+    ];
+    let phase = phases[tc.draw(gs::integers::<usize>().min_value(0).max_value(phases.len() - 1))];
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+    runtime.block_on(async {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        let mut convoy = backend
+            .using::<Convoy>("dev")
+            .create(&InputMeta::builder().name("inbox".into()).build(), &ConvoySpec::builder().workflow_ref("single-agent".into()).build())
+            .await
+            .expect("convoy");
+        let mut status = ConvoyStatus::default();
+        let workflow = flotilla_resources::single_agent_workflow_spec();
+        status.workflow_snapshot = Some(flotilla_resources::WorkflowSnapshot {
+            cascade: None,
+            exit: workflow.exit,
+            turn_delivery: workflow.turn_delivery,
+            vessels: workflow.vessels,
+            stall_nudges: workflow.stall_nudges,
+            supervision: workflow.supervision,
+        });
+        if held {
+            status.turn_deliveries.insert(
+                "checks-settled".into(),
+                flotilla_resources::TurnDeliveryStatus {
+                    hold: Some(ConvoyAttention {
+                        source: "checks-settled".into(),
+                        reason: "limit".into(),
+                        raised_at: "2026-10-07T12:00:00Z".parse().expect("time"),
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        convoy.status = Some(status);
+        let row = ConvoyRow::builder()
+            .resource(convoy_ref("dev", "inbox"))
+            .name("inbox")
+            .workflow_ref("single-agent")
+            .phase(ConvoyPhase::Active)
+            .build();
+        let mut records = SubjectCatalogInput { convoys: vec![convoy], ..Default::default() };
+        let now: Timestamp = "2026-10-07T12:00:00Z".parse().expect("time");
+        if ledger {
+            for (name, at) in [("older", now - std::time::Duration::from_secs(1)), ("latest", now)] {
+                let artifact = backend
+                    .using::<Artifact>("dev")
+                    .create(
+                        &InputMeta::builder().name(name.into()).build(),
+                        &ArtifactSpec::builder()
+                            .convoy("inbox".into())
+                            .producer("coder".into())
+                            .kind("decision-ledger".into())
+                            .subject("inbox".into())
+                            .digest("digest".into())
+                            .size(1)
+                            .media_type("text/markdown".into())
+                            .recorded_at(at)
+                            .expires_at(now + std::time::Duration::from_secs(86400))
+                            .build(),
+                    )
+                    .await
+                    .expect("artifact");
+                records.artifacts.insert(0, artifact);
+            }
+        }
+        let mut message = backend
+            .using::<Message>("dev")
+            .create(
+                &InputMeta::builder().name("signal".into()).build(),
+                &MessageSpec::builder()
+                    .sender("system:test".into())
+                    .receiver("p/inbox/work/coder".into())
+                    .relation(MessageRelation::System)
+                    .body("held".into())
+                    .build(),
+            )
+            .await
+            .expect("message");
+        message.status = Some(MessageStatus { phase, reason: waiting_reason.then(|| "raw reason".into()), ..Default::default() });
+        records.messages.push(message.clone());
+        message.metadata.namespace = "other".into();
+        records.messages.push(message);
+        let rows = [row];
+        let mut input = catalog_input(&rows);
+        input.subjects = Some(&records);
+        let catalog = project_catalog(&input, &mint());
+        let patches = catalog.reassert_patches();
+        let target = entity::convoy("dev", "inbox", "kiwi");
+        let facts = find_entity(&patches, &target);
+        assert_eq!(facts.set[KEY_CONVOY_HELD].value, MetadataValue::Bool(held));
+        let MetadataValue::StringList(holds) = &facts.set[KEY_CONVOY_HOLDS].value else { panic!("hold facts") };
+        assert_eq!(holds.len(), usize::from(held));
+        if held {
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&holds[0]).expect("hold")["reason"], "limit");
+        }
+        assert_eq!(facts.set.contains_key(KEY_CONVOY_LEDGER), ledger);
+        if ledger {
+            assert_eq!(text(facts, KEY_CONVOY_LEDGER), "artifact/latest");
+        }
+        let MetadataValue::StringList(pending) = &facts.set[KEY_CONVOY_PENDING_MESSAGES].value else { panic!("pending") };
+        assert_eq!(pending.len(), usize::from(!phase.is_terminal()));
+        let MetadataValue::StringList(stuck) = &facts.set[KEY_CONVOY_STUCK_MESSAGES].value else { panic!("stuck") };
+        assert_eq!(stuck.len(), usize::from(phase == MessagePhase::DeadLettered || (phase.is_waiting() && waiting_reason)));
+        let empty = SubjectCatalogInput::default();
+        input.subjects = Some(&empty);
+        let cleared = project_catalog(&input, &mint());
+        let changes = cleared.diff_patches(&catalog);
+        if ledger {
+            assert!(find_entity(&changes, &target).unset.contains(&KEY_CONVOY_LEDGER.to_string()));
+        }
+        let cleared_patches = cleared.reassert_patches();
+        assert_eq!(find_entity(&cleared_patches, &target).set[KEY_CONVOY_HELD].value, MetadataValue::Bool(false));
+    });
 }

@@ -117,7 +117,10 @@ pub struct TurnDeliveryTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum HoldAct {
-    ChangeRequestComment { body: String },
+    /// State-only hold. The alias accepts previous-generation workflow snapshots;
+    /// remove it one fleet roll after #2758 (ADR 0047). Unknown legacy body is dropped.
+    #[serde(alias = "change-request-comment")]
+    State,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -658,9 +661,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
                 .on("$cr.checks != pending".parse().expect("valid stock checks leaf"))
                 .to(target())
                 .brief("Inspect checks and reviews at the bound head. Fix failures caused by this PR and continue shepherding; complete when checks pass, review findings are handled, and the PR is mergeable.".to_string())
-                .hold(HoldAct::ChangeRequestComment {
-                    body: "Flotilla paused automatic turn delivery after repeated checks-settled episodes; human attention is required.".to_string(),
-                })
+                .hold(HoldAct::State)
                 .build(),
         ),
         (
@@ -669,9 +670,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
                 .on("$cr.state == merged".parse().expect("valid stock merged leaf"))
                 .to(target())
                 .brief("The PR merged. Submit your decision ledger and run `flotilla crew complete` with the PR URL to finish your settlement claim.".to_string())
-                .hold(HoldAct::ChangeRequestComment {
-                    body: "Flotilla could not deliver the merged PR settlement reminder; human attention is required.".to_string(),
-                })
+                .hold(HoldAct::State)
                 .build(),
         ),
         (
@@ -683,10 +682,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
                     "Address the actionable review at the bound head, push the durable fix, and file a fresh settlement claim."
                         .to_string(),
                 )
-                .hold(HoldAct::ChangeRequestComment {
-                    body: "Flotilla paused automatic turn delivery after repeated actionable-review episodes; human attention is required."
-                        .to_string(),
-                })
+                .hold(HoldAct::State)
                 .build(),
         ),
         (
@@ -698,10 +694,7 @@ fn standard_review_turn_delivery(vessel: &str, role: &str) -> IndexMap<String, T
                     "Rebase onto the current base branch and resolve conflicts additively, keeping both sides' intent. Regenerate generated files rather than hand-merging them. Re-run the repository's pinned CI gates, push the same branch, process any review, and file a fresh settlement claim; the previous claim is superseded."
                         .to_string(),
                 )
-                .hold(HoldAct::ChangeRequestComment {
-                    body: "Flotilla paused automatic turn delivery after repeated conflicting episodes; human attention is required."
-                        .to_string(),
-                })
+                .hold(HoldAct::State)
                 .build(),
         ),
     ])
@@ -1475,5 +1468,21 @@ mod tests {
         spec.vessels[0].crew[1].source = CrewSource::Tool { command: "kubectl get pod -o go-template='{{.metadata.name}}'".to_string() };
 
         assert!(validate(&spec).is_ok(), "foreign interpolations should pass through");
+    }
+}
+
+#[cfg(test)]
+mod state_hold_compatibility_tests {
+    use super::HoldAct;
+    // ADR 0047/#2758: previous-generation stored comments decode as state-only
+    // holds and write only the new shape. Bodies, including empty ones, are retired.
+    #[hegel::test]
+    fn previous_hold_comments_decode_to_state(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let body = "legacy body ".repeat(tc.draw(gs::integers::<usize>().min_value(0).max_value(8)));
+        let hold: HoldAct =
+            serde_json::from_value(serde_json::json!({"kind": "change-request-comment", "body": body})).expect("legacy hold");
+        assert_eq!(hold, HoldAct::State);
+        assert_eq!(serde_json::to_value(hold).expect("new hold"), serde_json::json!({"kind": "state"}));
     }
 }

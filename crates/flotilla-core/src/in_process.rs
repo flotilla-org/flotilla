@@ -1870,7 +1870,6 @@ impl InProcessDaemon {
                 .config(Arc::clone(&config))
                 .host_name(host_name.clone())
                 .brief_artifact_writer(Arc::clone(&brief_artifact_writer))
-                .environment_manager(Arc::clone(&environment_manager))
                 .checkout_providers(Arc::clone(&checkout_providers))
                 .local_environment_id(local_environment_id.clone())
                 .build(),

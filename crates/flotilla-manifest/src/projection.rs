@@ -64,6 +64,9 @@ use subjects::{project_role_attempts, project_subjects};
 /// With no clock, only live subjects are eligible; landed subjects are omitted.
 #[derive(Default, bon::Builder)]
 pub struct SubjectCatalogInput {
+    pub convoys: Vec<ResourceObject<flotilla_resources::Convoy>>,
+    pub artifacts: Vec<ResourceObject<flotilla_resources::Artifact>>,
+    pub messages: Vec<ResourceObject<flotilla_resources::Message>>,
     pub change_requests: Vec<ResourceObject<ChangeRequest>>,
     pub issues: Vec<ResourceObject<Issue>>,
     pub forges: Vec<ResourceObject<Forge>>,

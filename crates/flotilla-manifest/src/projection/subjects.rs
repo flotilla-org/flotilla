@@ -166,6 +166,7 @@ fn project_forge(catalog: &mut Catalog, id: &str, kind: ForgeKind, web_url: &str
 }
 
 pub(super) fn project_subjects(catalog: &mut Catalog, input: &CatalogInput<'_>, observations: &SubjectCatalogInput) {
+    project_inbox(catalog, input, observations);
     let mut links: BTreeMap<Subject, BTreeMap<Relationship, BTreeSet<EntityRef>>> = BTreeMap::new();
     let mut projects = BTreeMap::new();
     let mut landed = BTreeSet::new();
@@ -375,4 +376,76 @@ pub fn change_request_facts(status: Option<&flotilla_resources::ChangeRequestSta
         );
     }
     facts
+}
+
+// Raw records, not an inbox policy: surfaces choose ordering and salience.
+fn project_inbox(catalog: &mut Catalog, input: &CatalogInput<'_>, records: &SubjectCatalogInput) {
+    use crate::keys::{KEY_CONVOY_HELD, KEY_CONVOY_HOLDS, KEY_CONVOY_LEDGER, KEY_CONVOY_PENDING_MESSAGES, KEY_CONVOY_STUCK_MESSAGES};
+    use flotilla_resources::{MessagePhase, MessageReference};
+    for row in input.convoys {
+        let namespace = &row.resource.namespace;
+        let name = &row.resource.name;
+        let target = entity::convoy(namespace, name, &entity::resource_origin(&row.resource));
+        // Inbox facts may introduce a convoy absent from awareness. Seed its
+        // canonical identity before other projections test whether it exists.
+        if !catalog.facts.contains_key(&MetadataTarget::Entity(target.clone())) {
+            catalog.assert_entity(target.clone(), super::convoy_identity_facts(row), None);
+        }
+        let resource = records.convoys.iter().find(|record| record.metadata.namespace == *namespace && record.metadata.name == *name);
+        let holds: Vec<_> = resource
+            .and_then(|record| record.status.as_ref())
+            .into_iter()
+            .flat_map(|status| status.turn_delivery_holds())
+            .map(|hold| serde_json::to_string(&hold).expect("hold facts"))
+            .collect();
+        let mut facts =
+            vec![(KEY_CONVOY_HELD, MetadataValue::Bool(!holds.is_empty())), (KEY_CONVOY_HOLDS, MetadataValue::StringList(holds))];
+        if let Some(artifact) = records
+            .artifacts
+            .iter()
+            .filter(|record| {
+                record.metadata.namespace == *namespace
+                    && record.spec.convoy == *name
+                    && record.spec.kind == "decision-ledger"
+                    && record.spec.subject == *name
+            })
+            .max_by_key(|record| (record.spec.recorded_at.unwrap_or(record.metadata.creation_timestamp), &record.metadata.name))
+        {
+            facts.push((KEY_CONVOY_LEDGER, MetadataValue::text(format!("artifact/{}", artifact.metadata.name))));
+        }
+        let mut pending = BTreeMap::new();
+        let mut stuck = BTreeMap::new();
+        for record in &records.messages {
+            if record.metadata.namespace != *namespace {
+                continue;
+            }
+            let address_matches = |address: &str| address.split('/').nth(1) == Some(name.as_str()) && address.split('/').count() == 4;
+            let associated = address_matches(&record.spec.sender)
+                || address_matches(&record.spec.receiver)
+                || record.spec.references.iter().any(|reference| {
+                    matches!(reference, MessageReference::ControlRecord { resource, .. }
+                    if resource.kind == "Convoy" && resource.namespace == *namespace && resource.name == *name)
+                });
+            if !associated {
+                continue;
+            }
+            let status = record.status.clone().unwrap_or_default();
+            let value = serde_json::json!({"name": record.metadata.name, "sender": record.spec.sender,
+                "receiver": record.spec.receiver, "phase": status.phase, "reason": status.reason, "since": status.since,
+                "references": record.spec.references, "expectation": record.spec.expectation})
+            .to_string();
+            if !status.phase.is_terminal() {
+                pending.insert(record.metadata.name.clone(), value.clone());
+            }
+            if status.phase == MessagePhase::DeadLettered
+                || (status.phase.is_waiting() && status.reason.is_some())
+                || (!status.phase.is_terminal() && status.retry.is_some())
+            {
+                stuck.insert(record.metadata.name.clone(), value);
+            }
+        }
+        facts.push((KEY_CONVOY_PENDING_MESSAGES, MetadataValue::StringList(pending.into_values().collect())));
+        facts.push((KEY_CONVOY_STUCK_MESSAGES, MetadataValue::StringList(stuck.into_values().collect())));
+        catalog.assert_entity(target, facts, None);
+    }
 }

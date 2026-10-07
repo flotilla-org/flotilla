@@ -2547,12 +2547,14 @@ impl Aggregator {
             .min_by_key(|demand| {
                 (if demand.metadata.annotations.contains_key(RECLAIM_REFUSAL_REASON_ANNOTATION) { 0 } else { 1 }, &demand.metadata.name)
             });
-        let convoy_attention = status.and_then(|status| status.attention.as_ref());
+        let holds = status.map(|status| status.turn_delivery_holds()).unwrap_or_default();
+        let convoy_attention = status.and_then(|status| status.attention.as_ref()).or_else(|| holds.first());
         let pending_supervisor_turn_count = status
             .map_or(0, |status| status.turn_deliveries.values().filter(|delivery| delivery.pending_supervisor_turn.is_some()).count());
         let surface_state = if !subject_conflicts.is_empty()
             || attention_demand.is_some()
             || convoy_attention.is_some()
+            || !holds.is_empty()
             || pending_supervisor_turn_count > 0
             || vessels.iter().any(|vessel| vessel.surface_state.needs_attention())
         {
@@ -4609,7 +4611,7 @@ mod tests {
             .expect("create branch-backed convoy")
     }
 
-    async fn convoy_with_vessel(name: &str) -> ResourceObject<Convoy> {
+    pub(super) async fn convoy_with_vessel(name: &str) -> ResourceObject<Convoy> {
         let backend = ResourceBackend::InMemory(flotilla_resources::InMemoryBackend::default());
         let resolver = backend.using::<Convoy>("flotilla");
         let created = resolver
@@ -7069,5 +7071,39 @@ mod project_parent_tests {
         assert!(root.parent.is_none());
         assert_eq!(group.parent.as_ref().map(|parent| parent.name.as_str()), Some("root"));
         assert_eq!(child.parent.as_ref().map(|parent| parent.name.as_str()), Some("group"));
+    }
+}
+
+#[cfg(test)]
+mod hold_attention_tests {
+    use chrono::Utc;
+
+    use super::*;
+    // #2758: persistent holds remain in attention views even if an unrelated
+    // reconciler clears the shared attention slot; the reason survives too.
+    #[tokio::test]
+    async fn persisted_hold_survives_attention_slot_clear() {
+        let state = AggregatorProjectionState::new();
+        let (event_tx, _) = broadcast::channel(8);
+        let mut aggregator = Aggregator::new(state.clone(), HostName::new("local"), event_tx);
+        let mut convoy = super::tests::convoy_with_vessel("held").await;
+        let status = convoy.status.as_mut().expect("status");
+        status.attention = None;
+        status.turn_deliveries.insert(
+            "checks-settled".into(),
+            flotilla_resources::TurnDeliveryStatus {
+                hold: Some(flotilla_resources::ConvoyAttention {
+                    source: "checks-settled".into(),
+                    reason: "episode limit".into(),
+                    raised_at: Utc::now(),
+                }),
+                ..Default::default()
+            },
+        );
+        aggregator.apply_convoy_event_from(LocalSource::Durable, WatchEvent::Added(convoy)).await;
+        let result = state.result_set().await;
+        let row = result.rows.as_convoys().expect("convoys").iter().find(|row| row.name == "held").expect("held row");
+        assert_eq!(row.surface_state, SurfaceState::NeedsYou);
+        assert_eq!(row.message.as_deref(), Some("episode limit"));
     }
 }

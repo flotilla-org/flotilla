@@ -9,6 +9,7 @@ use flotilla_resources::{
 use super::*;
 use crate::{
     change_request_observer::{ChangeRequestObservationSource, ChangeRequestRef, ChangeRequestRefreshCadence, ChangeRequestRefresher},
+    environment_manager::EnvironmentManager,
     event_sink::RecordingEventSink,
     providers::{change_request::ObservationError, discovery::test_support::fake_discovery},
 };
@@ -86,7 +87,6 @@ async fn fixture(phase: CrewWorkPhase) -> (Arc<CrewService>, ResourceBackend, Ar
             .config(config)
             .host_name(HostName::new("host"))
             .brief_artifact_writer(Arc::new(RwLock::new(None)))
-            .environment_manager(environment_manager)
             .checkout_providers(providers)
             .local_environment_id(environment)
             .build(),
@@ -315,7 +315,7 @@ async fn actuator_refuses_delivery_and_hold_after_service_stops() {
     };
     assert_eq!(actuator.deliver(&request).await.expect_err("stopped delivery"), "daemon stopped before turn delivery");
     assert_eq!(
-        actuator.hold(&request, &HoldAct::ChangeRequestComment { body: "hold".into() }, "stopped").await.expect_err("stopped hold"),
+        actuator.hold(&request, &HoldAct::State, "stopped").await.expect_err("stopped hold"),
         "daemon stopped before turn-delivery hold"
     );
 }
@@ -463,39 +463,6 @@ fn orientation_follows_live_project(tc: hegel::TestCase) {
         assert!(unscoped.project.is_none());
         assert!(unscoped.project_error.is_none());
     });
-}
-
-// #2654: hold resolution follows produced/adopted subjects, including discovered
-// PRs with no legacy binding. Explicit firing identity wins when there are many.
-#[tokio::test]
-async fn turn_hold_resolves_discovered_pr_without_legacy_binding() {
-    let (_, backend, _, _) = fixture(CrewWorkPhase::Done).await;
-    let mut convoy = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("hold subject scenario");
-    convoy.spec.change_request = None;
-    let subject = flotilla_protocol::Subject {
-        kind: flotilla_protocol::SubjectKind::ChangeRequest,
-        source: flotilla_protocol::IssueSource { service: "github.com".into(), scope: "team/repo".into() },
-        id: "2643".into(),
-    };
-    assert!(turn_hold_subject(&convoy, None).is_err());
-    convoy.status.as_mut().expect("hold subject scenario").discover_subject(
-        subject.clone(),
-        flotilla_protocol::Relationship::Produces,
-        flotilla_resources::SubjectDiscoverySource::Claim,
-        Utc::now(),
-    );
-    assert_eq!(turn_hold_subject(&convoy, None).expect("hold subject scenario"), subject);
-    let other = flotilla_protocol::Subject { id: "42".into(), ..subject.clone() };
-    convoy.status.as_mut().expect("hold subject scenario").discover_subject(
-        other,
-        flotilla_protocol::Relationship::Produces,
-        flotilla_resources::SubjectDiscoverySource::Claim,
-        Utc::now(),
-    );
-    assert!(turn_hold_subject(&convoy, None).is_err(), "ambiguous holds must not comment on an arbitrary PR");
-    assert_eq!(turn_hold_subject(&convoy, Some(&subject)).expect("hold subject scenario"), subject);
-    let issue = flotilla_protocol::Subject { kind: flotilla_protocol::SubjectKind::Issue, ..subject };
-    assert!(turn_hold_subject(&convoy, Some(&issue)).is_err());
 }
 
 // A delivered-open subject suppresses the next intent. Admission returns the
@@ -1678,4 +1645,138 @@ async fn supervisor_decision_survives_authority_disappearing_after_publication()
         assert_eq!(records[0].spec.receiver, "flotilla/crew/work/coder");
         assert_eq!(records[0].spec.expectation, flotilla_resources::MessageExpectation::None);
     }
+}
+
+// #2758: holds persist convoy/session facts and admit exactly one plain supervisor
+// Message across retries, with no forge collaborator available. Cover local and project
+// supervisors, no PR binding, and retries carrying newer head identities.
+#[hegel::test]
+fn hold_state_and_single_supervisor_message(tc: hegel::TestCase) {
+    use hegel::generators as gs;
+    let local_supervisor = tc.draw(gs::booleans());
+    let retries = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let (crew, backend, _, _dir) = fixture(CrewWorkPhase::Done).await;
+        let convoys = backend.using::<ResourceConvoy>("flotilla");
+        if local_supervisor {
+            let current = convoys.get("crew").await.expect("convoy");
+            let mut status = current.status.expect("status");
+            status.crew_work.get_mut("work").expect("work").insert("bosun".into(),
+                CrewWorkState::builder().phase(CrewWorkPhase::Working).build());
+            convoys.update_status("crew", &current.metadata.resource_version, &status).await.expect("supervisor");
+        }
+        let mut request = crate::leaf_engine::CrewTurnIntent::builder()
+            .namespace("flotilla".into()).convoy("crew".into()).source("checks-settled".into())
+            .vessel("work".into()).role("coder".into()).brief("continue".into())
+            .subject_revision("head-one".into()).sender("system:turn-rules".into()).build();
+        for retry in 0..retries {
+            request.subject_revision = format!("head-{retry}");
+            crew.execute_turn_delivery_hold(&request, &HoldAct::State, "episode limit").await.expect("hold");
+        }
+        let convoy = convoys.get("crew").await.expect("convoy");
+        assert_eq!(convoy.status.expect("status").attention.expect("attention").reason, "episode limit");
+        let session = backend.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
+        assert_eq!(session.status.expect("status").turn_delivery_hold.expect("hold").reason, "episode limit");
+        let messages = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("messages");
+        assert_eq!(messages.items.len(), 1, "retries cannot duplicate supervisor signals");
+        let message = &messages.items[0];
+        assert_eq!(message.spec.receiver, if local_supervisor { "flotilla/crew/work/bosun" } else { "flotilla/governor" });
+        assert_eq!(message.spec.relation, flotilla_resources::MessageRelation::System);
+        assert_eq!(message.spec.expectation, flotilla_resources::MessageExpectation::None);
+        assert!(message.spec.body.contains("episode limit"));
+        assert!(matches!(message.spec.references.last(), Some(flotilla_resources::MessageReference::ControlRecord { resource, .. }) if resource.name == "crew"));
+    });
+}
+
+// #2758: the convoy keeps its hold through a receiver-home outage; session state
+// is patched at its authority before the single supervisor signal is published.
+#[tokio::test]
+async fn remote_session_hold_retries_through_existing_mutation_router() {
+    use crate::leaf_engine::{CrewTurnIntent, ResourceIntentPublisher};
+    // Stand-in for the inter-host command channel; both endpoint stores and inbox
+    // admission are real in-memory collaborators, including version validation.
+    struct Router {
+        source: ResourceBackend,
+        receiver: ResourceBackend,
+        fail: AtomicBool,
+    }
+    #[async_trait]
+    impl ResourceIntentPublisher for Router {
+        async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<ResourceRef, String> {
+            let spec: flotilla_resources::MessageSpec = serde_json::from_value(document["spec"].clone()).expect("Message intent");
+            let name = document["metadata"]["name"].as_str().expect("Message name");
+            flotilla_resources::MessageInbox::new(self.source.clone(), namespace)
+                .accept(&InputMeta::builder().name(name.into()).build(), &spec, Utc::now())
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, name))
+        }
+        async fn patch_status(
+            self: Arc<Self>,
+            namespace: &str,
+            kind: &str,
+            name: &str,
+            status: serde_json::Value,
+            expected: &str,
+        ) -> Result<(), String> {
+            assert_eq!(kind, "TerminalSession");
+            if self.fail.swap(false, Ordering::SeqCst) {
+                return Err("receiver unavailable".into());
+            }
+            flotilla_resources::patch_resource_status_if_version(&self.receiver, namespace, kind, name, status, expected)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.source
+                .replica_writer::<ResourceTerminalSession>(flotilla_protocol::NodeId::new("receiver"), namespace)
+                .replace(
+                    &self.receiver.using::<ResourceTerminalSession>(namespace).list().await.map_err(|error| error.to_string())?,
+                    Utc::now(),
+                )
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }
+    let (crew, backend, _, _dir) = fixture(CrewWorkPhase::Done).await;
+    let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+    let source = sessions.get("session").await.expect("source session");
+    let receiver = ResourceBackend::InMemory(InMemoryBackend::default());
+    let remote = receiver
+        .using::<ResourceTerminalSession>("flotilla")
+        .create(&InputMeta::from(&source.metadata), &source.spec)
+        .await
+        .expect("remote session");
+    receiver
+        .using::<ResourceTerminalSession>("flotilla")
+        .update_status("session", &remote.metadata.resource_version, &source.status.clone().unwrap_or_default())
+        .await
+        .expect("remote status");
+    sessions.delete("session").await.expect("retire local record");
+    backend
+        .replica_writer::<ResourceTerminalSession>(flotilla_protocol::NodeId::new("receiver"), "flotilla")
+        .replace(&receiver.using::<ResourceTerminalSession>("flotilla").list().await.expect("remote snapshot"), Utc::now())
+        .await
+        .expect("replica");
+    let router: Arc<dyn ResourceIntentPublisher> =
+        Arc::new(Router { source: backend.clone(), receiver: receiver.clone(), fail: AtomicBool::new(true) });
+    crew.set_resource_intent_publisher(Arc::downgrade(&router));
+    let request = CrewTurnIntent::builder()
+        .namespace("flotilla".into())
+        .convoy("crew".into())
+        .source("checks-settled".into())
+        .vessel("work".into())
+        .role("coder".into())
+        .brief("continue".into())
+        .subject_revision("head".into())
+        .sender("system:turn-rules".into())
+        .build();
+    assert_eq!(crew.execute_turn_delivery_hold(&request, &HoldAct::State, "limit").await.expect_err("outage"), "receiver unavailable");
+    let held = backend.using::<ResourceConvoy>("flotilla").get("crew").await.expect("convoy");
+    let raised_at = held.status.expect("status").turn_delivery_holds()[0].raised_at;
+    assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items.is_empty());
+    for _ in 0..2 {
+        crew.execute_turn_delivery_hold(&request, &HoldAct::State, "limit").await.expect("retry hold");
+    }
+    let session = receiver.using::<ResourceTerminalSession>("flotilla").get("session").await.expect("session");
+    assert_eq!(session.status.expect("status").turn_delivery_hold.expect("hold").raised_at, raised_at);
+    assert_eq!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items.len(), 1);
 }

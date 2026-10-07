@@ -864,7 +864,7 @@ async fn connector_watch_end_and_error_cancel_siblings_before_snapshot_restart()
         let daemon = Arc::new(MockDaemon::new(vec![convoys_set(1)]));
         let sink = Arc::new(RecordingSink::new());
         let handle = tokio::spawn(run_connector(daemon.clone(), sink.clone(), Arc::new(mint()), Duration::from_secs(30)));
-        wait_until(|| daemon.watch_starts.load(Ordering::SeqCst) == 5).await;
+        wait_until(|| daemon.watch_starts.load(Ordering::SeqCst) == resources::KINDS.len()).await;
         let command_id = daemon.watch_commands.lock().expect("watches")[&("flotilla".into(), "changerequests".into())];
         daemon
             .tx
@@ -882,12 +882,12 @@ async fn connector_watch_end_and_error_cancel_siblings_before_snapshot_restart()
             .expect("task")
             .expect_err("snapshot restart");
         assert!(error.contains("watch"));
-        wait_until(|| daemon.cancelled.lock().expect("cancelled").len() == 4).await;
+        wait_until(|| daemon.cancelled.lock().expect("cancelled").len() == resources::KINDS.len() - 1).await;
         let restarted = tokio::spawn(run_connector(daemon.clone(), sink, Arc::new(mint()), Duration::from_secs(30)));
-        wait_until(|| daemon.watch_starts.load(Ordering::SeqCst) == 10).await;
+        wait_until(|| daemon.watch_starts.load(Ordering::SeqCst) == 2 * resources::KINDS.len()).await;
         restarted.abort();
         let _ = restarted.await;
-        wait_until(|| daemon.cancelled.lock().expect("cancelled").len() == 9).await;
+        wait_until(|| daemon.cancelled.lock().expect("cancelled").len() == 2 * resources::KINDS.len() - 1).await;
     }
 }
 
@@ -903,10 +903,10 @@ async fn connector_partial_watch_failure_cancels_admitted_watches_before_retry()
     wait_until(|| daemon.cancelled.lock().expect("cancelled").len() == 2).await;
     *daemon.list_failure.lock().expect("list failure") = None;
     let handle = tokio::spawn(run_connector(daemon.clone(), sink, Arc::new(mint()), Duration::from_secs(30)));
-    wait_until(|| daemon.watch_starts.load(Ordering::SeqCst) == 8).await;
+    wait_until(|| daemon.watch_starts.load(Ordering::SeqCst) == 3 + resources::KINDS.len()).await;
     handle.abort();
     let _ = handle.await;
-    wait_until(|| daemon.cancelled.lock().expect("cancelled").len() == 7).await;
+    wait_until(|| daemon.cancelled.lock().expect("cancelled").len() == 2 + resources::KINDS.len()).await;
 }
 
 #[test]
@@ -1177,4 +1177,75 @@ fn remote_connector_keeps_viewer_locality() {
             configured.map(HostName::new).unwrap_or_else(|| HostName::new("beaufort"))
         );
     }
+}
+
+// #2758: resource-watch admission reaches convoy catalog facts, including
+// replica-only records and deletion of ledger/message facts while the row stays.
+#[test]
+fn connector_admits_hold_ledger_and_message_records() {
+    let mut state = ConnectorState::default();
+    state.apply_event(&DaemonEvent::ResultSet(Box::new(ResultSet {
+        seq: 1,
+        rows: Rows::Convoys { scope: None, rows: vec![linked_subject_convoy()] },
+        state: Default::default(),
+    })));
+    let cases = [
+        (
+            "Convoy",
+            "convoys",
+            "ship-it",
+            serde_json::json!({"workflow_ref":"dev"}),
+            serde_json::json!({"phase":"Active","turn_deliveries":{"checks-settled":{"hold":{"source":"checks-settled","reason":"episode limit","raised_at":"2026-10-07T12:00:00Z"}}}}),
+        ),
+        (
+            "Artifact",
+            "artifacts",
+            "ledger",
+            serde_json::json!({"convoy":"ship-it","producer":"coder","kind":"decision-ledger","subject":"ship-it",
+            "digest":"digest","size":1,"media_type":"text/markdown","recorded_at":"2026-10-07T12:00:00Z","expires_at":"2026-10-08T12:00:00Z"}),
+            serde_json::Value::Null,
+        ),
+        (
+            "Message",
+            "messages",
+            "signal",
+            serde_json::json!({"sender":"system:turn-rules","receiver":"p/ship-it/work/coder","relation":"system","body":"hold"}),
+            serde_json::json!({"phase":"accepted","since":"2026-10-07T12:00:00Z","reason":"receiver absent"}),
+        ),
+    ];
+    let mut envelopes = Vec::new();
+    for (kind, plural, name, spec, status) in cases {
+        let mut envelope = subject_envelope();
+        envelope.resource_kind = kind.into();
+        envelope.plural = plural.into();
+        let object = envelope.records[0].object.as_mut().expect("object");
+        object["kind"] = serde_json::json!(kind);
+        object["metadata"]["name"] = serde_json::json!(name);
+        object["spec"] = spec;
+        object["status"] = status;
+        if kind == "Convoy" {
+            let parsed: flotilla_resources::K8sResourceObject<flotilla_resources::Convoy> =
+                serde_json::from_value(object.clone()).expect("valid convoy fixture");
+            flotilla_resources::ResourceObject::from_k8s_object(parsed).expect("valid convoy metadata");
+        }
+        state.apply_resource_records(&envelope).expect("admit replica record");
+        envelopes.push(envelope);
+    }
+    let target = MetadataTarget::Entity(entity::convoy("flotilla", "ship-it", "kiwi"));
+    let patches = state.rebuild(&mint());
+    let facts = patches.iter().find(|patch| patch.target == target).expect("convoy facts");
+    assert_eq!(facts.set["flotilla.convoy.held"].value, MetadataValue::Bool(true));
+    assert_eq!(facts.set["flotilla.convoy.latest_ledger"].value, MetadataValue::text("artifact/ledger"));
+    let MetadataValue::StringList(messages) = &facts.set["flotilla.convoy.stuck_messages"].value else { panic!("messages") };
+    assert_eq!(messages.len(), 1);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&messages[0]).expect("message facts")["reason"], "receiver absent");
+    for mut envelope in envelopes {
+        envelope.records[0].record_type = flotilla_protocol::ResourceRecordType::Deleted;
+        state.apply_resource_records(&envelope).expect("delete replica record");
+    }
+    let patches = state.rebuild(&mint());
+    let facts = patches.iter().find(|patch| patch.target == target).expect("retracted facts");
+    assert_eq!(facts.set["flotilla.convoy.held"].value, MetadataValue::Bool(false));
+    assert!(facts.unset.contains(&"flotilla.convoy.latest_ledger".into()));
+    assert_eq!(facts.set["flotilla.convoy.pending_messages"].value, MetadataValue::StringList(vec![]));
 }

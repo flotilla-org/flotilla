@@ -4,16 +4,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use flotilla_manifest::projection::{subject_forge, SubjectCatalogInput};
 use flotilla_protocol::{IssueSource, RepositoryAlias, ResourceReadEnvelope, ResourceRecordProvenance, ResourceRecordType};
 use flotilla_resources::{
-    ChangeRequest, Forge, Issue, K8sResourceObject, Project, Repository, RepositoryIdentity, Resource, ResourceObject,
+    Artifact, ChangeRequest, Convoy, Forge, Issue, K8sResourceObject, Message, Project, Repository, RepositoryIdentity, Resource,
+    ResourceObject,
 };
 use serde_json::Value;
 use tracing::warn;
 
-pub(super) const KINDS: &[&str] = &["changerequests", "issues", "forges", "repositories", "projects"];
+pub(super) const KINDS: &[&str] = &["changerequests", "issues", "forges", "repositories", "projects", "convoys", "artifacts", "messages"];
 
 // Decode at admission, retaining typed records so projection cannot panic
 // while trying to decode an already accepted JSON value again.
 enum SubjectRecord {
+    Convoy(Box<ResourceObject<Convoy>>),
+    Artifact(ResourceObject<Artifact>),
+    Message(Box<ResourceObject<Message>>),
     ChangeRequest(ResourceObject<ChangeRequest>),
     Issue(ResourceObject<Issue>),
     Forge(ResourceObject<Forge>),
@@ -23,6 +27,8 @@ enum SubjectRecord {
 impl SubjectRecord {
     fn observed_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         match self {
+            Self::Artifact(record) => record.spec.recorded_at,
+            Self::Message(record) => record.status.as_ref().map(|status| status.since),
             Self::ChangeRequest(record) => record.status.as_ref().and_then(|status| {
                 [
                     status.title.observed_at,
@@ -68,6 +74,9 @@ macro_rules! record_type {
         }
     };
 }
+record_type!(Convoy, Convoy);
+record_type!(Artifact, Artifact);
+record_type!(Message, Message);
 record_type!(ChangeRequest, ChangeRequest);
 record_type!(Issue, Issue);
 record_type!(Forge, Forge);
@@ -79,6 +88,7 @@ pub(super) struct Records {
     // Retain each source separately: deleting one replica must not erase the
     // same observation still held by another root.
     objects: BTreeMap<(String, String, String, String), SubjectRecord>,
+    local_roots: BTreeSet<String>,
 }
 
 fn decode<T: Resource>(value: &Value) -> Result<ResourceObject<T>, String> {
@@ -100,6 +110,9 @@ impl Records {
                 ResourceRecordProvenance::Local { node_id } => node_id.to_string(),
                 ResourceRecordProvenance::Replica { origin_root, .. } => origin_root.to_string(),
             };
+            if matches!(record.provenance, ResourceRecordProvenance::Local { .. }) {
+                self.local_roots.insert(root.clone());
+            }
             let Some(name) = object.pointer("/metadata/name").and_then(Value::as_str) else {
                 warn!(kind = %envelope.plural, "ignoring subject resource without a name");
                 continue;
@@ -111,6 +124,9 @@ impl Records {
                 continue;
             }
             let decoded = match envelope.plural.as_str() {
+                "convoys" => decode::<Convoy>(object).map(Box::new).map(SubjectRecord::Convoy),
+                "artifacts" => decode::<Artifact>(object).map(SubjectRecord::Artifact),
+                "messages" => decode::<Message>(object).map(Box::new).map(SubjectRecord::Message),
                 "changerequests" => decode::<ChangeRequest>(object).map(SubjectRecord::ChangeRequest),
                 "issues" => decode::<Issue>(object).map(SubjectRecord::Issue),
                 "forges" => decode::<Forge>(object).map(SubjectRecord::Forge),
@@ -144,7 +160,9 @@ impl Records {
             // field, then origin root; never use receiving-host resourceVersion
             // or serialized object fields. Definitions use the root tie-break.
             let key = (namespace.clone(), name.clone());
-            let stamp = (record.observed_at(), root);
+            let authoritative = matches!(record, SubjectRecord::Convoy(_) | SubjectRecord::Artifact(_) | SubjectRecord::Message(_))
+                && self.local_roots.contains(root);
+            let stamp = (authoritative, record.observed_at(), root);
             if objects.get(&key).is_none_or(|(prior, _)| &stamp > prior) {
                 objects.insert(key, (stamp, object.clone()));
             }
@@ -236,6 +254,15 @@ impl Records {
                 });
             }
         }
-        SubjectCatalogInput { change_requests, issues, forges, references, now: None }
+        SubjectCatalogInput {
+            convoys: self.typed::<Convoy>("convoys"),
+            artifacts: self.typed::<Artifact>("artifacts"),
+            messages: self.typed::<Message>("messages"),
+            change_requests,
+            issues,
+            forges,
+            references,
+            now: None,
+        }
     }
 }

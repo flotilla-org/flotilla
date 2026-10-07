@@ -363,7 +363,7 @@ pub struct ExplainedCrewDelivery {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct ExplainedDecisionLedger {
-    /// The durable ledger evidence; the PR comment is only a projection.
+    /// The durable ledger evidence. Older comment references remain historical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_address: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -414,6 +414,8 @@ pub struct ExplainedSettlement {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvoyExplanation {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holds: Vec<ExplainedTurnDeliveryHold>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cascade: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -2375,4 +2377,12 @@ mod tests {
             })
         );
     }
+}
+
+/// Raw persisted automatic turn-delivery hold, independent of settlement verdicts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplainedTurnDeliveryHold {
+    pub source: String,
+    pub reason: String,
+    pub raised_at: String,
 }
