@@ -1,5 +1,8 @@
 # Development
 
+For the post-r591 provider and label cleanup, see the
+[compatibility retirement acceptance checks](compatibility-retirement-acceptance.md).
+
 ## Daemon logs
 
 The daemon's canonical structured log is
