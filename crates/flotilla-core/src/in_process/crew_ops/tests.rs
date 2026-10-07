@@ -539,6 +539,50 @@ async fn follow_up_reference_releases_from_message_evidence() {
     assert_eq!(backend.using::<Message>("flotilla").list().await.unwrap().items.len(), 1);
 }
 
+// Follow-up references resolve their target namespace, even when a same-name
+// Message in the Convoy namespace has different delivery evidence and intent.
+#[tokio::test]
+async fn follow_up_reference_uses_target_namespace() {
+    use flotilla_resources::{Message, MessageStatusPatch, ResolvedMessageReceiver};
+    let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
+    crew.resume("flotilla", "crew", "local decoy", Some("work"), Some("coder")).await.expect("queue local follow-up");
+    let convoys = backend.using::<ResourceConvoy>("flotilla");
+    let convoy = convoys.get("crew").await.expect("convoy");
+    let mut status = convoy.status.expect("crew status");
+    let pending = status
+        .crew_work
+        .get_mut("work")
+        .expect("vessel")
+        .get_mut("coder")
+        .expect("coder")
+        .pending_follow_up
+        .as_mut()
+        .expect("queued reference");
+    pending.namespace = "target".into();
+    let name = pending.name.clone();
+    convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("retarget follow-up");
+    let local = backend.using::<Message>("flotilla").get(&name).await.expect("local decoy");
+    let mut intent = local.spec;
+    intent.body = "target continuation".into();
+    let messages = backend.using::<Message>("target");
+    messages.create(&InputMeta::builder().name(name.clone()).build(), &intent).await.expect("target message");
+    flotilla_resources::apply_status_patch(&messages, &name, &MessageStatusPatch::Delivered {
+        receiver: ResolvedMessageReceiver::builder()
+            .crew_id("crew-id".into())
+            .session("session".into())
+            .delivered_at(Utc::now())
+            .evidence("transport acceptance".into())
+            .build(),
+        at: Utc::now(),
+    })
+    .await
+    .expect("target delivery evidence");
+    crew.reconcile_pending_supervisor_turns_once("flotilla").await.expect("continue from target");
+    let state = convoys.get("crew").await.expect("continued convoy").status.expect("continued status").crew_work["work"]["coder"].clone();
+    assert!(state.pending_follow_up.is_none());
+    assert_eq!(state.message.as_deref(), Some("target continuation"));
+}
+
 // Receiver admission can suppress a turn before its Message has replicated to
 // the producer. The acknowledgement must restore speculative workflow activation.
 #[tokio::test]

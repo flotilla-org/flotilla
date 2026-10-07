@@ -2415,13 +2415,16 @@ impl CrewService {
             for (vessel, crew) in &mut next.crew_work {
                 for (role, state) in crew {
                     let Some(reference) = &state.pending_follow_up else { continue };
-                    let message =
-                        match self.resource_backend.including_replicas::<flotilla_resources::Message>(namespace).get(&reference.name).await
-                        {
-                            Ok(message) => message.object,
-                            Err(ResourceError::NotFound { .. }) => continue,
-                            Err(error) => return Err(error.to_string()),
-                        };
+                    let message = match self
+                        .resource_backend
+                        .including_replicas::<flotilla_resources::Message>(&reference.namespace)
+                        .get(&reference.name)
+                        .await
+                    {
+                        Ok(message) => message.object,
+                        Err(ResourceError::NotFound { .. }) => continue,
+                        Err(error) => return Err(error.to_string()),
+                    };
                     if let Some(status) = &message.status {
                         if status.phase.has_delivery_evidence() {
                             continuations.push((vessel.clone(), role.clone(), reference.name.clone(), message.spec.body, status.since));
