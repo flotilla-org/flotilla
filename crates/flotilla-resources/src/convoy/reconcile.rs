@@ -1890,6 +1890,8 @@ fn vessel_outcome(
                         let Some(outcome) = create_vessel_outcome(convoy, &requirement.name, now) else { continue };
                         outcome
                     } else {
+                        // Unexplained disappearance also starts with a delay: repeated host loss
+                        // must not bypass the provisioning rate bound.
                         InternalReconcileOutcome { patch: None, actuations: Vec::new(), events: Vec::new() }
                     };
                     outcome.patch = Some(ConvoyStatusPatch::WorkProvisioningRetry { work: requirement.name.clone(), retry: next, message });

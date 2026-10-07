@@ -214,7 +214,6 @@ impl AgentMaterialRegistry {
         if let Err(ref error) = result {
             let selected = decode_selected_skills(environment).unwrap_or_default();
             let source_name = error.lines().rev().find_map(|line| line.strip_prefix(STAGE_SOURCE_PREFIX));
-            let source_name = source_name.or_else(|| selected.first().map(|entry| entry.source.as_str()));
             let source = if let Some(path) = self.skills.source.clone() {
                 tokio::task::spawn_blocking(move || inspect_skill_sources(&path))
                     .await
@@ -552,15 +551,6 @@ struct SkillSource {
     paths: Vec<String>,
 }
 
-fn source_repository_path(repository: &str) -> Option<&str> {
-    let path = if let Some((_, path)) = repository.split_once("://") {
-        path.split_once('/').map(|(_, path)| path)
-    } else {
-        repository.split_once(':').map(|(_, path)| path)
-    };
-    path.map(|path| path.trim_end_matches(".git"))
-}
-
 /// A standing convoy retains its admission pin after a generation roll. The
 /// current supply still authorizes the repository, credential and path roots;
 /// only the revision comes from the durable selection (ADR 0052).
@@ -577,7 +567,9 @@ fn resolve_frozen_sources(sources: &[SkillSource], selected: &[flotilla_resource
             }
             flotilla_resources::validate_skill_ref(&entry.name).map_err(|error| format!("{context}: {error}"))?;
             flotilla_resources::crew_defaults::validate_skill_path(&entry.path).map_err(|error| format!("{context}: {error}"))?;
-            if entry.repository != source.repository && source_repository_path(&source.repository) != Some(entry.repository.as_str()) {
+            if entry.repository != source.repository
+                && flotilla_resources::crew_defaults::source_repository_path(&source.repository) != Some(entry.repository.as_str())
+            {
                 return Err(format!(
                     "{context}: frozen repository {} differs from authorized source {}",
                     entry.repository, source.repository
@@ -2380,6 +2372,36 @@ esac
         }
         assert!(log.contains("credential=private-skills") || log.contains("credential=\"private-skills\""), "{log}");
         assert!(!log.contains("source=unknown") && !log.contains("revision=unknown"), "{log}");
+    }
+
+    // A bundle-level failure must not blame an unrelated selected source.
+    #[tokio::test]
+    async fn skill_bundle_warning_does_not_attribute_a_missing_bundle_to_selected_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        std::fs::remove_dir_all(registry.skills.source.as_ref().expect("source")).expect("remove bundle");
+        let runner = promisor_runner(temp.path());
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogCaptureWriter(Arc::clone(&output));
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let environment = vec![(
+            "FLOTILLA_RESOLVED_SKILLS".into(),
+            serde_json::to_string(&vec![crew_skill("private-source", "skills/private-folder")]).expect("selection"),
+        )];
+        registry
+            .stage_skills("governor", &BTreeSet::from([CLAUDE_CODE_ADAPTER_ID.into()]), &environment, &BTreeMap::new(), &runner)
+            .await
+            .expect_err("missing bundle");
+        let log = String::from_utf8(output.lock().expect("log").clone()).expect("UTF-8 log");
+        assert!(log.contains("source=skill-bundle") || log.contains("source=\"skill-bundle\""), "{log}");
+        assert!(!log.contains("source=private-skills") && !log.contains("source=\"private-skills\""), "{log}");
     }
 
     // #2875: retaining a frozen revision never authorizes another repository,

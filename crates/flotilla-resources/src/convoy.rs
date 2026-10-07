@@ -1929,9 +1929,8 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             }
             Self::WorkRunning { work, started_at, launched_roles } => {
                 if let Some(state) = status.work.get_mut(work) {
+                    // Running ends this provisioning episode; later runtime failures start a new episode.
                     state.provisioning_retry = None;
-                }
-                if let Some(state) = status.work.get_mut(work) {
                     state.phase = WorkPhase::Running;
                     state.completion_authority = WorkCompletionAuthority::CrewRollup;
                     state.message = None;

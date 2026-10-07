@@ -225,6 +225,16 @@ pub fn path_within_source(path: &str, source_path: &str) -> bool {
     path == source_path || path.strip_prefix(source_path).is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+/// Normalize an authorized Git source URL to its catalog repository identity.
+pub fn source_repository_path(repository: &str) -> Option<&str> {
+    let path = if let Some((_, path)) = repository.split_once("://") {
+        path.split_once('/').map(|(_, path)| path)
+    } else {
+        repository.split_once(':').map(|(_, path)| path)
+    };
+    path.map(|path| path.trim_end_matches(".git"))
+}
+
 /// Catalogs are supply facts from the same pinned generation, never demand.
 pub fn validate_catalog(catalog: &[SkillCatalogEntry], manifest: &serde_json::Value) -> Result<(), String> {
     let sources = manifest.get("sources").and_then(serde_json::Value::as_array).ok_or("skill manifest sources missing")?;
@@ -240,12 +250,7 @@ pub fn validate_catalog(catalog: &[SkillCatalogEntry], manifest: &serde_json::Va
             return Err(format!("catalog revision differs from source {}", entry.source));
         }
         let repository = source["repository"].as_str().ok_or("source repository missing")?;
-        let repository_path = if let Some((_, path)) = repository.split_once("://") {
-            path.split_once('/').map(|(_, path)| path)
-        } else {
-            repository.split_once(':').map(|(_, path)| path)
-        };
-        if repository_path.map(|path| path.trim_end_matches(".git")) != Some(entry.repository.as_str()) {
+        if source_repository_path(repository) != Some(entry.repository.as_str()) {
             return Err(format!("catalog repository differs from source {}", entry.source));
         }
         let paths = source
