@@ -155,6 +155,10 @@ impl DockerEnvironmentRuntime for ForeignEnvironmentRuntime {
     async fn destroy(&self, _environment_ref: &str, _container_id: &str) -> Result<(), String> {
         panic!("a non-actuator must not destroy a foreign environment")
     }
+
+    async fn destroy_unrecorded(&self, _environment_ref: &str) -> Result<(), String> {
+        panic!("a non-actuator must not rediscover a foreign environment backing")
+    }
 }
 
 #[tokio::test]

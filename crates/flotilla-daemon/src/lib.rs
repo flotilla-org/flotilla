@@ -10,6 +10,7 @@ mod charter_delegation;
 mod codex_central;
 mod credential;
 mod dispatch_reconciler;
+mod environment_orphans;
 mod environment_tools;
 mod event_relay;
 mod fulfilment_probe;

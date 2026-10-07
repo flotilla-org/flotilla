@@ -204,12 +204,30 @@ impl ProvisionedMount {
 /// A live handle to a provisioned sandbox environment.
 pub type EnvironmentHandle = Arc<dyn ProvisionedEnvironment>;
 
+/// Minimal backing identity for recovery. No mutable mount or image metadata is
+/// needed to reclaim a container left behind by an earlier daemon generation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EnvironmentBacking {
+    pub environment_id: EnvironmentId,
+    pub container_id: String,
+}
+
 /// Manages lifecycle of sandbox environments: image building, creation, and listing.
 #[async_trait]
 pub trait EnvironmentProvider: Send + Sync {
     async fn ensure_image(&self, spec: &EnvironmentSpec, repo_root: &Path) -> Result<ImageId, String>;
     async fn create(&self, id: EnvironmentId, image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String>;
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String>;
+    async fn list_backings(&self) -> Result<Vec<EnvironmentBacking>, String> {
+        self.list()
+            .await?
+            .into_iter()
+            .map(|handle| {
+                let container_id = handle.container_name().ok_or("environment backing has no container identity")?.to_string();
+                Ok(EnvironmentBacking { environment_id: handle.id().clone(), container_id })
+            })
+            .collect()
+    }
     /// Destroy an environment using only its stable provider identity.
     ///
     /// Teardown must not depend on parsing mutable actuated-object metadata:

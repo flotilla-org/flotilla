@@ -33,6 +33,25 @@ startup failures or panics; it is not the structured daemon log and may be
 stale. The current built-in launcher sends that same pre-tracing and panic tail
 to `~/.config/flotilla/daemon-panic.log` instead.
 
+## Docker environment recovery
+
+Run one authoritative Flotilla daemon per Docker endpoint. Environment container
+labels identify the Environment, not the daemon or config directory. Separate
+development or test daemons must use a separate Docker endpoint; different
+Flotilla config directories alone do not isolate container ownership.
+
+After startup restoration, the daemon inventories all containers labelled
+`flotilla.environment` every 60 seconds. This includes legacy containers without
+an owner label. A container absent from the local authoritative Environment store
+for 10 minutes of successful observations is reclaimed by immutable container
+ID. Failed inventory or store reads reset the grace period. Existing records,
+including quarantined records, prevent reclamation.
+
+Inventory failures appear every retry in the canonical structured log with
+`orphan environment sweep failed; will retry`, the host identity, and the error.
+A malformed inventory line stops the entire pass and resets the grace period;
+inspect those warnings when reclamation does not progress.
+
 ## Cargo target cache policy
 
 A checkout's `target/` is managed cache state. The fleet uses two complementary controls: a daily, per-host mtime-based sweep for old Cargo artifact families and a per-checkout size-cap backstop for unusually large targets.
