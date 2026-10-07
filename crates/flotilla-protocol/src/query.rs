@@ -195,6 +195,9 @@ mod project_repository_role_tests {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct CrewListMember {
+    #[serde(default)]
+    #[builder(default)]
+    pub session_archives: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[builder(default)]
     pub messages: Vec<CrewMessageView>,

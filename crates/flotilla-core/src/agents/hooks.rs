@@ -23,6 +23,7 @@ pub struct ParsedHookEvent {
     pub session_id: Option<String>,
     pub model: Option<String>,
     pub cwd: Option<String>,
+    pub log_path: Option<String>,
 }
 
 // ---------- Claude Code parser ----------
@@ -34,27 +35,38 @@ pub struct CodexParser;
 #[derive(Deserialize)]
 struct CodexNotifyPayload {
     #[serde(rename = "type")]
+    #[serde(default)]
     kind: String,
-    #[serde(rename = "thread-id")]
+    #[serde(rename = "thread-id", alias = "thread_id", alias = "session_id")]
     thread_id: Option<String>,
     cwd: Option<String>,
+    #[serde(default, alias = "rollout-path", alias = "transcript_path")]
+    rollout_path: Option<String>,
 }
 
 impl HarnessHookParser for CodexParser {
     fn parse_event(&self, event_type: &str, payload: &[u8]) -> Result<ParsedHookEvent, String> {
-        if event_type != "notify" {
+        if !matches!(event_type, "notify" | "session-start" | "SessionStart" | "stop" | "Stop") {
             return Err(format!("unknown Codex event type: {event_type}"));
         }
         let parsed: CodexNotifyPayload =
             serde_json::from_slice(payload).map_err(|error| format!("failed to parse Codex notify payload: {error}"))?;
-        let event_type = if parsed.kind == "agent-turn-complete" { AgentEventType::Idle } else { AgentEventType::NoChange };
-        Ok(ParsedHookEvent { event_type, session_id: parsed.thread_id, model: None, cwd: parsed.cwd })
+        let event_type = if matches!(event_type, "session-start" | "SessionStart") {
+            AgentEventType::Started
+        } else if parsed.kind == "agent-turn-complete" || matches!(event_type, "stop" | "Stop") {
+            AgentEventType::Idle
+        } else {
+            AgentEventType::NoChange
+        };
+        Ok(ParsedHookEvent { event_type, session_id: parsed.thread_id, model: None, cwd: parsed.cwd, log_path: parsed.rollout_path })
     }
 }
 
 /// Common fields present in every Claude Code hook stdin payload.
 #[derive(Deserialize)]
 struct ClaudeCommonPayload {
+    #[serde(default)]
+    transcript_path: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
@@ -90,12 +102,19 @@ impl HarnessHookParser for ClaudeCodeParser {
                     session_id: parsed.common.session_id,
                     model: parsed.model,
                     cwd: parsed.common.cwd,
+                    log_path: parsed.common.transcript_path,
                 })
             }
             "session-end" => {
                 let parsed: ClaudeCommonPayload =
                     serde_json::from_slice(payload).map_err(|e| format!("failed to parse SessionEnd payload: {e}"))?;
-                Ok(ParsedHookEvent { event_type: AgentEventType::Ended, session_id: parsed.session_id, model: None, cwd: parsed.cwd })
+                Ok(ParsedHookEvent {
+                    event_type: AgentEventType::Ended,
+                    session_id: parsed.session_id,
+                    model: None,
+                    cwd: parsed.cwd,
+                    log_path: parsed.transcript_path,
+                })
             }
             "user-prompt-submit" | "pre-tool-use" | "post-tool-use" => {
                 let parsed: ClaudeCommonPayload =
@@ -105,12 +124,19 @@ impl HarnessHookParser for ClaudeCodeParser {
                     session_id: parsed.session_id,
                     model: None,
                     cwd: parsed.cwd,
+                    log_path: parsed.transcript_path,
                 })
             }
             "stop" => {
                 let parsed: ClaudeCommonPayload =
                     serde_json::from_slice(payload).map_err(|e| format!("failed to parse Stop payload: {e}"))?;
-                Ok(ParsedHookEvent { event_type: AgentEventType::Idle, session_id: parsed.session_id, model: None, cwd: parsed.cwd })
+                Ok(ParsedHookEvent {
+                    event_type: AgentEventType::Idle,
+                    session_id: parsed.session_id,
+                    model: None,
+                    cwd: parsed.cwd,
+                    log_path: parsed.transcript_path,
+                })
             }
             "notification" => {
                 let parsed: ClaudeNotificationPayload =
@@ -123,7 +149,13 @@ impl HarnessHookParser for ClaudeCodeParser {
                 } else {
                     AgentEventType::NoChange
                 };
-                Ok(ParsedHookEvent { event_type, session_id: parsed.common.session_id, model: None, cwd: parsed.common.cwd })
+                Ok(ParsedHookEvent {
+                    event_type,
+                    session_id: parsed.common.session_id,
+                    model: None,
+                    cwd: parsed.common.cwd,
+                    log_path: parsed.common.transcript_path,
+                })
             }
             other => Err(format!("unknown Claude Code event type: {other}")),
         }
@@ -379,5 +411,43 @@ mod tests {
         let json = serde_json::to_string(&event).expect("serialize");
         let decoded: AgentHookEvent = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, event);
+    }
+}
+
+#[cfg(test)]
+mod session_log_tests {
+    use super::*;
+
+    // Harness log identity is available from its earliest signal, including a
+    // no-change notify. Unrelated attention fields do not suppress the path.
+    #[test]
+    fn native_hooks_capture_transcript_and_rollout_identity() {
+        for (parser, event, payload, id, path) in [
+            (
+                &ClaudeCodeParser as &dyn HarnessHookParser,
+                "session-start",
+                r#"{"session_id":"claude-session","transcript_path":"/config/projects/project/session.jsonl"}"#,
+                "claude-session",
+                "/config/projects/project/session.jsonl",
+            ),
+            (
+                &CodexParser as &dyn HarnessHookParser,
+                "notify",
+                r#"{"type":"metadata","thread-id":"codex-session","rollout-path":"/codex/sessions/rollout.jsonl"}"#,
+                "codex-session",
+                "/codex/sessions/rollout.jsonl",
+            ),
+            (
+                &CodexParser as &dyn HarnessHookParser,
+                "session-start",
+                r#"{"session_id":"codex-session","rollout_path":"/codex/sessions/rollout.jsonl"}"#,
+                "codex-session",
+                "/codex/sessions/rollout.jsonl",
+            ),
+        ] {
+            let parsed = parser.parse_event(event, payload.as_bytes()).expect("native hook");
+            assert_eq!(parsed.session_id.as_deref(), Some(id));
+            assert_eq!(parsed.log_path.as_deref(), Some(path));
+        }
     }
 }

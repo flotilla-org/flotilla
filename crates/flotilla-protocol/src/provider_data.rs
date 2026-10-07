@@ -255,6 +255,9 @@ pub struct AgentHookEvent {
     pub event_type: AgentEventType,
     /// The agent's native session ID (if available).
     pub session_id: Option<String>,
+    /// Harness-reported transcript or rollout path; content is never resource data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
     /// Model being used (if reported).
     pub model: Option<String>,
     /// Current working directory (if reported).

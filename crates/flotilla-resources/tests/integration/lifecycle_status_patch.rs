@@ -120,6 +120,7 @@ define_patch_kinds! {
     TerminalMarkDeliveryUnconfirmed => NONE,
     TerminalMarkDeliveryNotSubmitted => NONE,
     TerminalObserveAttention => NONE,
+    TerminalObserveSessionLog => NONE,
     TerminalObserveToolActivity => NONE,
     TerminalMarkCompletionPending => NONE,
     TerminalClearCompletionPending => NONE,
@@ -197,6 +198,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
 fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind {
     match patch {
         TerminalSessionStatusPatch::HoldTurnDelivery { .. } => PatchKind::TerminalHoldTurnDelivery,
+        TerminalSessionStatusPatch::ObserveSessionLog { .. } => PatchKind::TerminalObserveSessionLog,
         TerminalSessionStatusPatch::MarkStarting => PatchKind::TerminalMarkStarting,
         TerminalSessionStatusPatch::ClearRetiredLaunches => PatchKind::TerminalClearRetiredLaunches,
         TerminalSessionStatusPatch::MarkRunning { .. } => PatchKind::TerminalMarkRunning,
@@ -708,6 +710,8 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             kind: PatchKind::TerminalMarkRunning,
             exercise: || {
                 let mut status = TerminalSessionStatus {
+                    session_logs: Default::default(),
+                    session_archives: Default::default(),
                     configured_limits: None,
                     turn_delivery_hold: None,
                     last_tool_activity_at: None,
@@ -751,6 +755,8 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             kind: PatchKind::TerminalMarkStopped,
             exercise: || {
                 let mut status = TerminalSessionStatus {
+                    session_logs: Default::default(),
+                    session_archives: Default::default(),
                     phase: TerminalSessionPhase::Stopped,
                     started_at: Some(ts(10)),
                     stopped_at: Some(ts(20)),
@@ -773,6 +779,8 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             kind: PatchKind::TerminalMarkLost,
             exercise: || {
                 let mut status = TerminalSessionStatus {
+                    session_logs: Default::default(),
+                    session_archives: Default::default(),
                     phase: TerminalSessionPhase::Lost,
                     started_at: Some(ts(10)),
                     stopped_at: Some(ts(20)),
@@ -790,6 +798,8 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             kind: PatchKind::TerminalMarkFailed,
             exercise: || {
                 let mut status = TerminalSessionStatus {
+                    session_logs: Default::default(),
+                    session_archives: Default::default(),
                     phase: TerminalSessionPhase::Failed,
                     started_at: Some(ts(10)),
                     stopped_at: Some(ts(20)),
@@ -1074,6 +1084,8 @@ fn continuation_transitions_keep_started_at_and_clear_finished_at() {
             kind: PatchKind::TerminalMarkRevived,
             exercise: || {
                 let mut status = TerminalSessionStatus {
+                    session_logs: Default::default(),
+                    session_archives: Default::default(),
                     phase: TerminalSessionPhase::Lost,
                     started_at: Some(ts(10)),
                     stopped_at: Some(ts(20)),
@@ -1103,6 +1115,8 @@ fn new_attempt_transitions_replace_attempt_timestamps() {
             kind: PatchKind::TerminalMarkStarting,
             exercise: || {
                 let mut status = TerminalSessionStatus {
+                    session_logs: Default::default(),
+                    session_archives: Default::default(),
                     phase: TerminalSessionPhase::Stopped,
                     started_at: Some(ts(10)),
                     stopped_at: Some(ts(20)),

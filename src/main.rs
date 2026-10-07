@@ -2918,6 +2918,7 @@ async fn run_hook(cli: &Cli, harness: &str, event_type: &str, argument_payload: 
         .harness(harness_enum)
         .event_type(parsed.event_type)
         .maybe_session_id(parsed.session_id)
+        .maybe_log_path(parsed.log_path)
         .maybe_model(parsed.model)
         .maybe_cwd(parsed.cwd)
         .maybe_terminal(terminal)

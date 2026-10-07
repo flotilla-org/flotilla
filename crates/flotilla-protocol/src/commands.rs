@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -347,6 +347,8 @@ impl std::fmt::Display for ExplainedTerminalCondition {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainedCrewDelivery {
+    #[serde(default)]
+    pub session_archives: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_condition: Option<ExplainedTerminalCondition>,
     pub session: String,
@@ -2005,6 +2007,7 @@ mod tests {
                 vessel_ref: "convoy-a-implement".into(),
                 vessel: "implement".into(),
                 members: vec![CrewListMember {
+                    session_archives: Default::default(),
                     messages: Vec::new(),
                     role: "coder".into(),
                     kind: "agent".into(),

@@ -8,7 +8,10 @@
 //! (columns, labels, tab composition) are consumer config and never appear
 //! on the wire.
 
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -1289,6 +1292,8 @@ pub struct VesselRow {
 /// Crew membership summary on a vessel row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrewMemberSummary {
+    #[serde(default)]
+    pub session_archives: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

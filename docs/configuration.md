@@ -615,3 +615,42 @@ explicitly on the forge first. Continuation requires a remote branch: push WIP
 before dispatch. Git refuses an occupied physical worktree or local commits
 outside the remote history; preserve that work before retiring its checkout.
 See [recovery](development.md#rehydrating-work-after-host-loss).
+
+## Crew session archives
+
+Contained Codex and Claude crew homes live on the placement host. Environment
+teardown, including forced and recovery teardown, saves session evidence before
+reclaiming the backing and home:
+
+```text
+~/.local/share/flotilla/session-archive/<convoy>/<vessel>/<role>/<session-id>/
+  session.json            # identity and archive time; host-local, never replicated
+  identified-log.jsonl    # hook/metadata-identified transcript
+  sessions/ or projects/  # identified transcript in its harness layout
+  brief.md
+  skills/                 # includes the frozen skills manifest
+  decision-ledger.md      # if present in the private crew home
+```
+
+Launch registers a host-local manifest before starting the harness. Claude
+hooks report `transcript_path`; Codex notify/hooks report `rollout_path`, and
+live terminal observations also read the crew's Codex metadata index. Session
+status, `crew list` and `convoy explain` expose archive references; log content
+never enters resource storage or replication. Until a harness reports a native
+identity, its launch ID protects its private log trees. Once identified, each
+transcript is selected by its recorded path, without scanning for session files.
+
+Archives contain an allowlist of evidence. Auth files, settings, token staging
+and symlinks are excluded. If archiving fails, teardown preserves the original
+home and retries. Pre-roll homes with no identity manifest are preserved and
+teardown reports that operator attribution is required; it never deletes them.
+`FLOTILLA_DECISION_LEDGER_DRAFT` names the private-home draft path for crews.
+
+The existing hourly host sweep prunes archives older than 30 days by default,
+only after the owning convoy no longer exists. Live or quarantined convoys are
+protected across namespaces; a failed liveness lookup defers pruning. Configure
+this per host in `~/.config/flotilla/daemon.toml`:
+
+```toml
+session_archive_retention_days = 30
+```

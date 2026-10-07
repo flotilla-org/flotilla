@@ -347,6 +347,9 @@ pub struct DaemonConfig {
     /// Retention for forced checkout archives, in days.
     #[serde(default = "default_checkout_archive_retention_days")]
     pub checkout_archive_retention_days: u64,
+    /// Host-local crew session archive retention. Live convoys are always kept.
+    #[serde(default = "default_message_audit_retention_days")]
+    pub session_archive_retention_days: u64,
     /// Daemon-wide checkout removal concurrency, across execution environments.
     #[serde(default = "default_checkout_removal_concurrency", deserialize_with = "deserialize_checkout_removal_concurrency")]
     pub checkout_removal_concurrency: NonZeroUsize,
@@ -369,6 +372,7 @@ impl Default for DaemonConfig {
             blob_stores: Vec::new(),
             artifact_retention_days: default_artifact_retention_days(),
             checkout_archive_retention_days: default_checkout_archive_retention_days(),
+            session_archive_retention_days: 30,
             checkout_removal_concurrency: default_checkout_removal_concurrency(),
         }
     }

@@ -289,6 +289,12 @@ pub struct TerminalSessionStatus {
     /// after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configured_limits: Option<ConfiguredResourceLimits>,
+    /// Host-local log identities only. Default accepts the previous generation (ADR 0047).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_logs: BTreeMap<String, String>,
+    /// Host archive references, never log bytes. Default accepts the previous generation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub session_archives: BTreeMap<String, String>,
     pub phase: TerminalSessionPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -495,6 +501,11 @@ pub enum TerminalSessionStatusPatch {
     HoldTurnDelivery {
         hold: crate::ConvoyAttention,
     },
+    ObserveSessionLog {
+        session_id: String,
+        path: String,
+        archive: String,
+    },
     /// Starts a new attempt after a stopped session by clearing the previous attempt's status.
     /// Failed-session retry is not currently a legal controller transition.
     MarkStarting,
@@ -568,6 +579,10 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
     fn apply(&self, status: &mut TerminalSessionStatus) {
         match self {
             Self::HoldTurnDelivery { hold } => status.turn_delivery_hold = Some(hold.clone()),
+            Self::ObserveSessionLog { session_id, path, archive } => {
+                status.session_logs.insert(session_id.clone(), path.clone());
+                status.session_archives.insert(session_id.clone(), archive.clone());
+            }
             Self::MarkStarting => {
                 let completion_pending = status.completion_pending.take();
                 let turn_delivery_hold = status.turn_delivery_hold.take();
@@ -575,7 +590,16 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 if let Some(crew) = status.crew.take() {
                     retired_launches.insert(crew.id);
                 }
-                *status = TerminalSessionStatus { completion_pending, turn_delivery_hold, retired_launches, ..Default::default() };
+                let session_logs = std::mem::take(&mut status.session_logs);
+                let session_archives = std::mem::take(&mut status.session_archives);
+                *status = TerminalSessionStatus {
+                    completion_pending,
+                    turn_delivery_hold,
+                    retired_launches,
+                    session_logs,
+                    session_archives,
+                    ..Default::default()
+                };
             }
             Self::ClearRetiredLaunches => status.retired_launches.clear(),
             Self::ObserveCleatEndpoint { endpoint } => status.cleat_endpoint = endpoint.clone(),
@@ -1096,5 +1120,25 @@ mod tests {
 
         TerminalSessionStatusPatch::ClearCompletionPending.apply(&mut status);
         assert_eq!(status.completion_pending, None);
+    }
+}
+
+#[cfg(test)]
+mod archive_identity_tests {
+    use super::*;
+    // Resuming the terminal must retain references for every previous harness
+    // attempt, so lost-session evidence remains discoverable.
+    #[test]
+    fn starting_a_replacement_preserves_log_and_archive_identities() {
+        let mut status = TerminalSessionStatus::default();
+        TerminalSessionStatusPatch::ObserveSessionLog {
+            session_id: "old-native".into(),
+            path: "/home/sessions/old.jsonl".into(),
+            archive: "/archive/old-native".into(),
+        }
+        .apply(&mut status);
+        TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
+        assert_eq!(status.session_logs["old-native"], "/home/sessions/old.jsonl");
+        assert_eq!(status.session_archives["old-native"], "/archive/old-native");
     }
 }

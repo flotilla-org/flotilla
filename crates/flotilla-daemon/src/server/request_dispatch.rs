@@ -518,6 +518,34 @@ impl<'a> RequestDispatcher<'a> {
         }
 
         let Some(terminal) = event.terminal.as_ref() else { return Ok(()) };
+        let sessions = self.daemon.resource_backend().using::<flotilla_resources::TerminalSession>(&terminal.namespace);
+        let session = sessions.get(&terminal.session_name).await.map_err(|error| error.to_string())?;
+        if let (Some(id), Some(path)) = (&event.session_id, &event.log_path) {
+            let archive = crate::session_archive::HostSessionArchive::new(&*self.daemon.discovery_runtime().env);
+            let adapter = match event.harness {
+                flotilla_protocol::AgentHarness::Codex => "codex",
+                _ => "claude-code",
+            };
+            if let Some(location) = archive.register(&session.spec, id, adapter, Some(path), None).await? {
+                if !session
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.session_logs.get(id) == Some(path) && status.session_archives.get(id) == Some(&location))
+                {
+                    flotilla_resources::apply_status_patch(
+                        &sessions,
+                        &terminal.session_name,
+                        &flotilla_resources::TerminalSessionStatusPatch::ObserveSessionLog {
+                            session_id: id.clone(),
+                            path: path.clone(),
+                            archive: location,
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+        }
         let state = match event.event_type {
             AgentEventType::Active | AgentEventType::ToolActive => flotilla_resources::TerminalAttentionState::Working,
             AgentEventType::Idle | AgentEventType::Started => flotilla_resources::TerminalAttentionState::Idle,

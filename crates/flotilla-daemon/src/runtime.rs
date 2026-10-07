@@ -760,6 +760,7 @@ impl DaemonRuntime {
                     catalog_path: config.state_dir().as_path().join("checkout-archive-roots.json"),
                     roots: archive_roots,
                     retention_days: daemon_config.checkout_archive_retention_days,
+                    session_retention_days: daemon_config.session_archive_retention_days,
                 },
             )),
             spawn_blob_sync_status_task(
@@ -1167,6 +1168,7 @@ struct CheckoutArchiveSweep {
     catalog_path: PathBuf,
     roots: Vec<CheckoutArchiveRoot>,
     retention_days: u64,
+    session_retention_days: u64,
 }
 
 async fn load_checkout_archive_roots(path: &Path) -> Result<BTreeSet<CheckoutArchiveRoot>, String> {
@@ -1206,6 +1208,31 @@ async fn run_checkout_archive_gc(backend: ResourceBackend, namespace: String, ar
                 }
             } else {
                 debug!("empty convoy directory sweep skipped: local host identity unavailable");
+            }
+            let session_archive = crate::session_archive::HostSessionArchive::new(&*archive_sweep.daemon.discovery_runtime().env);
+            let live = async {
+                let mut live = BTreeSet::new();
+                for namespace in backend.stored_namespaces::<Convoy>().await.map_err(|error| error.to_string())? {
+                    for convoy in backend.including_replicas::<Convoy>(&namespace).list().await.map_err(|error| error.to_string())?.items {
+                        live.insert((namespace.clone(), convoy.object.metadata.name));
+                    }
+                }
+                if let Some(diagnostics) = backend.diagnostics().await.map_err(|error| error.to_string())? {
+                    for record in diagnostics.decode_quarantines.into_iter().filter(|record| record.kind == Convoy::API_PATHS.kind) {
+                        live.insert((record.namespace, record.name));
+                    }
+                }
+                Ok::<_, String>(live)
+            }
+            .await;
+            match live {
+                Ok(live) => {
+                    let days = archive_sweep.session_retention_days;
+                    if let Err(error) = crate::session_archive::sweep(&session_archive, &live, days, Utc::now()).await {
+                        warn!(%error, "session archive retention sweep failed");
+                    }
+                }
+                Err(error) => warn!(%error, "session archive retention deferred: convoy liveness unavailable"),
             }
             let mut roots = archive_sweep.roots.iter().cloned().collect::<BTreeSet<_>>();
             match load_checkout_archive_roots(&archive_sweep.catalog_path).await {
@@ -5296,6 +5323,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
     }
 
     async fn destroy(&self, environment_ref: &str, container_id: &str) -> Result<(), String> {
+        self.archive_sessions(environment_ref).await?;
         let active = self.state.provisioned_environments.lock().await.remove(container_id);
         match active {
             Some(active) => active.handle.destroy().await?,
@@ -5325,6 +5353,7 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             .environment_providers
             .get("docker")
             .ok_or("docker environment provider unavailable during backing recovery")?;
+        self.archive_sessions(environment_ref).await?;
         // The record may predate status persistence, or the daemon may have
         // restarted after Docker creation. Mutable mount labels are irrelevant.
         for backing in provider.list_backings().await? {
@@ -5345,10 +5374,8 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         }
         let mut cleanup_errors =
             forget_environment_state(self.state.credential_store.as_deref(), self.state.agent_material.as_deref(), environment_ref).await;
-        if let Some(registry) = self.state.agent_material.as_deref() {
-            if let Err(error) = registry.remove_environment_home(environment_ref).await {
-                cleanup_errors.push(error);
-            }
+        if let Some(material) = &self.state.agent_material {
+            crate::session_archive::teardown(&material.archive, environment_ref, Utc::now()).await?;
         }
         let cleat_state = self.state.config.state_dir().as_path().join("contained-cleat").join(environment_ref);
         match tokio::fs::remove_dir_all(&cleat_state).await {
@@ -5360,6 +5387,13 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
             return Err(cleanup_errors.join("; "));
         }
         Ok(())
+    }
+}
+
+impl DockerControllerRuntime {
+    async fn archive_sessions(&self, environment: &str) -> Result<(), String> {
+        let Some(material) = &self.state.agent_material else { return Ok(()) };
+        crate::session_archive::archive_environment(&material.archive, environment, Utc::now()).await
     }
 }
 
@@ -6868,6 +6902,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
                 }
                 let backend = self.state.daemon.resource_backend();
                 let fulfilment_grants = fulfilment_grants_for_terminal(&backend, context).await;
+                let delivered_brief = materialized_brief.content.clone();
                 let plan = adapter.launch(&AgentLaunchRequest {
                     role: spec.role.clone(),
                     model: requirement.model.clone(),
@@ -6882,6 +6917,11 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     .maybe_model(requirement.model)
                     .stance(plan.stance)
                     .build();
+                if let Some(material) =
+                    self.state.agent_material.as_ref().filter(|_| spec.env_ref != self.state.host_direct_environment_name)
+                {
+                    material.archive.register(spec, &crew.id, &crew.adapter, None, Some(&delivered_brief)).await?;
+                }
                 let mut env = plan.env;
                 let git_identity = compose(TargetId::AgentEnvironment, crew_git_identity_environment_fragments())
                     .expect("crew Git identity environment must compose")
@@ -7002,6 +7042,44 @@ impl TerminalRuntime for TerminalControllerRuntime {
     async fn observe_attention(&self, session_id: &str, spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {
         let pool = self.pool_for_spec(spec)?;
         let adapter = self.adapter_for_spec(spec)?;
+        // Persist harness metadata early, independently of container liveness.
+        if let Some(material) = self.state.agent_material.as_ref().filter(|_| {
+            spec.env_ref != self.state.host_direct_environment_name && adapter.as_ref().is_some_and(|adapter| adapter.id() == "codex")
+        }) {
+            let archive = &material.archive;
+            match archive.codex_metadata(&spec.env_ref, &spec.role).await {
+                Ok(logs) if !logs.is_empty() => {
+                    if let TerminalSessionSource::Agent { context, .. } = &spec.source {
+                        let sessions = self.state.daemon.resource_backend().using::<TerminalSession>(&context.namespace);
+                        for session in sessions.list().await.map_err(|error| error.to_string())?.items {
+                            if session.spec.env_ref == spec.env_ref && session.spec.role == spec.role {
+                                for (id, path) in &logs {
+                                    if let Some(location) = archive.register(spec, id, "codex", Some(path), None).await? {
+                                        if !session.status.as_ref().is_some_and(|status| {
+                                            status.session_logs.get(id) == Some(path) && status.session_archives.get(id) == Some(&location)
+                                        }) {
+                                            flotilla_resources::apply_status_patch(
+                                                &sessions,
+                                                &session.metadata.name,
+                                                &flotilla_resources::TerminalSessionStatusPatch::ObserveSessionLog {
+                                                    session_id: id.clone(),
+                                                    path: path.clone(),
+                                                    archive: location,
+                                                },
+                                            )
+                                            .await
+                                            .map_err(|error| error.to_string())?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => warn!(%error, "Codex session metadata unavailable; will retry"),
+            }
+        }
         observe_terminal_screen(&*pool, adapter.as_deref(), session_id, Utc::now()).await
     }
 
@@ -8993,6 +9071,7 @@ mod tests {
                 // This runner stands in for the contained process boundary;
                 // real scratch copying and credential links are tested in agent_material.
                 || (cmd == "sh" && args.contains(&"flotilla-crew-home"))
+                || (cmd == "sh" && args.contains(&"test -w /tmp/flotilla-config/agent-homes/claude"))
             {
                 Ok(String::new())
             } else {
@@ -10502,7 +10581,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn docker_teardown_after_restart_removes_persistent_agent_home() {
+    async fn docker_teardown_after_restart_archives_persistent_agent_home() {
+        run_archive_teardown(false).await;
+    }
+
+    // Explicit force skips checkout safety evidence, but its real ownership
+    // cascade still runs the environment archive finalizer.
+    #[tokio::test]
+    async fn forced_convoy_teardown_archives_agent_home_through_finalizers() {
+        run_archive_teardown(true).await;
+    }
+
+    async fn run_archive_teardown(force: bool) {
         let temp = TempDir::new().expect("tempdir");
         let config_base = temp.path().join("config");
         fs::create_dir_all(&config_base).expect("config directory");
@@ -10531,6 +10621,22 @@ mod tests {
         let environment_home = home.join(".local/share/flotilla/agent-homes/contained-restarted");
         fs::create_dir_all(environment_home.join("codex/sessions")).expect("persistent agent home");
         fs::write(environment_home.join("codex/sessions/rollout.jsonl"), "session state").expect("persistent session state");
+        crate::session_archive::write_record(
+            &environment_home.join(".session-records/native.json"),
+            &crate::session_archive::SessionRecord::builder()
+                .namespace("test".into())
+                .convoy("convoy".into())
+                .vessel("work".into())
+                .role("coder".into())
+                .id("native".into())
+                .adapter("codex".into())
+                .log_path("/tmp/flotilla-codex/sessions/rollout.jsonl".into())
+                .brief("brief".into())
+                .build(),
+        )
+        .await
+        .expect("session manifest");
+        fs::write(environment_home.join("codex/auth.json"), "secret").expect("credential");
         let agent_material = Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([("HOME", home.display().to_string())]))));
         let state = Arc::new(
             ControllerRuntimeState::new(
@@ -10556,13 +10662,87 @@ mod tests {
             runtime.cleanup(invalid).await.expect("unsafe names must not wedge finalization");
         }
         assert!(outside_state.join("sentinel").exists(), "unsafe cleanup must preserve unrelated state");
-        runtime
-            .destroy("contained-restarted", "test-interior")
-            .await
-            .expect("restart teardown should rediscover and destroy the container");
+        if force {
+            use flotilla_resources::controller::Reconciler;
+            let backend = runtime.state.daemon.resource_backend();
+            let namespace = "test";
+            backend
+                .using::<Convoy>(namespace)
+                .create(
+                    &InputMeta::builder().name("convoy".into()).build(),
+                    &flotilla_resources::ConvoySpec::builder().workflow_ref("single-agent".into()).build(),
+                )
+                .await
+                .expect("convoy");
+            let labels = BTreeMap::from([
+                (flotilla_resources::CONVOY_LABEL.into(), "convoy".into()),
+                (flotilla_resources::AUTHORITY_LABEL.into(), flotilla_protocol::LifecycleAuthority::Managed.as_label_value().into()),
+            ]);
+            let vessels = backend.using::<Vessel>(namespace);
+            vessels
+                .create(
+                    &InputMeta::builder()
+                        .name("convoy-work".into())
+                        .labels(labels.clone())
+                        .finalizers(vec!["flotilla.work/vessel-workspace-teardown".into()])
+                        .build(),
+                    &flotilla_resources::VesselSpec {
+                        convoy_ref: "convoy".into(),
+                        vessel_name: "work".into(),
+                        placement_policy_ref: "policy".into(),
+                        adopted_checkout_refs: Default::default(),
+                    },
+                )
+                .await
+                .expect("vessel");
+            let mut labels = labels;
+            labels.insert(flotilla_resources::VESSEL_REF_LABEL.into(), "convoy-work".into());
+            let environments = backend.using::<Environment>(namespace);
+            let created = environments
+                .create(
+                    &InputMeta::builder()
+                        .name("contained-restarted".into())
+                        .labels(labels)
+                        .finalizers(vec!["flotilla.work/environment-teardown".into()])
+                        .build(),
+                    &EnvironmentSpec {
+                        host_direct: None,
+                        docker: Some(
+                            serde_json::from_value(json!({"host_ref":"host-test", "image":"contained-image"})).expect("docker spec"),
+                        ),
+                    },
+                )
+                .await
+                .expect("environment");
+            environments
+                .update_status(
+                    "contained-restarted",
+                    &created.metadata.resource_version,
+                    &flotilla_resources::EnvironmentStatus { docker_container_id: Some("test-interior".into()), ..Default::default() },
+                )
+                .await
+                .expect("backing identity");
+            flotilla_core::convoy_ensure::ConvoyEnsureAdmission::reap(runtime.state.daemon.as_ref(), namespace, "convoy", true)
+                .await
+                .expect("force deletion");
+            let vessel = vessels.get("convoy-work").await.expect("vessel pending finalization");
+            assert!(vessel.metadata.deletion_timestamp.is_some());
+            VesselReconciler::new(backend.clone(), namespace).run_finalizer(&vessel).await.expect("vessel cascade");
+            let environment = environments.get("contained-restarted").await.expect("environment pending finalization");
+            assert!(environment.metadata.deletion_timestamp.is_some());
+            EnvironmentReconciler::new(Arc::new(runtime), backend, namespace).run_finalizer(&environment).await.expect("archive finalizer");
+        } else {
+            runtime
+                .destroy("contained-restarted", "test-interior")
+                .await
+                .expect("restart teardown should rediscover and destroy the container");
+        }
 
         assert!(destroyed.load(Ordering::SeqCst), "the restarted daemon must destroy the still-running lease holder");
-        assert!(!environment_home.exists(), "durable environment teardown must remove its persistent agent home");
+        assert!(!environment_home.exists(), "durable environment teardown reclaims the original home after archiving");
+        let archived = home.join(".local/share/flotilla/session-archive/convoy/work/coder/native");
+        assert_eq!(fs::read_to_string(archived.join("identified-log.jsonl")).expect("archived log"), "session state");
+        assert!(!archived.join("auth.json").exists());
         assert!(!cleat_state.exists(), "durable teardown must remove contained-cleat state too");
     }
 
@@ -11835,6 +12015,7 @@ mod tests {
                     CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/b".into() },
                 ],
                 retention_days: 14,
+                session_retention_days: 30,
             },
         ));
         tokio::time::timeout(Duration::from_secs(5), runner.finished.notified()).await.expect("later root swept");
@@ -17894,7 +18075,10 @@ mod tests {
                 "host-direct-host-test".to_string(),
             )
             .with_credential_store(credential_store)
-            .with_agent_material(Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([] as [(&str, &str); 0]))))),
+            .with_agent_material(Arc::new(AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([(
+                "HOME",
+                temp.path().to_str().expect("home"),
+            )]))))),
         );
         let spec = flotilla_resources::TerminalSessionSpec {
             env_ref: env_id.to_string(),
@@ -17970,7 +18154,7 @@ mod tests {
             launch.env_vars.iter().any(|(name, value)| name == "CLAUDE_CONFIG_DIR"
                 && value
                     == if private_home {
-                        crew_config_dir.join("crews/coder").display().to_string()
+                        Path::new("/tmp/flotilla-config/agent-homes/claude/crews/coder").display().to_string()
                     } else {
                         crew_config_dir.display().to_string()
                     }

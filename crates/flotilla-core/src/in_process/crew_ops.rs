@@ -761,6 +761,12 @@ impl CrewService {
                 };
                 let crew = session.and_then(|session| session.status.as_ref()).and_then(|status| status.crew.as_ref());
                 CrewListMember::builder()
+                    .session_archives(
+                        session
+                            .and_then(|session| session.status.as_ref())
+                            .map(|status| status.session_archives.clone())
+                            .unwrap_or_default(),
+                    )
                     .messages(
                         inbox_messages
                             .get(&crate::leaf_engine::crew_role_address(project, &context.convoy, &context.vessel, &process.role))

@@ -42,6 +42,7 @@ sha2 = "0.10"
 hmac = "0.12"
 bytes = "1"
 http = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -56,7 +57,6 @@ flotilla-resources = { path = "../flotilla-resources", features = ["test-support
 flotilla-test-support = { path = "../flotilla-test-support" }
 hegeltest = "=0.48.1"
 http = "1"
-rusqlite = { version = "0.37", features = ["bundled"] }
 
 [lints]
 workspace = true

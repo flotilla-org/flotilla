@@ -36,6 +36,7 @@ pub(crate) const FLOTILLA_CODEX_HOME_TEMPLATE_ENV: &str = "FLOTILLA_CODEX_HOME_T
 const SKILL_BUNDLE_MANIFEST: &str = ".flotilla-sources.json";
 const CONTAINER_SKILLS_SOURCE: &str = "/run/flotilla/skills";
 pub(crate) const CONTAINER_CODEX_HOME: &str = CONTAINED_CODEX_HOME;
+pub(crate) const CONTAINER_CLAUDE_HOME: &str = "/tmp/flotilla-config/agent-homes/claude";
 /// The one credential file inside a crew's `CODEX_HOME`. Everything else under
 /// that directory is per-crew scratch Codex may write freely.
 const CODEX_AUTH_FILE: &str = "auth.json";
@@ -100,6 +101,7 @@ trait AgentMaterialAdapter: Send + Sync {
 }
 
 pub(crate) struct AgentMaterialRegistry {
+    pub(crate) archive: crate::session_archive::HostSessionArchive,
     homes_dir: PathBuf,
     codex_central_auth_path: PathBuf,
     adapters: BTreeMap<&'static str, Arc<dyn AgentMaterialAdapter>>,
@@ -118,14 +120,14 @@ impl AgentMaterialRegistry {
             homes_dir.clone(),
             cfg!(any(target_os = "linux", test)),
         ));
-        let claude_code: Arc<dyn AgentMaterialAdapter> = Arc::new(ClaudeCodeMaterialAdapter);
+        let claude_code: Arc<dyn AgentMaterialAdapter> = Arc::new(ClaudeCodeMaterialAdapter { homes_dir: Some(homes_dir.clone()) });
         let mut adapters = BTreeMap::from([(codex.id(), codex), (claude_code.id(), Arc::clone(&claude_code))]);
         // The canary exercises normal skill staging without login material.
         // Its private config home uses the same layout as Claude crews.
         if env.get("FLOTILLA_FLEET_CANARY").as_deref() == Some("1") {
-            adapters.insert("fleet-canary", claude_code);
+            adapters.insert("fleet-canary", Arc::new(ClaudeCodeMaterialAdapter { homes_dir: None }));
         }
-        Self { homes_dir, codex_central_auth_path, adapters, skills }
+        Self { archive: crate::session_archive::HostSessionArchive::new(&*env), homes_dir, codex_central_auth_path, adapters, skills }
     }
 
     pub(crate) async fn prepare(
@@ -260,7 +262,13 @@ impl AgentMaterialRegistry {
         for adapter in required_adapters.iter().filter_map(|id| self.adapters.get(id.as_str())) {
             let Some(destination) = adapter.skill_destination(environment, &config_base)? else { continue };
             let base = destination.parent().expect("skill directory has a parent");
-            let home = base.join("crews").join(role);
+            let home = if adapter.id() == CLAUDE_CODE_ADAPTER_ID
+                && environment.iter().any(|(key, value)| key == "FLOTILLA_PERSISTENT_AGENT_HOMES" && value == "1")
+            {
+                Path::new(CONTAINER_CLAUDE_HOME).join("crews").join(role)
+            } else {
+                base.join("crews").join(role)
+            };
             // Static config seeds scratch once: later base edits intentionally do
             // not overwrite crew-owned config or state. Auth follows atomic
             // rotations in the delivered base. Never copy skills or other crews' state.
@@ -288,6 +296,8 @@ done"#,
             let variable = adapter.config_home_variable();
             result.retain(|(key, _)| key != variable);
             result.push((variable.into(), home.to_string_lossy().into_owned()));
+            result.retain(|(key, _)| key != "FLOTILLA_DECISION_LEDGER_DRAFT");
+            result.push(("FLOTILLA_DECISION_LEDGER_DRAFT".into(), home.join("decision-ledger.md").to_string_lossy().into_owned()));
         }
         Ok(result)
     }
@@ -334,11 +344,15 @@ done"#,
     }
 
     pub(crate) fn fragments(&self, required_adapters: &BTreeSet<String>, environment: &BTreeMap<String, String>) -> Vec<Fragment> {
-        required_adapters
+        let mut fragments: Vec<_> = required_adapters
             .iter()
             .filter_map(|adapter_id| self.adapters.get(adapter_id.as_str()))
             .filter_map(|adapter| adapter.fragment(environment))
-            .collect()
+            .collect();
+        if required_adapters.contains(CLAUDE_CODE_ADAPTER_ID) {
+            fragments.push(agent_environment_fragment("FLOTILLA_PERSISTENT_AGENT_HOMES", "1", "agent-material/claude"));
+        }
+        fragments
     }
 
     /// Drops the delivered credential copy for an environment that is being
@@ -373,6 +387,7 @@ done"#,
         install_read_only_copy(&credential, &home.join(CODEX_AUTH_FILE)).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn remove_environment_home(&self, environment_ref: &str) -> Result<(), String> {
         let home = self.homes_dir.join(environment_ref);
         match fs::remove_dir_all(&home).await {
@@ -977,7 +992,9 @@ impl AgentMaterialAdapter for CodexMaterialAdapter {
     }
 }
 
-struct ClaudeCodeMaterialAdapter;
+struct ClaudeCodeMaterialAdapter {
+    homes_dir: Option<PathBuf>,
+}
 
 #[async_trait]
 impl AgentMaterialAdapter for ClaudeCodeMaterialAdapter {
@@ -994,7 +1011,7 @@ impl AgentMaterialAdapter for ClaudeCodeMaterialAdapter {
     }
 
     fn is_managed_config_home(&self, config_home: &Path, config_base: &Path) -> bool {
-        config_home.starts_with(config_base)
+        config_home.starts_with(config_base) || config_home.starts_with(CONTAINER_CLAUDE_HOME)
     }
 
     fn externally_managed_home_opts_out_of_skills(&self) -> bool {
@@ -1003,10 +1020,20 @@ impl AgentMaterialAdapter for ClaudeCodeMaterialAdapter {
 
     async fn prepare(
         &self,
-        _environment_ref: &str,
+        environment_ref: &str,
         _environment: &BTreeMap<String, String>,
     ) -> Result<Option<AgentMaterialDelivery>, String> {
-        Ok(None)
+        let Some(homes_dir) = &self.homes_dir else { return Ok(None) };
+        let home = homes_dir.join(environment_ref).join("claude");
+        fs::create_dir_all(&home).await.map_err(|error| error.to_string())?;
+        Ok(Some(AgentMaterialDelivery {
+            mount: ProvisionedMount::new(home, CONTAINER_CLAUDE_HOME, ProvisionedMountMode::Rw),
+            preflight: AgentMaterialPreflight {
+                command: "sh".into(),
+                args: vec!["-c".into(), "test -w /tmp/flotilla-config/agent-homes/claude".into()],
+                failure_context: "Claude persistent home is not writable".into(),
+            },
+        }))
     }
 }
 

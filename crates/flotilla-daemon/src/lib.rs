@@ -19,6 +19,7 @@ mod issue_materializer;
 mod resource_limits;
 pub mod resource_manifest;
 mod restart_history;
+mod session_archive;
 mod sleep_inhibitor;
 mod startup;
 pub mod vessel_config;

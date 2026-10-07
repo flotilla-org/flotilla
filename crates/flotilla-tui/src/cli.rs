@@ -823,6 +823,9 @@ fn format_crew_list_human(response: &CrewListResponse) -> String {
     }
     let mut inbox = String::new();
     for member in &response.members {
+        for (id, location) in &member.session_archives {
+            let _ = writeln!(inbox, "Session archive {id} for {}: {location}", member.role);
+        }
         for message in &member.messages {
             let _ = writeln!(
                 inbox,
@@ -1206,6 +1209,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         output.push_str("  (none)\n");
     } else {
         for delivery in &explanation.crew_deliveries {
+            for (id, location) in &delivery.session_archives {
+                let _ = writeln!(output, "    session archive {id}: {location}");
+            }
             let _ = writeln!(
                 output,
                 "  - {} role={} last_rung={} delivered_message={} sender={}",

@@ -1107,6 +1107,7 @@ impl ReadProjections<'_> {
             .into_iter()
             .filter(|source| source.object.metadata.labels.get(CONVOY_LABEL).is_some_and(|convoy| convoy == name))
             .map(|source| ExplainedCrewDelivery {
+                session_archives: source.object.status.as_ref().map(|status| status.session_archives.clone()).unwrap_or_default(),
                 terminal_condition: source.object.status.as_ref().and_then(crate::terminal_health::condition),
                 session: source.object.metadata.name,
                 role: source.object.spec.role,

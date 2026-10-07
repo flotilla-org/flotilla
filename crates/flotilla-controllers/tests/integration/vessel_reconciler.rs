@@ -1019,7 +1019,13 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
         .update_status(
             &session.metadata.name,
             &session.metadata.resource_version,
-            &TerminalSessionStatus { phase: TerminalSessionPhase::Running, session_id: Some("running-crew".into()), ..Default::default() },
+            &TerminalSessionStatus {
+                session_logs: Default::default(),
+                session_archives: Default::default(),
+                phase: TerminalSessionPhase::Running,
+                session_id: Some("running-crew".into()),
+                ..Default::default()
+            },
         )
         .await
         .expect("running status");
@@ -2189,6 +2195,8 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
             terminal_name,
             &terminal.metadata.resource_version,
             &TerminalSessionStatus {
+                session_logs: Default::default(),
+                session_archives: Default::default(),
                 phase: TerminalSessionPhase::Stopped,
                 session_id: Some(terminal_name.to_string()),
                 message: Some("session missing from cleat".to_string()),
@@ -3149,6 +3157,8 @@ async fn create_running_terminal(
             name,
             &created.metadata.resource_version,
             &TerminalSessionStatus {
+                session_logs: Default::default(),
+                session_archives: Default::default(),
                 configured_limits: None,
                 turn_delivery_hold: None,
                 last_tool_activity_at: None,

@@ -2715,6 +2715,10 @@ impl Aggregator {
                 });
                 let observed_crew = session.and_then(|session| session.object.status.as_ref()?.crew.as_ref());
                 CrewMemberSummary {
+                    session_archives: session
+                        .and_then(|session| session.object.status.as_ref())
+                        .map(|status| status.session_archives.clone())
+                        .unwrap_or_default(),
                     session: session.map(|session| format!("{}/{}/{}", vessel_host, convoy_ref.namespace, session.object.metadata.name)),
                     adapter: observed_crew.map(|crew| crew.adapter.clone()),
                     model: observed_crew.and_then(|crew| crew.model.clone()),

@@ -947,6 +947,7 @@ fn crew_roles_remain_a_flat_fact() {
     let reference = convoy_ref("dev", "cutover");
     let mut coder = vessel().convoy(&reference).name("coder").phase(WorkPhase::Running).call();
     coder.crew = vec![CrewMemberSummary {
+        session_archives: Default::default(),
         session: None,
         adapter: None,
         model: None,
@@ -2657,6 +2658,7 @@ fn placement_catalog_preserves_raw_facts(tc: hegel::TestCase) {
     row.image_ref = contained.then(|| "crew:latest".into());
     row.local_image_id = contained.then(|| "sha256:abcdef1234567890".into());
     row.crew = vec![CrewMemberSummary {
+        session_archives: Default::default(),
         role: "coder".into(),
         command_preview: "codex".into(),
         requested_stance: None,

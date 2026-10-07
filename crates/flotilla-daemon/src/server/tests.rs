@@ -5436,3 +5436,75 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
     shutdown.send(true).expect("shutdown");
     task.await.expect("server task").expect("server stops");
 }
+
+// #2889: hook identity is stored before attention filtering and survives a new
+// daemon's reads. Inject HOME so local manifests never touch ambient agent state.
+#[tokio::test]
+async fn managed_hooks_persist_log_identity_even_without_attention_change() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = test_config_store(tmp.path().join("config"));
+    let mut discovery = fake_discovery(false);
+    discovery.env =
+        Arc::new(flotilla_core::providers::discovery::test_support::TestEnvVars::new([("HOME", tmp.path().to_str().expect("home"))]));
+    let daemon = InProcessDaemon::new(vec![], config, discovery, HostName::new("local")).await;
+    let sessions = daemon.resource_backend().using::<TerminalSession>("flotilla");
+    let store = flotilla_core::agents::shared_in_memory_agent_state_store();
+    for (name, harness, path) in [
+        ("claude-session", AgentHarness::ClaudeCode, "/tmp/flotilla-config/agent-homes/claude/crews/coder/projects/project/log.jsonl"),
+        ("codex-session", AgentHarness::Codex, "/tmp/flotilla-codex/crews/coder/sessions/log.jsonl"),
+    ] {
+        let mut spec = flotilla_resources::TerminalSessionSpec::builder()
+            .env_ref("contained".into())
+            .role("coder".into())
+            .cwd("/repo".into())
+            .pool("cleat".into())
+            .source(TerminalSessionSource::Agent {
+                selector: flotilla_resources::Selector { capability: "coding".into(), adapter: None, model: None },
+                brief: flotilla_resources::TerminalBrief {
+                    path: "brief.md".into(),
+                    content: "brief".into(),
+                    artifact_digest: None,
+                    copies: vec![],
+                },
+                context: Box::new(flotilla_resources::TerminalCrewContext {
+                    namespace: "flotilla".into(),
+                    convoy: "convoy".into(),
+                    vessel_ref: "convoy-work".into(),
+                }),
+                message: None,
+            })
+            .build();
+        spec.env.clear();
+        sessions.create(&InputMeta::builder().name(name.into()).build(), &spec).await.expect("session");
+        let mut recorded_version = None;
+        for _ in 0..2 {
+            let response = dispatch_request_with_state(
+                &daemon,
+                &store,
+                1,
+                Request::AgentHook {
+                    event: AgentHookEvent::builder()
+                        .attachable_id(AttachableId::new(name))
+                        .harness(harness.clone())
+                        .event_type(AgentEventType::NoChange)
+                        .session_id(name.into())
+                        .log_path(path.into())
+                        .terminal(flotilla_protocol::AgentHookTerminalRef { namespace: "flotilla".into(), session_name: name.into() })
+                        .build(),
+                },
+            )
+            .await;
+            assert!(matches!(ok_response(response, 1), Response::AgentHook));
+            let observed_version = sessions.get(name).await.expect("observed identity").metadata.resource_version;
+            if let Some(version) = &recorded_version {
+                assert_eq!(&observed_version, version, "duplicate identity must not churn resource versions");
+            }
+            recorded_version = Some(observed_version);
+        }
+        let status = sessions.get(name).await.expect("session").status.expect("status");
+        assert_eq!(status.session_logs.get(name).map(String::as_str), Some(path));
+        assert_eq!(status.session_archives.len(), 1, "duplicate hooks keep one identity");
+        assert!(status.session_archives[name].ends_with(&format!("convoy/work/coder/{name}")));
+        assert!(tmp.path().join(format!(".local/share/flotilla/agent-homes/contained/.session-records/{name}.json")).exists());
+    }
+}
