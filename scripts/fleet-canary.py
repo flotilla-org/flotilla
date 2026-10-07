@@ -8,8 +8,8 @@ import argparse
 import json
 import os
 from pathlib import Path
-import shutil
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -29,8 +29,11 @@ class Commands:
     def run(self, args, *, cwd=None):
         self.log.write(json.dumps([str(arg) for arg in args]) + '\n')
         self.log.flush()
-        result = subprocess.run(args, cwd=cwd, env=self.environment, text=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        try:
+            result = subprocess.run(args, cwd=cwd, env=self.environment, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        except subprocess.TimeoutExpired as error:
+            raise CanaryFailure(f"command timed out: {' '.join(map(str, args))}") from error
         if result.returncode:
             raise CanaryFailure(f"command failed: {args[0]} {' '.join(map(str, args[1:]))}: {result.stderr.strip()}")
         return result.stdout
@@ -59,13 +62,13 @@ class Commands:
                 process = Path('/proc') / str(pid)
                 if ((process / 'exe').resolve() != binary.resolve()
                         or f'CLEAT_RUNTIME_DIR={runtime}'.encode() not in (process / 'environ').read_bytes().split(b'\0')):
-                    raise CanaryFailure('host Cleat cleanup refused an unrelated process')
+                    continue  # Stale PID file; never signal an unrelated process.
                 signal.pidfd_send_signal(descriptor, signal.SIGTERM)
                 if not select.select([descriptor], [], [], 10)[0]:
                     signal.pidfd_send_signal(descriptor, signal.SIGKILL)
                     if not select.select([descriptor], [], [], 10)[0]:
                         raise CanaryFailure('host Cleat daemon was not reaped')
-            except (FileNotFoundError, ProcessLookupError):
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
                 pass
             finally:
                 os.close(descriptor)
@@ -90,8 +93,8 @@ def verify_baseline(report):
             raise CanaryFailure(f'baseline git config {key} missing or incorrect')
     if 'testing/SKILL.md' not in report['skills']:
         raise CanaryFailure('baseline crew skills missing')
-    for key in ('GH_TOKEN', 'GITHUB_TOKEN', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'):
-        if env.get(key):
+    for key, value in env.items():
+        if value and key.endswith(('_TOKEN', '_API_KEY', '_TOKEN_FILE')):
             raise CanaryFailure(f'credential-free canary received {key}')
 
 
@@ -240,13 +243,18 @@ def main(argv=None):
         canary = Canary(args.release, root, commands, args.timeout)
         try:
             canary.exercise()
-            canary.stop()
-            commands.reap_host_cleat(root, args.release / 'bin/cleat')
             success = True
         except (CanaryFailure, OSError, ValueError, subprocess.SubprocessError) as error:
             print(f'fleet-install: canary failed: {error}; logs: {root}', file=sys.stderr)
         finally:
-            canary.stop()
+            try:
+                canary.stop()
+            finally:
+                try:
+                    commands.reap_host_cleat(root, args.release / 'bin/cleat')
+                except (CanaryFailure, OSError, subprocess.SubprocessError) as error:
+                    success = False
+                    print(f'fleet-install: canary Cleat cleanup failed: {error}; logs: {root}', file=sys.stderr)
     if success:
         shutil.rmtree(root)
         print('fleet-install: canary passed on feta', flush=True)

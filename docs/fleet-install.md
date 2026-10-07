@@ -95,11 +95,11 @@ gate waits for Landed and the terminal/environment/vessel finalizers, and checks
 that its Docker container is gone. Container deletion also reaps its contained
 Cleat endpoint and sessions. It never prunes or kills fleet containers/sessions.
 
-Successful runs stop the canary daemon, reap any empty host Cleat daemon started
-by discovery, and remove scratch state. Host Cleat cleanup checks both its
-executable and private runtime environment, using Linux pidfds to avoid PID reuse. Failures
-stop only that daemon and retain state, logs, and any surviving canary container
-for inspection. The diagnostic names the failed assertion and log directory;
+All runs stop the canary daemon and reap any matching host Cleat daemon started
+by discovery. Host Cleat cleanup checks both its executable and private runtime
+environment, using Linux pidfds to avoid PID reuse; stale or inaccessible PID
+files never authorize signalling another process. Successful runs remove scratch
+state. Failures retain state, logs, and any surviving canary container for inspection. The diagnostic names the failed assertion and log directory;
 no active generation is switched. Inspect `daemon.log`, `commands.log`, and
 `crew-report.json` when present. After inspection, remove only the container ID
 recorded by that canary and its `/tmp/fleet-canary.*` directory.
@@ -107,7 +107,8 @@ recorded by that canary and its `/tmp/fleet-canary.*` directory.
 `fleet-install --canary <generation>` stages and probes without activation and
 is accepted only on feta. For an explicit emergency bypass, use
 `fleet-install --skip-canary <generation>` (or `--skip-canary latest`); every
-activation prints a warning. Rollback retains the previous-generation path and
+activation prints a warning identifying `FLEET_INSTALL_SKIP_CANARY=1`, which can
+also be set explicitly in the environment. Rollback retains the previous-generation path and
 does not run a new canary. The real-Codex optional probe is not implemented.
 
 For the first generation carrying the canary payload, sync the reviewed

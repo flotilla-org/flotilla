@@ -1135,6 +1135,18 @@ esac
         ])))
     }
 
+    fn registry_for_adapter(home: &Path, adapter: &str) -> AgentMaterialRegistry {
+        if adapter != "fleet-canary" {
+            return registry(home);
+        }
+        let skills = write_skill_sources(home);
+        AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
+            ("HOME", home.display().to_string()),
+            (FLOTILLA_SKILLS_DIR_ENV, skills.display().to_string()),
+            ("FLOTILLA_FLEET_CANARY", "1".to_string()),
+        ])))
+    }
+
     fn registry_with_home_template(home: &Path, template: &Path) -> AgentMaterialRegistry {
         let skills = write_skill_sources(home);
         AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
@@ -2233,16 +2245,7 @@ esac
         // even when the pinned source also supplies an unrelated skill.
         for adapter in [CLAUDE_CODE_ADAPTER_ID, CODEX_ADAPTER_ID, "fleet-canary"] {
             let temp = tempfile::tempdir().expect("tempdir");
-            let registry = if adapter == "fleet-canary" {
-                let skills = write_skill_sources(temp.path());
-                AgentMaterialRegistry::new(Arc::new(TestEnvVars::new([
-                    ("HOME", temp.path().display().to_string()),
-                    (FLOTILLA_SKILLS_DIR_ENV, skills.display().to_string()),
-                    ("FLOTILLA_FLEET_CANARY", "1".to_string()),
-                ])))
-            } else {
-                registry(temp.path())
-            };
+            let registry = registry_for_adapter(temp.path(), adapter);
             let bundle = registry.skills.source.as_ref().expect("source");
             std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"1111111111111111111111111111111111111111","credential":"private-skills"}]}"#).expect("manifest");
             let runner = promisor_runner(temp.path());

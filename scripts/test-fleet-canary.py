@@ -196,6 +196,7 @@ class Contract(unittest.TestCase):
                 root = processes[0].root
                 try:
                     self.assertIsNotNone(processes[0].process.poll())
+                    self.assertIn(['reap-host-cleat', str(root)], processes[0].calls)
                     self.assertEqual(result, 1 if failure else 0)
                     if failure:
                         self.assertTrue((root / 'crew-report.json').is_file())
@@ -222,7 +223,9 @@ class Contract(unittest.TestCase):
             pid_file = runtime / 'default/daemon.pid'
             try:
                 pid_file.write_text(str(unrelated.pid))
-                with self.assertRaisesRegex(canary.CanaryFailure, 'unrelated process'):
+                commands.reap_host_cleat(root, binary)
+                self.assertIsNone(unrelated.poll())
+                with patch.object(Path, 'read_bytes', side_effect=PermissionError('other user')):
                     commands.reap_host_cleat(root, binary)
                 self.assertIsNone(unrelated.poll())
                 pid_file.write_text(str(owned.pid))
@@ -234,6 +237,23 @@ class Contract(unittest.TestCase):
                     if process.poll() is None:
                         process.terminate()
                     process.wait()
+
+    # A hung process is translated at the process boundary so the wait loop
+    # retains the assertion being checked in its timeout diagnostic.
+    def test_command_timeout_keeps_assertion(self):
+        commands = canary.Commands({}, io.StringIO())
+        with tempfile.TemporaryDirectory() as directory:
+            probe = canary.Canary(Path(directory), Path(directory), commands, timeout=0.001)
+            with patch.object(subprocess, 'run', side_effect=subprocess.TimeoutExpired(['docker'], 30)):
+                with self.assertRaisesRegex(canary.CanaryFailure, 'stub reports.*command timed out: docker'):
+                    probe.wait('stub reports', lambda: commands.run(['docker', 'exec', 'probe']))
+
+    def test_credential_patterns_are_rejected(self):
+        for key in ('GITHUB_TOKEN_FILE', 'FORGEJO_TOKEN', 'CUSTOM_API_KEY', 'CUSTOM_TOKEN_FILE'):
+            report = copy.deepcopy(REPORT)
+            report['environment'][key] = 'injected-secret'
+            with self.subTest(key=key), self.assertRaisesRegex(canary.CanaryFailure, key):
+                canary.verify_baseline(report)
 
     # The real stub must dump its terminal environment before claiming completion,
     # and may claim only after the installer releases its handshake marker.

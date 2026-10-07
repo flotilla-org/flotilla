@@ -919,7 +919,7 @@ require_handoff_lock() {
 run_generation_canary() {
   local generation="$1"
   if [[ "${FLEET_INSTALL_SKIP_CANARY:-0}" == 1 ]]; then
-    printf 'fleet-install: WARNING canary explicitly skipped for %s\n' "$generation" >&2
+    printf 'fleet-install: WARNING canary explicitly skipped (FLEET_INSTALL_SKIP_CANARY=1, set by --skip-canary or environment) for %s\n' "$generation" >&2
     return
   fi
   local hostname
