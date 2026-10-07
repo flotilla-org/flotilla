@@ -39,10 +39,20 @@ Windows Git Bash uses `python`; Unix uses `python3`. Cargo dispatch uses the exa
 interpreter already running the selector planner. Keep all Cargo `--config`
 arguments before the `test` subcommand, and identical between build and execution.
 
-Features are also unified across rows: `ssh_adapter` is built with
+Feature unification across rows deliberately changes the former per-row feature
+graph: `ssh_adapter` is built with
 `tender/ssh-cleat-proof` because the adjacent `ssh_cleat` row requests it. Selected
 rows specify the job's test coverage; they do not prove each package works with
 its row's features in isolation. Add a separate job only when isolated feature
 coverage is deliberately required. Package and target unions can compile extra
 matching targets in a future selector set; artifact dispatch still limits execution
 to each original row. The current root package has no library target.
+
+Each selector records successful binary dispatches in a temporary receipt file.
+Cargo success is accepted only when every selected artifact has a receipt; a
+path mismatch or skipped runner invocation therefore fails the job.
+
+Features must be bare names; the planner adds their package qualification. These
+jobs explicitly target the rustc host, overriding ambient cross-target selection.
+The planner also owns the host runner configuration; custom runner configuration
+is replaced by the dispatch runner in these native CI jobs.

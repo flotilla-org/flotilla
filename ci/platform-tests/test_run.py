@@ -49,6 +49,31 @@ class RunnerTests(unittest.TestCase):
                          [["execute", "flotilla-client", "lib", "endpoint::"],
                           ["execute", "flotilla", "bin", "remote_"]])
 
+    def test_every_selected_binary_must_execute(self):
+        # Contract: Cargo success cannot hide zero or partial dispatch of selected targets.
+        for skipped in ("SKIP_DISPATCH", "SKIP_LAST_DISPATCH"):
+            with self.subTest(skipped=skipped):
+                self.env[skipped] = "1"
+                result, commands = self.run_job("windows", "windows|-p flotilla-client --lib --bin flotilla same\n")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("selected test binaries did not execute", result.stderr)
+                del self.env[skipped]
+
+    def test_native_target_is_explicit(self):
+        # Contract: ambient cross-target config cannot bypass the native dispatch runner.
+        self.env["CARGO_BUILD_TARGET"] = "different-target"
+        result, commands = self.run_job("windows", "windows|--lib same\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        build = next(c for c in commands if "--no-run" in c)
+        target = build[build.index("--target") + 1]
+        self.assertIn(f"target.{target}.runner=", " ".join(build))
+
+    def test_qualified_features_fail_before_build(self):
+        result, commands = self.run_job("tender-ssh", "tender-ssh|-p tender --test ssh_adapter --features tender/foo\n")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("features must be bare names", result.stderr)
+        self.assertEqual(commands, [])
+
     def test_features_and_harness_arguments(self):
         # Contract: features resolve across the job; ignored/nocapture stay row-local.
         result, commands = self.run_job("tender-ssh", "tender-ssh|-p tender --locked --test ssh_adapter selected -- --ignored\ntender-ssh|-p tender --locked --features ssh-cleat-proof --test ssh_cleat -- --nocapture\n")

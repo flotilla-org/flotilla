@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -41,6 +42,8 @@ def run(commands):
                         raise ValueError("each selector must name one package")
                     explicit_package = package = value
                 elif token == "--features":
+                    if "/" in value:
+                        raise ValueError("selector features must be bare names, not package-qualified")
                     features.extend(value.split(","))
                 else:
                     targets.append((token[2:], value))
@@ -66,7 +69,7 @@ def run(commands):
         raise ValueError("rustc did not report its host target")
     runner = json.dumps([sys.executable, str(Path(__file__).resolve()), "--dispatch"])
     common = ["cargo", "--config", 'profile.dev.package."*".debug=0',
-              "--config", f"target.{host}.runner={runner}", "test", "--locked"]
+              "--config", f"target.{host}.runner={runner}", "test", "--locked", "--target", host]
     common += [arg for args in union for arg in args]
     argv = common + ["--no-run", "--message-format=json", "--timings"]
     print("Unified build:", " ".join(argv), flush=True)
@@ -74,7 +77,10 @@ def run(commands):
     artifacts = []
     with subprocess.Popen(argv, stdout=subprocess.PIPE, text=True, encoding="utf-8") as build:
         for line in build.stdout:
-            message = json.loads(line)
+            try:
+                message = json.loads(line)
+            except ValueError as error:
+                raise ValueError(f"invalid Cargo build JSON: {line.rstrip()}") from error
             if message["reason"] == "compiler-artifact" and message.get("executable") and message["profile"]["test"]:
                 artifacts.append(message)
             elif message["reason"] == "compiler-message":
@@ -93,9 +99,16 @@ def run(commands):
             raise ValueError(f"no test binary for {package}: {targets}")
         print("Selected targets:", package, [a["target"]["name"] for a in matched], filters + harness, flush=True)
         test_start = time.monotonic()
-        subprocess.run(common + filters + ["--", *harness],
-                       check=True, env=dict(os.environ, FLOTILLA_SELECTED_TEST_BINARIES=json.dumps(
-                           [str(Path(a["executable"]).resolve()) for a in matched])))
+        selected = {os.path.normcase(str(Path(a["executable"]).resolve())) for a in matched}
+        with tempfile.TemporaryDirectory() as receipt_directory:
+            receipt = Path(receipt_directory) / "executed.jsonl"
+            subprocess.run(common + filters + ["--", *harness], check=True,
+                           env=dict(os.environ, FLOTILLA_SELECTED_TEST_BINARIES=json.dumps(sorted(selected)),
+                                    FLOTILLA_TEST_DISPATCH_LOG=str(receipt)))
+            executed = {json.loads(line) for line in receipt.read_text(encoding="utf-8").splitlines()} if receipt.exists() else set()
+            missing = selected - executed
+            if missing:
+                raise ValueError(f"selected test binaries did not execute: {sorted(missing)}")
         print(f"Selected test seconds (including Cargo dispatch): {time.monotonic() - test_start:.2f}", flush=True)
 
 
@@ -107,8 +120,11 @@ def kind_matches(selector, kinds):
 
 def dispatch(binary, arguments):
     selected = {os.path.normcase(path) for path in json.loads(os.environ["FLOTILLA_SELECTED_TEST_BINARIES"])}
-    if os.path.normcase(str(Path(binary).resolve())) in selected:
+    canonical = os.path.normcase(str(Path(binary).resolve()))
+    if canonical in selected:
         subprocess.run([binary, *arguments], check=True)
+        with open(os.environ["FLOTILLA_TEST_DISPATCH_LOG"], "a", encoding="utf-8") as receipt:
+            receipt.write(json.dumps(canonical) + "\n")
 
 
 if __name__ == "__main__":

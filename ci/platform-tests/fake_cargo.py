@@ -59,12 +59,16 @@ else:
     filters = []
     index = 0
     while index < boundary:
-        if argv[index] in ("--config", "-p", "--features", "--bin", "--test"):
+        if argv[index] in ("--config", "--target", "-p", "--features", "--bin", "--test"):
             index += 2
             continue
         if argv[index] not in ("test", "--locked", "--lib"):
             filters.append(argv[index])
         index += 1
+    if os.environ.get("SKIP_DISPATCH"):
+        sys.exit(0)
+    if os.environ.get("SKIP_LAST_DISPATCH"):
+        artifacts = artifacts[:-1]
     for artifact in artifacts:
         name = artifact["package_id"]
         result = subprocess.run([*runner, artifact["executable"], *filters, *argv[boundary + 1:]],
