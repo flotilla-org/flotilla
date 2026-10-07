@@ -494,7 +494,8 @@ where
             CheckoutSpec::FreshClone(_) if continuing => {
                 Ok(match self.runtime.continue_checkout_in(obj, None, &checkout_registration_reason(obj, convoy.as_ref())).await {
                     Ok(prepared) => CheckoutPrepared::Ready { prepared },
-                    Err(error) => CheckoutPrepared::Failed(error.to_string()),
+                    Err(CheckoutMaterialisationError::Protection(error)) => return Err(ResourceError::other(error)),
+                    Err(CheckoutMaterialisationError::Creation(error)) => CheckoutPrepared::Failed(error),
                 })
             }
             CheckoutSpec::FreshClone(spec) => Ok(

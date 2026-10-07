@@ -76,6 +76,9 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
         _reason: &str,
     ) -> Result<PreparedCheckout, CheckoutMaterialisationError> {
         self.creation_attempts.fetch_add(1, Ordering::SeqCst);
+        if self.creation_protection_failures.try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1)).is_ok() {
+            return Err(CheckoutMaterialisationError::Protection("temporary protection failure".into()));
+        }
         Ok(PreparedCheckout { commit: Some("remote-tip".into()), branch_provenance: CheckoutBranchProvenance::PreExisting })
     }
     async fn protect_worktree_in(&self, env_ref: &str, clone_path: &str, target: &str, reason: &str) -> Result<(), String> {
@@ -194,23 +197,48 @@ impl CheckoutRuntime for RecordingCheckoutRuntime {
 // without a terminal Failed phase or losing the creation's branch provenance.
 #[tokio::test(start_paused = true)]
 async fn pending_checkout_recovers_creation_protection_through_controller_loop() {
+    exercise_creation_protection_recovery(false).await;
+}
+
+// #2873: FreshClone continuation must keep protection failures retryable, even
+// beyond the retry budget, and recover without an operator resetting Failed.
+#[tokio::test(start_paused = true)]
+async fn continued_fresh_clone_recovers_protection_through_controller_loop() {
+    exercise_creation_protection_recovery(true).await;
+}
+
+async fn exercise_creation_protection_recovery(continuing_fresh: bool) {
     let backend = ResourceBackend::InMemory(Default::default());
     create_ready_clone(&backend, NAMESPACE, "clone-recovery", REPO_URL, "host-direct-a", "/checkouts/repo").await;
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
-    let checkout = checkouts
-        .create(
-            &meta("checkout-recovery").with_lifecycle_authority(LifecycleAuthority::Managed),
-            &CheckoutSpec::Worktree(CheckoutWorktreeSpec {
-                repo_ref: RepositoryKey(repo_key(REPO_URL)),
-                env_ref: "host-direct-a".into(),
-                r#ref: "recovery/work".into(),
-                base_ref: Some("main".into()),
-                target_path: "/checkouts/recovery".into(),
-                clone_ref: "clone-recovery".into(),
-            }),
-        )
-        .await
-        .expect("checkout");
+    let repo = RepositoryKey(repo_key(REPO_URL));
+    let mut metadata = meta("checkout-recovery").with_lifecycle_authority(LifecycleAuthority::Managed);
+    let spec = if continuing_fresh {
+        backend
+            .using::<Convoy>(NAMESPACE)
+            .create(&meta("continuing-owner"), &ConvoySpec::builder().workflow_ref("dev".into()).continuation(repo.clone()).build())
+            .await
+            .expect("continuing convoy");
+        metadata.labels.insert(CONVOY_LABEL.into(), "continuing-owner".into());
+        CheckoutSpec::FreshClone(FreshCloneCheckoutSpec {
+            repo_ref: repo,
+            env_ref: "host-direct-a".into(),
+            url: REPO_URL.into(),
+            r#ref: "recovery/work".into(),
+            base_ref: Some("main".into()),
+            target_path: "/checkouts/recovery".into(),
+        })
+    } else {
+        CheckoutSpec::Worktree(CheckoutWorktreeSpec {
+            repo_ref: repo,
+            env_ref: "host-direct-a".into(),
+            r#ref: "recovery/work".into(),
+            base_ref: Some("main".into()),
+            target_path: "/checkouts/recovery".into(),
+            clone_ref: "clone-recovery".into(),
+        })
+    };
+    let checkout = checkouts.create(&metadata, &spec).await.expect("checkout");
     let runtime = Arc::new(RecordingCheckoutRuntime {
         allow_creation: true,
         creation_protection_failures: AtomicUsize::new(7),
@@ -245,8 +273,11 @@ async fn pending_checkout_recovers_creation_protection_through_controller_loop()
                 saw_exhausted_retry = true;
             }
             if status.phase == CheckoutPhase::Ready {
-                assert_eq!(status.branch_provenance, CheckoutBranchProvenance::CreatedForConvoy);
-                assert_eq!(status.commit.as_deref(), Some("base-commit"));
+                assert_eq!(
+                    status.branch_provenance,
+                    if continuing_fresh { CheckoutBranchProvenance::PreExisting } else { CheckoutBranchProvenance::CreatedForConvoy }
+                );
+                assert_eq!(status.commit.as_deref(), Some(if continuing_fresh { "remote-tip" } else { "base-commit" }));
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
