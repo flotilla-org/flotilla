@@ -562,7 +562,11 @@ addresses, references, canonical suppression pointer, receiver receipt, submissi
 evidence, and status. Exact producer retries still resolve to the original record.
 Records are never deleted by this policy. Unresolved submissions, terminal members
 of active recovery batches, and follow-ups awaiting workflow continuation keep their
-body text. Compacted bodies cannot be recovered by changing the retention setting.
+body text. Follow-up references are protected across all locally stored and replicated
+Convoy namespaces, using the reference's target Message namespace. Each sweep
+releases inbox locks after at most 100 updates, refreshes recovery protection
+between batches, and logs individual update failures for retry on the next sweep.
+Compacted bodies cannot be recovered by changing the retention setting.
 
 Active inbox reads use maintained in-memory indexes and SQLite indexes, with
 receiver, reply correlation, and batch queries available over the resource API.
