@@ -216,6 +216,7 @@ fn docker_crew_preserves_vessel_environment(tc: hegel::TestCase) {
             ("GIT_CONFIG_VALUE_2", "crew@example.test"),
             ("FLOTILLA_CREW_SKILLS", value),
             ("DISABLE_AUTOUPDATER", "1"),
+            ("LIBGL_ALWAYS_SOFTWARE", "1"),
             // #2825: provisioning installs durable cleat state for the client.
             ("CLEAT_RUNTIME_DIR", "/var/lib/flotilla/cleat"),
         ]

@@ -1,0 +1,140 @@
+{
+  "repository": "https://github.com/flotilla-org/flotilla",
+  "base_default": "ubuntu:24.04",
+  "input_stability": "unpinned",
+  "layers": [
+    {
+      "name": "spine-base",
+      "stage": "base",
+      "fragment": ".flotilla/image-layers/base.Dockerfile",
+      "pins": {
+        "ZIG_VERSION": {
+          "value": "0.16.0",
+          "source": "https://ziglang.org/download/index.json"
+        },
+        "NODE_VERSION": {
+          "value": "24.18.0",
+          "source": "https://nodejs.org/dist/"
+        },
+        "RUST_NIGHTLY": {
+          "value": "nightly-2026-03-12",
+          "source": "https://static.rust-lang.org/dist/"
+        }
+      },
+      "sources": {
+        "rust": "rust-toolchain.toml (provides and probe derived from channel)",
+        "apt": "selected Ubuntu base apt sources"
+      },
+      "provides": [
+        "toolchain:node@24.18.0",
+        "toolchain:zig@0.16.0"
+      ],
+      "probes": {
+        "toolchain:node@24.18.0": [
+          "sh",
+          "-c",
+          "test \"$(node --version)\" = v24.18.0"
+        ],
+        "toolchain:zig@0.16.0": [
+          "sh",
+          "-c",
+          "test \"$(zig version)\" = 0.16.0"
+        ]
+      }
+    },
+    {
+      "name": "spine-utilities",
+      "stage": "utilities",
+      "fragment": ".flotilla/image-layers/utilities.Dockerfile",
+      "pins": {
+        "TEA_VERSION": {
+          "value": "0.16.0",
+          "source": "https://dl.gitea.com/tea/"
+        }
+      },
+      "sources": {
+        "gh": "https://cli.github.com/packages",
+        "apt": "selected Ubuntu base apt sources"
+      },
+      "provides": [
+        "utility:git",
+        "utility:gh",
+        "utility:tea@0.16.0"
+      ],
+      "probes": {
+        "utility:git": [
+          "git",
+          "--version"
+        ],
+        "utility:gh": [
+          "gh",
+          "--version"
+        ],
+        "utility:tea@0.16.0": [
+          "sh",
+          "-c",
+          "tea --version | grep -E '(^|[^0-9])0\\.16\\.0([^0-9.]|$)'"
+        ]
+      }
+    },
+    {
+      "name": "capability-display-x11",
+      "stage": "capability",
+      "fragment": ".flotilla/image-layers/display-x11.Dockerfile",
+      "provides": [
+        "display:headless-x11"
+      ],
+      "probes": {
+        "display:headless-x11": [
+          "xdpyinfo"
+        ]
+      },
+      "sources": {
+        "apt": "selected Ubuntu base apt sources"
+      }
+    },
+    {
+      "name": "spine-harness",
+      "stage": "harness",
+      "fragment": ".flotilla/image-layers/harness.Dockerfile",
+      "pins": {
+        "ZIG_VERSION": {
+          "value": "0.16.0",
+          "source": "https://ziglang.org/download/index.json"
+        },
+        "CLEAT_REF": {
+          "value": "e233d6d244da0ba495858582c9364ad062572159",
+          "source": "https://github.com/flotilla-org/cleat"
+        },
+        "CLAUDE_CODE_VERSION": {
+          "value": "2.1.287",
+          "source": "https://registry.npmjs.org/@anthropic-ai/claude-code"
+        },
+        "CODEX_VERSION": {
+          "value": "0.160.0",
+          "source": "https://registry.npmjs.org/@openai/codex"
+        }
+      },
+      "sources": {
+        "uv": "https://astral.sh/uv/install.sh",
+        "ghostty": "cleat tools/ghostty-toolchain.toml at CLEAT_REF"
+      },
+      "provides": [
+        "harness:codex@0.160.0",
+        "harness:claude-code@2.1.287"
+      ],
+      "probes": {
+        "harness:codex@0.160.0": [
+          "sh",
+          "-c",
+          "codex --version | grep -E '(^|[^0-9])0\\.160\\.0([^0-9.]|$)'"
+        ],
+        "harness:claude-code@2.1.287": [
+          "sh",
+          "-c",
+          "claude --version | grep -E '(^|[^0-9])2\\.1\\.287([^0-9.]|$)'"
+        ]
+      }
+    }
+  ]
+}
