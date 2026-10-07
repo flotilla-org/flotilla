@@ -15,5 +15,6 @@ tender-ssh| -p tender --locked --features ssh-cleat-proof --test ssh_cleat -- --
 macos| --locked --bin flotilla resource_validate::frozen::tests::
 macos| -p flotilla-daemon --locked --lib pre_roll_skill_probe_checks_authority_pin_and_preserves_operator_tokens
 macos| -p flotilla-daemon --locked --lib session_archive::
-all| -p flotilla-core --locked --lib agents::hooks::session_log_tests
+# The core lib-test graph contains Unix-only fixtures; Windows tests portable resource status.
+macos| -p flotilla-core --locked --lib agents::hooks::session_log_tests
 all| -p flotilla-resources --locked --lib archive_identity_tests
