@@ -419,6 +419,7 @@ pub async fn build_plan(
         | CommandAction::QueryFleetList { .. }
         | CommandAction::QueryCrewStalls { .. }
         | CommandAction::QueryCrewCapabilities { .. }
+        | CommandAction::QueryMessageContacts { .. }
         | CommandAction::QueryCrewList { .. }
         | CommandAction::QueryDaemonLogs { .. }
         | CommandAction::QueryHostStatus { .. }

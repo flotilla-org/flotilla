@@ -1697,3 +1697,267 @@ async fn active_delivery_work_is_independent_of_audit_history() {
         assert_eq!(messages.list().await.unwrap().items.len(), historical + 3, "audit identities stay present");
     }
 }
+
+async fn routing_project(backend: &ResourceBackend, name: &str, parent: Option<&str>) {
+    use flotilla_resources::{Project, ProjectSpec, RoleDefinition, RoleSubscription};
+    let role = RoleDefinition {
+        subscriptions: Some(vec![RoleSubscription::builder().topic("supervision".into()).subtree(true).build()]),
+        ..Default::default()
+    };
+    backend
+        .definitions::<Project>("flotilla")
+        .create(
+            &InputMeta::builder().name(name.into()).build(),
+            &ProjectSpec::builder()
+                .display_name(name.into())
+                .maybe_parent(parent.map(str::to_string))
+                .role_definitions(std::collections::BTreeMap::from([("guide".into(), role)]))
+                .build(),
+        )
+        .await
+        .expect("project");
+}
+
+async fn routing_holder(backend: &ResourceBackend, project: &str, generation: &str) {
+    use flotilla_resources::*;
+    let name = format!("{project}-{generation}");
+    backend
+        .using::<Convoy>("flotilla")
+        .create(
+            &InputMeta::builder().name(name.clone()).build(),
+            &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref(project.into()).role("guide".into()).build(),
+        )
+        .await
+        .expect("standing convoy");
+    backend
+        .using::<TerminalSession>("flotilla")
+        .create(
+            &InputMeta::builder()
+                .name(format!("terminal-{name}"))
+                .labels(std::collections::BTreeMap::from([
+                    (CONVOY_LABEL.into(), name.clone()),
+                    (ROLE_LABEL.into(), "guide".into()),
+                    (VESSEL_LABEL.into(), "work".into()),
+                ]))
+                .build(),
+            &holder_spec(&name),
+        )
+        .await
+        .expect("terminal");
+    let ensures = backend.definitions::<ConvoyEnsure>("flotilla");
+    let declaration = match ensures.get(&format!("{project}-holder")).await {
+        Ok(declaration) => declaration,
+        Err(_) => ensures
+            .create(
+                &InputMeta::builder().name(format!("{project}-holder")).build(),
+                &ConvoyEnsureSpec::builder().project_ref(project.into()).role("guide".into()).repositories(Vec::new()).build(),
+            )
+            .await
+            .expect("ensure"),
+    };
+    let declaration = backend.using::<ConvoyEnsure>("flotilla").get(&declaration.metadata.name).await.expect("local declaration");
+    backend
+        .using::<ConvoyEnsure>("flotilla")
+        .update_status(
+            &declaration.metadata.name,
+            &declaration.metadata.resource_version,
+            &ConvoyEnsureStatus { convoy_ref: Some(name), ..Default::default() },
+        )
+        .await
+        .expect("holder pointer");
+}
+
+// Supervision skips unoccupied parent levels, stops at the nearest subscribed
+// holder, and excludes the sender. Generate every local/parent presence pair.
+#[hegel::test]
+fn subscription_supervision_follows_live_parent_chain(tc: hegel::TestCase) {
+    let local = tc.draw(gs::booleans());
+    let parent = tc.draw(gs::booleans());
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        use flotilla_resources::*;
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        routing_project(&backend, "root", None).await;
+        routing_project(&backend, "parent", Some("root")).await;
+        routing_project(&backend, "child", Some("parent")).await;
+        routing_holder(&backend, "root", "one").await;
+        if parent {
+            routing_holder(&backend, "parent", "one").await;
+        }
+        if local {
+            routing_holder(&backend, "child", "one").await;
+        }
+        let path = supervision_path(&backend, "flotilla", "child", "child/task/work/coder").await.expect("path");
+        let expected = if local {
+            "child/guide"
+        } else if parent {
+            "parent/guide"
+        } else {
+            "root/guide"
+        };
+        assert_eq!(path[0].address, expected);
+        let path = supervision_path(&backend, "flotilla", "child", "child/child-one/work/guide").await.expect("exclude sender");
+        assert!(!path.iter().any(|contact| contact.address == "child/guide"));
+        let book = crew_address_book(&backend, "flotilla", "child/task/work/coder").await.expect("contacts");
+        assert_eq!(book.supervision[0].address, expected);
+        routing_holder(&backend, "root", "two").await;
+        let next = crew_address_book(&backend, "flotilla", "child/task/work/coder").await.expect("refreshed contacts");
+        assert_eq!(next.supervision.last().expect("root").terminal.as_deref(), Some("terminal-root-two"));
+    });
+}
+
+// Two applied revisions before a turn boundary leave only the latest pending
+// notification; reconciling again or restarting does not create another input.
+#[tokio::test]
+async fn charter_updates_coalesce_to_latest_revision_once() {
+    use flotilla_resources::*;
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    routing_project(&backend, "root", None).await;
+    routing_holder(&backend, "root", "one").await;
+    let projects = backend.definitions::<Project>("flotilla");
+    for revision in ["first", "second"] {
+        let project = projects.get("root").await.expect("project");
+        let mut meta = InputMeta::from(&project.metadata);
+        meta.annotations.insert("flotilla.work/charter-revision".into(), revision.into());
+        projects.apply(&meta, &project.spec).await.expect("revision");
+        reconcile_charter_notifications(&MessageInbox::new(backend.clone(), "flotilla"), at(10)).await.expect("notification");
+    }
+    reconcile_charter_notifications(&MessageInbox::new(backend.clone(), "flotilla"), at(11)).await.expect("repeat");
+    let messages = backend.using::<Message>("flotilla").list().await.expect("messages");
+    assert_eq!(messages.items.len(), 2);
+    let pending: Vec<_> = messages.items.iter().filter(|message| !message.status.as_ref().expect("admitted").phase.is_terminal()).collect();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].spec.body.contains("charter@second"));
+}
+
+// A child supervision topic delivers at the occupied ancestor, and a reply
+// from that actual qualified holder answers it even across Project boundaries.
+#[tokio::test]
+async fn topic_receipt_and_reply_use_the_ancestor_holders_address() {
+    use flotilla_resources::*;
+    for adopted in [false, true] {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        routing_project(&backend, "root", None).await;
+        routing_project(&backend, "child", Some("root")).await;
+        routing_holder(&backend, "root", "one").await;
+        let terminals = backend.using::<TerminalSession>("flotilla");
+        if adopted {
+            let projects = backend.definitions::<Project>("flotilla");
+            let project = projects.get("root").await.expect("project");
+            let mut shape = project.spec;
+            shape.role_definitions.get_mut("guide").expect("role").adoptable = Some(true);
+            projects.apply(&InputMeta::from(&project.metadata), &shape).await.expect("adoptable");
+            let holder = terminals.get("terminal-root-one").await.expect("holder");
+            let mut meta = InputMeta::from(&holder.metadata);
+            meta.annotations.insert(ROLE_ADDRESS_ANNOTATION.into(), "root/guide".into());
+            terminals.update(&meta, &holder.metadata.resource_version, &holder.spec).await.expect("claim");
+        }
+        let holder = terminals.get("terminal-root-one").await.expect("holder");
+        terminals
+            .update_status(
+                &holder.metadata.name,
+                &holder.metadata.resource_version,
+                &TerminalSessionStatus {
+                    phase: TerminalSessionPhase::Running,
+                    session_id: Some("root-session".into()),
+                    crew: Some(CrewSessionStatus { id: "root-crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("running");
+        let inbox = MessageInbox::new(backend.clone(), "flotilla");
+        let intent = MessageSpec::builder()
+            .sender("child/task/work/coder".into())
+            .receiver("topic:child/supervision".into())
+            .relation(MessageRelation::Supervisor)
+            .body("needs ruling".into())
+            .expectation(MessageExpectation::Reply)
+            .build();
+        inbox.accept(&InputMeta::builder().name("topic-stall".into()).build(), &intent, at(10)).await.expect("accept");
+        let transport = FakeMessageTransport {
+            submissions: Default::default(),
+            observations: Default::default(),
+            outcome: MessageTransportOutcome::Accepted { evidence: "hook receipt".into() },
+            accepted: Default::default(),
+            working: Default::default(),
+        };
+        inbox.reconcile_delivery(&transport, at(11)).await.expect("delivery");
+        let messages = backend.using::<Message>("flotilla");
+        let delivered = messages.get("topic-stall").await.expect("message");
+        let receiver = delivered.status.expect("status").resolved_receiver.expect("receipt");
+        let address = if adopted { "root/guide" } else { "root/root-one/work/guide" };
+        assert_eq!(receiver.role_address.as_deref(), Some(address));
+        let reply = MessageSpec::builder()
+            .sender(address.into())
+            .receiver(intent.sender)
+            .relation(MessageRelation::Supervisor)
+            .body("retry".into())
+            .in_reply_to("topic-stall".into())
+            .build();
+        inbox.accept(&InputMeta::builder().name("ruling".into()).build(), &reply, at(12)).await.expect("reply");
+        inbox.reconcile_delivery(&transport, at(13)).await.expect("correlation");
+        assert_eq!(messages.get("topic-stall").await.expect("message").status.expect("status").phase, MessagePhase::Answered);
+    }
+}
+
+// Adoptable roles can be held by an existing agent without an ensured Convoy.
+// Stopped terminals retire presence; ambiguous live claims are never guessed.
+#[tokio::test]
+async fn adoptable_role_uses_a_unique_running_terminal_claim() {
+    use flotilla_resources::*;
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    routing_project(&backend, "root", None).await;
+    let projects = backend.definitions::<Project>("flotilla");
+    let project = projects.get("root").await.expect("project");
+    let mut shape = project.spec;
+    shape.role_definitions.insert("attended".into(), RoleDefinition { adoptable: Some(true), ..Default::default() });
+    projects.apply(&InputMeta::from(&project.metadata), &shape).await.expect("adoptable definition");
+    assert!(resolve_message_receiver(&backend, "flotilla", "root/attended").await.expect("absent").is_none());
+    let terminals = backend.using::<TerminalSession>("flotilla");
+    for name in ["external-one", "external-two"] {
+        terminals
+            .create(
+                &InputMeta::builder()
+                    .name(name.into())
+                    .annotations(std::collections::BTreeMap::from([(ROLE_ADDRESS_ANNOTATION.into(), "root/attended".into())]))
+                    .build(),
+                &holder_spec("external"),
+            )
+            .await
+            .expect("claimed terminal");
+        let terminal = terminals.get(name).await.expect("terminal");
+        terminals
+            .update_status(
+                name,
+                &terminal.metadata.resource_version,
+                &TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() },
+            )
+            .await
+            .expect("running claim");
+        if name == "external-one" {
+            assert_eq!(
+                resolve_message_receiver(&backend, "flotilla", "root/attended")
+                    .await
+                    .expect("resolve")
+                    .expect("claim")
+                    .object
+                    .metadata
+                    .name,
+                name
+            );
+        }
+    }
+    assert!(resolve_message_receiver(&backend, "flotilla", "root/attended").await.is_err());
+    for name in ["external-one", "external-two"] {
+        let terminal = terminals.get(name).await.expect("terminal");
+        terminals
+            .update_status(
+                name,
+                &terminal.metadata.resource_version,
+                &TerminalSessionStatus { phase: TerminalSessionPhase::Stopped, ..Default::default() },
+            )
+            .await
+            .expect("retired");
+    }
+    assert!(resolve_message_receiver(&backend, "flotilla", "root/attended").await.expect("retired").is_none());
+}

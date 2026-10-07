@@ -455,7 +455,7 @@ impl RemoteCommandRouter {
             _ => None,
         };
         let crew_convoy = match &command.action {
-            CommandAction::QueryCrewList { context } => context.convoy.clone(),
+            CommandAction::QueryMessageContacts { context } | CommandAction::QueryCrewList { context } => context.convoy.clone(),
             _ => None,
         };
         let target_node_id = self.target_node_id(&target.host).await.map_err(|error| error.to_string())?;
@@ -1148,6 +1148,7 @@ impl RemoteCommandRouter {
             CommandAction::CrewFail { context, .. }
             | CommandAction::CrewStall { context, .. }
             | CommandAction::CrewHandoff { context, .. }
+            | CommandAction::QueryMessageContacts { context }
             | CommandAction::QueryCrewList { context }
             | CommandAction::QueryCrewCapabilities { context } => (context, None),
             _ => return Ok(None),

@@ -313,6 +313,8 @@ enum DomainCommand {
     Dispatch(flotilla_commands::commands::dispatch::DispatchNoun),
     /// Communicate with crew members
     Crew(flotilla_commands::commands::crew::CrewNoun),
+    /// Inspect live message relationships
+    Message(MessageNoun),
     /// Code review (alias on CrNoun itself, not duplicated here)
     Cr(flotilla_commands::commands::cr::CrNoun),
     /// Issues
@@ -331,6 +333,45 @@ enum DomainCommand {
     Project(flotilla_commands::commands::project::ProjectNoun),
 }
 
+#[derive(clap::Args)]
+struct MessageNoun {
+    #[command(subcommand)]
+    verb: MessageVerb,
+}
+
+#[derive(clap::Subcommand)]
+enum MessageVerb {
+    /// Show your own address, supervision chain and reachable crews
+    Contacts {
+        #[arg(long)]
+        crew_id: Option<String>,
+        #[arg(long)]
+        namespace: Option<String>,
+        #[arg(long)]
+        convoy: Option<String>,
+        #[arg(long)]
+        vessel: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
+    },
+}
+
+impl MessageNoun {
+    fn resolve(self) -> std::result::Result<flotilla_commands::Resolved, String> {
+        let MessageVerb::Contacts { crew_id, namespace, convoy, vessel, role } = self.verb;
+        let context = flotilla_protocol::CrewCommandContext {
+            crew_id: crew_id.or_else(|| std::env::var("FLOTILLA_CREW_ID").ok()),
+            namespace,
+            convoy,
+            vessel_ref: vessel,
+            role,
+        };
+        Ok(flotilla_commands::Resolved::Ready(
+            flotilla_protocol::Command::builder().action(flotilla_protocol::CommandAction::QueryMessageContacts { context }).build(),
+        ))
+    }
+}
+
 impl DomainCommand {
     fn resolve(self) -> Result<flotilla_commands::Resolved> {
         match self {
@@ -339,6 +380,7 @@ impl DomainCommand {
             DomainCommand::Checkout(noun) => noun.resolve(),
             DomainCommand::Convoy(noun) => noun.resolve(),
             DomainCommand::Dispatch(noun) => noun.resolve(),
+            DomainCommand::Message(noun) => noun.resolve(),
             DomainCommand::Crew(noun) => noun.resolve_with_crew_id(std::env::var("FLOTILLA_CREW_ID").ok()),
             DomainCommand::Cr(noun) => noun.resolve(),
             DomainCommand::Issue(noun) => noun.resolve(),

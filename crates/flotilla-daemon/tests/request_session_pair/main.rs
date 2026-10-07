@@ -3637,6 +3637,8 @@ async fn remote_issue_query_returns_results() {
 #[derive(Clone, Copy, bon::Builder)]
 struct SupervisionScenario {
     #[builder(default)]
+    subscriptions: bool,
+    #[builder(default)]
     legacy_cursor: bool,
     #[builder(default)]
     unavailable: bool,
@@ -3649,7 +3651,7 @@ struct SupervisionScenario {
 }
 
 async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
-    let SupervisionScenario { legacy_cursor, unavailable, passes, source_remote, stale_home } = scenario;
+    let SupervisionScenario { subscriptions, legacy_cursor, unavailable, passes, source_remote, stale_home } = scenario;
     let topology = spawn_in_memory_request_topology_stateful(empty_daemon_named("host-a").await, empty_daemon_named("host-b").await)
         .await
         .expect("router topology");
@@ -3753,6 +3755,55 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
     }
     let a_backend = a.resource_backend();
     let b_backend = b.resource_backend();
+    if subscriptions {
+        use flotilla_resources::{
+            ConvoyEnsure, ConvoyEnsureSpec, ConvoyEnsureStatus, Project, ProjectSpec, RoleDefinition, RoleSubscription,
+        };
+        a_backend
+            .definitions::<Project>("flotilla")
+            .create(
+                &InputMeta::builder().name("project".into()).build(),
+                &ProjectSpec::builder()
+                    .display_name("project".into())
+                    .role_definitions(BTreeMap::from([(
+                        "governor".into(),
+                        RoleDefinition {
+                            subscriptions: Some(vec![RoleSubscription::builder().topic("supervision".into()).build()]),
+                            ..Default::default()
+                        },
+                    )]))
+                    .build(),
+            )
+            .await
+            .expect("project subscriptions");
+        b_backend
+            .replica_writer::<Project>(a.node_id().clone(), "flotilla")
+            .replace(&a_backend.using::<Project>("flotilla").list().await.expect("project"), Utc::now())
+            .await
+            .expect("replicate shape");
+        let ensures = b_backend.using::<ConvoyEnsure>("flotilla");
+        ensures
+            .create(
+                &InputMeta::builder().name("project-governor".into()).build(),
+                &ConvoyEnsureSpec::builder().project_ref("project".into()).role("governor".into()).repositories(Vec::new()).build(),
+            )
+            .await
+            .expect("presence");
+        let ensure = ensures.get("project-governor").await.expect("local ensure");
+        ensures
+            .update_status(
+                "project-governor",
+                &ensure.metadata.resource_version,
+                &ConvoyEnsureStatus { convoy_ref: Some("governor".into()), ..Default::default() },
+            )
+            .await
+            .expect("holder");
+        a_backend
+            .replica_writer::<ConvoyEnsure>(b.node_id().clone(), "flotilla")
+            .replace(&ensures.list().await.expect("ensure"), Utc::now())
+            .await
+            .expect("replicate presence");
+    }
     let convoys = a_backend.using::<Convoy>("flotilla");
     flotilla_resources::apply_status_patch(
         &convoys,
@@ -3874,6 +3925,7 @@ async fn cross_host_supervision_pinned_scenario_rows() {
         SupervisionScenario::builder().legacy_cursor(true).source_remote(true).build(),
         SupervisionScenario::builder().legacy_cursor(true).unavailable(true).passes(2).source_remote(true).build(),
         SupervisionScenario::builder().stale_home(true).passes(2).build(),
+        SupervisionScenario::builder().subscriptions(true).source_remote(true).passes(2).build(),
     ] {
         cross_host_supervision_scenario(scenario).await;
     }
@@ -3883,12 +3935,14 @@ async fn cross_host_supervision_pinned_scenario_rows() {
 // Each step checks the persisted rung and the governor's receiver-homed Message.
 #[hegel::test]
 fn generated_cross_host_supervision(tc: hegel::TestCase) {
+    let subscriptions = tc.draw(gs::booleans());
     let legacy = tc.draw(gs::booleans());
     let unavailable = tc.draw(gs::booleans());
     let passes = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
     runtime.block_on(cross_host_supervision_scenario(
         SupervisionScenario::builder()
+            .subscriptions(subscriptions)
             .legacy_cursor(legacy)
             .unavailable(unavailable)
             .passes(passes)

@@ -69,6 +69,7 @@ pub struct EpisodeKeyFields {
 /// crosses hosts; transport requests are not a wire protocol.
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
 pub struct CrewTurnIntent {
+    pub receiver: Option<String>,
     pub namespace: String,
     pub convoy: String,
     pub source: String,
@@ -259,6 +260,8 @@ pub struct LeafSubscriptionTable {
 
 struct LeafSubscriptionTableInner {
     backend: ResourceBackend,
+    message_inboxes: Arc<Mutex<HashMap<String, flotilla_resources::MessageInbox>>>,
+    charter_brief_renderer: Arc<dyn flotilla_resources::CharterBriefRenderer>,
     event_sink: Arc<dyn EventSink>,
     rows: Mutex<HashMap<uuid::Uuid, LeafSubscriptionRow>>,
     last_firings: Mutex<HashMap<(uuid::Uuid, Leaf), LeafFiringRecord>>,
@@ -409,6 +412,16 @@ impl LeafWatchRecovery {
 }
 
 impl LeafSubscriptionTable {
+    pub fn with_charter_brief_renderer(mut self, renderer: Arc<dyn flotilla_resources::CharterBriefRenderer>) -> Self {
+        Arc::get_mut(&mut self.inner).expect("configure rendering before sharing subscriptions").charter_brief_renderer = renderer;
+        self
+    }
+
+    pub fn with_message_inboxes(mut self, inboxes: Arc<Mutex<HashMap<String, flotilla_resources::MessageInbox>>>) -> Self {
+        Arc::get_mut(&mut self.inner).expect("configure inboxes before sharing subscriptions").message_inboxes = inboxes;
+        self
+    }
+
     pub fn new(backend: ResourceBackend, event_sink: Arc<dyn EventSink>, change_requests: ChangeRequestRefresher) -> Self {
         Self::with_episode_limit(backend, event_sink, change_requests, 3)
     }
@@ -444,6 +457,8 @@ impl LeafSubscriptionTable {
         Self {
             inner: Arc::new(LeafSubscriptionTableInner {
                 backend,
+                message_inboxes: Default::default(),
+                charter_brief_renderer: Arc::new(flotilla_resources::CharterProseRenderer),
                 event_sink,
                 rows: Mutex::new(HashMap::new()),
                 last_firings: Mutex::new(HashMap::new()),
@@ -1485,6 +1500,22 @@ impl ReconcilerWake {
         now: DateTime<Utc>,
     ) -> Result<(), String> {
         let backend = &self.subscriptions.inner.backend;
+        let inbox = self
+            .subscriptions
+            .inner
+            .message_inboxes
+            .lock()
+            .await
+            .entry(namespace.to_string())
+            .or_insert_with(|| flotilla_resources::MessageInbox::new(backend.clone(), namespace))
+            .clone();
+        flotilla_resources::reconcile_charter_notifications_with_renderer(
+            &inbox,
+            self.subscriptions.inner.charter_brief_renderer.as_ref(),
+            now,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         let projects = backend.including_replicas::<Project>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let available_convoys = backend.including_replicas::<Convoy>(namespace).list().await.map_err(|error| error.to_string())?.items;
         let available_ensures =
@@ -2038,7 +2069,7 @@ impl ReconcilerWake {
                     .find(|source| source.object.metadata.name == *project)
                     .and_then(|source| source.object.spec.supervision.clone())
             });
-            let policy = status
+            let mut policy = status
                 .workflow_snapshot
                 .as_ref()
                 .and_then(|workflow| workflow.supervision.clone())
@@ -2049,6 +2080,22 @@ impl ReconcilerWake {
                         SupervisionTarget::ProjectCrew { convoy_role: "governor".into(), vessel: String::new(), role: "governor".into() },
                     ]
                 });
+            if let Some(project) = convoy.spec.project_ref.as_deref() {
+                let sender = status
+                    .stalled
+                    .as_ref()
+                    .and_then(stalled_source_actor)
+                    .map(|(vessel, role)| crew_role_address(project, &convoy.metadata.name, vessel, role))
+                    .unwrap_or_else(|| format!("{project}/{}", convoy.spec.role));
+                let path =
+                    flotilla_resources::supervision_path(backend, namespace, project, &sender).await.map_err(|error| error.to_string())?;
+                if !path.is_empty() {
+                    // Explicit convoy supervision remains first; Project and fleet
+                    // routing comes from subscriptions, not role-name guesses.
+                    policy.retain(|target| matches!(target, SupervisionTarget::ConvoyCrew { .. }));
+                    policy.extend(path.into_iter().map(|contact| SupervisionTarget::Address { address: contact.address }));
+                }
+            }
             // An exhausted cursor on a crew target is a legacy failed lookup,
             // not a consumed operator policy. Retry that target after one roll.
             let retry_exhausted = status.stalled.as_ref().is_some_and(|stalled| {
@@ -2089,6 +2136,7 @@ impl ReconcilerWake {
                     began_at: prior.map_or(now, |stalled| stalled.began_at),
                     rung: StallRung::Operator,
                     supervisor: None,
+                    supervision_message: None,
                     supervision_index: None,
                     supervision_exhausted: false,
                     reason: None,
@@ -2412,6 +2460,26 @@ impl ReconcilerWake {
                                     }
                                     supervisor
                                 }
+                                SupervisionTarget::Address { address } => {
+                                    flotilla_resources::resolve_message_receiver(backend, namespace, address)
+                                        .await
+                                        .map_err(|error| error.to_string())?
+                                        .map(|holder| {
+                                            let labels = &holder.object.metadata.labels;
+                                            (
+                                                labels
+                                                    .get(flotilla_resources::CONVOY_LABEL)
+                                                    .cloned()
+                                                    .unwrap_or_else(|| convoy.metadata.name.clone()),
+                                                labels.get(flotilla_resources::VESSEL_LABEL).cloned().unwrap_or_default(),
+                                                labels
+                                                    .get(flotilla_resources::ROLE_LABEL)
+                                                    .cloned()
+                                                    .unwrap_or_else(|| holder.object.spec.role.clone()),
+                                                StallRung::Governor,
+                                            )
+                                        })
+                                }
                                 SupervisionTarget::Operator => None,
                             };
                             if let Some((target_convoy, target_vessel, target_role, rung)) = candidate {
@@ -2427,6 +2495,10 @@ impl ReconcilerWake {
                                     .unwrap_or_else(|| convoy_message_address(convoy));
                                 let brief = format!("Escalated from {from}:\n\n{}", stall_supervision_brief(convoy, &condition));
                                 let delivery = CrewTurnIntent::builder()
+                                    .maybe_receiver(match target {
+                                        SupervisionTarget::Address { address } => Some(address.clone()),
+                                        _ => None,
+                                    })
                                     .namespace(namespace.to_string())
                                     .convoy(target_convoy.clone())
                                     .source(supervision_message_source(&convoy.metadata.name, index))
@@ -2458,26 +2530,30 @@ impl ReconcilerWake {
                                         revision: convoy.metadata.resource_version.clone(),
                                     }])
                                     .build();
-                                if let Err(error) = self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&delivery).await {
-                                    if prior.is_none_or(|prior| {
-                                        prior.rung != StallRung::Operator
-                                            || !prior.evidence.ends_with(&format!("supervisor delivery failed: {error}"))
-                                    }) {
-                                        tracing::warn!(
-                                            convoy = %convoy.metadata.name,
-                                            target = %target_convoy,
-                                            %target_vessel,
-                                            %target_role,
-                                            reason = %error,
-                                            brief = %stall_supervision_log_brief(convoy, &condition),
-                                            "stall escalation fell back to operator"
-                                        );
+                                let admission = match self.subscriptions.inner.turn_delivery.lock().await.clone().deliver(&delivery).await {
+                                    Ok(admission) => admission,
+                                    Err(error) => {
+                                        if prior.is_none_or(|prior| {
+                                            prior.rung != StallRung::Operator
+                                                || !prior.evidence.ends_with(&format!("supervisor delivery failed: {error}"))
+                                        }) {
+                                            tracing::warn!(
+                                                convoy = %convoy.metadata.name,
+                                                target = %target_convoy,
+                                                %target_vessel,
+                                                %target_role,
+                                                reason = %error,
+                                                brief = %stall_supervision_log_brief(convoy, &condition),
+                                                "stall escalation fell back to operator"
+                                            );
+                                        }
+                                        condition.evidence.push_str(&format!("; supervisor delivery failed: {error}"));
+                                        condition.supervision_exhausted = false;
+                                        delivery_failed = true;
+                                        break;
                                     }
-                                    condition.evidence.push_str(&format!("; supervisor delivery failed: {error}"));
-                                    condition.supervision_exhausted = false;
-                                    delivery_failed = true;
-                                    break;
-                                }
+                                };
+                                condition.supervision_message = Some(admission.message);
                                 condition.rung = rung;
                                 condition.supervision_exhausted = false;
                                 condition.supervision_index = Some(index);
@@ -4219,6 +4295,112 @@ mod tests {
             .await
             .expect("crew session");
         (backend, wake, delivery)
+    }
+
+    // A real crew stall resolves the supervision topic through an unoccupied
+    // parent and publishes exactly one intent to the fleet's declared holder.
+    #[tokio::test]
+    async fn subscribed_fleet_holder_receives_stall_through_empty_parent() {
+        use flotilla_resources::{ConvoyEnsureSpec, ConvoyEnsureStatus, ProjectSpec, RoleDefinition, RoleSubscription};
+        let (backend, wake, delivery) = idle_nudge_scenario().await;
+        let projects = backend.definitions::<Project>("flotilla");
+        for (name, parent) in [("root", None), ("empty-parent", Some("root")), ("wheelhouse", Some("empty-parent"))] {
+            projects
+                .create(
+                    &InputMeta::builder().name(name.into()).build(),
+                    &ProjectSpec::builder()
+                        .display_name(name.into())
+                        .maybe_parent(parent.map(str::to_string))
+                        .role_definitions(if name == "root" {
+                            BTreeMap::from([(
+                                "guide".into(),
+                                RoleDefinition {
+                                    subscriptions: Some(vec![RoleSubscription::builder()
+                                        .topic("supervision".into())
+                                        .subtree(true)
+                                        .build()]),
+                                    ..Default::default()
+                                },
+                            )])
+                        } else {
+                            BTreeMap::new()
+                        })
+                        .build(),
+                )
+                .await
+                .expect("project");
+        }
+        let convoys = backend.using::<Convoy>("flotilla");
+        let source = convoys.get("stalled-work").await.expect("source");
+        let mut status = source.status.expect("source status");
+        status.crew_work.get_mut("work").expect("work").get_mut("coder").expect("coder").phase = CrewWorkPhase::Stalled;
+        convoys.update_status("stalled-work", &source.metadata.resource_version, &status).await.expect("stall");
+        let target = convoys
+            .create(
+                &InputMeta::builder().name("fleet-guide".into()).build(),
+                &ConvoySpec::builder().workflow_ref("workflow".into()).project_ref("root".into()).role("guide".into()).build(),
+            )
+            .await
+            .expect("target");
+        convoys
+            .update_status(
+                "fleet-guide",
+                &target.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ConvoyPhase::Active,
+                    crew_work: BTreeMap::from([(
+                        "work".into(),
+                        BTreeMap::from([("guide".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("target status");
+        let ensures = backend.using::<ConvoyEnsure>("flotilla");
+        let ensure = ensures
+            .create(
+                &InputMeta::builder().name("root-guide".into()).build(),
+                &ConvoyEnsureSpec::builder().project_ref("root".into()).role("guide".into()).repositories(Vec::new()).build(),
+            )
+            .await
+            .expect("presence");
+        let ensure = ensures.get(&ensure.metadata.name).await.expect("local ensure");
+        ensures
+            .update_status(
+                "root-guide",
+                &ensure.metadata.resource_version,
+                &ConvoyEnsureStatus { convoy_ref: Some("fleet-guide".into()), ..Default::default() },
+            )
+            .await
+            .expect("holder");
+        let terminals = backend.using::<TerminalSession>("flotilla");
+        let mut spec = terminals.get("resumed-coder").await.expect("source terminal").spec;
+        spec.role = "guide".into();
+        if let TerminalSessionSource::Agent { context, .. } = &mut spec.source {
+            context.convoy = "fleet-guide".into();
+        }
+        terminals
+            .create(
+                &InputMeta::builder()
+                    .name("guide-terminal".into())
+                    .labels(BTreeMap::from([
+                        (CONVOY_LABEL.into(), "fleet-guide".into()),
+                        (VESSEL_LABEL.into(), "work".into()),
+                        (ROLE_LABEL.into(), "guide".into()),
+                    ]))
+                    .build(),
+                &spec,
+            )
+            .await
+            .expect("guide terminal");
+        let source = convoys.get("stalled-work").await.expect("source");
+        let snapshot = HashMap::from([("stalled-work".into(), source)]);
+        wake.judge_stalls_at("flotilla", &snapshot, Utc::now()).await.expect("route stall");
+        let requests = delivery.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].convoy, "fleet-guide");
+        assert_eq!(requests[0].role, "guide");
     }
 
     // #2211: both typed remedies survive durable status restoration and reach an

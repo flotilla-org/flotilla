@@ -1829,8 +1829,14 @@ impl InProcessDaemon {
         if let Err(error) = issue_refresher.garbage_collect_orphans().await {
             tracing::warn!(%error, "garbage collect orphaned issue observations at startup failed");
         }
+        let message_inboxes = Arc::new(Mutex::new(HashMap::new()));
         let leaf_subscriptions =
-            LeafSubscriptionTable::with_issues(resource_backend.clone(), event_sink.clone(), change_request_refresher, issue_refresher);
+            LeafSubscriptionTable::with_issues(resource_backend.clone(), event_sink.clone(), change_request_refresher, issue_refresher)
+                .with_message_inboxes(Arc::clone(&message_inboxes))
+                .with_charter_brief_renderer(Arc::new(crate::charter_notifications::LiveCharterBriefRenderer::new(
+                    resource_backend.clone(),
+                    Arc::clone(&config),
+                )));
         let admission_free_space_path = config.state_dir().as_path().to_path_buf();
         let aggregator_projection_state = AggregatorProjectionState::new();
         let repository_change_requests = Arc::new(RwLock::new(HashMap::new()));
@@ -1853,7 +1859,6 @@ impl InProcessDaemon {
                 .provisioning_namespace(Arc::clone(&provisioning_namespace))
                 .build(),
         );
-        let message_inboxes = Arc::new(Mutex::new(HashMap::new()));
         let crew_ops = Arc::new(
             CrewService::builder()
                 .message_inboxes(Arc::clone(&message_inboxes))
@@ -3202,6 +3207,7 @@ impl InProcessDaemon {
             | flotilla_protocol::CommandAction::CrewFail { context, .. }
             | flotilla_protocol::CommandAction::CrewStall { context, .. }
             | flotilla_protocol::CommandAction::CrewHandoff { context, .. }
+            | flotilla_protocol::CommandAction::QueryMessageContacts { context }
             | flotilla_protocol::CommandAction::QueryCrewList { context } => {
                 let namespace = context.namespace.clone().unwrap_or(self.provisioning_namespace().await);
                 let name = context.convoy.as_deref().ok_or_else(|| "crew command was not resolved to a convoy".to_string())?;
@@ -5730,10 +5736,13 @@ impl InProcessDaemon {
         } else {
             None
         };
-        if let Some(holder) = flotilla_resources::resolve_message_receiver(&self.resource_backend, namespace, receiver)
-            .await
-            .map_err(|error| error.to_string())?
-        {
+        let holder = if receiver.starts_with("topic:") {
+            flotilla_resources::resolve_topic_receiver(&self.resource_backend, namespace, receiver, &spec.sender).await
+        } else {
+            flotilla_resources::resolve_message_receiver(&self.resource_backend, namespace, receiver).await
+        }
+        .map_err(|error| error.to_string())?;
+        if let Some(holder) = holder {
             return Ok(Some(match holder.provenance {
                 ResourceProvenance::Local => self.node_id.clone(),
                 ResourceProvenance::Replica { origin_root, .. } => origin_root,
@@ -5763,7 +5772,7 @@ impl InProcessDaemon {
             }));
         }
         if let [project, role] = parts.as_slice() {
-            if *project != "fleet" {
+            {
                 let declarations = self
                     .resource_backend
                     .including_replicas::<flotilla_resources::ConvoyEnsure>(namespace)
@@ -7841,6 +7850,13 @@ impl DaemonHandle for InProcessDaemon {
             }
             CommandAction::QueryCrewCapabilities { context } => match self.crew_capabilities_internal(context).await {
                 Ok(card) => Ok(CommandValue::CrewCapabilities { card }),
+                Err(message) => Ok(CommandValue::Error { message }),
+            },
+            CommandAction::QueryMessageContacts { context } => match self.crew_ops.message_contacts_internal(context).await {
+                Ok(book) => Ok(CommandValue::MessageContacts {
+                    text: book.render(),
+                    book: serde_json::to_value(book).map_err(|error| error.to_string())?,
+                }),
                 Err(message) => Ok(CommandValue::Error { message }),
             },
             CommandAction::QueryCrewList { context } => match self.crew_list_internal(context).await {

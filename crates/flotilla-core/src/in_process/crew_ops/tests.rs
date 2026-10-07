@@ -299,6 +299,7 @@ async fn actuator_refuses_delivery_and_hold_after_service_stops() {
     drop(crew);
     assert!(actuator.crew.upgrade().is_none(), "subscriptions and actuator must not form a strong cycle");
     let request = CrewTurnIntent {
+        receiver: None,
         namespace: "flotilla".into(),
         convoy: "crew".into(),
         source: "rule".into(),

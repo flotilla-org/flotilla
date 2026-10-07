@@ -12,6 +12,7 @@ pub mod awareness_projection;
 mod branch_lookup_observer;
 pub mod build_info;
 pub mod change_request_observer;
+mod charter_notifications;
 pub mod charter_store;
 pub mod checkout_integration;
 pub mod cleat_roll;

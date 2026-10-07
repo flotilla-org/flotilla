@@ -1053,6 +1053,10 @@ pub struct StalledCondition {
     pub rung: StallRung,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor: Option<StallSupervisor>,
+    /// Canonical receiver-homed escalation identity, available before replication.
+    // Previous-generation conditions reconstruct their producer key for one roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervision_message: Option<flotilla_protocol::ResourceRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervision_index: Option<usize>,
     #[serde(default)]
@@ -2184,6 +2188,7 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                     began_at: *at,
                     rung: StallRung::Operator,
                     supervisor: None,
+                    supervision_message: None,
                     supervision_index: None,
                     supervision_exhausted: false,
                     reason: Some(*reason),

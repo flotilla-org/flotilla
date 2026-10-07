@@ -1620,6 +1620,7 @@ mod tests {
                                         vessel: "control".into(),
                                         role: "governor".into(),
                                     }),
+                                    supervision_message: None,
                                     supervision_index: None,
                                     supervision_exhausted: false,
                                     reason: Some(flotilla_protocol::StallReason::Infra),

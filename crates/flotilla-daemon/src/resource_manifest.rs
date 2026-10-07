@@ -514,6 +514,7 @@ impl ResourceManifestReconciler {
                 began_at: now,
                 rung: StallRung::Operator,
                 supervisor: None,
+                supervision_message: None,
                 supervision_index: None,
                 supervision_exhausted: false,
                 reason: None,
