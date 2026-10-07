@@ -285,15 +285,18 @@ impl super::CloudAgentService for ClaudeCodingAgent {
 
                 let id = s.id.clone();
 
-                (id, CloudAgentSession {
-                    title: s.title,
-                    status,
-                    model,
-                    updated_at: Some(s.updated_at.clone()),
-                    provider_name: provider_name.clone(),
-                    provider_display_name: "Claude".into(),
-                    item_noun: "Agent".into(),
-                })
+                (
+                    id,
+                    CloudAgentSession {
+                        title: s.title,
+                        status,
+                        model,
+                        updated_at: Some(s.updated_at.clone()),
+                        provider_name: provider_name.clone(),
+                        provider_display_name: "Claude".into(),
+                        item_noun: "Agent".into(),
+                    },
+                )
             })
             .collect())
     }

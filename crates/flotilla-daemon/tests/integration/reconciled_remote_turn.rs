@@ -117,33 +117,37 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     let created =
         convoys.create(&meta("nudge-convoy"), &ConvoySpec::builder().workflow_ref("wf".to_string()).build()).await.expect("convoy");
     convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Active,
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                exit: Some(ExitDeclaration::Claim(ClaimExit)),
-                turn_delivery: Default::default(),
-                stall_nudges: Default::default(),
-                supervision: None,
-                vessels: vec![VesselRequirement::builder()
-                    .name("work".to_string())
-                    .crew(vec![CrewSpec::builder()
-                        .role("coder".to_string())
-                        .source(CrewSource::Agent {
-                            selector: Selector::for_capability("coding"),
-                            prompt: Some("Initial".to_string()),
-                            brief_template: None,
-                        })
-                        .build()])
-                    .build()],
-            }),
-            work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
-            crew_work: BTreeMap::from([(
-                "work".to_string(),
-                BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-            )]),
-            ..Default::default()
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    exit: Some(ExitDeclaration::Claim(ClaimExit)),
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    vessels: vec![VesselRequirement::builder()
+                        .name("work".to_string())
+                        .crew(vec![CrewSpec::builder()
+                            .role("coder".to_string())
+                            .source(CrewSource::Agent {
+                                selector: Selector::for_capability("coding"),
+                                prompt: Some("Initial".to_string()),
+                                brief_template: None,
+                            })
+                            .build()])
+                        .build()],
+                }),
+                work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
+                crew_work: BTreeMap::from([(
+                    "work".to_string(),
+                    BTreeMap::from([("coder".to_string(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("working crew");
     replicate::<Convoy>(&home, &placement, home_daemon.node_id()).await;
@@ -163,21 +167,24 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     replicate::<PlacementPolicy>(&home, &placement, home_daemon.node_id()).await;
     let environments = placement.clone().using::<Environment>("flotilla");
     let environment = environments
-        .create(&meta("host-direct-placement-host"), &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec {
-                host_ref: "placement-host".to_string(),
-                repo_default_dir: "/workspace".to_string(),
-            }),
-            docker: None,
-        })
+        .create(
+            &meta("host-direct-placement-host"),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec {
+                    host_ref: "placement-host".to_string(),
+                    repo_default_dir: "/workspace".to_string(),
+                }),
+                docker: None,
+            },
+        )
         .await
         .expect("placement environment");
     environments
-        .update_status(&environment.metadata.name, &environment.metadata.resource_version, &EnvironmentStatus {
-            phase: EnvironmentPhase::Ready,
-            ready: true,
-            ..Default::default()
-        })
+        .update_status(
+            &environment.metadata.name,
+            &environment.metadata.resource_version,
+            &EnvironmentStatus { phase: EnvironmentPhase::Ready, ready: true, ..Default::default() },
+        )
         .await
         .expect("ready environment");
     let vessel = placement
@@ -211,12 +218,16 @@ async fn remote_turn_scenario(closed_watch: Option<ClosedWatch>) {
     let sessions = placement.clone().using::<TerminalSession>("flotilla");
     let session = sessions.create(&session_meta, &session_spec).await.expect("persist reconciled terminal");
     sessions
-        .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            session_id: Some("receiver-session".into()),
-            crew: Some(CrewSessionStatus { id: "receiver-crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
-            ..Default::default()
-        })
+        .update_status(
+            &session.metadata.name,
+            &session.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                session_id: Some("receiver-session".into()),
+                crew: Some(CrewSessionStatus { id: "receiver-crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("running terminal");
     let convoy = convoys.get("nudge-convoy").await.expect("working convoy");

@@ -243,10 +243,13 @@ async fn project_issue_sources_are_the_deduplicated_union_of_repository_forges()
     let IssueSourceResolution::Available { bindings } = resolve_project_issue_sources(&repositories, &project).await else {
         panic!("derived sources should resolve");
     };
-    assert_eq!(bindings.iter().map(|binding| &binding.source).collect::<Vec<_>>(), vec![
-        &IssueSource { service: "https://gitlab.com".into(), scope: "widgets/api".into() },
-        &IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
-    ]);
+    assert_eq!(
+        bindings.iter().map(|binding| &binding.source).collect::<Vec<_>>(),
+        vec![
+            &IssueSource { service: "https://gitlab.com".into(), scope: "widgets/api".into() },
+            &IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+        ]
+    );
     assert_eq!(bindings.iter().map(|binding| binding.alias.as_str()).collect::<Vec<_>>(), vec!["api", "core"]);
     assert!(bindings.iter().find(|binding| binding.alias == "core").expect("filtered derived binding").creatable);
 }

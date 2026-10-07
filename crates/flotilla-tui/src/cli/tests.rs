@@ -162,13 +162,16 @@ fn fulfilment_list_distinguishes_image_and_host_model_support() {
         pool: "cleat".to_string(),
         realisation: realisation.to_string(),
         grants: vec!["platform:linux".to_string()],
-        harnesses: BTreeMap::from([("claude-code".to_string(), flotilla_protocol::FulfilmentHarness {
-            version: version.to_string(),
-            models: BTreeMap::from([("claude-new-model".to_string(), flotilla_protocol::FulfilmentModel {
-                usable,
-                source: "probe".to_string(),
-            })]),
-        })]),
+        harnesses: BTreeMap::from([(
+            "claude-code".to_string(),
+            flotilla_protocol::FulfilmentHarness {
+                version: version.to_string(),
+                models: BTreeMap::from([(
+                    "claude-new-model".to_string(),
+                    flotilla_protocol::FulfilmentModel { usable, source: "probe".to_string() },
+                )]),
+            },
+        )]),
         toolchains: BTreeMap::new(),
         gui_session_logged_in: Some(false),
         free_vessel_slots: None,

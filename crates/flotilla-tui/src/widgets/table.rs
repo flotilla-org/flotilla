@@ -654,10 +654,10 @@ mod tests {
             });
         }
         let rows = convoys.iter().collect::<Vec<_>>();
-        table_view::project(&"convoys/dev".parse().expect("valid address"), &table_view::TableRows {
-            convoys: rows,
-            ..table_view::TableRows::default()
-        })
+        table_view::project(
+            &"convoys/dev".parse().expect("valid address"),
+            &table_view::TableRows { convoys: rows, ..table_view::TableRows::default() },
+        )
         .expect("project snapshot table")
     }
 
@@ -749,10 +749,13 @@ mod tests {
             }],
             truncated: false,
         };
-        let view = table_view::project(&"issues?project=flotilla%2Froadmap".parse().expect("address"), &table_view::TableRows {
-            issue_results: vec![table_view::QueryRows { query: &query, rows: std::slice::from_ref(&row), state: &state }],
-            ..table_view::TableRows::default()
-        })
+        let view = table_view::project(
+            &"issues?project=flotilla%2Froadmap".parse().expect("address"),
+            &table_view::TableRows {
+                issue_results: vec![table_view::QueryRows { query: &query, rows: std::slice::from_ref(&row), state: &state }],
+                ..table_view::TableRows::default()
+            },
+        )
         .expect("issue table");
         let mut terminal = Terminal::new(TestBackend::new(110, 7)).expect("terminal");
         let mut widget = TableWidget::default();

@@ -255,12 +255,15 @@ async fn vessel_finalizer_contract(backend: ResourceBackend) {
     create(&backend, meta("convoy-surrogate", None)).await;
     let vessels = backend.using::<Vessel>(NS);
     vessels
-        .create(&meta("vessel", Some("convoy-surrogate")).with_added_finalizer("flotilla.work/vessel-workspace-teardown"), &VesselSpec {
-            convoy_ref: "convoy-surrogate".to_string(),
-            vessel_name: "work".to_string(),
-            placement_policy_ref: "unused".to_string(),
-            adopted_checkout_refs: Default::default(),
-        })
+        .create(
+            &meta("vessel", Some("convoy-surrogate")).with_added_finalizer("flotilla.work/vessel-workspace-teardown"),
+            &VesselSpec {
+                convoy_ref: "convoy-surrogate".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "unused".to_string(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
         .await
         .expect("create vessel");
     let terminals = backend.using::<TerminalSession>(NS);
@@ -269,14 +272,17 @@ async fn vessel_finalizer_contract(backend: ResourceBackend) {
     let mut terminal_meta = meta("running-terminal", None);
     terminal_meta.labels.insert(VESSEL_REF_LABEL.to_string(), "vessel".to_string());
     terminals
-        .create(&terminal_meta, &TerminalSessionSpec {
-            env_ref: "unused".to_string(),
-            role: "coder".to_string(),
-            source: TerminalSessionSource::Tool { command: "true".to_string() },
-            cwd: "/workspace".to_string(),
-            env: Default::default(),
-            pool: "test".to_string(),
-        })
+        .create(
+            &terminal_meta,
+            &TerminalSessionSpec {
+                env_ref: "unused".to_string(),
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Tool { command: "true".to_string() },
+                cwd: "/workspace".to_string(),
+                env: Default::default(),
+                pool: "test".to_string(),
+            },
+        )
         .await
         .expect("create terminal");
     let gc = start(&backend).await;

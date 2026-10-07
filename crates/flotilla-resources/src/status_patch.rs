@@ -218,10 +218,13 @@ mod tests {
         .expect("second attempt should succeed");
 
         assert_eq!(result, CounterStatus { value: 11, note: Some("fresh".to_string()) });
-        assert_eq!(writes.lock().expect("writes lock").as_slice(), &[
-            ("1".to_string(), CounterStatus { value: 2, note: None }),
-            ("2".to_string(), CounterStatus { value: 11, note: Some("fresh".to_string()) }),
-        ]);
+        assert_eq!(
+            writes.lock().expect("writes lock").as_slice(),
+            &[
+                ("1".to_string(), CounterStatus { value: 2, note: None }),
+                ("2".to_string(), CounterStatus { value: 11, note: Some("fresh".to_string()) }),
+            ]
+        );
     }
 
     #[tokio::test]

@@ -185,12 +185,15 @@ mod tests {
         let result = runner.run_with_timeout("cmd", &["arg"], Path::new("/work"), &ChannelLabel::Default, Duration::from_secs(3)).await;
         assert_eq!(result.expect("command result"), "done");
         let calls = inner.calls.lock().expect("calls mutex");
-        assert_eq!(calls.as_slice(), &[(
-            "docker".into(),
-            vec!["exec".into(), "-w".into(), "/work".into(), "container".into(), "cmd".into(), "arg".into()],
-            Path::new("/").to_path_buf(),
-            Duration::from_secs(3),
-        )]);
+        assert_eq!(
+            calls.as_slice(),
+            &[(
+                "docker".into(),
+                vec!["exec".into(), "-w".into(), "/work".into(), "container".into(), "cmd".into(), "arg".into()],
+                Path::new("/").to_path_buf(),
+                Duration::from_secs(3),
+            )]
+        );
     }
 
     #[tokio::test]

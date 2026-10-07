@@ -847,10 +847,13 @@ mod tests {
         let Resolved::NeedsContext { command: Command { action: CommandAction::ConvoyStart { intent }, .. }, .. } = resolved else {
             panic!("start resolves to a convoy start intent");
         };
-        assert_eq!(intent.agent_overrides, vec![
-            AgentOverride { capability: "code".into(), adapter: "claude-code".into(), model: Some("opus".into()) },
-            AgentOverride { capability: "review".into(), adapter: "codex".into(), model: None },
-        ]);
+        assert_eq!(
+            intent.agent_overrides,
+            vec![
+                AgentOverride { capability: "code".into(), adapter: "claude-code".into(), model: Some("opus".into()) },
+                AgentOverride { capability: "review".into(), adapter: "codex".into(), model: None },
+            ]
+        );
 
         for malformed in ["", ":opus", "code=", "claude-code:", "claude-code:opus; rm -rf ~", "cl$(whoami):opus", "claude code"] {
             ConvoyNoun::try_parse_from(["convoy", "start", "--project", "flotilla", "--agent", malformed])
@@ -1161,27 +1164,30 @@ mod tests {
                 .expect("resolve");
 
         let Resolved::NeedsContext { command, .. } = resolved else { panic!("expected daemon command") };
-        assert_eq!(command.action, CommandAction::ConvoyStart {
-            intent: Box::new(ConvoyStartIntent {
-                continuation: None,
-                standing_role: None,
-                namespace: None,
-                project_ref: "widgets".into(),
-                change_request: None,
-                issues: Vec::new(),
-                name: Some("project-work".into()),
-                branch: Some("fix/widgets".into()),
-                workflow_ref: Some("single-agent".into()),
-                inputs: Vec::new(),
-                instruction: None,
-                placement_policy: None,
-                needs: Vec::new(),
-                escalation_reason: None,
-                agent_overrides: Vec::new(),
-                skills: Vec::new(),
-                auto_attach: ConvoyAutoAttach::Never,
-            }),
-        });
+        assert_eq!(
+            command.action,
+            CommandAction::ConvoyStart {
+                intent: Box::new(ConvoyStartIntent {
+                    continuation: None,
+                    standing_role: None,
+                    namespace: None,
+                    project_ref: "widgets".into(),
+                    change_request: None,
+                    issues: Vec::new(),
+                    name: Some("project-work".into()),
+                    branch: Some("fix/widgets".into()),
+                    workflow_ref: Some("single-agent".into()),
+                    inputs: Vec::new(),
+                    instruction: None,
+                    placement_policy: None,
+                    needs: Vec::new(),
+                    escalation_reason: None,
+                    agent_overrides: Vec::new(),
+                    skills: Vec::new(),
+                    auto_attach: ConvoyAutoAttach::Never,
+                }),
+            }
+        );
     }
 
     #[test]

@@ -298,10 +298,10 @@ async fn completed_with_overrides_result() {
         &resolver,
     )
     .await;
-    assert_eq!(result, CommandValue::CheckoutCreated {
-        branch: "feat/x".into(),
-        path: QualifiedPath::host(HostId::new("host-a"), "/repo/wt-feat-x"),
-    });
+    assert_eq!(
+        result,
+        CommandValue::CheckoutCreated { branch: "feat/x".into(), path: QualifiedPath::host(HostId::new("host-a"), "/repo/wt-feat-x") }
+    );
 }
 
 #[tokio::test]
@@ -393,10 +393,10 @@ async fn later_failure_preserves_earlier_completed_with() {
         &resolver,
     )
     .await;
-    assert_eq!(result, CommandValue::CheckoutCreated {
-        branch: "feat/x".into(),
-        path: QualifiedPath::host(HostId::new("host-a"), "/repo/wt-feat-x"),
-    });
+    assert_eq!(
+        result,
+        CommandValue::CheckoutCreated { branch: "feat/x".into(), path: QualifiedPath::host(HostId::new("host-a"), "/repo/wt-feat-x") }
+    );
 }
 
 #[tokio::test]
@@ -412,10 +412,13 @@ async fn local_step_consumes_produced_outcome_from_remote_step() {
             _action: StepAction,
             prior: &[StepOutcome],
         ) -> Result<StepOutcome, String> {
-            assert_eq!(prior, &[StepOutcome::Produced(CommandValue::AttachCommandResolved {
-                plan: flotilla_protocol::ResolvedAttachPlan::shell_command("attach remote"),
-                binding: None
-            })]);
+            assert_eq!(
+                prior,
+                &[StepOutcome::Produced(CommandValue::AttachCommandResolved {
+                    plan: flotilla_protocol::ResolvedAttachPlan::shell_command("attach remote"),
+                    binding: None
+                })]
+            );
             Ok(StepOutcome::Completed)
         }
     }

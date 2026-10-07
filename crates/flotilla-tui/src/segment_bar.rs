@@ -213,14 +213,10 @@ mod tests {
 
     #[test]
     fn render_produces_hit_regions() {
-        let items =
-            vec![SegmentItem { label: "Alpha".into(), key_hint: None, active: true, dragging: false, style_override: None }, SegmentItem {
-                label: "Beta".into(),
-                key_hint: None,
-                active: false,
-                dragging: false,
-                style_override: None,
-            }];
+        let items = vec![
+            SegmentItem { label: "Alpha".into(), key_hint: None, active: true, dragging: false, style_override: None },
+            SegmentItem { label: "Beta".into(), key_hint: None, active: false, dragging: false, style_override: None },
+        ];
 
         struct TestStyle;
         impl BarStyle for TestStyle {

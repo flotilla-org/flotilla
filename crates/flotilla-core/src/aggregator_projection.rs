@@ -668,10 +668,10 @@ mod tests {
         state.replace_store_catalog(repositories.clone(), HashMap::from([(retained, vec![])])).await;
         assert_eq!(state.subscribe_demand().borrow().keys().cloned().collect::<HashSet<_>>(), HashSet::from([retained_issues]));
 
-        state.replace_subscriber(subscriber, &[QueryCursor { query: awareness, since: None }, QueryCursor {
-            query: removed_issues.clone(),
-            since: None,
-        }]);
+        state.replace_subscriber(
+            subscriber,
+            &[QueryCursor { query: awareness, since: None }, QueryCursor { query: removed_issues.clone(), since: None }],
+        );
         state.replace_store_catalog(repositories, HashMap::new()).await;
         assert_eq!(state.subscribe_demand().borrow().keys().cloned().collect::<HashSet<_>>(), HashSet::from([removed_issues]));
     }
@@ -689,11 +689,16 @@ mod tests {
         let issue_query = QueryId::Issues { scope: project.clone(), search: None, label: Some(READY_ISSUE_LABEL.into()) };
         state.replace_subscriber(Uuid::new_v4(), &[QueryCursor { query: issue_query.clone(), since: None }]);
         let generation = *state.subscribe_demand().borrow().get(&issue_query).expect("issue query generation");
-        state.replace_issues(&issue_query, generation, vec![issue_row("flotilla-org/flotilla", "862")], ResultSetState {
-            demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: false }),
-            conditions: vec![],
-            truncated: false,
-        });
+        state.replace_issues(
+            &issue_query,
+            generation,
+            vec![issue_row("flotilla-org/flotilla", "862")],
+            ResultSetState {
+                demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: false }),
+                conditions: vec![],
+                truncated: false,
+            },
+        );
 
         let result = state.awareness_result_set(&None, AwarenessGrouping::Project, AwarenessLimit::default()).await;
         let Rows::Awareness { rows, .. } = result.rows else { panic!("awareness rows") };

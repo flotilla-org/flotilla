@@ -262,11 +262,14 @@ impl OpenViews {
     /// Build the fresh-config tab set, adding a composite landing View when
     /// one was resolved.
     pub fn seed_with_landing(landing: Option<(RepoIdentity, ViewAddress)>) -> Self {
-        let mut entries = vec![OpenViewEntry { address: ViewAddress::Overview.to_string(), label: None, history: vec![] }, OpenViewEntry {
-            address: ViewAddress::Convoys { namespace: "flotilla".to_string(), scope: None }.to_string(),
-            label: None,
-            history: vec![],
-        }];
+        let mut entries = vec![
+            OpenViewEntry { address: ViewAddress::Overview.to_string(), label: None, history: vec![] },
+            OpenViewEntry {
+                address: ViewAddress::Convoys { namespace: "flotilla".to_string(), scope: None }.to_string(),
+                label: None,
+                history: vec![],
+            },
+        ];
         if let Some((_, address)) = &landing {
             if !matches!(address, ViewAddress::Repo { .. }) {
                 entries.push(OpenViewEntry { address: address.to_string(), label: None, history: vec![] });

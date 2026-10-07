@@ -114,10 +114,10 @@ async fn designation_and_parent_federate() {
     source.definitions::<Project>("flotilla").apply(&InputMeta::builder().name("root".into()).build(), &project(None)).await.expect("root");
     source
         .definitions::<FleetDesignation>("flotilla")
-        .apply(&InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(), &FleetDesignationSpec {
-            project: "root".into(),
-            image_cache: None,
-        })
+        .apply(
+            &InputMeta::builder().name(FLEET_DESIGNATION_NAME.into()).build(),
+            &FleetDesignationSpec { project: "root".into(), image_cache: None },
+        )
         .await
         .expect("designation");
     target

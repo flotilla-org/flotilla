@@ -818,27 +818,36 @@ mod tests {
 
     fn model_with_hosts() -> TuiModel {
         let mut model = empty_model();
-        model.hosts.insert(EnvironmentId::host(HostId::new("feta-env")), crate::app::TuiHostState {
-            environment_id: EnvironmentId::host(HostId::new("feta-env")),
-            host_name: HostName::new("feta"),
-            is_local: false,
-            status: crate::app::PeerStatus::Connected,
-            summary: stub_host_summary("feta"),
-        });
-        model.hosts.insert(EnvironmentId::host(HostId::new("brie-env")), crate::app::TuiHostState {
-            environment_id: EnvironmentId::host(HostId::new("brie-env")),
-            host_name: HostName::new("brie"),
-            is_local: false,
-            status: crate::app::PeerStatus::Connected,
-            summary: stub_host_summary("brie"),
-        });
-        model.hosts.insert(EnvironmentId::host(HostId::new("status-env")), crate::app::TuiHostState {
-            environment_id: EnvironmentId::host(HostId::new("status-env")),
-            host_name: HostName::new("status"),
-            is_local: false,
-            status: crate::app::PeerStatus::Connected,
-            summary: stub_host_summary("status"),
-        });
+        model.hosts.insert(
+            EnvironmentId::host(HostId::new("feta-env")),
+            crate::app::TuiHostState {
+                environment_id: EnvironmentId::host(HostId::new("feta-env")),
+                host_name: HostName::new("feta"),
+                is_local: false,
+                status: crate::app::PeerStatus::Connected,
+                summary: stub_host_summary("feta"),
+            },
+        );
+        model.hosts.insert(
+            EnvironmentId::host(HostId::new("brie-env")),
+            crate::app::TuiHostState {
+                environment_id: EnvironmentId::host(HostId::new("brie-env")),
+                host_name: HostName::new("brie"),
+                is_local: false,
+                status: crate::app::PeerStatus::Connected,
+                summary: stub_host_summary("brie"),
+            },
+        );
+        model.hosts.insert(
+            EnvironmentId::host(HostId::new("status-env")),
+            crate::app::TuiHostState {
+                environment_id: EnvironmentId::host(HostId::new("status-env")),
+                host_name: HostName::new("status"),
+                is_local: false,
+                status: crate::app::PeerStatus::Connected,
+                summary: stub_host_summary("status"),
+            },
+        );
         model
     }
 
@@ -1027,22 +1036,28 @@ mod tests {
             image: ImageId::new("image-1"),
             status: EnvironmentStatus::Running,
         });
-        model.hosts.insert(EnvironmentId::host(HostId::new("feta-env")), crate::app::TuiHostState {
-            environment_id: EnvironmentId::host(HostId::new("feta-env")),
-            host_name: HostName::new("feta"),
-            is_local: false,
-            status: crate::app::PeerStatus::Connected,
-            summary: feta_summary,
-        });
+        model.hosts.insert(
+            EnvironmentId::host(HostId::new("feta-env")),
+            crate::app::TuiHostState {
+                environment_id: EnvironmentId::host(HostId::new("feta-env")),
+                host_name: HostName::new("feta"),
+                is_local: false,
+                status: crate::app::PeerStatus::Connected,
+                summary: feta_summary,
+            },
+        );
 
         // Host "brie": bare host, no environment providers or environments.
-        model.hosts.insert(EnvironmentId::host(HostId::new("brie-env")), crate::app::TuiHostState {
-            environment_id: EnvironmentId::host(HostId::new("brie-env")),
-            host_name: HostName::new("brie"),
-            is_local: false,
-            status: crate::app::PeerStatus::Connected,
-            summary: stub_host_summary("brie"),
-        });
+        model.hosts.insert(
+            EnvironmentId::host(HostId::new("brie-env")),
+            crate::app::TuiHostState {
+                environment_id: EnvironmentId::host(HostId::new("brie-env")),
+                host_name: HostName::new("brie"),
+                is_local: false,
+                status: crate::app::PeerStatus::Connected,
+                summary: stub_host_summary("brie"),
+            },
+        );
 
         model
     }

@@ -638,16 +638,19 @@ pub fn project(address: &ViewAddress, data: &TableRows<'_>) -> Result<TableView,
                 .iter()
                 .find(|candidate| &candidate.name == vessel)
                 .ok_or_else(|| format!("vessel not found: {namespace}/{convoy}/{vessel}"))?;
-            Ok(vessel_spec().project(format!("Vessel · {vessel}"), [VesselProjection {
-                namespace: namespace.clone(),
-                convoy: convoy.clone(),
-                convoy_name: convoy_row.name.clone(),
-                origin_host: convoy_row.origin_host.clone(),
-                project_ref: convoy_row.project_ref.clone(),
-                repo_hint: convoy_row.repo_hint.clone(),
-                vessel_count: convoy_row.vessels.len(),
-                vessel: vessel_row.clone(),
-            }]))
+            Ok(vessel_spec().project(
+                format!("Vessel · {vessel}"),
+                [VesselProjection {
+                    namespace: namespace.clone(),
+                    convoy: convoy.clone(),
+                    convoy_name: convoy_row.name.clone(),
+                    origin_host: convoy_row.origin_host.clone(),
+                    project_ref: convoy_row.project_ref.clone(),
+                    repo_hint: convoy_row.repo_hint.clone(),
+                    vessel_count: convoy_row.vessels.len(),
+                    vessel: vessel_row.clone(),
+                }],
+            ))
         }
         ViewAddress::Issues { scope } => {
             let query = query_for(address, data.source_search).expect("issues address has a query");
@@ -1161,10 +1164,10 @@ fn readiness_cell(readiness: &flotilla_protocol::result_set::Readiness) -> CellV
 }
 
 fn readiness_details(readiness: &flotilla_protocol::result_set::Readiness) -> Vec<DetailField> {
-    vec![DetailField { label: "Readiness", value: readiness.state.as_str().into() }, DetailField {
-        label: "Readiness reasons",
-        value: readiness.explanation(),
-    }]
+    vec![
+        DetailField { label: "Readiness", value: readiness.state.as_str().into() },
+        DetailField { label: "Readiness reasons", value: readiness.explanation() },
+    ]
 }
 
 fn convoy_progress(row: &ConvoySummary) -> CellValue {
@@ -1594,10 +1597,10 @@ mod tests {
                 .describe
                 .iter()
                 .any(|field| field.label == "Readiness reasons" && field.value.contains("Forgejo authentication refused")));
-            let vessels = project(&ViewAddress::Convoy { namespace: "dev".into(), name: row.resource_name.clone() }, &TableRows {
-                convoys: vec![&row],
-                ..Default::default()
-            })
+            let vessels = project(
+                &ViewAddress::Convoy { namespace: "dev".into(), name: row.resource_name.clone() },
+                &TableRows { convoys: vec![&row], ..Default::default() },
+            )
             .expect("vessels");
             assert!(vessels.rows[0]
                 .describe
@@ -1658,16 +1661,10 @@ mod tests {
         row.message = Some("workspace launch failed: disk full".into());
         let view = project_convoys("convoys/dev", &[&row]).expect("project table");
 
-        assert_eq!(view.columns.iter().map(|column| column.id).collect::<Vec<_>>(), vec![
-            "name",
-            "workflow",
-            "phase",
-            "readiness",
-            "pr",
-            "vessels",
-            "scope",
-            "message"
-        ]);
+        assert_eq!(
+            view.columns.iter().map(|column| column.id).collect::<Vec<_>>(),
+            vec!["name", "workflow", "phase", "readiness", "pr", "vessels", "scope", "message"]
+        );
         assert_eq!(view.rows[0].cells[2], CellValue::toned("failed", CellTone::Error));
         assert_eq!(view.rows[0].cells[7].text, "workspace launch failed: disk full");
         assert_eq!(view.rows[0].drill, Some("convoy/dev/tables".parse().expect("valid address")));
@@ -1936,19 +1933,22 @@ mod tests {
         let unavailable = independent("wedged", "feta", None);
         let query = QueryId::Independents { scope: None };
         let state = ResultSetState::default();
-        let view = project(&ViewAddress::Independents { scope: None }, &TableRows {
-            independent_results: vec![QueryRows { query: &query, rows: &[unavailable, available], state: &state }],
-            ..TableRows::default()
-        })
+        let view = project(
+            &ViewAddress::Independents { scope: None },
+            &TableRows {
+                independent_results: vec![QueryRows { query: &query, rows: &[unavailable, available], state: &state }],
+                ..TableRows::default()
+            },
+        )
         .expect("independents table");
 
         assert_eq!(view.columns.iter().map(|column| column.id).collect::<Vec<_>>(), vec!["name", "repo", "host", "phase", "attach"]);
         assert_eq!(view.rows.iter().map(|row| row.cells[0].text.as_str()).collect::<Vec<_>>(), vec!["scratch", "wedged"]);
         assert_eq!(view.rows[0].cells[4], CellValue::toned("available", CellTone::Success));
-        assert_eq!(view.rows[0].actions[0].intent, TableIntent::AttachPane {
-            reference: "terminal-scratch".to_string(),
-            host: HostName::new("kiwi")
-        });
+        assert_eq!(
+            view.rows[0].actions[0].intent,
+            TableIntent::AttachPane { reference: "terminal-scratch".to_string(), host: HostName::new("kiwi") }
+        );
         assert_eq!(view.rows[1].cells[4], CellValue::toned("unavailable", CellTone::Muted));
         assert!(view.rows[1].actions.is_empty(), "an unavailable attach must not render as an action");
     }
@@ -2012,59 +2012,62 @@ mod tests {
         let state = ResultSetState::default();
         let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
 
-        let panels = project_panels(&address, &TableRows {
-            convoys: vec![&convoy],
-            issue_results: vec![QueryRows { query: &issue_query, rows: std::slice::from_ref(&issue_row), state: &state }],
-            checkout_results: vec![QueryRows { query: &checkout_query, rows: std::slice::from_ref(&checkout), state: &state }],
-            independent_results: vec![QueryRows { query: &independent_query, rows: std::slice::from_ref(&independent), state: &state }],
-            awareness_results: vec![QueryRows { query: &awareness_query, rows: std::slice::from_ref(&awareness), state: &state }],
-            ..TableRows::default()
-        })
+        let panels = project_panels(
+            &address,
+            &TableRows {
+                convoys: vec![&convoy],
+                issue_results: vec![QueryRows { query: &issue_query, rows: std::slice::from_ref(&issue_row), state: &state }],
+                checkout_results: vec![QueryRows { query: &checkout_query, rows: std::slice::from_ref(&checkout), state: &state }],
+                independent_results: vec![QueryRows { query: &independent_query, rows: std::slice::from_ref(&independent), state: &state }],
+                awareness_results: vec![QueryRows { query: &awareness_query, rows: std::slice::from_ref(&awareness), state: &state }],
+                ..TableRows::default()
+            },
+        )
         .expect("project panels");
 
-        assert_eq!(panels.iter().map(|panel| panel.kind).collect::<Vec<_>>(), vec![
-            ProjectPanelKind::Convoys,
-            ProjectPanelKind::Checkouts,
-            ProjectPanelKind::Issues,
-            ProjectPanelKind::Independents,
-        ]);
-        assert_eq!(panels.iter().map(|panel| panel.target.to_string()).collect::<Vec<_>>(), vec![
-            "convoys/flotilla?project=flotilla%2Froadmap",
-            "checkouts?project=flotilla%2Froadmap",
-            "issues?project=flotilla%2Froadmap",
-            "independents?project=flotilla%2Froadmap",
-        ]);
-        assert_eq!(panels.iter().map(|panel| panel.table.title.as_str()).collect::<Vec<_>>(), vec![
-            "Convoys (1)",
-            "Checkouts (1)",
-            "Issues (1)",
-            "Independents (1)",
-        ]);
+        assert_eq!(
+            panels.iter().map(|panel| panel.kind).collect::<Vec<_>>(),
+            vec![ProjectPanelKind::Convoys, ProjectPanelKind::Checkouts, ProjectPanelKind::Issues, ProjectPanelKind::Independents,]
+        );
+        assert_eq!(
+            panels.iter().map(|panel| panel.target.to_string()).collect::<Vec<_>>(),
+            vec![
+                "convoys/flotilla?project=flotilla%2Froadmap",
+                "checkouts?project=flotilla%2Froadmap",
+                "issues?project=flotilla%2Froadmap",
+                "independents?project=flotilla%2Froadmap",
+            ]
+        );
+        assert_eq!(
+            panels.iter().map(|panel| panel.table.title.as_str()).collect::<Vec<_>>(),
+            vec!["Convoys (1)", "Checkouts (1)", "Issues (1)", "Independents (1)",]
+        );
         assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
         assert!(panels[0].table.columns.iter().all(|column| column.id != "scope"));
-        assert_eq!(panels.iter().map(|panel| panel.table.meta.salience).collect::<Vec<_>>(), vec![
-            Salience::Urgent,
-            Salience::None,
-            Salience::Attention,
-            Salience::Info,
-        ]);
+        assert_eq!(
+            panels.iter().map(|panel| panel.table.meta.salience).collect::<Vec<_>>(),
+            vec![Salience::Urgent, Salience::None, Salience::Attention, Salience::Info,]
+        );
         assert!(panels.iter().all(|panel| panel.table.meta.as_of == Some(flotilla_protocol::result_set::Timestamp::UNIX_EPOCH)));
         assert_eq!(panels[0].table.rows[0].cells[0].text, "tables");
         assert_eq!(panels[1].table.rows[0].cells[1].text, "/work/flotilla");
-        assert_eq!(panels[2].table.rows[0].actions[0].intent, TableIntent::StartConvoy {
-            namespace: "flotilla".into(),
-            project: "roadmap".into(),
-            issue: TableIssueStart {
-                row_id: issue_row_id(&scope, &issue_row.reference),
-                issue: issue_row.reference,
-                title: "Composite project issue".into(),
-                ready: false,
-            },
-        });
-        assert_eq!(panels[3].table.rows[0].actions[0].intent, TableIntent::AttachPane {
-            reference: "terminal-governor".into(),
-            host: HostName::new("feta"),
-        });
+        assert_eq!(
+            panels[2].table.rows[0].actions[0].intent,
+            TableIntent::StartConvoy {
+                namespace: "flotilla".into(),
+                project: "roadmap".into(),
+                issue: TableIssueStart {
+                    row_id: issue_row_id(&scope, &issue_row.reference),
+                    issue: issue_row.reference,
+                    title: "Composite project issue".into(),
+                    ready: false,
+                },
+            }
+        );
+        assert_eq!(
+            panels[3].table.rows[0].actions[0].intent,
+            TableIntent::AttachPane { reference: "terminal-governor".into(), host: HostName::new("feta") }
+        );
     }
 
     #[test]
@@ -2096,25 +2099,31 @@ mod tests {
         };
         let address: ViewAddress = "issues?project=flotilla%2Froadmap".parse().expect("issues address");
 
-        let view = project(&address, &TableRows {
-            convoys: vec![],
-            issue_results: vec![QueryRows { query: &query, rows: std::slice::from_ref(&row), state: &state }],
-            ..TableRows::default()
-        })
+        let view = project(
+            &address,
+            &TableRows {
+                convoys: vec![],
+                issue_results: vec![QueryRows { query: &query, rows: std::slice::from_ref(&row), state: &state }],
+                ..TableRows::default()
+            },
+        )
         .expect("scoped issue table");
 
         assert_eq!(view.rows.len(), 1);
         assert_eq!(view.rows[0].cells[0].text, "ENG-42");
-        assert_eq!(view.rows[0].actions[0].intent, TableIntent::StartConvoy {
-            namespace: "flotilla".into(),
-            project: "roadmap".into(),
-            issue: TableIssueStart {
-                row_id: issue_row_id(&scope, &row.reference),
-                issue: row.reference,
-                title: "Start convoy from scoped issue".into(),
-                ready: false,
-            },
-        });
+        assert_eq!(
+            view.rows[0].actions[0].intent,
+            TableIntent::StartConvoy {
+                namespace: "flotilla".into(),
+                project: "roadmap".into(),
+                issue: TableIssueStart {
+                    row_id: issue_row_id(&scope, &row.reference),
+                    issue: row.reference,
+                    title: "Start convoy from scoped issue".into(),
+                    ready: false,
+                },
+            }
+        );
         assert_eq!(view.meta.as_of, state.demand.as_ref().map(|metadata| metadata.as_of));
         assert!(view.meta.has_more);
         assert_eq!(view.meta.conditions, vec!["one source is unavailable"]);
@@ -2133,26 +2142,23 @@ mod tests {
             .build();
         let query = QueryId::Checkouts { scope: None };
         let state = ResultSetState::default();
-        let view = project(&ViewAddress::Checkouts { scope: None }, &TableRows {
-            checkout_results: vec![QueryRows { query: &query, rows: std::slice::from_ref(&row), state: &state }],
-            ..TableRows::default()
-        })
+        let view = project(
+            &ViewAddress::Checkouts { scope: None },
+            &TableRows {
+                checkout_results: vec![QueryRows { query: &query, rows: std::slice::from_ref(&row), state: &state }],
+                ..TableRows::default()
+            },
+        )
         .expect("checkout table");
 
-        assert_eq!(view.columns.iter().map(|column| column.id).collect::<Vec<_>>(), vec![
-            "host",
-            "path",
-            "branch",
-            "repository",
-            "authority",
-        ]);
-        assert_eq!(view.rows[0].cells.iter().map(|cell| cell.text.as_str()).collect::<Vec<_>>(), vec![
-            "kiwi",
-            "/work/widgets-api",
-            "feature/scoped-tabs",
-            "widgets-api",
-            "observed",
-        ]);
+        assert_eq!(
+            view.columns.iter().map(|column| column.id).collect::<Vec<_>>(),
+            vec!["host", "path", "branch", "repository", "authority",]
+        );
+        assert_eq!(
+            view.rows[0].cells.iter().map(|cell| cell.text.as_str()).collect::<Vec<_>>(),
+            vec!["kiwi", "/work/widgets-api", "feature/scoped-tabs", "widgets-api", "observed",]
+        );
         assert!(view.rows[0].actions.is_empty());
     }
 
@@ -2180,11 +2186,14 @@ mod tests {
         let query = QueryId::Checkouts { scope: None };
         let state = ResultSetState::default();
         let rows = [first, second];
-        let view = project(&ViewAddress::Checkouts { scope: None }, &TableRows {
-            checkout_results: vec![QueryRows { query: &query, rows: &rows, state: &state }],
-            host_home_dirs: HashMap::from([(host, Path::new("/home/dev"))]),
-            ..TableRows::default()
-        })
+        let view = project(
+            &ViewAddress::Checkouts { scope: None },
+            &TableRows {
+                checkout_results: vec![QueryRows { query: &query, rows: &rows, state: &state }],
+                host_home_dirs: HashMap::from([(host, Path::new("/home/dev"))]),
+                ..TableRows::default()
+            },
+        )
         .expect("checkout table");
 
         assert_eq!(view.rows[0].cells[0].text, "kiwi");

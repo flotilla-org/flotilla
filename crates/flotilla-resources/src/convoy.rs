@@ -2586,23 +2586,26 @@ mod subject_tests {
         let other = ConvoyAttention { source: "settlement".into(), reason: "keep this".into(), raised_at: start };
         let mut status = ConvoyStatus::default();
         for source in ["first", "second"] {
-            status.turn_deliveries.insert(source.into(), TurnDeliveryStatus {
-                episodes: vec![TurnDeliveryEpisode {
-                    subject_revision: "head".into(),
-                    evidence_at: start,
-                    judged_claim_at: start,
-                    outcome: TurnDeliveryOutcome::Queued {
-                        rung: TurnDeliveryRung::WarmSession,
-                        queued_at: start,
-                        vessel: "work".into(),
-                        role: "coder".into(),
-                        message_id: source.into(),
-                        blocking_reason: "Pending".into(),
-                    },
-                    sender: Default::default(),
-                }],
-                ..Default::default()
-            });
+            status.turn_deliveries.insert(
+                source.into(),
+                TurnDeliveryStatus {
+                    episodes: vec![TurnDeliveryEpisode {
+                        subject_revision: "head".into(),
+                        evidence_at: start,
+                        judged_claim_at: start,
+                        outcome: TurnDeliveryOutcome::Queued {
+                            rung: TurnDeliveryRung::WarmSession,
+                            queued_at: start,
+                            vessel: "work".into(),
+                            role: "coder".into(),
+                            message_id: source.into(),
+                            blocking_reason: "Pending".into(),
+                        },
+                        sender: Default::default(),
+                    }],
+                    ..Default::default()
+                },
+            );
         }
         status.attention = unrelated.then_some(other.clone());
         for age in [-1, 299, 300, 301] {
@@ -2984,22 +2987,25 @@ mod subject_tests {
         };
         let mut status = ConvoyStatus {
             attention: Some(old_attention.clone()),
-            turn_deliveries: BTreeMap::from([("turn-1".to_string(), TurnDeliveryStatus {
-                pending_supervisor_turn: Some(PendingSupervisorTurn {
-                    queued_order: 0,
-                    vessel: "govern".to_string(),
-                    role: "governor".to_string(),
-                    message: TerminalCrewMessage {
-                        id: "turn-1".to_string(),
-                        text: "Supervise".to_string(),
-                        sender: CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
-                        delivery: CrewMessageDelivery::Queued,
-                        acknowledged: Default::default(),
-                        following: Vec::new(),
-                    },
-                }),
-                ..Default::default()
-            })]),
+            turn_deliveries: BTreeMap::from([(
+                "turn-1".to_string(),
+                TurnDeliveryStatus {
+                    pending_supervisor_turn: Some(PendingSupervisorTurn {
+                        queued_order: 0,
+                        vessel: "govern".to_string(),
+                        role: "governor".to_string(),
+                        message: TerminalCrewMessage {
+                            id: "turn-1".to_string(),
+                            text: "Supervise".to_string(),
+                            sender: CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
+                            delivery: CrewMessageDelivery::Queued,
+                            acknowledged: Default::default(),
+                            following: Vec::new(),
+                        },
+                    }),
+                    ..Default::default()
+                },
+            )]),
             ..Default::default()
         };
         ConvoyStatusPatch::AcknowledgeSupervisorTurn { message_id: "turn-1".to_string() }.apply(&mut status);

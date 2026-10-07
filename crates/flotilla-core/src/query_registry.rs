@@ -432,11 +432,16 @@ mod tests {
         let registry = QueryRegistry::default();
         let query = issues("paged");
         registry.replace(Uuid::new_v4(), &[cursor(query.clone())]);
-        registry.replace_issues(&query, registry.generation(&query), vec![], ResultSetState {
-            demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: true }),
-            conditions: vec![],
-            truncated: false,
-        });
+        registry.replace_issues(
+            &query,
+            registry.generation(&query),
+            vec![],
+            ResultSetState {
+                demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: true }),
+                conditions: vec![],
+                truncated: false,
+            },
+        );
         let mut intents = registry.subscribe_fetch_more();
 
         registry.request_fetch_more(&query).expect("live paged query accepts fetch-more");
@@ -452,11 +457,16 @@ mod tests {
         let mut intents = registry.subscribe_fetch_more();
         registry.replace(subscriber, &[cursor(query.clone())]);
         let first_generation = registry.generation(&query);
-        registry.replace_issues(&query, first_generation, vec![], ResultSetState {
-            demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: true }),
-            conditions: vec![],
-            truncated: false,
-        });
+        registry.replace_issues(
+            &query,
+            first_generation,
+            vec![],
+            ResultSetState {
+                demand: Some(DemandBackedMetadata { as_of: Utc::now(), has_more: true }),
+                conditions: vec![],
+                truncated: false,
+            },
+        );
         registry.request_fetch_more(&query).expect("first lifetime accepts fetch-more");
 
         registry.remove(subscriber);

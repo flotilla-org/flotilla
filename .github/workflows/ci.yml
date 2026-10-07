@@ -28,8 +28,7 @@ jobs:
         id: rust-pin
         uses: ./ci/toolchain/action
         with:
-          components: ''
-      # Formatting remains on the explicitly installed temporary nightly.
+          components: rustfmt
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -40,12 +39,10 @@ jobs:
           python -m pip install -r ci/git-boundary/requirements.txt
           python -m unittest discover -s ci/git-boundary -p test_check.py
           python ci/git-boundary/check.py
-      - name: Install temporary nightly formatter
-        run: rustup toolchain install nightly-2026-03-12 --profile minimal --component rustfmt
       - name: Test Rust compiler pin contract
         run: ci/toolchain/test-pin.sh
       - name: Check Rust formatting
-        run: cargo +nightly-2026-03-12 fmt --check
+        run: cargo fmt --check
 
   script-contracts:
     name: Script contracts

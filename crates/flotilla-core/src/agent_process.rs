@@ -343,12 +343,15 @@ mod tests {
         let count = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(513));
         let values = (0..count)
             .map(|index| {
-                (PathBuf::from(format!("/checkout-{index}/{}", exit_receipt(&index.to_string()))), match index % 4 {
-                    0 => None,
-                    1 => Some(0),
-                    2 => Some(42),
-                    _ => Some(130),
-                })
+                (
+                    PathBuf::from(format!("/checkout-{index}/{}", exit_receipt(&index.to_string()))),
+                    match index % 4 {
+                        0 => None,
+                        1 => Some(0),
+                        2 => Some(42),
+                        _ => Some(130),
+                    },
+                )
             })
             .collect::<BTreeMap<_, _>>();
         let runner = MemoryReceiptRunner { values: values.clone(), calls: AtomicUsize::new(0) };

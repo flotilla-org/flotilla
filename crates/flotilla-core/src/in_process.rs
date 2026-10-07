@@ -2818,11 +2818,15 @@ impl InProcessDaemon {
                 )
                 .collect::<BTreeSet<_>>();
             if !relationships.is_empty() {
-                apply_resource_status_patch(&convoys, &convoy.metadata.name, &ConvoyStatusPatch::DiscoverSubjects {
-                    subjects: relationships.into_iter().map(|relationship| (subject.clone(), relationship)).collect(),
-                    source: flotilla_resources::SubjectDiscoverySource::Relay,
-                    at: self.clock.now(),
-                })
+                apply_resource_status_patch(
+                    &convoys,
+                    &convoy.metadata.name,
+                    &ConvoyStatusPatch::DiscoverSubjects {
+                        subjects: relationships.into_iter().map(|relationship| (subject.clone(), relationship)).collect(),
+                        source: flotilla_resources::SubjectDiscoverySource::Relay,
+                        at: self.clock.now(),
+                    },
+                )
                 .await
                 .map_err(|error| error.to_string())?;
             }
@@ -2942,9 +2946,11 @@ impl InProcessDaemon {
                 )
                 .await
             };
-            apply_resource_status_patch(&checkouts, &checkout.metadata.name, &flotilla_resources::CheckoutStatusPatch::UpdateIntegration {
-                integration: Box::new(integration),
-            })
+            apply_resource_status_patch(
+                &checkouts,
+                &checkout.metadata.name,
+                &flotilla_resources::CheckoutStatusPatch::UpdateIntegration { integration: Box::new(integration) },
+            )
             .await
             .map_err(|error| error.to_string())?;
         }
@@ -3668,11 +3674,15 @@ impl InProcessDaemon {
             }
         }
         if !subjects.is_empty() {
-            apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::DiscoverSubjects {
-                subjects,
-                source: flotilla_resources::SubjectDiscoverySource::Branch,
-                at: self.clock.now(),
-            })
+            apply_resource_status_patch(
+                &convoys,
+                convoy_name,
+                &ConvoyStatusPatch::DiscoverSubjects {
+                    subjects,
+                    source: flotilla_resources::SubjectDiscoverySource::Branch,
+                    at: self.clock.now(),
+                },
+            )
             .await
             .map_err(|error| error.to_string())?;
         }
@@ -3688,9 +3698,11 @@ impl InProcessDaemon {
         }
         if let Some(error) = errors.into_iter().next() {
             if convoy.status.as_ref().and_then(|status| status.branch_subject_scan_error.as_deref()) != Some(error.as_str()) {
-                apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::RecordBranchSubjectScanFailure {
-                    error: error.clone(),
-                })
+                apply_resource_status_patch(
+                    &convoys,
+                    convoy_name,
+                    &ConvoyStatusPatch::RecordBranchSubjectScanFailure { error: error.clone() },
+                )
                 .await
                 .map_err(|patch_error| patch_error.to_string())?;
             }
@@ -3750,11 +3762,15 @@ impl InProcessDaemon {
             {
                 return Err(format!("change request `{reference}` is outside this convoy's repositories"));
             }
-            apply_resource_status_patch(&convoys, convoy_name, &ConvoyStatusPatch::DiscoverSubjects {
-                subjects: vec![(subject, relationship)],
-                source: flotilla_resources::SubjectDiscoverySource::Operator,
-                at: self.clock.now(),
-            })
+            apply_resource_status_patch(
+                &convoys,
+                convoy_name,
+                &ConvoyStatusPatch::DiscoverSubjects {
+                    subjects: vec![(subject, relationship)],
+                    source: flotilla_resources::SubjectDiscoverySource::Operator,
+                    at: self.clock.now(),
+                },
+            )
             .await
             .map_err(|error| error.to_string())?;
         } else {
@@ -3841,13 +3857,10 @@ impl InProcessDaemon {
             }
             repos.insert(
                 identity.clone(),
-                RepoState::new(identity.clone(), RepoRootState {
-                    path: synthetic_path.clone(),
-                    model,
-                    slug: None,
-                    unmet: Vec::new(),
-                    is_local: false,
-                }),
+                RepoState::new(
+                    identity.clone(),
+                    RepoRootState { path: synthetic_path.clone(), model, slug: None, unmet: Vec::new(), is_local: false },
+                ),
             );
             order.push(identity.clone());
         }
@@ -5235,13 +5248,10 @@ impl InProcessDaemon {
                     let repository = source.object;
                     let reference = repository.metadata.name;
                     let name = repository.spec.leaf_slug();
-                    items.insert((String::new(), reference.clone()), CliListRow {
-                        repo: Some(name.clone()),
-                        reference,
-                        name,
-                        status: "declared".into(),
-                        provider: None,
-                    });
+                    items.insert(
+                        (String::new(), reference.clone()),
+                        CliListRow { repo: Some(name.clone()), reference, name, status: "declared".into(), provider: None },
+                    );
                 }
             }
             CliListKind::Checkout => {
@@ -5301,13 +5311,16 @@ impl InProcessDaemon {
                         _ => continue,
                     };
                     let reference = change_request.metadata.name;
-                    items.insert((String::new(), reference.clone()), CliListRow {
-                        repo: Some(change_request.spec.scope),
-                        reference,
-                        name: status.title.value.unwrap_or_else(|| format!("#{}", change_request.spec.number)),
-                        status: state.into(),
-                        provider: Some(change_request.spec.service),
-                    });
+                    items.insert(
+                        (String::new(), reference.clone()),
+                        CliListRow {
+                            repo: Some(change_request.spec.scope),
+                            reference,
+                            name: status.title.value.unwrap_or_else(|| format!("#{}", change_request.spec.number)),
+                            status: state.into(),
+                            provider: Some(change_request.spec.service),
+                        },
+                    );
                 }
             }
             CliListKind::Agent | CliListKind::Workspace => return self.list_provider_cli_items(kind).await,
@@ -6100,10 +6113,14 @@ impl InProcessDaemon {
         {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
             let result = request_manifest_resolution(&self.resource_backend, namespace, kind, name, *resolution, requested_by).await;
-            self.finish_context_free_command(id, empty_identity, match result {
-                Ok(root) => CommandValue::ResourceObject(Box::new(root)),
-                Err(error) => CommandValue::Error { message: error },
-            });
+            self.finish_context_free_command(
+                id,
+                empty_identity,
+                match result {
+                    Ok(root) => CommandValue::ResourceObject(Box::new(root)),
+                    Err(error) => CommandValue::Error { message: error },
+                },
+            );
             return Ok(id);
         }
         Err("ResourceManifestResolve action selected the wrong handler".to_string())
@@ -6719,9 +6736,13 @@ impl InProcessDaemon {
                 dispatching_principal_ref.clone().unwrap_or_else(|| PrincipalRef::implicit_for_namespace(&acting_namespace));
             let key = ConvoyStartKey::new(namespace, &intent);
             if !self.convoy_admission.mark_pending(key.clone()).await {
-                self.finish_context_free_command(id, empty_identity, flotilla_protocol::CommandValue::Error {
-                    message: format!("convoy start for project {} is already in progress", intent.project_ref),
-                });
+                self.finish_context_free_command(
+                    id,
+                    empty_identity,
+                    flotilla_protocol::CommandValue::Error {
+                        message: format!("convoy start for project {} is already in progress", intent.project_ref),
+                    },
+                );
                 return Ok(id);
             }
             let task = ConvoyStartTask::builder()
@@ -6736,9 +6757,11 @@ impl InProcessDaemon {
                 });
             } else {
                 self.convoy_admission.clear_pending(&key).await;
-                self.finish_context_free_command(id, empty_identity, flotilla_protocol::CommandValue::Error {
-                    message: "convoy start worker is unavailable".to_string(),
-                });
+                self.finish_context_free_command(
+                    id,
+                    empty_identity,
+                    flotilla_protocol::CommandValue::Error { message: "convoy start worker is unavailable".to_string() },
+                );
             }
             return Ok(id);
         }
@@ -8184,11 +8207,14 @@ async fn request_manifest_resolution(
     for _ in 0..3 {
         let existing = roots.get(&root_name).await.map_err(|error| error.to_string())?;
         let mut spec = existing.spec;
-        spec.resolutions.insert(key.clone(), Resolution {
-            action,
-            token: uuid::Uuid::new_v4().to_string(),
-            requested_by: if requested_by.is_empty() { "unknown".to_string() } else { requested_by.to_string() },
-        });
+        spec.resolutions.insert(
+            key.clone(),
+            Resolution {
+                action,
+                token: uuid::Uuid::new_v4().to_string(),
+                requested_by: if requested_by.is_empty() { "unknown".to_string() } else { requested_by.to_string() },
+            },
+        );
         match roots.update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &spec).await {
             Ok(updated) => {
                 return Ok(ResourceJsonResponse {

@@ -404,11 +404,14 @@ impl PeerManager {
 
     fn install_direct_route(&mut self, host: &NodeId, generation: u64) {
         let learned_epoch = self.next_route_epoch();
-        self.routes.insert(host.clone(), RouteState {
-            primary: RouteHop { next_hop: host.clone(), next_hop_generation: generation, learned_epoch },
-            fallbacks: Vec::new(),
-            candidates: Vec::new(),
-        });
+        self.routes.insert(
+            host.clone(),
+            RouteState {
+                primary: RouteHop { next_hop: host.clone(), next_hop_generation: generation, learned_epoch },
+                fallbacks: Vec::new(),
+                candidates: Vec::new(),
+            },
+        );
     }
 
     fn route_hop_is_live(&self, hop: &RouteHop) -> bool {
@@ -633,11 +636,8 @@ impl PeerManager {
                     target_node_id: target_node_id.clone(),
                 };
                 let learned_at = self.next_route_epoch();
-                self.command_reverse_paths.insert(key, ReversePathHop {
-                    next_hop: connection_peer,
-                    next_hop_generation: connection_generation,
-                    learned_at,
-                });
+                self.command_reverse_paths
+                    .insert(key, ReversePathHop { next_hop: connection_peer, next_hop_generation: connection_generation, learned_at });
 
                 let forwarded = RoutedPeerMessage::CommandRequest {
                     request_id,
@@ -676,11 +676,8 @@ impl PeerManager {
                     target_node_id: target_node_id.clone(),
                 };
                 let learned_at = self.next_route_epoch();
-                self.command_reverse_paths.insert(key, ReversePathHop {
-                    next_hop: connection_peer,
-                    next_hop_generation: connection_generation,
-                    learned_at,
-                });
+                self.command_reverse_paths
+                    .insert(key, ReversePathHop { next_hop: connection_peer, next_hop_generation: connection_generation, learned_at });
 
                 let forwarded = RoutedPeerMessage::CommandCancelRequest {
                     cancel_id,
@@ -840,11 +837,8 @@ impl PeerManager {
                     target_node_id: target_node_id.clone(),
                 };
                 let learned_at = self.next_route_epoch();
-                self.command_reverse_paths.insert(key, ReversePathHop {
-                    next_hop: connection_peer,
-                    next_hop_generation: connection_generation,
-                    learned_at,
-                });
+                self.command_reverse_paths
+                    .insert(key, ReversePathHop { next_hop: connection_peer, next_hop_generation: connection_generation, learned_at });
 
                 let forwarded = RoutedPeerMessage::RemoteStepRequest {
                     request_id,
@@ -981,11 +975,8 @@ impl PeerManager {
                     target_node_id: target_node_id.clone(),
                 };
                 let learned_at = self.next_route_epoch();
-                self.command_reverse_paths.insert(key, ReversePathHop {
-                    next_hop: connection_peer,
-                    next_hop_generation: connection_generation,
-                    learned_at,
-                });
+                self.command_reverse_paths
+                    .insert(key, ReversePathHop { next_hop: connection_peer, next_hop_generation: connection_generation, learned_at });
 
                 let forwarded = RoutedPeerMessage::RemoteStepCancelRequest {
                     cancel_id,

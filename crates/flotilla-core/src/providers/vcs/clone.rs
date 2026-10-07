@@ -597,10 +597,21 @@ mod tests {
             } else {
                 vcs.list_checkouts().await.expect("list clones").into_iter().map(EnumeratedCheckout::from).collect()
             };
-            assert_eq!(checkouts, vec![
-                EnumeratedCheckout { path: ExecutionEnvironmentPath::new("/workspace/feat-a"), git_ref: "feat/a".into(), is_main: false },
-                EnumeratedCheckout { path: ExecutionEnvironmentPath::new("/workspace/feat-b"), git_ref: "feat/b".into(), is_main: false },
-            ]);
+            assert_eq!(
+                checkouts,
+                vec![
+                    EnumeratedCheckout {
+                        path: ExecutionEnvironmentPath::new("/workspace/feat-a"),
+                        git_ref: "feat/a".into(),
+                        is_main: false
+                    },
+                    EnumeratedCheckout {
+                        path: ExecutionEnvironmentPath::new("/workspace/feat-b"),
+                        git_ref: "feat/b".into(),
+                        is_main: false
+                    },
+                ]
+            );
             assert_eq!(runner.calls().len(), 6, "listing, root probes, and branch queries only");
         }
     }

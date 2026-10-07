@@ -640,10 +640,13 @@ mod tests {
             .await
             .expect("label-filtered issue query should succeed");
 
-        assert_eq!(api.requests(), vec![(
-            "repos/owner/repo/issues?state=open&sort=updated&direction=desc&per_page=10&page=2&labels=ready%20now".into(),
-            PathBuf::from("/neutral"),
-        )]);
+        assert_eq!(
+            api.requests(),
+            vec![(
+                "repos/owner/repo/issues?state=open&sort=updated&direction=desc&per_page=10&page=2&labels=ready%20now".into(),
+                PathBuf::from("/neutral"),
+            )]
+        );
     }
 
     #[tokio::test]
@@ -668,10 +671,10 @@ mod tests {
 
         provider.open_in_browser(&IssueRef { source: source(), id: "42".into() }).await.expect("open-in-browser should succeed");
 
-        assert_eq!(runner.calls(), vec![(
-            "gh".into(),
-            vec!["issue", "view", "42", "--repo", "owner/repo", "--web"].into_iter().map(str::to_string).collect()
-        )]);
+        assert_eq!(
+            runner.calls(),
+            vec![("gh".into(), vec!["issue", "view", "42", "--repo", "owner/repo", "--web"].into_iter().map(str::to_string).collect())]
+        );
     }
 
     #[tokio::test]

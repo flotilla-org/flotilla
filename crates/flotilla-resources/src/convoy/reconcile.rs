@@ -1040,10 +1040,11 @@ impl Reconciler for ConvoyReconciler {
         if !obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
             let prior = obj.status.as_ref().and_then(|status| status.stalled.as_ref());
             if let Some(evidence) = &prepared.capacity_wait {
-                let retry = ControllerRetry::retryable(None, now, RetryBackoff {
-                    initial: std::time::Duration::from_secs(30),
-                    maximum: std::time::Duration::from_secs(30),
-                });
+                let retry = ControllerRetry::retryable(
+                    None,
+                    now,
+                    RetryBackoff { initial: std::time::Duration::from_secs(30), maximum: std::time::Duration::from_secs(30) },
+                );
                 let condition = StalledCondition {
                     leaves: Vec::new(),
                     maker: Some(LeafMaker::Controller {
@@ -1291,11 +1292,15 @@ fn reconcile_internal(
     }
 
     if status.phase.is_terminal() {
-        return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, InternalReconcileOutcome {
-            patch: None,
-            actuations: Vec::new(),
-            events: Vec::new(),
-        });
+        return with_cleanup(
+            convoy,
+            &status,
+            vessels,
+            presentations,
+            checkouts,
+            conditions.reclaim_eligible,
+            InternalReconcileOutcome { patch: None, actuations: Vec::new(), events: Vec::new() },
+        );
     }
 
     if let Some(observed) = status.observed_workflow_ref.as_ref() {
@@ -1338,27 +1343,39 @@ fn reconcile_internal(
     }
 
     if let Some(outcome) = roll_up_crew_work_outcome(convoy, &status, vessels, now) {
-        return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, InternalReconcileOutcome {
-            patch: outcome.patch,
-            actuations: provisioning.actuations,
-            events: outcome.events,
-        });
+        return with_cleanup(
+            convoy,
+            &status,
+            vessels,
+            presentations,
+            checkouts,
+            conditions.reclaim_eligible,
+            InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events },
+        );
     }
 
     if let Some(outcome) = advance_ready_outcome(&status, now) {
-        return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, InternalReconcileOutcome {
-            patch: outcome.patch,
-            actuations: provisioning.actuations,
-            events: outcome.events,
-        });
+        return with_cleanup(
+            convoy,
+            &status,
+            vessels,
+            presentations,
+            checkouts,
+            conditions.reclaim_eligible,
+            InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events },
+        );
     }
 
     if let Some(outcome) = roll_up_phase_outcome(convoy, &status, checkouts, conditions.exit_disposition.as_deref(), now) {
-        return with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, InternalReconcileOutcome {
-            patch: outcome.patch,
-            actuations: provisioning.actuations,
-            events: outcome.events,
-        });
+        return with_cleanup(
+            convoy,
+            &status,
+            vessels,
+            presentations,
+            checkouts,
+            conditions.reclaim_eligible,
+            InternalReconcileOutcome { patch: outcome.patch, actuations: provisioning.actuations, events: outcome.events },
+        );
     }
 
     with_cleanup(convoy, &status, vessels, presentations, checkouts, conditions.reclaim_eligible, provisioning)
@@ -1429,16 +1446,19 @@ fn bootstrap_outcome(
         .vessels
         .iter()
         .map(|vessel| {
-            (vessel.name.clone(), WorkState {
-                provisioning_retry: None,
-                phase: WorkPhase::Pending,
-                completion_authority: WorkCompletionAuthority::CrewRollup,
-                ready_at: None,
-                started_at: None,
-                finished_at: None,
-                message: None,
-                placement: None,
-            })
+            (
+                vessel.name.clone(),
+                WorkState {
+                    provisioning_retry: None,
+                    phase: WorkPhase::Pending,
+                    completion_authority: WorkCompletionAuthority::CrewRollup,
+                    ready_at: None,
+                    started_at: None,
+                    finished_at: None,
+                    message: None,
+                    placement: None,
+                },
+            )
         })
         .collect();
     let crew_work = template

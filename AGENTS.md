@@ -25,5 +25,5 @@ The TUI needs a real terminal (TTY). Use `cargo run` inside a terminal emulator,
 ## General
 
 - `cargo build` without `--locked` may update `Cargo.lock`; use `--locked` for reproducible builds.
-- Formatting follows `cargo +nightly-2026-03-12 fmt`; `cargo fmt` on stable may not match.
+- Formatting follows `cargo fmt` using the stable pin in `rust-toolchain.toml`.
 - If you say a change matches CI locally, it should have been checked against the exact commands in `CLAUDE.md` rather than close approximations.

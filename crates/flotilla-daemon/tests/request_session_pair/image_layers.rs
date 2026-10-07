@@ -114,10 +114,13 @@ async fn layered_baseline_routing_row(issuer: usize, satisfiable: bool, build: b
     }
     backend
         .definitions::<CrewImageBaseline>("flotilla")
-        .apply(&InputMeta::builder().name("fleet-crew".into()).build(), &CrewImageBaselineSpec {
-            image: "crew:authoritative".into(),
-            layers: Some(ImageLayerSelection::builder().base("base".into()).harness("harness".into()).build()),
-        })
+        .apply(
+            &InputMeta::builder().name("fleet-crew".into()).build(),
+            &CrewImageBaselineSpec {
+                image: "crew:authoritative".into(),
+                layers: Some(ImageLayerSelection::builder().base("base".into()).harness("harness".into()).build()),
+            },
+        )
         .await
         .expect("baseline alongside layers");
     for host in &hosts {

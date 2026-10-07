@@ -1812,13 +1812,17 @@ async fn replicated_declared_and_discovered_subjects_publish_the_same_multi_repo
     .await;
     let issue_record = author
         .using::<Issue>("flotilla")
-        .update_status("issue", &issue_record.metadata.resource_version, &IssueStatus {
-            title: Observation::known("Make it work".into(), now),
-            assignees: Observation::known(vec!["alice".into()], now),
-            state: Observation::known(ObservedIssueState::Open, now),
-            labels: Observation::known(vec!["ready".into()], now),
-            updated_at: Observation::known(now, now),
-        })
+        .update_status(
+            "issue",
+            &issue_record.metadata.resource_version,
+            &IssueStatus {
+                title: Observation::known("Make it work".into(), now),
+                assignees: Observation::known(vec!["alice".into()], now),
+                state: Observation::known(ObservedIssueState::Open, now),
+                labels: Observation::known(vec!["ready".into()], now),
+                updated_at: Observation::known(now, now),
+            },
+        )
         .await
         .expect("observe issue");
     replica
@@ -1961,11 +1965,10 @@ fn subject_project_is_unambiguous(tc: hegel::TestCase) {
     let count = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
     let with_role = tc.draw(gs::booleans());
     let source = IssueSource { service: "github".into(), scope: "org/repo".into() };
-    let subjects = [Subject { kind: SubjectKind::ChangeRequest, source: source.clone(), id: "42".into() }, Subject {
-        kind: SubjectKind::Issue,
-        source: source.clone(),
-        id: "42".into(),
-    }];
+    let subjects = [
+        Subject { kind: SubjectKind::ChangeRequest, source: source.clone(), id: "42".into() },
+        Subject { kind: SubjectKind::Issue, source: source.clone(), id: "42".into() },
+    ];
     let backend = ResourceBackend::InMemory(InMemoryBackend::default());
     let runtime = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
     let observations = runtime.block_on(async {
@@ -2364,11 +2367,10 @@ fn builtin_github_forge_resolves_subjects(tc: hegel::TestCase) {
             }
         });
         let source = IssueSource { service: "github.com".into(), scope: "org/repo".into() };
-        let subjects = [Subject { kind: SubjectKind::ChangeRequest, source: source.clone(), id: number.to_string() }, Subject {
-            kind: SubjectKind::Issue,
-            source,
-            id: number.to_string(),
-        }];
+        let subjects = [
+            Subject { kind: SubjectKind::ChangeRequest, source: source.clone(), id: number.to_string() },
+            Subject { kind: SubjectKind::Issue, source, id: number.to_string() },
+        ];
         let mut convoy =
             ConvoyRow::builder().resource(convoy_ref("dev", "work")).name("work").workflow_ref("dev").phase(ConvoyPhase::Active).build();
         convoy.subjects = (0..count)

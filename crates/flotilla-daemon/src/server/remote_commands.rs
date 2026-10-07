@@ -1065,12 +1065,10 @@ impl RemoteStepExecutor for RemoteCommandRouter {
             pm.next_request_id()
         };
         let (tx, rx) = oneshot::channel();
-        self.pending_remote_step_batches.lock().await.insert(request_id, PendingRemoteStepBatch {
-            command_id: request.command_id,
-            progress_sink,
-            failed_message: None,
-            completion: tx,
-        });
+        self.pending_remote_step_batches.lock().await.insert(
+            request_id,
+            PendingRemoteStepBatch { command_id: request.command_id, progress_sink, failed_message: None, completion: tx },
+        );
         self.active_remote_step_batches
             .lock()
             .await
@@ -1462,16 +1460,19 @@ impl RoutedRemoteStepProgressSink {
         }
         let _ = self
             .router
-            .send_routed_to(&self.reply_via, RoutedPeerMessage::RemoteStepEvent {
-                request_id: self.request_id,
-                requester_node_id: self.requester_node_id.clone(),
-                responder_node_id: self.responder_node_id.clone(),
-                remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
-                batch_step_index,
-                batch_step_count,
-                description,
-                status,
-            })
+            .send_routed_to(
+                &self.reply_via,
+                RoutedPeerMessage::RemoteStepEvent {
+                    request_id: self.request_id,
+                    requester_node_id: self.requester_node_id.clone(),
+                    responder_node_id: self.responder_node_id.clone(),
+                    remaining_hops: PeerManager::DEFAULT_ROUTED_HOPS,
+                    batch_step_index,
+                    batch_step_count,
+                    description,
+                    status,
+                },
+            )
             .await;
     }
 

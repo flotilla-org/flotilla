@@ -628,19 +628,10 @@ mod tests {
         .await
         .expect("ensure sized session");
 
-        assert_eq!(logical_calls(&runner)[1].1, vec![
-            "launch",
-            "--env-clear",
-            "--json",
-            "--record",
-            "my-session",
-            "--cwd",
-            "/repo",
-            "--cmd",
-            "bash",
-            "--size",
-            "200x50",
-        ]);
+        assert_eq!(
+            logical_calls(&runner)[1].1,
+            vec!["launch", "--env-clear", "--json", "--record", "my-session", "--cwd", "/repo", "--cmd", "bash", "--size", "200x50",]
+        );
     }
 
     #[tokio::test]
@@ -676,28 +667,34 @@ mod tests {
         let runner = Arc::new(MockRunner::new(vec![Ok("[]".into()), Ok("{}".into())]));
         let pool = test_pool(Arc::clone(&runner) as Arc<dyn CommandRunner>, "cleat");
 
-        pool.ensure_session("terminal-demo-coder", "codex", &ExecutionEnvironmentPath::new("/repo"), &vec![], &[
-            TerminalSessionTag::new("convoy", "demo"),
-            TerminalSessionTag::new("vessel", "demo-work"),
-        ])
+        pool.ensure_session(
+            "terminal-demo-coder",
+            "codex",
+            &ExecutionEnvironmentPath::new("/repo"),
+            &vec![],
+            &[TerminalSessionTag::new("convoy", "demo"), TerminalSessionTag::new("vessel", "demo-work")],
+        )
         .await
         .expect("ensure tagged session");
 
-        assert_eq!(logical_calls(&runner)[1].1, vec![
-            "launch",
-            "--env-clear",
-            "--json",
-            "--record",
-            "terminal-demo-coder",
-            "--cwd",
-            "/repo",
-            "--cmd",
-            "codex",
-            "--tag",
-            "convoy=demo",
-            "--tag",
-            "vessel=demo-work",
-        ]);
+        assert_eq!(
+            logical_calls(&runner)[1].1,
+            vec![
+                "launch",
+                "--env-clear",
+                "--json",
+                "--record",
+                "terminal-demo-coder",
+                "--cwd",
+                "/repo",
+                "--cmd",
+                "codex",
+                "--tag",
+                "convoy=demo",
+                "--tag",
+                "vessel=demo-work",
+            ]
+        );
     }
 
     #[tokio::test]
@@ -767,12 +764,10 @@ mod tests {
         assert_eq!(calls[0].0, "cleat");
         assert_eq!(calls[0].1, vec!["send", "reviewer-session", "\x1b[200~Please review commit abc123\x1b[201~", "--no-enter"]);
         assert_eq!(calls[1].1, vec!["send-keys", "reviewer-session", "Enter"]);
-        assert_eq!(calls[2].1, vec![
-            "send",
-            "reviewer-session",
-            "\x1b[200~handoff from coder@work\n\nPlease review commit abc123\x1b[201~",
-            "--no-enter"
-        ]);
+        assert_eq!(
+            calls[2].1,
+            vec!["send", "reviewer-session", "\x1b[200~handoff from coder@work\n\nPlease review commit abc123\x1b[201~", "--no-enter"]
+        );
         assert_eq!(calls[3].1, vec!["send-keys", "reviewer-session", "Enter"]);
     }
 
@@ -783,12 +778,15 @@ mod tests {
         let pool = test_pool(Arc::new(MockRunner::new(vec![])), "cleat");
         let args = pool.attach_args("my-session", "bash", &ExecutionEnvironmentPath::new("/repo"), &vec![]).expect("attach_args");
 
-        assert_eq!(args, vec![
-            Arg::Literal("cleat".into()),
-            Arg::Literal("attach".into()),
-            Arg::Literal("--no-create".into()),
-            Arg::Literal("my-session".into()),
-        ]);
+        assert_eq!(
+            args,
+            vec![
+                Arg::Literal("cleat".into()),
+                Arg::Literal("attach".into()),
+                Arg::Literal("--no-create".into()),
+                Arg::Literal("my-session".into()),
+            ]
+        );
     }
 
     #[test]
@@ -858,12 +856,15 @@ mod tests {
         let args = pool.attach_args("sess-1", "", &ExecutionEnvironmentPath::new("/home/dev"), &vec![]).expect("attach_args");
 
         // Same structure regardless of command
-        assert_eq!(args, vec![
-            Arg::Literal("cleat".into()),
-            Arg::Literal("attach".into()),
-            Arg::Literal("--no-create".into()),
-            Arg::Literal("sess-1".into()),
-        ]);
+        assert_eq!(
+            args,
+            vec![
+                Arg::Literal("cleat".into()),
+                Arg::Literal("attach".into()),
+                Arg::Literal("--no-create".into()),
+                Arg::Literal("sess-1".into()),
+            ]
+        );
     }
 
     #[test]
@@ -873,12 +874,15 @@ mod tests {
         let args = pool.attach_args("sess", "cmd", &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
 
         // Env vars are baked in at ensure_session/launch time — not in attach_args
-        assert_eq!(args, vec![
-            Arg::Literal("cleat".into()),
-            Arg::Literal("attach".into()),
-            Arg::Literal("--no-create".into()),
-            Arg::Literal("sess".into()),
-        ]);
+        assert_eq!(
+            args,
+            vec![
+                Arg::Literal("cleat".into()),
+                Arg::Literal("attach".into()),
+                Arg::Literal("--no-create".into()),
+                Arg::Literal("sess".into()),
+            ]
+        );
     }
 
     #[test]
@@ -887,12 +891,15 @@ mod tests {
         let env = vec![("KEY".to_string(), "val".to_string())];
         let args = pool.attach_args("sess", "", &ExecutionEnvironmentPath::new("/wd"), &env).expect("attach_args");
 
-        assert_eq!(args, vec![
-            Arg::Literal("cleat".into()),
-            Arg::Literal("attach".into()),
-            Arg::Literal("--no-create".into()),
-            Arg::Literal("sess".into()),
-        ]);
+        assert_eq!(
+            args,
+            vec![
+                Arg::Literal("cleat".into()),
+                Arg::Literal("attach".into()),
+                Arg::Literal("--no-create".into()),
+                Arg::Literal("sess".into()),
+            ]
+        );
     }
 
     #[test]

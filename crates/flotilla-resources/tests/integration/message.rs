@@ -189,15 +189,19 @@ fn subject_supersession_follows_identity_and_expectation(tc: hegel::TestCase) {
             let first_spec = spec(subject, if open { MessageExpectation::Reply } else { MessageExpectation::None });
             inbox.accept(&InputMeta::builder().name("first".into()).build(), &first_spec, at(10)).await.expect("first");
             if delivered {
-                flotilla_resources::apply_status_patch(&resolver, "first", &MessageStatusPatch::Delivered {
-                    receiver: ResolvedMessageReceiver::builder()
-                        .crew_id("crew".into())
-                        .session("session".into())
-                        .delivered_at(at(20))
-                        .evidence("accepted".into())
-                        .build(),
-                    at: at(20),
-                })
+                flotilla_resources::apply_status_patch(
+                    &resolver,
+                    "first",
+                    &MessageStatusPatch::Delivered {
+                        receiver: ResolvedMessageReceiver::builder()
+                            .crew_id("crew".into())
+                            .session("session".into())
+                            .delivered_at(at(20))
+                            .evidence("accepted".into())
+                            .build(),
+                        at: at(20),
+                    },
+                )
                 .await
                 .expect("deliver first");
             }
@@ -398,10 +402,11 @@ async fn addresses_resolve_current_holders_after_replication() {
         .expect("holder declaration");
     let declaration = declarations.get(&declaration.metadata.name).await.expect("current declaration");
     declarations
-        .update_status("coder-holder", &declaration.metadata.resource_version, &flotilla_resources::ConvoyEnsureStatus {
-            convoy_ref: Some("next-convoy".into()),
-            ..Default::default()
-        })
+        .update_status(
+            "coder-holder",
+            &declaration.metadata.resource_version,
+            &flotilla_resources::ConvoyEnsureStatus { convoy_ref: Some("next-convoy".into()), ..Default::default() },
+        )
         .await
         .expect("declared current holder");
     let holder = resolve_message_receiver(&backend, "flotilla", "flotilla/coder").await.expect("project role").expect("holder");
@@ -482,15 +487,19 @@ async fn replay_of_suppressed_partial_admission_returns_canonical_predecessor() 
     next.subject = Some(subject.clone());
     next.references = vec![subject];
     messages.create(&InputMeta::builder().name("partial".into()).build(), &next).await.unwrap();
-    apply_status_patch(&messages, "first", &MessageStatusPatch::Delivered {
-        receiver: ResolvedMessageReceiver::builder()
-            .crew_id("crew".into())
-            .session("session".into())
-            .delivered_at(at(20))
-            .evidence("receipt".into())
-            .build(),
-        at: at(20),
-    })
+    apply_status_patch(
+        &messages,
+        "first",
+        &MessageStatusPatch::Delivered {
+            receiver: ResolvedMessageReceiver::builder()
+                .crew_id("crew".into())
+                .session("session".into())
+                .delivered_at(at(20))
+                .evidence("receipt".into())
+                .build(),
+            at: at(20),
+        },
+    )
     .await
     .unwrap();
     for now in [21, 22] {
@@ -498,11 +507,11 @@ async fn replay_of_suppressed_partial_admission_returns_canonical_predecessor() 
         let admission = restarted.accept(&InputMeta::builder().name("partial".into()).build(), &next, at(now)).await.unwrap();
         assert!(matches!(admission, MessageAdmission::Suppressed { predecessor } if predecessor.metadata.name == "first"));
     }
-    apply_status_patch(&messages, "first", &MessageStatusPatch::Finish {
-        phase: MessagePhase::Answered,
-        reason: "reply received".into(),
-        at: at(23),
-    })
+    apply_status_patch(
+        &messages,
+        "first",
+        &MessageStatusPatch::Finish { phase: MessagePhase::Answered, reason: "reply received".into(), at: at(23) },
+    )
     .await
     .unwrap();
     let admission = inbox.accept(&InputMeta::builder().name("partial".into()).build(), &next, at(24)).await.unwrap();
@@ -608,12 +617,16 @@ async fn delivery_inbox() -> (ResourceBackend, flotilla_resources::MessageInbox)
         .await
         .expect("holder");
     terminals
-        .update_status("terminal", &holder.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            session_id: Some("session".into()),
-            crew: Some(CrewSessionStatus { id: "crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
-            ..Default::default()
-        })
+        .update_status(
+            "terminal",
+            &holder.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                session_id: Some("session".into()),
+                crew: Some(CrewSessionStatus { id: "crew".into(), adapter: "codex".into(), model: None, stance: "work".into() }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("running");
     let inbox = MessageInbox::new(backend.clone(), "flotilla");
@@ -917,15 +930,19 @@ async fn deadlines_preserve_acceptance_and_unresolved_submission() {
         inbox.accept(&InputMeta::builder().name(name.into()).build(), &intent, at(10)).await.expect("admit Message fixture");
         inbox.reconcile_delivery(&transport, at(20)).await.expect("reconcile receiver delivery");
         if name != "uncertain" {
-            apply_status_patch(&messages, name, &MessageStatusPatch::Delivered {
-                receiver: ResolvedMessageReceiver::builder()
-                    .crew_id("crew".into())
-                    .session("session".into())
-                    .delivered_at(at(21))
-                    .evidence("later transport receipt".into())
-                    .build(),
-                at: at(21),
-            })
+            apply_status_patch(
+                &messages,
+                name,
+                &MessageStatusPatch::Delivered {
+                    receiver: ResolvedMessageReceiver::builder()
+                        .crew_id("crew".into())
+                        .session("session".into())
+                        .delivered_at(at(21))
+                        .evidence("later transport receipt".into())
+                        .build(),
+                    at: at(21),
+                },
+            )
             .await
             .expect("apply fixture status transition");
         }
@@ -1088,11 +1105,11 @@ async fn partial_receipt_recovery_keeps_terminal_members_closed() {
     apply_status_patch(&messages, "message-0", &MessageStatusPatch::Delivered { receiver: receipt.clone(), at: at(21) })
         .await
         .expect("apply fixture status transition");
-    apply_status_patch(&messages, "message-0", &MessageStatusPatch::Finish {
-        phase: MessagePhase::Satisfied,
-        reason: "notification accepted".into(),
-        at: at(21),
-    })
+    apply_status_patch(
+        &messages,
+        "message-0",
+        &MessageStatusPatch::Finish { phase: MessagePhase::Satisfied, reason: "notification accepted".into(), at: at(21) },
+    )
     .await
     .expect("apply fixture status transition");
     let settled = messages.get("message-0").await.expect("read Message fixture");
@@ -1117,15 +1134,19 @@ async fn explicit_supersession_replaces_open_expectations() {
         let messages = backend.using::<Message>("flotilla");
         let original = spec(None, expectation);
         inbox.accept(&InputMeta::builder().name("original".into()).build(), &original, at(10)).await.expect("original admission");
-        apply_status_patch(&messages, "original", &MessageStatusPatch::Delivered {
-            receiver: ResolvedMessageReceiver::builder()
-                .crew_id("crew".into())
-                .session("session".into())
-                .delivered_at(at(11))
-                .evidence("receipt".into())
-                .build(),
-            at: at(11),
-        })
+        apply_status_patch(
+            &messages,
+            "original",
+            &MessageStatusPatch::Delivered {
+                receiver: ResolvedMessageReceiver::builder()
+                    .crew_id("crew".into())
+                    .session("session".into())
+                    .delivered_at(at(11))
+                    .evidence("receipt".into())
+                    .build(),
+                at: at(11),
+            },
+        )
         .await
         .expect("original receipt");
         let mut replacement = original;
@@ -1254,10 +1275,11 @@ async fn project_role_expectations_accept_replies_from_the_recorded_qualified_cr
         .expect("standing declaration");
     let declaration = ensures.get("governor-holder").await.expect("local standing declaration status version");
     ensures
-        .update_status("governor-holder", &declaration.metadata.resource_version, &ConvoyEnsureStatus {
-            convoy_ref: Some("convoy".into()),
-            ..Default::default()
-        })
+        .update_status(
+            "governor-holder",
+            &declaration.metadata.resource_version,
+            &ConvoyEnsureStatus { convoy_ref: Some("convoy".into()), ..Default::default() },
+        )
         .await
         .expect("admitted standing holder");
     let mut request = spec(None, MessageExpectation::Reply);
@@ -1370,11 +1392,15 @@ async fn closed_batch_recovery_clears_only_its_existing_delivery_gate() {
     meta.name = "manual-review".into();
     demands.create(&meta, &manual).await.expect("unrelated operator gate");
     for member in ["message-0", "message-1", "message-2"] {
-        apply_status_patch(&backend.using::<Message>("flotilla"), member, &MessageStatusPatch::Finish {
-            phase: MessagePhase::DeadLettered,
-            reason: "operator closure persisted before process exit".into(),
-            at: at(321),
-        })
+        apply_status_patch(
+            &backend.using::<Message>("flotilla"),
+            member,
+            &MessageStatusPatch::Finish {
+                phase: MessagePhase::DeadLettered,
+                reason: "operator closure persisted before process exit".into(),
+                at: at(321),
+            },
+        )
         .await
         .expect("durable closure before crash");
     }

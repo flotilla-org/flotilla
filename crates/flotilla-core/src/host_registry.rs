@@ -45,13 +45,16 @@ pub(crate) struct HostRegistry {
 impl HostRegistry {
     pub(crate) fn new(local_node: NodeInfo, local_host_summary: HostSummary) -> Self {
         let mut hosts = HashMap::new();
-        hosts.insert(local_host_summary.environment_id.clone(), HostState {
-            node_id: local_node.node_id.clone(),
-            environment_id: local_host_summary.environment_id.clone(),
-            summary: Some(local_host_summary.clone()),
-            seq: 1,
-            removed: false,
-        });
+        hosts.insert(
+            local_host_summary.environment_id.clone(),
+            HostState {
+                node_id: local_node.node_id.clone(),
+                environment_id: local_host_summary.environment_id.clone(),
+                summary: Some(local_host_summary.clone()),
+                seq: 1,
+                removed: false,
+            },
+        );
         let mut node_connectivity = HashMap::new();
         node_connectivity.insert(local_node.node_id.clone(), PeerConnectionState::Connected);
         let mut node_environments = HashMap::new();
@@ -166,12 +169,12 @@ impl HostRegistry {
         }
         let summary = state.summary.clone();
 
-        let mut response = build_host_status(environment_id, state, summary, HostStatusContext {
-            local_node: &self.local_node,
-            configured: &configured,
-            node_connectivity: &node_connectivity,
-            counts,
-        });
+        let mut response = build_host_status(
+            environment_id,
+            state,
+            summary,
+            HostStatusContext { local_node: &self.local_node, configured: &configured, node_connectivity: &node_connectivity, counts },
+        );
         if let Some(details) = self.query_details.read().await.get(environment_id) {
             response.blob_sync = details.blob_sync.clone();
             if let Some(environments) = &details.visible_environments {

@@ -43,39 +43,48 @@ fn nested(arg: &Arg) -> &[Arg] {
 
 fn ssh_resolver() -> SshRemoteHopResolver {
     let hosts = HashMap::from([
-        ("udder".to_string(), RemoteHostConfig {
-            hostname: "udder.example".to_string(),
-            expected_host_name: "udder".to_string(),
-            expected_node_id: None,
-            user: Some("alice".to_string()),
-            ssh_multiplex: Some(false),
-            agentless_ssh: false,
-        }),
-        ("jump".to_string(), RemoteHostConfig {
-            hostname: "jump.example".to_string(),
-            expected_host_name: "jump".to_string(),
-            expected_node_id: None,
-            user: None,
-            ssh_multiplex: Some(false),
-            agentless_ssh: false,
-        }),
+        (
+            "udder".to_string(),
+            RemoteHostConfig {
+                hostname: "udder.example".to_string(),
+                expected_host_name: "udder".to_string(),
+                expected_node_id: None,
+                user: Some("alice".to_string()),
+                ssh_multiplex: Some(false),
+                agentless_ssh: false,
+            },
+        ),
+        (
+            "jump".to_string(),
+            RemoteHostConfig {
+                hostname: "jump.example".to_string(),
+                expected_host_name: "jump".to_string(),
+                expected_node_id: None,
+                user: None,
+                ssh_multiplex: Some(false),
+                agentless_ssh: false,
+            },
+        ),
     ]);
-    SshRemoteHopResolver::new(DaemonHostPath::new(std::env::temp_dir().join("flotilla-hop-chain-tests")), HostsConfig {
-        ssh: SshConfig { multiplex: false },
-        hosts,
-    })
+    SshRemoteHopResolver::new(
+        DaemonHostPath::new(std::env::temp_dir().join("flotilla-hop-chain-tests")),
+        HostsConfig { ssh: SshConfig { multiplex: false }, hosts },
+    )
 }
 
 #[test]
 fn one_hop_ssh_runs_recursive_attach_as_the_remote_command() {
     let args = ssh_resolver()
-        .one_hop_command_args(&HostName::new("jump"), vec![
-            Arg::Literal("flotilla".into()),
-            Arg::Literal("attach".into()),
-            Arg::Literal("--host".into()),
-            Arg::Quoted("udder".into()),
-            Arg::Quoted("governor".into()),
-        ])
+        .one_hop_command_args(
+            &HostName::new("jump"),
+            vec![
+                Arg::Literal("flotilla".into()),
+                Arg::Literal("attach".into()),
+                Arg::Literal("--host".into()),
+                Arg::Quoted("udder".into()),
+                Arg::Quoted("governor".into()),
+            ],
+        )
         .expect("known next hop");
 
     assert_eq!(args[0], Arg::Literal("ssh".into()));
@@ -83,13 +92,16 @@ fn one_hop_ssh_runs_recursive_attach_as_the_remote_command() {
     assert_eq!(args[2], Arg::Quoted("jump.example".into()));
     let login = nested(&args[3]);
     assert_eq!(login[..3], [Arg::Literal("${SHELL:-/bin/sh}".into()), Arg::Literal("-l".into()), Arg::Literal("-c".into())]);
-    assert_eq!(nested(&login[3]), [
-        Arg::Literal("flotilla".into()),
-        Arg::Literal("attach".into()),
-        Arg::Literal("--host".into()),
-        Arg::Quoted("udder".into()),
-        Arg::Quoted("governor".into()),
-    ]);
+    assert_eq!(
+        nested(&login[3]),
+        [
+            Arg::Literal("flotilla".into()),
+            Arg::Literal("attach".into()),
+            Arg::Literal("--host".into()),
+            Arg::Quoted("udder".into()),
+            Arg::Quoted("governor".into()),
+        ]
+    );
 }
 
 #[test]
@@ -143,15 +155,18 @@ fn docker_environment_wrap_supervises_and_reaps_the_exec_command() {
     assert!(wrapper.contains("FLOTILLA_ATTACH_LEASE=$lease"));
     assert!(wrapper.contains("kill -KILL \"$pid\""));
     assert!(wrapper.contains("sleep 5"));
-    assert_eq!(&args[3..], [
-        Arg::Literal("flotilla-docker-attach".into()),
-        Arg::Quoted("crew-container".into()),
-        Arg::Quoted("/work/crew".into()),
-        Arg::Quoted(super::environment::DOCKER_ATTACH_INNER_WRAPPER.into()),
-        Arg::Literal("cleat".into()),
-        Arg::Literal("attach".into()),
-        Arg::Quoted("session".into()),
-    ]);
+    assert_eq!(
+        &args[3..],
+        [
+            Arg::Literal("flotilla-docker-attach".into()),
+            Arg::Quoted("crew-container".into()),
+            Arg::Quoted("/work/crew".into()),
+            Arg::Quoted(super::environment::DOCKER_ATTACH_INNER_WRAPPER.into()),
+            Arg::Literal("cleat".into()),
+            Arg::Literal("attach".into()),
+            Arg::Quoted("session".into()),
+        ]
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -416,9 +431,10 @@ fn missing_environment_adapter_names_the_environment() {
         Arc::new(NoopEnvironmentHopResolver),
         Arc::new(NoopTerminalHopResolver),
     );
-    let plan = HopPlan(vec![Hop::EnterEnvironment { env_id: EnvironmentId::new("missing"), provider: "docker".into() }, Hop::RunCommand {
-        command: vec![Arg::Literal("true".into())],
-    }]);
+    let plan = HopPlan(vec![
+        Hop::EnterEnvironment { env_id: EnvironmentId::new("missing"), provider: "docker".into() },
+        Hop::RunCommand { command: vec![Arg::Literal("true".into())] },
+    ]);
 
     let error = resolver.resolve(&plan, &mut context()).expect_err("missing adapter should fail");
 

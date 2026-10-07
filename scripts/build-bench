@@ -19,6 +19,13 @@ def output(command, cwd=None):
     return subprocess.check_output(command, cwd=cwd, text=True).strip()
 
 
+def benchmark_toolchain(root, override):
+    if override:
+        return override
+    return output(['sh', '-c', '. "$1"; read_rust_pin "$2"', 'build-bench',
+                   str(root / 'ci/toolchain/pin.sh'), str(root / 'rust-toolchain.toml')])
+
+
 def size(path):
     return int(output(['du', '-s', '-B1', str(path)]).split()[0]) if path.exists() else 0
 
@@ -203,7 +210,7 @@ def main():
     parser.add_argument('--jobs', type=int, help='uniform Cargo job count, overriding every variant')
     parser.add_argument('--reuse-prime', action='store_true', help='reuse private targets across sequential scenarios in each pair')
     parser.add_argument('--scenarios', nargs='+', choices=['cold', 'leaf-edit', 'core-edit', 'crew-cycle', 'primed', 'test-runtime'], default=['cold', 'leaf-edit', 'core-edit', 'crew-cycle', 'primed', 'test-runtime'])
-    parser.add_argument('--toolchain', default='nightly-2026-03-12')
+    parser.add_argument('--toolchain', help='override the repository stable compiler pin')
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
     names = args.variants or list(config['variants'])
@@ -217,6 +224,7 @@ def main():
     if len(set(args.scenarios)) != len(args.scenarios) or ('cold' in args.scenarios and args.scenarios[0] != 'cold'):
         parser.error('scenarios must be unique and cold must come first')
     root = Path(output(['git', 'rev-parse', '--show-toplevel']))
+    args.toolchain = benchmark_toolchain(root, args.toolchain)
     allowed = sorted(os.sched_getaffinity(0))
     if args.cpus > len(allowed):
         parser.error('--cpus exceeds available affinity')

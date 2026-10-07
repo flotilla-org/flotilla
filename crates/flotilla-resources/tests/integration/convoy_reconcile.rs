@@ -86,20 +86,23 @@ fn crew_completion_conditions_are_role_scoped_and_require_a_ready_pr(tc: hegel::
     let mut change_requests = BTreeMap::new();
     let ledger = |role: &str| {
         let name = flotilla_resources::artifact_record_name("completion", role, "decision-ledger", "completion");
-        (name.clone(), flotilla_resources::ResourceObject::<flotilla_resources::Artifact> {
-            metadata: common::object_meta(&name, "flotilla", "1"),
-            spec: flotilla_resources::ArtifactSpec::builder()
-                .convoy("completion".to_string())
-                .producer(role.to_string())
-                .kind("decision-ledger".to_string())
-                .subject("completion".to_string())
-                .digest("sha256:test".to_string())
-                .size(1)
-                .media_type("text/markdown".to_string())
-                .expires_at(now)
-                .build(),
-            status: None,
-        })
+        (
+            name.clone(),
+            flotilla_resources::ResourceObject::<flotilla_resources::Artifact> {
+                metadata: common::object_meta(&name, "flotilla", "1"),
+                spec: flotilla_resources::ArtifactSpec::builder()
+                    .convoy("completion".to_string())
+                    .producer(role.to_string())
+                    .kind("decision-ledger".to_string())
+                    .subject("completion".to_string())
+                    .digest("sha256:test".to_string())
+                    .size(1)
+                    .media_type("text/markdown".to_string())
+                    .expires_at(now)
+                    .build(),
+                status: None,
+            },
+        )
     };
     let mut artifacts = BTreeMap::new();
     let evaluate = |role: &str, records: &BTreeMap<_, _>, artifacts: &BTreeMap<_, _>| {
@@ -360,21 +363,24 @@ fn declared_artifact_completion_accepts_a_new_kind_and_rebinds_to_current_head()
     };
     let artifact = |head: &str| {
         let name = flotilla_resources::artifact_record_name("toy", "coder", "toy-explainer", head);
-        (name.clone(), flotilla_resources::ResourceObject::<Artifact> {
-            metadata: common::object_meta(&name, "flotilla", "1"),
-            spec: ArtifactSpec::builder()
-                .convoy("toy".to_string())
-                .producer("coder".to_string())
-                .kind("toy-explainer".to_string())
-                .subject(head.to_string())
-                .summary(BTreeMap::from([("disposition".to_string(), serde_json::json!("approved"))]))
-                .digest("sha256:test".to_string())
-                .size(1)
-                .media_type("text/plain".to_string())
-                .expires_at(now)
-                .build(),
-            status: None,
-        })
+        (
+            name.clone(),
+            flotilla_resources::ResourceObject::<Artifact> {
+                metadata: common::object_meta(&name, "flotilla", "1"),
+                spec: ArtifactSpec::builder()
+                    .convoy("toy".to_string())
+                    .producer("coder".to_string())
+                    .kind("toy-explainer".to_string())
+                    .subject(head.to_string())
+                    .summary(BTreeMap::from([("disposition".to_string(), serde_json::json!("approved"))]))
+                    .digest("sha256:test".to_string())
+                    .size(1)
+                    .media_type("text/plain".to_string())
+                    .expires_at(now)
+                    .build(),
+                status: None,
+            },
+        )
     };
     let mut change_requests = BTreeMap::from([(cr_name.clone(), record("X"))]);
     let mut artifacts = BTreeMap::from([artifact("X")]);
@@ -586,12 +592,15 @@ async fn reconcile_with_observed_change_request(
         .expect("convoy status");
 
     vessels
-        .create(&vessel_meta("convoy-a-implement", "convoy-a", "implement"), &VesselSpec {
-            convoy_ref: "convoy-a".to_string(),
-            vessel_name: "implement".to_string(),
-            placement_policy_ref: "test".to_string(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &vessel_meta("convoy-a-implement", "convoy-a", "implement"),
+            &VesselSpec {
+                convoy_ref: "convoy-a".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "test".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("live vessel create");
 
@@ -615,25 +624,29 @@ async fn reconcile_with_observed_change_request(
             .await
             .expect("checkout create");
         checkouts
-            .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
-                clone_retry: None,
-                phase: CheckoutPhase::Ready,
-                path: Some("/tmp/checkout-a".to_string()),
-                commit: None,
-                branch_provenance: Default::default(),
-                integration: CheckoutIntegrationStatus {
-                    head_revision: None,
-                    clean: Default::default(),
-                    pushed: Default::default(),
-                    landed: IntegrationCondition::builder().value(value).observed_at(observed_at.to_rfc3339()).build(),
-                    landed_evidence: observed_target_ref.map(|target_ref| {
-                        LandedEvidence::builder().change_request_id("42".to_string()).target_ref(target_ref.to_string()).build()
-                    }),
-                    change_request: None,
-                    remote_refs: Default::default(),
+            .update_status(
+                &checkout.metadata.name,
+                &checkout.metadata.resource_version,
+                &CheckoutStatus {
+                    clone_retry: None,
+                    phase: CheckoutPhase::Ready,
+                    path: Some("/tmp/checkout-a".to_string()),
+                    commit: None,
+                    branch_provenance: Default::default(),
+                    integration: CheckoutIntegrationStatus {
+                        head_revision: None,
+                        clean: Default::default(),
+                        pushed: Default::default(),
+                        landed: IntegrationCondition::builder().value(value).observed_at(observed_at.to_rfc3339()).build(),
+                        landed_evidence: observed_target_ref.map(|target_ref| {
+                            LandedEvidence::builder().change_request_id("42".to_string()).target_ref(target_ref.to_string()).build()
+                        }),
+                        change_request: None,
+                        remote_refs: Default::default(),
+                    },
+                    message: None,
                 },
-                message: None,
-            })
+            )
             .await
             .expect("checkout status");
     }
@@ -706,22 +719,26 @@ async fn reconcile_with_observed_digest(
         .await
         .expect("checkout create");
     checkouts
-        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
-            phase: CheckoutPhase::Ready,
-            integration: CheckoutIntegrationStatus {
-                remote_refs: observed_digest.map_or_else(BTreeMap::new, |digest| {
-                    BTreeMap::from([(
-                        "refs/heads/topic".to_string(),
-                        flotilla_resources::RemoteRefObservation::builder()
-                            .digest(digest.to_string())
-                            .observed_at(now.to_rfc3339())
-                            .build(),
-                    )])
-                }),
+        .update_status(
+            &checkout.metadata.name,
+            &checkout.metadata.resource_version,
+            &CheckoutStatus {
+                phase: CheckoutPhase::Ready,
+                integration: CheckoutIntegrationStatus {
+                    remote_refs: observed_digest.map_or_else(BTreeMap::new, |digest| {
+                        BTreeMap::from([(
+                            "refs/heads/topic".to_string(),
+                            flotilla_resources::RemoteRefObservation::builder()
+                                .digest(digest.to_string())
+                                .observed_at(now.to_rfc3339())
+                                .build(),
+                        )])
+                    }),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        })
+        )
         .await
         .expect("checkout status");
 
@@ -821,11 +838,15 @@ async fn convoy_finalizer_waits_for_remote_checkout_authority() {
         .await
         .expect("create remote checkout");
     remote_checkouts
-        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
-            phase: CheckoutPhase::Failed,
-            message: Some("checkout teardown failed: checkout /checkouts/a preserved: DirtyCheckout".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &checkout.metadata.name,
+            &checkout.metadata.resource_version,
+            &CheckoutStatus {
+                phase: CheckoutPhase::Failed,
+                message: Some("checkout teardown failed: checkout /checkouts/a preserved: DirtyCheckout".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("record checkout preservation");
     let remote_root = flotilla_protocol::NodeId::new("feta-root");
@@ -1400,16 +1421,19 @@ fn landing_requires_each_active_subject_to_reach_either_world_terminal() {
         let name = change_request_record_name("github.com", scope, number);
         let mut status = merged_change_request_status(now);
         status.state = Observation::known(state, now);
-        records.insert(name.clone(), flotilla_resources::ResourceObject::<ChangeRequest> {
-            metadata: common::object_meta(&name, "flotilla", "1"),
-            spec: ChangeRequestSpec::builder()
-                .service("github.com".to_string())
-                .scope(scope.to_string())
-                .number(number)
-                .observing_authority("host-a".to_string())
-                .build(),
-            status: Some(status),
-        });
+        records.insert(
+            name.clone(),
+            flotilla_resources::ResourceObject::<ChangeRequest> {
+                metadata: common::object_meta(&name, "flotilla", "1"),
+                spec: ChangeRequestSpec::builder()
+                    .service("github.com".to_string())
+                    .scope(scope.to_string())
+                    .number(number)
+                    .observing_authority("host-a".to_string())
+                    .build(),
+                status: Some(status),
+            },
+        );
     }
     let evaluate = |records: &BTreeMap<_, _>| {
         evaluate_landing_settlement(
@@ -1783,18 +1807,25 @@ async fn reconcile_terminal_bound_change_request(
             .await
             .expect("checkout create");
         checkouts
-            .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
-                clone_retry: None,
-                phase: CheckoutPhase::Ready,
-                path: Some("/tmp/checkout-a".to_string()),
-                commit: None,
-                branch_provenance: Default::default(),
-                integration: CheckoutIntegrationStatus {
-                    landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(timestamp(40).to_rfc3339()).build(),
-                    ..Default::default()
+            .update_status(
+                &checkout.metadata.name,
+                &checkout.metadata.resource_version,
+                &CheckoutStatus {
+                    clone_retry: None,
+                    phase: CheckoutPhase::Ready,
+                    path: Some("/tmp/checkout-a".to_string()),
+                    commit: None,
+                    branch_provenance: Default::default(),
+                    integration: CheckoutIntegrationStatus {
+                        landed: IntegrationCondition::builder()
+                            .value(ConditionValue::False)
+                            .observed_at(timestamp(40).to_rfc3339())
+                            .build(),
+                        ..Default::default()
+                    },
+                    message: None,
                 },
-                message: None,
-            })
+            )
             .await
             .expect("checkout status update");
     }
@@ -1817,18 +1848,25 @@ async fn reconcile_terminal_bound_change_request(
             .await
             .expect("context checkout create");
         checkouts
-            .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
-                clone_retry: None,
-                phase: CheckoutPhase::Ready,
-                path: Some("/tmp/checkout-context".to_string()),
-                commit: None,
-                branch_provenance: Default::default(),
-                integration: CheckoutIntegrationStatus {
-                    landed: IntegrationCondition::builder().value(ConditionValue::False).observed_at(timestamp(40).to_rfc3339()).build(),
-                    ..Default::default()
+            .update_status(
+                &checkout.metadata.name,
+                &checkout.metadata.resource_version,
+                &CheckoutStatus {
+                    clone_retry: None,
+                    phase: CheckoutPhase::Ready,
+                    path: Some("/tmp/checkout-context".to_string()),
+                    commit: None,
+                    branch_provenance: Default::default(),
+                    integration: CheckoutIntegrationStatus {
+                        landed: IntegrationCondition::builder()
+                            .value(ConditionValue::False)
+                            .observed_at(timestamp(40).to_rfc3339())
+                            .build(),
+                        ..Default::default()
+                    },
+                    message: None,
                 },
-                message: None,
-            })
+            )
             .await
             .expect("context checkout status update");
     }
@@ -1854,12 +1892,15 @@ async fn reconcile_terminal_bound_change_request(
     let vessels = backend.clone().using::<Vessel>("flotilla");
     if vessel_present {
         vessels
-            .create(&vessel_meta("convoy-a-implement", "convoy-a", "implement"), &VesselSpec {
-                convoy_ref: "convoy-a".to_string(),
-                vessel_name: "implement".to_string(),
-                placement_policy_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            })
+            .create(
+                &vessel_meta("convoy-a-implement", "convoy-a", "implement"),
+                &VesselSpec {
+                    convoy_ref: "convoy-a".to_string(),
+                    vessel_name: "implement".to_string(),
+                    placement_policy_ref: "test".to_string(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
             .await
             .expect("vessel create");
     }
@@ -1985,26 +2026,30 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
         .await
         .expect("create remote checkout");
     remote_checkouts
-        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
-            clone_retry: None,
-            phase: CheckoutPhase::Ready,
-            path: Some("/remote/worktree".to_string()),
-            commit: None,
-            branch_provenance: Default::default(),
-            integration: CheckoutIntegrationStatus {
-                landed: IntegrationCondition::builder().value(ConditionValue::False).build(),
-                change_request: Some(
-                    ChangeRequestObservation::builder()
-                        .id("42".to_string())
-                        .state(ChangeRequestState::Open)
-                        .mergeability(ChangeRequestMergeability::Mergeable)
-                        .observed_at(timestamp(40).to_rfc3339())
-                        .build(),
-                ),
-                ..Default::default()
+        .update_status(
+            &checkout.metadata.name,
+            &checkout.metadata.resource_version,
+            &CheckoutStatus {
+                clone_retry: None,
+                phase: CheckoutPhase::Ready,
+                path: Some("/remote/worktree".to_string()),
+                commit: None,
+                branch_provenance: Default::default(),
+                integration: CheckoutIntegrationStatus {
+                    landed: IntegrationCondition::builder().value(ConditionValue::False).build(),
+                    change_request: Some(
+                        ChangeRequestObservation::builder()
+                            .id("42".to_string())
+                            .state(ChangeRequestState::Open)
+                            .mergeability(ChangeRequestMergeability::Mergeable)
+                            .observed_at(timestamp(40).to_rfc3339())
+                            .build(),
+                    ),
+                    ..Default::default()
+                },
+                message: None,
             },
-            message: None,
-        })
+        )
         .await
         .expect("record open change request");
     authority
@@ -2022,11 +2067,11 @@ async fn federated_open_checkout_holds_landing_on_authority_host() {
         panic!("remote checkout evidence must be persisted before settlement");
     };
     assert_eq!(subjects.len(), 1);
-    flotilla_resources::apply_status_patch(&convoys, "cross-host", &ConvoyStatusPatch::DiscoverSubjects {
-        subjects,
-        source: flotilla_resources::SubjectDiscoverySource::Branch,
-        at: timestamp(40),
-    })
+    flotilla_resources::apply_status_patch(
+        &convoys,
+        "cross-host",
+        &ConvoyStatusPatch::DiscoverSubjects { subjects, source: flotilla_resources::SubjectDiscoverySource::Branch, at: timestamp(40) },
+    )
     .await
     .expect("persist discovered request");
     let current = convoys.get("cross-host").await.expect("convoy with discovered request");
@@ -2535,21 +2580,24 @@ async fn skill_failure_vessel(convoy: &flotilla_resources::ResourceObject<Convoy
     backend.using::<Convoy>("flotilla").create(&convoy_meta(&convoy.metadata.name), &convoy.spec).await.expect("convoy");
     let environments = backend.using::<flotilla_resources::Environment>("flotilla");
     let environment = environments
-        .create(&InputMeta::builder().name("failed-skills".into()).build(), &flotilla_resources::EnvironmentSpec {
-            host_direct: None,
-            docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                host_ref: "host".into(),
-                image: "test".into(),
-                image_composition: None,
-                image_build_ref: None,
-                memory_policy: Default::default(),
-                declared_agent_adapters: Default::default(),
-                required_agent_adapters: Default::default(),
-                pull_policy: Default::default(),
-                mounts: Vec::new(),
-                env: Default::default(),
-            }),
-        })
+        .create(
+            &InputMeta::builder().name("failed-skills".into()).build(),
+            &flotilla_resources::EnvironmentSpec {
+                host_direct: None,
+                docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    host_ref: "host".into(),
+                    image: "test".into(),
+                    image_composition: None,
+                    image_build_ref: None,
+                    memory_policy: Default::default(),
+                    declared_agent_adapters: Default::default(),
+                    required_agent_adapters: Default::default(),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: Default::default(),
+                }),
+            },
+        )
         .await
         .expect("environment");
     let env_reconciler = EnvironmentReconciler::new(Arc::new(FailedSkillStaging), backend.clone(), "flotilla");
@@ -3291,11 +3339,15 @@ fn collected_merge_evidence_preserves_settlement(tc: hegel::TestCase) {
             .expect("orphan session");
         let session = sessions.get("orphan-session").await.expect("session");
         sessions
-            .update_status("orphan-session", &session.metadata.resource_version, &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                session_id: Some("already-removed-container-session".to_string()),
-                ..Default::default()
-            })
+            .update_status(
+                "orphan-session",
+                &session.metadata.resource_version,
+                &TerminalSessionStatus {
+                    phase: TerminalSessionPhase::Running,
+                    session_id: Some("already-removed-container-session".to_string()),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("running orphan session");
         let reconciler = ConvoyReconciler::new(backend.definitions::<WorkflowTemplate>("flotilla"))

@@ -14,12 +14,16 @@ use super::{ActivationResult, ConnectionDirection, ConnectionMeta, HandleResult,
 use crate::peer::{test_support::MockPeerSender, PeerConnectionStatus, PeerSender, PeerTransport};
 
 fn activate(mgr: &mut PeerManager, peer: &str, sender: Arc<MockPeerSender>) -> u64 {
-    match mgr.activate_connection(NodeId::new(peer), sender, ConnectionMeta {
-        direction: ConnectionDirection::Outbound,
-        config_label: None,
-        expected_peer: Some(NodeId::new(peer)),
-        config_backed: false,
-    }) {
+    match mgr.activate_connection(
+        NodeId::new(peer),
+        sender,
+        ConnectionMeta {
+            direction: ConnectionDirection::Outbound,
+            config_label: None,
+            expected_peer: Some(NodeId::new(peer)),
+            config_backed: false,
+        },
+    ) {
         ActivationResult::Accepted { generation, .. } => generation,
         ActivationResult::Rejected { reason } => panic!("connection unexpectedly rejected: {reason:?}"),
     }

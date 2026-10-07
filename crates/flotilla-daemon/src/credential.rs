@@ -867,24 +867,27 @@ impl CredentialStore {
             env.extend(delivered.env);
             if let Some((request, expires_at, effective_permissions)) = resolved.github_app {
                 let paths = delivery_paths.as_ref().expect("GitHub App adapter resolves delivery paths");
-                self.github_app_deliveries.lock().await.insert(cache_key.clone(), GithubAppDelivery {
-                    generation: uuid::Uuid::new_v4(),
-                    // A successful mint accepts the explicit requested permission ceiling.
-                    // Without a response or an explicit request, permissions stay unknown.
-                    effective_permissions: effective_permissions.or_else(|| request.permissions.clone()),
-                    request,
-                    runner: Arc::clone(&runner),
-                    token_file: github_app_token_file(paths, name),
-                    issued_at: self.clock.now(),
-                    expires_at,
-                    refresh_failures: 0,
-                    next_refresh_attempt_at: None,
-                    installation_repository: match &spec.consumer {
-                        CredentialConsumer::GithubApp { installation_repository, .. } => installation_repository.clone(),
-                        _ => None,
+                self.github_app_deliveries.lock().await.insert(
+                    cache_key.clone(),
+                    GithubAppDelivery {
+                        generation: uuid::Uuid::new_v4(),
+                        // A successful mint accepts the explicit requested permission ceiling.
+                        // Without a response or an explicit request, permissions stay unknown.
+                        effective_permissions: effective_permissions.or_else(|| request.permissions.clone()),
+                        request,
+                        runner: Arc::clone(&runner),
+                        token_file: github_app_token_file(paths, name),
+                        issued_at: self.clock.now(),
+                        expires_at,
+                        refresh_failures: 0,
+                        next_refresh_attempt_at: None,
+                        installation_repository: match &spec.consumer {
+                            CredentialConsumer::GithubApp { installation_repository, .. } => installation_repository.clone(),
+                            _ => None,
+                        },
+                        scope: None,
                     },
-                    scope: None,
-                });
+                );
             }
             if let Some(git_credential) = delivered.git_credential {
                 git_config_owner.get_or_insert_with(|| (name.clone(), spec.consumer.adapter_name().to_string(), cache_key.clone()));
@@ -1987,10 +1990,11 @@ impl CredentialStore {
                     return Err("consumer binary is unavailable".to_string());
                 }
                 if !already_prepared {
-                    api_key_preflight(&*runner, "https://api.anthropic.com/v1/models?limit=1", &[
-                        ("x-api-key", material),
-                        ("anthropic-version", "2023-06-01"),
-                    ])
+                    api_key_preflight(
+                        &*runner,
+                        "https://api.anthropic.com/v1/models?limit=1",
+                        &[("x-api-key", material), ("anthropic-version", "2023-06-01")],
+                    )
                     .await?;
                 }
                 env.insert("ANTHROPIC_API_KEY".to_string(), material.to_string());
@@ -2099,10 +2103,11 @@ impl CredentialStore {
                         )
                         .await
                         .map_err(|error| format!("login preflight failed: {error}"))?;
-                    api_key_preflight(&*runner, "https://api.openai.com/v1/models?limit=1", &[(
-                        "Authorization",
-                        &format!("Bearer {material}"),
-                    )])
+                    api_key_preflight(
+                        &*runner,
+                        "https://api.openai.com/v1/models?limit=1",
+                        &[("Authorization", &format!("Bearer {material}"))],
+                    )
                     .await?;
                 }
                 env.insert("CODEX_HOME".to_string(), codex_home);
@@ -2481,17 +2486,23 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a"));
         backend
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("github-skills-fork".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp {
-                    actor_login: None,
-                    installation_id: Some(9876),
-                    installation_repository: None,
-                    permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
+            .create(
+                &InputMeta::builder().name("github-skills-fork".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::GithubApp {
+                        actor_login: None,
+                        installation_id: Some(9876),
+                        installation_repository: None,
+                        permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
+                    },
+                    source: CredentialSource::GithubApp {
+                        app_id_path: "/host/app-id".to_string(),
+                        private_key_path: "/host/key".to_string(),
+                    },
+                    lifecycle: CredentialLifecycle::Refreshable,
+                    placement: CredentialPlacementRequirements::default(),
                 },
-                source: CredentialSource::GithubApp { app_id_path: "/host/app-id".to_string(), private_key_path: "/host/key".to_string() },
-                lifecycle: CredentialLifecycle::Refreshable,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            )
             .await
             .expect("credential declaration");
         let minter = Arc::new(SlowFlakySkillMinter {
@@ -2643,25 +2654,28 @@ mod tests {
             GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
             PathBuf::from("/state"),
         );
-        store.github_app_deliveries.lock().await.insert(("vessel".to_string(), "github-app".to_string()), GithubAppDelivery {
-            effective_permissions: None,
-            generation: uuid::Uuid::new_v4(),
-            request: GithubAppMintRequest {
-                installation_id: 1,
-                app_id_path: "app-id".to_string(),
-                private_key_path: "key".to_string(),
-                repositories: vec!["flotilla".to_string()],
-                permissions: None,
+        store.github_app_deliveries.lock().await.insert(
+            ("vessel".to_string(), "github-app".to_string()),
+            GithubAppDelivery {
+                effective_permissions: None,
+                generation: uuid::Uuid::new_v4(),
+                request: GithubAppMintRequest {
+                    installation_id: 1,
+                    app_id_path: "app-id".to_string(),
+                    private_key_path: "key".to_string(),
+                    repositories: vec!["flotilla".to_string()],
+                    permissions: None,
+                },
+                runner,
+                token_file: PathBuf::from("/state/credentials/github-app/token"),
+                issued_at: now,
+                expires_at: now + Duration::hours(1),
+                refresh_failures: 0,
+                next_refresh_attempt_at: None,
+                installation_repository: None,
+                scope: None,
             },
-            runner,
-            token_file: PathBuf::from("/state/credentials/github-app/token"),
-            issued_at: now,
-            expires_at: now + Duration::hours(1),
-            refresh_failures: 0,
-            next_refresh_attempt_at: None,
-            installation_repository: None,
-            scope: None,
-        });
+        );
         clock.advance(Duration::minutes(29));
         assert!(store.refresh_due_github_app_tokens().await.is_empty());
         assert!(minter.requests.lock().expect("requests lock").is_empty());
@@ -2709,25 +2723,28 @@ mod tests {
             GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
             PathBuf::from("/state"),
         );
-        store.github_app_deliveries.lock().await.insert(("vessel".to_string(), "github-app".to_string()), GithubAppDelivery {
-            effective_permissions: None,
-            generation: uuid::Uuid::new_v4(),
-            request: GithubAppMintRequest {
-                installation_id: 1,
-                app_id_path: "app-id".to_string(),
-                private_key_path: "key".to_string(),
-                repositories: vec!["flotilla".to_string()],
-                permissions: None,
+        store.github_app_deliveries.lock().await.insert(
+            ("vessel".to_string(), "github-app".to_string()),
+            GithubAppDelivery {
+                effective_permissions: None,
+                generation: uuid::Uuid::new_v4(),
+                request: GithubAppMintRequest {
+                    installation_id: 1,
+                    app_id_path: "app-id".to_string(),
+                    private_key_path: "key".to_string(),
+                    repositories: vec!["flotilla".to_string()],
+                    permissions: None,
+                },
+                runner,
+                token_file: PathBuf::from("/state/credentials/github-app/token"),
+                issued_at: now,
+                expires_at: now + Duration::hours(1),
+                refresh_failures: 0,
+                next_refresh_attempt_at: None,
+                installation_repository: None,
+                scope: None,
             },
-            runner,
-            token_file: PathBuf::from("/state/credentials/github-app/token"),
-            issued_at: now,
-            expires_at: now + Duration::hours(1),
-            refresh_failures: 0,
-            next_refresh_attempt_at: None,
-            installation_repository: None,
-            scope: None,
-        });
+        );
 
         clock.advance(Duration::minutes(30));
         assert_eq!(store.refresh_due_github_app_tokens().await.len(), 1);
@@ -2861,20 +2878,23 @@ mod tests {
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp {
-                    actor_login: None,
-                    installation_id: Some(9876),
-                    installation_repository: None,
-                    permissions: None,
+            .create(
+                &InputMeta::builder().name("github-app".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::GithubApp {
+                        actor_login: None,
+                        installation_id: Some(9876),
+                        installation_repository: None,
+                        permissions: None,
+                    },
+                    source: CredentialSource::GithubApp {
+                        app_id_path: "/host-only/github-app.id".to_string(),
+                        private_key_path: "/host-only/github-app.pem".to_string(),
+                    },
+                    lifecycle: CredentialLifecycle::Refreshable,
+                    placement: CredentialPlacementRequirements::default(),
                 },
-                source: CredentialSource::GithubApp {
-                    app_id_path: "/host-only/github-app.id".to_string(),
-                    private_key_path: "/host-only/github-app.pem".to_string(),
-                },
-                lifecycle: CredentialLifecycle::Refreshable,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            )
             .await
             .expect("create credential declaration");
         let runner = Arc::new(RecordingRunner::default());
@@ -2896,21 +2916,23 @@ mod tests {
         store
             .set_github_app_scopes(
                 "project-env",
-                &BTreeMap::from([("github-app".to_string(), GithubAppScope {
-                    fixed_repositories: BTreeSet::new(),
-                    projects: BTreeSet::from(["island".to_string()]),
-                    permissions: None,
-                })]),
+                &BTreeMap::from([(
+                    "github-app".to_string(),
+                    GithubAppScope {
+                        fixed_repositories: BTreeSet::new(),
+                        projects: BTreeSet::from(["island".to_string()]),
+                        permissions: None,
+                    },
+                )]),
             )
             .await;
         store
             .set_github_app_scopes(
                 "fixed-env",
-                &BTreeMap::from([("github-app".to_string(), GithubAppScope {
-                    fixed_repositories: BTreeSet::from([first.key()]),
-                    projects: BTreeSet::new(),
-                    permissions: None,
-                })]),
+                &BTreeMap::from([(
+                    "github-app".to_string(),
+                    GithubAppScope { fixed_repositories: BTreeSet::from([first.key()]), projects: BTreeSet::new(), permissions: None },
+                )]),
             )
             .await;
         projects.delete("island").await.expect("remove old project membership");
@@ -2954,11 +2976,10 @@ mod tests {
         store
             .set_github_app_scopes(
                 "project-env",
-                &BTreeMap::from([("github-app".into(), GithubAppScope {
-                    fixed_repositories: BTreeSet::from([second.key()]),
-                    projects: BTreeSet::new(),
-                    permissions: None,
-                })]),
+                &BTreeMap::from([(
+                    "github-app".into(),
+                    GithubAppScope { fixed_repositories: BTreeSet::from([second.key()]), projects: BTreeSet::new(), permissions: None },
+                )]),
             )
             .await;
         assert_eq!(store.refresh_due_github_app_tokens().await.len(), 1);
@@ -3387,20 +3408,23 @@ mod tests {
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp {
-                    actor_login: Some("configured-crew[bot]".to_string()),
-                    installation_id: None,
-                    installation_repository: Some("flotilla-org/flotilla".to_string()),
-                    permissions: None,
+            .create(
+                &InputMeta::builder().name("github-app".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::GithubApp {
+                        actor_login: Some("configured-crew[bot]".to_string()),
+                        installation_id: None,
+                        installation_repository: Some("flotilla-org/flotilla".to_string()),
+                        permissions: None,
+                    },
+                    source: CredentialSource::GithubApp {
+                        app_id_path: app_id_path.to_string_lossy().into_owned(),
+                        private_key_path: private_key_path.to_string_lossy().into_owned(),
+                    },
+                    lifecycle: CredentialLifecycle::Refreshable,
+                    placement: CredentialPlacementRequirements::default(),
                 },
-                source: CredentialSource::GithubApp {
-                    app_id_path: app_id_path.to_string_lossy().into_owned(),
-                    private_key_path: private_key_path.to_string_lossy().into_owned(),
-                },
-                lifecycle: CredentialLifecycle::Refreshable,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            )
             .await
             .expect("create credential declaration");
         let fixture = r#"
@@ -3507,20 +3531,23 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp {
-                    actor_login: None,
-                    installation_id: Some(9876),
-                    installation_repository: None,
-                    permissions: None,
+            .create(
+                &InputMeta::builder().name("github-app".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::GithubApp {
+                        actor_login: None,
+                        installation_id: Some(9876),
+                        installation_repository: None,
+                        permissions: None,
+                    },
+                    source: CredentialSource::GithubApp {
+                        app_id_path: app_id_path.to_string_lossy().into_owned(),
+                        private_key_path: private_key_path.to_string_lossy().into_owned(),
+                    },
+                    lifecycle: CredentialLifecycle::Refreshable,
+                    placement: CredentialPlacementRequirements::default(),
                 },
-                source: CredentialSource::GithubApp {
-                    app_id_path: app_id_path.to_string_lossy().into_owned(),
-                    private_key_path: private_key_path.to_string_lossy().into_owned(),
-                },
-                lifecycle: CredentialLifecycle::Refreshable,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            )
             .await
             .expect("create credential declaration");
 
@@ -3611,20 +3638,23 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("github-skills-fork".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp {
-                    actor_login: None,
-                    installation_id: Some(9876),
-                    installation_repository: None,
-                    permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
+            .create(
+                &InputMeta::builder().name("github-skills-fork".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::GithubApp {
+                        actor_login: None,
+                        installation_id: Some(9876),
+                        installation_repository: None,
+                        permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
+                    },
+                    source: CredentialSource::GithubApp {
+                        app_id_path: app_id_path.to_string_lossy().into_owned(),
+                        private_key_path: private_key_path.to_string_lossy().into_owned(),
+                    },
+                    lifecycle: CredentialLifecycle::Refreshable,
+                    placement: CredentialPlacementRequirements::default(),
                 },
-                source: CredentialSource::GithubApp {
-                    app_id_path: app_id_path.to_string_lossy().into_owned(),
-                    private_key_path: private_key_path.to_string_lossy().into_owned(),
-                },
-                lifecycle: CredentialLifecycle::Refreshable,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            )
             .await
             .expect("create skill credential declaration");
         let fixture = r#"
@@ -3855,20 +3885,23 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp {
-                    actor_login: None,
-                    installation_id: Some(9876),
-                    installation_repository: None,
-                    permissions: None,
+            .create(
+                &InputMeta::builder().name("github-app".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::GithubApp {
+                        actor_login: None,
+                        installation_id: Some(9876),
+                        installation_repository: None,
+                        permissions: None,
+                    },
+                    source: CredentialSource::GithubApp {
+                        app_id_path: "/host-only/github-app.id".to_string(),
+                        private_key_path: "/host-only/github-app.pem".to_string(),
+                    },
+                    lifecycle: CredentialLifecycle::Refreshable,
+                    placement: CredentialPlacementRequirements::default(),
                 },
-                source: CredentialSource::GithubApp {
-                    app_id_path: "/host-only/github-app.id".to_string(),
-                    private_key_path: "/host-only/github-app.pem".to_string(),
-                },
-                lifecycle: CredentialLifecycle::Refreshable,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            )
             .await
             .expect("create credential declaration");
         let runner = Arc::new(RecordingRunner::default());
@@ -4024,20 +4057,23 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp {
-                    actor_login: None,
-                    installation_id: Some(9876),
-                    installation_repository: None,
-                    permissions: None,
+            .create(
+                &InputMeta::builder().name("github-app".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::GithubApp {
+                        actor_login: None,
+                        installation_id: Some(9876),
+                        installation_repository: None,
+                        permissions: None,
+                    },
+                    source: CredentialSource::GithubApp {
+                        app_id_path: "/host-only/github-app.id".to_string(),
+                        private_key_path: "/host-only/github-app.pem".to_string(),
+                    },
+                    lifecycle: CredentialLifecycle::Refreshable,
+                    placement: CredentialPlacementRequirements::default(),
                 },
-                source: CredentialSource::GithubApp {
-                    app_id_path: "/host-only/github-app.id".to_string(),
-                    private_key_path: "/host-only/github-app.pem".to_string(),
-                },
-                lifecycle: CredentialLifecycle::Refreshable,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            )
             .await
             .expect("create credential declaration");
         let runner = Arc::new(RecordingRunner::default());
@@ -4129,20 +4165,23 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("github-app".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp {
-                    actor_login: None,
-                    installation_id: Some(9876),
-                    installation_repository: None,
-                    permissions: None,
+            .create(
+                &InputMeta::builder().name("github-app".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::GithubApp {
+                        actor_login: None,
+                        installation_id: Some(9876),
+                        installation_repository: None,
+                        permissions: None,
+                    },
+                    source: CredentialSource::GithubApp {
+                        app_id_path: "/host/app.id".to_string(),
+                        private_key_path: "/host/app.pem".to_string(),
+                    },
+                    lifecycle: CredentialLifecycle::Refreshable,
+                    placement: CredentialPlacementRequirements::default(),
                 },
-                source: CredentialSource::GithubApp {
-                    app_id_path: "/host/app.id".to_string(),
-                    private_key_path: "/host/app.pem".to_string(),
-                },
-                lifecycle: CredentialLifecycle::Refreshable,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            )
             .await
             .expect("credential");
         let minter = Arc::new(FakeGithubAppTokenMinter {
@@ -4297,12 +4336,15 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("model-api".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Codex,
-                source: CredentialSource::Env { name: "TEST_OPENAI_KEY".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("model-api".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::Codex,
+                    source: CredentialSource::Env { name: "TEST_OPENAI_KEY".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create credential declaration");
         let secret = "test-secret-never-in-argv";
@@ -4338,12 +4380,15 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name(name.to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::ClaudeOauth { account_email: account_email.to_string() },
-                source: CredentialSource::Env { name: source_env.to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name(name.to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::ClaudeOauth { account_email: account_email.to_string() },
+                    source: CredentialSource::Env { name: source_env.to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create credential declaration");
     }
@@ -4502,12 +4547,15 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("claude-api".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Claude,
-                source: CredentialSource::Env { name: "TEST_ANTHROPIC_KEY".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("claude-api".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::Claude,
+                    source: CredentialSource::Env { name: "TEST_ANTHROPIC_KEY".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create API-key credential declaration");
         let env = Arc::new(TestEnv(BTreeMap::from([
@@ -4555,12 +4603,15 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("claude-max".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
-                source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Refreshable,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("claude-max".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::ClaudeOauth { account_email: "ops@example.com".to_string() },
+                    source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Refreshable,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create refreshable Claude credential declaration");
         let env = Arc::new(RotatingTokenEnv(StdMutex::new(VecDeque::from([
@@ -4716,12 +4767,15 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("model-api".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Codex,
-                source: CredentialSource::Env { name: "TEST_OPENAI_KEY".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("model-api".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::Codex,
+                    source: CredentialSource::Env { name: "TEST_OPENAI_KEY".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create credential declaration");
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_OPENAI_KEY".to_string(), "host-secret".to_string())])));
@@ -4784,12 +4838,15 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("github-work".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GitHttpToken { host: "github.com".to_string(), username: "bot".to_string() },
-                source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Issued,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("github-work".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::GitHttpToken { host: "github.com".to_string(), username: "bot".to_string() },
+                    source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Issued,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create issued credential");
         let runner = Arc::new(flotilla_core::providers::ProcessCommandRunner);
@@ -4851,12 +4908,15 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("github".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Gh,
-                source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("github".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::Gh,
+                    source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create credential declaration");
         let secret = "github-test-token";
@@ -4868,11 +4928,14 @@ interactions:
         let delivered =
             store.prepare("env-a", &BTreeSet::from(["github".to_string()]), runner.clone()).await.expect("prepare GitHub credential");
 
-        assert_eq!(delivered, vec![
-            ("GH_TOKEN".to_string(), secret.to_string()),
-            ("GIT_CONFIG_GLOBAL".to_string(), "/tmp/flotilla-test-state/credentials/gitconfig".to_string()),
-            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-        ]);
+        assert_eq!(
+            delivered,
+            vec![
+                ("GH_TOKEN".to_string(), secret.to_string()),
+                ("GIT_CONFIG_GLOBAL".to_string(), "/tmp/flotilla-test-state/credentials/gitconfig".to_string()),
+                ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+            ]
+        );
         let writes = runner.writes.lock().expect("writes lock");
         assert_eq!(writes.as_slice(), &[(
             PathBuf::from("/tmp/flotilla-test-state/credentials/gitconfig"),
@@ -4895,12 +4958,15 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("github".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Gh,
-                source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("github".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::Gh,
+                    source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create GitHub credential declaration");
         create_git_http_token_spec(&backend, "lab-forgejo", "forgejo.lab", "TEST_FORGEJO_TOKEN").await;
@@ -4959,12 +5025,15 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("github".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Gh,
-                source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("github".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::Gh,
+                    source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create GitHub credential declaration");
         create_git_http_token_spec(&backend, "lab-forgejo", "forgejo.lab", "TEST_FORGEJO_TOKEN").await;
@@ -5000,12 +5069,15 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("lab-forgejo".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GitHttpToken { host: "forgejo.lab".to_string(), username: "crew-reader".to_string() },
-                source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("lab-forgejo".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::GitHttpToken { host: "forgejo.lab".to_string(), username: "crew-reader".to_string() },
+                    source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create credential declaration");
         let secret = "forgejo-test-token";
@@ -5019,10 +5091,13 @@ interactions:
             .await
             .expect("prepare Git HTTP credential");
 
-        assert_eq!(delivered, vec![
-            ("GIT_CONFIG_GLOBAL".to_string(), "/tmp/flotilla-test-state/credentials/gitconfig".to_string()),
-            ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
-        ]);
+        assert_eq!(
+            delivered,
+            vec![
+                ("GIT_CONFIG_GLOBAL".to_string(), "/tmp/flotilla-test-state/credentials/gitconfig".to_string()),
+                ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+            ]
+        );
         let writes = runner.writes.lock().expect("writes lock");
         assert_eq!(writes[0], (PathBuf::from("/tmp/flotilla-test-state/credentials/lab-forgejo/token"), secret.to_string()));
         assert_eq!(writes[1].0, PathBuf::from("/tmp/flotilla-test-state/credentials/lab-forgejo/git-credential-http-token"));
@@ -5058,19 +5133,22 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("review-store".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::ReviewBundleStore {
-                    endpoint: "http://rustfs.lab:9000".to_string(),
-                    bucket: "flotilla".to_string(),
-                    region: "us-east-1".to_string(),
-                    public_base_url: "https://reviews.example/flotilla".to_string(),
-                    allow_http: true,
-                    virtual_hosted_style: false,
+            .create(
+                &InputMeta::builder().name("review-store".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::ReviewBundleStore {
+                        endpoint: "http://rustfs.lab:9000".to_string(),
+                        bucket: "flotilla".to_string(),
+                        region: "us-east-1".to_string(),
+                        public_base_url: "https://reviews.example/flotilla".to_string(),
+                        allow_http: true,
+                        virtual_hosted_style: false,
+                    },
+                    source: CredentialSource::Env { name: "TEST_REVIEW_STORE_CREDENTIAL".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
                 },
-                source: CredentialSource::Env { name: "TEST_REVIEW_STORE_CREDENTIAL".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            )
             .await
             .expect("create review store credential declaration");
         let material = r#"{"access_key_id":"crew","secret_access_key":"secret"}"#;
@@ -5108,12 +5186,15 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name(name.to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GitHttpToken { host: host.to_string(), username: "crew-reader".to_string() },
-                source: CredentialSource::Env { name: source_env.to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name(name.to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::GitHttpToken { host: host.to_string(), username: "crew-reader".to_string() },
+                    source: CredentialSource::Env { name: source_env.to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create credential declaration");
     }
@@ -5264,12 +5345,15 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("forgejo-api".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Forgejo { forge_ref: "lab".to_string(), username: "crew-reader".to_string() },
-                source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("forgejo-api".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::Forgejo { forge_ref: "lab".to_string(), username: "crew-reader".to_string() },
+                    source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create Forgejo credential declaration");
         let runner = Arc::new(RecordingRunner::default());
@@ -5311,12 +5395,15 @@ interactions:
             .expect("create Forge definition");
         backend
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("forgejo-api".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Forgejo { forge_ref: "lab".to_string(), username: "crew".to_string() },
-                source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("forgejo-api".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::Forgejo { forge_ref: "lab".to_string(), username: "crew".to_string() },
+                    source: CredentialSource::Env { name: "TEST_FORGEJO_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create credential declaration");
         let runner = Arc::new(RecordingRunner::default());
@@ -5351,12 +5438,15 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("github".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Gh,
-                source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("github".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::Gh,
+                    source: CredentialSource::Env { name: "TEST_GITHUB_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create GitHub credential declaration");
         let runner = Arc::new(RecordingRunner::default());
@@ -5393,12 +5483,15 @@ interactions:
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         backend
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("registry".into()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".into(), username: "builder".into() },
-                source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".into() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: Default::default(),
-            })
+            .create(
+                &InputMeta::builder().name("registry".into()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".into(), username: "builder".into() },
+                    source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".into() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: Default::default(),
+                },
+            )
             .await
             .expect("credential");
         let hosts = backend.using::<Host>("flotilla");
@@ -5414,10 +5507,13 @@ interactions:
             state.path().into(),
         );
         let operation = || {
-            store.image_registry_operation("builder", HostImageAction::ImagePush, "registry", "registry.example/images", &[
-                "push",
-                "registry.example/images:label",
-            ])
+            store.image_registry_operation(
+                "builder",
+                HostImageAction::ImagePush,
+                "registry",
+                "registry.example/images",
+                &["push", "registry.example/images:label"],
+            )
         };
         assert!(operation().await.expect_err("no grant").contains("no ImagePush grant"));
         backend
@@ -5467,12 +5563,15 @@ interactions:
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         backend
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("registry".into()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".into(), username: "host".into() },
-                source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".into() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: Default::default(),
-            })
+            .create(
+                &InputMeta::builder().name("registry".into()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".into(), username: "host".into() },
+                    source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".into() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: Default::default(),
+                },
+            )
             .await
             .expect("credential");
         backend
@@ -5503,10 +5602,13 @@ interactions:
         ));
         let task = tokio::spawn(async move {
             store
-                .image_registry_operation("host", HostImageAction::ImagePull, "registry", "registry.example/images", &[
-                    "pull",
-                    "registry.example/images@sha256:3333333333333333333333333333333333333333333333333333333333333333",
-                ])
+                .image_registry_operation(
+                    "host",
+                    HostImageAction::ImagePull,
+                    "registry",
+                    "registry.example/images",
+                    &["pull", "registry.example/images@sha256:3333333333333333333333333333333333333333333333333333333333333333"],
+                )
                 .await
         });
         gate.0.notified().await;
@@ -5524,12 +5626,15 @@ interactions:
         backend
             .clone()
             .definitions::<CredentialSpec>("flotilla")
-            .create(&InputMeta::builder().name("private-registry".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".to_string(), username: "crew".to_string() },
-                source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("private-registry".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".to_string(), username: "crew".to_string() },
+                    source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create credential declaration");
         let env = Arc::new(TestEnv(BTreeMap::from([("TEST_REGISTRY_TOKEN".to_string(), "registry-secret".to_string())])));

@@ -288,16 +288,19 @@ mod tests {
         let repository_key = RepositoryKey("local-repository".to_string());
         let path = QualifiedPath::host(HostId::new("host-01"), "/workspace/repo");
         let providers = ProviderData {
-            checkouts: [(path, Checkout {
-                branch: "main".to_string(),
-                is_main: true,
-                trunk_ahead_behind: None,
-                remote_ahead_behind: None,
-                working_tree: None,
-                last_commit: None,
-                host_name: None,
-                environment_id: None,
-            })]
+            checkouts: [(
+                path,
+                Checkout {
+                    branch: "main".to_string(),
+                    is_main: true,
+                    trunk_ahead_behind: None,
+                    remote_ahead_behind: None,
+                    working_tree: None,
+                    last_commit: None,
+                    host_name: None,
+                    environment_id: None,
+                },
+            )]
             .into_iter()
             .collect(),
             ..ProviderData::default()

@@ -123,32 +123,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut watch = convoy_resolver.watch(WatchStart::resuming_from(&listed)).await?;
     println!("updating convoy status");
     let updated_convoy = convoy_resolver
-        .update_status(&created_convoy.metadata.name, &created_convoy.metadata.resource_version, &ConvoyStatus {
-            environment_observations: Default::default(),
-            nudge_obligations: Vec::new(),
-            ensure_admission: None,
-            subjects: Vec::new(),
-            branch_subject_scan_at: None,
-            branch_subject_scan_error: None,
-            unlinked_subjects: Vec::new(),
-            stalled: None,
-            provisioning: None,
-            placement_decision: None,
-            phase: ConvoyPhase::Active,
-            workflow_snapshot: None,
-            work: Default::default(),
-            crew_work: Default::default(),
-            message: None,
-            started_at: None,
-            finished_at: None,
-            disposition: None,
-            observed_workflow_ref: None,
-            observed_workflows: None,
-            target_mismatches: Vec::new(),
-            turn_deliveries: Default::default(),
-            attention: None,
-            lifecycle_mutations: Vec::new(),
-        })
+        .update_status(
+            &created_convoy.metadata.name,
+            &created_convoy.metadata.resource_version,
+            &ConvoyStatus {
+                environment_observations: Default::default(),
+                nudge_obligations: Vec::new(),
+                ensure_admission: None,
+                subjects: Vec::new(),
+                branch_subject_scan_at: None,
+                branch_subject_scan_error: None,
+                unlinked_subjects: Vec::new(),
+                stalled: None,
+                provisioning: None,
+                placement_decision: None,
+                phase: ConvoyPhase::Active,
+                workflow_snapshot: None,
+                work: Default::default(),
+                crew_work: Default::default(),
+                message: None,
+                started_at: None,
+                finished_at: None,
+                disposition: None,
+                observed_workflow_ref: None,
+                observed_workflows: None,
+                target_mismatches: Vec::new(),
+                turn_deliveries: Default::default(),
+                attention: None,
+                lifecycle_mutations: Vec::new(),
+            },
+        )
         .await?;
     println!("updated convoy rv={}", updated_convoy.metadata.resource_version);
 

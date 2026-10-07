@@ -137,18 +137,18 @@ impl InProcessDaemon {
         let default_backend = host_config.change_request.preference.backend;
         if let Some(backend) = repository.spec.change_request().backend.as_deref().or(default_backend.as_deref()) {
             if !registry.change_requests.prefer_by_backend(backend) {
-                unmet.push(("change_request".into(), UnmetRequirement::UnknownProviderPreference {
-                    category: ProviderCategory::ChangeRequest,
-                    key: backend.into(),
-                }));
+                unmet.push((
+                    "change_request".into(),
+                    UnmetRequirement::UnknownProviderPreference { category: ProviderCategory::ChangeRequest, key: backend.into() },
+                ));
             }
         }
         if let Some(backend) = host_config.issue_tracker.preference.backend {
             if !registry.issue_trackers.prefer_by_backend(&backend) {
-                unmet.push(("issue_tracker".into(), UnmetRequirement::UnknownProviderPreference {
-                    category: ProviderCategory::IssueProvider,
-                    key: backend,
-                }));
+                unmet.push((
+                    "issue_tracker".into(),
+                    UnmetRequirement::UnknownProviderPreference { category: ProviderCategory::IssueProvider, key: backend },
+                ));
             }
         }
         let host_bag = self.environment_manager.local_environment_bag();

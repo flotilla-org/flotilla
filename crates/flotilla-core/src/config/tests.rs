@@ -111,11 +111,10 @@ fn open_views_roundtrip_and_parse_failures() {
 
     assert!(store.load_open_views().is_none());
 
-    let views = vec![OpenViewEntry { address: "overview".to_string(), label: None, history: vec![] }, OpenViewEntry {
-        address: "repo/github.com/o/r".to_string(),
-        label: Some("mine".to_string()),
-        history: vec![],
-    }];
+    let views = vec![
+        OpenViewEntry { address: "overview".to_string(), label: None, history: vec![] },
+        OpenViewEntry { address: "repo/github.com/o/r".to_string(), label: Some("mine".to_string()), history: vec![] },
+    ];
     store.save_open_views(&views);
     assert_eq!(store.load_open_views(), Some(views));
 

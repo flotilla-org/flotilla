@@ -42,10 +42,11 @@ pub async fn assert_terminal_session_label_lookup_with_backend(backend: Resource
             .build();
         let created = sessions.create(&identity.input_meta(), &spec).await.expect("create reconciler-shaped session");
         sessions
-            .update_status(&created.metadata.name, &created.metadata.resource_version, &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                ..Default::default()
-            })
+            .update_status(
+                &created.metadata.name,
+                &created.metadata.resource_version,
+                &TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() },
+            )
             .await
             .expect("update session status");
     }
@@ -506,11 +507,15 @@ pub async fn assert_local_authority_shadows_self_origin_replica_with_backend(bac
         .await
         .expect("create authoritative local host");
     hosts
-        .update_status(&local.metadata.name, &local.metadata.resource_version, &HostStatus {
-            disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
-            admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
-            ..HostStatus::default()
-        })
+        .update_status(
+            &local.metadata.name,
+            &local.metadata.resource_version,
+            &HostStatus {
+                disk_free_bytes: Some(100 * 1024 * 1024 * 1024),
+                admission_free_space_floor_bytes: Some(20 * 1024 * 1024 * 1024),
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("publish authoritative local capacity");
 
@@ -1052,10 +1057,13 @@ pub async fn assert_watch_retention_expires_only_versions_below_floor_with_backe
         .watch(WatchStart::FromVersion(created.metadata.resource_version.clone()))
         .await
         .expect_err("watch below compaction floor should expire");
-    assert_eq!(expired, ResourceError::WatchExpired {
-        requested_version: created.metadata.resource_version,
-        compacted_through: Some(second.metadata.resource_version),
-    });
+    assert_eq!(
+        expired,
+        ResourceError::WatchExpired {
+            requested_version: created.metadata.resource_version,
+            compacted_through: Some(second.metadata.resource_version),
+        }
+    );
 }
 
 pub async fn assert_consumer_relists_after_expired_watch_and_converges_with_backend<F: ResourceContractFixture>(backend: ResourceBackend) {

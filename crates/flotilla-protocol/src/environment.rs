@@ -455,12 +455,15 @@ token_env_vars: []
         let info: EnvironmentInfo = serde_json::from_str(r#"{"kind":"direct","id":"env-direct","status":"Running"}"#)
             .expect("should deserialize direct environment without image");
 
-        assert_eq!(info, EnvironmentInfo::Direct {
-            id: EnvironmentId::new("env-direct"),
-            display_name: None,
-            host_id: None,
-            status: EnvironmentStatus::Running,
-        });
+        assert_eq!(
+            info,
+            EnvironmentInfo::Direct {
+                id: EnvironmentId::new("env-direct"),
+                display_name: None,
+                host_id: None,
+                status: EnvironmentStatus::Running,
+            }
+        );
     }
 
     #[test]
@@ -492,12 +495,15 @@ token_env_vars: []
         let info: EnvironmentInfo = serde_json::from_str(r#"{"id":"env-provisioned","image":"ubuntu:24.04","status":"Stopped"}"#)
             .expect("legacy provisioned environments without kind should still deserialize");
 
-        assert_eq!(info, EnvironmentInfo::Provisioned {
-            id: EnvironmentId::new("env-provisioned"),
-            display_name: None,
-            image: ImageId::new("ubuntu:24.04"),
-            status: EnvironmentStatus::Stopped,
-        });
+        assert_eq!(
+            info,
+            EnvironmentInfo::Provisioned {
+                id: EnvironmentId::new("env-provisioned"),
+                display_name: None,
+                image: ImageId::new("ubuntu:24.04"),
+                status: EnvironmentStatus::Stopped,
+            }
+        );
     }
 }
 

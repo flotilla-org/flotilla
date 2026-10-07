@@ -401,10 +401,10 @@ async fn project_declarations_register_single_and_multi_member_projects_with_pro
     );
     let split = backend.using::<Project>("flotilla").get("split").await.expect("split project");
     assert_eq!(split.spec.default_workflow_ref, "single-agent");
-    assert_eq!(split.spec.repositories.iter().map(|member| member.alias.as_deref()).collect::<Vec<_>>(), vec![
-        Some("app"),
-        Some("operations")
-    ]);
+    assert_eq!(
+        split.spec.repositories.iter().map(|member| member.alias.as_deref()).collect::<Vec<_>>(),
+        vec![Some("app"), Some("operations")]
+    );
     for member in &split.spec.repositories {
         let repository = backend.using::<Repository>("flotilla").get(&member.repo.to_string()).await.expect("member repository");
         assert_eq!(repository.metadata.annotations.get(BOOTSTRAP_COMMIT_ANNOTATION).map(String::as_str), Some("0123456789abcdef"));
@@ -515,12 +515,16 @@ async fn declaration_adoption_survives_whole_repository_project_reconciliation()
 
     for result in [
         execute_project_add(&daemon, &mut rx, checkout.to_string_lossy().into_owned(), Some("flotilla"), None).await,
-        execute_project_command(&daemon, &mut rx, CommandAction::ProjectApply {
-            name: "flotilla".to_string(),
-            spec_yaml: format!(
-                "display_name: overwritten\ndefault_workflow_ref: single-agent\nrepositories:\n  - repo: {registered_repo}\n"
-            ),
-        })
+        execute_project_command(
+            &daemon,
+            &mut rx,
+            CommandAction::ProjectApply {
+                name: "flotilla".to_string(),
+                spec_yaml: format!(
+                    "display_name: overwritten\ndefault_workflow_ref: single-agent\nrepositories:\n  - repo: {registered_repo}\n"
+                ),
+            },
+        )
         .await,
     ] {
         assert!(
@@ -761,10 +765,11 @@ async fn ops_entries_materialize_by_frontmatter_scope_with_provenance_and_conver
     let repositories = backend.using::<flotilla_resources::Repository>("flotilla");
     for source in repositories.list().await.expect("list repositories").items {
         repositories
-            .update_status(&source.metadata.name, &source.metadata.resource_version, &flotilla_resources::RepositoryStatus {
-                default_branch: Some("main".to_string()),
-                ..Default::default()
-            })
+            .update_status(
+                &source.metadata.name,
+                &source.metadata.resource_version,
+                &flotilla_resources::RepositoryStatus { default_branch: Some("main".to_string()), ..Default::default() },
+            )
             .await
             .expect("resolve repository default branch");
     }
@@ -989,13 +994,16 @@ async fn project_replica_does_not_materialize_operational_entries_on_refresh() {
         .with_subscriber(subscriber)
         .await;
 
-    assert_eq!(result, CommandValue::ProjectRefreshed {
-        name: "replicated".to_string(),
-        members: 2,
-        converged: false,
-        changes: Vec::new(),
-        operational_entries: Vec::new(),
-    });
+    assert_eq!(
+        result,
+        CommandValue::ProjectRefreshed {
+            name: "replicated".to_string(),
+            members: 2,
+            converged: false,
+            changes: Vec::new(),
+            operational_entries: Vec::new(),
+        }
+    );
     assert!(
         matches!(backend.using::<Project>("flotilla").get("replicated").await, Err(flotilla_resources::ResourceError::NotFound { .. })),
         "refreshing a replica must not establish local Project authorship"
@@ -1375,14 +1383,17 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
         .execute(Command::builder().action(CommandAction::TrackRepoPath { path: checkout_path.clone() }).build())
         .await
         .expect("repo add after remote appears");
-    assert_eq!(await_command_result(&mut rx, second_id).await, CommandValue::RepoTracked {
-        path: physical_path,
-        resolved_from: None,
-        identity_change: Some(RepositoryIdentityChange {
-            previous_display: "local".to_string(),
-            current_display: "https://github.com/flotilla-org/andamento".to_string(),
-        }),
-    });
+    assert_eq!(
+        await_command_result(&mut rx, second_id).await,
+        CommandValue::RepoTracked {
+            path: physical_path,
+            resolved_from: None,
+            identity_change: Some(RepositoryIdentityChange {
+                previous_display: "local".to_string(),
+                current_display: "https://github.com/flotilla-org/andamento".to_string(),
+            }),
+        }
+    );
 
     let projects = backend.definitions::<Project>("flotilla").list().await.expect("project list");
     assert_eq!(projects.len(), 1, "identity refresh must not create another Project");
@@ -1397,10 +1408,11 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
     backend
         .clone()
         .using::<Repository>("flotilla")
-        .update_status(&repository.metadata.name, &repository.metadata.resource_version, &RepositoryStatus {
-            default_branch: Some("main".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &repository.metadata.name,
+            &repository.metadata.resource_version,
+            &RepositoryStatus { default_branch: Some("main".to_string()), ..Default::default() },
+        )
         .await
         .expect("repository status update");
     let convoy_id = daemon
@@ -1420,9 +1432,10 @@ async fn retracking_path_after_remote_appears_does_not_materialize_a_project() {
         )
         .await
         .expect("convoy create");
-    assert_eq!(await_command_result(&mut rx, convoy_id).await, CommandValue::ConvoyCreated {
-        name: "identity-migrated@github-com-flotilla-org-andamento".into()
-    });
+    assert_eq!(
+        await_command_result(&mut rx, convoy_id).await,
+        CommandValue::ConvoyCreated { name: "identity-migrated@github-com-flotilla-org-andamento".into() }
+    );
 }
 
 #[tokio::test]
@@ -1554,14 +1567,17 @@ async fn refresh_surfaces_repository_identity_change_without_materializing_a_pro
         .await
         .expect("refresh command");
 
-    assert_eq!(await_command_result(&mut rx, refresh_id).await, CommandValue::Refreshed {
-        repository_count: 1,
-        repos: vec![physical_path],
-        identity_changes: vec![RepositoryIdentityChange {
-            previous_display: "local".to_string(),
-            current_display: "https://github.com/flotilla-org/refreshed".to_string(),
-        }],
-    });
+    assert_eq!(
+        await_command_result(&mut rx, refresh_id).await,
+        CommandValue::Refreshed {
+            repository_count: 1,
+            repos: vec![physical_path],
+            identity_changes: vec![RepositoryIdentityChange {
+                previous_display: "local".to_string(),
+                current_display: "https://github.com/flotilla-org/refreshed".to_string(),
+            }],
+        }
+    );
     assert!(backend.using::<Project>("flotilla").list().await.expect("project list").items.is_empty());
     assert!(backend.using::<Repository>("flotilla").get(&remote_key.to_string()).await.is_ok());
 }
@@ -1797,28 +1813,31 @@ async fn tracking_repo_does_not_use_naming_cascade_when_slug_candidates_collide(
     let projects = backend.clone().using::<Project>("flotilla");
     for (name, repo_ref) in [("shared", "first-repository"), ("github-com-org-b-shared", "second-repository")] {
         projects
-            .create(&InputMeta::builder().name(name.to_string()).build(), &flotilla_resources::ProjectSpec {
-                charter: None,
-                role_definitions: BTreeMap::new(),
-                charter_prose: BTreeMap::new(),
-                parent: None,
-                platform_matrix: Vec::new(),
-                role_needs: Default::default(),
-                skills: BTreeMap::new(),
-                display_name: name.to_string(),
-                default_workflow_ref: "custom-workflow".to_string(),
-                supervision: None,
-                issue_source_bindings: Vec::new(),
-                dispatch_policy: None,
-                repositories: vec![flotilla_resources::ProjectRepositorySpec {
-                    charter_store: None,
-                    repo: RepositoryKey(repo_ref.to_string()),
-                    alias: None,
-                    roles: Default::default(),
-                    subpath: None,
-                    default_branch: None,
-                }],
-            })
+            .create(
+                &InputMeta::builder().name(name.to_string()).build(),
+                &flotilla_resources::ProjectSpec {
+                    charter: None,
+                    role_definitions: BTreeMap::new(),
+                    charter_prose: BTreeMap::new(),
+                    parent: None,
+                    platform_matrix: Vec::new(),
+                    role_needs: Default::default(),
+                    skills: BTreeMap::new(),
+                    display_name: name.to_string(),
+                    default_workflow_ref: "custom-workflow".to_string(),
+                    supervision: None,
+                    issue_source_bindings: Vec::new(),
+                    dispatch_policy: None,
+                    repositories: vec![flotilla_resources::ProjectRepositorySpec {
+                        charter_store: None,
+                        repo: RepositoryKey(repo_ref.to_string()),
+                        alias: None,
+                        roles: Default::default(),
+                        subpath: None,
+                        default_branch: None,
+                    }],
+                },
+            )
             .await
             .expect("occupied project create");
     }
@@ -1850,14 +1869,17 @@ async fn project_add_untracked_path_ensures_repository_checkout_and_whole_repo_p
     assert_eq!(project.spec.display_name, "My Project");
     // #2719: generated Projects leave workflow choice to the cascade.
     assert!(project.spec.default_workflow_ref.is_empty());
-    assert_eq!(project.spec.repositories.as_slice(), [flotilla_resources::ProjectRepositorySpec {
-        charter_store: None,
-        repo: repository_key,
-        alias: None,
-        roles: Default::default(),
-        subpath: None,
-        default_branch: None,
-    }]);
+    assert_eq!(
+        project.spec.repositories.as_slice(),
+        [flotilla_resources::ProjectRepositorySpec {
+            charter_store: None,
+            repo: repository_key,
+            alias: None,
+            roles: Default::default(),
+            subpath: None,
+            default_branch: None,
+        }]
+    );
 }
 
 async fn project_checkout_set_with_store_history(tmp: &tempfile::TempDir, with_history: bool) -> Vec<CheckoutSpec> {
@@ -2050,9 +2072,10 @@ async fn repeated_project_add_preserves_user_edits_to_materialized_project() {
         .await
         .expect("repository create");
     let mut rx = daemon.subscribe();
-    assert_eq!(execute_project_add(&daemon, &mut rx, "repo".to_string(), Some("core"), None).await, CommandValue::ProjectAdded {
-        name: "core".into()
-    });
+    assert_eq!(
+        execute_project_add(&daemon, &mut rx, "repo".to_string(), Some("core"), None).await,
+        CommandValue::ProjectAdded { name: "core".into() }
+    );
     let projects = backend.clone().using::<Project>("flotilla");
     let original = projects.get("core").await.expect("project");
     let mut evolved = original.spec.clone();
@@ -2064,9 +2087,10 @@ async fn repeated_project_add_preserves_user_edits_to_materialized_project() {
         .await
         .expect("evolve project");
 
-    assert_eq!(execute_project_add(&daemon, &mut rx, "repo".to_string(), Some("core"), None).await, CommandValue::ProjectAdded {
-        name: "core".into()
-    });
+    assert_eq!(
+        execute_project_add(&daemon, &mut rx, "repo".to_string(), Some("core"), None).await,
+        CommandValue::ProjectAdded { name: "core".into() }
+    );
     let reconciled = projects.get("core").await.expect("project");
     assert_eq!(reconciled.spec, evolved);
     assert_eq!(reconciled.metadata.labels.get(MANAGED_BY_LABEL).map(String::as_str), Some("whole-repository-project"));
@@ -2170,10 +2194,11 @@ async fn convoy_create_carries_project_ref() {
     backend
         .clone()
         .using::<Repository>("flotilla")
-        .update_status(&repository.metadata.name, &repository.metadata.resource_version, &RepositoryStatus {
-            default_branch: Some("main".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &repository.metadata.name,
+            &repository.metadata.resource_version,
+            &RepositoryStatus { default_branch: Some("main".to_string()), ..Default::default() },
+        )
         .await
         .expect("repository status update");
     assert_eq!(

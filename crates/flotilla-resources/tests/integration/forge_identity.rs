@@ -34,11 +34,14 @@ fn equivalent_urls_have_one_forge_relative_repository_key() {
         .map(|form| {
             let canonical = flotilla_resources::canonicalize_repo_url(form).expect("canonical remote");
             let spec = RepositorySpec::remote(canonical).expect("repository").on_forge(&forge).expect("forge identity");
-            assert_eq!(spec.identity(), &RepositoryIdentity::Forge {
-                forge_ref: "flotilla-lab".to_string(),
-                owner: "robert".to_string(),
-                repo_name: "ghostty-ops".to_string(),
-            });
+            assert_eq!(
+                spec.identity(),
+                &RepositoryIdentity::Forge {
+                    forge_ref: "flotilla-lab".to_string(),
+                    owner: "robert".to_string(),
+                    repo_name: "ghostty-ops".to_string(),
+                }
+            );
             spec.key()
         })
         .collect::<BTreeSet<_>>();

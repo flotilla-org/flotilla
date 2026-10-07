@@ -67,10 +67,12 @@ pub async fn run(socket_path: &Path, config_dir: &Path, state_dir: &Path, timeou
     )
     .await?;
     let daemon = server.daemon();
-    let runtime = DaemonRuntime::start_with_options(daemon, Arc::clone(&config), Some(socket_path.to_path_buf()), RuntimeOptions {
-        startup_ready: Some(server.startup_ready()),
-        ..RuntimeOptions::default()
-    })
+    let runtime = DaemonRuntime::start_with_options(
+        daemon,
+        Arc::clone(&config),
+        Some(socket_path.to_path_buf()),
+        RuntimeOptions { startup_ready: Some(server.startup_ready()), ..RuntimeOptions::default() },
+    )
     .await?;
     server.install_blob_store(Arc::clone(&runtime.blob_store))?;
 

@@ -73,29 +73,33 @@ async fn vessel_metadata_and_status_roundtrip() {
     };
     let created = resolver.create(&vessel_meta("convoy-fix-bug-123-implement"), &spec).await.expect("create should succeed");
     let updated = resolver
-        .update_status("convoy-fix-bug-123-implement", &created.metadata.resource_version, &VesselStatus {
-            configured_limits: None,
-            runtime_observation: None,
-            placement_decision: None,
-            phase: VesselPhase::Ready,
-            message: None,
-            observed_policy_ref: Some("docker-on-01HXYZ".to_string()),
-            observed_policy_version: Some("12".to_string()),
-            environment_ref: Some("env-a".to_string()),
-            image_ref: Some("registry.example/crew:latest".to_string()),
-            local_image_id: Some("sha256:test-image".to_string()),
-            registry_digest: None,
-            checkout_refs: Default::default(),
-            terminal_session_refs: vec!["term-a".to_string()],
-            interrupted_roles: Default::default(),
-            started_at: Some(Utc::now()),
-            ready_at: Some(Utc::now()),
-            requested_stance: Some(flotilla_resources::Stance::WorkspaceWrite),
-            effective_stance: Some(flotilla_resources::Stance::Contained),
-            held_credentials: Default::default(),
-            credential_delivery_retry: None,
-            credential_refresh_retry: None,
-        })
+        .update_status(
+            "convoy-fix-bug-123-implement",
+            &created.metadata.resource_version,
+            &VesselStatus {
+                configured_limits: None,
+                runtime_observation: None,
+                placement_decision: None,
+                phase: VesselPhase::Ready,
+                message: None,
+                observed_policy_ref: Some("docker-on-01HXYZ".to_string()),
+                observed_policy_version: Some("12".to_string()),
+                environment_ref: Some("env-a".to_string()),
+                image_ref: Some("registry.example/crew:latest".to_string()),
+                local_image_id: Some("sha256:test-image".to_string()),
+                registry_digest: None,
+                checkout_refs: Default::default(),
+                terminal_session_refs: vec!["term-a".to_string()],
+                interrupted_roles: Default::default(),
+                started_at: Some(Utc::now()),
+                ready_at: Some(Utc::now()),
+                requested_stance: Some(flotilla_resources::Stance::WorkspaceWrite),
+                effective_stance: Some(flotilla_resources::Stance::Contained),
+                held_credentials: Default::default(),
+                credential_delivery_retry: None,
+                credential_refresh_retry: None,
+            },
+        )
         .await
         .expect("status update should succeed");
 

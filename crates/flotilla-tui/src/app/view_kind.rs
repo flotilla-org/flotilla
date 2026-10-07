@@ -92,17 +92,20 @@ mod tests {
     #[test]
     fn project_view_composes_store_and_demand_backed_queries() {
         let address = ViewAddress::Project { namespace: "flotilla".into(), name: "roadmap".into() };
-        assert_eq!(queries(&address, None), vec![
-            QueryId::Awareness {
-                scope: Some(QueryScope::new("flotilla", "roadmap")),
-                grouping: AwarenessGrouping::Project,
-                limit: AwarenessLimit::default(),
-            },
-            QueryId::Convoys { scope: Some(QueryScope::new("flotilla", "roadmap")) },
-            QueryId::Checkouts { scope: Some(QueryScope::new("flotilla", "roadmap")) },
-            QueryId::Issues { scope: QueryScope::new("flotilla", "roadmap"), search: None, label: None },
-            QueryId::Independents { scope: Some(QueryScope::new("flotilla", "roadmap")) },
-        ]);
+        assert_eq!(
+            queries(&address, None),
+            vec![
+                QueryId::Awareness {
+                    scope: Some(QueryScope::new("flotilla", "roadmap")),
+                    grouping: AwarenessGrouping::Project,
+                    limit: AwarenessLimit::default(),
+                },
+                QueryId::Convoys { scope: Some(QueryScope::new("flotilla", "roadmap")) },
+                QueryId::Checkouts { scope: Some(QueryScope::new("flotilla", "roadmap")) },
+                QueryId::Issues { scope: QueryScope::new("flotilla", "roadmap"), search: None, label: None },
+                QueryId::Independents { scope: Some(QueryScope::new("flotilla", "roadmap")) },
+            ]
+        );
         assert_eq!(kind_modes(Some(&address)), vec![BindingModeId::Convoys, BindingModeId::DemandTable, BindingModeId::Project]);
     }
 
@@ -118,11 +121,10 @@ mod tests {
     #[test]
     fn scoped_issue_view_subscribes_to_its_ephemeral_search_window() {
         let address: ViewAddress = "issues?project=flotilla%2Froadmap".parse().expect("address");
-        assert_eq!(queries(&address, Some("widget")), vec![QueryId::Issues {
-            scope: QueryScope::new("flotilla", "roadmap"),
-            search: Some("widget".into()),
-            label: None,
-        }]);
+        assert_eq!(
+            queries(&address, Some("widget")),
+            vec![QueryId::Issues { scope: QueryScope::new("flotilla", "roadmap"), search: Some("widget".into()), label: None }]
+        );
     }
 
     #[test]

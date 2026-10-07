@@ -1898,11 +1898,10 @@ esac
             .await
             .expect("skip external Codex home");
 
-        assert_eq!(runner.0.lock().expect("recording runner lock should be healthy").as_slice(), &[("rm".to_string(), vec![
-            "-f".to_string(),
-            "--".to_string(),
-            "/tmp/unused-skill-token".to_string()
-        ])]);
+        assert_eq!(
+            runner.0.lock().expect("recording runner lock should be healthy").as_slice(),
+            &[("rm".to_string(), vec!["-f".to_string(), "--".to_string(), "/tmp/unused-skill-token".to_string()])]
+        );
     }
 
     #[test]

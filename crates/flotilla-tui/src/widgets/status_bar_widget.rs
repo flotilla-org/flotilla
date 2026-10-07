@@ -397,11 +397,14 @@ mod tests {
         let repo_identity = RepoIdentity { authority: String::new(), path: String::new() };
 
         let mut in_flight = HashMap::new();
-        in_flight.insert(10, InFlightCommand {
-            repo_identity: repo_identity.clone(),
-            repo: PathBuf::from("/tmp/test-repo"),
-            description: "older command".into(),
-        });
+        in_flight.insert(
+            10,
+            InFlightCommand {
+                repo_identity: repo_identity.clone(),
+                repo: PathBuf::from("/tmp/test-repo"),
+                description: "older command".into(),
+            },
+        );
         in_flight.insert(20, InFlightCommand { repo_identity, repo: PathBuf::from("/tmp/test-repo"), description: "newer command".into() });
 
         let task = active_task(&in_flight).expect("should have an active task");
@@ -427,11 +430,14 @@ mod tests {
     #[test]
     fn active_task_shows_context_free_command_on_project_view() {
         let mut in_flight = HashMap::new();
-        in_flight.insert(42, InFlightCommand {
-            repo_identity: RepoIdentity { authority: String::new(), path: String::new() },
-            repo: PathBuf::new(),
-            description: "Starting convoy...".into(),
-        });
+        in_flight.insert(
+            42,
+            InFlightCommand {
+                repo_identity: RepoIdentity { authority: String::new(), path: String::new() },
+                repo: PathBuf::new(),
+                description: "Starting convoy...".into(),
+            },
+        );
 
         let task = active_task(&in_flight).expect("project view should show context-free command progress");
 
@@ -441,11 +447,14 @@ mod tests {
     #[test]
     fn command_progress_is_visible_without_an_implicit_repository() {
         let mut in_flight = HashMap::new();
-        in_flight.insert(42, InFlightCommand {
-            repo_identity: RepoIdentity { authority: "github.com".into(), path: "org/repo".into() },
-            repo: PathBuf::from("/tmp/repo"),
-            description: "Opening workspace...".into(),
-        });
+        in_flight.insert(
+            42,
+            InFlightCommand {
+                repo_identity: RepoIdentity { authority: "github.com".into(), path: "org/repo".into() },
+                repo: PathBuf::from("/tmp/repo"),
+                description: "Opening workspace...".into(),
+            },
+        );
         assert_eq!(active_task(&in_flight).expect("global status shows repository command progress").description, "Opening workspace...");
     }
 

@@ -232,20 +232,23 @@ mod tests {
     fn ssh_invocation_refuses_prompts_and_quotes_the_remote_command() {
         let endpoint =
             SshEndpoint::parse("ssh://udder/opt/flotilla tools/flotilla").expect("parse").with_remote_socket("/run/my daemon.sock");
-        assert_eq!(endpoint.ssh_args(), vec![
-            "-T",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=3",
-            "--",
-            "ssh://udder",
-            "'/opt/flotilla tools/flotilla' --socket '/run/my daemon.sock' daemon-bridge",
-        ]);
+        assert_eq!(
+            endpoint.ssh_args(),
+            vec![
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
+                "--",
+                "ssh://udder",
+                "'/opt/flotilla tools/flotilla' --socket '/run/my daemon.sock' daemon-bridge",
+            ]
+        );
         assert_eq!(SshEndpoint::parse("ssh://udder").expect("parse").remote_command(), "'flotilla' daemon-bridge");
     }
 

@@ -59,23 +59,27 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         .expect("convoy");
     backend
         .using::<Convoy>(NAMESPACE)
-        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: ConvoyPhase::Active,
-            observed_workflow_ref: Some("scratch".into()),
-            workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                cascade: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                stall_nudges: Default::default(),
-                supervision: None,
-                vessels: vec![VesselRequirement::builder()
-                    .name("work".into())
-                    .crew(vec![CrewSpec::builder().role("shell".into()).source(CrewSource::Tool { command: "true".into() }).build()])
-                    .build()],
-            }),
-            work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
-            ..Default::default()
-        })
+        .update_status(
+            &convoy.metadata.name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ConvoyPhase::Active,
+                observed_workflow_ref: Some("scratch".into()),
+                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                    cascade: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    vessels: vec![VesselRequirement::builder()
+                        .name("work".into())
+                        .crew(vec![CrewSpec::builder().role("shell".into()).source(CrewSource::Tool { command: "true".into() }).build()])
+                        .build()],
+                }),
+                work: BTreeMap::from([("work".into(), WorkState::builder().phase(WorkPhase::Running).build())]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("admitted convoy");
     let repo = RepositoryKey("test-repository".into());
@@ -95,11 +99,15 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         )
         .await
         .expect("checkout");
-    flotilla_resources::apply_status_patch(&checkouts, "recoverable-work", &flotilla_resources::CheckoutStatusPatch::MarkReady {
-        path: "/hulls/work/flotilla".into(),
-        commit: None,
-        branch_provenance: Default::default(),
-    })
+    flotilla_resources::apply_status_patch(
+        &checkouts,
+        "recoverable-work",
+        &flotilla_resources::CheckoutStatusPatch::MarkReady {
+            path: "/hulls/work/flotilla".into(),
+            commit: None,
+            branch_provenance: Default::default(),
+        },
+    )
     .await
     .expect("checkout ready");
     let vessels = backend.using::<Vessel>(NAMESPACE);
@@ -119,12 +127,16 @@ async fn memory_incident_survives_backing_loss_and_is_visible_in_explain() {
         .await
         .expect("vessel");
     vessels
-        .update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &VesselStatus {
-            phase: flotilla_resources::VesselPhase::Ready,
-            environment_ref: Some(env_id.to_string()),
-            checkout_refs: BTreeMap::from([(repo, "recoverable-work".into())]),
-            ..Default::default()
-        })
+        .update_status(
+            &vessel.metadata.name,
+            &vessel.metadata.resource_version,
+            &VesselStatus {
+                phase: flotilla_resources::VesselPhase::Ready,
+                environment_ref: Some(env_id.to_string()),
+                checkout_refs: BTreeMap::from([(repo, "recoverable-work".into())]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("vessel ready");
     let provider = flotilla_core::providers::environment::docker::DockerEnvironmentProvider::new(Arc::new(MemoryIncidentRunner::default()));

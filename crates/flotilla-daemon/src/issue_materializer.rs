@@ -1405,11 +1405,10 @@ mod tests {
             let mut matching = issue("1");
             matching.labels = vec!["BUG".into()];
             let provider = Arc::new(ScriptedProvider::new(
-                vec![IssueResultPage { items: vec![matching.clone(), issue("2")], total: None, has_more }, IssueResultPage {
-                    items: vec![matching],
-                    total: None,
-                    has_more: false,
-                }],
+                vec![
+                    IssueResultPage { items: vec![matching.clone(), issue("2")], total: None, has_more },
+                    IssueResultPage { items: vec![matching], total: None, has_more: false },
+                ],
                 vec![],
             ));
             let resolver = Arc::new(FixedResolver {
@@ -1439,11 +1438,10 @@ mod tests {
         let first = project_query("turnover-first");
         let second = project_query("turnover-second");
         let third = project_query("turnover-third");
-        let old = Arc::new(ScriptedProvider::new(vec![page(&["1"], false), page(&["retired"], false)], vec![IssueChangeset {
-            updated: vec![],
-            closed: vec![],
-            has_more: false,
-        }]));
+        let old = Arc::new(ScriptedProvider::new(
+            vec![page(&["1"], false), page(&["retired"], false)],
+            vec![IssueChangeset { updated: vec![], closed: vec![], has_more: false }],
+        ));
         let replacement = Arc::new(ScriptedProvider::new(vec![page(&["2"], false)], vec![]));
         let resolver = Arc::new(TurnoverResolver {
             source: IssueSource { service: "github".into(), scope: "owner/repo".into() },
@@ -1476,11 +1474,10 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let query = project_query("turnover");
         let old = Arc::new(ScriptedProvider::new(vec![page(&["1"], true), page(&["retired"], false)], vec![]));
-        let replacement = Arc::new(ScriptedProvider::new(vec![page(&["2"], false)], vec![IssueChangeset {
-            updated: vec![issue("3")],
-            closed: vec![],
-            has_more: false,
-        }]));
+        let replacement = Arc::new(ScriptedProvider::new(
+            vec![page(&["2"], false)],
+            vec![IssueChangeset { updated: vec![issue("3")], closed: vec![], has_more: false }],
+        ));
         let resolver = Arc::new(TurnoverResolver {
             source: IssueSource { service: "github".into(), scope: "owner/repo".into() },
             provider: StdMutex::new(old.clone()),
@@ -1661,11 +1658,10 @@ mod tests {
         let source = IssueSource { service: "https://github.com".into(), scope: "owner/repo".into() };
         let mut changed = issue("2");
         changed.as_of = Utc::now() + ChronoDuration::seconds(1);
-        let provider = Arc::new(ScriptedProvider::new(vec![page(&["1"], false), page(&["1"], false)], vec![IssueChangeset {
-            updated: vec![changed],
-            closed: vec![],
-            has_more: false,
-        }]));
+        let provider = Arc::new(ScriptedProvider::new(
+            vec![page(&["1"], false), page(&["1"], false)],
+            vec![IssueChangeset { updated: vec![changed], closed: vec![], has_more: false }],
+        ));
         let resolver = Arc::new(FixedResolver { sources: vec![source], provider: provider.clone() });
         let (event_tx, mut events) = broadcast::channel(8);
         let mut materializer = IssueMaterializer::new(state.clone(), resolver, Arc::new(BroadcastEventSink::new(event_tx)));
@@ -1993,20 +1989,20 @@ mod tests {
         loses_ready.labels = vec![READY_ISSUE_LABEL.into()];
         let mut gains_ready = issue("GAINS-READY");
         gains_ready.labels = vec![READY_ISSUE_LABEL.into()];
-        let provider =
-            Arc::new(ScriptedProvider::new(vec![IssueResultPage { items: vec![loses_ready], total: Some(1), has_more: false }], vec![
-                IssueChangeset { updated: vec![issue("LOSES-READY"), gains_ready], closed: vec![], has_more: false },
-            ]));
+        let provider = Arc::new(ScriptedProvider::new(
+            vec![IssueResultPage { items: vec![loses_ready], total: Some(1), has_more: false }],
+            vec![IssueChangeset { updated: vec![issue("LOSES-READY"), gains_ready], closed: vec![], has_more: false }],
+        ));
         let (materializer, mut events) = manager(&state, &query, vec![source.clone()], provider);
         let _ = next_event(&mut events).await;
 
         materializer.refresh(&query);
 
         let DaemonEvent::ResultDelta(delta) = next_event(&mut events).await else { panic!("refresh must emit a delta") };
-        assert_eq!(delta.changes.as_issues().expect("newly ready issue")[0].reference, IssueRef {
-            source: source.clone(),
-            id: "GAINS-READY".into()
-        });
+        assert_eq!(
+            delta.changes.as_issues().expect("newly ready issue")[0].reference,
+            IssueRef { source: source.clone(), id: "GAINS-READY".into() }
+        );
         assert_eq!(delta.changes.removed_issues().expect("issue that lost ready"), &[IssueRef { source, id: "LOSES-READY".into() }]);
         assert_eq!(
             state
@@ -2030,11 +2026,10 @@ mod tests {
         let source = IssueSource { service: "https://issues.example".into(), scope: "stable/order".into() };
         let mut refreshed_low_id = issue("1");
         refreshed_low_id.as_of = Utc::now();
-        let provider = Arc::new(ScriptedProvider::new(vec![page(&["10", "1"], false)], vec![IssueChangeset {
-            updated: vec![refreshed_low_id],
-            closed: vec![],
-            has_more: false,
-        }]));
+        let provider = Arc::new(ScriptedProvider::new(
+            vec![page(&["10", "1"], false)],
+            vec![IssueChangeset { updated: vec![refreshed_low_id], closed: vec![], has_more: false }],
+        ));
         let (materializer, mut events) = manager(&state, &query, vec![source], provider);
         let _ = next_event(&mut events).await;
         let initial_window = state.result_set_for(&query).await.expect("initial window");
@@ -2066,9 +2061,10 @@ mod tests {
             .collect::<Vec<_>>();
         let mut newest = issue("NEWEST");
         newest.as_of = base + ChronoDuration::seconds(1);
-        let provider = Arc::new(ScriptedProvider::new(vec![IssueResultPage { items: initial, total: Some(51), has_more: true }], vec![
-            IssueChangeset { updated: vec![newest], closed: vec![], has_more: false },
-        ]));
+        let provider = Arc::new(ScriptedProvider::new(
+            vec![IssueResultPage { items: initial, total: Some(51), has_more: true }],
+            vec![IssueChangeset { updated: vec![newest], closed: vec![], has_more: false }],
+        ));
         let (materializer, mut events) = manager(&state, &query, vec![source.clone()], provider);
         let _ = next_event(&mut events).await;
 
@@ -2091,11 +2087,10 @@ mod tests {
         let initial = (0..PAGE_SIZE).map(|index| issue(&format!("ISSUE-{index:02}"))).collect::<Vec<_>>();
         let reloaded = (1..=PAGE_SIZE).map(|index| issue(&format!("ISSUE-{index:02}"))).collect::<Vec<_>>();
         let provider = Arc::new(ScriptedProvider::new(
-            vec![IssueResultPage { items: initial, total: Some(51), has_more: true }, IssueResultPage {
-                items: reloaded,
-                total: Some(50),
-                has_more: false,
-            }],
+            vec![
+                IssueResultPage { items: initial, total: Some(51), has_more: true },
+                IssueResultPage { items: reloaded, total: Some(50), has_more: false },
+            ],
             vec![IssueChangeset {
                 updated: vec![],
                 closed: vec![IssueRef { source: source.clone(), id: "ISSUE-00".into() }],
@@ -2120,10 +2115,13 @@ mod tests {
         let state = AggregatorProjectionState::new();
         let query = project_query("repo_closed_cursor");
         let source = IssueSource { service: "https://issues.example".into(), scope: "closed/repo".into() };
-        let provider = Arc::new(ScriptedProvider::new(vec![page(&["CLOSED"], false)], vec![
-            IssueChangeset { updated: vec![], closed: vec![IssueRef { source: source.clone(), id: "CLOSED".into() }], has_more: false },
-            IssueChangeset { updated: vec![], closed: vec![], has_more: false },
-        ]));
+        let provider = Arc::new(ScriptedProvider::new(
+            vec![page(&["CLOSED"], false)],
+            vec![
+                IssueChangeset { updated: vec![], closed: vec![IssueRef { source: source.clone(), id: "CLOSED".into() }], has_more: false },
+                IssueChangeset { updated: vec![], closed: vec![], has_more: false },
+            ],
+        ));
         let (materializer, mut events) = manager(&state, &query, vec![source], provider.clone());
         let _ = next_event(&mut events).await;
 

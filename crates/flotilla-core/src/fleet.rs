@@ -64,11 +64,14 @@ pub(crate) async fn replicated_host_reports(
         }) {
             continue;
         }
-        reports.insert(host, ReplicatedHostReport {
-            host_id: source.object.metadata.name.clone(),
-            last_synced_at: *last_synced_at,
-            status: source.object.status.clone(),
-        });
+        reports.insert(
+            host,
+            ReplicatedHostReport {
+                host_id: source.object.metadata.name.clone(),
+                last_synced_at: *last_synced_at,
+                status: source.object.status.clone(),
+            },
+        );
     }
     reports
 }

@@ -3917,13 +3917,11 @@ mod tests {
         assert!(
             matches!(daemon.command, Some(SubCommand::Resource { command: ResourceSubCommand::Validate { path: None, from_daemon: true, host: Some(host), .. } }) if host == "feta")
         );
-        for args in [vec!["flotilla", "resource", "validate"], vec!["flotilla", "resource", "validate", "--host", "feta"], vec![
-            "flotilla",
-            "resource",
-            "validate",
-            "--from-daemon",
-            "resource.yaml",
-        ]] {
+        for args in [
+            vec!["flotilla", "resource", "validate"],
+            vec!["flotilla", "resource", "validate", "--host", "feta"],
+            vec!["flotilla", "resource", "validate", "--from-daemon", "resource.yaml"],
+        ] {
             assert!(Cli::try_parse_from(args).is_err());
         }
     }
@@ -4115,10 +4113,15 @@ mod tests {
         }
         // Other kinds carrying host refs must also round-trip through the same
         // read envelope, CLI renderer and local/routed apply-command handler.
-        cli_round_trip_host_reference::<Environment>(&home.resource_backend(), &*topology.client, node_id.clone(), &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.clone(), repo_default_dir: "/workspace".into() }),
-            docker: None,
-        })
+        cli_round_trip_host_reference::<Environment>(
+            &home.resource_backend(),
+            &*topology.client,
+            node_id.clone(),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.clone(), repo_default_dir: "/workspace".into() }),
+                docker: None,
+            },
+        )
         .await;
         cli_round_trip_host_reference::<FulfilmentKind>(
             &home.resource_backend(),
@@ -4459,9 +4462,12 @@ mod tests {
             assert_eq!(command.context_repo, Some(RepoSelector::Repository(key.clone())));
         }
         assert_eq!(super::resolve_optional_cwd_repository(&*daemon, "/unobserved".into()).await.expect("optional cwd"), None);
-        for args in [vec!["flotilla", "cr"], vec!["flotilla", "agent"], vec!["flotilla", "cr", "123", "open"], vec![
-            "flotilla", "agent", "session", "archive",
-        ]] {
+        for args in [
+            vec!["flotilla", "cr"],
+            vec!["flotilla", "agent"],
+            vec!["flotilla", "cr", "123", "open"],
+            vec!["flotilla", "agent", "session", "archive"],
+        ] {
             let cli = Cli::try_parse_from(args).expect("CLI");
             let resolved = match cli.command.as_ref().expect("noun") {
                 SubCommand::Domain(DomainCommand::Cr(noun)) => noun.clone().resolve(),

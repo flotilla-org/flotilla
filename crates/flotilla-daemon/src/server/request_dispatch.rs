@@ -82,11 +82,14 @@ impl LedgerCreationAuthority for RoutedLedgerCreation<'_> {
     async fn reserve(&self, address: &LeafAddress) -> Result<bool, String> {
         match self
             .dispatcher
-            .artifact_home_action(&self.node_id, CommandAction::ArtifactReserveLedgerComment {
-                namespace: self.namespace.clone(),
-                name: self.name.clone(),
-                address: address.clone(),
-            })
+            .artifact_home_action(
+                &self.node_id,
+                CommandAction::ArtifactReserveLedgerComment {
+                    namespace: self.namespace.clone(),
+                    name: self.name.clone(),
+                    address: address.clone(),
+                },
+            )
             .await?
         {
             CommandValue::LedgerCommentCreationReserved { granted } => Ok(granted),
@@ -376,11 +379,14 @@ impl<'a> RequestDispatcher<'a> {
         session_id: uuid::Uuid,
         query_subscriptions: QuerySubscriptions,
     ) -> Self {
-        Self::new_with_caller(daemon, remote_command_router, agent_state_store, session_id, query_subscriptions, CommandCaller {
-            principal_ref: flotilla_protocol::PrincipalRef::default(),
-            process: None,
-            crew: None,
-        })
+        Self::new_with_caller(
+            daemon,
+            remote_command_router,
+            agent_state_store,
+            session_id,
+            query_subscriptions,
+            CommandCaller { principal_ref: flotilla_protocol::PrincipalRef::default(), process: None, crew: None },
+        )
     }
 
     pub(super) fn new_with_caller(
@@ -1370,9 +1376,10 @@ mod ledger_projection_tests {
                 assert_eq!(project(revised).await.expect("revision"), url);
                 assert_eq!(project(revised).await.expect("unchanged revision"), url);
                 assert_eq!(runner.comments.lock().expect("comments").len(), 1);
-                assert_eq!(runner.writes.lock().expect("writes").iter().map(|(method, _)| method.as_str()).collect::<Vec<_>>(), [
-                    "POST", "PATCH"
-                ]);
+                assert_eq!(
+                    runner.writes.lock().expect("writes").iter().map(|(method, _)| method.as_str()).collect::<Vec<_>>(),
+                    ["POST", "PATCH"]
+                );
                 // Persisted reservations survive serialized round trips and spec revisions.
                 let resolver = authority.backend.using::<flotilla_resources::Artifact>("flotilla");
                 let stored = resolver.get(&authority.name).await.expect("reserved ledger");
@@ -1456,10 +1463,10 @@ mod ledger_projection_tests {
             let url = project_ledger_comment("demo", "coder", first, &address, &runner, Path::new("/"), &env, &AllowCreation)
                 .await
                 .expect("first projection");
-            assert_eq!(runner.writes.lock().expect("writes lock").as_slice(), [(
-                "POST".into(),
-                "repos/acme/repo/issues/42/comments".into()
-            )]);
+            assert_eq!(
+                runner.writes.lock().expect("writes lock").as_slice(),
+                [("POST".into(), "repos/acme/repo/issues/42/comments".into())]
+            );
             assert_eq!(
                 project_ledger_comment("demo", "coder", first, &address, &runner, Path::new("/"), &env, &AllowCreation)
                     .await

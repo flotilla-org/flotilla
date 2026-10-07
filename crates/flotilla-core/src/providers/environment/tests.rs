@@ -1252,27 +1252,30 @@ async fn docker_cleat_launch_does_not_forward_outer_terminal_identity() {
     let pool = CleatTerminalPoolFactory.probe(&bag, &config, &repo_root, env_runner).await.expect("cleat pool in Docker");
     pool.ensure_session("session", "codex", &repo_root, &vec![], &[]).await.expect("launch in Docker");
 
-    assert_eq!(inner.calls()[2].1, vec![
-        "exec",
-        "-w",
-        "/",
-        "test-container",
-        "/usr/bin/env",
-        "-i",
-        "PATH=/usr/local/bin:/usr/bin:/bin",
-        "/usr/local/bin/cleat",
-        "launch",
-        "--env-clear",
-        "--json",
-        "--record",
-        "session",
-        "--cwd",
-        "/repo",
-        "--cmd",
-        "codex",
-        "--env",
-        "PATH=/usr/local/bin:/usr/bin:/bin",
-    ]);
+    assert_eq!(
+        inner.calls()[2].1,
+        vec![
+            "exec",
+            "-w",
+            "/",
+            "test-container",
+            "/usr/bin/env",
+            "-i",
+            "PATH=/usr/local/bin:/usr/bin:/bin",
+            "/usr/local/bin/cleat",
+            "launch",
+            "--env-clear",
+            "--json",
+            "--record",
+            "session",
+            "--cwd",
+            "/repo",
+            "--cmd",
+            "codex",
+            "--env",
+            "PATH=/usr/local/bin:/usr/bin:/bin",
+        ]
+    );
 }
 
 /// Verifies that DockerEnvironmentRunner correctly transforms command calls into docker exec form,
@@ -1422,16 +1425,20 @@ async fn create_bounds_memory_and_swap() {
     let runner = Arc::new(RecordingRunner::new_ok("container-id"));
     let provider = DockerEnvironmentProvider::new(runner.clone());
     provider
-        .create(EnvironmentId::new("memory-test"), &flotilla_protocol::ImageId::new("test-image"), CreateOpts {
-            tokens: Vec::new(),
-            working_directory: None,
-            provisioned_mounts: Vec::new(),
-            tools: Vec::new(),
-            image_pull_policy: ImagePullPolicy::Never,
-            prepared_auth: Default::default(),
-            cpu_limit: None,
-            memory_policy: Default::default(),
-        })
+        .create(
+            EnvironmentId::new("memory-test"),
+            &flotilla_protocol::ImageId::new("test-image"),
+            CreateOpts {
+                tokens: Vec::new(),
+                working_directory: None,
+                provisioned_mounts: Vec::new(),
+                tools: Vec::new(),
+                image_pull_policy: ImagePullPolicy::Never,
+                prepared_auth: Default::default(),
+                cpu_limit: None,
+                memory_policy: Default::default(),
+            },
+        )
         .await
         .expect("create");
     let calls = runner.calls();
@@ -1625,19 +1632,22 @@ async fn list_backings_uses_immutable_identity_without_mount_metadata() {
     let provider = DockerEnvironmentProvider::new(runner.clone());
     let backings = provider.list_backings().await.expect("list backing identities");
     assert_eq!(backings, vec![super::EnvironmentBacking { environment_id: EnvironmentId::new("env-orphan"), container_id: id }]);
-    assert_eq!(runner.calls(), vec![(
-        "docker".into(),
-        vec![
-            "ps".into(),
-            "-a".into(),
-            "--no-trunc".into(),
-            "--filter".into(),
-            "label=flotilla.environment".into(),
-            "--format".into(),
-            r#"{{.ID}}\t{{.Label "flotilla.environment"}}"#.into(),
-        ],
-        PathBuf::from("/")
-    )]);
+    assert_eq!(
+        runner.calls(),
+        vec![(
+            "docker".into(),
+            vec![
+                "ps".into(),
+                "-a".into(),
+                "--no-trunc".into(),
+                "--filter".into(),
+                "label=flotilla.environment".into(),
+                "--format".into(),
+                r#"{{.ID}}\t{{.Label "flotilla.environment"}}"#.into(),
+            ],
+            PathBuf::from("/")
+        )]
+    );
 }
 
 // Empty listings are valid. Incomplete IDs or labels must fail closed, rather

@@ -183,16 +183,19 @@ async fn generated_table_action_completes_work() {
     convoys.create(&convoy_meta("fix-bug-123"), &convoy_spec("review-and-fix", "fix-bug-123")).await.expect("create convoy");
 
     let mut work = BTreeMap::new();
-    work.insert("implement".to_string(), WorkState {
-        provisioning_retry: None,
-        phase: WorkPhase::Pending,
-        completion_authority: WorkCompletionAuthority::CrewRollup,
-        ready_at: None,
-        started_at: None,
-        finished_at: None,
-        message: None,
-        placement: None,
-    });
+    work.insert(
+        "implement".to_string(),
+        WorkState {
+            provisioning_retry: None,
+            phase: WorkPhase::Pending,
+            completion_authority: WorkCompletionAuthority::CrewRollup,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            message: None,
+            placement: None,
+        },
+    );
     let snapshot = WorkflowSnapshot {
         cascade: None,
         stall_nudges: Default::default(),

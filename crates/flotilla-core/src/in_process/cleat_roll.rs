@@ -259,15 +259,19 @@ mod tests {
                 .await
                 .expect("crew session");
             resolver
-                .update_status(name, &session.metadata.resource_version, &TerminalSessionStatus {
-                    cleat_endpoint: Some(CleatEndpoint {
-                        runtime_root: "/named/crew root".into(),
-                        daemon: daemon_name.into(),
-                        session: name.into(),
-                    }),
-                    phase: TerminalSessionPhase::Running,
-                    ..Default::default()
-                })
+                .update_status(
+                    name,
+                    &session.metadata.resource_version,
+                    &TerminalSessionStatus {
+                        cleat_endpoint: Some(CleatEndpoint {
+                            runtime_root: "/named/crew root".into(),
+                            daemon: daemon_name.into(),
+                            session: name.into(),
+                        }),
+                        phase: TerminalSessionPhase::Running,
+                        ..Default::default()
+                    },
+                )
                 .await
                 .expect("record crew endpoint");
         }
@@ -298,15 +302,19 @@ mod tests {
             .await
             .expect("retained vessel session");
         sessions
-            .update_status("missing-runner", &missing.metadata.resource_version, &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                cleat_endpoint: Some(CleatEndpoint {
-                    runtime_root: "/var/lib/flotilla/cleat".into(),
-                    daemon: "default@1".into(),
-                    session: "coder".into(),
-                }),
-                ..Default::default()
-            })
+            .update_status(
+                "missing-runner",
+                &missing.metadata.resource_version,
+                &TerminalSessionStatus {
+                    phase: TerminalSessionPhase::Running,
+                    cleat_endpoint: Some(CleatEndpoint {
+                        runtime_root: "/var/lib/flotilla/cleat".into(),
+                        daemon: "default@1".into(),
+                        session: "coder".into(),
+                    }),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("retained endpoint");
         let inventory = daemon.crew_cleat_targets(true).await.expect("known targets");

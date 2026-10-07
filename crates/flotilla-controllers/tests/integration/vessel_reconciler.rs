@@ -207,50 +207,57 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
     let convoy = backend
         .clone()
         .using::<Convoy>(NAMESPACE)
-        .create(&meta("convoy-scratch"), &ConvoySpec {
-            continuation: None,
-            subjects: Vec::new(),
-            role: String::new(),
-            generation: 1,
-            workflow_ref: "scratch".to_string(),
-            dispatching_principal_ref: Default::default(),
-            inputs: BTreeMap::new(),
-            placement_policy: None,
-            repositories: Vec::new(),
-            r#ref: None,
-            project_ref: None,
-            adopted_checkout_refs: BTreeMap::new(),
-            issues: Vec::new(),
-            change_request: None,
-            instruction: None,
-        })
+        .create(
+            &meta("convoy-scratch"),
+            &ConvoySpec {
+                continuation: None,
+                subjects: Vec::new(),
+                role: String::new(),
+                generation: 1,
+                workflow_ref: "scratch".to_string(),
+                dispatching_principal_ref: Default::default(),
+                inputs: BTreeMap::new(),
+                placement_policy: None,
+                repositories: Vec::new(),
+                r#ref: None,
+                project_ref: None,
+                adopted_checkout_refs: BTreeMap::new(),
+                issues: Vec::new(),
+                change_request: None,
+                instruction: None,
+            },
+        )
         .await
         .expect("convoy should create");
     backend
         .clone()
         .using::<Convoy>(NAMESPACE)
-        .update_status("convoy-scratch", &convoy.metadata.resource_version, &ConvoyStatus {
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: vec![VesselRequirement {
-                    name: "work".to_string(),
-                    depends_on: Vec::new(),
-                    repository_refs: None,
-                    credential_refs: Default::default(),
-                    credential_scopes: Default::default(),
-                    credential_permissions: Default::default(),
-                    crew: vec![CrewSpec::builder()
-                        .role("shell".to_string())
-                        .source(CrewSource::Tool { command: "bash".to_string() })
-                        .build()],
-                }],
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "convoy-scratch",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement {
+                        name: "work".to_string(),
+                        depends_on: Vec::new(),
+                        repository_refs: None,
+                        credential_refs: Default::default(),
+                        credential_scopes: Default::default(),
+                        credential_permissions: Default::default(),
+                        crew: vec![CrewSpec::builder()
+                            .role("shell".to_string())
+                            .source(CrewSource::Tool { command: "bash".to_string() })
+                            .build()],
+                    }],
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("convoy status should update");
     create_host_direct_policy(&backend, NAMESPACE, "policy-scratch", HOST_REF, "cleat").await;
@@ -258,12 +265,15 @@ async fn repositoryless_vessel_runs_tools_without_provisioning_a_checkout() {
     let vessel = backend
         .clone()
         .using::<Vessel>(NAMESPACE)
-        .create(&meta("workspace-scratch"), &VesselSpec {
-            convoy_ref: "convoy-scratch".to_string(),
-            vessel_name: "work".to_string(),
-            placement_policy_ref: "policy-scratch".to_string(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &meta("workspace-scratch"),
+            &VesselSpec {
+                convoy_ref: "convoy-scratch".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "policy-scratch".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("vessel should create");
 
@@ -406,15 +416,19 @@ async fn sequential_vessels_share_a_convoy_owned_worktree_checkout() {
     let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
     let checkout = checkouts.create(&checkout_meta, &checkout_spec).await.expect("shared checkout create");
     checkouts
-        .update_status(&checkout_meta.name, &checkout.metadata.resource_version, &CheckoutStatus {
-            clone_retry: None,
-            phase: CheckoutPhase::Ready,
-            path: checkout_spec.target_path().map(str::to_string),
-            commit: None,
-            branch_provenance: Default::default(),
-            integration: Default::default(),
-            message: None,
-        })
+        .update_status(
+            &checkout_meta.name,
+            &checkout.metadata.resource_version,
+            &CheckoutStatus {
+                clone_retry: None,
+                phase: CheckoutPhase::Ready,
+                path: checkout_spec.target_path().map(str::to_string),
+                commit: None,
+                branch_provenance: Default::default(),
+                integration: Default::default(),
+                message: None,
+            },
+        )
         .await
         .expect("shared checkout ready");
 
@@ -475,11 +489,15 @@ async fn stuck_provisioning_vessel_surfaces_the_statusless_checkout_it_is_retryi
         .expect("checkout resource should be created without a completion status");
     let now = Utc::now();
     vessels
-        .update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &VesselStatus {
-            phase: VesselPhase::Provisioning,
-            started_at: Some(now - chrono::Duration::minutes(3)),
-            ..VesselStatus::default()
-        })
+        .update_status(
+            &vessel.metadata.name,
+            &vessel.metadata.resource_version,
+            &VesselStatus {
+                phase: VesselPhase::Provisioning,
+                started_at: Some(now - chrono::Duration::minutes(3)),
+                ..VesselStatus::default()
+            },
+        )
         .await
         .expect("vessel should be marked provisioning");
     let vessel = vessels.get("workspace-stuck").await.expect("vessel should exist");
@@ -550,100 +568,107 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
     let convoy = backend
         .clone()
         .using::<Convoy>(NAMESPACE)
-        .create(&meta("convoy-multi"), &ConvoySpec {
-            continuation: None,
-            subjects: Vec::new(),
-            role: String::new(),
-            generation: 1,
-            workflow_ref: "wf".to_string(),
-            dispatching_principal_ref: Default::default(),
-            inputs: BTreeMap::new(),
-            placement_policy: None,
-            repositories: vec![
-                ConvoyRepositorySpec {
-                    url: "https://github.com/flotilla-org/cleat".to_string(),
-                    repo_ref: repository_specs[1].key(),
-                    source_ref: "main".to_string(),
-                    target_ref: "main".to_string(),
-                    workspace_slug: "cleat".to_string(),
-                    subpaths: Vec::new(),
-                },
-                ConvoyRepositorySpec {
-                    url: "https://github.com/flotilla-org/flotilla".to_string(),
-                    repo_ref: repository_specs[0].key(),
-                    source_ref: "main".to_string(),
-                    target_ref: "main".to_string(),
-                    workspace_slug: "flotilla".to_string(),
-                    subpaths: Vec::new(),
-                },
-            ],
-            r#ref: Some("feature/multi".to_string()),
-            project_ref: Some("flotilla-suite".to_string()),
-            adopted_checkout_refs: BTreeMap::new(),
-            issues: vec![
-                ConvoyIssue {
-                    reference: IssueRef {
-                        source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
-                        id: "732".into(),
+        .create(
+            &meta("convoy-multi"),
+            &ConvoySpec {
+                continuation: None,
+                subjects: Vec::new(),
+                role: String::new(),
+                generation: 1,
+                workflow_ref: "wf".to_string(),
+                dispatching_principal_ref: Default::default(),
+                inputs: BTreeMap::new(),
+                placement_policy: None,
+                repositories: vec![
+                    ConvoyRepositorySpec {
+                        url: "https://github.com/flotilla-org/cleat".to_string(),
+                        repo_ref: repository_specs[1].key(),
+                        source_ref: "main".to_string(),
+                        target_ref: "main".to_string(),
+                        workspace_slug: "cleat".to_string(),
+                        subpaths: Vec::new(),
                     },
-                    repository_ref: Some(repository_specs[0].key()),
-                    snapshot: IssueSnapshot {
-                        title: "Start convoy from an issue".into(),
-                        body: Some("Persist this exact issue body.".into()),
-                        state: IssueState::Open,
-                        labels: vec!["enhancement".into()],
-                        as_of: "2026-07-18T09:30:00Z".parse().expect("timestamp"),
+                    ConvoyRepositorySpec {
+                        url: "https://github.com/flotilla-org/flotilla".to_string(),
+                        repo_ref: repository_specs[0].key(),
+                        source_ref: "main".to_string(),
+                        target_ref: "main".to_string(),
+                        workspace_slug: "flotilla".to_string(),
+                        subpaths: Vec::new(),
                     },
-                },
-                ConvoyIssue {
-                    reference: IssueRef {
-                        source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/cleat".into() },
-                        id: "733".into(),
+                ],
+                r#ref: Some("feature/multi".to_string()),
+                project_ref: Some("flotilla-suite".to_string()),
+                adopted_checkout_refs: BTreeMap::new(),
+                issues: vec![
+                    ConvoyIssue {
+                        reference: IssueRef {
+                            source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+                            id: "732".into(),
+                        },
+                        repository_ref: Some(repository_specs[0].key()),
+                        snapshot: IssueSnapshot {
+                            title: "Start convoy from an issue".into(),
+                            body: Some("Persist this exact issue body.".into()),
+                            state: IssueState::Open,
+                            labels: vec!["enhancement".into()],
+                            as_of: "2026-07-18T09:30:00Z".parse().expect("timestamp"),
+                        },
                     },
-                    repository_ref: None,
-                    snapshot: IssueSnapshot {
-                        title: "Fix shared workflow setup".into(),
-                        body: Some("This issue applies across the checked-out repositories.".into()),
-                        state: IssueState::Open,
-                        labels: vec!["enhancement".into()],
-                        as_of: "2026-07-18T09:31:00Z".parse().expect("timestamp"),
+                    ConvoyIssue {
+                        reference: IssueRef {
+                            source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/cleat".into() },
+                            id: "733".into(),
+                        },
+                        repository_ref: None,
+                        snapshot: IssueSnapshot {
+                            title: "Fix shared workflow setup".into(),
+                            body: Some("This issue applies across the checked-out repositories.".into()),
+                            state: IssueState::Open,
+                            labels: vec!["enhancement".into()],
+                            as_of: "2026-07-18T09:31:00Z".parse().expect("timestamp"),
+                        },
                     },
-                },
-            ],
-            change_request: None,
-            instruction: Some("Keep the public seam stable.".into()),
-        })
+                ],
+                change_request: None,
+                instruction: Some("Keep the public seam stable.".into()),
+            },
+        )
         .await
         .expect("convoy should create");
     backend
         .clone()
         .using::<Convoy>(NAMESPACE)
-        .update_status("convoy-multi", &convoy.metadata.resource_version, &ConvoyStatus {
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: vec![VesselRequirement {
-                    name: "implement".to_string(),
-                    depends_on: Vec::new(),
-                    repository_refs: None,
-                    credential_refs: Default::default(),
-                    credential_scopes: Default::default(),
-                    credential_permissions: Default::default(),
-                    crew: vec![CrewSpec::builder()
-                        .role("coder".to_string())
-                        .source(CrewSource::Agent {
-                            selector: Selector::for_capability("coding"),
-                            prompt: Some("Work across both repositories.".to_string()),
-                            brief_template: None,
-                        })
-                        .build()],
-                }],
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "convoy-multi",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement {
+                        name: "implement".to_string(),
+                        depends_on: Vec::new(),
+                        repository_refs: None,
+                        credential_refs: Default::default(),
+                        credential_scopes: Default::default(),
+                        credential_permissions: Default::default(),
+                        crew: vec![CrewSpec::builder()
+                            .role("coder".to_string())
+                            .source(CrewSource::Agent {
+                                selector: Selector::for_capability("coding"),
+                                prompt: Some("Work across both repositories.".to_string()),
+                                brief_template: None,
+                            })
+                            .build()],
+                    }],
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("convoy status should update");
     create_host_direct_policy(&backend, NAMESPACE, "policy-multi", HOST_REF, "cleat").await;
@@ -670,12 +695,15 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
     let vessel = backend
         .clone()
         .using::<Vessel>(NAMESPACE)
-        .create(&meta("workspace-multi"), &VesselSpec {
-            convoy_ref: "convoy-multi".to_string(),
-            vessel_name: "implement".to_string(),
-            placement_policy_ref: "policy-multi".to_string(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &meta("workspace-multi"),
+            &VesselSpec {
+                convoy_ref: "convoy-multi".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "policy-multi".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("vessel should create");
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
@@ -691,23 +719,30 @@ async fn multi_repository_vessel_provisions_every_checkout_and_runs_crew_at_work
         })
         .collect::<Vec<_>>();
     assert_eq!(checkout_actuations.len(), 2);
-    assert_eq!(checkout_actuations.iter().map(|(_, spec)| spec.target_path().expect("managed checkout path")).collect::<Vec<_>>(), [
-        "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi/cleat",
-        "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi/flotilla",
-    ]);
+    assert_eq!(
+        checkout_actuations.iter().map(|(_, spec)| spec.target_path().expect("managed checkout path")).collect::<Vec<_>>(),
+        [
+            "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi/cleat",
+            "/Users/alice/dev/flotilla-repos/convoy-multi/feature-multi/flotilla",
+        ]
+    );
     for (meta, spec) in checkout_actuations {
         let checkouts = backend.clone().using::<Checkout>(NAMESPACE);
         let created = checkouts.create(&meta, &spec).await.expect("checkout should create");
         checkouts
-            .update_status(&meta.name, &created.metadata.resource_version, &CheckoutStatus {
-                clone_retry: None,
-                phase: CheckoutPhase::Ready,
-                path: spec.target_path().map(str::to_string),
-                commit: Some("44982740".to_string()),
-                branch_provenance: Default::default(),
-                integration: Default::default(),
-                message: None,
-            })
+            .update_status(
+                &meta.name,
+                &created.metadata.resource_version,
+                &CheckoutStatus {
+                    clone_retry: None,
+                    phase: CheckoutPhase::Ready,
+                    path: spec.target_path().map(str::to_string),
+                    commit: Some("44982740".to_string()),
+                    branch_provenance: Default::default(),
+                    integration: Default::default(),
+                    message: None,
+                },
+            )
             .await
             .expect("checkout should become ready");
     }
@@ -770,67 +805,74 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
     let convoy = backend
         .clone()
         .using::<Convoy>(NAMESPACE)
-        .create(&meta("convoy-multi-docker"), &ConvoySpec {
-            continuation: None,
-            subjects: Vec::new(),
-            role: String::new(),
-            generation: 1,
-            workflow_ref: "wf".to_string(),
-            dispatching_principal_ref: Default::default(),
-            inputs: BTreeMap::new(),
-            placement_policy: None,
-            repositories: vec![
-                ConvoyRepositorySpec {
-                    url: "https://github.com/flotilla-org/flotilla".to_string(),
-                    repo_ref: repositories[0].key(),
-                    source_ref: "main".to_string(),
-                    target_ref: "main".to_string(),
-                    workspace_slug: "flotilla".to_string(),
-                    subpaths: Vec::new(),
-                },
-                ConvoyRepositorySpec {
-                    url: "https://github.com/flotilla-org/cleat".to_string(),
-                    repo_ref: repositories[1].key(),
-                    source_ref: "main".to_string(),
-                    target_ref: "main".to_string(),
-                    workspace_slug: "cleat".to_string(),
-                    subpaths: Vec::new(),
-                },
-            ],
-            r#ref: Some("feature/multi".to_string()),
-            project_ref: Some("flotilla-suite".to_string()),
-            adopted_checkout_refs: BTreeMap::new(),
-            issues: Vec::new(),
-            change_request: None,
-            instruction: None,
-        })
+        .create(
+            &meta("convoy-multi-docker"),
+            &ConvoySpec {
+                continuation: None,
+                subjects: Vec::new(),
+                role: String::new(),
+                generation: 1,
+                workflow_ref: "wf".to_string(),
+                dispatching_principal_ref: Default::default(),
+                inputs: BTreeMap::new(),
+                placement_policy: None,
+                repositories: vec![
+                    ConvoyRepositorySpec {
+                        url: "https://github.com/flotilla-org/flotilla".to_string(),
+                        repo_ref: repositories[0].key(),
+                        source_ref: "main".to_string(),
+                        target_ref: "main".to_string(),
+                        workspace_slug: "flotilla".to_string(),
+                        subpaths: Vec::new(),
+                    },
+                    ConvoyRepositorySpec {
+                        url: "https://github.com/flotilla-org/cleat".to_string(),
+                        repo_ref: repositories[1].key(),
+                        source_ref: "main".to_string(),
+                        target_ref: "main".to_string(),
+                        workspace_slug: "cleat".to_string(),
+                        subpaths: Vec::new(),
+                    },
+                ],
+                r#ref: Some("feature/multi".to_string()),
+                project_ref: Some("flotilla-suite".to_string()),
+                adopted_checkout_refs: BTreeMap::new(),
+                issues: Vec::new(),
+                change_request: None,
+                instruction: None,
+            },
+        )
         .await
         .expect("convoy should create");
     backend
         .clone()
         .using::<Convoy>(NAMESPACE)
-        .update_status("convoy-multi-docker", &convoy.metadata.resource_version, &ConvoyStatus {
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: vec![VesselRequirement {
-                    name: "implement".to_string(),
-                    depends_on: Vec::new(),
-                    repository_refs: None,
-                    credential_refs: Default::default(),
-                    credential_scopes: Default::default(),
-                    credential_permissions: Default::default(),
-                    crew: vec![CrewSpec::builder()
-                        .role("coder".to_string())
-                        .source(CrewSource::Tool { command: "cargo test".to_string() })
-                        .build()],
-                }],
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "convoy-multi-docker",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement {
+                        name: "implement".to_string(),
+                        depends_on: Vec::new(),
+                        repository_refs: None,
+                        credential_refs: Default::default(),
+                        credential_scopes: Default::default(),
+                        credential_permissions: Default::default(),
+                        crew: vec![CrewSpec::builder()
+                            .role("coder".to_string())
+                            .source(CrewSource::Tool { command: "cargo test".to_string() })
+                            .build()],
+                    }],
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("convoy status should update");
     create_docker_worktree_policy(
@@ -879,27 +921,34 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
             .await
             .expect("checkout should create");
         checkouts
-            .update_status(&name, &created.metadata.resource_version, &CheckoutStatus {
-                clone_retry: None,
-                phase: CheckoutPhase::Ready,
-                path: Some(path),
-                commit: Some("44982740".to_string()),
-                branch_provenance: Default::default(),
-                integration: Default::default(),
-                message: None,
-            })
+            .update_status(
+                &name,
+                &created.metadata.resource_version,
+                &CheckoutStatus {
+                    clone_retry: None,
+                    phase: CheckoutPhase::Ready,
+                    path: Some(path),
+                    commit: Some("44982740".to_string()),
+                    branch_provenance: Default::default(),
+                    integration: Default::default(),
+                    message: None,
+                },
+            )
             .await
             .expect("checkout should become ready");
     }
     let vessel = backend
         .clone()
         .using::<Vessel>(NAMESPACE)
-        .create(&meta("workspace-multi-docker"), &VesselSpec {
-            convoy_ref: "convoy-multi-docker".to_string(),
-            vessel_name: "implement".to_string(),
-            placement_policy_ref: "policy-multi-docker".to_string(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &meta("workspace-multi-docker"),
+            &VesselSpec {
+                convoy_ref: "convoy-multi-docker".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "policy-multi-docker".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("vessel should create");
 
@@ -953,22 +1002,25 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
     let environment = create_ready_docker_environment(&backend, NAMESPACE, "env-workspace-multi-docker", legacy).await;
     let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
     let session = sessions
-        .create(&meta("existing-crew"), &TerminalSessionSpec {
-            env_ref: environment.metadata.name.clone(),
-            role: "coder".into(),
-            source: TerminalSessionSource::Tool { command: "codex".into() },
-            cwd: "/workspace".into(),
-            env: Default::default(),
-            pool: "cleat".into(),
-        })
+        .create(
+            &meta("existing-crew"),
+            &TerminalSessionSpec {
+                env_ref: environment.metadata.name.clone(),
+                role: "coder".into(),
+                source: TerminalSessionSource::Tool { command: "codex".into() },
+                cwd: "/workspace".into(),
+                env: Default::default(),
+                pool: "cleat".into(),
+            },
+        )
         .await
         .expect("running crew");
     let session = sessions
-        .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            session_id: Some("running-crew".into()),
-            ..Default::default()
-        })
+        .update_status(
+            &session.metadata.name,
+            &session.metadata.resource_version,
+            &TerminalSessionStatus { phase: TerminalSessionPhase::Running, session_id: Some("running-crew".into()), ..Default::default() },
+        )
         .await
         .expect("running status");
     let mut running = vessel.clone();
@@ -1032,12 +1084,15 @@ async fn multi_repository_docker_mounts_the_workspace_and_each_git_common_dir() 
     let mixed = backend
         .clone()
         .using::<Vessel>(NAMESPACE)
-        .create(&meta("workspace-multi-mixed"), &VesselSpec {
-            convoy_ref: "convoy-multi-docker".to_string(),
-            vessel_name: "implement".to_string(),
-            placement_policy_ref: "policy-multi-docker".to_string(),
-            adopted_checkout_refs: BTreeMap::from([(repositories[0].key(), "checkout-workspace-multi-docker-flotilla".to_string())]),
-        })
+        .create(
+            &meta("workspace-multi-mixed"),
+            &VesselSpec {
+                convoy_ref: "convoy-multi-docker".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "policy-multi-docker".to_string(),
+                adopted_checkout_refs: BTreeMap::from([(repositories[0].key(), "checkout-workspace-multi-docker-flotilla".to_string())]),
+            },
+        )
         .await
         .expect("mixed vessel should create");
     let deps = reconciler.prepare(&mixed).await.expect("mixed deps should load");
@@ -1064,64 +1119,71 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
     let convoy = backend
         .clone()
         .using::<Convoy>(NAMESPACE)
-        .create(&meta("convoy-multi-fresh"), &ConvoySpec {
-            continuation: None,
-            subjects: Vec::new(),
-            role: String::new(),
-            generation: 1,
-            workflow_ref: "wf".to_string(),
-            dispatching_principal_ref: Default::default(),
-            inputs: BTreeMap::new(),
-            placement_policy: None,
-            repositories: vec![
-                ConvoyRepositorySpec {
-                    url: "https://github.com/flotilla-org/flotilla".to_string(),
-                    repo_ref: repositories[0].key(),
-                    source_ref: "main".to_string(),
-                    target_ref: "main".to_string(),
-                    workspace_slug: "flotilla".to_string(),
-                    subpaths: Vec::new(),
-                },
-                ConvoyRepositorySpec {
-                    url: "https://github.com/flotilla-org/cleat".to_string(),
-                    repo_ref: repositories[1].key(),
-                    source_ref: "main".to_string(),
-                    target_ref: "main".to_string(),
-                    workspace_slug: "cleat".to_string(),
-                    subpaths: Vec::new(),
-                },
-            ],
-            r#ref: Some("feature/multi".to_string()),
-            project_ref: Some("flotilla-suite".to_string()),
-            adopted_checkout_refs: BTreeMap::new(),
-            issues: Vec::new(),
-            change_request: None,
-            instruction: None,
-        })
+        .create(
+            &meta("convoy-multi-fresh"),
+            &ConvoySpec {
+                continuation: None,
+                subjects: Vec::new(),
+                role: String::new(),
+                generation: 1,
+                workflow_ref: "wf".to_string(),
+                dispatching_principal_ref: Default::default(),
+                inputs: BTreeMap::new(),
+                placement_policy: None,
+                repositories: vec![
+                    ConvoyRepositorySpec {
+                        url: "https://github.com/flotilla-org/flotilla".to_string(),
+                        repo_ref: repositories[0].key(),
+                        source_ref: "main".to_string(),
+                        target_ref: "main".to_string(),
+                        workspace_slug: "flotilla".to_string(),
+                        subpaths: Vec::new(),
+                    },
+                    ConvoyRepositorySpec {
+                        url: "https://github.com/flotilla-org/cleat".to_string(),
+                        repo_ref: repositories[1].key(),
+                        source_ref: "main".to_string(),
+                        target_ref: "main".to_string(),
+                        workspace_slug: "cleat".to_string(),
+                        subpaths: Vec::new(),
+                    },
+                ],
+                r#ref: Some("feature/multi".to_string()),
+                project_ref: Some("flotilla-suite".to_string()),
+                adopted_checkout_refs: BTreeMap::new(),
+                issues: Vec::new(),
+                change_request: None,
+                instruction: None,
+            },
+        )
         .await
         .expect("convoy should create");
     backend
         .clone()
         .using::<Convoy>(NAMESPACE)
-        .update_status("convoy-multi-fresh", &convoy.metadata.resource_version, &ConvoyStatus {
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: vec![VesselRequirement {
-                    name: "implement".to_string(),
-                    depends_on: Vec::new(),
-                    repository_refs: None,
-                    credential_refs: Default::default(),
-                    credential_scopes: Default::default(),
-                    credential_permissions: Default::default(),
-                    crew: Vec::new(),
-                }],
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "convoy-multi-fresh",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement {
+                        name: "implement".to_string(),
+                        depends_on: Vec::new(),
+                        repository_refs: None,
+                        credential_refs: Default::default(),
+                        credential_scopes: Default::default(),
+                        credential_permissions: Default::default(),
+                        crew: Vec::new(),
+                    }],
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("convoy status should update");
     create_policy(
@@ -1143,28 +1205,36 @@ async fn multi_repository_docker_fresh_clone_uses_per_repository_paths() {
             .build(),
     )
     .await;
-    create_ready_docker_environment(&backend, NAMESPACE, "env-workspace-multi-fresh", DockerEnvironmentSpec {
-        image_composition: None,
-        image_build_ref: None,
-        memory_policy: Default::default(),
-        host_ref: HOST_REF.to_string(),
-        image: "ghcr.io/flotilla/dev:latest".to_string(),
-        declared_agent_adapters: Default::default(),
-        required_agent_adapters: Default::default(),
-        pull_policy: Default::default(),
-        mounts: Vec::new(),
-        env: Default::default(),
-    })
+    create_ready_docker_environment(
+        &backend,
+        NAMESPACE,
+        "env-workspace-multi-fresh",
+        DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
+            memory_policy: Default::default(),
+            host_ref: HOST_REF.to_string(),
+            image: "ghcr.io/flotilla/dev:latest".to_string(),
+            declared_agent_adapters: Default::default(),
+            required_agent_adapters: Default::default(),
+            pull_policy: Default::default(),
+            mounts: Vec::new(),
+            env: Default::default(),
+        },
+    )
     .await;
     let vessel = backend
         .clone()
         .using::<Vessel>(NAMESPACE)
-        .create(&meta("workspace-multi-fresh"), &VesselSpec {
-            convoy_ref: "convoy-multi-fresh".to_string(),
-            vessel_name: "implement".to_string(),
-            placement_policy_ref: "policy-multi-fresh".to_string(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &meta("workspace-multi-fresh"),
+            &VesselSpec {
+                convoy_ref: "convoy-multi-fresh".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "policy-multi-fresh".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("vessel should create");
 
@@ -1204,64 +1274,71 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
     let convoy = backend
         .clone()
         .using::<Convoy>(NAMESPACE)
-        .create(&meta("convoy-scoped"), &ConvoySpec {
-            continuation: None,
-            subjects: Vec::new(),
-            role: String::new(),
-            generation: 1,
-            workflow_ref: "wf".to_string(),
-            dispatching_principal_ref: Default::default(),
-            inputs: BTreeMap::new(),
-            placement_policy: None,
-            repositories: vec![
-                ConvoyRepositorySpec {
-                    url: "https://github.com/flotilla-org/cleat".to_string(),
-                    repo_ref: cleat.key(),
-                    source_ref: "main".to_string(),
-                    target_ref: "main".to_string(),
-                    workspace_slug: "cleat".to_string(),
-                    subpaths: Vec::new(),
-                },
-                ConvoyRepositorySpec {
-                    url: "https://github.com/flotilla-org/flotilla".to_string(),
-                    repo_ref: flotilla.key(),
-                    source_ref: "main".to_string(),
-                    target_ref: "main".to_string(),
-                    workspace_slug: "flotilla".to_string(),
-                    subpaths: Vec::new(),
-                },
-            ],
-            r#ref: Some("feature/scoped".to_string()),
-            project_ref: Some("flotilla-suite".to_string()),
-            adopted_checkout_refs: BTreeMap::new(),
-            issues: Vec::new(),
-            change_request: None,
-            instruction: None,
-        })
+        .create(
+            &meta("convoy-scoped"),
+            &ConvoySpec {
+                continuation: None,
+                subjects: Vec::new(),
+                role: String::new(),
+                generation: 1,
+                workflow_ref: "wf".to_string(),
+                dispatching_principal_ref: Default::default(),
+                inputs: BTreeMap::new(),
+                placement_policy: None,
+                repositories: vec![
+                    ConvoyRepositorySpec {
+                        url: "https://github.com/flotilla-org/cleat".to_string(),
+                        repo_ref: cleat.key(),
+                        source_ref: "main".to_string(),
+                        target_ref: "main".to_string(),
+                        workspace_slug: "cleat".to_string(),
+                        subpaths: Vec::new(),
+                    },
+                    ConvoyRepositorySpec {
+                        url: "https://github.com/flotilla-org/flotilla".to_string(),
+                        repo_ref: flotilla.key(),
+                        source_ref: "main".to_string(),
+                        target_ref: "main".to_string(),
+                        workspace_slug: "flotilla".to_string(),
+                        subpaths: Vec::new(),
+                    },
+                ],
+                r#ref: Some("feature/scoped".to_string()),
+                project_ref: Some("flotilla-suite".to_string()),
+                adopted_checkout_refs: BTreeMap::new(),
+                issues: Vec::new(),
+                change_request: None,
+                instruction: None,
+            },
+        )
         .await
         .expect("convoy should create");
     backend
         .clone()
         .using::<Convoy>(NAMESPACE)
-        .update_status("convoy-scoped", &convoy.metadata.resource_version, &ConvoyStatus {
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: vec![VesselRequirement {
-                    name: "implement".to_string(),
-                    depends_on: Vec::new(),
-                    repository_refs: Some(vec![cleat.key()]),
-                    credential_refs: Default::default(),
-                    credential_scopes: Default::default(),
-                    credential_permissions: Default::default(),
-                    crew: Vec::new(),
-                }],
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "convoy-scoped",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement {
+                        name: "implement".to_string(),
+                        depends_on: Vec::new(),
+                        repository_refs: Some(vec![cleat.key()]),
+                        credential_refs: Default::default(),
+                        credential_scopes: Default::default(),
+                        credential_permissions: Default::default(),
+                        crew: Vec::new(),
+                    }],
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("convoy status should update");
     create_host_direct_policy(&backend, NAMESPACE, "policy-scoped", HOST_REF, "cleat").await;
@@ -1269,12 +1346,15 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
     let vessel = backend
         .clone()
         .using::<Vessel>(NAMESPACE)
-        .create(&meta("workspace-scoped"), &VesselSpec {
-            convoy_ref: "convoy-scoped".to_string(),
-            vessel_name: "implement".to_string(),
-            placement_policy_ref: "policy-scoped".to_string(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &meta("workspace-scoped"),
+            &VesselSpec {
+                convoy_ref: "convoy-scoped".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "policy-scoped".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("vessel should create");
 
@@ -1318,26 +1398,33 @@ async fn vessel_repository_scope_narrows_a_multi_repository_convoy() {
         .await
         .expect("adopted checkout should create");
     checkouts
-        .update_status("adopted-cleat-scoped", &adopted.metadata.resource_version, &CheckoutStatus {
-            clone_retry: None,
-            phase: CheckoutPhase::Ready,
-            path: Some(adopted_path.to_string()),
-            commit: Some("abc123".to_string()),
-            branch_provenance: Default::default(),
-            integration: Default::default(),
-            message: None,
-        })
+        .update_status(
+            "adopted-cleat-scoped",
+            &adopted.metadata.resource_version,
+            &CheckoutStatus {
+                clone_retry: None,
+                phase: CheckoutPhase::Ready,
+                path: Some(adopted_path.to_string()),
+                commit: Some("abc123".to_string()),
+                branch_provenance: Default::default(),
+                integration: Default::default(),
+                message: None,
+            },
+        )
         .await
         .expect("adopted checkout should become ready");
     let adopted_vessel = backend
         .clone()
         .using::<Vessel>(NAMESPACE)
-        .create(&meta("workspace-scoped-adopted"), &VesselSpec {
-            convoy_ref: "convoy-scoped".to_string(),
-            vessel_name: "implement".to_string(),
-            placement_policy_ref: "policy-scoped".to_string(),
-            adopted_checkout_refs: BTreeMap::from([(cleat.key(), "adopted-cleat-scoped".to_string())]),
-        })
+        .create(
+            &meta("workspace-scoped-adopted"),
+            &VesselSpec {
+                convoy_ref: "convoy-scoped".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "policy-scoped".to_string(),
+                adopted_checkout_refs: BTreeMap::from([(cleat.key(), "adopted-cleat-scoped".to_string())]),
+            },
+        )
         .await
         .expect("adopted vessel should create");
 
@@ -1386,18 +1473,23 @@ async fn contained_requirement_runs_in_contained_docker_placement() {
     )
     .await;
     let environment_ref = "env-workspace-docker-stance";
-    create_ready_docker_environment(&backend, NAMESPACE, environment_ref, DockerEnvironmentSpec {
-        image_composition: None,
-        image_build_ref: None,
-        memory_policy: Default::default(),
-        host_ref: HOST_REF.to_string(),
-        image: "ghcr.io/flotilla/dev:latest".to_string(),
-        declared_agent_adapters: Default::default(),
-        required_agent_adapters: Default::default(),
-        pull_policy: Default::default(),
-        mounts: Vec::new(),
-        env: Default::default(),
-    })
+    create_ready_docker_environment(
+        &backend,
+        NAMESPACE,
+        environment_ref,
+        DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
+            memory_policy: Default::default(),
+            host_ref: HOST_REF.to_string(),
+            image: "ghcr.io/flotilla/dev:latest".to_string(),
+            declared_agent_adapters: Default::default(),
+            required_agent_adapters: Default::default(),
+            pull_policy: Default::default(),
+            mounts: Vec::new(),
+            env: Default::default(),
+        },
+    )
     .await;
     create_ready_checkout(
         &backend,
@@ -1771,12 +1863,15 @@ async fn docker_worktree_rejects_an_adopted_checkout_without_shared_clone_metada
     let workspace = backend
         .clone()
         .using::<Vessel>(NAMESPACE)
-        .create(&vessel_meta("workspace-adopted-docker", REPO_URL), &VesselSpec {
-            convoy_ref: "convoy-adopted-docker".to_string(),
-            vessel_name: "implement".to_string(),
-            placement_policy_ref: "policy-adopted-docker".to_string(),
-            adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-checkout-convoy-adopted-docker".to_string())]),
-        })
+        .create(
+            &vessel_meta("workspace-adopted-docker", REPO_URL),
+            &VesselSpec {
+                convoy_ref: "convoy-adopted-docker".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "policy-adopted-docker".to_string(),
+                adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-checkout-convoy-adopted-docker".to_string())]),
+            },
+        )
         .await
         .expect("workspace should create");
 
@@ -2062,37 +2157,44 @@ async fn disappeared_live_agent_session_interrupts_the_vessel_and_requests_a_res
     let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
     let terminal_name = "terminal-workspace-recover-coder";
     let terminal = sessions
-        .create(&meta(terminal_name), &TerminalSessionSpec {
-            env_ref: host_direct_env_name(),
-            role: "coder".to_string(),
-            source: TerminalSessionSource::Agent {
-                selector: Selector::for_capability("coding"),
-                brief: TerminalBrief {
-                    artifact_digest: None,
-                    path: ".flotilla/briefs/coder.md".to_string(),
-                    content: "Finish the issue.".to_string(),
-                    copies: Vec::new(),
+        .create(
+            &meta(terminal_name),
+            &TerminalSessionSpec {
+                env_ref: host_direct_env_name(),
+                role: "coder".to_string(),
+                source: TerminalSessionSource::Agent {
+                    selector: Selector::for_capability("coding"),
+                    brief: TerminalBrief {
+                        artifact_digest: None,
+                        path: ".flotilla/briefs/coder.md".to_string(),
+                        content: "Finish the issue.".to_string(),
+                        copies: Vec::new(),
+                    },
+                    context: Box::new(TerminalCrewContext {
+                        namespace: NAMESPACE.to_string(),
+                        convoy: "convoy-recover".to_string(),
+                        vessel_ref: "workspace-recover".to_string(),
+                    }),
+                    message: None,
                 },
-                context: Box::new(TerminalCrewContext {
-                    namespace: NAMESPACE.to_string(),
-                    convoy: "convoy-recover".to_string(),
-                    vessel_ref: "workspace-recover".to_string(),
-                }),
-                message: None,
+                cwd: checkout_path.to_string(),
+                env: Default::default(),
+                pool: "cleat".to_string(),
             },
-            cwd: checkout_path.to_string(),
-            env: Default::default(),
-            pool: "cleat".to_string(),
-        })
+        )
         .await
         .expect("terminal create");
     sessions
-        .update_status(terminal_name, &terminal.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Stopped,
-            session_id: Some(terminal_name.to_string()),
-            message: Some("session missing from cleat".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            terminal_name,
+            &terminal.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Stopped,
+                session_id: Some(terminal_name.to_string()),
+                message: Some("session missing from cleat".to_string()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("terminal stopped");
 
@@ -2146,12 +2248,15 @@ async fn adopted_checkout_ref_reuses_checkout_without_creating_clone_or_checkout
     let workspace = backend
         .clone()
         .using::<Vessel>(NAMESPACE)
-        .create(&vessel_meta("workspace-adopted", REPO_URL), &VesselSpec {
-            convoy_ref: "convoy-adopted".to_string(),
-            vessel_name: "implement".to_string(),
-            placement_policy_ref: "policy-adopted".to_string(),
-            adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-checkout-convoy-adopted".to_string())]),
-        })
+        .create(
+            &vessel_meta("workspace-adopted", REPO_URL),
+            &VesselSpec {
+                convoy_ref: "convoy-adopted".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "policy-adopted".to_string(),
+                adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-checkout-convoy-adopted".to_string())]),
+            },
+        )
         .await
         .expect("workspace create should succeed");
 
@@ -2232,12 +2337,15 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
     let workspace = backend
         .clone()
         .using::<Vessel>(NAMESPACE)
-        .create(&vessel_meta("workspace-crew", REPO_URL), &VesselSpec {
-            convoy_ref: "convoy-crew".to_string(),
-            vessel_name: "implement".to_string(),
-            placement_policy_ref: "policy-crew".to_string(),
-            adopted_checkout_refs: BTreeMap::from([(repo_ref.clone(), "adopted-checkout-convoy-crew".to_string())]),
-        })
+        .create(
+            &vessel_meta("workspace-crew", REPO_URL),
+            &VesselSpec {
+                convoy_ref: "convoy-crew".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "policy-crew".to_string(),
+                adopted_checkout_refs: BTreeMap::from([(repo_ref.clone(), "adopted-checkout-convoy-crew".to_string())]),
+            },
+        )
         .await
         .expect("workspace create");
 
@@ -2288,10 +2396,11 @@ async fn first_agent_is_provisioned_with_a_durable_crew_brief_while_later_agents
     let sessions = backend.using::<TerminalSession>(NAMESPACE);
     let coder = sessions.create(meta, spec).await.expect("materialize coder");
     sessions
-        .update_status(&coder.metadata.name, &coder.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            ..Default::default()
-        })
+        .update_status(
+            &coder.metadata.name,
+            &coder.metadata.resource_version,
+            &TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() },
+        )
         .await
         .expect("running coder");
     flotilla_resources::apply_status_patch(
@@ -2347,12 +2456,15 @@ async fn vessel_waits_for_admission_brief_envelope_then_pins_its_digest() {
     create_ready_adopted_checkout(&backend, NAMESPACE, "adopted-artifact", "/Users/alice/dev/flotilla-existing").await;
     let vessel = backend
         .using::<Vessel>(NAMESPACE)
-        .create(&vessel_meta("workspace-artifact", REPO_URL), &VesselSpec {
-            convoy_ref: "convoy-artifact".to_string(),
-            vessel_name: "implement".to_string(),
-            placement_policy_ref: "policy-artifact".to_string(),
-            adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-artifact".to_string())]),
-        })
+        .create(
+            &vessel_meta("workspace-artifact", REPO_URL),
+            &VesselSpec {
+                convoy_ref: "convoy-artifact".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "policy-artifact".to_string(),
+                adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-artifact".to_string())]),
+            },
+        )
         .await
         .expect("vessel");
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);
@@ -2439,12 +2551,15 @@ async fn repo_level_brief_template_override_changes_one_block_for_that_repo_conv
     let workspace = backend
         .clone()
         .using::<Vessel>(NAMESPACE)
-        .create(&vessel_meta("workspace-repo-override", REPO_URL), &VesselSpec {
-            convoy_ref: "convoy-repo-override".to_string(),
-            vessel_name: "implement".to_string(),
-            placement_policy_ref: "policy-repo-override".to_string(),
-            adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-checkout-convoy-repo-override".to_string())]),
-        })
+        .create(
+            &vessel_meta("workspace-repo-override", REPO_URL),
+            &VesselSpec {
+                convoy_ref: "convoy-repo-override".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "policy-repo-override".to_string(),
+                adopted_checkout_refs: BTreeMap::from([(repo_ref, "adopted-checkout-convoy-repo-override".to_string())]),
+            },
+        )
         .await
         .expect("workspace create");
 
@@ -2472,59 +2587,66 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
     let convoy = backend
         .clone()
         .using::<Convoy>(NAMESPACE)
-        .create(&meta("convoy-issue-brief"), &ConvoySpec {
-            continuation: None,
-            subjects: Vec::new(),
-            role: String::new(),
-            generation: 1,
-            workflow_ref: "wf".to_string(),
-            dispatching_principal_ref: Default::default(),
-            inputs: BTreeMap::new(),
-            placement_policy: None,
-            repositories: vec![ConvoyRepositorySpec {
-                url: "https://github.com/flotilla-org/flotilla".to_string(),
-                repo_ref: repository_key.clone(),
-                source_ref: "main".to_string(),
-                target_ref: "main".to_string(),
-                workspace_slug: "flotilla".to_string(),
-                subpaths: Vec::new(),
-            }],
-            r#ref: Some("feat/issue-brief".to_string()),
-            project_ref: None,
-            adopted_checkout_refs: BTreeMap::new(),
-            issues: vec![ConvoyIssue {
-                reference: IssueRef {
-                    source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
-                    id: "811".into(),
-                },
-                repository_ref: Some(repository_key.clone()),
-                snapshot: IssueSnapshot {
-                    title: "Attention signal".into(),
-                    body: Some("The issue body is the contract.".into()),
-                    state: IssueState::Open,
-                    labels: vec!["enhancement".into()],
-                    as_of: "2026-07-22T09:30:00Z".parse().expect("timestamp"),
-                },
-            }],
-            change_request: None,
-            instruction: None,
-        })
+        .create(
+            &meta("convoy-issue-brief"),
+            &ConvoySpec {
+                continuation: None,
+                subjects: Vec::new(),
+                role: String::new(),
+                generation: 1,
+                workflow_ref: "wf".to_string(),
+                dispatching_principal_ref: Default::default(),
+                inputs: BTreeMap::new(),
+                placement_policy: None,
+                repositories: vec![ConvoyRepositorySpec {
+                    url: "https://github.com/flotilla-org/flotilla".to_string(),
+                    repo_ref: repository_key.clone(),
+                    source_ref: "main".to_string(),
+                    target_ref: "main".to_string(),
+                    workspace_slug: "flotilla".to_string(),
+                    subpaths: Vec::new(),
+                }],
+                r#ref: Some("feat/issue-brief".to_string()),
+                project_ref: None,
+                adopted_checkout_refs: BTreeMap::new(),
+                issues: vec![ConvoyIssue {
+                    reference: IssueRef {
+                        source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+                        id: "811".into(),
+                    },
+                    repository_ref: Some(repository_key.clone()),
+                    snapshot: IssueSnapshot {
+                        title: "Attention signal".into(),
+                        body: Some("The issue body is the contract.".into()),
+                        state: IssueState::Open,
+                        labels: vec!["enhancement".into()],
+                        as_of: "2026-07-22T09:30:00Z".parse().expect("timestamp"),
+                    },
+                }],
+                change_request: None,
+                instruction: None,
+            },
+        )
         .await
         .expect("convoy create");
     backend
         .clone()
         .using::<Convoy>(NAMESPACE)
-        .update_status("convoy-issue-brief", &convoy.metadata.resource_version, &ConvoyStatus {
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: interactive_single_workflow_spec().vessels,
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "convoy-issue-brief",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: interactive_single_workflow_spec().vessels,
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("convoy status update");
     create_host_direct_policy(&backend, NAMESPACE, "policy-issue-brief", HOST_REF, "cleat").await;
@@ -2533,12 +2655,15 @@ async fn issue_carrying_convoy_without_prompt_assigns_the_issue_in_the_brief() {
     let workspace = backend
         .clone()
         .using::<Vessel>(NAMESPACE)
-        .create(&vessel_meta("workspace-issue-brief", "https://github.com/flotilla-org/flotilla"), &VesselSpec {
-            convoy_ref: "convoy-issue-brief".to_string(),
-            vessel_name: "work".to_string(),
-            placement_policy_ref: "policy-issue-brief".to_string(),
-            adopted_checkout_refs: BTreeMap::from([(repository_key, "adopted-checkout-issue-brief".to_string())]),
-        })
+        .create(
+            &vessel_meta("workspace-issue-brief", "https://github.com/flotilla-org/flotilla"),
+            &VesselSpec {
+                convoy_ref: "convoy-issue-brief".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "policy-issue-brief".to_string(),
+                adopted_checkout_refs: BTreeMap::from([(repository_key, "adopted-checkout-issue-brief".to_string())]),
+            },
+        )
         .await
         .expect("workspace create");
 
@@ -2902,85 +3027,92 @@ async fn create_convoy_with_labeled_processes(
         .expect("repository create should succeed");
     let convoys = backend.clone().using::<Convoy>(namespace);
     let convoy = convoys
-        .create(&meta(name), &ConvoySpec {
-            continuation: None,
-            subjects: Vec::new(),
-            role: String::new(),
-            generation: 1,
-            workflow_ref: "wf".to_string(),
-            dispatching_principal_ref: Default::default(),
-            inputs: Default::default(),
-            placement_policy: None,
-            repositories: vec![ConvoyRepositorySpec {
-                url: repo_url.to_string(),
-                repo_ref: repository_key.clone(),
-                source_ref: git_ref.to_string(),
-                target_ref: "landing-target".to_string(),
-                workspace_slug: repository_spec.leaf_slug(),
-                subpaths: Vec::new(),
-            }],
-            r#ref: Some(git_ref.to_string()),
-            project_ref: None,
-            adopted_checkout_refs: BTreeMap::new(),
-            issues: Vec::new(),
-            change_request: None,
-            instruction: None,
-        })
+        .create(
+            &meta(name),
+            &ConvoySpec {
+                continuation: None,
+                subjects: Vec::new(),
+                role: String::new(),
+                generation: 1,
+                workflow_ref: "wf".to_string(),
+                dispatching_principal_ref: Default::default(),
+                inputs: Default::default(),
+                placement_policy: None,
+                repositories: vec![ConvoyRepositorySpec {
+                    url: repo_url.to_string(),
+                    repo_ref: repository_key.clone(),
+                    source_ref: git_ref.to_string(),
+                    target_ref: "landing-target".to_string(),
+                    workspace_slug: repository_spec.leaf_slug(),
+                    subpaths: Vec::new(),
+                }],
+                r#ref: Some(git_ref.to_string()),
+                project_ref: None,
+                adopted_checkout_refs: BTreeMap::new(),
+                issues: Vec::new(),
+                change_request: None,
+                instruction: None,
+            },
+        )
         .await
         .expect("convoy create should succeed");
     convoys
-        .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus {
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: vec![
-                    VesselRequirement {
-                        name: "implement".to_string(),
-                        depends_on: Vec::new(),
-                        repository_refs: None,
-                        credential_refs: Default::default(),
-                        credential_scopes: Default::default(),
-                        credential_permissions: Default::default(),
-                        crew: vec![CrewSpec::builder()
-                            .role("coder".to_string())
-                            .source(CrewSource::Tool { command: "cargo fmt --check".to_string() })
-                            .build()],
-                    },
-                    VesselRequirement {
-                        name: "review".to_string(),
-                        depends_on: vec!["implement".to_string()],
-                        repository_refs: None,
-                        credential_refs: BTreeSet::from(["github-app".to_string()]),
-                        credential_scopes: BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]),
-                        credential_permissions: Default::default(),
-                        crew: vec![
-                            CrewSpec::builder()
-                                .role("build".to_string())
-                                .source(CrewSource::Tool { command: "cargo check".to_string() })
-                                .build(),
-                            CrewSpec::builder()
-                                .role("test".to_string())
-                                .source(CrewSource::Tool { command: "cargo test".to_string() })
-                                .labels(BTreeMap::from([
-                                    ("service".to_string(), "api".to_string()),
-                                    ("team".to_string(), "platform".to_string()),
-                                    (CONVOY_LABEL.to_string(), "wrong-convoy".to_string()),
-                                    (VESSEL_LABEL.to_string(), "wrong-task".to_string()),
-                                    (VESSEL_REF_LABEL.to_string(), "wrong-workspace".to_string()),
-                                    (ROLE_LABEL.to_string(), "wrong-role".to_string()),
-                                    (VESSEL_ORDINAL_LABEL.to_string(), "999".to_string()),
-                                    (CREW_ORDINAL_LABEL.to_string(), "999".to_string()),
-                                ]))
-                                .build(),
-                        ],
-                    },
-                ],
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![
+                        VesselRequirement {
+                            name: "implement".to_string(),
+                            depends_on: Vec::new(),
+                            repository_refs: None,
+                            credential_refs: Default::default(),
+                            credential_scopes: Default::default(),
+                            credential_permissions: Default::default(),
+                            crew: vec![CrewSpec::builder()
+                                .role("coder".to_string())
+                                .source(CrewSource::Tool { command: "cargo fmt --check".to_string() })
+                                .build()],
+                        },
+                        VesselRequirement {
+                            name: "review".to_string(),
+                            depends_on: vec!["implement".to_string()],
+                            repository_refs: None,
+                            credential_refs: BTreeSet::from(["github-app".to_string()]),
+                            credential_scopes: BTreeMap::from([("github-app".to_string(), BTreeSet::from([repository_key]))]),
+                            credential_permissions: Default::default(),
+                            crew: vec![
+                                CrewSpec::builder()
+                                    .role("build".to_string())
+                                    .source(CrewSource::Tool { command: "cargo check".to_string() })
+                                    .build(),
+                                CrewSpec::builder()
+                                    .role("test".to_string())
+                                    .source(CrewSource::Tool { command: "cargo test".to_string() })
+                                    .labels(BTreeMap::from([
+                                        ("service".to_string(), "api".to_string()),
+                                        ("team".to_string(), "platform".to_string()),
+                                        (CONVOY_LABEL.to_string(), "wrong-convoy".to_string()),
+                                        (VESSEL_LABEL.to_string(), "wrong-task".to_string()),
+                                        (VESSEL_REF_LABEL.to_string(), "wrong-workspace".to_string()),
+                                        (ROLE_LABEL.to_string(), "wrong-role".to_string()),
+                                        (VESSEL_ORDINAL_LABEL.to_string(), "999".to_string()),
+                                        (CREW_ORDINAL_LABEL.to_string(), "999".to_string()),
+                                    ]))
+                                    .build(),
+                            ],
+                        },
+                    ],
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("convoy status update should succeed");
     convoys.get(name).await.expect("convoy get should succeed")
@@ -2999,40 +3131,47 @@ async fn create_running_terminal(
 ) -> flotilla_resources::ResourceObject<TerminalSession> {
     let sessions = backend.clone().using::<TerminalSession>(namespace);
     let created = sessions
-        .create(&meta(name), &TerminalSessionSpec {
-            env_ref: env_ref.to_string(),
-            role: role.to_string(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: command.to_string() },
-            cwd: cwd.to_string(),
-            env: Default::default(),
-            pool: pool.to_string(),
-        })
+        .create(
+            &meta(name),
+            &TerminalSessionSpec {
+                env_ref: env_ref.to_string(),
+                role: role.to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: command.to_string() },
+                cwd: cwd.to_string(),
+                env: Default::default(),
+                pool: pool.to_string(),
+            },
+        )
         .await
         .expect("terminal create should succeed");
     sessions
-        .update_status(name, &created.metadata.resource_version, &TerminalSessionStatus {
-            configured_limits: None,
-            last_tool_activity_at: None,
-            last_output_digest: None,
-            last_output_activity_at: None,
-            phase: TerminalSessionPhase::Running,
-            session_id: Some(format!("session-{name}")),
-            cleat_endpoint: None,
-            pid: Some(42),
-            started_at: Some(Utc::now()),
-            stopped_at: None,
-            inner_command_status: Some(InnerCommandStatus::Running),
-            inner_exit_code: None,
-            message: None,
-            crew: None,
-            retired_launches: Default::default(),
-            launch_command: Some(command.to_string()),
-            delivered_message_id: None,
-            attention: None,
-            occupancy: Default::default(),
-            completion_pending: None,
-            degraded: None,
-        })
+        .update_status(
+            name,
+            &created.metadata.resource_version,
+            &TerminalSessionStatus {
+                configured_limits: None,
+                last_tool_activity_at: None,
+                last_output_digest: None,
+                last_output_activity_at: None,
+                phase: TerminalSessionPhase::Running,
+                session_id: Some(format!("session-{name}")),
+                cleat_endpoint: None,
+                pid: Some(42),
+                started_at: Some(Utc::now()),
+                stopped_at: None,
+                inner_command_status: Some(InnerCommandStatus::Running),
+                inner_exit_code: None,
+                message: None,
+                crew: None,
+                retired_launches: Default::default(),
+                launch_command: Some(command.to_string()),
+                delivered_message_id: None,
+                attention: None,
+                occupancy: Default::default(),
+                completion_pending: None,
+                degraded: None,
+            },
+        )
         .await
         .expect("terminal status update should succeed");
     sessions.get(name).await.expect("terminal get should succeed")
@@ -3042,13 +3181,16 @@ async fn create_labeled_environment(backend: &ResourceBackend, namespace: &str, 
     backend
         .clone()
         .using::<Environment>(namespace)
-        .create(&labeled_meta(name, [(VESSEL_REF_LABEL.to_string(), workspace_name.to_string())]), &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec {
-                host_ref: HOST_REF.to_string(),
-                repo_default_dir: "/Users/alice/dev/flotilla-repos".to_string(),
-            }),
-            docker: None,
-        })
+        .create(
+            &labeled_meta(name, [(VESSEL_REF_LABEL.to_string(), workspace_name.to_string())]),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec {
+                    host_ref: HOST_REF.to_string(),
+                    repo_default_dir: "/Users/alice/dev/flotilla-repos".to_string(),
+                }),
+                docker: None,
+            },
+        )
         .await
         .expect("environment create should succeed");
 }
@@ -3105,15 +3247,19 @@ async fn create_ready_adopted_checkout(backend: &ResourceBackend, namespace: &st
         .await
         .expect("adopted checkout create should succeed");
     checkouts
-        .update_status(name, &created.metadata.resource_version, &CheckoutStatus {
-            clone_retry: None,
-            phase: CheckoutPhase::Ready,
-            path: Some(path.to_string()),
-            commit: Some("abc123".to_string()),
-            branch_provenance: Default::default(),
-            integration: Default::default(),
-            message: None,
-        })
+        .update_status(
+            name,
+            &created.metadata.resource_version,
+            &CheckoutStatus {
+                clone_retry: None,
+                phase: CheckoutPhase::Ready,
+                path: Some(path.to_string()),
+                commit: Some("abc123".to_string()),
+                branch_provenance: Default::default(),
+                integration: Default::default(),
+                message: None,
+            },
+        )
         .await
         .expect("checkout status update should succeed");
 }
@@ -3134,15 +3280,19 @@ async fn create_ready_observed_checkout_without_status_path(backend: &ResourceBa
         .await
         .expect("checkout create should succeed");
     checkouts
-        .update_status(name, &checkout.metadata.resource_version, &CheckoutStatus {
-            clone_retry: None,
-            phase: CheckoutPhase::Ready,
-            path: None,
-            commit: Some("abc123".to_string()),
-            branch_provenance: Default::default(),
-            integration: Default::default(),
-            message: None,
-        })
+        .update_status(
+            name,
+            &checkout.metadata.resource_version,
+            &CheckoutStatus {
+                clone_retry: None,
+                phase: CheckoutPhase::Ready,
+                path: None,
+                commit: Some("abc123".to_string()),
+                branch_provenance: Default::default(),
+                integration: Default::default(),
+                message: None,
+            },
+        )
         .await
         .expect("checkout status update should succeed");
 }
@@ -3151,14 +3301,17 @@ async fn create_labeled_terminal(backend: &ResourceBackend, namespace: &str, nam
     backend
         .clone()
         .using::<TerminalSession>(namespace)
-        .create(&labeled_meta(name, [(VESSEL_REF_LABEL.to_string(), workspace_name.to_string())]), &TerminalSessionSpec {
-            env_ref: host_direct_env_name(),
-            role: "coder".to_string(),
-            source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
-            cwd: format!("/Users/alice/dev/flotilla-repos/{workspace_name}"),
-            env: Default::default(),
-            pool: "cleat".to_string(),
-        })
+        .create(
+            &labeled_meta(name, [(VESSEL_REF_LABEL.to_string(), workspace_name.to_string())]),
+            &TerminalSessionSpec {
+                env_ref: host_direct_env_name(),
+                role: "coder".to_string(),
+                source: flotilla_resources::TerminalSessionSource::Tool { command: "cargo test".to_string() },
+                cwd: format!("/Users/alice/dev/flotilla-repos/{workspace_name}"),
+                env: Default::default(),
+                pool: "cleat".to_string(),
+            },
+        )
         .await
         .expect("terminal create should succeed");
 }
@@ -3296,18 +3449,23 @@ async fn existing_environment_survives_deleted_image_baseline(#[case] checkout: 
             .build(),
     )
     .await;
-    create_ready_docker_environment(&backend, NAMESPACE, "env-vessel", DockerEnvironmentSpec {
-        image_composition: None,
-        image_build_ref: None,
-        memory_policy: Default::default(),
-        host_ref: HOST_REF.to_string(),
-        image: "crew:v1".to_string(),
-        declared_agent_adapters: Default::default(),
-        required_agent_adapters: Default::default(),
-        pull_policy: DockerImagePullPolicy::Always,
-        mounts: Vec::new(),
-        env: Default::default(),
-    })
+    create_ready_docker_environment(
+        &backend,
+        NAMESPACE,
+        "env-vessel",
+        DockerEnvironmentSpec {
+            image_composition: None,
+            image_build_ref: None,
+            memory_policy: Default::default(),
+            host_ref: HOST_REF.to_string(),
+            image: "crew:v1".to_string(),
+            declared_agent_adapters: Default::default(),
+            required_agent_adapters: Default::default(),
+            pull_policy: DockerImagePullPolicy::Always,
+            mounts: Vec::new(),
+            env: Default::default(),
+        },
+    )
     .await;
     let vessel = create_workspace(&backend, NAMESPACE, "vessel", "convoy", "implement", "crew-policy", REPO_URL).await;
     let reconciler = test_vessel_reconciler(backend.clone(), NAMESPACE);

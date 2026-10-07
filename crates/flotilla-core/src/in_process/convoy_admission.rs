@@ -362,11 +362,14 @@ impl ConvoyAdmission {
                     continue;
                 }
             };
-            self.repository_change_requests.write().await.insert(repository_key.clone(), RepositoryChangeRequestProvider {
-                service_url: identity.service_url.clone(),
-                repository: identity.repository.clone(),
-                provider: Arc::clone(&provider),
-            });
+            self.repository_change_requests.write().await.insert(
+                repository_key.clone(),
+                RepositoryChangeRequestProvider {
+                    service_url: identity.service_url.clone(),
+                    repository: identity.repository.clone(),
+                    provider: Arc::clone(&provider),
+                },
+            );
             candidates.push((repository_key.clone(), identity.repository.clone(), provider));
         }
         (candidates, failures)
@@ -4080,16 +4083,14 @@ mod tests {
             .resolve_convoy_admission_workflow("flotilla", "example", &project, &[], &intent)
             .await
             .expect("admission");
-        assert_eq!(frozen.vessels[0].crew[0].skills.selected.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(), [
-            "implement",
-            "research",
-            "review"
-        ]);
-        assert_eq!(frozen.vessels[0].crew[1].skills.selected.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(), [
-            "research",
-            "review",
-            "wayfinder"
-        ]);
+        assert_eq!(
+            frozen.vessels[0].crew[0].skills.selected.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+            ["implement", "research", "review"]
+        );
+        assert_eq!(
+            frozen.vessels[0].crew[1].skills.selected.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+            ["research", "review", "wayfinder"]
+        );
         backend.definitions::<CrewDefaults>("flotilla").apply(&meta, &CrewDefaultsSpec::default()).await.expect("change defaults");
         assert_eq!(frozen.vessels[0].crew[0].skills.selected.len(), 3);
         let mut invalid = intent;
@@ -4120,11 +4121,10 @@ mod tests {
         .await;
         let projects = backend.definitions::<Project>("flotilla");
         let shape = |model: &str| {
-            BTreeMap::from([("coder".into(), RoleDefinition {
-                agent: Some("claude-code".into()),
-                model: Some(model.into()),
-                ..Default::default()
-            })])
+            BTreeMap::from([(
+                "coder".into(),
+                RoleDefinition { agent: Some("claude-code".into()), model: Some(model.into()), ..Default::default() },
+            )])
         };
         let fleet = ProjectSpec::builder()
             .display_name("Fleet".into())
@@ -4208,14 +4208,17 @@ mod tests {
             .expect("repository declaration");
         let tracker = Arc::new(FakeChangeRequest::new());
         tracker
-            .add_change_requests(vec![("7".to_string(), ChangeRequest {
-                title: "Ready".to_string(),
-                branch: "feature".to_string(),
-                status: flotilla_protocol::ChangeRequestStatus::Open,
-                body: None,
-                provider_name: "fake".to_string(),
-                provider_display_name: "Fake".to_string(),
-            })])
+            .add_change_requests(vec![(
+                "7".to_string(),
+                ChangeRequest {
+                    title: "Ready".to_string(),
+                    branch: "feature".to_string(),
+                    status: flotilla_protocol::ChangeRequestStatus::Open,
+                    body: None,
+                    provider_name: "fake".to_string(),
+                    provider_display_name: "Fake".to_string(),
+                },
+            )])
             .await;
         let port = Arc::new(FakeQueryPort { backend, tracker, discoveries: AtomicUsize::new(0) });
         let source = ProviderChangeRequestObservationSource::new(port.backend.clone(), port.clone());

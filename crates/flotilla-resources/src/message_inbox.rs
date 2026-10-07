@@ -61,11 +61,10 @@ pub fn qualify_message_address(address: &str, context: &MessageAddressContext) -
 pub fn qualify_message_spec(mut spec: MessageSpec) -> Result<MessageSpec, ResourceError> {
     validate_message_address(&spec.sender)?;
     if let [project, convoy, vessel, _] = spec.sender.split('/').collect::<Vec<_>>().as_slice() {
-        spec.receiver = qualify_message_address(&spec.receiver, &MessageAddressContext {
-            project: (*project).into(),
-            convoy: (*convoy).into(),
-            vessel: (*vessel).into(),
-        })?;
+        spec.receiver = qualify_message_address(
+            &spec.receiver,
+            &MessageAddressContext { project: (*project).into(), convoy: (*convoy).into(), vessel: (*vessel).into() },
+        )?;
     }
     validate_message_address(&spec.receiver)?;
     Ok(spec)
@@ -188,15 +187,19 @@ impl MessageInbox {
             .collect();
         if let Some(predecessor) = predecessors.iter().find(|message| spec.supersedes.is_none() && message_expectation_open(message)) {
             if let Some(partial) = &partial {
-                apply_status_patch(&self.messages, &partial.metadata.name, &MessageStatusPatch::Suppressed {
-                    predecessor: flotilla_protocol::ResourceRef::new(
-                        "flotilla.work/v1",
-                        "Message",
-                        &self.messages.namespace,
-                        &predecessor.metadata.name,
-                    ),
-                    at: now,
-                })
+                apply_status_patch(
+                    &self.messages,
+                    &partial.metadata.name,
+                    &MessageStatusPatch::Suppressed {
+                        predecessor: flotilla_protocol::ResourceRef::new(
+                            "flotilla.work/v1",
+                            "Message",
+                            &self.messages.namespace,
+                            &predecessor.metadata.name,
+                        ),
+                        at: now,
+                    },
+                )
                 .await?;
             }
             return Ok(MessageAdmission::Suppressed { predecessor: (*predecessor).clone() });
@@ -211,11 +214,15 @@ impl MessageInbox {
                 && (spec.supersedes.as_deref() == Some(predecessor.metadata.name.as_str())
                     || (!phase.has_delivery_evidence() && predecessor.status.as_ref().is_none_or(|status| status.submission.is_none())))
             {
-                apply_status_patch(&self.messages, &predecessor.metadata.name, &MessageStatusPatch::Finish {
-                    phase: MessagePhase::Superseded,
-                    reason: format!("replaced by {}", message.metadata.name),
-                    at: now,
-                })
+                apply_status_patch(
+                    &self.messages,
+                    &predecessor.metadata.name,
+                    &MessageStatusPatch::Finish {
+                        phase: MessagePhase::Superseded,
+                        reason: format!("replaced by {}", message.metadata.name),
+                        at: now,
+                    },
+                )
                 .await?;
             }
         }

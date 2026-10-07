@@ -123,20 +123,14 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<CloneResource>(RegisteredResource::Clone, &[]),
     kind::<Convoy>(RegisteredResource::Convoy, &[]),
     kind::<ConvoyEnsure>(RegisteredResource::ConvoyEnsure, &["convoyensure", "convoy_ensure", "convoy-ensure"]),
-    kind::<CredentialGrant>(RegisteredResource::CredentialGrant, &[
-        "credentialgrant",
-        "credential_grant",
-        "credential_grants",
-        "credential-grant",
-        "credential-grants",
-    ]),
-    kind::<CredentialSpec>(RegisteredResource::CredentialSpec, &[
-        "credentialspec",
-        "credential_spec",
-        "credential_specs",
-        "credential-spec",
-        "credential-specs",
-    ]),
+    kind::<CredentialGrant>(
+        RegisteredResource::CredentialGrant,
+        &["credentialgrant", "credential_grant", "credential_grants", "credential-grant", "credential-grants"],
+    ),
+    kind::<CredentialSpec>(
+        RegisteredResource::CredentialSpec,
+        &["credentialspec", "credential_spec", "credential_specs", "credential-spec", "credential-specs"],
+    ),
     kind::<CrewDefaults>(RegisteredResource::CrewDefaults, &["crew-defaults"]),
     kind::<CrewImageBaseline>(RegisteredResource::CrewImageBaseline, &["crew-image-baseline", "image-baseline"]),
     kind::<ImageBuild>(RegisteredResource::ImageBuild, &["image-build"]),
@@ -144,54 +138,39 @@ pub const REGISTERED_RESOURCE_KINDS: &[RegisteredResourceKind] = &[
     kind::<Demand>(RegisteredResource::Demand, &[]),
     kind::<DispatchHold>(RegisteredResource::DispatchHold, &["dispatch-hold"]),
     kind::<DispatchDeployment>(RegisteredResource::DispatchDeployment, &["dispatch-deployment"]),
-    kind::<DispatchObservation>(RegisteredResource::DispatchObservation, &[
-        "dispatchobservation",
-        "dispatch_observation",
-        "dispatch_observations",
-        "dispatch-observation",
-        "dispatch-observations",
-    ]),
+    kind::<DispatchObservation>(
+        RegisteredResource::DispatchObservation,
+        &["dispatchobservation", "dispatch_observation", "dispatch_observations", "dispatch-observation", "dispatch-observations"],
+    ),
     kind::<Environment>(RegisteredResource::Environment, &[]),
     kind::<Event>(RegisteredResource::Event, &[]),
     kind::<FleetDesignation>(RegisteredResource::FleetDesignation, &["fleet-designation"]),
     kind::<Forge>(RegisteredResource::Forge, &[]),
-    kind::<FulfilmentKind>(RegisteredResource::FulfilmentKind, &[
-        "fulfilmentkind",
-        "fulfilment_kind",
-        "fulfilment_kinds",
-        "fulfilment-kind",
-        "fulfilment-kinds",
-    ]),
+    kind::<FulfilmentKind>(
+        RegisteredResource::FulfilmentKind,
+        &["fulfilmentkind", "fulfilment_kind", "fulfilment_kinds", "fulfilment-kind", "fulfilment-kinds"],
+    ),
     kind::<Host>(RegisteredResource::Host, &[]),
     kind::<ManifestRoot>(RegisteredResource::ManifestRoot, &["manifest-root", "manifest_root"]),
-    kind::<PlacementPolicy>(RegisteredResource::PlacementPolicy, &[
-        "placementpolicy",
-        "placement_policy",
-        "placement_policies",
-        "placement-policy",
-        "placement-policies",
-    ]),
+    kind::<PlacementPolicy>(
+        RegisteredResource::PlacementPolicy,
+        &["placementpolicy", "placement_policy", "placement_policies", "placement-policy", "placement-policies"],
+    ),
     kind::<Presentation>(RegisteredResource::Presentation, &[]),
     kind::<Message>(RegisteredResource::Message, &[]),
     kind::<Project>(RegisteredResource::Project, &[]),
     kind::<Regard>(RegisteredResource::Regard, &[]),
     kind::<Repository>(RegisteredResource::Repository, &[]),
-    kind::<TerminalSession>(RegisteredResource::TerminalSession, &[
-        "terminalsession",
-        "terminal_session",
-        "terminal_sessions",
-        "terminal-session",
-        "terminal-sessions",
-    ]),
+    kind::<TerminalSession>(
+        RegisteredResource::TerminalSession,
+        &["terminalsession", "terminal_session", "terminal_sessions", "terminal-session", "terminal-sessions"],
+    ),
     kind::<Usage>(RegisteredResource::Usage, &[]),
     kind::<Vessel>(RegisteredResource::Vessel, &[]),
-    kind::<WorkflowTemplate>(RegisteredResource::WorkflowTemplate, &[
-        "workflowtemplate",
-        "workflow_template",
-        "workflow_templates",
-        "workflow-template",
-        "workflow-templates",
-    ]),
+    kind::<WorkflowTemplate>(
+        RegisteredResource::WorkflowTemplate,
+        &["workflowtemplate", "workflow_template", "workflow_templates", "workflow-template", "workflow-templates"],
+    ),
 ];
 
 const fn kind<T: Resource>(resource: RegisteredResource, aliases: &'static [&'static str]) -> RegisteredResourceKind {
@@ -1652,10 +1631,10 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         backend
             .using::<Usage>("flotilla")
-            .create(&InputMeta::builder().name("usage-account".to_string()).build(), &crate::UsageSpec {
-                provider: "codex".to_string(),
-                account: "ada@example.com".to_string(),
-            })
+            .create(
+                &InputMeta::builder().name("usage-account".to_string()).build(),
+                &crate::UsageSpec { provider: "codex".to_string(), account: "ada@example.com".to_string() },
+            )
             .await
             .expect("create usage");
 
@@ -1716,13 +1695,17 @@ mod tests {
         let hosts = backend.using::<Host>("flotilla");
         let host = hosts.create(&InputMeta::builder().name("feta".to_string()).build(), &HostSpec::default()).await.expect("create host");
         hosts
-            .update_status("feta", &host.metadata.resource_version, &HostStatus {
-                capabilities: BTreeMap::new(),
-                heartbeat_at: Some(Utc::now() - Duration::seconds(61)),
-                ready: true,
-                resource_store: None,
-                ..HostStatus::default()
-            })
+            .update_status(
+                "feta",
+                &host.metadata.resource_version,
+                &HostStatus {
+                    capabilities: BTreeMap::new(),
+                    heartbeat_at: Some(Utc::now() - Duration::seconds(61)),
+                    ready: true,
+                    resource_store: None,
+                    ..HostStatus::default()
+                },
+            )
             .await
             .expect("write stale heartbeat");
 
@@ -1741,13 +1724,17 @@ mod tests {
             .await
             .expect("create source host");
         source_hosts
-            .update_status("feta", &host.metadata.resource_version, &HostStatus {
-                capabilities: BTreeMap::new(),
-                heartbeat_at: Some(Utc::now() - Duration::seconds(61)),
-                ready: true,
-                resource_store: None,
-                ..HostStatus::default()
-            })
+            .update_status(
+                "feta",
+                &host.metadata.resource_version,
+                &HostStatus {
+                    capabilities: BTreeMap::new(),
+                    heartbeat_at: Some(Utc::now() - Duration::seconds(61)),
+                    ready: true,
+                    resource_store: None,
+                    ..HostStatus::default()
+                },
+            )
             .await
             .expect("write source stale heartbeat");
         let source_list = source_hosts.list().await.expect("list source hosts");

@@ -290,14 +290,17 @@ impl<'de> Deserialize<'de> for HostsConfig {
             .into_iter()
             .map(|(label, host)| {
                 let expected_host_name = host.expected_host_name.unwrap_or_else(|| label.clone());
-                (label, RemoteHostConfig {
-                    hostname: host.hostname,
-                    expected_host_name,
-                    expected_node_id: host.expected_node_id,
-                    user: host.user,
-                    ssh_multiplex: host.ssh_multiplex,
-                    agentless_ssh: host.agentless_ssh,
-                })
+                (
+                    label,
+                    RemoteHostConfig {
+                        hostname: host.hostname,
+                        expected_host_name,
+                        expected_node_id: host.expected_node_id,
+                        user: host.user,
+                        ssh_multiplex: host.ssh_multiplex,
+                        agentless_ssh: host.agentless_ssh,
+                    },
+                )
             })
             .collect();
         Ok(Self { ssh, hosts })

@@ -29,10 +29,10 @@ The TUI is *factored, not frozen* — keep it maintained, but extract the surfac
 
 ```bash
 cargo build                                    # build
-cargo +nightly-2026-03-12 fmt --check          # CI format gate
+cargo fmt --check          # CI format gate
 cargo clippy --workspace --all-targets --locked -- -D warnings  # CI clippy gate
 cargo test --workspace --locked                # CI test gate
-cargo +nightly-2026-03-12 fmt                  # apply pinned formatting
+cargo fmt                  # apply pinned formatting
 uv run --with-requirements ci/git-boundary/requirements.txt python ci/git-boundary/check.py  # ast-grep Git boundary check
 cargo run                                      # run, auto-detect repo from cwd
 scripts/prune-target.sh --dry-run              # preview the per-checkout target size-cap backstop
@@ -44,13 +44,13 @@ Install the Git check dependency in a virtual environment with `python3 -m venv 
 
 Platform test coverage belongs in `ci/platform-tests/selectors.txt`, executed by `ci/platform-tests/run.sh`. Add a CI job only for a new runner type or OS, or for deliberate isolation; otherwise use an existing job on the same runner.
 
-Before pushing, run the Git check and its tests plus the exact CI commands: `cargo +nightly-2026-03-12 fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked`.
+Before pushing, run the Git check and its tests plus the exact CI commands: `cargo fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked`.
 
 Desk builds keep Cargo incrementals enabled. Crew vessel and CI builds set `CARGO_INCREMENTAL=0`. Each fleet host runs an mtime-based `cargo-sweep --time 3` daily, while `scripts/prune-target.sh` remains a size-cap backstop. See [docs/development.md](docs/development.md) for installation, scope, logs, and thresholds.
 
 **Stable toolchain:** `rust-toolchain.toml` is the single compiler pin (currently Rust 1.99.0). Rustup selects it automatically and installs rustfmt, Clippy, llvm-tools, and the Relay Workers WebAssembly target. CI installs that pin and runs `ci/toolchain/assert.sh` to reject a mismatched compiler. Coverage uses stable with line coverage only. Release candidates and the crew image read the same file.
 
-**Temporary nightly tooling:** Formatting retains `nightly-2026-03-12` until #2794 lands. Install the formatter with `rustup toolchain install nightly-2026-03-12 --profile minimal --component rustfmt`.
+**Formatting:** `cargo fmt` uses the same stable pin; no nightly toolchain is required.
 
 
 Only when `CODEX_SANDBOX` is set, use `mkdir -p .codex-tmp && TMPDIR="$PWD/.codex-tmp" cargo test --workspace --locked --features flotilla-daemon/skip-no-sandbox-tests` so native dependencies can create temp files and socket-bind tests stay skipped. Everywhere else, use the default `TMPDIR` and run `cargo test --workspace --locked`. Unix-socket tests use the shared harness's SUN_LEN-safe directory directly beneath `/tmp`, independent of `TMPDIR`; do not change this command to work around socket-path length errors.
@@ -213,7 +213,7 @@ Every PR that changes a resource kind's serialized shape must name the out-of-re
 
 See [CODING_STANDARDS.md](CODING_STANDARDS.md) for coding conventions and judgement-call standards.
 
-- **Formatting**: `cargo +nightly-2026-03-12 fmt` — uses `max_width=140`, `imports_granularity="Crate"`, `group_imports="StdExternalCrate"`. See `rustfmt.toml`.
+- **Formatting**: `cargo fmt` — uses `max_width=140` and `use_small_heuristics="Max"`. See `rustfmt.toml`.
 - **Inline paths**: Prefer `use` imports over long inline `crate::` paths (>3 segments). Enforced by Clippy `absolute_paths`, with external crates allowed in `clippy.toml` to preserve the former crate-relative scope. `self::` and `super::` paths are unchecked. Add new external dependencies to the allowed-crates list as needed.
 
 ## Design and Substrate Work

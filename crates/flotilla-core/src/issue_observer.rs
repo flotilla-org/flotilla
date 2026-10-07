@@ -134,11 +134,8 @@ impl IssueRefresher {
         let this = self.clone();
         let task_subject = subject.clone();
         let task = tokio::spawn(async move { this.refresh_loop(task_subject).await });
-        active.insert(subject, ActiveRefresh {
-            demands: HashMap::from([(subscription_id, freshness)]),
-            wake: Arc::new(Notify::new()),
-            task,
-        });
+        active
+            .insert(subject, ActiveRefresh { demands: HashMap::from([(subscription_id, freshness)]), wake: Arc::new(Notify::new()), task });
         Ok(())
     }
 
@@ -481,13 +478,17 @@ mod tests {
         let created = records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.expect("create issue");
         let old = Utc::now() - chrono::Duration::hours(1);
         records
-            .update_status(&name, &created.metadata.resource_version, &IssueStatus {
-                title: Default::default(),
-                assignees: Default::default(),
-                state: flotilla_resources::Observation::known(ObservedIssueState::Open, old),
-                labels: flotilla_resources::Observation::known(vec![], old),
-                updated_at: flotilla_resources::Observation::known(old, old),
-            })
+            .update_status(
+                &name,
+                &created.metadata.resource_version,
+                &IssueStatus {
+                    title: Default::default(),
+                    assignees: Default::default(),
+                    state: flotilla_resources::Observation::known(ObservedIssueState::Open, old),
+                    labels: flotilla_resources::Observation::known(vec![], old),
+                    updated_at: flotilla_resources::Observation::known(old, old),
+                },
+            )
             .await
             .expect("old status");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -532,13 +533,17 @@ mod tests {
         let created = records.create(&InputMeta::builder().name(name.clone()).build(), &spec).await.expect("create issue");
         let now = Utc::now();
         records
-            .update_status(&name, &created.metadata.resource_version, &IssueStatus {
-                title: Default::default(),
-                assignees: Default::default(),
-                state: Observation::known(ObservedIssueState::Open, now),
-                labels: Observation::known(vec![], now),
-                updated_at: Observation::known(now, now),
-            })
+            .update_status(
+                &name,
+                &created.metadata.resource_version,
+                &IssueStatus {
+                    title: Default::default(),
+                    assignees: Default::default(),
+                    state: Observation::known(ObservedIssueState::Open, now),
+                    labels: Observation::known(vec![], now),
+                    updated_at: Observation::known(now, now),
+                },
+            )
             .await
             .expect("fresh status");
         let calls = Arc::new(AtomicUsize::new(0));

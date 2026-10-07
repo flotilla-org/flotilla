@@ -383,10 +383,13 @@ impl InMemoryBackend {
                 .get(name)
                 .copied()
                 .ok_or_else(|| ResourceError::other(format!("replica row '{name}' has no sync timestamp")))?;
-            items.push((origin_root.clone(), ReadResourceObject {
-                object: Self::decode_object(value.clone())?,
-                provenance: ResourceProvenance::Replica { origin_root: origin_root.clone(), last_synced_at },
-            }));
+            items.push((
+                origin_root.clone(),
+                ReadResourceObject {
+                    object: Self::decode_object(value.clone())?,
+                    provenance: ResourceProvenance::Replica { origin_root: origin_root.clone(), last_synced_at },
+                },
+            ));
         }
         items.sort_by(|(left, _), (right, _)| left.cmp(right));
         Ok(items.into_iter().map(|(_, item)| item).collect())
@@ -502,17 +505,20 @@ impl InMemoryBackend {
                 });
             }
         }
-        state.partitions.insert(replica_key, ReplicaPartition {
-            messages,
-            objects,
-            digest,
-            synced_at_by_name,
-            cursor: if bucket.is_some() {
-                old.cursor
-            } else {
-                Some(ReplicaCursor { resource_version: listed.resource_version.clone(), generation: listed.generation.clone() })
+        state.partitions.insert(
+            replica_key,
+            ReplicaPartition {
+                messages,
+                objects,
+                digest,
+                synced_at_by_name,
+                cursor: if bucket.is_some() {
+                    old.cursor
+                } else {
+                    Some(ReplicaCursor { resource_version: listed.resource_version.clone(), generation: listed.generation.clone() })
+                },
             },
-        });
+        );
         for event in events {
             Self::notify_replica_watchers(&mut state, &store_key, event);
         }
@@ -572,12 +578,11 @@ impl InMemoryBackend {
                 partition.synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
             }
         }
-        Self::notify_replica_watchers(&mut state, &store_key, StoredReplicaEvent {
-            origin_root: origin_root.clone(),
-            synced_at,
-            kind,
-            object: encoded,
-        });
+        Self::notify_replica_watchers(
+            &mut state,
+            &store_key,
+            StoredReplicaEvent { origin_root: origin_root.clone(), synced_at, kind, object: encoded },
+        );
         Ok(())
     }
 
@@ -608,12 +613,11 @@ impl InMemoryBackend {
         partition.objects.remove(&tombstone.name);
         partition.digest.set(&tombstone.name, None);
         partition.synced_at_by_name.insert(tombstone.name.clone(), synced_at);
-        Self::notify_replica_watchers(&mut state, &store_key, StoredReplicaEvent {
-            origin_root: origin_root.clone(),
-            synced_at,
-            kind: StoredReplicaEventKind::Deleted,
-            object: encoded,
-        });
+        Self::notify_replica_watchers(
+            &mut state,
+            &store_key,
+            StoredReplicaEvent { origin_root: origin_root.clone(), synced_at, kind: StoredReplicaEventKind::Deleted, object: encoded },
+        );
         Ok(())
     }
 

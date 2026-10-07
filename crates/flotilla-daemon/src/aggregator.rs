@@ -3090,22 +3090,25 @@ mod tests {
             reason: "Existing concern".to_string(),
             raised_at: Utc::now(),
         });
-        status.turn_deliveries.insert("supervision-1".to_string(), flotilla_resources::TurnDeliveryStatus {
-            pending_supervisor_turn: Some(flotilla_resources::PendingSupervisorTurn {
-                queued_order: 0,
-                vessel: "govern".to_string(),
-                role: "governor".to_string(),
-                message: flotilla_resources::TerminalCrewMessage {
-                    id: "supervision-1".to_string(),
-                    text: "Supervise the stalled crew".to_string(),
-                    sender: flotilla_resources::CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
-                    delivery: flotilla_resources::CrewMessageDelivery::Queued,
-                    acknowledged: Default::default(),
-                    following: Vec::new(),
-                },
-            }),
-            ..Default::default()
-        });
+        status.turn_deliveries.insert(
+            "supervision-1".to_string(),
+            flotilla_resources::TurnDeliveryStatus {
+                pending_supervisor_turn: Some(flotilla_resources::PendingSupervisorTurn {
+                    queued_order: 0,
+                    vessel: "govern".to_string(),
+                    role: "governor".to_string(),
+                    message: flotilla_resources::TerminalCrewMessage {
+                        id: "supervision-1".to_string(),
+                        text: "Supervise the stalled crew".to_string(),
+                        sender: flotilla_resources::CrewMessageSender::FlotillaEscalation { from: "coder@work".to_string() },
+                        delivery: flotilla_resources::CrewMessageDelivery::Queued,
+                        acknowledged: Default::default(),
+                        following: Vec::new(),
+                    },
+                }),
+                ..Default::default()
+            },
+        );
         let mut no_prior_attention = governor.clone();
         no_prior_attention.metadata.name = "governor-no-prior-attention".to_string();
         no_prior_attention.status.as_mut().expect("status").attention = None;
@@ -3169,12 +3172,14 @@ mod tests {
         let result = state.result_set().await;
         let rows = result.rows.as_convoys().expect("convoys");
         assert_eq!(rows.iter().filter(|row| row.surface_state == SurfaceState::Available).count(), 3);
-        assert_eq!(rows.iter().find(|row| row.name == "crew").expect("crew").surface_state, SurfaceState::StalledHandled {
-            rung: flotilla_protocol::result_set::HandledRung::Nudge
-        });
-        assert_eq!(rows.iter().find(|row| row.name == "crew").expect("crew").vessels[0].surface_state, SurfaceState::StalledHandled {
-            rung: flotilla_protocol::result_set::HandledRung::Nudge
-        });
+        assert_eq!(
+            rows.iter().find(|row| row.name == "crew").expect("crew").surface_state,
+            SurfaceState::StalledHandled { rung: flotilla_protocol::result_set::HandledRung::Nudge }
+        );
+        assert_eq!(
+            rows.iter().find(|row| row.name == "crew").expect("crew").vessels[0].surface_state,
+            SurfaceState::StalledHandled { rung: flotilla_protocol::result_set::HandledRung::Nudge }
+        );
         assert_eq!(rows.iter().filter(|row| row.surface_state.needs_attention()).count(), 1);
         assert_eq!(rows.iter().find(|row| row.name == "orphan").expect("orphan").surface_state, SurfaceState::NeedsYou);
 
@@ -4030,10 +4035,10 @@ mod tests {
         let row = convoys.rows.as_convoys().expect("convoy rows").first().expect("convoy row");
         assert_eq!(row.ensured_from.as_deref(), Some("ensure-governor"));
 
-        for provenance in [ResourceProvenance::Local, ResourceProvenance::Replica {
-            origin_root: flotilla_protocol::NodeId::new("feta-node-id"),
-            last_synced_at: Utc::now(),
-        }] {
+        for provenance in [
+            ResourceProvenance::Local,
+            ResourceProvenance::Replica { origin_root: flotilla_protocol::NodeId::new("feta-node-id"), last_synced_at: Utc::now() },
+        ] {
             let tombstone = flotilla_resources::ResourceTombstone {
                 name: "ensure-governor".to_string(),
                 namespace: "flotilla".to_string(),
@@ -4651,11 +4656,15 @@ mod tests {
             .await
             .expect("create scripted presentation");
         resolver
-            .update_status(name, &created.metadata.resource_version, &PresentationStatus {
-                phase: PresentationPhase::Active,
-                observed_workspace_ref: workspace.map(str::to_string),
-                ..Default::default()
-            })
+            .update_status(
+                name,
+                &created.metadata.resource_version,
+                &PresentationStatus {
+                    phase: PresentationPhase::Active,
+                    observed_workspace_ref: workspace.map(str::to_string),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("set scripted presentation status")
     }
@@ -4677,11 +4686,11 @@ mod tests {
             .await
             .expect("create scripted terminal session");
         resolver
-            .update_status(name, &created.metadata.resource_version, &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                session_id: Some(name.to_string()),
-                ..Default::default()
-            })
+            .update_status(
+                name,
+                &created.metadata.resource_version,
+                &TerminalSessionStatus { phase: TerminalSessionPhase::Running, session_id: Some(name.to_string()), ..Default::default() },
+            )
             .await
             .expect("set scripted terminal session status")
     }
@@ -4690,10 +4699,13 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         backend
             .using::<Environment>("flotilla")
-            .create(&InputMeta::builder().name(name.to_string()).build(), &EnvironmentSpec {
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".to_string(), repo_default_dir: "/repo".to_string() }),
-                docker: None,
-            })
+            .create(
+                &InputMeta::builder().name(name.to_string()).build(),
+                &EnvironmentSpec {
+                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".to_string(), repo_default_dir: "/repo".to_string() }),
+                    docker: None,
+                },
+            )
             .await
             .expect("create scripted environment")
     }
@@ -5149,24 +5161,27 @@ mod tests {
         unrelated_convoy.spec.project_ref = Some("other".into());
         let mut deleting_convoy = convoy.clone();
         deleting_convoy.metadata.deletion_timestamp = Some(Utc::now());
-        let durable_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(WatchStream::new(
-            None,
-            Box::pin(
-                stream::iter(vec![
-                    WatchEvent::Added(convoy),
-                    WatchEvent::Added(unrelated_convoy),
-                    WatchEvent::Modified(deleting_convoy.clone()),
-                    WatchEvent::Deleted(deleting_convoy),
-                ])
-                .then(|event| async move {
-                    // Distinct lifecycle observations need separate delivery windows;
-                    // an insert and delete inside one burst intentionally coalesce.
-                    tokio::time::sleep(Duration::from_millis(40)).await;
-                    Ok(event)
-                })
-                .chain(stream::pending()),
-            ),
-        ))]);
+        let durable_convoys = ScriptedSource::new(
+            vec![empty_list()],
+            vec![Ok(WatchStream::new(
+                None,
+                Box::pin(
+                    stream::iter(vec![
+                        WatchEvent::Added(convoy),
+                        WatchEvent::Added(unrelated_convoy),
+                        WatchEvent::Modified(deleting_convoy.clone()),
+                        WatchEvent::Deleted(deleting_convoy),
+                    ])
+                    .then(|event| async move {
+                        // Distinct lifecycle observations need separate delivery windows;
+                        // an insert and delete inside one burst intentionally coalesce.
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        Ok(event)
+                    })
+                    .chain(stream::pending()),
+                ),
+            ))],
+        );
         let durable_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_convoys = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let observed_presentations = ScriptedSource::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -5341,10 +5356,10 @@ mod tests {
         let durable_demands = ScriptedSource::<Demand>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_environments = ScriptedSource::<Environment>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_presentations = ScriptedSource::<Presentation>::new(vec![empty_list()], vec![Ok(pending_watch())]);
-        let durable_sessions =
-            ScriptedSource::new(vec![ResourceList { items: vec![session], resource_version: "1".to_string(), generation: None }], vec![
-                Ok(pending_watch()),
-            ]);
+        let durable_sessions = ScriptedSource::new(
+            vec![ResourceList { items: vec![session], resource_version: "1".to_string(), generation: None }],
+            vec![Ok(pending_watch())],
+        );
         let durable_projects = ScriptedSource::<Project>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_convoy_ensures = ScriptedSource::<ConvoyEnsure>::new(vec![empty_list()], vec![Ok(pending_watch())]);
         let durable_repositories = ScriptedSource::<Repository>::new(vec![empty_list()], vec![Ok(pending_watch())]);
@@ -5491,11 +5506,10 @@ mod tests {
         let bound = &result_set.rows.as_convoys().expect("convoy result rows")[0].subjects[0];
         assert_eq!(bound.subject.id, "1071");
         assert_eq!(bound.relationship, flotilla_protocol::Relationship::Adopts);
-        assert_eq!(resolver.calls.lock().await.as_slice(), &[(
-            vec![RepositoryKey("repo_flotilla".to_string())],
-            "feat/convoy".to_string(),
-            Some("1071".to_string()),
-        )]);
+        assert_eq!(
+            resolver.calls.lock().await.as_slice(),
+            &[(vec![RepositoryKey("repo_flotilla".to_string())], "feat/convoy".to_string(), Some("1071".to_string()),)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -6056,12 +6070,15 @@ mod tests {
                 Some(PlacementStatus { fields: BTreeMap::from([("host".into(), serde_json::json!(host.as_str()))]) });
             let mut vessel = backend
                 .using::<Vessel>("flotilla")
-                .create(&InputMeta::builder().name("vessel-a".into()).build(), &VesselSpec {
-                    convoy_ref: convoy.metadata.name.clone(),
-                    vessel_name: "implement".into(),
-                    placement_policy_ref: "local".into(),
-                    adopted_checkout_refs: BTreeMap::new(),
-                })
+                .create(
+                    &InputMeta::builder().name("vessel-a".into()).build(),
+                    &VesselSpec {
+                        convoy_ref: convoy.metadata.name.clone(),
+                        vessel_name: "implement".into(),
+                        placement_policy_ref: "local".into(),
+                        adopted_checkout_refs: BTreeMap::new(),
+                    },
+                )
                 .await
                 .expect("vessel");
             vessel.status = Some(VesselStatus { phase: VesselPhase::Provisioning, checkout_refs: BTreeMap::new(), ..Default::default() });

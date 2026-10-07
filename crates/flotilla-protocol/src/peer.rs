@@ -339,14 +339,17 @@ mod tests {
                 assert_eq!(requester_node_id, NodeId::new("workstation"));
                 assert_eq!(responder_node_id, NodeId::new("feta"));
                 assert_eq!(remaining_hops, 5);
-                assert_eq!(*event, CommandPeerEvent::StepUpdate {
-                    repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
-                    repo: Some(PathBuf::from("/repo")),
-                    step_index: 1,
-                    step_count: 3,
-                    description: "Creating worktree".into(),
-                    status: StepStatus::Started,
-                });
+                assert_eq!(
+                    *event,
+                    CommandPeerEvent::StepUpdate {
+                        repo_identity: RepoIdentity { authority: "github.com".into(), path: "owner/repo".into() },
+                        repo: Some(PathBuf::from("/repo")),
+                        step_index: 1,
+                        step_count: 3,
+                        description: "Creating worktree".into(),
+                        status: StepStatus::Started,
+                    }
+                );
             }
             other => panic!("expected CommandEvent, got {:?}", other),
         }

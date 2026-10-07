@@ -11,23 +11,24 @@ async fn contract(backend: ResourceBackend) {
     let spec = ManifestRootSpec::builder().host("host-a".into()).path("/tmp/manifests".into()).source("source".into()).build();
     let root = roots.create(&InputMeta::builder().name("host-a".into()).build(), &spec).await.expect("create root");
     let mut requested = root.spec.clone();
-    requested.resolutions.insert(key.clone(), Resolution {
-        action: ResolutionAction::Sync,
-        token: "token-1".into(),
-        requested_by: "operator".into(),
-    });
+    requested
+        .resolutions
+        .insert(key.clone(), Resolution { action: ResolutionAction::Sync, token: "token-1".into(), requested_by: "operator".into() });
     let updated = roots.update(&InputMeta::from(&root.metadata), &root.metadata.resource_version, &requested).await.expect("request sync");
     let mut status = ManifestRootStatus::default();
-    status.documents.insert(key.clone(), DocumentState {
-        phase: DocumentPhase::Refused,
-        reason: Some("spec.pool: invalid".into()),
-        live_hash: Some("live".into()),
-        desired_hash: Some("desired".into()),
-        baseline_hash: Some("baseline".into()),
-        observed_at: Utc::now(),
-        resolved_token: None,
-        resolution_outcome: None,
-    });
+    status.documents.insert(
+        key.clone(),
+        DocumentState {
+            phase: DocumentPhase::Refused,
+            reason: Some("spec.pool: invalid".into()),
+            live_hash: Some("live".into()),
+            desired_hash: Some("desired".into()),
+            baseline_hash: Some("baseline".into()),
+            observed_at: Utc::now(),
+            resolved_token: None,
+            resolution_outcome: None,
+        },
+    );
     let status_updated = roots.update_status("host-a", &updated.metadata.resource_version, &status).await.expect("publish status");
     assert_eq!(status_updated.spec, requested);
     assert_eq!(status_updated.status.as_ref().expect("status").documents[&key].reason.as_deref(), Some("spec.pool: invalid"));

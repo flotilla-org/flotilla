@@ -255,12 +255,16 @@ impl ResourceManifestReconciler {
 
     #[cfg(test)]
     async fn reconcile_once_for_test(&mut self) -> Result<ManifestPassReport, String> {
-        materialize_bound_manifest_root(&self.backend, &self.default_namespace, &flotilla_core::config::ResourceManifestsConfig {
-            binding: self.binding.clone(),
-            dir: self.root.clone(),
-            source: self.source.clone(),
-            reconciler_root: self.reconciler_root.clone(),
-        })
+        materialize_bound_manifest_root(
+            &self.backend,
+            &self.default_namespace,
+            &flotilla_core::config::ResourceManifestsConfig {
+                binding: self.binding.clone(),
+                dir: self.root.clone(),
+                source: self.source.clone(),
+                reconciler_root: self.reconciler_root.clone(),
+            },
+        )
         .await?;
         self.reconcile_once().await
     }

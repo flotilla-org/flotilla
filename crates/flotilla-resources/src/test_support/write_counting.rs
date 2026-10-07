@@ -127,11 +127,11 @@ mod tests {
         assert_eq!(backend.writes(), 1);
 
         checkouts
-            .update_status("checkout-a", &created.metadata.resource_version, &CheckoutStatus {
-                phase: CheckoutPhase::Ready,
-                path: Some("/work/checkout-a".to_string()),
-                ..Default::default()
-            })
+            .update_status(
+                "checkout-a",
+                &created.metadata.resource_version,
+                &CheckoutStatus { phase: CheckoutPhase::Ready, path: Some("/work/checkout-a".to_string()), ..Default::default() },
+            )
             .await
             .expect("update checkout status");
         assert_eq!(backend.reset_writes(), 2);

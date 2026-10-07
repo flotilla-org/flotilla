@@ -85,57 +85,64 @@ pub async fn create_convoy_with_single_task(
         .expect("repository create should succeed");
     let convoys = backend.clone().using::<Convoy>(namespace);
     let convoy = convoys
-        .create(&meta(name), &ConvoySpec {
-            continuation: None,
-            subjects: Vec::new(),
-            role: String::new(),
-            generation: 1,
-            workflow_ref: "wf".to_string(),
-            dispatching_principal_ref: Default::default(),
-            inputs: Default::default(),
-            placement_policy: None,
-            repositories: vec![ConvoyRepositorySpec {
-                url: repo_url.to_string(),
-                repo_ref: repository_key,
-                source_ref: git_ref.to_string(),
-                target_ref: git_ref.to_string(),
-                workspace_slug: repository_spec.leaf_slug(),
-                subpaths: Vec::new(),
-            }],
-            r#ref: Some(git_ref.to_string()),
-            project_ref: None,
-            adopted_checkout_refs: BTreeMap::new(),
-            issues: Vec::new(),
-            change_request: None,
-            instruction: None,
-        })
+        .create(
+            &meta(name),
+            &ConvoySpec {
+                continuation: None,
+                subjects: Vec::new(),
+                role: String::new(),
+                generation: 1,
+                workflow_ref: "wf".to_string(),
+                dispatching_principal_ref: Default::default(),
+                inputs: Default::default(),
+                placement_policy: None,
+                repositories: vec![ConvoyRepositorySpec {
+                    url: repo_url.to_string(),
+                    repo_ref: repository_key,
+                    source_ref: git_ref.to_string(),
+                    target_ref: git_ref.to_string(),
+                    workspace_slug: repository_spec.leaf_slug(),
+                    subpaths: Vec::new(),
+                }],
+                r#ref: Some(git_ref.to_string()),
+                project_ref: None,
+                adopted_checkout_refs: BTreeMap::new(),
+                issues: Vec::new(),
+                change_request: None,
+                instruction: None,
+            },
+        )
         .await
         .expect("convoy create should succeed");
     convoys
-        .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus {
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                stall_nudges: Default::default(),
-                supervision: None,
-                // This generic fixture has no exit. Tests that expect a dispatched
-                // agent brief must declare one on their pinned workflow snapshot.
-                exit: None,
-                turn_delivery: Default::default(),
-                vessels: vec![VesselRequirement {
-                    name: task.to_string(),
-                    depends_on: Vec::new(),
-                    repository_refs: None,
-                    credential_refs: Default::default(),
-                    credential_scopes: Default::default(),
-                    credential_permissions: Default::default(),
-                    crew: vec![CrewSpec::builder()
-                        .role("coder".to_string())
-                        .source(CrewSource::Tool { command: "cargo test".to_string() })
-                        .build()],
-                }],
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            name,
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                    // This generic fixture has no exit. Tests that expect a dispatched
+                    // agent brief must declare one on their pinned workflow snapshot.
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    vessels: vec![VesselRequirement {
+                        name: task.to_string(),
+                        depends_on: Vec::new(),
+                        repository_refs: None,
+                        credential_refs: Default::default(),
+                        credential_scopes: Default::default(),
+                        credential_permissions: Default::default(),
+                        crew: vec![CrewSpec::builder()
+                            .role("coder".to_string())
+                            .source(CrewSource::Tool { command: "cargo test".to_string() })
+                            .build()],
+                    }],
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("convoy status update should succeed");
     convoys.get(name).await.expect("convoy get should succeed")
@@ -154,12 +161,15 @@ pub async fn create_workspace(
     let mut meta = vessel_meta(name, repo_url);
     meta.labels.insert(flotilla_resources::CONVOY_LABEL.to_string(), convoy_ref.to_string());
     workspaces
-        .create(&meta, &VesselSpec {
-            convoy_ref: convoy_ref.to_string(),
-            vessel_name: task.to_string(),
-            placement_policy_ref: placement_policy_ref.to_string(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &meta,
+            &VesselSpec {
+                convoy_ref: convoy_ref.to_string(),
+                vessel_name: task.to_string(),
+                placement_policy_ref: placement_policy_ref.to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("workspace create should succeed")
 }
@@ -225,27 +235,37 @@ pub async fn create_ready_host_direct_environment(
     let environments = backend.clone().using::<Environment>(namespace);
     let name = format!("host-direct-{host_ref}");
     let created = environments
-        .create(&meta(&name), &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec { host_ref: host_ref.to_string(), repo_default_dir: repo_default_dir.to_string() }),
-            docker: None,
-        })
+        .create(
+            &meta(&name),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec {
+                    host_ref: host_ref.to_string(),
+                    repo_default_dir: repo_default_dir.to_string(),
+                }),
+                docker: None,
+            },
+        )
         .await
         .expect("environment create should succeed");
     environments
-        .update_status(&name, &created.metadata.resource_version, &EnvironmentStatus {
-            image_build_refs: Vec::new(),
-            configured_limits: None,
-            runtime_observation: None,
-            phase: EnvironmentPhase::Ready,
-            ready: true,
-            docker_container_id: None,
-            image_ref: None,
-            local_image_id: None,
-            registry_digest: None,
-            message: None,
-            credential_delivery_retry: None,
-            credential_refresh_retry: None,
-        })
+        .update_status(
+            &name,
+            &created.metadata.resource_version,
+            &EnvironmentStatus {
+                image_build_refs: Vec::new(),
+                configured_limits: None,
+                runtime_observation: None,
+                phase: EnvironmentPhase::Ready,
+                ready: true,
+                docker_container_id: None,
+                image_ref: None,
+                local_image_id: None,
+                registry_digest: None,
+                message: None,
+                credential_delivery_retry: None,
+                credential_refresh_retry: None,
+            },
+        )
         .await
         .expect("environment status update should succeed");
     environments.get(&name).await.expect("environment get should succeed")
@@ -264,20 +284,24 @@ pub async fn create_ready_docker_environment(
         .await
         .expect("docker env create should succeed");
     environments
-        .update_status(name, &created.metadata.resource_version, &EnvironmentStatus {
-            image_build_refs: Vec::new(),
-            configured_limits: None,
-            runtime_observation: None,
-            phase: EnvironmentPhase::Ready,
-            ready: true,
-            docker_container_id: Some(format!("container-{name}")),
-            image_ref: Some(image_ref),
-            local_image_id: Some("sha256:test-image".to_string()),
-            registry_digest: None,
-            message: None,
-            credential_delivery_retry: None,
-            credential_refresh_retry: None,
-        })
+        .update_status(
+            name,
+            &created.metadata.resource_version,
+            &EnvironmentStatus {
+                image_build_refs: Vec::new(),
+                configured_limits: None,
+                runtime_observation: None,
+                phase: EnvironmentPhase::Ready,
+                ready: true,
+                docker_container_id: Some(format!("container-{name}")),
+                image_ref: Some(image_ref),
+                local_image_id: Some("sha256:test-image".to_string()),
+                registry_digest: None,
+                message: None,
+                credential_delivery_retry: None,
+                credential_refresh_retry: None,
+            },
+        )
         .await
         .expect("docker env status update should succeed");
     environments.get(name).await.expect("docker env get should succeed")
@@ -293,23 +317,32 @@ pub async fn create_ready_clone(
 ) -> flotilla_resources::ResourceObject<Clone> {
     let clones = backend.clone().using::<Clone>(namespace);
     let created = clones
-        .create(&meta(name), &CloneSpec {
-            repo_ref: flotilla_resources::RepositoryKey(repo_key(&canonicalize_repo_url(repo_url).expect("repo URL should canonicalize"))),
-            url: repo_url.to_string(),
-            env_ref: env_ref.to_string(),
-            path: path.to_string(),
-        })
+        .create(
+            &meta(name),
+            &CloneSpec {
+                repo_ref: flotilla_resources::RepositoryKey(repo_key(
+                    &canonicalize_repo_url(repo_url).expect("repo URL should canonicalize"),
+                )),
+                url: repo_url.to_string(),
+                env_ref: env_ref.to_string(),
+                path: path.to_string(),
+            },
+        )
         .await
         .expect("clone create should succeed");
     clones
-        .update_status(name, &created.metadata.resource_version, &CloneStatus {
-            phase: ClonePhase::Ready,
-            default_branch: Some("main".to_string()),
-            message: None,
-            failed_at: None,
-            failure_policy: None,
-            retry: None,
-        })
+        .update_status(
+            name,
+            &created.metadata.resource_version,
+            &CloneStatus {
+                phase: ClonePhase::Ready,
+                default_branch: Some("main".to_string()),
+                message: None,
+                failed_at: None,
+                failure_policy: None,
+                retry: None,
+            },
+        )
         .await
         .expect("clone status update should succeed");
     clones.get(name).await.expect("clone get should succeed")
@@ -339,15 +372,19 @@ pub async fn create_ready_checkout(
     };
     let created = checkouts.create(&meta(&fixture.name), &spec).await.expect("checkout create should succeed");
     checkouts
-        .update_status(&fixture.name, &created.metadata.resource_version, &CheckoutStatus {
-            clone_retry: None,
-            phase: CheckoutPhase::Ready,
-            path: Some(fixture.path.clone()),
-            commit: Some("44982740".to_string()),
-            branch_provenance: Default::default(),
-            integration: Default::default(),
-            message: None,
-        })
+        .update_status(
+            &fixture.name,
+            &created.metadata.resource_version,
+            &CheckoutStatus {
+                clone_retry: None,
+                phase: CheckoutPhase::Ready,
+                path: Some(fixture.path.clone()),
+                commit: Some("44982740".to_string()),
+                branch_provenance: Default::default(),
+                integration: Default::default(),
+                message: None,
+            },
+        )
         .await
         .expect("checkout status update should succeed");
     checkouts.get(&fixture.name).await.expect("checkout get should succeed")
@@ -371,40 +408,47 @@ pub async fn create_stopped_terminal(
 ) -> flotilla_resources::ResourceObject<TerminalSession> {
     let sessions = backend.clone().using::<TerminalSession>(namespace);
     let created = sessions
-        .create(&meta(&fixture.name), &TerminalSessionSpec {
-            env_ref: fixture.env_ref,
-            role: fixture.role,
-            source: flotilla_resources::TerminalSessionSource::Tool { command: fixture.command.clone() },
-            cwd: fixture.cwd,
-            env: Default::default(),
-            pool: fixture.pool,
-        })
+        .create(
+            &meta(&fixture.name),
+            &TerminalSessionSpec {
+                env_ref: fixture.env_ref,
+                role: fixture.role,
+                source: flotilla_resources::TerminalSessionSource::Tool { command: fixture.command.clone() },
+                cwd: fixture.cwd,
+                env: Default::default(),
+                pool: fixture.pool,
+            },
+        )
         .await
         .expect("terminal create should succeed");
     sessions
-        .update_status(&fixture.name, &created.metadata.resource_version, &TerminalSessionStatus {
-            configured_limits: None,
-            phase: TerminalSessionPhase::Stopped,
-            session_id: Some(format!("session-{}", fixture.name)),
-            cleat_endpoint: None,
-            pid: Some(42),
-            started_at: Some(Utc::now()),
-            stopped_at: Some(Utc::now()),
-            inner_command_status: Some(flotilla_resources::InnerCommandStatus::Exited),
-            inner_exit_code: Some(1),
-            message: Some(fixture.message),
-            crew: None,
-            retired_launches: Default::default(),
-            launch_command: Some(fixture.command),
-            delivered_message_id: None,
-            attention: None,
-            last_tool_activity_at: None,
-            last_output_digest: None,
-            last_output_activity_at: None,
-            occupancy: Default::default(),
-            completion_pending: None,
-            degraded: None,
-        })
+        .update_status(
+            &fixture.name,
+            &created.metadata.resource_version,
+            &TerminalSessionStatus {
+                configured_limits: None,
+                phase: TerminalSessionPhase::Stopped,
+                session_id: Some(format!("session-{}", fixture.name)),
+                cleat_endpoint: None,
+                pid: Some(42),
+                started_at: Some(Utc::now()),
+                stopped_at: Some(Utc::now()),
+                inner_command_status: Some(flotilla_resources::InnerCommandStatus::Exited),
+                inner_exit_code: Some(1),
+                message: Some(fixture.message),
+                crew: None,
+                retired_launches: Default::default(),
+                launch_command: Some(fixture.command),
+                delivered_message_id: None,
+                attention: None,
+                last_tool_activity_at: None,
+                last_output_digest: None,
+                last_output_activity_at: None,
+                occupancy: Default::default(),
+                completion_pending: None,
+                degraded: None,
+            },
+        )
         .await
         .expect("terminal status update should succeed");
     sessions.get(&fixture.name).await.expect("terminal get should succeed")

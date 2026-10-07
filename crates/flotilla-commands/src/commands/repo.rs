@@ -197,31 +197,37 @@ mod tests {
     #[test]
     fn repo_checkout_existing_branch() {
         let resolved = parse(&["repo", "myslug", "checkout", "feat-x"]).resolve().unwrap();
-        crate::test_utils::assert_ready(resolved, CommandAction::Checkout {
-            repo: RepoSelector::Query("myslug".into()),
-            target: CheckoutTarget::Branch("feat-x".into()),
-            issue_ids: vec![],
-        });
+        crate::test_utils::assert_ready(
+            resolved,
+            CommandAction::Checkout {
+                repo: RepoSelector::Query("myslug".into()),
+                target: CheckoutTarget::Branch("feat-x".into()),
+                issue_ids: vec![],
+            },
+        );
     }
 
     #[test]
     fn repo_checkout_fresh_branch() {
         let resolved = parse(&["repo", "myslug", "checkout", "--fresh", "feat-x"]).resolve().unwrap();
-        crate::test_utils::assert_ready(resolved, CommandAction::Checkout {
-            repo: RepoSelector::Query("myslug".into()),
-            target: CheckoutTarget::FreshBranch("feat-x".into()),
-            issue_ids: vec![],
-        });
+        crate::test_utils::assert_ready(
+            resolved,
+            CommandAction::Checkout {
+                repo: RepoSelector::Query("myslug".into()),
+                target: CheckoutTarget::FreshBranch("feat-x".into()),
+                issue_ids: vec![],
+            },
+        );
     }
 
     #[test]
     fn repo_prepare_terminal() {
         let resolved = parse(&["repo", "myslug", "prepare-terminal", "/tmp/path"]).resolve().unwrap();
         let Resolved::Ready(command) = resolved else { panic!("expected a ready command") };
-        assert_eq!(command.action, CommandAction::PrepareTerminalForCheckout {
-            checkout_path: PathBuf::from("/tmp/path"),
-            commands: vec![]
-        });
+        assert_eq!(
+            command.action,
+            CommandAction::PrepareTerminalForCheckout { checkout_path: PathBuf::from("/tmp/path"), commands: vec![] }
+        );
         assert_eq!(command.context_repo, Some(RepoSelector::Query("myslug".into())));
     }
 

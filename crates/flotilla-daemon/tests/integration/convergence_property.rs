@@ -203,11 +203,10 @@ impl Harness {
         let stale_source = ResourceBackend::InMemory(InMemoryBackend::default());
         let stale = stale_source.using::<Host>(NAMESPACE);
         let stale_object = stale
-            .create(&InputMeta::builder().name("host-0".to_string()).build(), &HostSpec {
-                display_name: "stale-self-copy".into(),
-                connection: Default::default(),
-                ..HostSpec::default()
-            })
+            .create(
+                &InputMeta::builder().name("host-0".to_string()).build(),
+                &HostSpec { display_name: "stale-self-copy".into(), connection: Default::default(), ..HostSpec::default() },
+            )
             .await
             .expect("create stale self-origin fixture");
         stale
@@ -297,11 +296,14 @@ impl Harness {
                 let resolver = self.nodes[index].backend.using::<Host>(NAMESPACE);
                 if matches!(resolver.get(&name).await, Err(ResourceError::NotFound { .. })) {
                     resolver
-                        .create(&InputMeta::builder().name(name).build(), &HostSpec {
-                            display_name: format!("created-by-{}", self.seed),
-                            connection: Default::default(),
-                            ..HostSpec::default()
-                        })
+                        .create(
+                            &InputMeta::builder().name(name).build(),
+                            &HostSpec {
+                                display_name: format!("created-by-{}", self.seed),
+                                connection: Default::default(),
+                                ..HostSpec::default()
+                            },
+                        )
                         .await
                         .map_err(|error| error.to_string())?;
                 }
@@ -311,11 +313,15 @@ impl Harness {
                 let resolver = self.nodes[index].backend.using::<Host>(NAMESPACE);
                 if let Ok(current) = resolver.get(&name).await {
                     resolver
-                        .update(&InputMeta::builder().name(name).build(), &current.metadata.resource_version, &HostSpec {
-                            display_name: format!("seed-{}-rv-{}", self.seed, current.metadata.resource_version),
-                            connection: Default::default(),
-                            ..HostSpec::default()
-                        })
+                        .update(
+                            &InputMeta::builder().name(name).build(),
+                            &current.metadata.resource_version,
+                            &HostSpec {
+                                display_name: format!("seed-{}-rv-{}", self.seed, current.metadata.resource_version),
+                                connection: Default::default(),
+                                ..HostSpec::default()
+                            },
+                        )
                         .await
                         .map_err(|error| error.to_string())?;
                 }
@@ -325,10 +331,11 @@ impl Harness {
                 let resolver = self.nodes[index].backend.using::<Host>(NAMESPACE);
                 if let Ok(current) = resolver.get(&name).await {
                     resolver
-                        .update_status(&name, &current.metadata.resource_version, &HostStatus {
-                            disk_free_bytes: Some(self.seed + index as u64),
-                            ..HostStatus::default()
-                        })
+                        .update_status(
+                            &name,
+                            &current.metadata.resource_version,
+                            &HostStatus { disk_free_bytes: Some(self.seed + index as u64), ..HostStatus::default() },
+                        )
                         .await
                         .map_err(|error| error.to_string())?;
                 }
@@ -491,11 +498,10 @@ impl Harness {
         let stale_source = ResourceBackend::InMemory(InMemoryBackend::default());
         let stale = stale_source
             .using::<Host>(NAMESPACE)
-            .create(&InputMeta::builder().name("host-0".to_string()).build(), &HostSpec {
-                display_name: "watch-shadow".to_string(),
-                connection: Default::default(),
-                ..HostSpec::default()
-            })
+            .create(
+                &InputMeta::builder().name("host-0".to_string()).build(),
+                &HostSpec { display_name: "watch-shadow".to_string(), connection: Default::default(), ..HostSpec::default() },
+            )
             .await
             .map_err(|error| error.to_string())?;
         node.backend

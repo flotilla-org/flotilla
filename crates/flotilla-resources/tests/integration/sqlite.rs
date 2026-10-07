@@ -405,10 +405,10 @@ async fn undecodable_replica_partition_is_dropped_and_forces_full_resync() {
     {
         let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
         connection
-            .execute("UPDATE replica_objects SET body_json = '{}' WHERE origin_root = ?1 AND name = ?2", rusqlite::params![
-                origin.to_string(),
-                "remote"
-            ])
+            .execute(
+                "UPDATE replica_objects SET body_json = '{}' WHERE origin_root = ?1 AND name = ?2",
+                rusqlite::params![origin.to_string(), "remote"],
+            )
             .expect("corrupt cached replica");
     }
 
@@ -665,10 +665,10 @@ async fn recreating_a_quarantined_object_clears_its_decode_diagnosis() {
     }
     let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
     let changed = connection
-        .execute("UPDATE resource_objects SET body_json = '{}' WHERE kind = ?1 AND name = ?2", rusqlite::params![
-            Convoy::API_PATHS.kind,
-            "poisoned"
-        ])
+        .execute(
+            "UPDATE resource_objects SET body_json = '{}' WHERE kind = ?1 AND name = ?2",
+            rusqlite::params![Convoy::API_PATHS.kind, "poisoned"],
+        )
         .expect("corrupt stored object");
     assert_eq!(changed, 1);
     drop(connection);
@@ -701,10 +701,10 @@ async fn deleting_a_quarantined_object_clears_its_decode_diagnosis() {
     }
     let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
     let changed = connection
-        .execute("UPDATE resource_objects SET body_json = '{}' WHERE kind = ?1 AND name = ?2", rusqlite::params![
-            Convoy::API_PATHS.kind,
-            "poisoned"
-        ])
+        .execute(
+            "UPDATE resource_objects SET body_json = '{}' WHERE kind = ?1 AND name = ?2",
+            rusqlite::params![Convoy::API_PATHS.kind, "poisoned"],
+        )
         .expect("corrupt stored object");
     assert_eq!(changed, 1);
     drop(connection);
@@ -738,10 +738,10 @@ async fn deleting_a_non_replicated_quarantined_object_clears_its_decode_diagnosi
     }
     let connection = rusqlite::Connection::open(&path).expect("open raw sqlite connection");
     let changed = connection
-        .execute("UPDATE resource_objects SET body_json = '{}' WHERE kind = ?1 AND name = ?2", rusqlite::params![
-            WorkflowTemplate::API_PATHS.kind,
-            "poisoned"
-        ])
+        .execute(
+            "UPDATE resource_objects SET body_json = '{}' WHERE kind = ?1 AND name = ?2",
+            rusqlite::params![WorkflowTemplate::API_PATHS.kind, "poisoned"],
+        )
         .expect("corrupt stored object");
     assert_eq!(changed, 1);
     drop(connection);
@@ -799,10 +799,10 @@ async fn slow_sqlite_crud_does_not_stall_tokio_executor() {
     });
 
     resolver
-        .create(&resource_meta().name("alpha").call(), &SlowSpec {
-            value: "alpha".to_string(),
-            serialization_delay: Duration::from_millis(200),
-        })
+        .create(
+            &resource_meta().name("alpha").call(),
+            &SlowSpec { value: "alpha".to_string(), serialization_delay: Duration::from_millis(200) },
+        )
         .await
         .expect("slow create should succeed");
 
@@ -816,10 +816,10 @@ async fn concurrent_create_and_watch_delivers_the_committed_version_once() {
     let create_resolver = resolver.clone();
     let create = tokio::spawn(async move {
         create_resolver
-            .create(&resource_meta().name("alpha").call(), &SlowSpec {
-                value: "alpha".to_string(),
-                serialization_delay: Duration::from_millis(200),
-            })
+            .create(
+                &resource_meta().name("alpha").call(),
+                &SlowSpec { value: "alpha".to_string(), serialization_delay: Duration::from_millis(200) },
+            )
             .await
     });
 
@@ -1043,10 +1043,10 @@ async fn watch_replay_quarantines_an_undecodable_event_and_requires_a_snapshot()
     let backend = ResourceBackend::Sqlite(SqliteBackend::open(&path).expect("sqlite backend should reopen after schema upgrade"));
     backend
         .using::<CurrentReplayCredential>("flotilla")
-        .create(&resource_meta().name("healthy").call(), &CurrentReplayCredentialSpec {
-            service: "forgejo".to_string(),
-            username: "robert".to_string(),
-        })
+        .create(
+            &resource_meta().name("healthy").call(),
+            &CurrentReplayCredentialSpec { service: "forgejo".to_string(), username: "robert".to_string() },
+        )
         .await
         .expect("create current-schema event");
 
@@ -1076,17 +1076,18 @@ async fn compaction_removes_a_superseded_event_quarantine_with_its_event() {
     let backend = ResourceBackend::Sqlite(SqliteBackend::open_with_event_retention(&path, retention).expect("sqlite backend should open"));
     let resolver = backend.using::<CurrentReplayCredential>("flotilla");
     let first = resolver
-        .create(&resource_meta().name("superseded").call(), &CurrentReplayCredentialSpec {
-            service: "forgejo".to_string(),
-            username: "old".to_string(),
-        })
+        .create(
+            &resource_meta().name("superseded").call(),
+            &CurrentReplayCredentialSpec { service: "forgejo".to_string(), username: "old".to_string() },
+        )
         .await
         .expect("create first event");
     resolver
-        .update(&resource_meta().name("superseded").call(), &first.metadata.resource_version, &CurrentReplayCredentialSpec {
-            service: "forgejo".to_string(),
-            username: "current".to_string(),
-        })
+        .update(
+            &resource_meta().name("superseded").call(),
+            &first.metadata.resource_version,
+            &CurrentReplayCredentialSpec { service: "forgejo".to_string(), username: "current".to_string() },
+        )
         .await
         .expect("replace resource with a superseding event");
     drop(resolver);
@@ -1103,9 +1104,10 @@ async fn compaction_removes_a_superseded_event_quarantine_with_its_event() {
         .expect("spec should be an object")
         .remove("username");
     connection
-        .execute("UPDATE resource_events SET body_json = ?1 WHERE event_version = 1", [
-            serde_json::to_string(&body).expect("encode old-schema body")
-        ])
+        .execute(
+            "UPDATE resource_events SET body_json = ?1 WHERE event_version = 1",
+            [serde_json::to_string(&body).expect("encode old-schema body")],
+        )
         .expect("downgrade first event body");
     drop(connection);
 
@@ -1120,10 +1122,10 @@ async fn compaction_removes_a_superseded_event_quarantine_with_its_event() {
     );
 
     resolver
-        .create(&resource_meta().name("compaction-trigger").call(), &CurrentReplayCredentialSpec {
-            service: "forgejo".to_string(),
-            username: "healthy".to_string(),
-        })
+        .create(
+            &resource_meta().name("compaction-trigger").call(),
+            &CurrentReplayCredentialSpec { service: "forgejo".to_string(), username: "healthy".to_string() },
+        )
         .await
         .expect("create event that advances the compaction floor");
     assert!(
@@ -1163,10 +1165,13 @@ async fn reopening_with_smaller_retention_compacts_existing_events_and_persists_
         .watch(WatchStart::FromVersion(first.metadata.resource_version.clone()))
         .await
         .expect_err("startup compaction should expire old version");
-    assert_eq!(expired, flotilla_resources::ResourceError::WatchExpired {
-        requested_version: first.metadata.resource_version,
-        compacted_through: Some(second.metadata.resource_version),
-    });
+    assert_eq!(
+        expired,
+        flotilla_resources::ResourceError::WatchExpired {
+            requested_version: first.metadata.resource_version,
+            compacted_through: Some(second.metadata.resource_version),
+        }
+    );
 
     drop(resolver);
     drop(backend);

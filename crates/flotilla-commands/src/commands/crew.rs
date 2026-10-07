@@ -339,9 +339,10 @@ mod tests {
     #[test]
     fn capabilities_uses_ambient_identity_and_rejects_completion_options() {
         let noun = CrewNoun::try_parse_from(["crew", "capabilities"]).expect("parse");
-        assert_eq!(action(noun.clone(), Some("crew-123")), CommandAction::QueryCrewCapabilities {
-            context: CrewCommandContext::builder().crew_id("crew-123".into()).build(),
-        });
+        assert_eq!(
+            action(noun.clone(), Some("crew-123")),
+            CommandAction::QueryCrewCapabilities { context: CrewCommandContext::builder().crew_id("crew-123".into()).build() }
+        );
         assert_eq!(CrewNoun::try_parse_from(noun.to_string().split_whitespace()).expect("round-trip"), noun);
         let invalid = CrewNoun::try_parse_from(["crew", "capabilities", "--message", "done"]).expect("parse");
         assert!(invalid
@@ -353,20 +354,24 @@ mod tests {
     #[test]
     fn list_uses_ambient_crew_identity() {
         let noun = CrewNoun::try_parse_from(["crew", "list"]).expect("parse list");
-        assert_eq!(action(noun, Some("crew-123")), CommandAction::QueryCrewList {
-            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() }
-        });
+        assert_eq!(
+            action(noun, Some("crew-123")),
+            CommandAction::QueryCrewList { context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() } }
+        );
     }
 
     #[test]
     fn stall_requires_closed_reason_and_message() {
         let noun = CrewNoun::try_parse_from(["crew", "stall", "--reason", "access", "--message", "repo denied"]).expect("parse stall");
-        assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewStall {
-            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
-            reason: StallReason::Access,
-            proposed_disposition: None,
-            message: "repo denied".into(),
-        });
+        assert_eq!(
+            action(noun, Some("crew-123")),
+            CommandAction::CrewStall {
+                context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+                reason: StallReason::Access,
+                proposed_disposition: None,
+                message: "repo denied".into(),
+            }
+        );
         let invalid =
             CrewNoun::try_parse_from(["crew", "stall", "--reason", "maybe", "--message", "blocked"]).expect("parse invalid reason");
         assert!(invalid.resolve_with_crew_id(None).expect_err("closed reason").contains("invalid stall reason"));
@@ -385,12 +390,15 @@ mod tests {
             "ship the decoder first",
         ])
         .expect("parse proposed stall");
-        assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewStall {
-            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
-            reason: StallReason::Scope,
-            proposed_disposition: Some(flotilla_protocol::StallProposedDisposition::ReduceScope),
-            message: "ship the decoder first".into(),
-        });
+        assert_eq!(
+            action(noun, Some("crew-123")),
+            CommandAction::CrewStall {
+                context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+                reason: StallReason::Scope,
+                proposed_disposition: Some(flotilla_protocol::StallProposedDisposition::ReduceScope),
+                message: "ship the decoder first".into(),
+            }
+        );
         let invalid = CrewNoun::try_parse_from(["crew", "stall", "--reason", "scope", "--propose", "maybe", "--message", "blocked"])
             .expect("parse invalid proposal");
         assert!(invalid.resolve_with_crew_id(None).expect_err("closed proposal").contains("invalid proposed disposition"));
@@ -399,11 +407,10 @@ mod tests {
     #[test]
     fn operator_can_request_forced_failure() {
         let noun = CrewNoun::try_parse_from(["crew", "fail", "--force", "--message", "supervisor ruling"]).expect("parse forced failure");
-        assert_eq!(action(noun, None), CommandAction::CrewFail {
-            context: CrewCommandContext::default(),
-            message: "supervisor ruling".into(),
-            force: true,
-        });
+        assert_eq!(
+            action(noun, None),
+            CommandAction::CrewFail { context: CrewCommandContext::default(), message: "supervisor ruling".into(), force: true }
+        );
     }
 
     #[test]
@@ -422,26 +429,32 @@ mod tests {
             "try again",
         ])
         .expect("parse supervisor resume");
-        assert_eq!(action(noun, Some("governor-crew")), CommandAction::CrewSupervise {
-            namespace: None,
-            convoy: "work".into(),
-            vessel: "implement".into(),
-            role: "coder".into(),
-            operation: flotilla_protocol::CrewSupervisionAction::Resume,
-            message: "try again".into(),
-            actor_crew_id: Some("governor-crew".into()),
-        });
+        assert_eq!(
+            action(noun, Some("governor-crew")),
+            CommandAction::CrewSupervise {
+                namespace: None,
+                convoy: "work".into(),
+                vessel: "implement".into(),
+                role: "coder".into(),
+                operation: flotilla_protocol::CrewSupervisionAction::Resume,
+                message: "try again".into(),
+                actor_crew_id: Some("governor-crew".into()),
+            }
+        );
     }
 
     #[test]
     fn handoff_preserves_target_and_message() {
         let noun = CrewNoun::try_parse_from(["crew", "reviewer", "handoff", "--message", "Review commit abc123"]).expect("parse handoff");
-        assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewHandoff {
-            carries: Vec::new(),
-            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
-            target: "reviewer".into(),
-            message: "Review commit abc123".into(),
-        });
+        assert_eq!(
+            action(noun, Some("crew-123")),
+            CommandAction::CrewHandoff {
+                carries: Vec::new(),
+                context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+                target: "reviewer".into(),
+                message: "Review commit abc123".into(),
+            }
+        );
     }
 
     #[test]
@@ -449,12 +462,15 @@ mod tests {
         for role in ["list", "complete", "fail"] {
             let marked = format!("@{role}");
             let noun = CrewNoun::try_parse_from(["crew", &marked, "handoff", "--message", "continue"]).expect("parse marked crew role");
-            assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewHandoff {
-                carries: Vec::new(),
-                context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
-                target: role.into(),
-                message: "continue".into(),
-            });
+            assert_eq!(
+                action(noun, Some("crew-123")),
+                CommandAction::CrewHandoff {
+                    carries: Vec::new(),
+                    context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+                    target: role.into(),
+                    message: "continue".into(),
+                }
+            );
         }
     }
 
@@ -471,12 +487,15 @@ mod tests {
     fn explicit_subject_preserves_literal_address_marker() {
         let noun = CrewNoun::try_parse_from(["crew", "--subject", "@reviewer", "handoff", "--message", "continue"])
             .expect("parse explicit crew subject");
-        assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewHandoff {
-            carries: Vec::new(),
-            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
-            target: "@reviewer".into(),
-            message: "continue".into(),
-        });
+        assert_eq!(
+            action(noun, Some("crew-123")),
+            CommandAction::CrewHandoff {
+                carries: Vec::new(),
+                context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+                target: "@reviewer".into(),
+                message: "continue".into(),
+            }
+        );
     }
 
     #[test]
@@ -489,39 +508,48 @@ mod tests {
     #[test]
     fn complete_uses_ambient_crew_identity() {
         let noun = CrewNoun::try_parse_from(["crew", "complete", "--message", "ready for review"]).expect("parse complete");
-        assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewComplete {
-            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
-            message: Some("ready for review".into()),
-            disposition: None,
-            decision_ledger_ref: None,
-            force: false,
-        });
+        assert_eq!(
+            action(noun, Some("crew-123")),
+            CommandAction::CrewComplete {
+                context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+                message: Some("ready for review".into()),
+                disposition: None,
+                decision_ledger_ref: None,
+                force: false,
+            }
+        );
     }
 
     #[test]
     fn complete_preserves_declared_disposition() {
         let noun = CrewNoun::try_parse_from(["crew", "complete", "--message", "ready for review", "--disposition", "changes-pushed"])
             .expect("parse complete disposition");
-        assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewComplete {
-            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
-            message: Some("ready for review".into()),
-            disposition: Some("changes-pushed".into()),
-            decision_ledger_ref: None,
-            force: false,
-        });
+        assert_eq!(
+            action(noun, Some("crew-123")),
+            CommandAction::CrewComplete {
+                context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+                message: Some("ready for review".into()),
+                disposition: Some("changes-pushed".into()),
+                decision_ledger_ref: None,
+                force: false,
+            }
+        );
     }
 
     #[test]
     fn complete_preserves_decision_ledger_pointer() {
         let url = "https://github.com/flotilla-org/flotilla/pull/1#issuecomment-2";
         let noun = CrewNoun::try_parse_from(["crew", "complete", "--decision-ledger-ref", url]).expect("parse ledger pointer");
-        assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewComplete {
-            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
-            message: None,
-            disposition: None,
-            decision_ledger_ref: Some(url.into()),
-            force: false,
-        });
+        assert_eq!(
+            action(noun, Some("crew-123")),
+            CommandAction::CrewComplete {
+                context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+                message: None,
+                disposition: None,
+                decision_ledger_ref: Some(url.into()),
+                force: false,
+            }
+        );
     }
 
     #[test]
@@ -553,11 +581,14 @@ mod tests {
     #[test]
     fn fail_uses_ambient_crew_identity() {
         let noun = CrewNoun::try_parse_from(["crew", "fail", "--message", "cannot reproduce"]).expect("parse fail");
-        assert_eq!(action(noun, Some("crew-123")), CommandAction::CrewFail {
-            context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
-            message: "cannot reproduce".into(),
-            force: false,
-        });
+        assert_eq!(
+            action(noun, Some("crew-123")),
+            CommandAction::CrewFail {
+                context: CrewCommandContext { crew_id: Some("crew-123".into()), ..Default::default() },
+                message: "cannot reproduce".into(),
+                force: false,
+            }
+        );
     }
 
     #[test]
@@ -575,15 +606,18 @@ mod tests {
             "coder",
         ])
         .expect("parse fallback");
-        assert_eq!(action(noun, None), CommandAction::QueryCrewList {
-            context: CrewCommandContext {
-                crew_id: None,
-                namespace: Some("flotilla".into()),
-                convoy: Some("demo".into()),
-                vessel_ref: Some("demo-implement".into()),
-                role: Some("coder".into()),
+        assert_eq!(
+            action(noun, None),
+            CommandAction::QueryCrewList {
+                context: CrewCommandContext {
+                    crew_id: None,
+                    namespace: Some("flotilla".into()),
+                    convoy: Some("demo".into()),
+                    vessel_ref: Some("demo-implement".into()),
+                    role: Some("coder".into()),
+                }
             }
-        });
+        );
     }
 
     #[test]
@@ -614,10 +648,13 @@ mod tests {
         let CommandAction::CrewHandoff { target, carries, .. } = action(noun, Some("crew-123")) else { panic!("handoff action") };
         assert_eq!(target, "demo/review/reviewer");
         assert_eq!(carries.len(), 1);
-        assert_eq!(carries[0], flotilla_protocol::MessageReference::ControlRecord {
-            resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "demo"),
-            revision: "rv-1".into(),
-        });
+        assert_eq!(
+            carries[0],
+            flotilla_protocol::MessageReference::ControlRecord {
+                resource: flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "demo"),
+                revision: "rv-1".into(),
+            }
+        );
         assert_round_trip::<CrewNoun>(&args);
         CrewNoun::try_parse_from(["crew", "reviewer", "handoff", "--message", "review", "--carry", "scratch.log"])
             .expect_err("untyped paths are not Message references");

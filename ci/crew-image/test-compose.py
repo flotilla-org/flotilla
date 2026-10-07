@@ -81,6 +81,31 @@ class Composition(unittest.TestCase):
 
 
 class AcceptanceCommand(unittest.TestCase):
+    def test_stable_formatter_acceptance_uses_nonroot_offline_image(self):
+        # Glue: inject only the Docker process boundary; run the real script.
+        # The operator probe must reject nightly and exercise the baked formatter.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            docker = root / 'docker'
+            docker.write_text("""#!/usr/bin/env python3
+import sys
+args = sys.argv[1:]
+assert args[0] == 'run'
+assert '--network=none' in args and '--pull=never' in args
+assert args[args.index('--user') + 1] == '12345:12345'
+assert 'test:stable' in args
+script = args[-1]
+assert 'read_rust_pin rust-toolchain.toml' in script
+assert 'rustup toolchain list | grep -q nightly' in script
+assert 'rustfmt --check' in script and 'cargo fmt --version' in script
+""")
+            docker.chmod(0o755)
+            result = subprocess.run(
+                [str(ROOT / 'ci/crew-image/accept-stable-fmt.sh'), 'test:stable'],
+                env=dict(os.environ, PATH=str(root) + ':' + os.environ['PATH']),
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_operator_command_loads_composed_image_and_probes_as_host_uid(self):
         # Stand in only for the Docker process. Inspect the generated input and
         # argv while the operator's actual script performs orchestration.

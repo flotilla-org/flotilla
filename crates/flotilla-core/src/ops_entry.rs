@@ -294,10 +294,10 @@ mod tests {
         let OperationalEntryDefinition::Ensure(ensure) = entry.definition else {
             panic!("ensure entry");
         };
-        assert_eq!(ensure.agent_overrides, vec![
-            "claude-code:claude-fable-5-1".parse().expect("bare override"),
-            "review=codex".parse().expect("scoped override"),
-        ]);
+        assert_eq!(
+            ensure.agent_overrides,
+            vec!["claude-code:claude-fable-5-1".parse().expect("bare override"), "review=codex".parse().expect("scoped override"),]
+        );
 
         for token in ["governor=", "governor=claude-code:", "governor role=claude-code", "governor=claude-code:bad model"] {
             let contents = format!("---\nkind: ensure\nrole: governor\n---\nworkflow: governor\nagents: ['{token}']\n");

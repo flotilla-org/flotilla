@@ -523,18 +523,23 @@ mod tests {
         }
         let builds = builder.using::<ImageBuild>("test");
         assert_eq!(builds.list().await.expect("list").items.len(), 2);
-        apply_status_patch(&builds, "build", &ImageBuildStatusPatch::Start {
-            at: Utc::now(),
-            parent_digest: spec.inputs.parent_digest.clone(),
-        })
+        apply_status_patch(
+            &builds,
+            "build",
+            &ImageBuildStatusPatch::Start { at: Utc::now(), parent_digest: spec.inputs.parent_digest.clone() },
+        )
         .await
         .expect("start");
-        apply_status_patch(&builds, "build", &ImageBuildStatusPatch::Built {
-            at: Utc::now(),
-            identity: PlacedImageIdentity { local_image_id: format!("sha256:{}", "3".repeat(64)), registry_digest: None },
-            verified_provides: BTreeSet::new(),
-            log_ref: "log".into(),
-        })
+        apply_status_patch(
+            &builds,
+            "build",
+            &ImageBuildStatusPatch::Built {
+                at: Utc::now(),
+                identity: PlacedImageIdentity { local_image_id: format!("sha256:{}", "3".repeat(64)), registry_digest: None },
+                verified_provides: BTreeSet::new(),
+                log_ref: "log".into(),
+            },
+        )
         .await
         .expect("built");
         home.replica_writer::<ImageBuild>(NodeId::new("builder-root"), "test")

@@ -156,10 +156,11 @@ async fn acknowledged_demand_cannot_report_a_successful_resolution_without_a_ver
         )
         .await
         .expect("create demand");
-    flotilla_resources::apply_status_patch(&demands, "dismissed", &DemandStatusPatch::Acknowledge {
-        as_of: timestamp(20),
-        authority: "principal/default".to_string(),
-    })
+    flotilla_resources::apply_status_patch(
+        &demands,
+        "dismissed",
+        &DemandStatusPatch::Acknowledge { as_of: timestamp(20), authority: "principal/default".to_string() },
+    )
     .await
     .expect("acknowledge demand");
     let verdict = DemandVerdict::builder()

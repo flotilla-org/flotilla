@@ -598,10 +598,13 @@ mod tests {
                 assert_eq!(tombstone.name, "lost-account");
                 assert_eq!(tombstone.namespace, "default");
                 assert_eq!(tombstone.resource_version, "42");
-                assert_eq!(provenance, ResourceProvenance::Replica {
-                    origin_root: flotilla_protocol::NodeId::new("origin-a"),
-                    last_synced_at: Utc.with_ymd_and_hms(2026, 8, 11, 20, 0, 0).unwrap(),
-                });
+                assert_eq!(
+                    provenance,
+                    ResourceProvenance::Replica {
+                        origin_root: flotilla_protocol::NodeId::new("origin-a"),
+                        last_synced_at: Utc.with_ymd_and_hms(2026, 8, 11, 20, 0, 0).unwrap(),
+                    }
+                );
             }
             other => panic!("expected name tombstone, got {other:?}"),
         }

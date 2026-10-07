@@ -53,21 +53,24 @@ async fn a_provisioning_failure_marks_the_environment_failed() {
     let backend = ResourceBackend::InMemory(Default::default());
     let environments = backend.clone().using::<Environment>("flotilla");
     let environment = environments
-        .create(&InputMeta::builder().name("env-waiting".to_string()).build(), &EnvironmentSpec {
-            host_direct: None,
-            docker: Some(DockerEnvironmentSpec {
-                image_composition: None,
-                image_build_ref: None,
-                memory_policy: Default::default(),
-                host_ref: "host-a".to_string(),
-                image: "crew-image".to_string(),
-                declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
-                required_agent_adapters: BTreeSet::from(["codex".to_string()]),
-                pull_policy: Default::default(),
-                mounts: Vec::new(),
-                env: Default::default(),
-            }),
-        })
+        .create(
+            &InputMeta::builder().name("env-waiting".to_string()).build(),
+            &EnvironmentSpec {
+                host_direct: None,
+                docker: Some(DockerEnvironmentSpec {
+                    image_composition: None,
+                    image_build_ref: None,
+                    memory_policy: Default::default(),
+                    host_ref: "host-a".to_string(),
+                    image: "crew-image".to_string(),
+                    declared_agent_adapters: BTreeSet::from(["codex".to_string()]),
+                    required_agent_adapters: BTreeSet::from(["codex".to_string()]),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: Default::default(),
+                }),
+            },
+        )
         .await
         .expect("create environment");
     let reconciler = EnvironmentReconciler::new(Arc::new(FailingDockerRuntime), backend.clone(), "flotilla");
@@ -87,10 +90,10 @@ async fn finalizer_error_surfaces_as_failed_environment_status() {
     let backend = ResourceBackend::InMemory(Default::default());
     let environment = backend
         .using::<Environment>("flotilla")
-        .create(&InputMeta::builder().name("env-corrupt-metadata".to_string()).build(), &EnvironmentSpec {
-            host_direct: None,
-            docker: None,
-        })
+        .create(
+            &InputMeta::builder().name("env-corrupt-metadata".to_string()).build(),
+            &EnvironmentSpec { host_direct: None, docker: None },
+        )
         .await
         .expect("create environment");
     let reconciler = EnvironmentReconciler::new(Arc::new(FailingDockerRuntime), backend.clone(), "flotilla");
@@ -111,29 +114,36 @@ async fn failed_environment_without_a_container_still_runs_terminal_cleanup() {
     let backend = ResourceBackend::InMemory(Default::default());
     let environments = backend.clone().using::<Environment>("flotilla");
     let environment = environments
-        .create(&InputMeta::builder().name("env-failed".to_string()).build(), &EnvironmentSpec {
-            host_direct: None,
-            docker: Some(DockerEnvironmentSpec {
-                image_composition: None,
-                image_build_ref: None,
-                memory_policy: Default::default(),
-                host_ref: "host-a".to_string(),
-                image: "crew-image".to_string(),
-                declared_agent_adapters: BTreeSet::new(),
-                required_agent_adapters: BTreeSet::new(),
-                pull_policy: Default::default(),
-                mounts: Vec::new(),
-                env: Default::default(),
-            }),
-        })
+        .create(
+            &InputMeta::builder().name("env-failed".to_string()).build(),
+            &EnvironmentSpec {
+                host_direct: None,
+                docker: Some(DockerEnvironmentSpec {
+                    image_composition: None,
+                    image_build_ref: None,
+                    memory_policy: Default::default(),
+                    host_ref: "host-a".to_string(),
+                    image: "crew-image".to_string(),
+                    declared_agent_adapters: BTreeSet::new(),
+                    required_agent_adapters: BTreeSet::new(),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: Default::default(),
+                }),
+            },
+        )
         .await
         .expect("create environment");
     let environment = environments
-        .update_status("env-failed", &environment.metadata.resource_version, &EnvironmentStatus {
-            phase: EnvironmentPhase::Failed,
-            message: Some("provisioning failed".to_string()),
-            ..EnvironmentStatus::default()
-        })
+        .update_status(
+            "env-failed",
+            &environment.metadata.resource_version,
+            &EnvironmentStatus {
+                phase: EnvironmentPhase::Failed,
+                message: Some("provisioning failed".to_string()),
+                ..EnvironmentStatus::default()
+            },
+        )
         .await
         .expect("mark environment failed");
     let runtime = Arc::new(RecordingDockerRuntime::default());
@@ -167,38 +177,43 @@ async fn foreign_environment_is_not_actuated_or_finalized() {
     let hosts = backend.using::<Host>("flotilla");
     for host in ["kiwi", "udder"] {
         hosts
-            .create(&InputMeta::builder().name(host.to_string()).build(), &HostSpec {
-                display_name: host.to_string(),
-                connection: Default::default(),
-                ..HostSpec::default()
-            })
+            .create(
+                &InputMeta::builder().name(host.to_string()).build(),
+                &HostSpec { display_name: host.to_string(), connection: Default::default(), ..HostSpec::default() },
+            )
             .await
             .expect("create host identity");
     }
     let environments = backend.using::<Environment>("flotilla");
     let docker = environments
-        .create(&InputMeta::builder().name("env-udder".to_string()).build(), &EnvironmentSpec {
-            host_direct: None,
-            docker: Some(DockerEnvironmentSpec {
-                image_composition: None,
-                image_build_ref: None,
-                memory_policy: Default::default(),
-                host_ref: "udder".to_string(),
-                image: "crew:latest".to_string(),
-                declared_agent_adapters: BTreeSet::new(),
-                required_agent_adapters: BTreeSet::new(),
-                pull_policy: Default::default(),
-                mounts: Vec::new(),
-                env: Default::default(),
-            }),
-        })
+        .create(
+            &InputMeta::builder().name("env-udder".to_string()).build(),
+            &EnvironmentSpec {
+                host_direct: None,
+                docker: Some(DockerEnvironmentSpec {
+                    image_composition: None,
+                    image_build_ref: None,
+                    memory_policy: Default::default(),
+                    host_ref: "udder".to_string(),
+                    image: "crew:latest".to_string(),
+                    declared_agent_adapters: BTreeSet::new(),
+                    required_agent_adapters: BTreeSet::new(),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: Default::default(),
+                }),
+            },
+        )
         .await
         .expect("create foreign docker environment");
     let host_direct = environments
-        .create(&InputMeta::builder().name("direct-udder".to_string()).build(), &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "udder".to_string(), repo_default_dir: "/worktrees".to_string() }),
-            docker: None,
-        })
+        .create(
+            &InputMeta::builder().name("direct-udder".to_string()).build(),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "udder".to_string(), repo_default_dir: "/worktrees".to_string() }),
+                docker: None,
+            },
+        )
         .await
         .expect("create foreign host-direct environment");
     let reconciler = EnvironmentReconciler::new(Arc::new(ForeignEnvironmentRuntime), backend.clone(), "flotilla")
@@ -216,21 +231,24 @@ async fn orphaned_environment_can_finalize_after_its_host_disappears() {
     let backend = ResourceBackend::InMemory(Default::default());
     let environment = backend
         .using::<Environment>("flotilla")
-        .create(&InputMeta::builder().name("env-orphaned".to_string()).build(), &EnvironmentSpec {
-            host_direct: None,
-            docker: Some(DockerEnvironmentSpec {
-                image_composition: None,
-                image_build_ref: None,
-                memory_policy: Default::default(),
-                host_ref: "deleted-host".to_string(),
-                image: "crew:latest".to_string(),
-                declared_agent_adapters: BTreeSet::new(),
-                required_agent_adapters: BTreeSet::new(),
-                pull_policy: Default::default(),
-                mounts: Vec::new(),
-                env: Default::default(),
-            }),
-        })
+        .create(
+            &InputMeta::builder().name("env-orphaned".to_string()).build(),
+            &EnvironmentSpec {
+                host_direct: None,
+                docker: Some(DockerEnvironmentSpec {
+                    image_composition: None,
+                    image_build_ref: None,
+                    memory_policy: Default::default(),
+                    host_ref: "deleted-host".to_string(),
+                    image: "crew:latest".to_string(),
+                    declared_agent_adapters: BTreeSet::new(),
+                    required_agent_adapters: BTreeSet::new(),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: Default::default(),
+                }),
+            },
+        )
         .await
         .expect("create orphaned environment");
     let reconciler = EnvironmentReconciler::new(Arc::new(ForeignEnvironmentRuntime), backend, "flotilla")

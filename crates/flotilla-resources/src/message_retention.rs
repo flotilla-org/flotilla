@@ -145,11 +145,11 @@ mod tests {
                 .await
                 .unwrap();
             messages
-                .update_status(name, &record.metadata.resource_version, &MessageStatus {
-                    phase: MessagePhase::Expired,
-                    since: Utc.timestamp_opt(0, 0).unwrap(),
-                    ..Default::default()
-                })
+                .update_status(
+                    name,
+                    &record.metadata.resource_version,
+                    &MessageStatus { phase: MessagePhase::Expired, since: Utc.timestamp_opt(0, 0).unwrap(), ..Default::default() },
+                )
                 .await
                 .unwrap();
         }

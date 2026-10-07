@@ -132,10 +132,11 @@ async fn deleting_mis_homed_convoy_finalizes_checkout_at_its_home() {
         .await
         .expect("create child at placement home");
     checkouts
-        .update_status("old-child", &child.metadata.resource_version, &CheckoutStatus {
-            phase: CheckoutPhase::Failed,
-            ..Default::default()
-        })
+        .update_status(
+            "old-child",
+            &child.metadata.resource_version,
+            &CheckoutStatus { phase: CheckoutPhase::Failed, ..Default::default() },
+        )
         .await
         .expect("settle child before teardown");
     child_backend
@@ -257,10 +258,10 @@ async fn empty_daemon_named_with_floor(host_name: &str, free_space_floor_gib: Op
 
 fn compatible_codex_facts() -> flotilla_resources::FulfilmentFacts {
     flotilla_resources::FulfilmentFacts {
-        harnesses: BTreeMap::from([("codex".into(), flotilla_resources::HarnessFacts {
-            version: "0.160.0".into(),
-            models: BTreeMap::new(),
-        })]),
+        harnesses: BTreeMap::from([(
+            "codex".into(),
+            flotilla_resources::HarnessFacts { version: "0.160.0".into(), models: BTreeMap::new() },
+        )]),
         ..Default::default()
     }
 }
@@ -273,17 +274,21 @@ async fn seed_host_capacity(daemon: &Arc<InProcessDaemon>, free_bytes: u64, floo
         .await
         .expect("create host capacity resource");
     hosts
-        .update_status(&host_id, &host.metadata.resource_version, &HostStatus {
-            capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
-            fulfilment_facts: BTreeMap::from([(format!("host-direct-{host_id}"), compatible_codex_facts())]),
-            heartbeat_at: Some(Utc::now()),
-            ready: true,
-            daemon_generation: Some("test-generation".to_string()),
-            daemon_started_at: Some(Utc::now()),
-            disk_free_bytes: Some(free_bytes),
-            admission_free_space_floor_bytes: Some(floor_bytes),
-            ..HostStatus::default()
-        })
+        .update_status(
+            &host_id,
+            &host.metadata.resource_version,
+            &HostStatus {
+                capabilities: [(AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"]))].into_iter().collect(),
+                fulfilment_facts: BTreeMap::from([(format!("host-direct-{host_id}"), compatible_codex_facts())]),
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                daemon_generation: Some("test-generation".to_string()),
+                daemon_started_at: Some(Utc::now()),
+                disk_free_bytes: Some(free_bytes),
+                admission_free_space_floor_bytes: Some(floor_bytes),
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("publish host capacity");
 }
@@ -1019,11 +1024,11 @@ async fn forced_convoy_teardown_cascades_to_checkout_on_another_host() {
     mesh.hosts[1]
         .resource_backend()
         .using::<Checkout>(namespace)
-        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
-            phase: CheckoutPhase::Ready,
-            path: Some("/tmp/cross-home".to_string()),
-            ..Default::default()
-        })
+        .update_status(
+            &checkout.metadata.name,
+            &checkout.metadata.resource_version,
+            &CheckoutStatus { phase: CheckoutPhase::Ready, path: Some("/tmp/cross-home".to_string()), ..Default::default() },
+        )
         .await
         .expect("ready checkout");
     let checkout_backend = mesh.hosts[1].resource_backend();
@@ -1110,13 +1115,16 @@ async fn codex_version_admission_row(issuer_index: usize, minor: u32) {
         .expect("kind");
     let host = backend.using::<Host>("flotilla").get(&host_id).await.expect("host");
     let mut status = host.status.expect("status");
-    status.fulfilment_facts.insert("codex-direct".into(), flotilla_resources::FulfilmentFacts {
-        harnesses: BTreeMap::from([("codex".into(), flotilla_resources::HarnessFacts {
-            version: format!("0.{minor}.0"),
-            models: BTreeMap::new(),
-        })]),
-        ..Default::default()
-    });
+    status.fulfilment_facts.insert(
+        "codex-direct".into(),
+        flotilla_resources::FulfilmentFacts {
+            harnesses: BTreeMap::from([(
+                "codex".into(),
+                flotilla_resources::HarnessFacts { version: format!("0.{minor}.0"), models: BTreeMap::new() },
+            )]),
+            ..Default::default()
+        },
+    );
     backend.using::<Host>("flotilla").update_status(&host_id, &host.metadata.resource_version, &status).await.expect("probe facts");
     for host in &hosts {
         seed_trusted_remote_convoy_project(host, "flotilla").await;
@@ -1514,29 +1522,38 @@ async fn router_homing_scenario_table_runs_mutations_at_the_record_home() {
 async fn router_delivery_scenario_table_reaches_remote_convoy_authority() {
     let scenarios = [
         ("ensure-roll", CommandAction::ConvoyEnsureRoll { namespace: "flotilla".into(), name: "remote-ensure".into() }),
-        ("resume", CommandAction::ConvoyResume {
-            namespace: Some("flotilla".into()),
-            name: "remote-work".into(),
-            prompt: "continue".into(),
-            vessel: None,
-            role: None,
-        }),
-        ("nudge", CommandAction::ConvoyResume {
-            namespace: Some("flotilla".into()),
-            name: "remote-work".into(),
-            prompt: "check in".into(),
-            vessel: Some("work".into()),
-            role: Some("coder".into()),
-        }),
-        ("supervise", CommandAction::CrewSupervise {
-            namespace: Some("flotilla".into()),
-            convoy: "remote-work".into(),
-            vessel: "work".into(),
-            role: "coder".into(),
-            operation: flotilla_protocol::CrewSupervisionAction::Resume,
-            message: "continue".into(),
-            actor_crew_id: None,
-        }),
+        (
+            "resume",
+            CommandAction::ConvoyResume {
+                namespace: Some("flotilla".into()),
+                name: "remote-work".into(),
+                prompt: "continue".into(),
+                vessel: None,
+                role: None,
+            },
+        ),
+        (
+            "nudge",
+            CommandAction::ConvoyResume {
+                namespace: Some("flotilla".into()),
+                name: "remote-work".into(),
+                prompt: "check in".into(),
+                vessel: Some("work".into()),
+                role: Some("coder".into()),
+            },
+        ),
+        (
+            "supervise",
+            CommandAction::CrewSupervise {
+                namespace: Some("flotilla".into()),
+                convoy: "remote-work".into(),
+                vessel: "work".into(),
+                role: "coder".into(),
+                operation: flotilla_protocol::CrewSupervisionAction::Resume,
+                message: "continue".into(),
+                actor_crew_id: None,
+            },
+        ),
     ];
     for (name, action) in scenarios {
         let leader = empty_daemon_named("desk").await;
@@ -1654,21 +1671,20 @@ async fn convoy_delete_routes_to_the_home_and_its_tombstone_does_not_resurrect()
 async fn ambient_surface_observations_do_not_create_regards_over_the_client_protocol() {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named("follower").await;
-    let topology = spawn_in_memory_request_topology_stateful_with_surface(Arc::clone(&leader), follower, SurfaceDeclaration {
-        principal_ref: PrincipalRef::implicit_for_namespace("flotilla"),
-        character: SurfaceCharacter::Ambient,
-    })
+    let topology = spawn_in_memory_request_topology_stateful_with_surface(
+        Arc::clone(&leader),
+        follower,
+        SurfaceDeclaration { principal_ref: PrincipalRef::implicit_for_namespace("flotilla"), character: SurfaceCharacter::Ambient },
+    )
     .await
     .expect("spawn ambient client topology");
 
     topology
         .client
-        .observe_focus(uuid::Uuid::nil(), vec![ResourceRef::new(
-            api_version(Convoy::API_PATHS),
-            Convoy::API_PATHS.kind,
-            "flotilla",
-            "ambient-demo",
-        )])
+        .observe_focus(
+            uuid::Uuid::nil(),
+            vec![ResourceRef::new(api_version(Convoy::API_PATHS), Convoy::API_PATHS.kind, "flotilla", "ambient-demo")],
+        )
         .await
         .expect("report ambient focus");
 
@@ -1684,12 +1700,10 @@ async fn default_focal_surface_uses_the_daemons_provisioning_principal() {
 
     topology
         .client
-        .observe_focus(uuid::Uuid::nil(), vec![ResourceRef::new(
-            api_version(Convoy::API_PATHS),
-            Convoy::API_PATHS.kind,
-            "dev",
-            "focused-demo",
-        )])
+        .observe_focus(
+            uuid::Uuid::nil(),
+            vec![ResourceRef::new(api_version(Convoy::API_PATHS), Convoy::API_PATHS.kind, "dev", "focused-demo")],
+        )
         .await
         .expect("report focal focus");
 
@@ -1717,10 +1731,11 @@ async fn convoy_creation_attribution_scenario() {
     seed_host_capacity(&follower, 2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024).await;
     let follower_host_id = follower.local_host_id().expect("follower host identity").to_string();
     let principal_ref = PrincipalRef { namespace: "flotilla".to_string(), name: "alice".to_string() };
-    let topology = spawn_in_memory_request_topology_stateful_with_surface(Arc::clone(&leader), follower, SurfaceDeclaration {
-        principal_ref: principal_ref.clone(),
-        character: SurfaceCharacter::Focal,
-    })
+    let topology = spawn_in_memory_request_topology_stateful_with_surface(
+        Arc::clone(&leader),
+        follower,
+        SurfaceDeclaration { principal_ref: principal_ref.clone(), character: SurfaceCharacter::Focal },
+    )
     .await
     .expect("spawn named focal client topology");
     await_host_capacity(&leader, &follower_host_id).await;
@@ -1758,21 +1773,26 @@ async fn convoy_creation_attribution_scenario() {
 async fn assert_abandon_attribution(principal_ref: PrincipalRef, expected_authority: WorkCompletionAuthority, expected_actor: &str) {
     let leader = empty_daemon_named("leader").await;
     let follower = empty_daemon_named("follower").await;
-    let topology = spawn_in_memory_request_topology_stateful_with_surface(Arc::clone(&leader), follower, SurfaceDeclaration {
-        principal_ref,
-        character: SurfaceCharacter::Focal,
-    })
+    let topology = spawn_in_memory_request_topology_stateful_with_surface(
+        Arc::clone(&leader),
+        follower,
+        SurfaceDeclaration { principal_ref, character: SurfaceCharacter::Focal },
+    )
     .await
     .expect("spawn attributed client topology");
     let convoys = leader.resource_backend().using::<Convoy>("flotilla");
     let role = "attributed-abandon";
     let created = convoys.create(&convoy_meta("attributed-abandon-g1", role), &convoy_spec("empty", role)).await.expect("create convoy");
     convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
-            phase: ResourceConvoyPhase::Active,
-            work: BTreeMap::from([("implement".to_string(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
-            ..Default::default()
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ResourceConvoyPhase::Active,
+                work: BTreeMap::from([("implement".to_string(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("seed convoy status");
     let mut events = leader.subscribe();
@@ -1791,10 +1811,10 @@ async fn assert_abandon_attribution(principal_ref: PrincipalRef, expected_author
         })
         .await
         .expect("dispatch abandon");
-    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyAbandoned {
-        name: role.to_string(),
-        archives: Vec::new()
-    });
+    assert_eq!(
+        await_command_result(&mut events, command_id).await,
+        CommandValue::ConvoyAbandoned { name: role.to_string(), archives: Vec::new() }
+    );
 
     let status = convoys.get(&created.metadata.name).await.expect("abandoned convoy").status.expect("convoy status");
     assert_eq!(status.work["implement"].completion_authority, expected_authority);
@@ -1849,10 +1869,11 @@ async fn in_memory_mutation_preserves_socket_caller_in_status_and_explain() {
     let role = "attributed-status";
     let created = convoys.create(&convoy_meta("attributed-status-g1", role), &convoy_spec("empty", role)).await.expect("create convoy");
     convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
-            phase: ResourceConvoyPhase::Active,
-            ..Default::default()
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &ConvoyStatus { phase: ResourceConvoyPhase::Active, ..Default::default() },
+        )
         .await
         .expect("seed status");
     let mut events = leader.subscribe();
@@ -1939,16 +1960,20 @@ async fn artifact_requests_store_body_locally_and_route_envelope_to_convoy_home(
         .await
         .expect("create crew terminal");
     sessions
-        .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
-            crew: Some(
-                CrewSessionStatus::builder()
-                    .id("crew-artifact".to_string())
-                    .adapter("codex".to_string())
-                    .stance("trusted".to_string())
-                    .build(),
-            ),
-            ..TerminalSessionStatus::default()
-        })
+        .update_status(
+            &session.metadata.name,
+            &session.metadata.resource_version,
+            &TerminalSessionStatus {
+                crew: Some(
+                    CrewSessionStatus::builder()
+                        .id("crew-artifact".to_string())
+                        .adapter("codex".to_string())
+                        .stance("trusted".to_string())
+                        .build(),
+                ),
+                ..TerminalSessionStatus::default()
+            },
+        )
         .await
         .expect("mark crew session");
     let caller = CommandCaller {
@@ -2140,10 +2165,12 @@ async fn artifact_environment_reference_contract() {
         // Install the real credential collaborator while keeping automatic
         // resource reconciliation gated; this contract drives requests itself.
         let (_startup_tx, startup_ready) = tokio::sync::watch::channel(false);
-        let runtime = DaemonRuntime::start_with_options(leader.clone(), leader.config_store(), None, RuntimeOptions {
-            startup_ready: Some(startup_ready),
-            ..Default::default()
-        })
+        let runtime = DaemonRuntime::start_with_options(
+            leader.clone(),
+            leader.config_store(),
+            None,
+            RuntimeOptions { startup_ready: Some(startup_ready), ..Default::default() },
+        )
         .await
         .expect("runtime credential controller");
         let follower = empty_daemon_named("artifact-home").await;
@@ -2220,45 +2247,52 @@ async fn artifact_environment_reference_contract() {
         let convoys = leader.resource_backend().using::<Convoy>(namespace);
         let created = convoys.get(convoy).await.expect("convoy");
         convoys
-            .update_status(convoy, &created.metadata.resource_version, &ConvoyStatus {
-                phase: ResourceConvoyPhase::Active,
-                workflow_snapshot: Some(WorkflowSnapshot {
-                    cascade: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".into())
-                        .crew(vec![CrewSpec::builder()
-                            .role("coder".into())
-                            .source(CrewSource::Tool { command: "test".into() })
-                            .completion_conditions(vec![CrewCompletionExpectation::artifact_exists(
-                                "coder",
-                                "decision-ledger",
-                                ArtifactSubjectBinding::Convoy,
-                            )])
-                            .build()])
-                        .build()],
-                }),
-                work: BTreeMap::from([("work".into(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
-                ..Default::default()
-            })
+            .update_status(
+                convoy,
+                &created.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ResourceConvoyPhase::Active,
+                    workflow_snapshot: Some(WorkflowSnapshot {
+                        cascade: None,
+                        exit: None,
+                        turn_delivery: Default::default(),
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                        vessels: vec![VesselRequirement::builder()
+                            .name("work".into())
+                            .crew(vec![CrewSpec::builder()
+                                .role("coder".into())
+                                .source(CrewSource::Tool { command: "test".into() })
+                                .completion_conditions(vec![CrewCompletionExpectation::artifact_exists(
+                                    "coder",
+                                    "decision-ledger",
+                                    ArtifactSubjectBinding::Convoy,
+                                )])
+                                .build()])
+                            .build()],
+                    }),
+                    work: BTreeMap::from([("work".into(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
+                    crew_work: BTreeMap::from([(
+                        "work".into(),
+                        BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                    )]),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("active crew work");
         leader
             .resource_backend()
             .using::<Vessel>(namespace)
-            .create(&InputMeta::builder().name("artifact-demo-work".into()).build(), &VesselSpec {
-                convoy_ref: convoy.into(),
-                vessel_name: "work".into(),
-                placement_policy_ref: "test".into(),
-                adopted_checkout_refs: BTreeMap::new(),
-            })
+            .create(
+                &InputMeta::builder().name("artifact-demo-work".into()).build(),
+                &VesselSpec {
+                    convoy_ref: convoy.into(),
+                    vessel_name: "work".into(),
+                    placement_policy_ref: "test".into(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
             .await
             .expect("crew vessel");
         let sessions = leader.resource_backend().using::<TerminalSession>(namespace);
@@ -2296,16 +2330,20 @@ async fn artifact_environment_reference_contract() {
             .await
             .expect("create crew terminal");
         sessions
-            .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
-                crew: Some(
-                    CrewSessionStatus::builder()
-                        .id("crew-artifact".to_string())
-                        .adapter("codex".to_string())
-                        .stance("trusted".to_string())
-                        .build(),
-                ),
-                ..TerminalSessionStatus::default()
-            })
+            .update_status(
+                &session.metadata.name,
+                &session.metadata.resource_version,
+                &TerminalSessionStatus {
+                    crew: Some(
+                        CrewSessionStatus::builder()
+                            .id("crew-artifact".to_string())
+                            .adapter("codex".to_string())
+                            .stance("trusted".to_string())
+                            .build(),
+                    ),
+                    ..TerminalSessionStatus::default()
+                },
+            )
             .await
             .expect("mark crew session");
         let caller = CommandCaller {
@@ -2377,10 +2415,10 @@ async fn artifact_environment_reference_contract() {
         topology.client.artifact_get(address.clone(), "result.bin".into()).await.expect("get ledger");
         if two_repositories {
             // #2527: both repositories receive the convoy ledger; retry cannot duplicate comments.
-            assert_eq!(comments.lock().expect("comments").keys().cloned().collect::<Vec<_>>(), vec![
-                "repos/acme/first/issues/42/comments",
-                "repos/acme/second/issues/43/comments"
-            ]);
+            assert_eq!(
+                comments.lock().expect("comments").keys().cloned().collect::<Vec<_>>(),
+                vec!["repos/acme/first/issues/42/comments", "repos/acme/second/issues/43/comments"]
+            );
             topology
                 .client
                 .artifact_put("decision-ledger".into(), String::new(), BTreeMap::new(), "text/markdown".into(), "ledger.md".into())
@@ -2812,10 +2850,10 @@ async fn hostless_convoy_abandon_routes_to_remote_home() {
         .await
         .expect("dispatch hostless convoy abandon");
 
-    assert_eq!(await_command_result(&mut rx, command_id).await, CommandValue::ConvoyAbandoned {
-        name: convoy_name.to_string(),
-        archives: Vec::new()
-    });
+    assert_eq!(
+        await_command_result(&mut rx, command_id).await,
+        CommandValue::ConvoyAbandoned { name: convoy_name.to_string(), archives: Vec::new() }
+    );
     let status = follower_convoys
         .get(convoy_name)
         .await
@@ -2840,11 +2878,15 @@ async fn hostless_convoy_work_complete_routes_to_remote_home() {
         .await
         .expect("create remote-homed convoy");
     follower_convoys
-        .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
-            phase: ResourceConvoyPhase::Active,
-            work: BTreeMap::from([(work_name.to_string(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
-            ..Default::default()
-        })
+        .update_status(
+            &created.metadata.name,
+            &created.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ResourceConvoyPhase::Active,
+                work: BTreeMap::from([(work_name.to_string(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("seed remote work status");
     apply_convoy_replica_feed(&topology.leader, namespace, convoy_name, topology.follower_host.clone()).await;
@@ -3142,11 +3184,10 @@ async fn convoy_start_routes_to_placement_when_presentation_membership_is_stale(
         .await
         .expect("placement host should admit despite stale presentation membership");
 
-    assert_eq!(await_command_result(&mut events, command_id).await, CommandValue::ConvoyStarted {
-        name: "remote-work@flotilla".to_string(),
-        attach_plan: None,
-        binding: None
-    });
+    assert_eq!(
+        await_command_result(&mut events, command_id).await,
+        CommandValue::ConvoyStarted { name: "remote-work@flotilla".to_string(), attach_plan: None, binding: None }
+    );
     let origin_convoys = topology
         .leader
         .resource_backend()
@@ -3231,12 +3272,15 @@ async fn lagging_start_placement_scenario(explicit: bool, destination_holds_cred
         .leader
         .resource_backend()
         .definitions::<CredentialSpec>(namespace)
-        .create(&InputMeta::builder().name("claude-max".to_string()).build(), &CredentialSpecSpec {
-            consumer: CredentialConsumer::ClaudeOauth { account_email: "crew@example.com".to_string() },
-            source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
-            lifecycle: CredentialLifecycle::Static,
-            placement: CredentialPlacementRequirements::default(),
-        })
+        .create(
+            &InputMeta::builder().name("claude-max".to_string()).build(),
+            &CredentialSpecSpec {
+                consumer: CredentialConsumer::ClaudeOauth { account_email: "crew@example.com".to_string() },
+                source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: CredentialPlacementRequirements::default(),
+            },
+        )
         .await
         .expect("create Claude credential declaration");
     topology
@@ -3423,27 +3467,30 @@ async fn remote_docker_admission_fails_closed_without_target_capacity() {
 
     let hosts = daemon.resource_backend().using::<Host>(namespace);
     let host = hosts
-        .create(&InputMeta::builder().name("remote-docker-host".to_string()).build(), &HostSpec {
-            display_name: "remote-docker".to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &InputMeta::builder().name("remote-docker-host".to_string()).build(),
+            &HostSpec { display_name: "remote-docker".to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .expect("create remote Docker host");
     hosts
-        .update_status("remote-docker-host", &host.metadata.resource_version, &HostStatus {
-            capabilities: [
-                (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
-                ("docker".to_string(), serde_json::json!(true)),
-                ("os".to_string(), serde_json::json!("linux")),
-            ]
-            .into_iter()
-            .collect(),
-            fulfilment_facts: BTreeMap::from([("remote-docker".into(), compatible_codex_facts())]),
-            heartbeat_at: Some(Utc::now()),
-            ready: true,
-            ..HostStatus::default()
-        })
+        .update_status(
+            "remote-docker-host",
+            &host.metadata.resource_version,
+            &HostStatus {
+                capabilities: [
+                    (AGENT_ADAPTERS_CAPABILITY.to_string(), serde_json::json!(["codex"])),
+                    ("docker".to_string(), serde_json::json!(true)),
+                    ("os".to_string(), serde_json::json!("linux")),
+                ]
+                .into_iter()
+                .collect(),
+                fulfilment_facts: BTreeMap::from([("remote-docker".into(), compatible_codex_facts())]),
+                heartbeat_at: Some(Utc::now()),
+                ready: true,
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("mark remote Docker host ready without capacity");
     let remote_policy = PlacementPolicySpec::builder()
@@ -3640,16 +3687,20 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
             turn_delivery: Default::default(),
         };
         convoys
-            .update_status(name, &convoy.metadata.resource_version, &ConvoyStatus {
-                phase: ResourceConvoyPhase::Active,
-                workflow_snapshot: Some(snapshot),
-                work: BTreeMap::from([(vessel.into(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
-                crew_work: BTreeMap::from([(
-                    vessel.into(),
-                    BTreeMap::from([(role.into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-                )]),
-                ..Default::default()
-            })
+            .update_status(
+                name,
+                &convoy.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ResourceConvoyPhase::Active,
+                    workflow_snapshot: Some(snapshot),
+                    work: BTreeMap::from([(vessel.into(), WorkState::builder().phase(ResourceWorkPhase::Running).build())]),
+                    crew_work: BTreeMap::from([(
+                        vessel.into(),
+                        BTreeMap::from([(role.into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                    )]),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("active crew");
         let sessions = backend.using::<TerminalSession>("flotilla");
@@ -3689,16 +3740,20 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
             .await
             .expect("session");
         sessions
-            .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
-                phase: flotilla_resources::TerminalSessionPhase::Running,
-                crew: Some(CrewSessionStatus { id: crew_id.into(), adapter: "codex".into(), model: None, stance: role.into() }),
-                attention: Some(flotilla_resources::TerminalAttention {
-                    state: flotilla_resources::TerminalAttentionState::Working,
-                    as_of: Utc::now(),
-                    source: flotilla_resources::TerminalAttentionSource::Hook,
-                }),
-                ..Default::default()
-            })
+            .update_status(
+                &session.metadata.name,
+                &session.metadata.resource_version,
+                &TerminalSessionStatus {
+                    phase: flotilla_resources::TerminalSessionPhase::Running,
+                    crew: Some(CrewSessionStatus { id: crew_id.into(), adapter: "codex".into(), model: None, stance: role.into() }),
+                    attention: Some(flotilla_resources::TerminalAttention {
+                        state: flotilla_resources::TerminalAttentionState::Working,
+                        as_of: Utc::now(),
+                        source: flotilla_resources::TerminalAttentionSource::Hook,
+                    }),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("running crew session");
     }
@@ -3895,24 +3950,31 @@ async fn exited_crew_resume_scenario(remote_home: bool, interrupted: bool) {
     let convoys = backend.clone().using::<Convoy>("flotilla");
     let convoy = convoys.create(&convoy_meta("exited-work", "exited-work"), &convoy_spec("scratch", "exited-work")).await.expect("convoy");
     convoys
-        .update_status("exited-work", &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: ResourceConvoyPhase::Active,
-            work: BTreeMap::from([("work".into(), flotilla_resources::WorkState::builder().phase(ResourceWorkPhase::Interrupted).build())]),
-            crew_work: BTreeMap::from([(
-                "work".into(),
-                BTreeMap::from([(
-                    "coder".into(),
-                    flotilla_resources::CrewWorkState::builder()
-                        .phase(if interrupted {
-                            flotilla_resources::CrewWorkPhase::Interrupted
-                        } else {
-                            flotilla_resources::CrewWorkPhase::Working
-                        })
-                        .build(),
+        .update_status(
+            "exited-work",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ResourceConvoyPhase::Active,
+                work: BTreeMap::from([(
+                    "work".into(),
+                    flotilla_resources::WorkState::builder().phase(ResourceWorkPhase::Interrupted).build(),
                 )]),
-            )]),
-            ..Default::default()
-        })
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([(
+                        "coder".into(),
+                        flotilla_resources::CrewWorkState::builder()
+                            .phase(if interrupted {
+                                flotilla_resources::CrewWorkPhase::Interrupted
+                            } else {
+                                flotilla_resources::CrewWorkPhase::Working
+                            })
+                            .build(),
+                    )]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("unfinished exited work");
     let sessions = backend.using::<TerminalSession>("flotilla");
@@ -3952,10 +4014,11 @@ async fn exited_crew_resume_scenario(remote_home: bool, interrupted: bool) {
         .await
         .expect("warm terminal");
     sessions
-        .update_status("exited-session", &session.metadata.resource_version, &TerminalSessionStatus {
-            phase: flotilla_resources::TerminalSessionPhase::Stopped,
-            ..Default::default()
-        })
+        .update_status(
+            "exited-session",
+            &session.metadata.resource_version,
+            &TerminalSessionStatus { phase: flotilla_resources::TerminalSessionPhase::Stopped, ..Default::default() },
+        )
         .await
         .expect("agent exited");
     if remote_home {
@@ -4183,14 +4246,18 @@ async fn operator_crew_stalls_query_reads_remote_obligations() {
         .await
         .expect("remote convoy");
     remote
-        .update_status("remote-stall", &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: ResourceConvoyPhase::Active,
-            crew_work: BTreeMap::from([(
-                "work".into(),
-                BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
-            )]),
-            ..Default::default()
-        })
+        .update_status(
+            "remote-stall",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: ResourceConvoyPhase::Active,
+                crew_work: BTreeMap::from([(
+                    "work".into(),
+                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build())]),
+                )]),
+                ..Default::default()
+            },
+        )
         .await
         .expect("working crew");
     flotilla_resources::apply_status_patch(
@@ -4263,10 +4330,11 @@ async fn run_message_role_waiting_home_case(remote: bool, admitted: bool) {
             .expect("admitted convoy without terminal");
         let declaration = declarations.get("waiting-governor").await.expect("local declaration status version");
         declarations
-            .update_status("waiting-governor", &declaration.metadata.resource_version, &ConvoyEnsureStatus {
-                convoy_ref: Some("standing".into()),
-                ..Default::default()
-            })
+            .update_status(
+                "waiting-governor",
+                &declaration.metadata.resource_version,
+                &ConvoyEnsureStatus { convoy_ref: Some("standing".into()), ..Default::default() },
+            )
             .await
             .expect("standing declaration status");
     }
@@ -4384,36 +4452,46 @@ async fn capabilities_routing_scenario(remote: bool, workflows: bool) {
     let convoy =
         convoys.create(&convoy_meta("capabilities", "capabilities"), &convoy_spec("scratch", "capabilities")).await.expect("convoy");
     convoys
-        .update_status("capabilities", &convoy.metadata.resource_version, &ConvoyStatus {
-            workflow_snapshot: Some(WorkflowSnapshot {
-                cascade: None,
-                vessels: vec![VesselRequirement::builder().name("work".into()).crew(vec![]).build()],
-                exit: None,
-                turn_delivery: Default::default(),
-                stall_nudges: Default::default(),
-                supervision: None,
-            }),
-            ..Default::default()
-        })
+        .update_status(
+            "capabilities",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                workflow_snapshot: Some(WorkflowSnapshot {
+                    cascade: None,
+                    vessels: vec![VesselRequirement::builder().name("work".into()).crew(vec![]).build()],
+                    exit: None,
+                    turn_delivery: Default::default(),
+                    stall_nudges: Default::default(),
+                    supervision: None,
+                }),
+                ..Default::default()
+            },
+        )
         .await
         .expect("workflow");
     let backend = owner.resource_backend();
     backend
         .using::<Vessel>("flotilla")
-        .create(&InputMeta::builder().name("capabilities-work".into()).build(), &VesselSpec {
-            convoy_ref: "capabilities".into(),
-            vessel_name: "work".into(),
-            placement_policy_ref: "policy".into(),
-            adopted_checkout_refs: Default::default(),
-        })
+        .create(
+            &InputMeta::builder().name("capabilities-work".into()).build(),
+            &VesselSpec {
+                convoy_ref: "capabilities".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "policy".into(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
         .await
         .expect("vessel");
     backend
         .using::<Environment>("flotilla")
-        .create(&InputMeta::builder().name("capabilities-env".into()).build(), &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec { host_ref: "session-host".into(), repo_default_dir: "/repo".into() }),
-            docker: None,
-        })
+        .create(
+            &InputMeta::builder().name("capabilities-env".into()).build(),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "session-host".into(), repo_default_dir: "/repo".into() }),
+                docker: None,
+            },
+        )
         .await
         .expect("environment");
     backend

@@ -752,12 +752,16 @@ impl DaemonRuntime {
             ),
             tokio::spawn(Arc::clone(&blob_store).run_sync()),
             tokio::spawn(run_artifact_gc(daemon.resource_backend(), options.namespace.clone(), Arc::clone(&blob_store))),
-            tokio::spawn(run_checkout_archive_gc(daemon.resource_backend(), options.namespace.clone(), CheckoutArchiveSweep {
-                daemon: Arc::clone(&daemon),
-                catalog_path: config.state_dir().as_path().join("checkout-archive-roots.json"),
-                roots: archive_roots,
-                retention_days: daemon_config.checkout_archive_retention_days,
-            })),
+            tokio::spawn(run_checkout_archive_gc(
+                daemon.resource_backend(),
+                options.namespace.clone(),
+                CheckoutArchiveSweep {
+                    daemon: Arc::clone(&daemon),
+                    catalog_path: config.state_dir().as_path().join("checkout-archive-roots.json"),
+                    roots: archive_roots,
+                    retention_days: daemon_config.checkout_archive_retention_days,
+                },
+            )),
             spawn_blob_sync_status_task(
                 Arc::clone(&blob_store),
                 daemon.resource_backend(),
@@ -2405,19 +2409,22 @@ async fn record_credential_delivery_retry(
         if terminal {
             ControllerRetry::terminal(previous, Utc::now(), error)
         } else {
-            ControllerRetry::retryable(previous, Utc::now(), RetryBackoff {
-                initial: Duration::from_secs(30),
-                maximum: Duration::from_secs(120),
-            })
+            ControllerRetry::retryable(
+                previous,
+                Utc::now(),
+                RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(120) },
+            )
         }
     });
     if previous == retry.as_ref() {
         mirror_credential_retry_to_vessels(backend, namespace, environment_ref, retry, false).await?;
         return Ok(());
     }
-    flotilla_resources::apply_status_patch(&environments, environment_ref, &EnvironmentStatusPatch::CredentialDelivery {
-        retry: retry.clone(),
-    })
+    flotilla_resources::apply_status_patch(
+        &environments,
+        environment_ref,
+        &EnvironmentStatusPatch::CredentialDelivery { retry: retry.clone() },
+    )
     .await
     .map_err(|error| format!("record credential delivery disposition: {error}"))?;
     mirror_credential_retry_to_vessels(backend, namespace, environment_ref, retry, false).await?;
@@ -2716,12 +2723,16 @@ async fn ensure_host_exists(backend: &ResourceBackend, namespace: &str, host_nam
         Ok(existing) if existing.spec.display_name == display_name => return Ok(()),
         Ok(existing) => {
             return hosts
-                .update(&InputMeta::from(&existing.metadata), &existing.metadata.resource_version, &HostSpec {
-                    display_name: display_name.to_string(),
-                    connection: Default::default(),
-                    expected_concurrent_rust_crews: existing.spec.expected_concurrent_rust_crews,
-                    image_build_capacity: existing.spec.image_build_capacity.clone(),
-                })
+                .update(
+                    &InputMeta::from(&existing.metadata),
+                    &existing.metadata.resource_version,
+                    &HostSpec {
+                        display_name: display_name.to_string(),
+                        connection: Default::default(),
+                        expected_concurrent_rust_crews: existing.spec.expected_concurrent_rust_crews,
+                        image_build_capacity: existing.spec.image_build_capacity.clone(),
+                    },
+                )
                 .await
                 .map(|_| ())
                 .map_err(|err| err.to_string())
@@ -2730,11 +2741,10 @@ async fn ensure_host_exists(backend: &ResourceBackend, namespace: &str, host_nam
         Err(err) => return Err(format!("check host {host_name}: {err}")),
     }
     hosts
-        .create(&empty_meta(host_name), &HostSpec {
-            display_name: display_name.to_string(),
-            connection: Default::default(),
-            ..HostSpec::default()
-        })
+        .create(
+            &empty_meta(host_name),
+            &HostSpec { display_name: display_name.to_string(), connection: Default::default(), ..HostSpec::default() },
+        )
         .await
         .map(|_| ())
         .map_err(|err| err.to_string())
@@ -2754,13 +2764,16 @@ async fn ensure_host_direct_environment_exists(
     }
 
     environments
-        .create(&empty_meta(&name), &EnvironmentSpec {
-            host_direct: Some(HostDirectEnvironmentSpec {
-                host_ref: profile.host_id.clone(),
-                repo_default_dir: profile.repo_default_dir.clone(),
-            }),
-            docker: None,
-        })
+        .create(
+            &empty_meta(&name),
+            &EnvironmentSpec {
+                host_direct: Some(HostDirectEnvironmentSpec {
+                    host_ref: profile.host_id.clone(),
+                    repo_default_dir: profile.repo_default_dir.clone(),
+                }),
+                docker: None,
+            },
+        )
         .await
         .map(|_| ())
         .map_err(|err| err.to_string())
@@ -3250,12 +3263,12 @@ fn spawn_local_fulfilment_probe_task(
             .await
             {
                 Ok(facts) if facts != previous || model_probes != status.model_probes => {
-                    if let Err(error) =
-                        flotilla_resources::apply_status_patch(&hosts, &profile.host_id, &HostStatusPatch::FulfilmentFacts {
-                            facts,
-                            model_probes,
-                        })
-                        .await
+                    if let Err(error) = flotilla_resources::apply_status_patch(
+                        &hosts,
+                        &profile.host_id,
+                        &HostStatusPatch::FulfilmentFacts { facts, model_probes },
+                    )
+                    .await
                     {
                         warn!(%error, "failed to publish observed fulfilment facts");
                     }
@@ -3297,12 +3310,12 @@ fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, namespace: Stri
             {
                 Ok(facts) if facts != previous || model_probes != status.model_probes => {
                     *ssh.fulfilment_facts.write().await = facts.clone();
-                    if let Err(error) =
-                        flotilla_resources::apply_status_patch(&hosts, &ssh.provisioning.host_id, &HostStatusPatch::FulfilmentFacts {
-                            facts,
-                            model_probes,
-                        })
-                        .await
+                    if let Err(error) = flotilla_resources::apply_status_patch(
+                        &hosts,
+                        &ssh.provisioning.host_id,
+                        &HostStatusPatch::FulfilmentFacts { facts, model_probes },
+                    )
+                    .await
                     {
                         warn!(host = %ssh.provisioning.host_id, %error, "failed to publish observed SSH fulfilment facts");
                     }
@@ -3503,17 +3516,20 @@ async fn record_credential_refresh_dispositions(
             continue;
         }
         let retry = error.map(|_| {
-            ControllerRetry::retryable(previous, Utc::now(), RetryBackoff {
-                initial: Duration::from_secs(30),
-                maximum: Duration::from_secs(120),
-            })
+            ControllerRetry::retryable(
+                previous,
+                Utc::now(),
+                RetryBackoff { initial: Duration::from_secs(30), maximum: Duration::from_secs(120) },
+            )
         });
         if previous == retry.as_ref() {
             continue;
         }
-        flotilla_resources::apply_status_patch(&environments, &environment.metadata.name, &EnvironmentStatusPatch::CredentialRefresh {
-            retry: retry.clone(),
-        })
+        flotilla_resources::apply_status_patch(
+            &environments,
+            &environment.metadata.name,
+            &EnvironmentStatusPatch::CredentialRefresh { retry: retry.clone() },
+        )
         .await
         .map_err(|error| format!("record credential refresh disposition: {error}"))?;
         mirror_credential_retry_to_vessels(backend, namespace, &environment.metadata.name, retry, true).await?;
@@ -4161,22 +4177,26 @@ async fn apply_host_heartbeat_with_credentials(
     }
     capabilities.insert("forge_budgets".into(), serde_json::to_value(daemon.forge_budget_rows()).expect("forge budgets serialize"));
     let ready = !conditions.iter().any(HostCondition::blocks_readiness);
-    flotilla_resources::apply_status_patch(&hosts, &profile.host_id, &HostStatusPatch::Heartbeat {
-        description: Some(Box::new(summary)),
-        capabilities,
-        agent_adapter_baseline: Some(adapter_assessment.baseline),
-        heartbeat_at: Utc::now(),
-        ready,
-        resource_store: resource_store.map(Box::new),
-        daemon_rss_bytes: flotilla_core::host_summary::daemon_rss_bytes(),
-        daemon_generation: health.generation.clone(),
-        protocol_fingerprint: Some(flotilla_protocol::PROTOCOL_FINGERPRINT.to_string()),
-        daemon_version: Some(health.version.clone()),
-        daemon_started_at: Some(health.started_at),
-        disk_free_bytes,
-        admission_free_space_floor_bytes: Some(admission_free_space_floor_bytes),
-        conditions,
-    })
+    flotilla_resources::apply_status_patch(
+        &hosts,
+        &profile.host_id,
+        &HostStatusPatch::Heartbeat {
+            description: Some(Box::new(summary)),
+            capabilities,
+            agent_adapter_baseline: Some(adapter_assessment.baseline),
+            heartbeat_at: Utc::now(),
+            ready,
+            resource_store: resource_store.map(Box::new),
+            daemon_rss_bytes: flotilla_core::host_summary::daemon_rss_bytes(),
+            daemon_generation: health.generation.clone(),
+            protocol_fingerprint: Some(flotilla_protocol::PROTOCOL_FINGERPRINT.to_string()),
+            daemon_version: Some(health.version.clone()),
+            daemon_started_at: Some(health.started_at),
+            disk_free_bytes,
+            admission_free_space_floor_bytes: Some(admission_free_space_floor_bytes),
+            conditions,
+        },
+    )
     .await
     .map_err(|err| err.to_string())?;
     Ok(())
@@ -4998,16 +5018,20 @@ impl DockerEnvironmentRuntime for DockerControllerRuntime {
         }
         let jobs = context.rust_build_jobs().await?;
         let handle = match provider
-            .create(env_id.clone(), &image, CreateOpts {
-                tokens: environment_variables,
-                working_directory: None,
-                image_pull_policy: spec.pull_policy.into(),
-                provisioned_mounts,
-                tools,
-                prepared_auth,
-                cpu_limit: Some(jobs),
-                memory_policy: spec.memory_policy.clone(),
-            })
+            .create(
+                env_id.clone(),
+                &image,
+                CreateOpts {
+                    tokens: environment_variables,
+                    working_directory: None,
+                    image_pull_policy: spec.pull_policy.into(),
+                    provisioned_mounts,
+                    tools,
+                    prepared_auth,
+                    cpu_limit: Some(jobs),
+                    memory_policy: spec.memory_policy.clone(),
+                },
+            )
             .await
         {
             Ok(handle) => handle,
@@ -5989,10 +6013,13 @@ impl CheckoutControllerRuntime {
                     vcs.remove_materialised_checkout(branch, target_path).await?
                 };
                 let result = if matches!(removal, CheckoutRemoval::LandedWorktree { .. })
-                    && matches!(result, flotilla_core::vcs::CheckoutRemoval::PreservedCheckout {
-                        reason: flotilla_core::vcs::CheckoutPreservationReason::DifferentBranch,
-                        ..
-                    }) {
+                    && matches!(
+                        result,
+                        flotilla_core::vcs::CheckoutRemoval::PreservedCheckout {
+                            reason: flotilla_core::vcs::CheckoutPreservationReason::DifferentBranch,
+                            ..
+                        }
+                    ) {
                     // A merged PR may have deleted its head ref after a squash.
                     // Archive first so a checkout that changed since settlement
                     // evidence was observed still remains recoverable.
@@ -6426,11 +6453,10 @@ impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
         let task = tokio::spawn(async move {
             deliver_and_confirm(&*pool, adapter.as_deref(), &session, &text, TerminalDeliveryReadiness::TurnBoundary, false).await
         });
-        deliveries.insert(batch.submission.session.clone(), PendingTerminalDelivery {
-            message_batch: Some(batch.submission.batch_id.clone()),
-            message: batch.text.clone(),
-            task,
-        });
+        deliveries.insert(
+            batch.submission.session.clone(),
+            PendingTerminalDelivery { message_batch: Some(batch.submission.batch_id.clone()), message: batch.text.clone(), task },
+        );
         flotilla_resources::MessageTransportOutcome::Pending
     }
     async fn release(&self, batch: &flotilla_resources::MessageBatch) {
@@ -7336,13 +7362,16 @@ mod tests {
         let restricted = BTreeSet::from([flotilla_resources::FulfilmentGrant::platform("linux".to_string())]);
         for (name, grants) in [("broad", broad.clone()), ("restricted", restricted.clone())] {
             kinds
-                .create(&empty_meta(name), &FulfilmentKindSpec {
-                    host_ref: "host".to_string(),
-                    pool: "test".to_string(),
-                    cost_class: Default::default(),
-                    grants,
-                    realisation: FulfilmentRealisation::HostDirect,
-                })
+                .create(
+                    &empty_meta(name),
+                    &FulfilmentKindSpec {
+                        host_ref: "host".to_string(),
+                        pool: "test".to_string(),
+                        cost_class: Default::default(),
+                        grants,
+                        realisation: FulfilmentRealisation::HostDirect,
+                    },
+                )
                 .await
                 .expect("fulfilment kind");
         }
@@ -7356,14 +7385,14 @@ mod tests {
                 .build()
         };
         let pins = BTreeMap::from([
-            ("work".to_string(), flotilla_resources::VesselPlacementPin {
-                policy_ref: "snapshot-work".to_string(),
-                decision: decision("broad"),
-            }),
-            ("ops".to_string(), flotilla_resources::VesselPlacementPin {
-                policy_ref: "snapshot-ops".to_string(),
-                decision: decision("restricted"),
-            }),
+            (
+                "work".to_string(),
+                flotilla_resources::VesselPlacementPin { policy_ref: "snapshot-work".to_string(), decision: decision("broad") },
+            ),
+            (
+                "ops".to_string(),
+                flotilla_resources::VesselPlacementPin { policy_ref: "snapshot-ops".to_string(), decision: decision("restricted") },
+            ),
         ]);
         let convoys = backend.using::<Convoy>(NAMESPACE);
         let convoy = convoys
@@ -7380,20 +7409,24 @@ mod tests {
             .await
             .expect("convoy");
         convoys
-            .update_status("demo", &convoy.metadata.resource_version, &ConvoyStatus {
-                placement_decision: Some(decision("broad")),
-                ..ConvoyStatus::default()
-            })
+            .update_status(
+                "demo",
+                &convoy.metadata.resource_version,
+                &ConvoyStatus { placement_decision: Some(decision("broad")), ..ConvoyStatus::default() },
+            )
             .await
             .expect("convoy status");
         backend
             .using::<Vessel>(NAMESPACE)
-            .create(&empty_meta("demo-ops"), &VesselSpec {
-                convoy_ref: "demo".to_string(),
-                vessel_name: "ops".to_string(),
-                placement_policy_ref: "snapshot-ops".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            })
+            .create(
+                &empty_meta("demo-ops"),
+                &VesselSpec {
+                    convoy_ref: "demo".to_string(),
+                    vessel_name: "ops".to_string(),
+                    placement_policy_ref: "snapshot-ops".to_string(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
             .await
             .expect("ops vessel");
         let context = flotilla_resources::TerminalCrewContext {
@@ -7481,12 +7514,15 @@ mod tests {
                 "Clone" => {
                     let clones = backend.clone().using::<Clone>(NAMESPACE);
                     clones
-                        .create(&empty_meta("renewed-demand"), &CloneSpec {
-                            repo_ref: RepositoryKey("github.com/flotilla-org/flotilla".to_string()),
-                            url: "https://github.com/flotilla-org/flotilla".to_string(),
-                            env_ref: "host-direct".to_string(),
-                            path: "/workspace".to_string(),
-                        })
+                        .create(
+                            &empty_meta("renewed-demand"),
+                            &CloneSpec {
+                                repo_ref: RepositoryKey("github.com/flotilla-org/flotilla".to_string()),
+                                url: "https://github.com/flotilla-org/flotilla".to_string(),
+                                env_ref: "host-direct".to_string(),
+                                path: "/workspace".to_string(),
+                            },
+                        )
                         .await
                         .expect("create renewed clone demand");
                     watch.next().await.expect("watch should remain open").expect("clone create event");
@@ -7604,19 +7640,23 @@ mod tests {
         };
         let observed_at = Utc::now();
         records
-            .update_status(&record.metadata.name, &record.metadata.resource_version, &flotilla_resources::ChangeRequestStatus {
-                title: Default::default(),
-                author: Default::default(),
-                review_decision: Default::default(),
-                review_requested_from_owner: Default::default(),
-                state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
-                head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
-                checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
-                review: flotilla_resources::ChangeRequestReviewObservation {
-                    actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+            .update_status(
+                &record.metadata.name,
+                &record.metadata.resource_version,
+                &flotilla_resources::ChangeRequestStatus {
+                    title: Default::default(),
+                    author: Default::default(),
+                    review_decision: Default::default(),
+                    review_requested_from_owner: Default::default(),
+                    state: flotilla_resources::Observation::known(flotilla_resources::ObservedChangeRequestState::Merged, observed_at),
+                    head_sha: flotilla_resources::Observation::known("abc".to_string(), observed_at),
+                    checks: flotilla_resources::Observation::known(flotilla_resources::ObservedChecks::Pass, observed_at),
+                    review: flotilla_resources::ChangeRequestReviewObservation {
+                        actionable_at_head: flotilla_resources::Observation::known(false, observed_at),
+                    },
+                    mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
                 },
-                mergeable: flotilla_resources::Observation::known(flotilla_resources::ObservedMergeability::Mergeable, observed_at),
-            })
+            )
             .await
             .expect("publish merged CR observation");
     }
@@ -7692,10 +7732,13 @@ mod tests {
         let backend = ResourceBackend::InMemory(InMemoryBackend::default());
         let environments = backend.clone().using::<Environment>(NAMESPACE);
         environments
-            .create(&empty_meta("refresh-work"), &EnvironmentSpec {
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
-                docker: None,
-            })
+            .create(
+                &empty_meta("refresh-work"),
+                &EnvironmentSpec {
+                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+                    docker: None,
+                },
+            )
             .await
             .expect("create environment");
         let failure = CredentialRefreshError {
@@ -7737,40 +7780,51 @@ mod tests {
             .await
             .expect("create convoy");
         convoys
-            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".to_string())
-                        .credential_refs(BTreeSet::from(["github-app".to_string()]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                ..ConvoyStatus::default()
-            })
+            .update_status(
+                &convoy.metadata.name,
+                &convoy.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ConvoyPhase::Active,
+                    workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                        cascade: None,
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                        exit: None,
+                        turn_delivery: Default::default(),
+                        vessels: vec![VesselRequirement::builder()
+                            .name("work".to_string())
+                            .credential_refs(BTreeSet::from(["github-app".to_string()]))
+                            .crew(Vec::new())
+                            .build()],
+                    }),
+                    ..ConvoyStatus::default()
+                },
+            )
             .await
             .expect("set convoy status");
         let vessels = backend.using::<Vessel>(NAMESPACE);
         let vessel = vessels
-            .create(&empty_meta("credential-vessel"), &VesselSpec {
-                convoy_ref: "credential-convoy".to_string(),
-                vessel_name: "work".to_string(),
-                placement_policy_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            })
+            .create(
+                &empty_meta("credential-vessel"),
+                &VesselSpec {
+                    convoy_ref: "credential-convoy".to_string(),
+                    vessel_name: "work".to_string(),
+                    placement_policy_ref: "test".to_string(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
             .await
             .expect("create vessel");
         vessels
-            .update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some("standing-vessel".to_string()),
-                ..VesselStatus::default()
-            })
+            .update_status(
+                &vessel.metadata.name,
+                &vessel.metadata.resource_version,
+                &VesselStatus {
+                    phase: flotilla_resources::VesselPhase::Ready,
+                    environment_ref: Some("standing-vessel".to_string()),
+                    ..VesselStatus::default()
+                },
+            )
             .await
             .expect("place vessel");
         let transient = CredentialRefreshError {
@@ -7794,18 +7848,23 @@ mod tests {
         assert_eq!(raised.len(), 1);
         assert!(raised[0].metadata.annotations[CREDENTIAL_REFRESH_REASON_ANNOTATION].contains("expires in 120 seconds"));
         assert_eq!(raised[0].spec.originating_work_ref.name, "credential-convoy");
-        flotilla_resources::apply_status_patch(&demands, &raised[0].metadata.name, &flotilla_resources::DemandStatusPatch::Acknowledge {
-            as_of: chrono::Utc::now(),
-            authority: "operator".to_string(),
-        })
+        flotilla_resources::apply_status_patch(
+            &demands,
+            &raised[0].metadata.name,
+            &flotilla_resources::DemandStatusPatch::Acknowledge { as_of: chrono::Utc::now(), authority: "operator".to_string() },
+        )
         .await
         .expect("acknowledge demand");
-        reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[CredentialRefreshError {
-            environment_ref: "standing-vessel".to_string(),
-            credential_name: Some("github-app".to_string()),
-            message: "credential `github-app`: outage; expires in 60 seconds".to_string(),
-            should_surface: true,
-        }])
+        reconcile_credential_refresh_attention(
+            &daemon,
+            NAMESPACE,
+            &[CredentialRefreshError {
+                environment_ref: "standing-vessel".to_string(),
+                credential_name: Some("github-app".to_string()),
+                message: "credential `github-app`: outage; expires in 60 seconds".to_string(),
+                should_surface: true,
+            }],
+        )
         .await
         .expect("keep persistent failure raised");
         assert_eq!(
@@ -7815,12 +7874,16 @@ mod tests {
                 .map_or(flotilla_resources::DemandState::Raised, |status| status.state),
             flotilla_resources::DemandState::Raised
         );
-        reconcile_credential_refresh_attention(&daemon, NAMESPACE, &[CredentialRefreshError {
-            environment_ref: "standing-vessel".to_string(),
-            credential_name: Some("github-app".to_string()),
-            message: "credential `github-app`: outage; expired 5 seconds ago".to_string(),
-            should_surface: false,
-        }])
+        reconcile_credential_refresh_attention(
+            &daemon,
+            NAMESPACE,
+            &[CredentialRefreshError {
+                environment_ref: "standing-vessel".to_string(),
+                credential_name: Some("github-app".to_string()),
+                message: "credential `github-app`: outage; expired 5 seconds ago".to_string(),
+                should_surface: false,
+            }],
+        )
         .await
         .expect("retain alert during retry after restart");
         assert_eq!(demands.list().await.expect("list demands").items.len(), 1);
@@ -8263,11 +8326,10 @@ mod tests {
         let kiwi_store = ResourceBackend::InMemory(Default::default());
         let kiwi_hosts = kiwi_store.using::<Host>(NAMESPACE);
         kiwi_hosts
-            .create(&empty_meta("kiwi-host"), &HostSpec {
-                display_name: "kiwi".to_string(),
-                connection: Default::default(),
-                ..HostSpec::default()
-            })
+            .create(
+                &empty_meta("kiwi-host"),
+                &HostSpec { display_name: "kiwi".to_string(), connection: Default::default(), ..HostSpec::default() },
+            )
             .await
             .expect("kiwi holds a replicable Host");
 
@@ -8645,12 +8707,17 @@ mod tests {
             .set_direct_environment_ssh_destination_for_test(&collision_environment_id, "crew@colliding-host".to_string())
             .expect("set colliding SSH destination");
 
-        let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
-            heartbeat_interval: Duration::from_secs(300),
-            controller_resync_interval: Duration::from_secs(300),
-            start_controllers: false,
-            ..RuntimeOptions::default()
-        })
+        let runtime = DaemonRuntime::start_with_options(
+            Arc::clone(&daemon),
+            config,
+            None,
+            RuntimeOptions {
+                heartbeat_interval: Duration::from_secs(300),
+                controller_resync_interval: Duration::from_secs(300),
+                start_controllers: false,
+                ..RuntimeOptions::default()
+            },
+        )
         .await
         .expect("bad SSH preflight must not abort daemon startup");
 
@@ -8904,10 +8971,10 @@ mod tests {
             .expect("stage agent environment");
 
         assert_eq!(path, Path::new("/home/crew/flotilla/agent-environment"));
-        assert_eq!(runner.writes.lock().expect("writes lock").as_slice(), &[(
-            PathBuf::from("/home/crew/flotilla/agent-environment"),
-            "export CODEX_HOME='/mounted/codex'\n".to_string()
-        )]);
+        assert_eq!(
+            runner.writes.lock().expect("writes lock").as_slice(),
+            &[(PathBuf::from("/home/crew/flotilla/agent-environment"), "export CODEX_HOME='/mounted/codex'\n".to_string())]
+        );
         assert!(!path.starts_with("/run/flotilla"));
     }
 
@@ -9669,12 +9736,10 @@ mod tests {
             compose(TargetId::AgentEnvironment, crew_git_identity_environment_fragments()).expect("crew Git identity").environment,
             "tool environment belongs to the tool description; crew Git identity is a container baseline"
         );
-        assert_eq!(opts.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(), vec![
-            "flotilla",
-            "cleat",
-            "rust-build-limits",
-            "fourth"
-        ]);
+        assert_eq!(
+            opts.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+            vec!["flotilla", "cleat", "rust-build-limits", "fourth"]
+        );
         // The contained tool delivers both the workspace default and dependency profile shim.
         assert!(opts.tools[2].environment.contains(&EnvironmentVariableUpdate::set(
             "CARGO_PROFILE_DEV_DEBUG",
@@ -9794,32 +9859,38 @@ mod tests {
             backend
                 .clone()
                 .definitions::<CredentialSpec>(NAMESPACE)
-                .create(&empty_meta(name), &CredentialSpecSpec {
-                    consumer,
-                    source: CredentialSource::Env { name: source.to_string() },
-                    lifecycle: CredentialLifecycle::Static,
-                    placement: CredentialPlacementRequirements::default(),
-                })
+                .create(
+                    &empty_meta(name),
+                    &CredentialSpecSpec {
+                        consumer,
+                        source: CredentialSource::Env { name: source.to_string() },
+                        lifecycle: CredentialLifecycle::Static,
+                        placement: CredentialPlacementRequirements::default(),
+                    },
+                )
                 .await
                 .expect("credential declaration");
         }
         backend
             .clone()
             .definitions::<CredentialSpec>(NAMESPACE)
-            .create(&empty_meta("github-skills-fork"), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GithubApp {
-                    actor_login: None,
-                    installation_id: Some(9876),
-                    installation_repository: None,
-                    permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
+            .create(
+                &empty_meta("github-skills-fork"),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::GithubApp {
+                        actor_login: None,
+                        installation_id: Some(9876),
+                        installation_repository: None,
+                        permissions: Some(BTreeMap::from([("contents".to_string(), "read".to_string())])),
+                    },
+                    source: CredentialSource::GithubApp {
+                        app_id_path: app_id_path.to_string_lossy().into_owned(),
+                        private_key_path: private_key_path.to_string_lossy().into_owned(),
+                    },
+                    lifecycle: CredentialLifecycle::Refreshable,
+                    placement: CredentialPlacementRequirements::default(),
                 },
-                source: CredentialSource::GithubApp {
-                    app_id_path: app_id_path.to_string_lossy().into_owned(),
-                    private_key_path: private_key_path.to_string_lossy().into_owned(),
-                },
-                lifecycle: CredentialLifecycle::Refreshable,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            )
             .await
             .expect("skill credential declaration");
 
@@ -10064,29 +10135,32 @@ mod tests {
             [("work", BTreeMap::new()), ("external-home", BTreeMap::from([("CODEX_HOME".to_string(), "/image/codex".to_string())]))]
         {
             let environment = environments
-                .create(&empty_meta(name), &EnvironmentSpec {
-                    host_direct: None,
-                    docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                        image_composition: None,
-                        image_build_ref: None,
-                        memory_policy: Default::default(),
-                        host_ref: "host-test".to_string(),
-                        image: "test".to_string(),
-                        declared_agent_adapters: required.clone(),
-                        required_agent_adapters: required.clone(),
-                        pull_policy: Default::default(),
-                        mounts: Vec::new(),
-                        env,
-                    }),
-                })
+                .create(
+                    &empty_meta(name),
+                    &EnvironmentSpec {
+                        host_direct: None,
+                        docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                            image_composition: None,
+                            image_build_ref: None,
+                            memory_policy: Default::default(),
+                            host_ref: "host-test".to_string(),
+                            image: "test".to_string(),
+                            declared_agent_adapters: required.clone(),
+                            required_agent_adapters: required.clone(),
+                            pull_policy: Default::default(),
+                            mounts: Vec::new(),
+                            env,
+                        }),
+                    },
+                )
                 .await
                 .expect("environment");
             environments
-                .update_status(&environment.metadata.name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
-                    phase: EnvironmentPhase::Ready,
-                    ready: true,
-                    ..Default::default()
-                })
+                .update_status(
+                    &environment.metadata.name,
+                    &environment.metadata.resource_version,
+                    &flotilla_resources::EnvironmentStatus { phase: EnvironmentPhase::Ready, ready: true, ..Default::default() },
+                )
                 .await
                 .expect("ready");
         }
@@ -10132,12 +10206,15 @@ mod tests {
         daemon
             .resource_backend()
             .definitions::<CredentialSpec>(NAMESPACE)
-            .create(&InputMeta::builder().name("openai".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Codex,
-                source: CredentialSource::Env { name: "TEST_CODEX_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("openai".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::Codex,
+                    source: CredentialSource::Env { name: "TEST_CODEX_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create Codex credential");
         let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None) });
@@ -10216,12 +10293,15 @@ mod tests {
         daemon
             .resource_backend()
             .definitions::<CredentialSpec>(NAMESPACE)
-            .create(&InputMeta::builder().name("private-registry".to_string()).build(), &CredentialSpecSpec {
-                consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".to_string(), username: "crew".to_string() },
-                source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &InputMeta::builder().name("private-registry".to_string()).build(),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".to_string(), username: "crew".to_string() },
+                    source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("create registry credential");
         let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None) });
@@ -10317,12 +10397,18 @@ mod tests {
             daemon
                 .resource_backend()
                 .definitions::<CredentialSpec>(NAMESPACE)
-                .create(&InputMeta::builder().name("private-registry".to_string()).build(), &CredentialSpecSpec {
-                    consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".to_string(), username: "crew".to_string() },
-                    source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".to_string() },
-                    lifecycle: CredentialLifecycle::Static,
-                    placement: CredentialPlacementRequirements::default(),
-                })
+                .create(
+                    &InputMeta::builder().name("private-registry".to_string()).build(),
+                    &CredentialSpecSpec {
+                        consumer: CredentialConsumer::DockerRegistry {
+                            registry: "registry.example".to_string(),
+                            username: "crew".to_string(),
+                        },
+                        source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".to_string() },
+                        lifecycle: CredentialLifecycle::Static,
+                        placement: CredentialPlacementRequirements::default(),
+                    },
+                )
                 .await
                 .expect("create registry credential");
             let provider = Arc::new(CapturingFailingEnvironmentProvider { create_opts: Mutex::new(None) });
@@ -10392,9 +10478,10 @@ mod tests {
             if outcome == RegistryPreflightOutcome::Success {
                 assert_eq!(error, "stop after capturing create options");
                 let admitted = registry_runner.directory.lock().await.clone().expect("preflight directory");
-                assert_eq!(opts.expect("provider invoked").prepared_auth, PreparedEnvironmentAuth::RegistryConfig {
-                    directory: DaemonHostPath::new(admitted.clone()),
-                });
+                assert_eq!(
+                    opts.expect("provider invoked").prepared_auth,
+                    PreparedEnvironmentAuth::RegistryConfig { directory: DaemonHostPath::new(admitted.clone()) }
+                );
                 assert!(!admitted.exists(), "failed create must remove the admitted auth artifact");
                 assert_eq!(registry_runner.calls.load(Ordering::SeqCst), 2);
             } else {
@@ -10526,21 +10613,24 @@ mod tests {
         let backend = state.daemon.resource_backend();
         let environment = backend
             .using::<Environment>(NAMESPACE)
-            .create(&empty_meta("env-lost-status"), &EnvironmentSpec {
-                host_direct: None,
-                docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    host_ref: "host-test".into(),
-                    image: "image".into(),
-                    image_composition: None,
-                    image_build_ref: None,
-                    memory_policy: Default::default(),
-                    declared_agent_adapters: Default::default(),
-                    required_agent_adapters: Default::default(),
-                    pull_policy: Default::default(),
-                    mounts: Vec::new(),
-                    env: Default::default(),
-                }),
-            })
+            .create(
+                &empty_meta("env-lost-status"),
+                &EnvironmentSpec {
+                    host_direct: None,
+                    docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                        host_ref: "host-test".into(),
+                        image: "image".into(),
+                        image_composition: None,
+                        image_build_ref: None,
+                        memory_policy: Default::default(),
+                        declared_agent_adapters: Default::default(),
+                        required_agent_adapters: Default::default(),
+                        pull_policy: Default::default(),
+                        mounts: Vec::new(),
+                        env: Default::default(),
+                    }),
+                },
+            )
             .await
             .expect("environment without saved status");
         EnvironmentReconciler::new(Arc::new(DockerControllerRuntime { state }), backend, NAMESPACE)
@@ -10570,13 +10660,17 @@ mod tests {
             .await
             .expect("convoy");
         let convoy = convoys
-            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-                phase: flotilla_resources::ConvoyPhase::Failed,
-                provisioning: Some(ConvoyProvisioningState::NotStarted),
-                message: Some("workflow validation failed".to_string()),
-                finished_at: Some(Utc::now()),
-                ..Default::default()
-            })
+            .update_status(
+                &convoy.metadata.name,
+                &convoy.metadata.resource_version,
+                &flotilla_resources::ConvoyStatus {
+                    phase: flotilla_resources::ConvoyPhase::Failed,
+                    provisioning: Some(ConvoyProvisioningState::NotStarted),
+                    message: Some("workflow validation failed".to_string()),
+                    finished_at: Some(Utc::now()),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("failed convoy status");
         let state = ControllerRuntimeState::new(
@@ -10612,27 +10706,31 @@ mod tests {
             .await
             .expect("convoy");
         let convoy = convoys
-            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &flotilla_resources::ConvoyStatus {
-                provisioning: Some(ConvoyProvisioningState::Started { started_at: Utc::now() }),
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                }),
-                placement_decision: Some(
-                    PlacementDecision::builder()
-                        .policy_name("docker".to_string())
-                        .target_host(PlacementTargetHost {
-                            reference: CanonicalHostId::resolved("host-test"),
-                            display_name: "host-test".to_string(),
-                        })
-                        .build(),
-                ),
-                ..Default::default()
-            })
+            .update_status(
+                &convoy.metadata.name,
+                &convoy.metadata.resource_version,
+                &flotilla_resources::ConvoyStatus {
+                    provisioning: Some(ConvoyProvisioningState::Started { started_at: Utc::now() }),
+                    workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                        cascade: None,
+                        vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(Vec::new()).build()],
+                        exit: None,
+                        turn_delivery: Default::default(),
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                    }),
+                    placement_decision: Some(
+                        PlacementDecision::builder()
+                            .policy_name("docker".to_string())
+                            .target_host(PlacementTargetHost {
+                                reference: CanonicalHostId::resolved("host-test"),
+                                display_name: "host-test".to_string(),
+                            })
+                            .build(),
+                    ),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("convoy status");
         let mut registry = ProviderRegistry::new();
@@ -10711,13 +10809,17 @@ mod tests {
             .await
             .expect("environment");
         environments
-            .update_status(&environment.metadata.name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
-                phase: EnvironmentPhase::Failed,
-                ready: false,
-                docker_container_id: Some("test-interior".to_string()),
-                message: Some("provider registry unavailable".to_string()),
-                ..Default::default()
-            })
+            .update_status(
+                &environment.metadata.name,
+                &environment.metadata.resource_version,
+                &flotilla_resources::EnvironmentStatus {
+                    phase: EnvironmentPhase::Failed,
+                    ready: false,
+                    docker_container_id: Some("test-interior".to_string()),
+                    message: Some("provider registry unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("failed daemon-side environment phase");
         let handle: EnvironmentHandle = Arc::new(TestInteriorEnvironment {
@@ -10749,10 +10851,11 @@ mod tests {
 
         let environment = environments.get("quartermaster-work").await.expect("environment");
         environments
-            .update_status(&environment.metadata.name, &environment.metadata.resource_version, &flotilla_resources::EnvironmentStatus {
-                phase: EnvironmentPhase::Failed,
-                ..Default::default()
-            })
+            .update_status(
+                &environment.metadata.name,
+                &environment.metadata.resource_version,
+                &flotilla_resources::EnvironmentStatus { phase: EnvironmentPhase::Failed, ..Default::default() },
+            )
             .await
             .expect("remove container identity");
         let refusal = state.verify_backing_dead(&convoy).await.expect_err("missing container identity must hold standing teardown");
@@ -11131,13 +11234,16 @@ mod tests {
         for (name, host, root) in [("local-env", "local", &local), ("remote-env", "remote", &remote)] {
             backend
                 .using::<Environment>("environments")
-                .create(&empty_meta(name), &EnvironmentSpec {
-                    host_direct: Some(HostDirectEnvironmentSpec {
-                        host_ref: host.into(),
-                        repo_default_dir: root.to_str().expect("test fixture operation succeeds").into(),
-                    }),
-                    docker: None,
-                })
+                .create(
+                    &empty_meta(name),
+                    &EnvironmentSpec {
+                        host_direct: Some(HostDirectEnvironmentSpec {
+                            host_ref: host.into(),
+                            repo_default_dir: root.to_str().expect("test fixture operation succeeds").into(),
+                        }),
+                        docker: None,
+                    },
+                )
                 .await
                 .expect("test fixture operation succeeds");
         }
@@ -11166,13 +11272,16 @@ mod tests {
             let backend = ResourceBackend::Sqlite(SqliteBackend::open(&database).expect("resource store"));
             backend
                 .using::<Environment>(NAMESPACE)
-                .create(&empty_meta("host-direct"), &EnvironmentSpec {
-                    host_direct: Some(HostDirectEnvironmentSpec {
-                        host_ref: "local".into(),
-                        repo_default_dir: root.to_str().expect("root path").into(),
-                    }),
-                    docker: None,
-                })
+                .create(
+                    &empty_meta("host-direct"),
+                    &EnvironmentSpec {
+                        host_direct: Some(HostDirectEnvironmentSpec {
+                            host_ref: "local".into(),
+                            repo_default_dir: root.to_str().expect("root path").into(),
+                        }),
+                        docker: None,
+                    },
+                )
                 .await
                 .expect("host environment");
             if has_convoy_namespace {
@@ -11544,10 +11653,13 @@ mod tests {
             branch: "feature/work".to_string(),
             target_path: target.to_str().expect("utf-8 target path").to_string(),
         };
-        assert_eq!(runtime.remove_checkout(&removal).await.expect("worktree should be removed"), CheckoutRemovalOutcome::PreservedBranch {
-            branch: "feature/work".to_string(),
-            reason: BranchPreservationReason::CommitsPastBase,
-        });
+        assert_eq!(
+            runtime.remove_checkout(&removal).await.expect("worktree should be removed"),
+            CheckoutRemovalOutcome::PreservedBranch {
+                branch: "feature/work".to_string(),
+                reason: BranchPreservationReason::CommitsPastBase,
+            }
+        );
         assert!(!convoy_dir.exists(), "empty convoy directory should be removed");
 
         let branch = ProcessCommand::new("git")
@@ -11653,11 +11765,14 @@ mod tests {
         let past = (chrono::Utc::now() - chrono::Duration::days(20)).format("%Y%m%d%H%M.%S").to_string();
         assert!(std::process::Command::new("touch").args(["-t", &past]).arg(&expired).status().expect("age archive").success());
         state
-            .register_checkout_archive_roots("host-direct-test-host", &CheckoutRemoval::ForcedWorktree {
-                clone_path: temp.path().join("custom/base").display().to_string(),
-                branch: "feature/work".to_string(),
-                target_path: temp.path().join("checkouts/work").display().to_string(),
-            })
+            .register_checkout_archive_roots(
+                "host-direct-test-host",
+                &CheckoutRemoval::ForcedWorktree {
+                    clone_path: temp.path().join("custom/base").display().to_string(),
+                    branch: "feature/work".to_string(),
+                    target_path: temp.path().join("checkouts/work").display().to_string(),
+                },
+            )
             .await
             .expect("record archive root before removal");
         drop(state);
@@ -11709,15 +11824,19 @@ mod tests {
         daemon
             .register_direct_environment_for_test(EnvironmentId::new("remote"), runner.clone(), EnvironmentBag::new(), None)
             .expect("register remote sweep runner");
-        let task = tokio::spawn(run_checkout_archive_gc(daemon.resource_backend(), NAMESPACE.into(), CheckoutArchiveSweep {
-            daemon,
-            catalog_path: temp.path().join("missing-catalog"),
-            roots: vec![CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/a".into() }, CheckoutArchiveRoot {
-                env_ref: "remote".into(),
-                path: "/archives/b".into(),
-            }],
-            retention_days: 14,
-        }));
+        let task = tokio::spawn(run_checkout_archive_gc(
+            daemon.resource_backend(),
+            NAMESPACE.into(),
+            CheckoutArchiveSweep {
+                daemon,
+                catalog_path: temp.path().join("missing-catalog"),
+                roots: vec![
+                    CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/a".into() },
+                    CheckoutArchiveRoot { env_ref: "remote".into(), path: "/archives/b".into() },
+                ],
+                retention_days: 14,
+            },
+        ));
         tokio::time::timeout(Duration::from_secs(5), runner.finished.notified()).await.expect("later root swept");
         assert_eq!(*runner.roots.lock().expect("roots"), ["/archives/a", "/archives/b"]);
         task.abort();
@@ -11831,10 +11950,10 @@ mod tests {
             branch: "main".to_string(),
             target_path: target.to_str().expect("utf-8 target path").to_string(),
         };
-        assert_eq!(runtime.remove_checkout(&removal).await.expect("worktree should be removed"), CheckoutRemovalOutcome::PreservedBranch {
-            branch: "main".to_string(),
-            reason: BranchPreservationReason::NotCreatedForConvoy,
-        });
+        assert_eq!(
+            runtime.remove_checkout(&removal).await.expect("worktree should be removed"),
+            CheckoutRemovalOutcome::PreservedBranch { branch: "main".to_string(), reason: BranchPreservationReason::NotCreatedForConvoy }
+        );
         let branch = ProcessCommand::new("git")
             .args(["-C", clone.path().to_str().expect("utf-8 clone path"), "show-ref", "--verify", "--quiet", "refs/heads/main"])
             .status()
@@ -12402,48 +12521,55 @@ mod tests {
             .expect("create remote placement policy");
         let convoys = kiwi.resource_backend().using::<Convoy>(NAMESPACE);
         let convoy = convoys
-            .create(&empty_meta("remote-placement"), &ConvoySpec {
-                continuation: None,
-                subjects: Vec::new(),
-                role: String::new(),
-                generation: 1,
-                workflow_ref: workflow_name.to_string(),
-                dispatching_principal_ref: Default::default(),
-                inputs: BTreeMap::new(),
-                placement_policy: Some(policy_name.to_string()),
-                repositories: vec![ConvoyRepositorySpec {
-                    url: repo_url,
-                    repo_ref: repository_key,
-                    source_ref: "main".to_string(),
-                    target_ref: "main".to_string(),
-                    workspace_slug: repository_spec.leaf_slug(),
-                    subpaths: Vec::new(),
-                }],
-                r#ref: Some("remote-placement".to_string()),
-                project_ref: None,
-                adopted_checkout_refs: BTreeMap::new(),
-                issues: Vec::new(),
-                change_request: None,
-                instruction: None,
-            })
+            .create(
+                &empty_meta("remote-placement"),
+                &ConvoySpec {
+                    continuation: None,
+                    subjects: Vec::new(),
+                    role: String::new(),
+                    generation: 1,
+                    workflow_ref: workflow_name.to_string(),
+                    dispatching_principal_ref: Default::default(),
+                    inputs: BTreeMap::new(),
+                    placement_policy: Some(policy_name.to_string()),
+                    repositories: vec![ConvoyRepositorySpec {
+                        url: repo_url,
+                        repo_ref: repository_key,
+                        source_ref: "main".to_string(),
+                        target_ref: "main".to_string(),
+                        workspace_slug: repository_spec.leaf_slug(),
+                        subpaths: Vec::new(),
+                    }],
+                    r#ref: Some("remote-placement".to_string()),
+                    project_ref: None,
+                    adopted_checkout_refs: BTreeMap::new(),
+                    issues: Vec::new(),
+                    change_request: None,
+                    instruction: None,
+                },
+            )
             .await
             .expect("create admitting Convoy");
         convoys
-            .update_status("remote-placement", &convoy.metadata.resource_version, &ConvoyStatus {
-                placement_decision: Some(PlacementDecision {
-                    minimal_alternatives: Vec::new(),
-                    escalation_reason: None,
-                    policy_name: policy_name.to_string(),
-                    target_host: PlacementTargetHost {
-                        reference: CanonicalHostId::resolved(feta_host_ref.clone()),
-                        display_name: "feta".to_string(),
-                    },
-                    refused_candidates: Vec::new(),
-                    viable_not_selected: Vec::new(),
-                    allocation: None,
-                }),
-                ..ConvoyStatus::default()
-            })
+            .update_status(
+                "remote-placement",
+                &convoy.metadata.resource_version,
+                &ConvoyStatus {
+                    placement_decision: Some(PlacementDecision {
+                        minimal_alternatives: Vec::new(),
+                        escalation_reason: None,
+                        policy_name: policy_name.to_string(),
+                        target_host: PlacementTargetHost {
+                            reference: CanonicalHostId::resolved(feta_host_ref.clone()),
+                            display_name: "feta".to_string(),
+                        },
+                        refused_candidates: Vec::new(),
+                        viable_not_selected: Vec::new(),
+                        allocation: None,
+                    }),
+                    ..ConvoyStatus::default()
+                },
+            )
             .await
             .expect("record remote placement");
 
@@ -12596,30 +12722,37 @@ mod tests {
         let host_ref = daemon.local_host_id().expect("local host identity").to_string();
         let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
         environments
-            .create(&empty_meta(name), &EnvironmentSpec {
-                host_direct: None,
-                docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    image_composition: None,
-                    image_build_ref: None,
-                    memory_policy: Default::default(),
-                    host_ref,
-                    image: "contained-image".to_string(),
-                    declared_agent_adapters,
-                    required_agent_adapters: BTreeSet::new(),
-                    pull_policy: Default::default(),
-                    mounts: Vec::new(),
-                    env: BTreeMap::new(),
-                }),
-            })
+            .create(
+                &empty_meta(name),
+                &EnvironmentSpec {
+                    host_direct: None,
+                    docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                        image_composition: None,
+                        image_build_ref: None,
+                        memory_policy: Default::default(),
+                        host_ref,
+                        image: "contained-image".to_string(),
+                        declared_agent_adapters,
+                        required_agent_adapters: BTreeSet::new(),
+                        pull_policy: Default::default(),
+                        mounts: Vec::new(),
+                        env: BTreeMap::new(),
+                    }),
+                },
+            )
             .await
             .expect("create environment record");
-        flotilla_resources::apply_status_patch(&environments, name, &EnvironmentStatusPatch::MarkReady {
-            configured_limits: None,
-            docker_container_id: Some(container_id.to_string()),
-            image_ref: Some("contained-image".to_string()),
-            local_image_id: Some("sha256:test-interior".to_string()),
-            registry_digest: None,
-        })
+        flotilla_resources::apply_status_patch(
+            &environments,
+            name,
+            &EnvironmentStatusPatch::MarkReady {
+                configured_limits: None,
+                docker_container_id: Some(container_id.to_string()),
+                image_ref: Some("contained-image".to_string()),
+                local_image_id: Some("sha256:test-interior".to_string()),
+                registry_digest: None,
+            },
+        )
         .await
         .expect("mark environment ready");
     }
@@ -12637,35 +12770,39 @@ mod tests {
     async fn create_credential_test_session(backend: &ResourceBackend, name: &str, convoy: &str, vessel_ref: &str, env_ref: &str) {
         let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
         let session = sessions
-            .create(&empty_meta(name), &TerminalSessionSpec {
-                env_ref: env_ref.to_string(),
-                role: "coder".to_string(),
-                source: TerminalSessionSource::Agent {
-                    selector: Selector { capability: "code".to_string(), adapter: None, model: None },
-                    brief: flotilla_resources::TerminalBrief {
-                        artifact_digest: None,
-                        path: ".flotilla/briefs/coder.md".to_string(),
-                        content: "Work on the issue".to_string(),
-                        copies: Vec::new(),
+            .create(
+                &empty_meta(name),
+                &TerminalSessionSpec {
+                    env_ref: env_ref.to_string(),
+                    role: "coder".to_string(),
+                    source: TerminalSessionSource::Agent {
+                        selector: Selector { capability: "code".to_string(), adapter: None, model: None },
+                        brief: flotilla_resources::TerminalBrief {
+                            artifact_digest: None,
+                            path: ".flotilla/briefs/coder.md".to_string(),
+                            content: "Work on the issue".to_string(),
+                            copies: Vec::new(),
+                        },
+                        context: Box::new(flotilla_resources::TerminalCrewContext {
+                            namespace: NAMESPACE.to_string(),
+                            convoy: convoy.to_string(),
+                            vessel_ref: vessel_ref.to_string(),
+                        }),
+                        message: None,
                     },
-                    context: Box::new(flotilla_resources::TerminalCrewContext {
-                        namespace: NAMESPACE.to_string(),
-                        convoy: convoy.to_string(),
-                        vessel_ref: vessel_ref.to_string(),
-                    }),
-                    message: None,
+                    cwd: "/workspace".to_string(),
+                    env: Default::default(),
+                    pool: "test".to_string(),
                 },
-                cwd: "/workspace".to_string(),
-                env: Default::default(),
-                pool: "test".to_string(),
-            })
+            )
             .await
             .expect("create live crew session");
         sessions
-            .update_status(name, &session.metadata.resource_version, &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                ..TerminalSessionStatus::default()
-            })
+            .update_status(
+                name,
+                &session.metadata.resource_version,
+                &TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..TerminalSessionStatus::default() },
+            )
             .await
             .expect("mark crew session live");
     }
@@ -12678,10 +12815,12 @@ mod tests {
         fs::write(temp.path().join("daemon.toml"), "machine_id = \"slow-credentials-test\"\n").expect("daemon identity");
         let config = Arc::new(ConfigStore::with_base(temp.path()));
         let daemon = in_memory_daemon(Vec::new(), config.clone()).await;
-        let runtime = DaemonRuntime::start_with_options(daemon.clone(), config.clone(), None, RuntimeOptions {
-            start_controllers: false,
-            ..RuntimeOptions::default()
-        })
+        let runtime = DaemonRuntime::start_with_options(
+            daemon.clone(),
+            config.clone(),
+            None,
+            RuntimeOptions { start_controllers: false, ..RuntimeOptions::default() },
+        )
         .await
         .expect("publish initial heartbeat");
         // #2220: runtime installs the ensure controller even when background
@@ -12690,12 +12829,15 @@ mod tests {
         let backend = daemon.resource_backend();
         backend
             .definitions::<CredentialSpec>(NAMESPACE)
-            .create(&empty_meta("work-token"), &CredentialSpecSpec {
-                consumer: CredentialConsumer::Claude,
-                source: CredentialSource::Env { name: "TEST_WORK_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Issued,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &empty_meta("work-token"),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::Claude,
+                    source: CredentialSource::Env { name: "TEST_WORK_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Issued,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("credential declaration");
         let runner = Arc::new(GatedCredentialPreflight::new());
@@ -12728,40 +12870,51 @@ mod tests {
             .await
             .expect("convoy");
         convoys
-            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".to_string())
-                        .credential_refs(BTreeSet::from(["work-token".to_string()]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                ..ConvoyStatus::default()
-            })
+            .update_status(
+                &convoy.metadata.name,
+                &convoy.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ConvoyPhase::Active,
+                    workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                        cascade: None,
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                        exit: None,
+                        turn_delivery: Default::default(),
+                        vessels: vec![VesselRequirement::builder()
+                            .name("work".to_string())
+                            .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                            .crew(Vec::new())
+                            .build()],
+                    }),
+                    ..ConvoyStatus::default()
+                },
+            )
             .await
             .expect("live convoy");
         let vessels = backend.using::<Vessel>(NAMESPACE);
         let vessel = vessels
-            .create(&empty_meta("credential-work-vessel"), &VesselSpec {
-                convoy_ref: "credential-work".to_string(),
-                vessel_name: "work".to_string(),
-                placement_policy_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            })
+            .create(
+                &empty_meta("credential-work-vessel"),
+                &VesselSpec {
+                    convoy_ref: "credential-work".to_string(),
+                    vessel_name: "work".to_string(),
+                    placement_policy_ref: "test".to_string(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
             .await
             .expect("vessel");
         vessels
-            .update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some(env_id.to_string()),
-                ..VesselStatus::default()
-            })
+            .update_status(
+                &vessel.metadata.name,
+                &vessel.metadata.resource_version,
+                &VesselStatus {
+                    phase: flotilla_resources::VesselPhase::Ready,
+                    environment_ref: Some(env_id.to_string()),
+                    ..VesselStatus::default()
+                },
+            )
             .await
             .expect("placed vessel");
         create_credential_test_session(&backend, "live-crew", "credential-work", "credential-work-vessel", env_id.as_str()).await;
@@ -12834,12 +12987,15 @@ mod tests {
         backend
             .clone()
             .definitions::<CredentialSpec>(NAMESPACE)
-            .create(&empty_meta("work-token"), &CredentialSpecSpec {
-                consumer: CredentialConsumer::GitHttpToken { host: "github.com".to_string(), username: "bot".to_string() },
-                source: CredentialSource::Env { name: "TEST_WORK_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Issued,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &empty_meta("work-token"),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::GitHttpToken { host: "github.com".to_string(), username: "bot".to_string() },
+                    source: CredentialSource::Env { name: "TEST_WORK_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Issued,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("credential declaration");
         let runner = Arc::new(ProcessCommandRunner);
@@ -12872,41 +13028,52 @@ mod tests {
             .await
             .expect("create convoy");
         convoys
-            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("work".to_string())
-                        .credential_refs(BTreeSet::from(["work-token".to_string()]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
-                ..ConvoyStatus::default()
-            })
+            .update_status(
+                &convoy.metadata.name,
+                &convoy.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ConvoyPhase::Active,
+                    workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                        cascade: None,
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                        exit: None,
+                        turn_delivery: Default::default(),
+                        vessels: vec![VesselRequirement::builder()
+                            .name("work".to_string())
+                            .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                            .crew(Vec::new())
+                            .build()],
+                    }),
+                    work: BTreeMap::from([("work".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
+                    ..ConvoyStatus::default()
+                },
+            )
             .await
             .expect("mark work running");
         let vessels = backend.using::<Vessel>(NAMESPACE);
         let vessel = vessels
-            .create(&empty_meta("credential-work-vessel"), &VesselSpec {
-                convoy_ref: "credential-work".to_string(),
-                vessel_name: "work".to_string(),
-                placement_policy_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            })
+            .create(
+                &empty_meta("credential-work-vessel"),
+                &VesselSpec {
+                    convoy_ref: "credential-work".to_string(),
+                    vessel_name: "work".to_string(),
+                    placement_policy_ref: "test".to_string(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
             .await
             .expect("create vessel");
         vessels
-            .update_status(&vessel.metadata.name, &vessel.metadata.resource_version, &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some(env_id.as_str().to_string()),
-                ..VesselStatus::default()
-            })
+            .update_status(
+                &vessel.metadata.name,
+                &vessel.metadata.resource_version,
+                &VesselStatus {
+                    phase: flotilla_resources::VesselPhase::Ready,
+                    environment_ref: Some(env_id.as_str().to_string()),
+                    ..VesselStatus::default()
+                },
+            )
             .await
             .expect("place vessel");
         create_credential_test_session(&backend, "credential-work-session", "credential-work", "credential-work-vessel", env_id.as_str())
@@ -12961,44 +13128,55 @@ mod tests {
             .await
             .expect("create convoy with unavailable placement");
         convoys
-            .update_status(&unavailable_convoy.metadata.name, &unavailable_convoy.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("unavailable".to_string())
-                        .credential_refs(BTreeSet::from(["work-token".to_string()]))
-                        .credential_scopes(BTreeMap::from([(
-                            "work-token".to_string(),
-                            BTreeSet::from([RepositoryKey("repo".to_string())]),
-                        )]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                work: BTreeMap::from([("unavailable".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
-                ..ConvoyStatus::default()
-            })
+            .update_status(
+                &unavailable_convoy.metadata.name,
+                &unavailable_convoy.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ConvoyPhase::Active,
+                    workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                        cascade: None,
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                        exit: None,
+                        turn_delivery: Default::default(),
+                        vessels: vec![VesselRequirement::builder()
+                            .name("unavailable".to_string())
+                            .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                            .credential_scopes(BTreeMap::from([(
+                                "work-token".to_string(),
+                                BTreeSet::from([RepositoryKey("repo".to_string())]),
+                            )]))
+                            .crew(Vec::new())
+                            .build()],
+                    }),
+                    work: BTreeMap::from([("unavailable".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
+                    ..ConvoyStatus::default()
+                },
+            )
             .await
             .expect("mark unavailable work running");
         let unavailable_vessel = vessels
-            .create(&empty_meta("unavailable-work-vessel"), &VesselSpec {
-                convoy_ref: "unavailable-credential-work".to_string(),
-                vessel_name: "unavailable".to_string(),
-                placement_policy_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            })
+            .create(
+                &empty_meta("unavailable-work-vessel"),
+                &VesselSpec {
+                    convoy_ref: "unavailable-credential-work".to_string(),
+                    vessel_name: "unavailable".to_string(),
+                    placement_policy_ref: "test".to_string(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
             .await
             .expect("create unavailable vessel");
         vessels
-            .update_status(&unavailable_vessel.metadata.name, &unavailable_vessel.metadata.resource_version, &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some("aaa-unavailable".to_string()),
-                ..VesselStatus::default()
-            })
+            .update_status(
+                &unavailable_vessel.metadata.name,
+                &unavailable_vessel.metadata.resource_version,
+                &VesselStatus {
+                    phase: flotilla_resources::VesselPhase::Ready,
+                    environment_ref: Some("aaa-unavailable".to_string()),
+                    ..VesselStatus::default()
+                },
+            )
             .await
             .expect("place unavailable vessel");
         create_credential_test_session(
@@ -13024,10 +13202,13 @@ mod tests {
 
         let environments = backend.clone().using::<Environment>(NAMESPACE);
         environments
-            .create(&empty_meta(env_id.as_str()), &EnvironmentSpec {
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
-                docker: None,
-            })
+            .create(
+                &empty_meta(env_id.as_str()),
+                &EnvironmentSpec {
+                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+                    docker: None,
+                },
+            )
             .await
             .expect("create durable shared environment");
 
@@ -13039,44 +13220,55 @@ mod tests {
             .await
             .expect("create second crew convoy");
         convoys
-            .update_status(&conflicting_convoy.metadata.name, &conflicting_convoy.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
-                    cascade: None,
-                    stall_nudges: Default::default(),
-                    supervision: None,
-                    exit: None,
-                    turn_delivery: Default::default(),
-                    vessels: vec![VesselRequirement::builder()
-                        .name("other-work".to_string())
-                        .credential_refs(BTreeSet::from(["work-token".to_string()]))
-                        .credential_permissions(BTreeMap::from([(
-                            "work-token".to_string(),
-                            BTreeMap::from([("contents".to_string(), "read".to_string())]),
-                        )]))
-                        .crew(Vec::new())
-                        .build()],
-                }),
-                work: BTreeMap::from([("other-work".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
-                ..ConvoyStatus::default()
-            })
+            .update_status(
+                &conflicting_convoy.metadata.name,
+                &conflicting_convoy.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ConvoyPhase::Active,
+                    workflow_snapshot: Some(flotilla_resources::WorkflowSnapshot {
+                        cascade: None,
+                        stall_nudges: Default::default(),
+                        supervision: None,
+                        exit: None,
+                        turn_delivery: Default::default(),
+                        vessels: vec![VesselRequirement::builder()
+                            .name("other-work".to_string())
+                            .credential_refs(BTreeSet::from(["work-token".to_string()]))
+                            .credential_permissions(BTreeMap::from([(
+                                "work-token".to_string(),
+                                BTreeMap::from([("contents".to_string(), "read".to_string())]),
+                            )]))
+                            .crew(Vec::new())
+                            .build()],
+                    }),
+                    work: BTreeMap::from([("other-work".to_string(), WorkState::builder().phase(WorkPhase::Running).build())]),
+                    ..ConvoyStatus::default()
+                },
+            )
             .await
             .expect("mark second crew running");
         let conflicting_vessel = vessels
-            .create(&empty_meta("conflicting-work-vessel"), &VesselSpec {
-                convoy_ref: "conflicting-credential-work".to_string(),
-                vessel_name: "other-work".to_string(),
-                placement_policy_ref: "test".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            })
+            .create(
+                &empty_meta("conflicting-work-vessel"),
+                &VesselSpec {
+                    convoy_ref: "conflicting-credential-work".to_string(),
+                    vessel_name: "other-work".to_string(),
+                    placement_policy_ref: "test".to_string(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
             .await
             .expect("create second vessel");
         vessels
-            .update_status(&conflicting_vessel.metadata.name, &conflicting_vessel.metadata.resource_version, &VesselStatus {
-                phase: flotilla_resources::VesselPhase::Ready,
-                environment_ref: Some(env_id.as_str().to_string()),
-                ..VesselStatus::default()
-            })
+            .update_status(
+                &conflicting_vessel.metadata.name,
+                &conflicting_vessel.metadata.resource_version,
+                &VesselStatus {
+                    phase: flotilla_resources::VesselPhase::Ready,
+                    environment_ref: Some(env_id.as_str().to_string()),
+                    ..VesselStatus::default()
+                },
+            )
             .await
             .expect("place second vessel in shared environment");
         create_credential_test_session(
@@ -13116,9 +13308,11 @@ mod tests {
             disposition: ControllerRetryDisposition::Retryable { next_attempt_at: Utc::now() - chrono::Duration::seconds(1) },
             ..conflict_retry
         };
-        flotilla_resources::apply_status_patch(&environments, env_id.as_str(), &EnvironmentStatusPatch::CredentialDelivery {
-            retry: Some(due_retry),
-        })
+        flotilla_resources::apply_status_patch(
+            &environments,
+            env_id.as_str(),
+            &EnvironmentStatusPatch::CredentialDelivery { retry: Some(due_retry) },
+        )
         .await
         .expect("advance retry deadline");
 
@@ -13190,10 +13384,11 @@ mod tests {
         let sessions = backend.clone().using::<TerminalSession>(NAMESPACE);
         let session = sessions.get("credential-work-session").await.expect("live crew session");
         sessions
-            .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Stopped,
-                ..TerminalSessionStatus::default()
-            })
+            .update_status(
+                &session.metadata.name,
+                &session.metadata.resource_version,
+                &TerminalSessionStatus { phase: TerminalSessionPhase::Stopped, ..TerminalSessionStatus::default() },
+            )
             .await
             .expect("stop last crew session");
         reconcile_work_credentials(&state, NAMESPACE).await.expect("revoke when last session ends");
@@ -13356,30 +13551,37 @@ mod tests {
         create_ready_docker_environment(&daemon, good_id.as_str(), "test-interior", BTreeSet::new()).await;
         let environments = daemon.resource_backend().using::<Environment>(NAMESPACE);
         environments
-            .create(&empty_meta(orphaned_id.as_str()), &EnvironmentSpec {
-                host_direct: None,
-                docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    image_composition: None,
-                    image_build_ref: None,
-                    memory_policy: Default::default(),
-                    host_ref: "deleted-host".to_string(),
-                    image: "contained-image".to_string(),
-                    declared_agent_adapters: BTreeSet::new(),
-                    required_agent_adapters: BTreeSet::new(),
-                    pull_policy: Default::default(),
-                    mounts: Vec::new(),
-                    env: BTreeMap::new(),
-                }),
-            })
+            .create(
+                &empty_meta(orphaned_id.as_str()),
+                &EnvironmentSpec {
+                    host_direct: None,
+                    docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                        image_composition: None,
+                        image_build_ref: None,
+                        memory_policy: Default::default(),
+                        host_ref: "deleted-host".to_string(),
+                        image: "contained-image".to_string(),
+                        declared_agent_adapters: BTreeSet::new(),
+                        required_agent_adapters: BTreeSet::new(),
+                        pull_policy: Default::default(),
+                        mounts: Vec::new(),
+                        env: BTreeMap::new(),
+                    }),
+                },
+            )
             .await
             .expect("create orphaned environment");
-        flotilla_resources::apply_status_patch(&environments, orphaned_id.as_str(), &EnvironmentStatusPatch::MarkReady {
-            configured_limits: None,
-            docker_container_id: Some("orphaned-container".to_string()),
-            image_ref: Some("contained-image".to_string()),
-            local_image_id: Some("sha256:contained".to_string()),
-            registry_digest: None,
-        })
+        flotilla_resources::apply_status_patch(
+            &environments,
+            orphaned_id.as_str(),
+            &EnvironmentStatusPatch::MarkReady {
+                configured_limits: None,
+                docker_container_id: Some("orphaned-container".to_string()),
+                image_ref: Some("contained-image".to_string()),
+                local_image_id: Some("sha256:contained".to_string()),
+                registry_digest: None,
+            },
+        )
         .await
         .expect("mark orphaned environment ready");
         let handle = |id: EnvironmentId| {
@@ -13734,10 +13936,13 @@ mod tests {
 
         let health = daemon.fleet_health_internal().await.expect("fleet health");
         let local = health.hosts.iter().find(|host| host.is_local).expect("local fleet row");
-        assert_eq!(local.credential_attention, vec![flotilla_protocol::CredentialAttention {
-            severity: flotilla_protocol::CredentialAttentionSeverity::Expired,
-            message: "ambient claude login expired on 2020-02-01".to_string(),
-        }]);
+        assert_eq!(
+            local.credential_attention,
+            vec![flotilla_protocol::CredentialAttention {
+                severity: flotilla_protocol::CredentialAttentionSeverity::Expired,
+                message: "ambient claude login expired on 2020-02-01".to_string(),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -14075,10 +14280,11 @@ mod tests {
             .await
             .expect("create durable convoy");
         let failed = convoys
-            .update_status(&created.metadata.name, &created.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Failed,
-                ..Default::default()
-            })
+            .update_status(
+                &created.metadata.name,
+                &created.metadata.resource_version,
+                &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
+            )
             .await
             .expect("mark durable convoy failed");
         convoys.delete(&failed.metadata.name).await.expect("begin durable convoy reaping");
@@ -14388,12 +14594,16 @@ mod tests {
             .await
             .expect("create checkout on authority host B");
         checkouts
-            .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &ResourceCheckoutStatus {
-                phase: ResourceCheckoutPhase::Ready,
-                path: Some(git_repo.path().display().to_string()),
-                integration: CheckoutIntegrationStatus::default(),
-                ..Default::default()
-            })
+            .update_status(
+                &checkout.metadata.name,
+                &checkout.metadata.resource_version,
+                &ResourceCheckoutStatus {
+                    phase: ResourceCheckoutPhase::Ready,
+                    path: Some(git_repo.path().display().to_string()),
+                    integration: CheckoutIntegrationStatus::default(),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("mark checkout ready");
 
@@ -14525,10 +14735,13 @@ mod tests {
         let backend = ResourceBackend::Sqlite(SqliteBackend::open(&sqlite_path).expect("sqlite store"));
         let environments = backend.clone().using::<Environment>(NAMESPACE);
         environments
-            .create(&empty_meta("credential-work"), &EnvironmentSpec {
-                host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
-                docker: None,
-            })
+            .create(
+                &empty_meta("credential-work"),
+                &EnvironmentSpec {
+                    host_direct: Some(HostDirectEnvironmentSpec { host_ref: "local".into(), repo_default_dir: "/tmp".into() }),
+                    docker: None,
+                },
+            )
             .await
             .expect("work environment");
         let connection = rusqlite::Connection::open(&sqlite_path).expect("raw sqlite store");
@@ -14605,12 +14818,17 @@ mod tests {
         drop(connection);
 
         let daemon = sqlite_daemon(Vec::new(), Arc::clone(&config)).await;
-        let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
-            heartbeat_interval: Duration::from_secs(300),
-            controller_resync_interval: Duration::from_secs(300),
-            start_controllers: false,
-            ..RuntimeOptions::default()
-        })
+        let runtime = DaemonRuntime::start_with_options(
+            Arc::clone(&daemon),
+            config,
+            None,
+            RuntimeOptions {
+                heartbeat_interval: Duration::from_secs(300),
+                controller_resync_interval: Duration::from_secs(300),
+                start_controllers: false,
+                ..RuntimeOptions::default()
+            },
+        )
         .await
         .expect("daemon should boot with undecodable stored resources");
 
@@ -14645,12 +14863,17 @@ mod tests {
         drop(connection);
 
         let daemon = sqlite_daemon(Vec::new(), Arc::clone(&config)).await;
-        let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
-            heartbeat_interval: Duration::from_millis(10),
-            controller_resync_interval: Duration::from_secs(300),
-            start_controllers: false,
-            ..RuntimeOptions::default()
-        })
+        let runtime = DaemonRuntime::start_with_options(
+            Arc::clone(&daemon),
+            config,
+            None,
+            RuntimeOptions {
+                heartbeat_interval: Duration::from_millis(10),
+                controller_resync_interval: Duration::from_secs(300),
+                start_controllers: false,
+                ..RuntimeOptions::default()
+            },
+        )
         .await
         .expect("daemon should boot with an undecodable stored resource");
 
@@ -14714,12 +14937,17 @@ mod tests {
         .expect("seed restart history");
 
         let daemon = sqlite_daemon(Vec::new(), Arc::clone(&config)).await;
-        let runtime = DaemonRuntime::start_with_options(Arc::clone(&daemon), config, None, RuntimeOptions {
-            heartbeat_interval: Duration::from_secs(300),
-            controller_resync_interval: Duration::from_secs(300),
-            start_controllers: false,
-            ..RuntimeOptions::default()
-        })
+        let runtime = DaemonRuntime::start_with_options(
+            Arc::clone(&daemon),
+            config,
+            None,
+            RuntimeOptions {
+                heartbeat_interval: Duration::from_secs(300),
+                controller_resync_interval: Duration::from_secs(300),
+                start_controllers: false,
+                ..RuntimeOptions::default()
+            },
+        )
         .await
         .expect("daemon should start");
 
@@ -14958,12 +15186,16 @@ mod tests {
         let sessions = backend.using::<TerminalSession>(NAMESPACE);
         let holder = sessions.get(name).await.expect("attention holder");
         let observation = runtime.observe_attention(name, &holder.spec).await.expect("terminal observation").expect("observed attention");
-        flotilla_resources::apply_status_patch(&sessions, name, &flotilla_resources::TerminalSessionStatusPatch::Observe {
-            attention: observation.attention,
-            occupancy: observation.occupancy,
-            output_digest: observation.output_digest,
-            observed_at: Utc::now(),
-        })
+        flotilla_resources::apply_status_patch(
+            &sessions,
+            name,
+            &flotilla_resources::TerminalSessionStatusPatch::Observe {
+                attention: observation.attention,
+                occupancy: observation.occupancy,
+                output_digest: observation.output_digest,
+                observed_at: Utc::now(),
+            },
+        )
         .await
         .expect("terminal controller attention projection");
     }
@@ -15530,11 +15762,10 @@ mod tests {
             std::future::pending::<()>().await;
             Ok(TerminalDeliveryOutcome::Confirmed)
         });
-        deliveries.lock().expect("delivery lock").insert("agent".to_string(), PendingTerminalDelivery {
-            message_batch: None,
-            message: "first".to_string(),
-            task: pending_task,
-        });
+        deliveries
+            .lock()
+            .expect("delivery lock")
+            .insert("agent".to_string(), PendingTerminalDelivery { message_batch: None, message: "first".to_string(), task: pending_task });
 
         assert!(matches!(lookup_terminal_delivery(&deliveries, "agent", "first"), TerminalDeliveryLookup::InFlight));
         let TerminalDeliveryLookup::Taken(replaced) = lookup_terminal_delivery(&deliveries, "agent", "second") else {
@@ -15548,11 +15779,10 @@ mod tests {
         while !completed_task.is_finished() {
             tokio::task::yield_now().await;
         }
-        deliveries.lock().expect("delivery lock").insert("agent".to_string(), PendingTerminalDelivery {
-            message_batch: None,
-            message: "second".to_string(),
-            task: completed_task,
-        });
+        deliveries.lock().expect("delivery lock").insert(
+            "agent".to_string(),
+            PendingTerminalDelivery { message_batch: None, message: "second".to_string(), task: completed_task },
+        );
         let TerminalDeliveryLookup::Taken(completed) = lookup_terminal_delivery(&deliveries, "agent", "second") else {
             panic!("finished delivery should be drained")
         };
@@ -15644,12 +15874,16 @@ mod tests {
             let holder = sessions.get("agent").await.expect("attention holder");
             let observation =
                 runtime.observe_attention("agent", &holder.spec).await.expect("terminal observation").expect("observed attention");
-            flotilla_resources::apply_status_patch(&sessions, "agent", &flotilla_resources::TerminalSessionStatusPatch::Observe {
-                attention: observation.attention,
-                occupancy: observation.occupancy,
-                output_digest: observation.output_digest,
-                observed_at: Utc::now(),
-            })
+            flotilla_resources::apply_status_patch(
+                &sessions,
+                "agent",
+                &flotilla_resources::TerminalSessionStatusPatch::Observe {
+                    attention: observation.attention,
+                    occupancy: observation.occupancy,
+                    output_digest: observation.output_digest,
+                    observed_at: Utc::now(),
+                },
+            )
             .await
             .expect("terminal controller attention projection");
         }
@@ -15821,11 +16055,10 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
             }
-            deliveries.lock().expect("pending transport tasks").insert("agent".into(), PendingTerminalDelivery {
-                message_batch: Some("batch".into()),
-                message: "framed input".into(),
-                task,
-            });
+            deliveries.lock().expect("pending transport tasks").insert(
+                "agent".into(),
+                PendingTerminalDelivery { message_batch: Some("batch".into()), message: "framed input".into(), task },
+            );
             for text in ["framed input", "legacy follow-up"] {
                 assert!(matches!(lookup_terminal_delivery(&deliveries, "agent", text), TerminalDeliveryLookup::InFlight));
                 assert_eq!(deliveries.lock().expect("pending transport tasks").len(), 1);
@@ -16009,11 +16242,15 @@ mod tests {
             .await
             .expect("session");
         sessions
-            .update_status("old-orphan", &created.metadata.resource_version, &TerminalSessionStatus {
-                phase: TerminalSessionPhase::Running,
-                session_id: Some("old-process".to_string()),
-                ..Default::default()
-            })
+            .update_status(
+                "old-orphan",
+                &created.metadata.resource_version,
+                &TerminalSessionStatus {
+                    phase: TerminalSessionPhase::Running,
+                    session_id: Some("old-process".to_string()),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("running orphan");
         drop(initial);
@@ -16025,10 +16262,12 @@ mod tests {
             .working_directory(ExecutionEnvironmentPath::new("/workspace"))
             .build()])
             .await;
-        let runtime = DaemonRuntime::start_with_options(Arc::clone(&restarted), config, None, RuntimeOptions {
-            controller_resync_interval: Duration::from_secs(3600),
-            ..RuntimeOptions::default()
-        })
+        let runtime = DaemonRuntime::start_with_options(
+            Arc::clone(&restarted),
+            config,
+            None,
+            RuntimeOptions { controller_resync_interval: Duration::from_secs(3600), ..RuntimeOptions::default() },
+        )
         .await
         .expect("daemon startup");
         for _ in 0..1000 {
@@ -16073,10 +16312,11 @@ mod tests {
             .await
             .expect("create convoy");
         convoys
-            .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                ..Default::default()
-            })
+            .update_status(
+                &convoy.metadata.name,
+                &convoy.metadata.resource_version,
+                &ConvoyStatus { phase: ConvoyPhase::Active, ..Default::default() },
+            )
             .await
             .expect("mark convoy active");
 
@@ -16624,10 +16864,11 @@ mod tests {
 
         release.notify_one();
         let observed_facts = probe.await.expect("probe task");
-        flotilla_resources::apply_status_patch(&hosts, &host_id, &HostStatusPatch::FulfilmentFacts {
-            facts: observed_facts,
-            model_probes: ModelProbeState::default(),
-        })
+        flotilla_resources::apply_status_patch(
+            &hosts,
+            &host_id,
+            &HostStatusPatch::FulfilmentFacts { facts: observed_facts, model_probes: ModelProbeState::default() },
+        )
         .await
         .expect("publish independently observed facts");
         apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &health, &runtime_health)
@@ -16637,10 +16878,11 @@ mod tests {
         assert_eq!(status.fulfilment_facts["host-direct-async-facts-test"].toolchains["rustc"], "rustc 1.94.1");
 
         let mut model_probes = ModelProbeState { total_requests: 2, ..ModelProbeState::default() };
-        flotilla_resources::apply_status_patch(&hosts, &host_id, &HostStatusPatch::FulfilmentFacts {
-            facts: status.fulfilment_facts.clone(),
-            model_probes: model_probes.clone(),
-        })
+        flotilla_resources::apply_status_patch(
+            &hosts,
+            &host_id,
+            &HostStatusPatch::FulfilmentFacts { facts: status.fulfilment_facts.clone(), model_probes: model_probes.clone() },
+        )
         .await
         .expect("publish model probe count");
         apply_host_heartbeat_with_credentials(&daemon, NAMESPACE, &profile, None, &health, &runtime_health)
@@ -16686,11 +16928,11 @@ mod tests {
             .system(flotilla_protocol::SystemInfo { os: Some("linux".into()), ..Default::default() })
             .build();
         hosts
-            .update_status("remote-host", &created.metadata.resource_version, &HostStatus {
-                description: Some(summary.clone()),
-                heartbeat_at: Some(Utc::now()),
-                ..Default::default()
-            })
+            .update_status(
+                "remote-host",
+                &created.metadata.resource_version,
+                &HostStatus { description: Some(summary.clone()), heartbeat_at: Some(Utc::now()), ..Default::default() },
+            )
             .await
             .expect("remote description");
         let mut events = daemon.subscribe();
@@ -16718,11 +16960,11 @@ mod tests {
         let mut changed = summary.clone();
         changed.system.cpu_count = Some(8);
         hosts
-            .update_status("remote-host", &current.metadata.resource_version, &HostStatus {
-                description: Some(changed.clone()),
-                heartbeat_at: Some(Utc::now()),
-                ..Default::default()
-            })
+            .update_status(
+                "remote-host",
+                &current.metadata.resource_version,
+                &HostStatus { description: Some(changed.clone()), heartbeat_at: Some(Utc::now()), ..Default::default() },
+            )
             .await
             .expect("change remote description");
         daemon
@@ -16759,10 +17001,14 @@ mod tests {
 
         ensure_host_exists(&daemon.resource_backend(), NAMESPACE, &host_id, "kiwi").await.expect("host registration should succeed");
         let hosts = daemon.resource_backend().using::<Host>(NAMESPACE);
-        flotilla_resources::apply_status_patch(&hosts, &host_id, &flotilla_resources::HostStatusPatch::SleepInhibition {
-            health: flotilla_protocol::SleepInhibitionHealth::Failed { consecutive_failures: 3, message: "polkit denied".to_string() },
-            observed_at: Utc::now(),
-        })
+        flotilla_resources::apply_status_patch(
+            &hosts,
+            &host_id,
+            &flotilla_resources::HostStatusPatch::SleepInhibition {
+                health: flotilla_protocol::SleepInhibitionHealth::Failed { consecutive_failures: 3, message: "polkit denied".to_string() },
+                observed_at: Utc::now(),
+            },
+        )
         .await
         .expect("seed sleep inhibition health");
         let heartbeat =
@@ -16950,11 +17196,10 @@ mod tests {
             backend
                 .clone()
                 .using::<Host>(NAMESPACE)
-                .create(&empty_meta(name), &HostSpec {
-                    display_name: "collision".into(),
-                    connection: Default::default(),
-                    ..HostSpec::default()
-                })
+                .create(
+                    &empty_meta(name),
+                    &HostSpec { display_name: "collision".into(), connection: Default::default(), ..HostSpec::default() },
+                )
                 .await
                 .expect("seed ambiguous host");
         }
@@ -17481,14 +17726,17 @@ mod tests {
         config.add_observation_root(&ExecutionEnvironmentPath::new(&repo)).expect("persist observation root");
         let requests = Arc::new(FakeChangeRequest::new());
         requests
-            .add_change_requests(vec![("884".into(), ProviderChangeRequest {
-                title: "Claimed result".into(),
-                branch: "claim-only".into(),
-                status: flotilla_protocol::ChangeRequestStatus::Merged,
-                body: None,
-                provider_name: "fake".into(),
-                provider_display_name: "Fake".into(),
-            })])
+            .add_change_requests(vec![(
+                "884".into(),
+                ProviderChangeRequest {
+                    title: "Claimed result".into(),
+                    branch: "claim-only".into(),
+                    status: flotilla_protocol::ChangeRequestStatus::Merged,
+                    body: None,
+                    provider_name: "fake".into(),
+                    provider_display_name: "Fake".into(),
+                },
+            )])
             .await;
         let daemon = daemon_with_backend_runner_and_change_requests(
             vec![repo.clone()],
@@ -17546,12 +17794,15 @@ mod tests {
         backend
             .clone()
             .definitions::<CredentialSpec>(NAMESPACE)
-            .create(&empty_meta("claude-max"), &CredentialSpecSpec {
-                consumer: CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() },
-                source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
-                lifecycle: CredentialLifecycle::Static,
-                placement: CredentialPlacementRequirements::default(),
-            })
+            .create(
+                &empty_meta("claude-max"),
+                &CredentialSpecSpec {
+                    consumer: CredentialConsumer::ClaudeOauth { account_email: "test@example.com".to_string() },
+                    source: CredentialSource::Env { name: "TEST_CLAUDE_TOKEN".to_string() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: CredentialPlacementRequirements::default(),
+                },
+            )
             .await
             .expect("Claude credential declaration");
 
@@ -17561,25 +17812,28 @@ mod tests {
         if !matches!(observation, LaunchObservationRecord::MissingEnvironment) {
             backend
                 .using::<Environment>(NAMESPACE)
-                .create(&empty_meta(env_id.as_str()), &EnvironmentSpec {
-                    host_direct: None,
-                    docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                        image_composition: None,
-                        image_build_ref: None,
-                        memory_policy: Default::default(),
-                        host_ref: "host-test".into(),
-                        image: "contained-image".into(),
-                        declared_agent_adapters: BTreeSet::from(["claude-code".into()]),
-                        required_agent_adapters: BTreeSet::from(["claude-code".into()]),
-                        pull_policy: Default::default(),
-                        mounts: Vec::new(),
-                        env: if private_home {
-                            BTreeMap::from([("FLOTILLA_CREW_SKILLS".into(), "{\"coder\":[],\"reviewer\":[]}".into())])
-                        } else {
-                            BTreeMap::new()
-                        },
-                    }),
-                })
+                .create(
+                    &empty_meta(env_id.as_str()),
+                    &EnvironmentSpec {
+                        host_direct: None,
+                        docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                            image_composition: None,
+                            image_build_ref: None,
+                            memory_policy: Default::default(),
+                            host_ref: "host-test".into(),
+                            image: "contained-image".into(),
+                            declared_agent_adapters: BTreeSet::from(["claude-code".into()]),
+                            required_agent_adapters: BTreeSet::from(["claude-code".into()]),
+                            pull_policy: Default::default(),
+                            mounts: Vec::new(),
+                            env: if private_home {
+                                BTreeMap::from([("FLOTILLA_CREW_SKILLS".into(), "{\"coder\":[],\"reviewer\":[]}".into())])
+                            } else {
+                                BTreeMap::new()
+                            },
+                        }),
+                    },
+                )
                 .await
                 .expect("environment");
         }
@@ -17678,12 +17932,15 @@ mod tests {
         }
         backend
             .using::<Vessel>(NAMESPACE)
-            .create(&empty_meta("demo-work"), &flotilla_resources::VesselSpec {
-                convoy_ref: "demo".into(),
-                vessel_name: "work".into(),
-                placement_policy_ref: "policy".into(),
-                adopted_checkout_refs: Default::default(),
-            })
+            .create(
+                &empty_meta("demo-work"),
+                &flotilla_resources::VesselSpec {
+                    convoy_ref: "demo".into(),
+                    vessel_name: "work".into(),
+                    placement_policy_ref: "policy".into(),
+                    adopted_checkout_refs: Default::default(),
+                },
+            )
             .await
             .expect("vessel");
         let mut terminal_meta = empty_meta("terminal-demo-work-coder");
@@ -18233,11 +18490,10 @@ mod tests {
             .await
             .expect("crew list");
         let CommandValue::CrewList(crew_list) = crew_list else { panic!("expected crew list") };
-        assert_eq!(crew_list.members.iter().map(|member| (member.role.as_str(), member.state.as_str())).collect::<Vec<_>>(), vec![
-            ("coder", "active"),
-            ("reviewer", "latent"),
-            ("watcher", "active")
-        ]);
+        assert_eq!(
+            crew_list.members.iter().map(|member| (member.role.as_str(), member.state.as_str())).collect::<Vec<_>>(),
+            vec![("coder", "active"), ("reviewer", "latent"), ("watcher", "active")]
+        );
         let initial_status = convoys.get(&crew_record).await.expect("crew convoy").status.expect("convoy status");
         assert_eq!(initial_status.crew_work["implement"]["coder"].phase, flotilla_resources::CrewWorkPhase::Working);
         // The reviewer is latent above and has no terminal session yet, so the
@@ -18687,9 +18943,10 @@ mod tests {
             )
             .await
             .expect("create unknown convoy");
-        assert_eq!(wait_for_command_result(&mut rx, create_id).await, CommandValue::Error {
-            message: "unknown agent capability `architect`".to_string()
-        });
+        assert_eq!(
+            wait_for_command_result(&mut rx, create_id).await,
+            CommandValue::Error { message: "unknown agent capability `architect`".to_string() }
+        );
         assert!(convoys.get("unknown-convoy").await.is_err(), "rejected convoy should not be persisted");
 
         for handle in controller_handles {
@@ -18796,9 +19053,10 @@ mod tests {
             )
             .await
             .expect("duplicate convoy create command should start");
-        assert_eq!(wait_for_command_result(&mut rx, duplicate_id).await, CommandValue::Error {
-            message: "live convoy convoy-adopted generation 1 already exists".to_string()
-        });
+        assert_eq!(
+            wait_for_command_result(&mut rx, duplicate_id).await,
+            CommandValue::Error { message: "live convoy convoy-adopted generation 1 already exists".to_string() }
+        );
         assert_eq!(
             checkouts.list().await.expect("list adopted checkouts after duplicate").items.len(),
             checkout_count,

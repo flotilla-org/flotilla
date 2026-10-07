@@ -245,10 +245,14 @@ impl fmt::Display for SubjectVariable {
         match self {
             Self::ChangeRequest => f.write_str("$cr"),
             Self::Issue => f.write_str("$issue"),
-            Self::Artifact { producer, kind, about } => write!(f, "$artifact({producer},{kind},{})", match about {
-                ArtifactSubjectBinding::Convoy => "convoy",
-                ArtifactSubjectBinding::ChangeRequestHead => "change-request-head",
-            }),
+            Self::Artifact { producer, kind, about } => write!(
+                f,
+                "$artifact({producer},{kind},{})",
+                match about {
+                    ArtifactSubjectBinding::Convoy => "convoy",
+                    ArtifactSubjectBinding::ChangeRequestHead => "change-request-head",
+                }
+            ),
         }
     }
 }
@@ -892,11 +896,10 @@ fn validate_turn_delivery(
                 SubjectVariable::Artifact { .. } => LeafKind::Artifact,
             };
             if let Err(reason) = validate_leaf_literal(kind, &rule.on.field_path, &rule.on.literal) {
-                push_error(errors, ValidationError::InvalidTurnDeliveryLiteral {
-                    source: source.clone(),
-                    template: rule.on.to_string(),
-                    reason,
-                });
+                push_error(
+                    errors,
+                    ValidationError::InvalidTurnDeliveryLiteral { source: source.clone(), template: rule.on.to_string(), reason },
+                );
             }
         }
         if rule.brief.trim().is_empty() {
@@ -908,11 +911,14 @@ fn validate_turn_delivery(
         };
         let agent = vessel.crew.iter().any(|member| member.role == rule.to.role && matches!(member.source, CrewSource::Agent { .. }));
         if !agent {
-            push_error(errors, ValidationError::UnknownTurnDeliveryRole {
-                source: source.clone(),
-                vessel: rule.to.vessel.clone(),
-                role: rule.to.role.clone(),
-            });
+            push_error(
+                errors,
+                ValidationError::UnknownTurnDeliveryRole {
+                    source: source.clone(),
+                    vessel: rule.to.vessel.clone(),
+                    role: rule.to.role.clone(),
+                },
+            );
         }
     }
 }
@@ -1010,18 +1016,17 @@ fn validate_vessel(
             };
             let leaf = flotilla_protocol::Leaf { address, field_path: field_path.clone(), operator: *operator, literal: literal.clone() };
             if let Err(reason) = crate::admit_leaf(&leaf) {
-                push_error(errors, ValidationError::InvalidCompletionCondition {
-                    vessel: vessel.name.clone(),
-                    role: process.role.clone(),
-                    reason,
-                });
+                push_error(
+                    errors,
+                    ValidationError::InvalidCompletionCondition { vessel: vessel.name.clone(), role: process.role.clone(), reason },
+                );
             }
         }
         if process.role.starts_with('@') {
-            push_error(errors, ValidationError::ReservedAddressMarkerInCrewRole {
-                vessel: vessel.name.clone(),
-                role: process.role.clone(),
-            });
+            push_error(
+                errors,
+                ValidationError::ReservedAddressMarkerInCrewRole { vessel: vessel.name.clone(), role: process.role.clone() },
+            );
         }
         if !roles.insert(process.role.clone()) {
             push_error(errors, ValidationError::DuplicateRoleInVessel { vessel: vessel.name.clone(), role: process.role.clone() });
@@ -1029,11 +1034,10 @@ fn validate_vessel(
 
         for key in process.labels.keys() {
             if key.starts_with(crate::labels::RESERVED_PREFIX) {
-                push_error(errors, ValidationError::ReservedLabelKey {
-                    vessel: vessel.name.clone(),
-                    role: process.role.clone(),
-                    key: key.clone(),
-                });
+                push_error(
+                    errors,
+                    ValidationError::ReservedLabelKey { vessel: vessel.name.clone(), role: process.role.clone(), key: key.clone() },
+                );
             }
         }
 

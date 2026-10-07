@@ -94,33 +94,41 @@ impl MessageInbox {
                 continue;
             }
             if phase == MessagePhase::Delivered && message.spec.expectation == MessageExpectation::None {
-                apply_status_patch(&self.messages, &message.metadata.name, &MessageStatusPatch::Finish {
-                    phase: MessagePhase::Satisfied,
-                    reason: "notification was accepted by its receiver".into(),
-                    at: now,
-                })
+                apply_status_patch(
+                    &self.messages,
+                    &message.metadata.name,
+                    &MessageStatusPatch::Finish {
+                        phase: MessagePhase::Satisfied,
+                        reason: "notification was accepted by its receiver".into(),
+                        at: now,
+                    },
+                )
                 .await?;
                 continue;
             }
             if message.spec.deadline.is_some_and(|deadline| now >= deadline)
                 && message.status.as_ref().is_none_or(|status| status.submission.is_none() || status.resolved_receiver.is_some())
             {
-                apply_status_patch(&self.messages, &message.metadata.name, &MessageStatusPatch::Finish {
-                    phase: MessagePhase::Expired,
-                    reason: "message deadline elapsed".into(),
-                    at: now,
-                })
+                apply_status_patch(
+                    &self.messages,
+                    &message.metadata.name,
+                    &MessageStatusPatch::Finish { phase: MessagePhase::Expired, reason: "message deadline elapsed".into(), at: now },
+                )
                 .await?;
                 continue;
             }
             if phase == MessagePhase::Delivered {
                 if let MessageExpectation::Outcome { condition } = &message.spec.expectation {
                     if self.outcome_met(condition, now).await? {
-                        apply_status_patch(&self.messages, &message.metadata.name, &MessageStatusPatch::Finish {
-                            phase: MessagePhase::OutcomeMet,
-                            reason: "outcome condition holds".into(),
-                            at: now,
-                        })
+                        apply_status_patch(
+                            &self.messages,
+                            &message.metadata.name,
+                            &MessageStatusPatch::Finish {
+                                phase: MessagePhase::OutcomeMet,
+                                reason: "outcome condition holds".into(),
+                                at: now,
+                            },
+                        )
                         .await?;
                     }
                 }
@@ -139,11 +147,15 @@ impl MessageInbox {
                     }
                 }
                 if answered {
-                    apply_status_patch(&self.messages, &message.metadata.name, &MessageStatusPatch::Finish {
-                        phase: MessagePhase::Answered,
-                        reason: "receiver published a correlated reply".into(),
-                        at: now,
-                    })
+                    apply_status_patch(
+                        &self.messages,
+                        &message.metadata.name,
+                        &MessageStatusPatch::Finish {
+                            phase: MessagePhase::Answered,
+                            reason: "receiver published a correlated reply".into(),
+                            at: now,
+                        },
+                    )
                     .await?;
                 }
                 continue;
@@ -156,11 +168,15 @@ impl MessageInbox {
                         && message_supersedes(&message.spec, predecessor)
                 })
             {
-                apply_status_patch(&self.messages, &message.metadata.name, &MessageStatusPatch::Finish {
-                    phase: MessagePhase::Superseded,
-                    reason: "same-subject predecessor was accepted with an open expectation".into(),
-                    at: now,
-                })
+                apply_status_patch(
+                    &self.messages,
+                    &message.metadata.name,
+                    &MessageStatusPatch::Finish {
+                        phase: MessagePhase::Superseded,
+                        reason: "same-subject predecessor was accepted with an open expectation".into(),
+                        at: now,
+                    },
+                )
                 .await?;
                 continue;
             }
@@ -237,11 +253,15 @@ impl MessageInbox {
         });
         let members = if members.is_empty() { vec![name.to_string()] } else { members };
         for member in members {
-            apply_status_patch(&self.messages, &member, &MessageStatusPatch::Finish {
-                phase: MessagePhase::DeadLettered,
-                reason: format!("operator failed batch: {reason}"),
-                at: now,
-            })
+            apply_status_patch(
+                &self.messages,
+                &member,
+                &MessageStatusPatch::Finish {
+                    phase: MessagePhase::DeadLettered,
+                    reason: format!("operator failed batch: {reason}"),
+                    at: now,
+                },
+            )
             .await?;
         }
         self.clear_signal(&message).await
@@ -521,10 +541,11 @@ impl MessageInbox {
 
     async fn accepted(&self, members: &[ResourceObject<Message>], receiver: &ResolvedMessageReceiver) -> Result<(), ResourceError> {
         for member in members {
-            apply_status_patch(&self.messages, &member.metadata.name, &MessageStatusPatch::Delivered {
-                receiver: receiver.clone(),
-                at: receiver.delivered_at,
-            })
+            apply_status_patch(
+                &self.messages,
+                &member.metadata.name,
+                &MessageStatusPatch::Delivered { receiver: receiver.clone(), at: receiver.delivered_at },
+            )
             .await?;
             self.clear_signal(member).await?;
         }

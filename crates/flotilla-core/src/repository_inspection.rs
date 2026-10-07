@@ -657,10 +657,13 @@ mod tests {
         let checkouts = inspector.inspect_checkouts(&inspection).await.expect("checkout inspection");
 
         assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(checkouts, vec![
-            LocalCheckoutInspection { path: root, host_ref: "host-01".to_string(), git_ref: "main".to_string(), is_main: true },
-            LocalCheckoutInspection { path: feature, host_ref: "host-01".to_string(), git_ref: "feature".to_string(), is_main: false },
-        ]);
+        assert_eq!(
+            checkouts,
+            vec![
+                LocalCheckoutInspection { path: root, host_ref: "host-01".to_string(), git_ref: "main".to_string(), is_main: true },
+                LocalCheckoutInspection { path: feature, host_ref: "host-01".to_string(), git_ref: "feature".to_string(), is_main: false },
+            ]
+        );
     }
 
     // Enumeration preserves the enriched parser's empty/bare filtering and detached labels,

@@ -64,15 +64,18 @@ async fn recorded_drain_outcomes_preserve_reports_and_continue() {
         assert_eq!(runner.remaining(), 0);
         assert_eq!(
             runner.calls()[0],
-            ("/incoming/bin/cleat".into(), vec![
-                "--runtime-root".into(),
-                "/state/crew cleat".into(),
-                "--server".into(),
-                "default".into(),
-                "server".into(),
-                "drain".into(),
-                "--json".into()
-            ])
+            (
+                "/incoming/bin/cleat".into(),
+                vec![
+                    "--runtime-root".into(),
+                    "/state/crew cleat".into(),
+                    "--server".into(),
+                    "default".into(),
+                    "server".into(),
+                    "drain".into(),
+                    "--json".into()
+                ]
+            )
         );
     }
 }
@@ -111,18 +114,19 @@ fn crew_inventory_uses_owned_roots_and_logical_names() {
         .with(EnvironmentAssertion::env_var("CLEAT_DAEMON", "named@4"));
     let environment =
         CleatEnvironment::builder().id(EnvironmentId::new("contained-work")).bag(bag).runner(runner.clone()).contained(true).build();
-    let endpoints =
-        [CleatEndpoint { runtime_root: "/named private/root".into(), daemon: "other@1".into(), session: "first".into() }, CleatEndpoint {
-            runtime_root: "/named private/root".into(),
-            daemon: "other@2".into(),
-            session: "second".into(),
-        }];
+    let endpoints = [
+        CleatEndpoint { runtime_root: "/named private/root".into(), daemon: "other@1".into(), session: "first".into() },
+        CleatEndpoint { runtime_root: "/named private/root".into(), daemon: "other@2".into(), session: "second".into() },
+    ];
     let targets = crew_targets(&environment, &endpoints).expect("targets");
-    assert_eq!(targets.iter().map(|target| (target.runtime_root.display().to_string(), target.name.clone())).collect::<Vec<_>>(), vec![
-        ("/contained-cleat/work".into(), "default".into()),
-        ("/contained-cleat/work".into(), "named".into()),
-        ("/named private/root".into(), "other".into())
-    ]);
+    assert_eq!(
+        targets.iter().map(|target| (target.runtime_root.display().to_string(), target.name.clone())).collect::<Vec<_>>(),
+        vec![
+            ("/contained-cleat/work".into(), "default".into()),
+            ("/contained-cleat/work".into(), "named".into()),
+            ("/named private/root".into(), "other".into())
+        ]
+    );
     assert!(targets.iter().all(|target| target.contained && target.environment == "contained-work"));
     assert!(runner.calls().is_empty(), "inventory must not rediscover daemons in shell");
     assert_eq!(crew_targets(&environment, &[]).expect("empty inventory").len(), 2);
@@ -496,17 +500,23 @@ async fn discovered_roll_targets_start_replacements_with_a_controlled_environmen
     let targets = crew_targets(&environment, &[]).expect("registered roll target");
     let report = drain("host".into(), "generation-2".into(), Path::new("/incoming/bin/cleat"), &targets, vec![]).await;
     assert!(!report.failed(), "{report:?}");
-    assert_eq!(runner.calls(), vec![("/usr/bin/env".into(), vec![
-        "-i".into(),
-        "HOME=/execution/home".into(),
-        "PATH=/execution/bin:/usr/bin:/bin".into(),
-        "/incoming/bin/cleat".into(),
-        "--runtime-root".into(),
-        "/execution/home/.local/state/cleat".into(),
-        "--server".into(),
-        "default".into(),
-        "server".into(),
-        "drain".into(),
-        "--json".into(),
-    ])]);
+    assert_eq!(
+        runner.calls(),
+        vec![(
+            "/usr/bin/env".into(),
+            vec![
+                "-i".into(),
+                "HOME=/execution/home".into(),
+                "PATH=/execution/bin:/usr/bin:/bin".into(),
+                "/incoming/bin/cleat".into(),
+                "--runtime-root".into(),
+                "/execution/home/.local/state/cleat".into(),
+                "--server".into(),
+                "default".into(),
+                "server".into(),
+                "drain".into(),
+                "--json".into(),
+            ]
+        )]
+    );
 }

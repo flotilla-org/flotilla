@@ -1568,9 +1568,11 @@ async fn explicit_lifecycle_wake_bypasses_a_parked_objects_remaining_backoff() {
 
     wake_degraded.store(true, Ordering::SeqCst);
     failures
-        .update(&InputMeta::from(&degraded.metadata), &degraded.metadata.resource_version, &PrimarySpec {
-            value: "lifecycle-wake".to_string(),
-        })
+        .update(
+            &InputMeta::from(&degraded.metadata),
+            &degraded.metadata.resource_version,
+            &PrimarySpec { value: "lifecycle-wake".to_string() },
+        )
         .await
         .expect("lifecycle change should be persisted");
     for _ in 0..20 {
@@ -1790,21 +1792,27 @@ async fn controller_loop_applies_delete_actuations_idempotently() {
     let vessels = backend.clone().using::<Vessel>("flotilla");
     primaries.create(&primary_meta("alpha"), &PrimarySpec { value: "one".to_string() }).await.expect("primary create should succeed");
     presentations
-        .create(&resource_meta().name("alpha-presentation").call(), &PresentationSpec {
-            convoy_ref: "alpha".to_string(),
-            presentation_policy_ref: "default".to_string(),
-            name: "alpha".to_string(),
-            process_selector: [("flotilla.work/convoy".to_string(), "alpha".to_string())].into_iter().collect(),
-        })
+        .create(
+            &resource_meta().name("alpha-presentation").call(),
+            &PresentationSpec {
+                convoy_ref: "alpha".to_string(),
+                presentation_policy_ref: "default".to_string(),
+                name: "alpha".to_string(),
+                process_selector: [("flotilla.work/convoy".to_string(), "alpha".to_string())].into_iter().collect(),
+            },
+        )
         .await
         .expect("presentation create should succeed");
     vessels
-        .create(&resource_meta().name("alpha-task").call(), &VesselSpec {
-            convoy_ref: "alpha".to_string(),
-            vessel_name: "implement".to_string(),
-            placement_policy_ref: "local".to_string(),
-            adopted_checkout_refs: Default::default(),
-        })
+        .create(
+            &resource_meta().name("alpha-task").call(),
+            &VesselSpec {
+                convoy_ref: "alpha".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "local".to_string(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
         .await
         .expect("task workspace create should succeed");
 
@@ -1885,12 +1893,15 @@ async fn controller_loop_delete_actuations_preserve_observed_and_adopted_resourc
         .await
         .expect("presentation create should succeed");
     vessels
-        .create(&resource_meta().name("observed-task").call().with_lifecycle_authority(LifecycleAuthority::Observed), &VesselSpec {
-            convoy_ref: "alpha".to_string(),
-            vessel_name: "implement".to_string(),
-            placement_policy_ref: "local".to_string(),
-            adopted_checkout_refs: Default::default(),
-        })
+        .create(
+            &resource_meta().name("observed-task").call().with_lifecycle_authority(LifecycleAuthority::Observed),
+            &VesselSpec {
+                convoy_ref: "alpha".to_string(),
+                vessel_name: "implement".to_string(),
+                placement_policy_ref: "local".to_string(),
+                adopted_checkout_refs: Default::default(),
+            },
+        )
         .await
         .expect("task workspace create should succeed");
     checkouts

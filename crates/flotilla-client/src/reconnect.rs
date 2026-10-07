@@ -93,16 +93,19 @@ mod tests {
         let mut backoff = ReconnectBackoff::default();
         let delays: Vec<_> = (0..8).map(|_| backoff.next_delay_with_jitter(1.0)).collect();
 
-        assert_eq!(delays, vec![
-            Duration::from_millis(500),
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-            Duration::from_secs(4),
-            Duration::from_secs(8),
-            Duration::from_secs(16),
-            Duration::from_secs(30),
-            Duration::from_secs(30),
-        ]);
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ]
+        );
 
         backoff.reset();
         assert_eq!(backoff.next_delay_with_jitter(0.0), Duration::from_millis(250));
@@ -123,13 +126,16 @@ mod tests {
         .expect("third attempt connects");
 
         assert_eq!(connected, "connected");
-        assert!(matches!(notices.as_slice(), [
-            ReconnectNotice::Attempt { attempt: 1 },
-            ReconnectNotice::Retry { attempt: 1, .. },
-            ReconnectNotice::Attempt { attempt: 2 },
-            ReconnectNotice::Retry { attempt: 2, .. },
-            ReconnectNotice::Attempt { attempt: 3 },
-        ]));
+        assert!(matches!(
+            notices.as_slice(),
+            [
+                ReconnectNotice::Attempt { attempt: 1 },
+                ReconnectNotice::Retry { attempt: 1, .. },
+                ReconnectNotice::Attempt { attempt: 2 },
+                ReconnectNotice::Retry { attempt: 2, .. },
+                ReconnectNotice::Attempt { attempt: 3 },
+            ]
+        ));
     }
 
     #[tokio::test]

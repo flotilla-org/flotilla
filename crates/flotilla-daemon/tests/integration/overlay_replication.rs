@@ -49,16 +49,20 @@ async fn sqlite_daemons_expose_remote_host_self_report_in_fleet_health() {
         .await
         .expect("create feta host self-report");
     feta_hosts
-        .update_status(&feta_host_id, &feta_host.metadata.resource_version, &HostStatus {
-            heartbeat_at: Some(heartbeat_at),
-            ready: true,
-            daemon_generation: Some("feta-generation".to_string()),
-            daemon_version: Some("0.1.0".to_string()),
-            daemon_started_at: Some(started_at),
-            disk_free_bytes: Some(459_371_896_832),
-            daemon_rss_bytes: Some(123_456_789),
-            ..HostStatus::default()
-        })
+        .update_status(
+            &feta_host_id,
+            &feta_host.metadata.resource_version,
+            &HostStatus {
+                heartbeat_at: Some(heartbeat_at),
+                ready: true,
+                daemon_generation: Some("feta-generation".to_string()),
+                daemon_version: Some("0.1.0".to_string()),
+                daemon_started_at: Some(started_at),
+                disk_free_bytes: Some(459_371_896_832),
+                daemon_rss_bytes: Some(123_456_789),
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("publish feta host self-report");
 
@@ -106,12 +110,16 @@ async fn fleet_list_and_health_include_replicated_remote_crew_without_snapshot_f
     let host =
         feta_hosts.create(&InputMeta::builder().name(feta_host_id.clone()).build(), &HostSpec::default()).await.expect("create feta host");
     feta_hosts
-        .update_status(&feta_host_id, &host.metadata.resource_version, &HostStatus {
-            heartbeat_at: Some(chrono::Utc::now()),
-            daemon_generation: Some("feta-generation".to_string()),
-            ready: true,
-            ..HostStatus::default()
-        })
+        .update_status(
+            &feta_host_id,
+            &host.metadata.resource_version,
+            &HostStatus {
+                heartbeat_at: Some(chrono::Utc::now()),
+                daemon_generation: Some("feta-generation".to_string()),
+                ready: true,
+                ..HostStatus::default()
+            },
+        )
         .await
         .expect("publish feta heartbeat");
     feta.resource_backend()
@@ -199,12 +207,15 @@ async fn connected_daemons_replicate_home_bound_runtime_kinds_and_deletes() {
         .expect("create remote convoy");
     remote
         .using::<Vessel>("flotilla")
-        .create(&InputMeta::builder().name("remote-vessel".to_string()).build(), &VesselSpec {
-            convoy_ref: "remote-convoy".to_string(),
-            vessel_name: "work".to_string(),
-            placement_policy_ref: "host-direct".to_string(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &InputMeta::builder().name("remote-vessel".to_string()).build(),
+            &VesselSpec {
+                convoy_ref: "remote-convoy".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "host-direct".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("create remote vessel");
     remote
@@ -458,15 +469,19 @@ async fn connected_in_process_daemons_replicate_checkout_settlement_evidence() {
         .await
         .expect("create checkout on vessel host");
     feta_checkouts
-        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
-            phase: CheckoutPhase::Ready,
-            path: Some("/srv/remote/repo".to_string()),
-            integration: flotilla_resources::CheckoutIntegrationStatus {
-                landed: IntegrationCondition::builder().value(ConditionValue::True).build(),
+        .update_status(
+            &checkout.metadata.name,
+            &checkout.metadata.resource_version,
+            &CheckoutStatus {
+                phase: CheckoutPhase::Ready,
+                path: Some("/srv/remote/repo".to_string()),
+                integration: flotilla_resources::CheckoutIntegrationStatus {
+                    landed: IntegrationCondition::builder().value(ConditionValue::True).build(),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        })
+        )
         .await
         .expect("publish checkout settlement evidence on vessel host");
 
@@ -504,11 +519,12 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
     let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
     let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
     let repository_url = "https://github.com/flotilla-org/flotilla";
-    let _kiwi_runtime = DaemonRuntime::start_with_options(Arc::clone(&kiwi), kiwi.config_store(), None, RuntimeOptions {
-        namespace: "flotilla".into(),
-        start_controllers: false,
-        ..RuntimeOptions::default()
-    })
+    let _kiwi_runtime = DaemonRuntime::start_with_options(
+        Arc::clone(&kiwi),
+        kiwi.config_store(),
+        None,
+        RuntimeOptions { namespace: "flotilla".into(), start_controllers: false, ..RuntimeOptions::default() },
+    )
     .await
     .expect("start other host query projection");
     let repository_key = RepositoryKey("repo_flotilla".into());
@@ -534,18 +550,23 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
         .await
         .expect("admit convoy before PR exists");
     home.using::<Convoy>("flotilla")
-        .update_status("crew-convoy", &convoy.metadata.resource_version, &ConvoyStatus {
-            phase: flotilla_resources::ConvoyPhase::Active,
-            observed_workflow_ref: Some("workflow".into()),
-            ..Default::default()
-        })
+        .update_status(
+            "crew-convoy",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                phase: flotilla_resources::ConvoyPhase::Active,
+                observed_workflow_ref: Some("workflow".into()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("convoy is active before PR exists");
-    let _feta_runtime = DaemonRuntime::start_with_options(Arc::clone(&feta), feta.config_store(), None, RuntimeOptions {
-        namespace: "flotilla".into(),
-        controller_resync_interval: Duration::from_secs(300),
-        ..RuntimeOptions::default()
-    })
+    let _feta_runtime = DaemonRuntime::start_with_options(
+        Arc::clone(&feta),
+        feta.config_store(),
+        None,
+        RuntimeOptions { namespace: "flotilla".into(), controller_resync_interval: Duration::from_secs(300), ..RuntimeOptions::default() },
+    )
     .await
     .expect("start home controller before crew opens PR");
     let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect hosts");
@@ -567,20 +588,24 @@ async fn pr_observed_after_admission_becomes_home_subject_and_replica_fact() {
         .await
         .expect("create checkout after admission");
     kiwi_checkouts
-        .update_status(&checkout.metadata.name, &checkout.metadata.resource_version, &CheckoutStatus {
-            phase: CheckoutPhase::Ready,
-            integration: flotilla_resources::CheckoutIntegrationStatus {
-                change_request: Some(ChangeRequestObservation {
-                    id: "2301".into(),
-                    state: ChangeRequestState::Open,
-                    mergeability: ChangeRequestMergeability::Unknown,
-                    target_ref: Some("main".into()),
-                    observed_at: chrono::Utc::now().to_rfc3339(),
-                }),
+        .update_status(
+            &checkout.metadata.name,
+            &checkout.metadata.resource_version,
+            &CheckoutStatus {
+                phase: CheckoutPhase::Ready,
+                integration: flotilla_resources::CheckoutIntegrationStatus {
+                    change_request: Some(ChangeRequestObservation {
+                        id: "2301".into(),
+                        state: ChangeRequestState::Open,
+                        mergeability: ChangeRequestMergeability::Unknown,
+                        target_ref: Some("main".into()),
+                        observed_at: chrono::Utc::now().to_rfc3339(),
+                    }),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
-        })
+        )
         .await
         .expect("crew opens PR without changing convoy phase");
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -889,11 +914,12 @@ async fn observed_resources_replicate_checkout_queries_and_independent_attach_ta
     let temp = tempfile::tempdir().expect("tempdir");
     let kiwi = daemon(temp.path().join("kiwi"), "kiwi-root", "kiwi").await;
     let feta = daemon(temp.path().join("feta"), "feta-root", "feta").await;
-    let _runtime = DaemonRuntime::start_with_options(Arc::clone(&kiwi), kiwi.config_store(), None, RuntimeOptions {
-        namespace: "flotilla".into(),
-        start_controllers: false,
-        ..RuntimeOptions::default()
-    })
+    let _runtime = DaemonRuntime::start_with_options(
+        Arc::clone(&kiwi),
+        kiwi.config_store(),
+        None,
+        RuntimeOptions { namespace: "flotilla".into(), start_controllers: false, ..RuntimeOptions::default() },
+    )
     .await
     .expect("start query projection");
     let checkouts = feta.observed_resource_backend().using::<Checkout>("flotilla");
@@ -926,11 +952,15 @@ async fn observed_resources_replicate_checkout_queries_and_independent_attach_ta
         .await
         .expect("create independent");
     sessions
-        .update_status(&session.metadata.name, &session.metadata.resource_version, &TerminalSessionStatus {
-            phase: TerminalSessionPhase::Running,
-            session_id: Some("terminal-independent".into()),
-            ..Default::default()
-        })
+        .update_status(
+            &session.metadata.name,
+            &session.metadata.resource_version,
+            &TerminalSessionStatus {
+                phase: TerminalSessionPhase::Running,
+                session_id: Some("terminal-independent".into()),
+                ..Default::default()
+            },
+        )
         .await
         .expect("running independent");
     let topology = spawn_in_memory_request_topology(Arc::clone(&kiwi), Arc::clone(&feta)).await.expect("connect daemons");
@@ -1331,10 +1361,10 @@ async fn reconnect_uses_log_until_horizon_or_quarantine_requires_one_snapshot() 
             let mut body: serde_json::Value = serde_json::from_str(&body).expect("event JSON");
             body["spec"].as_object_mut().expect("deleted spec").remove("workflow_ref");
             connection
-                .execute("UPDATE resource_events SET body_json = ?1 WHERE kind = 'Convoy' AND event_version = 3", [serde_json::to_string(
-                    &body,
+                .execute(
+                    "UPDATE resource_events SET body_json = ?1 WHERE kind = 'Convoy' AND event_version = 3",
+                    [serde_json::to_string(&body).expect("encode")],
                 )
-                .expect("encode")])
                 .expect("poison final delete");
         }
         let snapshots = Arc::new(AtomicUsize::new(0));

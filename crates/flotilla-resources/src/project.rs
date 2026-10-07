@@ -650,26 +650,26 @@ mod tests {
             }),
             IssueSource { service: "https://user:Pass@forge.example/IssueRoot".into(), scope: "Org/Repo".into() }
         );
-        assert_eq!(normalize_issue_source(&IssueSource { service: "localhost:3000".into(), scope: "Org/Repo".into() }), IssueSource {
-            service: "https://localhost:3000".into(),
-            scope: "Org/Repo".into()
-        });
+        assert_eq!(
+            normalize_issue_source(&IssueSource { service: "localhost:3000".into(), scope: "Org/Repo".into() }),
+            IssueSource { service: "https://localhost:3000".into(), scope: "Org/Repo".into() }
+        );
         assert_eq!(
             normalize_issue_source(&IssueSource { service: "localhost:3000/IssueRoot".into(), scope: "Org/Repo".into() }),
             IssueSource { service: "https://localhost:3000/IssueRoot".into(), scope: "Org/Repo".into() }
         );
-        assert_eq!(normalize_issue_source(&IssueSource { service: "::1".into(), scope: "Org/Repo".into() }), IssueSource {
-            service: "https://[::1]".into(),
-            scope: "Org/Repo".into()
-        });
+        assert_eq!(
+            normalize_issue_source(&IssueSource { service: "::1".into(), scope: "Org/Repo".into() }),
+            IssueSource { service: "https://[::1]".into(), scope: "Org/Repo".into() }
+        );
         assert_eq!(
             normalize_issue_source(&IssueSource { service: "[::1]:3000/IssueRoot".into(), scope: "Org/Repo".into() }),
             IssueSource { service: "https://[::1]:3000/IssueRoot".into(), scope: "Org/Repo".into() }
         );
-        assert_eq!(normalize_issue_source(&IssueSource { service: "HTTPS://GitHub.COM".into(), scope: "Org/Repo".into() }), IssueSource {
-            service: "https://github.com".into(),
-            scope: "Org/Repo".into()
-        });
+        assert_eq!(
+            normalize_issue_source(&IssueSource { service: "HTTPS://GitHub.COM".into(), scope: "Org/Repo".into() }),
+            IssueSource { service: "https://github.com".into(), scope: "Org/Repo".into() }
+        );
     }
 
     #[test]

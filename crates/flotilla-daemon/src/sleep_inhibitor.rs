@@ -657,19 +657,23 @@ mod tests {
     ) -> ResourceObject<Convoy> {
         let created = convoys.create(&InputMeta::builder().name(name.to_string()).build(), &convoy_spec()).await.expect("create convoy");
         convoys
-            .update_status(name, &created.metadata.resource_version, &ConvoyStatus {
-                phase,
-                placement_decision: target_host.map(|host| PlacementDecision {
-                    minimal_alternatives: Vec::new(),
-                    escalation_reason: None,
-                    policy_name: "test-policy".to_string(),
-                    target_host: PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.to_string() },
-                    refused_candidates: vec![],
-                    viable_not_selected: vec![],
-                    allocation: None,
-                }),
-                ..ConvoyStatus::default()
-            })
+            .update_status(
+                name,
+                &created.metadata.resource_version,
+                &ConvoyStatus {
+                    phase,
+                    placement_decision: target_host.map(|host| PlacementDecision {
+                        minimal_alternatives: Vec::new(),
+                        escalation_reason: None,
+                        policy_name: "test-policy".to_string(),
+                        target_host: PlacementTargetHost { reference: CanonicalHostId::resolved(host), display_name: host.to_string() },
+                        refused_candidates: vec![],
+                        viable_not_selected: vec![],
+                        allocation: None,
+                    }),
+                    ..ConvoyStatus::default()
+                },
+            )
             .await
             .expect("update convoy status")
     }
@@ -738,19 +742,21 @@ mod tests {
         assert!(next_state(&mut rx).await);
 
         convoys
-            .update_status("first", &first.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Landed,
-                ..ConvoyStatus::default()
-            })
+            .update_status(
+                "first",
+                &first.metadata.resource_version,
+                &ConvoyStatus { phase: ConvoyPhase::Landed, ..ConvoyStatus::default() },
+            )
             .await
             .expect("complete first convoy");
         assert!(next_state(&mut rx).await);
 
         convoys
-            .update_status("second", &second.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Landed,
-                ..ConvoyStatus::default()
-            })
+            .update_status(
+                "second",
+                &second.metadata.resource_version,
+                &ConvoyStatus { phase: ConvoyPhase::Landed, ..ConvoyStatus::default() },
+            )
             .await
             .expect("complete second convoy");
         assert!(!next_state(&mut rx).await);
@@ -825,22 +831,26 @@ mod tests {
         assert!(next_state(&mut rx).await);
         assert!(next_state(&mut rx).await);
         convoys
-            .update_status("lagging", &lagging.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                placement_decision: Some(PlacementDecision {
-                    minimal_alternatives: Vec::new(),
-                    escalation_reason: None,
-                    policy_name: "test-policy".to_string(),
-                    target_host: PlacementTargetHost {
-                        reference: CanonicalHostId::resolved("other-host"),
-                        display_name: "other-host".to_string(),
-                    },
-                    refused_candidates: vec![],
-                    viable_not_selected: vec![],
-                    allocation: None,
-                }),
-                ..ConvoyStatus::default()
-            })
+            .update_status(
+                "lagging",
+                &lagging.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ConvoyPhase::Active,
+                    placement_decision: Some(PlacementDecision {
+                        minimal_alternatives: Vec::new(),
+                        escalation_reason: None,
+                        policy_name: "test-policy".to_string(),
+                        target_host: PlacementTargetHost {
+                            reference: CanonicalHostId::resolved("other-host"),
+                            display_name: "other-host".to_string(),
+                        },
+                        refused_candidates: vec![],
+                        viable_not_selected: vec![],
+                        allocation: None,
+                    }),
+                    ..ConvoyStatus::default()
+                },
+            )
             .await
             .expect("resolve placement after lag");
         assert!(!next_state(&mut rx).await);
@@ -855,12 +865,15 @@ mod tests {
         create_host(&hosts).await;
         create_convoy(&backend.using::<Convoy>(NAMESPACE), "winding-down", ConvoyPhase::Landed, Some("test-host")).await;
         vessels
-            .create(&InputMeta::builder().name("local-vessel".to_string()).build(), &VesselSpec {
-                convoy_ref: "winding-down".to_string(),
-                vessel_name: "work".to_string(),
-                placement_policy_ref: "test-policy".to_string(),
-                adopted_checkout_refs: BTreeMap::new(),
-            })
+            .create(
+                &InputMeta::builder().name("local-vessel".to_string()).build(),
+                &VesselSpec {
+                    convoy_ref: "winding-down".to_string(),
+                    vessel_name: "work".to_string(),
+                    placement_policy_ref: "test-policy".to_string(),
+                    adopted_checkout_refs: BTreeMap::new(),
+                },
+            )
             .await
             .expect("create local vessel");
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -973,10 +986,10 @@ mod tests {
         tokio::task::yield_now().await;
 
         let status = hosts.get("test-host").await.expect("get host").status.expect("host status");
-        assert_eq!(status.sleep_inhibition, SleepInhibitionHealth::Failed {
-            consecutive_failures: FAILURE_THRESHOLD,
-            message: "polkit denied".to_string()
-        });
+        assert_eq!(
+            status.sleep_inhibition,
+            SleepInhibitionHealth::Failed { consecutive_failures: FAILURE_THRESHOLD, message: "polkit denied".to_string() }
+        );
         assert!(status.conditions.iter().any(|condition| condition.condition_type == "SleepInhibition"));
         task.abort();
     }
@@ -1001,10 +1014,10 @@ mod tests {
         }
 
         let failed = hosts.get("test-host").await.expect("get failed host").status.expect("failed host status");
-        assert_eq!(failed.sleep_inhibition, SleepInhibitionHealth::Failed {
-            consecutive_failures: FAILURE_THRESHOLD,
-            message: "polkit denied".to_string()
-        });
+        assert_eq!(
+            failed.sleep_inhibition,
+            SleepInhibitionHealth::Failed { consecutive_failures: FAILURE_THRESHOLD, message: "polkit denied".to_string() }
+        );
         assert_eq!(failed.conditions.len(), 1);
         assert_eq!(failed.conditions[0].condition_type, "SleepInhibition");
         assert_eq!(failed.conditions[0].reason, "InhibitorNotHeld");

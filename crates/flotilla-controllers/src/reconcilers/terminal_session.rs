@@ -654,10 +654,13 @@ where
         now: chrono::DateTime<chrono::Utc>,
     ) -> ReconcileOutcome<Self::Resource> {
         if matches!(prepared, TerminalPrepared::OwnerMissing) {
-            return ReconcileOutcome::with_actuations(None, vec![
-                Actuation::DeleteTerminalSession { name: obj.metadata.name.clone() },
-                Actuation::DeleteDemand { name: attention_demand_name(obj) },
-            ]);
+            return ReconcileOutcome::with_actuations(
+                None,
+                vec![
+                    Actuation::DeleteTerminalSession { name: obj.metadata.name.clone() },
+                    Actuation::DeleteDemand { name: attention_demand_name(obj) },
+                ],
+            );
         }
 
         let phase = obj.status.as_ref().map(|status| status.phase).unwrap_or(TerminalSessionPhase::Starting);

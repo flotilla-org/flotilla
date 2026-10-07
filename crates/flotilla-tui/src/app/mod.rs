@@ -140,15 +140,18 @@ impl TuiModel {
             let identity = info.identity;
             let path = Self::display_path(&identity, info.path);
             order.push(identity.clone());
-            repos.insert(identity.clone(), TuiRepoModel {
-                identity,
-                repository_key: info.repository_key,
-                path,
-                labels: info.labels,
-                provider_names: info.provider_names,
-                provider_health: info.provider_health,
-                loading: info.loading,
-            });
+            repos.insert(
+                identity.clone(),
+                TuiRepoModel {
+                    identity,
+                    repository_key: info.repository_key,
+                    path,
+                    labels: info.labels,
+                    provider_names: info.provider_names,
+                    provider_health: info.provider_health,
+                    loading: info.loading,
+                },
+            );
         }
         Self {
             repos,
@@ -215,10 +218,10 @@ impl TuiModel {
 
         for host in self.hosts.values() {
             if host.summary.environments.iter().any(|environment| environment.environment_id() == environment_id) {
-                return Ok((host.summary.node.node_id.clone(), ProvisioningTarget::ExistingEnvironment {
-                    host: host.host_name.clone(),
-                    env_id: environment_id.clone(),
-                }));
+                return Ok((
+                    host.summary.node.node_id.clone(),
+                    ProvisioningTarget::ExistingEnvironment { host: host.host_name.clone(), env_id: environment_id.clone() },
+                ));
             }
         }
 
@@ -1280,13 +1283,10 @@ impl App {
                     .map(|entry| entry.host_name.clone())
                     .or_else(|| snap.summary.host_name.clone())
                     .unwrap_or_else(|| HostName::new(&snap.node.display_name));
-                self.model.hosts.insert(environment_id.clone(), TuiHostState {
-                    environment_id,
-                    host_name,
-                    is_local: snap.is_local,
-                    status,
-                    summary: snap.summary,
-                });
+                self.model.hosts.insert(
+                    environment_id.clone(),
+                    TuiHostState { environment_id, host_name, is_local: snap.is_local, status, summary: snap.summary },
+                );
             }
             DaemonEvent::HostRemoved { environment_id, .. } => {
                 let clear_target =
@@ -1460,15 +1460,18 @@ impl App {
         }
         let path = TuiModel::display_path(&identity, info.path.clone());
 
-        self.model.repos.insert(identity.clone(), TuiRepoModel {
-            identity: info.identity,
-            repository_key: info.repository_key.clone(),
-            path: path.clone(),
-            labels: info.labels,
-            provider_names: info.provider_names,
-            provider_health: info.provider_health,
-            loading: info.loading,
-        });
+        self.model.repos.insert(
+            identity.clone(),
+            TuiRepoModel {
+                identity: info.identity,
+                repository_key: info.repository_key.clone(),
+                path: path.clone(),
+                labels: info.labels,
+                provider_names: info.provider_names,
+                provider_health: info.provider_health,
+                loading: info.loading,
+            },
+        );
         self.model.repo_order.push(identity.clone());
 
         // Open a tab only when this TUI asked for the add (the [+] flow).

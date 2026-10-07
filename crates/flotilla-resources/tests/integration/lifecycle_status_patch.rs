@@ -848,10 +848,13 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     VesselStatus { phase: VesselPhase::Ready, started_at: Some(ts(10)), ready_at: Some(ts(20)), ..VesselStatus::default() };
                 let before = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
                 let patch = VesselStatusPatch::StageLandingCredentials {
-                    credentials: BTreeMap::from([("landing".to_string(), LandingCredentialScope::Branch {
-                        repository: RepositoryKey("github.com-org-repo".to_string()),
-                        branch: "topic".to_string(),
-                    })]),
+                    credentials: BTreeMap::from([(
+                        "landing".to_string(),
+                        LandingCredentialScope::Branch {
+                            repository: RepositoryKey("github.com-org-repo".to_string()),
+                            branch: "topic".to_string(),
+                        },
+                    )]),
                 };
                 apply_and_replay(&mut status, &patch);
                 let after = LifecycleTimestamps { started_at: status.started_at, finished_at: status.ready_at };
@@ -864,11 +867,14 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             exercise: || {
                 let mut status = active_convoy_status();
                 let before = convoy_timestamps(&status);
-                apply_and_replay(&mut status, &ConvoyStatusPatch::QueueMessageFollowUp {
-                    vessel: "implement".into(),
-                    role: "coder".into(),
-                    message: Some(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "follow-up")),
-                });
+                apply_and_replay(
+                    &mut status,
+                    &ConvoyStatusPatch::QueueMessageFollowUp {
+                        vessel: "implement".into(),
+                        role: "coder".into(),
+                        message: Some(flotilla_protocol::ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "follow-up")),
+                    },
+                );
                 (before, convoy_timestamps(&status))
             },
         },

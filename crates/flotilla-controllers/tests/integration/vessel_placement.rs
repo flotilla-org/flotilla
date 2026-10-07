@@ -26,18 +26,25 @@ async fn placed_replica_is_projected_into_the_actuation_hosts_local_store() {
         .await
         .expect("create admitting Convoy");
     convoys
-        .update_status("remote-placement", &convoy.metadata.resource_version, &ConvoyStatus {
-            placement_decision: Some(PlacementDecision {
-                minimal_alternatives: Vec::new(),
-                escalation_reason: None,
-                policy_name: "host-direct-feta".to_string(),
-                target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("feta-host"), display_name: "feta".to_string() },
-                refused_candidates: Vec::new(),
-                viable_not_selected: Vec::new(),
-                allocation: None,
-            }),
-            ..ConvoyStatus::default()
-        })
+        .update_status(
+            "remote-placement",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                placement_decision: Some(PlacementDecision {
+                    minimal_alternatives: Vec::new(),
+                    escalation_reason: None,
+                    policy_name: "host-direct-feta".to_string(),
+                    target_host: PlacementTargetHost {
+                        reference: CanonicalHostId::resolved("feta-host"),
+                        display_name: "feta".to_string(),
+                    },
+                    refused_candidates: Vec::new(),
+                    viable_not_selected: Vec::new(),
+                    allocation: None,
+                }),
+                ..ConvoyStatus::default()
+            },
+        )
         .await
         .expect("record placement");
     kiwi.using::<Vessel>(NAMESPACE)
@@ -140,28 +147,38 @@ async fn owning_daemon_projects_a_vessel_placed_on_its_agentless_ssh_host() {
         .await
         .expect("admitting convoy");
     convoys
-        .update_status("ssh-placement", &convoy.metadata.resource_version, &ConvoyStatus {
-            placement_decision: Some(PlacementDecision {
-                minimal_alternatives: Vec::new(),
-                escalation_reason: None,
-                policy_name: "host-direct-ssh-host".to_string(),
-                target_host: PlacementTargetHost { reference: CanonicalHostId::resolved("ssh-host"), display_name: "beaufort".to_string() },
-                refused_candidates: Vec::new(),
-                viable_not_selected: Vec::new(),
-                allocation: None,
-            }),
-            ..ConvoyStatus::default()
-        })
+        .update_status(
+            "ssh-placement",
+            &convoy.metadata.resource_version,
+            &ConvoyStatus {
+                placement_decision: Some(PlacementDecision {
+                    minimal_alternatives: Vec::new(),
+                    escalation_reason: None,
+                    policy_name: "host-direct-ssh-host".to_string(),
+                    target_host: PlacementTargetHost {
+                        reference: CanonicalHostId::resolved("ssh-host"),
+                        display_name: "beaufort".to_string(),
+                    },
+                    refused_candidates: Vec::new(),
+                    viable_not_selected: Vec::new(),
+                    allocation: None,
+                }),
+                ..ConvoyStatus::default()
+            },
+        )
         .await
         .expect("placement decision");
     admitting
         .using::<Vessel>(NAMESPACE)
-        .create(&InputMeta::builder().name("ssh-placement-work".to_string()).build(), &VesselSpec {
-            convoy_ref: "ssh-placement".to_string(),
-            vessel_name: "work".to_string(),
-            placement_policy_ref: "host-direct-ssh-host".to_string(),
-            adopted_checkout_refs: BTreeMap::new(),
-        })
+        .create(
+            &InputMeta::builder().name("ssh-placement-work".to_string()).build(),
+            &VesselSpec {
+                convoy_ref: "ssh-placement".to_string(),
+                vessel_name: "work".to_string(),
+                placement_policy_ref: "host-direct-ssh-host".to_string(),
+                adopted_checkout_refs: BTreeMap::new(),
+            },
+        )
         .await
         .expect("admitting Vessel");
     owner
@@ -237,10 +254,11 @@ async fn placement_status_churn_does_not_spin() {
     assert_eq!(scans.load(Ordering::SeqCst), 1, "initial reconciliation");
     for update in 0..100 {
         convoy = convoys
-            .update_status("status-churn", &convoy.metadata.resource_version, &ConvoyStatus {
-                message: Some(format!("progress-{update}")),
-                ..ConvoyStatus::default()
-            })
+            .update_status(
+                "status-churn",
+                &convoy.metadata.resource_version,
+                &ConvoyStatus { message: Some(format!("progress-{update}")), ..ConvoyStatus::default() },
+            )
             .await
             .expect("placement scenario operation");
         writer
@@ -260,21 +278,25 @@ async fn placement_status_churn_does_not_spin() {
     // Real placement changes still reconcile, with one scan for a queued burst.
     for update in 0..100 {
         convoy = convoys
-            .update_status("status-churn", &convoy.metadata.resource_version, &ConvoyStatus {
-                placement_decision: Some(PlacementDecision {
-                    minimal_alternatives: Vec::new(),
-                    escalation_reason: None,
-                    policy_name: "host-direct".into(),
-                    target_host: PlacementTargetHost {
-                        reference: CanonicalHostId::resolved(format!("host-{update}")),
-                        display_name: "target".into(),
-                    },
-                    refused_candidates: Vec::new(),
-                    viable_not_selected: Vec::new(),
-                    allocation: None,
-                }),
-                ..ConvoyStatus::default()
-            })
+            .update_status(
+                "status-churn",
+                &convoy.metadata.resource_version,
+                &ConvoyStatus {
+                    placement_decision: Some(PlacementDecision {
+                        minimal_alternatives: Vec::new(),
+                        escalation_reason: None,
+                        policy_name: "host-direct".into(),
+                        target_host: PlacementTargetHost {
+                            reference: CanonicalHostId::resolved(format!("host-{update}")),
+                            display_name: "target".into(),
+                        },
+                        refused_candidates: Vec::new(),
+                        viable_not_selected: Vec::new(),
+                        allocation: None,
+                    }),
+                    ..ConvoyStatus::default()
+                },
+            )
             .await
             .expect("placement scenario operation");
         writer

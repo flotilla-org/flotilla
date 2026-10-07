@@ -460,10 +460,13 @@ mod tests {
     #[test]
     fn equal_priority_different_set_values_name_the_key_and_both_contributors() {
         let key = GitConfigKey::new("user", "email");
-        let error = compose(TargetId::GitConfig, [
-            git_fragment(key.clone(), "first@example.com", "credential/first"),
-            git_fragment(key, "second@example.com", "credential/second"),
-        ])
+        let error = compose(
+            TargetId::GitConfig,
+            [
+                git_fragment(key.clone(), "first@example.com", "credential/first"),
+                git_fragment(key, "second@example.com", "credential/second"),
+            ],
+        )
         .expect_err("equal-priority Set values must conflict")
         .to_string();
 
@@ -474,11 +477,10 @@ mod tests {
 
     #[test]
     fn agent_environment_renders_provenance_and_single_valued_delivery() {
-        let composed = compose(TargetId::AgentEnvironment, [agent_environment_fragment(
-            "CODEX_HOME",
-            "/run/flotilla/codex",
-            "agent-material/codex codex-central",
-        )])
+        let composed = compose(
+            TargetId::AgentEnvironment,
+            [agent_environment_fragment("CODEX_HOME", "/run/flotilla/codex", "agent-material/codex codex-central")],
+        )
         .expect("agent environment should compose");
 
         assert_eq!(composed.contents, "# fragment: agent-material/codex codex-central\nexport CODEX_HOME='/run/flotilla/codex'\n");
@@ -487,10 +489,13 @@ mod tests {
 
     #[test]
     fn credential_and_agent_material_conflict_names_both_contributors() {
-        let error = compose(TargetId::AgentEnvironment, [
-            agent_environment_fragment("CODEX_HOME", "/run/flotilla/codex", "agent-material/codex codex-central"),
-            agent_environment_fragment("CODEX_HOME", "/run/flotilla/credentials/openai/codex", "credential/codex openai"),
-        ])
+        let error = compose(
+            TargetId::AgentEnvironment,
+            [
+                agent_environment_fragment("CODEX_HOME", "/run/flotilla/codex", "agent-material/codex codex-central"),
+                agent_environment_fragment("CODEX_HOME", "/run/flotilla/credentials/openai/codex", "credential/codex openai"),
+            ],
+        )
         .expect_err("two Codex homes must conflict")
         .to_string();
 
@@ -507,11 +512,10 @@ mod tests {
                 .to_string();
         assert!(invalid_name.contains("agent-material/codex"));
 
-        let invalid_value = compose(TargetId::AgentEnvironment, [agent_environment_fragment(
-            "CODEX_HOME",
-            "/run/flotilla/codex\0injected",
-            "agent-material/codex",
-        )])
+        let invalid_value = compose(
+            TargetId::AgentEnvironment,
+            [agent_environment_fragment("CODEX_HOME", "/run/flotilla/codex\0injected", "agent-material/codex")],
+        )
         .expect_err("environment values must not contain NUL")
         .to_string();
         assert!(invalid_value.contains("CODEX_HOME"));
@@ -557,12 +561,15 @@ mod tests {
                 .provenance(Provenance::new(provenance))
                 .build()
         };
-        let composed = compose(TargetId::GitConfig, [
-            fragment(key.clone(), "late", "credential/alpha", order::LATE),
-            fragment(key.clone(), "same-order-z", "credential/zulu", order::EARLY),
-            fragment(key.clone(), "same-order-a-first", "credential/alpha", order::EARLY),
-            fragment(key, "same-order-a-second", "credential/alpha", order::EARLY),
-        ])
+        let composed = compose(
+            TargetId::GitConfig,
+            [
+                fragment(key.clone(), "late", "credential/alpha", order::LATE),
+                fragment(key.clone(), "same-order-z", "credential/zulu", order::EARLY),
+                fragment(key.clone(), "same-order-a-first", "credential/alpha", order::EARLY),
+                fragment(key, "same-order-a-second", "credential/alpha", order::EARLY),
+            ],
+        )
         .expect("append fragments should compose");
 
         let alpha_first = composed.contents.find("same-order-a-first").expect("first alpha fragment");
@@ -603,11 +610,10 @@ mod tests {
 
     #[test]
     fn provenance_with_a_line_break_is_rejected_before_rendering() {
-        let error = compose(TargetId::GitConfig, [git_fragment(
-            GitConfigKey::new("user", "email"),
-            "crew@example.com",
-            "credential/first\ninjected",
-        )])
+        let error = compose(
+            TargetId::GitConfig,
+            [git_fragment(GitConfigKey::new("user", "email"), "crew@example.com", "credential/first\ninjected")],
+        )
         .expect_err("provenance comments must remain one line")
         .to_string();
 
@@ -616,11 +622,10 @@ mod tests {
 
     #[test]
     fn gitconfig_key_with_a_line_break_is_rejected_before_rendering() {
-        let error = compose(TargetId::GitConfig, [git_fragment(
-            GitConfigKey::new("user\n[injected]", "email"),
-            "crew@example.com",
-            "credential/first",
-        )])
+        let error = compose(
+            TargetId::GitConfig,
+            [git_fragment(GitConfigKey::new("user\n[injected]", "email"), "crew@example.com", "credential/first")],
+        )
         .expect_err("gitconfig keys must remain one line")
         .to_string();
 
@@ -630,11 +635,10 @@ mod tests {
 
     #[test]
     fn gitconfig_value_with_a_line_break_is_rejected_before_rendering() {
-        let error = compose(TargetId::GitConfig, [git_fragment(
-            GitConfigKey::new("user", "email"),
-            "crew@example.com\n[injected]",
-            "credential/first",
-        )])
+        let error = compose(
+            TargetId::GitConfig,
+            [git_fragment(GitConfigKey::new("user", "email"), "crew@example.com\n[injected]", "credential/first")],
+        )
         .expect_err("gitconfig values must remain one line")
         .to_string();
 

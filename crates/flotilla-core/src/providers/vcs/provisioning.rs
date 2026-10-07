@@ -141,11 +141,14 @@ mod tests {
             .await
             .expect("clone should succeed");
 
-        assert_eq!(runner.calls(), vec![(
-            "git".to_string(),
-            vec!["clone".to_string(), "git@github.com:flotilla-org/flotilla.git".to_string(), "/tmp/flotilla".to_string()],
-            PathBuf::from("/")
-        )]);
+        assert_eq!(
+            runner.calls(),
+            vec![(
+                "git".to_string(),
+                vec!["clone".to_string(), "git@github.com:flotilla-org/flotilla.git".to_string(), "/tmp/flotilla".to_string()],
+                PathBuf::from("/")
+            )]
+        );
     }
 
     #[tokio::test]
@@ -158,11 +161,14 @@ mod tests {
             .await
             .expect("clone should succeed");
 
-        assert_eq!(runner.calls(), vec![(
-            "git".to_string(),
-            vec!["clone".to_string(), "https://forgejo.lab/fork-issues/zellij".to_string(), "/tmp/zellij".to_string()],
-            PathBuf::from("/")
-        )]);
+        assert_eq!(
+            runner.calls(),
+            vec![(
+                "git".to_string(),
+                vec!["clone".to_string(), "https://forgejo.lab/fork-issues/zellij".to_string(), "/tmp/zellij".to_string()],
+                PathBuf::from("/")
+            )]
+        );
     }
 
     #[tokio::test]

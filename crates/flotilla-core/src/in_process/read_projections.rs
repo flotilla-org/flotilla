@@ -296,14 +296,17 @@ impl ReadProjections<'_> {
                                 .models
                                 .iter()
                                 .map(|(name, model)| {
-                                    (name.clone(), FulfilmentModel {
-                                        usable: model.usable,
-                                        source: match model.source {
-                                            flotilla_resources::ModelFactSource::Probe => "probe",
-                                            flotilla_resources::ModelFactSource::Declaration => "declaration",
-                                        }
-                                        .to_string(),
-                                    })
+                                    (
+                                        name.clone(),
+                                        FulfilmentModel {
+                                            usable: model.usable,
+                                            source: match model.source {
+                                                flotilla_resources::ModelFactSource::Probe => "probe",
+                                                flotilla_resources::ModelFactSource::Declaration => "declaration",
+                                            }
+                                            .to_string(),
+                                        },
+                                    )
                                 })
                                 .collect();
                             (name.clone(), FulfilmentHarness { version: harness.version.clone(), models })
@@ -1577,43 +1580,47 @@ mod tests {
                         })
                         .collect();
                     convoys
-                        .update_status(&convoy.metadata.name, &convoy.metadata.resource_version, &ConvoyStatus {
-                            phase: if terminal { ConvoyPhase::Landed } else { ConvoyPhase::Active },
-                            stalled: Some(flotilla_resources::StalledCondition {
-                                leaves,
-                                maker: None,
-                                evidence: if shared {
-                                    if index % 2 == 0 {
-                                        "rate limit".into()
+                        .update_status(
+                            &convoy.metadata.name,
+                            &convoy.metadata.resource_version,
+                            &ConvoyStatus {
+                                phase: if terminal { ConvoyPhase::Landed } else { ConvoyPhase::Active },
+                                stalled: Some(flotilla_resources::StalledCondition {
+                                    leaves,
+                                    maker: None,
+                                    evidence: if shared {
+                                        if index % 2 == 0 {
+                                            "rate limit".into()
+                                        } else {
+                                            " rate\n limit ".into()
+                                        }
                                     } else {
-                                        " rate\n limit ".into()
-                                    }
-                                } else {
-                                    format!("cause {index}")
-                                },
-                                source: flotilla_resources::StallEvidenceSource::Crew,
-                                cause: None,
-                                began_at,
-                                rung: [
-                                    flotilla_resources::StallRung::Nudge,
-                                    flotilla_resources::StallRung::Supervisor,
-                                    flotilla_resources::StallRung::Bosun,
-                                    flotilla_resources::StallRung::Governor,
-                                    flotilla_resources::StallRung::Operator,
-                                ][rung],
-                                supervisor: (rung != 4).then(|| flotilla_resources::StallSupervisor {
-                                    convoy: "governor".into(),
-                                    vessel: "control".into(),
-                                    role: "governor".into(),
+                                        format!("cause {index}")
+                                    },
+                                    source: flotilla_resources::StallEvidenceSource::Crew,
+                                    cause: None,
+                                    began_at,
+                                    rung: [
+                                        flotilla_resources::StallRung::Nudge,
+                                        flotilla_resources::StallRung::Supervisor,
+                                        flotilla_resources::StallRung::Bosun,
+                                        flotilla_resources::StallRung::Governor,
+                                        flotilla_resources::StallRung::Operator,
+                                    ][rung],
+                                    supervisor: (rung != 4).then(|| flotilla_resources::StallSupervisor {
+                                        convoy: "governor".into(),
+                                        vessel: "control".into(),
+                                        role: "governor".into(),
+                                    }),
+                                    supervision_index: None,
+                                    supervision_exhausted: false,
+                                    reason: Some(flotilla_protocol::StallReason::Infra),
+                                    proposed_disposition: Some(flotilla_protocol::StallProposedDisposition::Resume),
+                                    nudge_history: vec![],
                                 }),
-                                supervision_index: None,
-                                supervision_exhausted: false,
-                                reason: Some(flotilla_protocol::StallReason::Infra),
-                                proposed_disposition: Some(flotilla_protocol::StallProposedDisposition::Resume),
-                                nudge_history: vec![],
-                            }),
-                            ..Default::default()
-                        })
+                                ..Default::default()
+                            },
+                        )
                         .await
                         .expect("stalled status");
                 }
@@ -1670,17 +1677,21 @@ mod tests {
             .await
             .expect("convoy");
         convoys
-            .update_status("stalled", &convoy.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Active,
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([
-                        ("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Stalled).message("rate limit".into()).build()),
-                        ("reviewer".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
-                    ]),
-                )]),
-                ..Default::default()
-            })
+            .update_status(
+                "stalled",
+                &convoy.metadata.resource_version,
+                &ConvoyStatus {
+                    phase: ConvoyPhase::Active,
+                    crew_work: BTreeMap::from([(
+                        "work".into(),
+                        BTreeMap::from([
+                            ("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Stalled).message("rate limit".into()).build()),
+                            ("reviewer".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
+                        ]),
+                    )]),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("status");
         let response = ReadProjections::crew_stalls(&backend, false, Utc::now()).await.expect("stalls");
@@ -1811,23 +1822,26 @@ mod tests {
             .expect("kind");
         let hosts = fixture.backend.clone().using::<ResourceHost>("flotilla");
         let host = hosts
-            .create(&InputMeta::builder().name("local-id".to_string()).build(), &HostSpec {
-                display_name: "local".to_string(),
-                connection: Default::default(),
-                ..HostSpec::default()
-            })
+            .create(
+                &InputMeta::builder().name("local-id".to_string()).build(),
+                &HostSpec { display_name: "local".to_string(), connection: Default::default(), ..HostSpec::default() },
+            )
             .await
             .expect("host");
         hosts
-            .update_status("local-id", &host.metadata.resource_version, &ResourceHostStatus {
-                heartbeat_at: Some(Utc::now()),
-                ready: true,
-                fulfilment_facts: BTreeMap::from([("linux-cleat".to_string(), flotilla_resources::FulfilmentFacts {
-                    gui_session_logged_in: true,
+            .update_status(
+                "local-id",
+                &host.metadata.resource_version,
+                &ResourceHostStatus {
+                    heartbeat_at: Some(Utc::now()),
+                    ready: true,
+                    fulfilment_facts: BTreeMap::from([(
+                        "linux-cleat".to_string(),
+                        flotilla_resources::FulfilmentFacts { gui_session_logged_in: true, ..Default::default() },
+                    )]),
                     ..Default::default()
-                })]),
-                ..Default::default()
-            })
+                },
+            )
             .await
             .expect("host facts");
 
@@ -1857,21 +1871,24 @@ mod tests {
             .expect("kind");
         let hosts = fixture.backend.clone().using::<ResourceHost>("flotilla");
         let host = hosts
-            .create(&InputMeta::builder().name("local-id".to_string()).build(), &HostSpec {
-                display_name: "local".to_string(),
-                connection: Default::default(),
-                ..HostSpec::default()
-            })
+            .create(
+                &InputMeta::builder().name("local-id".to_string()).build(),
+                &HostSpec { display_name: "local".to_string(), connection: Default::default(), ..HostSpec::default() },
+            )
             .await
             .expect("host");
         hosts
-            .update_status("local-id", &host.metadata.resource_version, &ResourceHostStatus {
-                heartbeat_at: Some(Utc::now()),
-                ready: true,
-                daemon_rss_bytes: Some(128 * 1024 * 1024),
-                protocol_fingerprint: Some("local-wire".to_string()),
-                ..Default::default()
-            })
+            .update_status(
+                "local-id",
+                &host.metadata.resource_version,
+                &ResourceHostStatus {
+                    heartbeat_at: Some(Utc::now()),
+                    ready: true,
+                    daemon_rss_bytes: Some(128 * 1024 * 1024),
+                    protocol_fingerprint: Some("local-wire".to_string()),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("host status");
         let host_list = fixture.registry.list_hosts(&HashMap::new()).await;
@@ -1992,12 +2009,16 @@ mod tests {
             let created =
                 remote_hosts.create(&InputMeta::builder().name(name.to_string()).build(), &HostSpec::default()).await.expect("host");
             remote_hosts
-                .update_status(name, &created.metadata.resource_version, &ResourceHostStatus {
-                    heartbeat_at: Some(heartbeat_at),
-                    daemon_generation: Some(generation.to_string()),
-                    protocol_fingerprint: Some(format!("{generation}-wire")),
-                    ..Default::default()
-                })
+                .update_status(
+                    name,
+                    &created.metadata.resource_version,
+                    &ResourceHostStatus {
+                        heartbeat_at: Some(heartbeat_at),
+                        daemon_generation: Some(generation.to_string()),
+                        protocol_fingerprint: Some(format!("{generation}-wire")),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .expect("host status");
         }
@@ -2013,11 +2034,15 @@ mod tests {
         let created =
             free_hosts.create(&InputMeta::builder().name("free-id".to_string()).build(), &HostSpec::default()).await.expect("free host");
         free_hosts
-            .update_status("free-id", &created.metadata.resource_version, &ResourceHostStatus {
-                heartbeat_at: Some(now),
-                daemon_generation: Some("free-generation".to_string()),
-                ..Default::default()
-            })
+            .update_status(
+                "free-id",
+                &created.metadata.resource_version,
+                &ResourceHostStatus {
+                    heartbeat_at: Some(now),
+                    daemon_generation: Some("free-generation".to_string()),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("free status");
         fixture
@@ -2065,12 +2090,16 @@ mod tests {
             .await
             .expect("mirror host");
         mirror_hosts
-            .update_status("mirror-id", &created.metadata.resource_version, &ResourceHostStatus {
-                heartbeat_at: Some(now - chrono::Duration::minutes(10)),
-                daemon_generation: Some("newer-sync".to_string()),
-                protocol_fingerprint: Some("newer-sync-wire".to_string()),
-                ..Default::default()
-            })
+            .update_status(
+                "mirror-id",
+                &created.metadata.resource_version,
+                &ResourceHostStatus {
+                    heartbeat_at: Some(now - chrono::Duration::minutes(10)),
+                    daemon_generation: Some("newer-sync".to_string()),
+                    protocol_fingerprint: Some("newer-sync-wire".to_string()),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("mirror status");
         fixture
@@ -2305,10 +2334,11 @@ mod tests {
             .await
             .expect("linked convoy");
         convoys
-            .update_status(&landed.metadata.name, &landed.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Landed,
-                ..Default::default()
-            })
+            .update_status(
+                &landed.metadata.name,
+                &landed.metadata.resource_version,
+                &ConvoyStatus { phase: ConvoyPhase::Landed, ..Default::default() },
+            )
             .await
             .expect("landed");
         let explanation = fixture.projections().explain_convoy("flotilla", "subjects").await.expect("explain");
@@ -2335,10 +2365,11 @@ mod tests {
             .await
             .expect("convoy");
         convoys
-            .update_status("finished", &created.metadata.resource_version, &ConvoyStatus {
-                phase: ConvoyPhase::Failed,
-                ..Default::default()
-            })
+            .update_status(
+                "finished",
+                &created.metadata.resource_version,
+                &ConvoyStatus { phase: ConvoyPhase::Failed, ..Default::default() },
+            )
             .await
             .expect("terminal status");
         let response = fixture.projections().explain_convoy("flotilla", "finished").await.expect("explanation");
@@ -2383,27 +2414,33 @@ mod tests {
             .await
             .expect("session");
         sessions
-            .update_status("health-session", &session.metadata.resource_version, &TerminalSessionStatus {
-                phase: flotilla_resources::TerminalSessionPhase::Running,
-                ..Default::default()
-            })
+            .update_status(
+                "health-session",
+                &session.metadata.resource_version,
+                &TerminalSessionStatus { phase: flotilla_resources::TerminalSessionPhase::Running, ..Default::default() },
+            )
             .await
             .expect("running");
-        apply_status_patch(&sessions, "health-session", &TerminalSessionStatusPatch::MarkReconcileDegraded {
-            message: "provider offline".into(),
-            consecutive_failures: 100,
-            observed_at: Utc::now(),
-        })
+        apply_status_patch(
+            &sessions,
+            "health-session",
+            &TerminalSessionStatusPatch::MarkReconcileDegraded {
+                message: "provider offline".into(),
+                consecutive_failures: 100,
+                observed_at: Utc::now(),
+            },
+        )
         .await
         .expect("degradation");
         let explanation = fixture.projections().explain_convoy("flotilla", "health-convoy").await.expect("explanation");
         assert!(
             matches!(&explanation.crew_deliveries[0].terminal_condition, Some(ExplainedTerminalCondition::ProviderUnavailable { message }) if message == "provider offline")
         );
-        apply_status_patch(&sessions, "health-session", &TerminalSessionStatusPatch::MarkLost {
-            reason: "daemon generation dead".into(),
-            lost_at: Utc::now(),
-        })
+        apply_status_patch(
+            &sessions,
+            "health-session",
+            &TerminalSessionStatusPatch::MarkLost { reason: "daemon generation dead".into(), lost_at: Utc::now() },
+        )
         .await
         .expect("confirmed loss");
         let explanation = fixture.projections().explain_convoy("flotilla", "health-convoy").await.expect("explanation");
@@ -2413,10 +2450,11 @@ mod tests {
         let explanation = fixture.projections().explain_convoy("flotilla", "health-convoy").await.expect("explanation");
         assert!(explanation.crew_deliveries[0].terminal_condition.is_none());
         let diagnostic = "Codex launch usage error (exit 2): error: unexpected argument '--no-daemon' found";
-        apply_status_patch(&sessions, "health-session", &TerminalSessionStatusPatch::MarkFailed {
-            message: diagnostic.into(),
-            stopped_at: Some(Utc::now()),
-        })
+        apply_status_patch(
+            &sessions,
+            "health-session",
+            &TerminalSessionStatusPatch::MarkFailed { message: diagnostic.into(), stopped_at: Some(Utc::now()) },
+        )
         .await
         .expect("usage failure");
         let explanation = fixture.projections().explain_convoy("flotilla", "health-convoy").await.expect("failed explanation");
@@ -2475,13 +2513,20 @@ mod tests {
             .await
             .expect("convoy");
         convoys
-            .update_status("ledger-artifact", &created.metadata.resource_version, &ConvoyStatus {
-                crew_work: BTreeMap::from([(
-                    "work".into(),
-                    BTreeMap::from([("coder".into(), CrewWorkState::builder().phase(CrewWorkPhase::Done).finished_at(Utc::now()).build())]),
-                )]),
-                ..Default::default()
-            })
+            .update_status(
+                "ledger-artifact",
+                &created.metadata.resource_version,
+                &ConvoyStatus {
+                    crew_work: BTreeMap::from([(
+                        "work".into(),
+                        BTreeMap::from([(
+                            "coder".into(),
+                            CrewWorkState::builder().phase(CrewWorkPhase::Done).finished_at(Utc::now()).build(),
+                        )]),
+                    )]),
+                    ..Default::default()
+                },
+            )
             .await
             .expect("claim");
         let mut summary = BTreeMap::new();
@@ -2657,18 +2702,22 @@ mod tests {
         backend
             .clone()
             .using::<Project>("flotilla")
-            .update_status("app", &current.metadata.resource_version, &ProjectStatus {
-                dispatch_queue: vec![DispatchQueueEntry {
-                    score: None,
-                    issue: issue.clone(),
-                    title: "Fix query".into(),
-                    issue_as_of: earlier,
-                    ready_observed_at: earlier,
-                    observed_at: earlier,
-                    provenance: "test".into(),
-                }],
-                ..ProjectStatus::default()
-            })
+            .update_status(
+                "app",
+                &current.metadata.resource_version,
+                &ProjectStatus {
+                    dispatch_queue: vec![DispatchQueueEntry {
+                        score: None,
+                        issue: issue.clone(),
+                        title: "Fix query".into(),
+                        issue_as_of: earlier,
+                        ready_observed_at: earlier,
+                        observed_at: earlier,
+                        provenance: "test".into(),
+                    }],
+                    ..ProjectStatus::default()
+                },
+            )
             .await
             .expect("publish dispatch status");
 
@@ -2705,15 +2754,19 @@ mod tests {
         assert_eq!(pending[0].phase, "accepted");
         assert!(pending[0].reason.as_deref().is_some_and(|reason| !reason.is_empty()));
         assert!(pending[0].crew_id.is_none());
-        flotilla_resources::apply_status_patch(&backend.using::<Message>("flotilla"), "view", &MessageStatusPatch::Delivered {
-            receiver: ResolvedMessageReceiver::builder()
-                .crew_id("crew".into())
-                .session("session".into())
-                .delivered_at(Utc::now())
-                .evidence("transport receipt".into())
-                .build(),
-            at: Utc::now(),
-        })
+        flotilla_resources::apply_status_patch(
+            &backend.using::<Message>("flotilla"),
+            "view",
+            &MessageStatusPatch::Delivered {
+                receiver: ResolvedMessageReceiver::builder()
+                    .crew_id("crew".into())
+                    .session("session".into())
+                    .delivered_at(Utc::now())
+                    .evidence("transport receipt".into())
+                    .build(),
+                at: Utc::now(),
+            },
+        )
         .await
         .expect("receipt");
         let delivered = super::crew_message_views(&backend, "flotilla").await.expect("delivered view");

@@ -71,10 +71,10 @@ async fn successful_connection_contract(stream: UnixStream, surface: SurfaceDecl
     let Some(Message::Request { id, request: Request::ListRepos }) = read_message(&mut reader).await else {
         panic!("expected ListRepos request");
     };
-    write_message(&mut writer, Message::Response {
-        id,
-        response: Box::new(ResponseResult::Ok { response: Box::new(Response::ListRepos(vec![])) }),
-    })
+    write_message(
+        &mut writer,
+        Message::Response { id, response: Box::new(ResponseResult::Ok { response: Box::new(Response::ListRepos(vec![])) }) },
+    )
     .await;
     assert!(read_message(&mut reader).await.is_none(), "dropping the client must close its stream");
 }
