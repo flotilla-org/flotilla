@@ -49,7 +49,7 @@ pub async fn assert_terminal_session_label_lookup_with_backend(backend: Resource
             .await
             .expect("update session status");
     }
-    // #588: both spellings select previous-generation and newly written sessions
+    // #2629: exact label selection separates canonical and historical keys
     // through the same storage contract (in-memory and SQLite).
     let mut legacy_meta = TerminalSessionIdentity::builder()
         .vessel_ref("legacy-work".to_string())
@@ -65,16 +65,13 @@ pub async fn assert_terminal_session_label_lookup_with_backend(backend: Resource
         legacy_meta.labels.insert(key.replace('-', "_"), value);
     }
     sessions.create(&legacy_meta, &spec).await.expect("store prior-generation labels");
-    // Ordinal selectors match all four new sessions plus the one legacy session.
-    // The vessel reference selector matches only the legacy session.
-    for (key, value, expected_count) in [
-        (flotilla_resources::VESSEL_REF_LABEL, "legacy-work", 1),
-        (flotilla_resources::VESSEL_ORDINAL_LABEL, "000", 5),
-        (flotilla_resources::CREW_ORDINAL_LABEL, "000", 5),
+    for (key, value, canonical_count) in [
+        (flotilla_resources::VESSEL_REF_LABEL, "legacy-work", 0),
+        (flotilla_resources::VESSEL_ORDINAL_LABEL, "000", 4),
+        (flotilla_resources::CREW_ORDINAL_LABEL, "000", 4),
     ] {
-        for spelling in [key.to_string(), key.replace('-', "_")] {
-            let selected =
-                sessions.list_matching_labels(&BTreeMap::from([(spelling, value.to_string())])).await.expect("dual-read selector");
+        for (spelling, expected_count) in [(key.to_string(), canonical_count), (key.replace('-', "_"), 1)] {
+            let selected = sessions.list_matching_labels(&BTreeMap::from([(spelling, value.to_string())])).await.expect("exact selector");
             assert_eq!(selected.items.len(), expected_count);
         }
     }

@@ -17,53 +17,18 @@ pub const REPO_LABEL: &str = "flotilla.work/repo";
 pub const CHANGE_REQUEST_ID_LABEL: &str = "flotilla.work/change-request-id";
 pub const RESERVED_PREFIX: &str = "flotilla.work/";
 
-// ADR 0047: remove this rename table one fleet roll after #588 lands.
-const RENAMED: [(&str, &str); 3] = [
-    (VESSEL_REF_LABEL, "flotilla.work/vessel_ref"),
-    (VESSEL_ORDINAL_LABEL, "flotilla.work/vessel_ordinal"),
-    (CREW_ORDINAL_LABEL, "flotilla.work/crew_ordinal"),
-];
-
-fn renamed_label(key: &str) -> Option<(&'static str, &'static str)> {
-    RENAMED.iter().copied().find(|(canonical, legacy)| key == *canonical || key == *legacy)
-}
-
-/// Read renamed labels with canonical spelling taking precedence.
-/// ADR 0047: remove the underscored fallbacks one fleet roll after #588 lands.
+/// Read a label by its exact key.
 pub fn label_value<'a>(labels: &'a BTreeMap<String, String>, key: &str) -> Option<&'a String> {
-    let Some((canonical, legacy)) = renamed_label(key) else {
-        return labels.get(key);
-    };
-    labels.get(canonical).or_else(|| labels.get(legacy))
+    labels.get(key)
 }
 
 pub fn labels_match(labels: &BTreeMap<String, String>, required: &BTreeMap<String, String>) -> bool {
     required.iter().all(|(key, expected)| label_value(labels, key) == Some(expected))
 }
 
-// ADR 0047: remove broad HTTP selection one fleet roll after #588 lands.
-pub(crate) fn selector_needs_legacy_read(required: &BTreeMap<String, String>) -> bool {
-    required.keys().any(|key| renamed_label(key).is_some())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rename_pairs_drive_lookup_and_http_selection() {
-        // #588: every rename pairs a hyphenated key with its previous spelling;
-        // HTTP must broaden selection for either spelling of each fixed pair.
-        for (canonical, legacy) in RENAMED {
-            assert_eq!(legacy, canonical.replace('-', "_"));
-            for key in [canonical, legacy] {
-                assert_eq!(renamed_label(key), Some((canonical, legacy)));
-                assert!(selector_needs_legacy_read(&BTreeMap::from([(key.to_string(), "value".to_string())])));
-            }
-        }
-        assert!(!selector_needs_legacy_read(&BTreeMap::new()));
-        assert!(!selector_needs_legacy_read(&BTreeMap::from([("custom/vessel_ref".to_string(), "value".to_string())])));
-    }
 
     #[test]
     fn well_known_keys_are_hyphenated() {
@@ -110,10 +75,10 @@ mod tests {
     }
 
     #[hegel::test]
-    fn renamed_labels_read_both_spellings(tc: hegel::TestCase) {
-        // #588 / ADR 0047: both selector spellings read either stored spelling;
-        // canonical wins on conflicting duplicates. Generate all three keys,
-        // missing/old/new/both states, and empty/boundary ordinal values.
+    fn label_spellings_match_only_exact_keys(tc: hegel::TestCase) {
+        // #2629: label keys have exact equality semantics after the roll.
+        // Generate all three keys, missing/old/new/both states, conflicting
+        // duplicates, and empty/boundary ordinal values.
         let index = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2));
         let state = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3));
         let value_index = tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(3));
@@ -131,8 +96,11 @@ mod tests {
             labels.insert(old.clone(), "conflicting".to_string());
         }
         for spelling in [key, old.as_str()] {
-            assert_eq!(label_value(&labels, spelling), (state != 0).then_some(&value));
-            assert_eq!(labels_match(&labels, &BTreeMap::from([(spelling.to_string(), value.clone())])), state != 0);
+            assert_eq!(label_value(&labels, spelling), labels.get(spelling));
+            assert_eq!(
+                labels_match(&labels, &BTreeMap::from([(spelling.to_string(), value.clone())])),
+                labels.get(spelling) == Some(&value)
+            );
             assert!(!labels_match(&labels, &BTreeMap::from([(spelling.to_string(), "absent".to_string())])));
         }
         assert!(labels_match(&labels, &BTreeMap::new()));
