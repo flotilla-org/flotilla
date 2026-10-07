@@ -61,6 +61,7 @@ pub struct MissionFields {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[serde(default)]
 pub struct DispatchScore {
     pub mission: String,
     pub mission_issue: Option<IssueRef>,
@@ -73,6 +74,23 @@ pub struct DispatchScore {
     pub project_share: u32,
     pub project_active_crews: usize,
     pub mission_active_crews: usize,
+}
+
+impl Default for DispatchScore {
+    fn default() -> Self {
+        Self {
+            mission: "routine".into(),
+            mission_issue: None,
+            attributes: MissionAttributes::default(),
+            membership: "routine".into(),
+            attribute_sources: Default::default(),
+            unblock_count: 0,
+            conflict_penalty: 0,
+            project_share: 1,
+            project_active_crews: 0,
+            mission_active_crews: 0,
+        }
+    }
 }
 
 /// Lexicographic ruling order. Fair share gates admission separately (#2785).
@@ -93,6 +111,24 @@ pub fn compare_dispatch_rows(left: &DispatchQueueRow, right: &DispatchQueueRow) 
 
 #[cfg(test)]
 mod tests {
+
+    // Stored scores tolerate additions at the container level with neutral
+    // ranking/admission defaults, while existing partial authored values survive.
+    #[test]
+    fn partial_stored_scores_decode_with_neutral_defaults() {
+        let score: super::DispatchScore =
+            serde_json::from_str(r#"{"mission":"stability","attributes":{"value":5},"unblock_count":7}"#).expect("previous stored score");
+        assert_eq!(score.mission, "stability");
+        assert_eq!(f64::from(score.attributes.value), 5.0);
+        assert_eq!(score.unblock_count, 7);
+        assert_eq!(score.attributes.class_of_service, super::ClassOfService::Standard);
+        assert_eq!(score.project_share, 1);
+        assert_eq!(score.conflict_penalty, 0);
+        assert_eq!(score.project_active_crews, 0);
+        let empty: super::DispatchScore = serde_json::from_str("{}").expect("empty stored score");
+        assert_eq!(empty.mission, "routine");
+        assert_eq!(empty.project_share, 1);
+    }
     use super::*;
 
     // Serialization preserves decimal priority values and rejects nonfinite ones.

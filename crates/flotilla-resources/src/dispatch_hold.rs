@@ -72,16 +72,42 @@ pub enum HoldClearWhen {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchHoldStatus {
     pub cleared_at: Option<DateTime<Utc>>,
+    // ADR 0047: old holds have no overlap status; automatic relationships now
+    // keep their identity while their volatile evidence changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlap: Option<AutomaticHoldObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomaticHoldObservation {
+    pub source: flotilla_protocol::IssueSource,
+    pub revision: String,
+    pub weight: u64,
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchHoldStatusPatch {
-    Clear { at: DateTime<Utc> },
+    Clear {
+        at: DateTime<Utc>,
+    },
+    /// Only the reconciler's owned automatic holds use this mutable evidence.
+    /// Manual holds retain the one-way Clear latch.
+    ActivateOverlap {
+        observation: AutomaticHoldObservation,
+    },
 }
 impl StatusPatch<DispatchHoldStatus> for DispatchHoldStatusPatch {
     fn apply(&self, status: &mut DispatchHoldStatus) {
-        let Self::Clear { at } = self;
-        status.cleared_at.get_or_insert(*at);
+        match self {
+            Self::Clear { at } => {
+                status.cleared_at.get_or_insert(*at);
+            }
+            Self::ActivateOverlap { observation } => {
+                status.cleared_at = None;
+                status.overlap = Some(observation.clone());
+            }
+        }
     }
 }
 

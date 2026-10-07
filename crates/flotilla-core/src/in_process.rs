@@ -4923,17 +4923,18 @@ impl InProcessDaemon {
 
     /// Schedule tracker observations without waiting for the forge or coupling
     /// board freshness to the availability of dispatch readiness evidence.
-    pub async fn refresh_dispatch_boards_internal(&self) -> Result<(), String> {
-        self.dispatch_board_repositories_internal(None).await.map(|_| ())
-    }
-
     pub async fn dispatch_board_repositories_internal(
         &self,
         project_filter: Option<&str>,
     ) -> Result<Vec<flotilla_protocol::DispatchBoardRepository>, String> {
+        self.dispatch_board_cache.snapshots(project_filter).await
+    }
+
+    pub async fn refresh_dispatch_boards_internal(&self) -> Result<(), String> {
         let namespace = self.provisioning_namespace().await;
         let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
         let mut sources = std::collections::BTreeSet::new();
+        let mut project_sources = BTreeMap::<String, BTreeSet<flotilla_protocol::IssueSource>>::new();
         let mut mission_issues = std::collections::BTreeSet::new();
         let mut footprint_projects = BTreeSet::new();
         let mut errors = Vec::new();
@@ -4941,15 +4942,16 @@ impl InProcessDaemon {
             if let Some(policy) = &project.spec.dispatch_policy {
                 mission_issues.extend(policy.missions.iter().filter_map(|mission| mission.issue.clone()));
             }
-            if project_filter.is_some_and(|name| name != project.metadata.name) {
-                continue;
-            }
             if project.spec.dispatch_policy.as_ref().is_some_and(|p| p.enabled && p.overlap_policy.is_some()) {
                 footprint_projects.insert(project.metadata.name.clone());
             }
             let scope = flotilla_protocol::QueryScope::new(&project.metadata.namespace, &project.metadata.name);
             match self.resolve_issue_source_bindings(&scope).await {
-                Ok(bindings) => sources.extend(bindings.into_iter().map(|binding| binding.source)),
+                Ok(bindings) => {
+                    let bound = bindings.into_iter().map(|binding| binding.source).collect::<BTreeSet<_>>();
+                    sources.extend(bound.iter().cloned());
+                    project_sources.insert(project.metadata.name.clone(), bound);
+                }
                 Err(error) => errors.push(error),
             }
         }
@@ -4983,6 +4985,10 @@ impl InProcessDaemon {
                     };
                     if convoy.spec.project_ref.as_ref().is_some_and(|p| footprint_projects.contains(p)) {
                         footprint_sources.insert(source.clone());
+                        project_sources
+                            .entry(convoy.spec.project_ref.clone().expect("controlled Project"))
+                            .or_default()
+                            .insert(source.clone());
                     }
                     if let Some(branch) = &convoy.spec.r#ref {
                         branches.entry(source).or_default().push(flotilla_protocol::BranchFootprintRequest {
@@ -5002,44 +5008,58 @@ impl InProcessDaemon {
                     let source =
                         footprint_repository_sources.get(&entry.repo).ok_or("footprint repository lacks authoritative forge binding")?;
                     footprint_sources.insert(source.clone());
+                    project_sources.entry(project.metadata.name.clone()).or_default().insert(source.clone());
                 }
             }
             branches.retain(|source, _| footprint_sources.contains(source));
             sources.extend(footprint_sources.iter().cloned());
         }
-        if project_filter.is_none() && errors.is_empty() {
+        if errors.is_empty() {
             self.dispatch_board_cache.retain_sources(&sources).await;
+            self.dispatch_board_cache.set_project_sources(project_sources).await;
         }
-        let mut repositories = Vec::new();
         for source in sources {
             let daemon = self.self_weak.clone();
             let tracker_source = source.clone();
             let mission_issues = mission_issues.clone();
             let observe_footprints = footprint_sources.contains(&source);
             let branches = branches.get(&source).cloned().unwrap_or_default();
+            let convoys = footprint_convoys.clone();
+            let repository_sources = footprint_repository_sources.clone();
             match self
                 .dispatch_board_cache
-                .read(&source, move || async move {
+                .read_indexed(&source, move |indices| async move {
                     let daemon = daemon.upgrade().ok_or("daemon stopped")?;
                     let provider = daemon.issue_provider_for_source(&tracker_source).await?;
                     let mut board = provider.dispatch_board(&tracker_source).await?;
-                    for issue in &mut board.issues {
-                        let reference = flotilla_protocol::IssueRef { source: tracker_source.clone(), id: issue.id.clone() };
-                        if mission_issues.iter().any(|mission| {
-                            mission.id == reference.id
-                                && mission.source.scope.eq_ignore_ascii_case(&reference.source.scope)
-                                && matches!(mission.source.service.trim_end_matches('/'), "github" | "github.com" | "https://github.com")
-                        }) || issue.issue_type.as_ref().is_some_and(|kind| kind.eq_ignore_ascii_case("map"))
-                            || issue
-                                .labels
+                    let mut indices = indices.lock().await;
+                    let selected = board
+                        .issues
+                        .iter()
+                        .filter(|issue| {
+                            mission_issues
                                 .iter()
-                                .any(|label| label.rsplit(':').next().is_some_and(|kind| kind.eq_ignore_ascii_case("map")))
-                        {
-                            issue.mission_fields = provider.mission_fields(&reference).await?;
-                        }
-                    }
+                                .any(|mission| mission.id == issue.id && mission.source.scope.eq_ignore_ascii_case(&tracker_source.scope))
+                                || issue.issue_type.as_ref().is_some_and(|kind| kind.eq_ignore_ascii_case("map"))
+                                || issue
+                                    .labels
+                                    .iter()
+                                    .any(|label| label.rsplit(':').next().is_some_and(|kind| kind.eq_ignore_ascii_case("map")))
+                        })
+                        .map(|issue| issue.id.clone())
+                        .collect();
+                    indices.refresh_missions(provider.as_ref(), &tracker_source, &mut board.issues, &selected).await;
                     if observe_footprints {
-                        board.footprints = Some(provider.footprints(&tracker_source, &board.pull_requests, &branches).await?);
+                        let mut observation = provider
+                            .footprints(&tracker_source, &board.pull_requests, &branches, &mut indices.footprints)
+                            .await
+                            .unwrap_or_else(|error| {
+                                let mut observation = flotilla_protocol::FootprintObservation::default();
+                                observation.stale_items.insert("provider".into(), error);
+                                observation
+                            });
+                        crate::dispatch_footprints::prepare_observation(&tracker_source, &mut observation, &convoys, &repository_sources);
+                        board.footprints = Some(observation);
                     }
                     Ok(board)
                 })
@@ -5048,13 +5068,12 @@ impl InProcessDaemon {
                 Ok(board) if observe_footprints && board.footprints.is_none() => {
                     errors.push(format!("awaiting footprint refresh for {}", source.scope))
                 }
-                Ok(board) => repositories.push(board),
+                Ok(_) => {}
                 Err(error) => errors.push(error),
             }
         }
         if errors.is_empty() {
-            crate::dispatch_footprints::enrich_reports(&mut repositories, &footprint_convoys, &footprint_repository_sources);
-            Ok(repositories)
+            Ok(())
         } else {
             Err(errors.join("; "))
         }

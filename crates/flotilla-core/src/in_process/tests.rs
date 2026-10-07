@@ -10242,6 +10242,8 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
         )
         .await
         .expect("cold project");
+    // Source membership is refreshed in the background, never by CLI reads.
+    assert!(daemon.refresh_dispatch_boards_internal().await.is_err());
     assert!(daemon.dispatch_board_internal(None).await.expect_err("complete source board").contains("initial observation"));
     assert_eq!(daemon.dispatch_board_internal(Some("large")).await.expect("healthy project").repositories[0].issues.len(), 400);
 }

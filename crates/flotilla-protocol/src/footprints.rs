@@ -31,6 +31,14 @@ pub struct FootprintObservation {
     pub work: Vec<WorkFootprint>,
     pub hot_files: Vec<HotFile>,
     pub merge_order: Vec<MergeOrderHint>,
+    /// Precomputed once by the source refresh, including unseen active paths.
+    #[serde(default)]
+    pub file_rarity: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub basename_counts: BTreeMap<String, usize>,
+    /// Item-local failure evidence; successful items remain usable.
+    #[serde(default)]
+    pub stale_items: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

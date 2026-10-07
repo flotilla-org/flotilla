@@ -205,13 +205,24 @@ time. Each shared file counts once; weights sum with saturation.
 
 Below the configured per-target threshold, summed overlap becomes the last ordering term
 `score.conflict_penalty`. At or above it, the reconciler authors an immutable
-`DispatchHold` with the overlapping paths/weight as its reason and an explicit
+`DispatchHold` with a stable (issue, target, source) identity and an explicit
 `land_after_work` convoy or PR target. `land_after` remains the candidate issue
 anchor for stored-shape compatibility; explicit work targets take precedence.
 Automatic holds clear when overlap drops, a target leaves flight, or landing is
 observed. If identical overlap returns after clearing (for example a revert push),
-a fresh immutable hold is created; a cleared historical hold cannot bypass it.
-Refresh failures retain last-good observations and their age/error;
+the same relationship reactivates. Revision, weight and paths live in
+`status.overlap`, so pushes do not churn hold identities. The hold inventory is
+read once per Project pass. Cleared automatic holds expire after 30 days through
+definition deletion; manual holds retain their authored lifetime.
+Each source cache entry owns an incremental footprint index. Merged PR files
+are fetched once by PR number within the latest-60 append-only window. Open PR
+files are fetched only on head-SHA changes; branch comparisons only on tip
+changes (a lightweight ref read detects pushes). Failed or oversized items keep
+their last-good evidence and appear in `stale_items`, without failing peers or
+the source refresh. Mission-field failures similarly retain item-local fields
+and expose `mission_fields_error`. Failed footprint items retry after five
+minutes; individual requests have a 20-second deadline and PR fetches run with
+eight-way concurrency. Source-level refresh failures retain age/error;
 an initial missing footprint observation makes this Project unavailable. Manual
 work-addressed holds require positive merged-PR or Landed-convoy evidence.
 
@@ -219,7 +230,12 @@ work-addressed holds require positive merged-PR or Landed-convoy evidence.
 observations, `hot_files` (recent merge frequency and active-work count), and
 `merge_order` hints with weighted shared paths. Hints use stable target order to
 avoid cycles and advise which overlapping work should land first; they do not
-merge PRs. Background refreshes own all forge calls. PR file lists are paginated
+merge PRs. Background refreshes own all forge calls and compute rarity, prediction path
+indices, hot files and work-pair reports once. CLI reads serve these prepared
+observations without recomputing reports or gathering resources. Reconciliation
+builds one ConflictBoard per pass shared across Projects. Stored queues use
+`compare_dispatch_rows` order, and partial stored scores decode with neutral
+defaults. PR file lists are paginated
 and checked against `changed_files`; reaching GitHub's 3,000-file PR cap or
 300-file branch-compare cap is unavailable evidence, never a truncated footprint.
 
@@ -248,3 +264,7 @@ GitHub interactions.
 
 Provider limits follow GitHub's [PR files endpoint](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files)
 and [compare endpoint](https://docs.github.com/en/rest/commits/commits#compare-two-commits).
+
+Deferred work: [incremental MissionBoard/footprint queries (#2859)](https://github.com/flotilla-org/flotilla/issues/2859),
+[board inputs once per pass (#2860)](https://github.com/flotilla-org/flotilla/issues/2860),
+and [admission-time volatile crew counts (#2861, #2785)](https://github.com/flotilla-org/flotilla/issues/2861).

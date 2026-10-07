@@ -137,7 +137,8 @@ pub use credential::{
 pub use crew_image_baseline::{CrewImageBaseline, CrewImageBaselineSpec};
 pub use definition::DefinitionResolver;
 pub use dispatch_hold::{
-    DispatchDeployment, DispatchDeploymentSpec, DispatchHold, DispatchHoldSpec, DispatchHoldStatus, DispatchHoldStatusPatch, HoldClearWhen,
+    AutomaticHoldObservation, DispatchDeployment, DispatchDeploymentSpec, DispatchHold, DispatchHoldSpec, DispatchHoldStatus,
+    DispatchHoldStatusPatch, HoldClearWhen,
 };
 pub use dispatch_observation::{
     DispatchObservation, DispatchObservationSpec, DispatchOverlap, DispatchOverlapSpec, DISPATCH_RECONCILER_PROVENANCE,

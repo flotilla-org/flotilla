@@ -1,3 +1,4 @@
+pub mod footprints;
 pub mod forgejo;
 pub mod github;
 
@@ -42,12 +43,13 @@ pub trait IssueProvider: Send + Sync {
         Err("board facts unavailable for this issue provider".into())
     }
 
-    /// Normalized optional mission fields. Unsupported sources use labels/charter.
+    /// Refresh source-local item indices; individual forge failures stay item-local.
     async fn footprints(
         &self,
         _source: &IssueSource,
         _pull_requests: &[flotilla_protocol::DispatchBoardPullRequest],
         _branches: &[flotilla_protocol::BranchFootprintRequest],
+        _index: &mut footprints::FootprintIndex,
     ) -> Result<flotilla_protocol::FootprintObservation, String> {
         Err("footprints unavailable for this issue provider".into())
     }

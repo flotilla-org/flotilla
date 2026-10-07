@@ -61,6 +61,7 @@ pub struct DispatchBoardIssue {
     pub issue_type: Option<String>,
     #[builder(default)]
     pub mission_fields: crate::MissionFields,
+    pub mission_fields_error: Option<String>,
     pub closed_at: Option<String>,
     pub labels: Vec<String>,
     pub blocked_by: Vec<DispatchBoardDependency>,
@@ -78,6 +79,9 @@ pub struct DispatchBoardPullRequest {
     pub state: String,
     pub merged_at: Option<String>,
     pub merge_state: Option<String>,
+    pub head_sha: Option<String>,
+    pub head_branch: Option<String>,
+    pub head_repository: Option<String>,
     pub ci: String,
 }
 
