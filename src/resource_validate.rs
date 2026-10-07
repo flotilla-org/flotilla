@@ -244,7 +244,7 @@ async fn validate_daemon_with_preview(
         &frozen::CandidateProbes { options: probes, inventory: &frozen_inventory, runner: &ProcessCommandRunner },
     )
     .await?;
-    frozen_report.inventory_complete = !frozen_inventory_failed && !retirement_inventory_failed;
+    frozen_report.inventory_complete &= !frozen_inventory_failed && !retirement_inventory_failed;
     println!("frozen-reference satisfiability: {}", serde_json::to_string(&frozen_report)?);
     for error in &frozen_report.failures {
         eprintln!("{error}");

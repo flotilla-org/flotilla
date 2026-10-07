@@ -105,7 +105,7 @@ impl Probes for CandidateProbes<'_> {
         // registry manifests. Local Docker inspection below is only a legacy
         // tag fallback: it cannot prove availability on another fleet host.
         if !errors.is_empty() {
-            return Err(errors.join("; "));
+            return Err(format!("image {reference} absent from host digest inventories; {}", errors.join("; ")));
         }
         if !flotilla_resources::is_image_digest(reference) && !reference.contains('@') {
             if self.runner.run("docker", &["image", "inspect", reference], Path::new("/"), &ChannelLabel::Default).await.is_ok() {
@@ -142,14 +142,32 @@ pub(super) struct Report {
     pub waivers: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+enum Category {
+    Skills,
+    Workflow,
+    Images,
+    Grants,
+}
+
+impl std::fmt::Display for Category {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Skills => "skills",
+            Self::Workflow => "workflow",
+            Self::Images => "images",
+            Self::Grants => "grants",
+        })
+    }
+}
+
 impl Report {
-    fn record(&mut self, category: &str, convoy: &str, reference: &str, result: Result<(), String>, waiver: Option<&str>) {
+    fn record(&mut self, category: Category, convoy: &str, reference: &str, result: Result<(), String>, waiver: Option<&str>) {
         let count = match category {
-            "skills" => &mut self.skills,
-            "workflow" => &mut self.workflow,
-            "images" => &mut self.images,
-            "grants" => &mut self.grants,
-            _ => unreachable!("known category"),
+            Category::Skills => &mut self.skills,
+            Category::Workflow => &mut self.workflow,
+            Category::Images => &mut self.images,
+            Category::Grants => &mut self.grants,
         };
         count.checked += 1;
         if let Err(error) = result {
@@ -169,8 +187,10 @@ fn decode<T: Resource>(document: &Value) -> Result<ResourceObject<T>> {
     Ok(ResourceObject::from_k8s_object(serde_json::from_value::<K8sResourceObject<T>>(document.clone())?)?)
 }
 
+// Routing/diagnostics only: typed metadata requires a namespace and has no
+// default. Keep absent metadata visibly invalid rather than inventing a scope.
 fn namespace(document: &Value) -> &str {
-    document["metadata"]["namespace"].as_str().unwrap_or("flotilla")
+    document["metadata"]["namespace"].as_str().unwrap_or("<missing namespace>")
 }
 
 fn name(document: &Value) -> &str {
@@ -196,7 +216,7 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
             .collect::<Result<BTreeMap<_, _>>>()?;
         let workflow_ref = pinned_workflow_ref(&convoy);
         if retired.contains(&(ns.clone(), workflow_ref.to_string())) {
-            report.record("workflow", &identity, workflow_ref, Err("candidate startup will tombstone this builtin".into()), waiver);
+            report.record(Category::Workflow, &identity, workflow_ref, Err("candidate startup will tombstone this builtin".into()), waiver);
         }
         let snapshot = convoy.status.as_ref().and_then(|status| status.workflow_snapshot.as_ref());
         if let Some(snapshot) = snapshot {
@@ -209,7 +229,7 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                 .maybe_supervision(snapshot.supervision.clone())
                 .build();
             report.record(
-                "workflow",
+                Category::Workflow,
                 &identity,
                 workflow_ref,
                 flotilla_resources::validate(&spec).map_err(|errors| format!("snapshot is not executable: {errors:?}")),
@@ -224,7 +244,7 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                     .collect::<BTreeSet<_>>();
                 for credential in granted {
                     report.record(
-                        "grants",
+                        Category::Grants,
                         &identity,
                         &format!("{}/{}", vessel.name, credential),
                         credentials
@@ -249,7 +269,7 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                         .collect::<Vec<_>>()
                         .join(", ");
                     report.record(
-                        "skills",
+                        Category::Skills,
                         &identity,
                         &format!("{} [{refs}]", vessel.name),
                         probes.skills(&crews, &credentials).await,
@@ -258,7 +278,13 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                 }
             }
         } else if convoy.status.as_ref().is_some_and(|status| status.phase != ConvoyPhase::Pending) {
-            report.record("workflow", &identity, workflow_ref, Err("live admitted convoy has no frozen workflow snapshot".into()), waiver);
+            report.record(
+                Category::Workflow,
+                &identity,
+                workflow_ref,
+                Err("live admitted convoy has no frozen workflow snapshot".into()),
+                waiver,
+            );
         } else {
             // Pending admissions still depend on a live definition. They have
             // no snapshot yet, so confirm the candidate can admit the workflow.
@@ -275,7 +301,7 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                 let spec: WorkflowTemplateSpec = serde_json::from_value(template["spec"].clone()).map_err(|error| error.to_string())?;
                 flotilla_resources::validate(&spec).map_err(|errors| format!("workflow is not executable: {errors:?}"))
             });
-            report.record("workflow", &identity, workflow_ref, result, waiver);
+            report.record(Category::Workflow, &identity, workflow_ref, result, waiver);
         }
         if let Some(encoded) = convoy.metadata.annotations.get(flotilla_resources::IMAGE_LAYERS_ANNOTATION) {
             let frozen = serde_json::from_str::<FrozenImageLayers>(encoded).map_err(|error| error.to_string());
@@ -290,23 +316,31 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                 }
                 Ok(())
             });
-            report.record("images", &identity, "frozen-image-layers", result, waiver);
+            report.record(Category::Images, &identity, "frozen-image-layers", result, waiver);
             if let Ok(frozen) = frozen {
                 if let Some(baseline) = frozen.baseline_image {
-                    report.record("images", &identity, &baseline, probes.image(&baseline).await, waiver);
+                    report.record(Category::Images, &identity, &baseline, probes.image(&baseline).await, waiver);
                 }
             }
         }
         for vessel in inventory.iter().filter(|document| {
             document["kind"] == "Vessel" && namespace(document) == ns && document["spec"]["convoy_ref"] == convoy.metadata.name
         }) {
-            let vessel = decode::<Vessel>(vessel)?;
+            let vessel = match decode::<Vessel>(vessel) {
+                Ok(vessel) => vessel,
+                Err(error) => {
+                    // Decode failures are inventory failures, never semantic waivers.
+                    report.inventory_complete = false;
+                    report.failures.push(format!("Convoy/{identity} Vessel/{ns}/{}: cannot decode frozen vessel: {error:#}", name(vessel)));
+                    continue;
+                }
+            };
             let Some(status) = &vessel.status else {
                 continue;
             };
             for credential in status.held_credentials.keys() {
                 report.record(
-                    "grants",
+                    Category::Grants,
                     &identity,
                     &format!("{}/held/{credential}", vessel.spec.vessel_name),
                     credentials
@@ -325,7 +359,7 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                     if let Some(docker) = &environment.spec.docker {
                         if let Some(composition) = &docker.image_composition {
                             report.record(
-                                "images",
+                                Category::Images,
                                 &identity,
                                 &format!("{environment_ref}/composition"),
                                 validate_composition(composition),
@@ -346,12 +380,12 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                                     }
                                     None => Err("frozen image build is unavailable".into()),
                                 };
-                                report.record("images", &identity, build_ref, result, waiver);
+                                report.record(Category::Images, &identity, build_ref, result, waiver);
                             }
                         }
                         if let Some(image) = docker.image_composition.as_ref().and_then(|composition| composition.identity.as_ref()) {
                             report.record(
-                                "images",
+                                Category::Images,
                                 &identity,
                                 image.registry_digest.as_deref().unwrap_or(&image.local_image_id),
                                 check_identity(probes, &image.local_image_id, image.registry_digest.as_deref()).await,
@@ -359,7 +393,7 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                             );
                         } else if let Some(local) = &status.local_image_id {
                             report.record(
-                                "images",
+                                Category::Images,
                                 &identity,
                                 status.registry_digest.as_deref().unwrap_or(local),
                                 check_identity(probes, local, status.registry_digest.as_deref()).await,
@@ -367,22 +401,28 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                             );
                         } else {
                             let reference = status.registry_digest.as_deref().unwrap_or(&docker.image);
-                            report.record("images", &identity, reference, probes.image(reference).await, waiver);
+                            report.record(Category::Images, &identity, reference, probes.image(reference).await, waiver);
                         }
                     }
                 } else {
-                    report.record("images", &identity, environment_ref, Err("vessel's frozen Environment is unavailable".into()), waiver);
+                    report.record(
+                        Category::Images,
+                        &identity,
+                        environment_ref,
+                        Err("vessel's frozen Environment is unavailable".into()),
+                        waiver,
+                    );
                 }
             } else if let Some(local) = &status.local_image_id {
                 report.record(
-                    "images",
+                    Category::Images,
                     &identity,
                     status.registry_digest.as_deref().unwrap_or(local),
                     check_identity(probes, local, status.registry_digest.as_deref()).await,
                     waiver,
                 );
             } else if let Some(registry) = &status.registry_digest {
-                report.record("images", &identity, registry, probes.image(registry).await, waiver);
+                report.record(Category::Images, &identity, registry, probes.image(registry).await, waiver);
             }
         }
     }
@@ -616,6 +656,24 @@ mod tests {
             .await
             .expect("placed vessel");
         inventory.push(serde_json::to_value(vessel.to_k8s_object()).expect("document"));
+        // A malformed retained Vessel stays actionable against its convoy and
+        // cannot be waived; absent namespaces have no invented default scope.
+        let mut malformed = inventory.clone();
+        malformed[0]["metadata"]["annotations"][READMISSION_ANNOTATION] = Value::String("re-admit".into());
+        malformed[3]["status"]["held_credentials"] = Value::String("invalid".into());
+        let report = check(&malformed, &BTreeSet::new(), &Supply { revision: "1".repeat(40), image_available: true })
+            .await
+            .expect("actionable decode report");
+        assert!(!report.inventory_complete);
+        assert!(report
+            .failures
+            .iter()
+            .any(|failure| failure.contains("Convoy/fleet/governor Vessel/fleet/vessel") && failure.contains("cannot decode")));
+        assert!(report.waivers.is_empty());
+        let mut missing_namespace = inventory[0].clone();
+        missing_namespace["metadata"].as_object_mut().expect("metadata").remove("namespace");
+        assert!(decode::<Convoy>(&missing_namespace).is_err(), "typed metadata requires a namespace");
+        assert_eq!(namespace(&missing_namespace), "<missing namespace>");
         let supply = Supply { revision: "1".repeat(40), image_available: true };
         let report = check(&inventory, &BTreeSet::new(), &supply).await.expect("check");
         assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -685,6 +743,10 @@ mod tests {
             let probes = CandidateProbes { options: &options, inventory: &inventory, runner: &runner };
             assert_eq!(check_identity(&probes, &local, Some(&registry)).await.is_ok(), cached || published);
             assert_eq!(*runner.calls.lock().expect("calls"), usize::from(!cached));
+            if !cached && !published {
+                let error = probes.image(&registry).await.expect_err("cache and registry unavailable");
+                assert!(error.contains("absent from host digest inventories") && error.contains("manifest unknown"), "{error}");
+            }
         });
     }
 
