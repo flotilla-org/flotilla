@@ -152,7 +152,14 @@ impl DispatchIssueSource for DaemonDispatchIssueSource {
                     if project.spec.dispatch_policy.as_ref().is_some_and(|policy| policy.enabled) {
                         for binding in bindings {
                             let query = ready_issue_query(binding);
-                            let key = (binding.source.clone(), serde_json::to_string(&query).map_err(|e| e.to_string())?);
+                            let serialized = match serde_json::to_string(&query) {
+                                Ok(serialized) => serialized,
+                                Err(error) => {
+                                    readiness = Err(error.to_string());
+                                    break;
+                                }
+                            };
+                            let key = (binding.source.clone(), serialized);
                             if !queries.contains_key(&key) {
                                 if !providers.contains_key(&binding.source) {
                                     providers.insert(binding.source.clone(), self.daemon.issue_provider_for_source(&binding.source).await);
@@ -297,7 +304,12 @@ impl DispatchReconciler {
             .filter(|project| project.spec.dispatch_policy.as_ref().is_some_and(|policy| policy.enabled))
             .cloned()
             .collect::<Vec<_>>();
-        let boards = self.issues.collect_boards(&enabled).await?;
+        let boards = self.issues.collect_boards(&enabled).await.unwrap_or_else(|error| {
+            enabled
+                .iter()
+                .map(|project| (project.metadata.name.clone(), Err(format!("dispatch source inventory unavailable: {error}"))))
+                .collect()
+        });
         let scopes = enabled.iter().map(|project| project.metadata.name.clone()).collect::<BTreeSet<_>>();
         let mut sources = BTreeSet::new();
         for input in boards.values().filter_map(|input| input.as_ref().ok()) {
@@ -652,7 +664,14 @@ impl DispatchReconciler {
                     continue;
                 }
                 if !inventories.workflows.contains(pinned_workflow_ref(convoy)) {
-                    warn!(project = %project.metadata.name, convoy = %convoy.metadata.name, issue = ?issue.reference, workflow = %pinned_workflow_ref(convoy), reason = "absent from pass inventory", "cannot record dispatch observation without its workflow");
+                    warn!(
+                        project = %project.metadata.name,
+                        convoy = %convoy.metadata.name,
+                        issue = ?issue.reference,
+                        workflow = %pinned_workflow_ref(convoy),
+                        reason = "absent from pass inventory",
+                        "cannot record dispatch observation without its workflow"
+                    );
                     continue;
                 }
                 let dispatched_at = convoy.metadata.creation_timestamp;
@@ -768,6 +787,7 @@ mod tests {
         facts_calls: Mutex<usize>,
         facts: Mutex<HashMap<IssueRef, DispatchIssueFacts>>,
         failing_projects: Mutex<HashSet<String>>,
+        failing_collection: Mutex<bool>,
         failing_refs: Mutex<HashSet<IssueRef>>,
     }
 
@@ -827,6 +847,9 @@ mod tests {
     #[async_trait]
     impl DispatchIssueSource for FakeIssues {
         async fn collect_boards(&self, projects: &[ResourceObject<Project>]) -> Result<ProjectBoards, String> {
+            if *self.failing_collection.lock().expect("collection failure") {
+                return Err("injected source inventory outage".into());
+            }
             let mut result = BTreeMap::new();
             for project in projects {
                 result.insert(
@@ -950,6 +973,7 @@ mod tests {
             facts_calls: Mutex::new(0),
             facts: Mutex::new(HashMap::new()),
             failing_projects: Mutex::new(Default::default()),
+            failing_collection: Mutex::new(false),
             failing_refs: Mutex::new(Default::default()),
         });
         let clock = Arc::new(VirtualClock::new("2026-08-04T12:00:00Z".parse().expect("clock timestamp")));
@@ -1074,6 +1098,12 @@ mod tests {
         assert!(unavailable.dispatch_queue_error.is_some());
         assert_eq!(unavailable.dispatch_queue[0].ready_observed_at, initial);
         *counted.fail_holds.lock().expect("failure") = false;
+        *issues.failing_collection.lock().expect("collection failure") = true;
+        assert_eq!(reconciler.reconcile_once().await.expect("source inventory outage").project_errors, 13);
+        let unavailable = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
+        assert!(unavailable.dispatch_queue_error.as_ref().expect("error").contains("source inventory unavailable"));
+        assert_eq!(unavailable.dispatch_queue[0].ready_observed_at, initial);
+        *issues.failing_collection.lock().expect("collection failure") = false;
         issues.failing_projects.lock().expect("failures").insert("overlap-0".into());
         let failed = reconciler.reconcile_once().await.expect("isolated error");
         assert_eq!(failed.project_errors, 1);
