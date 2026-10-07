@@ -58,6 +58,8 @@ use crate::{
 pub(super) struct CrewService {
     resource_backend: ResourceBackend,
     #[builder(default)]
+    pub(super) capability_source: RwLock<Option<Arc<dyn crate::crew_capabilities::SessionCapabilitySource>>>,
+    #[builder(default)]
     message_inboxes: Arc<Mutex<HashMap<String, flotilla_resources::MessageInbox>>>,
     #[builder(default)]
     resource_intent_publisher: std::sync::RwLock<Option<Weak<dyn crate::leaf_engine::ResourceIntentPublisher>>>,
@@ -611,6 +613,22 @@ impl CrewService {
             .caller_role(caller_role)
             .maybe_caller_session(caller_session)
             .build())
+    }
+
+    pub(super) async fn crew_capabilities_internal(&self, requested: &CrewCommandContext) -> Result<String, String> {
+        let context = self.resolve_crew_context(requested).await?;
+        let session = context.caller_session.as_ref().ok_or("capabilities requires a live crew session")?;
+        let source = self.capability_source.read().await.clone().ok_or("session capability source unavailable")?;
+        let credentials = source.credentials(&session.spec.env_ref, &crate::crew_capabilities::credential_references(session)?).await?;
+        crate::crew_capabilities::session_card(
+            &self.resource_backend,
+            &context.namespace,
+            &context.convoy,
+            &session.spec,
+            &credentials,
+            &source.endpoints(&session.spec.env_ref).await?,
+        )
+        .await
     }
 
     pub(super) async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String> {

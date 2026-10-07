@@ -1055,6 +1055,9 @@ pub enum CommandAction {
     QueryCrewStalls {
         full: bool,
     },
+    QueryCrewCapabilities {
+        context: CrewCommandContext,
+    },
     QueryCrewList {
         context: CrewCommandContext,
     },
@@ -1161,6 +1164,7 @@ impl CommandAction {
                 | CommandAction::QueryFulfilmentList {}
                 | CommandAction::QueryFleetList { .. }
                 | CommandAction::QueryCrewStalls { .. }
+                | CommandAction::QueryCrewCapabilities { .. }
                 | CommandAction::QueryCrewList { .. }
                 | CommandAction::QueryDaemonLogs { .. }
                 | CommandAction::QueryExplainConvoy { .. }
@@ -1240,6 +1244,7 @@ impl Command {
             CommandAction::QueryFulfilmentList {} => "query fulfilment list",
             CommandAction::QueryFleetList { .. } => "query fleet list",
             CommandAction::QueryCrewStalls { .. } => "query crew stalls",
+            CommandAction::QueryCrewCapabilities { .. } => "query crew capabilities",
             CommandAction::QueryCrewList { .. } => "query crew list",
             CommandAction::QueryDaemonLogs { .. } => "query daemon logs",
             CommandAction::QueryExplainConvoy { .. } => "explain convoy",
@@ -1405,6 +1410,9 @@ pub enum CommandValue {
     FulfilmentList(Box<FulfilmentListResponse>),
     FleetList(Box<FleetListResponse>),
     CrewStalls(Box<CrewStallsResponse>),
+    CrewCapabilities {
+        card: String,
+    },
     CrewList(Box<CrewListResponse>),
     DaemonLogs {
         /// Complete JSON-lines records, oldest first.

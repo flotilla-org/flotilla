@@ -1357,6 +1357,7 @@ fn format_command_result(result: &flotilla_protocol::commands::CommandValue) -> 
             }
             output
         }
+        CommandValue::CrewCapabilities { card } => card.clone(),
         CommandValue::CrewList(crew) => format_crew_list_human(crew),
         CommandValue::DaemonLogs { lines } => lines.join("\n"),
         CommandValue::ProjectExplanation(explanation) => serde_json::to_string_pretty(explanation).expect("serialize project explanation"),

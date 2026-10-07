@@ -69,6 +69,8 @@ struct GithubAppTokenRequest {
 
 #[derive(Deserialize)]
 struct GithubAppTokenResponse {
+    #[serde(default)]
+    permissions: Option<BTreeMap<String, String>>,
     token: String,
     expires_at: DateTime<Utc>,
 }
@@ -80,6 +82,7 @@ struct GithubAppInstallationResponse {
 
 #[derive(Clone, Debug)]
 struct GithubAppToken {
+    permissions: Option<BTreeMap<String, String>>,
     value: String,
     expires_at: DateTime<Utc>,
 }
@@ -208,7 +211,7 @@ impl GithubAppTokenMinter for RealGithubAppTokenMinter {
         if response.token.trim().is_empty() {
             return Err(GithubAppMintError::Other("installation token response was empty".to_string()));
         }
-        Ok(GithubAppToken { value: response.token, expires_at: response.expires_at })
+        Ok(GithubAppToken { value: response.token, expires_at: response.expires_at, permissions: response.permissions })
     }
 }
 
@@ -261,6 +264,8 @@ pub(crate) struct CredentialStore {
     state_dir: PathBuf,
     prepared: Mutex<BTreeSet<(String, String)>>,
     work_deliveries: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    capability_scopes: Mutex<BTreeMap<(String, String), Vec<String>>>,
+    capability_endpoints: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
     ledger_delivery_environment: Mutex<BTreeMap<String, LedgerDeliveryRecord>>,
     materials: Mutex<BTreeMap<(String, String), String>>,
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
@@ -287,6 +292,7 @@ fn github_app_refresh_at(issued_at: DateTime<Utc>, expires_at: DateTime<Utc>) ->
 struct GithubAppDelivery {
     generation: uuid::Uuid,
     request: GithubAppMintRequest,
+    effective_permissions: Option<BTreeMap<String, String>>,
     runner: Arc<dyn CommandRunner>,
     token_file: PathBuf,
     issued_at: DateTime<Utc>,
@@ -334,10 +340,12 @@ pub(crate) struct CredentialRefreshError {
 
 const GITHUB_APP_REFRESH_FAILURE_THRESHOLD: usize = 3;
 
+type ResolvedGithubApp = (GithubAppMintRequest, DateTime<Utc>, Option<BTreeMap<String, String>>);
+
 #[derive(Debug)]
 struct ResolvedMaterial {
     value: String,
-    github_app: Option<(GithubAppMintRequest, DateTime<Utc>)>,
+    github_app: Option<ResolvedGithubApp>,
 }
 
 #[derive(Default)]
@@ -536,6 +544,8 @@ impl CredentialStore {
             state_dir,
             prepared: Mutex::new(BTreeSet::new()),
             work_deliveries: Mutex::new(BTreeMap::new()),
+            capability_scopes: Mutex::new(BTreeMap::new()),
+            capability_endpoints: Mutex::new(BTreeMap::new()),
             ledger_delivery_environment: Mutex::new(BTreeMap::new()),
             materials: Mutex::new(BTreeMap::new()),
             git_config_fragments: Mutex::new(BTreeMap::new()),
@@ -827,7 +837,7 @@ impl CredentialStore {
                 self.materials.lock().await.remove(&cache_key);
                 return Err(error);
             }
-            if let Some((request, _)) = &resolved.github_app {
+            if let Some((request, _, _)) = &resolved.github_app {
                 let deliveries = self.github_app_deliveries.lock().await;
                 if deliveries.get(&cache_key).is_some_and(|existing| existing.request.permissions != request.permissions) {
                     return Err(bounded_adapter_error(
@@ -855,10 +865,11 @@ impl CredentialStore {
                     .collect::<BTreeMap<_, _>>(),
             );
             env.extend(delivered.env);
-            if let Some((request, expires_at)) = resolved.github_app {
+            if let Some((request, expires_at, effective_permissions)) = resolved.github_app {
                 let paths = delivery_paths.as_ref().expect("GitHub App adapter resolves delivery paths");
                 self.github_app_deliveries.lock().await.insert(cache_key.clone(), GithubAppDelivery {
                     generation: uuid::Uuid::new_v4(),
+                    effective_permissions: effective_permissions.or_else(|| request.permissions.clone()),
                     request,
                     runner: Arc::clone(&runner),
                     token_file: github_app_token_file(paths, name),
@@ -922,6 +933,11 @@ impl CredentialStore {
         // Retain only paths and endpoint metadata, keyed by credential so a
         // redelivery can replace its own path without disturbing another grant.
         self.ledger_delivery_environment.lock().await.entry(environment_ref.to_string()).or_default().extend(ledger_deliveries);
+        for key in &prepared_cache_keys {
+            let repositories =
+                credential_scopes.get(&key.1).map(|scope| scope.iter().map(ToString::to_string).collect()).unwrap_or_default();
+            self.capability_scopes.lock().await.insert(key.clone(), repositories);
+        }
         self.prepared.lock().await.extend(prepared_cache_keys);
         Ok(env.into_iter().collect())
     }
@@ -1232,6 +1248,8 @@ impl CredentialStore {
     pub(crate) async fn forget_environment(&self, environment_ref: &str) -> Result<(), String> {
         self.work_deliveries.lock().await.remove(environment_ref);
         self.ledger_delivery_environment.lock().await.remove(environment_ref);
+        self.capability_endpoints.lock().await.remove(environment_ref);
+        self.capability_scopes.lock().await.retain(|(environment, _), _| environment != environment_ref);
         self.cleaned_delivery_environments.lock().await.remove(environment_ref);
         self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
         self.materials.lock().await.retain(|(cached_environment, _), _| cached_environment != environment_ref);
@@ -1291,6 +1309,11 @@ impl CredentialStore {
             }
         }
         Ok(())
+    }
+
+    pub(crate) async fn record_capability_endpoints(&self, environment: &str, env: &[(String, String)]) {
+        let endpoints = env.iter().filter_map(|(key, value)| flotilla_core::crew_capabilities::endpoint_for_env(key, value)).collect();
+        self.capability_endpoints.lock().await.insert(environment.to_string(), endpoints);
     }
 
     pub(crate) async fn tracked_work_deliveries(&self) -> BTreeMap<String, BTreeSet<String>> {
@@ -1481,6 +1504,7 @@ impl CredentialStore {
                 current.issued_at = self.clock.now();
                 current.refresh_failures = 0;
                 current.next_refresh_attempt_at = None;
+                current.effective_permissions = token.permissions.or_else(|| request.permissions.clone());
                 current.request = request;
             }
         }
@@ -1632,7 +1656,7 @@ impl CredentialStore {
                 };
                 self.mint_github_app(&mut request, installation_repository.as_deref())
                     .await
-                    .map(|token| ResolvedMaterial { value: token.value, github_app: Some((request, token.expires_at)) })
+                    .map(|token| ResolvedMaterial { value: token.value, github_app: Some((request, token.expires_at, token.permissions)) })
             }
             (CredentialConsumer::GithubApp { .. }, _) => Err("github-app consumer requires a github-app source".to_string()),
             (_, CredentialSource::GithubApp { .. }) => Err("github-app source requires a github-app consumer".to_string()),
@@ -2430,7 +2454,7 @@ mod tests {
             if matches!(call, 0 | 2) {
                 Err(GithubAppMintError::Transient("GitHub returned HTTP 500".to_string()))
             } else {
-                Ok(GithubAppToken { value: format!("test-token-{call}"), expires_at: Utc::now() + Duration::hours(1) })
+                Ok(GithubAppToken { permissions: None, value: format!("test-token-{call}"), expires_at: Utc::now() + Duration::hours(1) })
             }
         }
     }
@@ -2546,13 +2570,23 @@ mod tests {
 
         async fn mint(&self, _request: &GithubAppMintRequest) -> Result<GithubAppToken, GithubAppMintError> {
             match self.calls.fetch_add(1, Ordering::SeqCst) {
-                0 => Ok(GithubAppToken { value: "initial-token".to_string(), expires_at: self.now + Duration::hours(1) }),
+                0 => {
+                    Ok(GithubAppToken { permissions: None, value: "initial-token".to_string(), expires_at: self.now + Duration::hours(1) })
+                }
                 1 => {
                     self.refresh_started.notify_one();
                     self.release_refresh.notified().await;
-                    Ok(GithubAppToken { value: "stale-refresh-token".to_string(), expires_at: self.now + Duration::hours(2) })
+                    Ok(GithubAppToken {
+                        permissions: None,
+                        value: "stale-refresh-token".to_string(),
+                        expires_at: self.now + Duration::hours(2),
+                    })
                 }
-                2 => Ok(GithubAppToken { value: "reprepared-token".to_string(), expires_at: self.now + Duration::hours(2) }),
+                2 => Ok(GithubAppToken {
+                    permissions: None,
+                    value: "reprepared-token".to_string(),
+                    expires_at: self.now + Duration::hours(2),
+                }),
                 call => Err(GithubAppMintError::Other(format!("unexpected mint call {call}"))),
             }
         }
@@ -2588,8 +2622,8 @@ mod tests {
         let clock = Arc::new(VirtualClock::new(now));
         let minter = Arc::new(FakeGithubAppTokenMinter {
             tokens: StdMutex::new(VecDeque::from([
-                Ok(GithubAppToken { value: "replacement".to_string(), expires_at: now + Duration::hours(2) }),
-                Ok(GithubAppToken { value: "late-replacement".to_string(), expires_at: now + Duration::hours(3) }),
+                Ok(GithubAppToken { permissions: None, value: "replacement".to_string(), expires_at: now + Duration::hours(2) }),
+                Ok(GithubAppToken { permissions: None, value: "late-replacement".to_string(), expires_at: now + Duration::hours(3) }),
             ])),
             requests: StdMutex::new(Vec::new()),
         });
@@ -2604,6 +2638,7 @@ mod tests {
             PathBuf::from("/state"),
         );
         store.github_app_deliveries.lock().await.insert(("vessel".to_string(), "github-app".to_string()), GithubAppDelivery {
+            effective_permissions: None,
             generation: uuid::Uuid::new_v4(),
             request: GithubAppMintRequest {
                 installation_id: 1,
@@ -2652,9 +2687,9 @@ mod tests {
                 Err("outage 5".to_string()),
                 Err("outage 6".to_string()),
                 Err("outage 7".to_string()),
-                Ok(GithubAppToken { value: "recovered".to_string(), expires_at: now + Duration::hours(2) }),
+                Ok(GithubAppToken { permissions: None, value: "recovered".to_string(), expires_at: now + Duration::hours(2) }),
                 Err("new outage".to_string()),
-                Ok(GithubAppToken { value: "recovered again".to_string(), expires_at: now + Duration::hours(3) }),
+                Ok(GithubAppToken { permissions: None, value: "recovered again".to_string(), expires_at: now + Duration::hours(3) }),
             ])),
             requests: StdMutex::new(Vec::new()),
         });
@@ -2669,6 +2704,7 @@ mod tests {
             PathBuf::from("/state"),
         );
         store.github_app_deliveries.lock().await.insert(("vessel".to_string(), "github-app".to_string()), GithubAppDelivery {
+            effective_permissions: None,
             generation: uuid::Uuid::new_v4(),
             request: GithubAppMintRequest {
                 installation_id: 1,
@@ -2730,8 +2766,8 @@ mod tests {
         let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
         let minter = Arc::new(FakeGithubAppTokenMinter {
             tokens: StdMutex::new(VecDeque::from([
-                Ok(GithubAppToken { value: "coder-token".to_string(), expires_at: now + Duration::hours(1) }),
-                Ok(GithubAppToken { value: "reviewer-token".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken { permissions: None, value: "coder-token".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken { permissions: None, value: "reviewer-token".to_string(), expires_at: now + Duration::hours(1) }),
             ])),
             requests: StdMutex::new(Vec::new()),
         });
@@ -2777,14 +2813,19 @@ mod tests {
 
     #[tokio::test]
     async fn project_membership_remints_live_token_without_widening_fixed_scope() {
+        use flotilla_core::crew_capabilities::{credential_card, SessionCapabilitySource};
         let now: DateTime<Utc> = "2026-08-03T16:00:00Z".parse().expect("test timestamp");
         let clock = Arc::new(VirtualClock::new(now));
         let minter = Arc::new(FakeGithubAppTokenMinter {
             tokens: StdMutex::new(VecDeque::from([
-                Ok(GithubAppToken { value: "project-initial".to_string(), expires_at: now + Duration::hours(1) }),
-                Ok(GithubAppToken { value: "fixed-initial".to_string(), expires_at: now + Duration::hours(1) }),
-                Ok(GithubAppToken { value: "project-expanded".to_string(), expires_at: now + Duration::hours(1) }),
-                Ok(GithubAppToken { value: "different-role".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken { permissions: None, value: "project-initial".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken { permissions: None, value: "fixed-initial".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken {
+                    permissions: Some(BTreeMap::from([("workflows".into(), "write".into()), ("contents".into(), "write".into())])),
+                    value: "project-expanded".to_string(),
+                    expires_at: now + Duration::hours(1),
+                }),
+                Ok(GithubAppToken { permissions: None, value: "different-role".to_string(), expires_at: now + Duration::hours(1) }),
             ])),
             requests: StdMutex::new(Vec::new()),
         });
@@ -2837,13 +2878,15 @@ mod tests {
             Arc::new(TestEnv::default()),
             EnvironmentBag::new(),
             runner.clone(),
-            GithubAppMinting { clock, minter: minter.clone() },
+            GithubAppMinting { clock: clock.clone(), minter: minter.clone() },
             PathBuf::from("/state"),
         );
         let refs = BTreeSet::from(["github-app".to_string()]);
         let initial = BTreeMap::from([("github-app".to_string(), BTreeSet::from([first.key()]))]);
         store.prepare_scoped("project-env", &refs, &initial, runner.clone()).await.expect("prepare project credential");
         store.prepare_scoped("fixed-env", &refs, &initial, runner.clone()).await.expect("prepare fixed credential");
+        assert!(!credential_card(&store.credentials("project-env", &refs).await.expect("launch capabilities"))
+            .contains("You can push `.github/workflows`"));
         store
             .set_github_app_scopes(
                 "project-env",
@@ -2871,6 +2914,10 @@ mod tests {
             .expect("expand project membership");
 
         assert!(store.refresh_due_github_app_tokens().await.is_empty());
+        let observed = store.credentials("project-env", &refs).await.expect("live refreshed delivery");
+        assert_eq!(observed[0].repositories, ["first", "second"]);
+        assert!(credential_card(&observed).contains("You can push `.github/workflows`"));
+        assert_eq!(store.credentials("fixed-env", &refs).await.expect("fixed delivery")[0].repositories, ["first"]);
         {
             let requests = minter.requests.lock().expect("requests lock");
             assert_eq!(requests.len(), 3, "membership change remints before expiry; explicit scope stays unchanged");
@@ -2889,6 +2936,29 @@ mod tests {
         assert!(error.contains("different minted permissions"), "{error}");
         assert_eq!(minter.requests.lock().expect("requests lock").len(), 3, "conflicting crew must not mint a discarded token");
         assert!(!runner.writes.lock().expect("writes lock").iter().any(|(_, contents)| contents.contains("different-role")));
+        // Shared environments cannot advertise credentials outside this session's
+        // references. Failed remints preserve the previous effective card.
+        assert!(store.credentials("project-env", &BTreeSet::new()).await.expect("ungranted credential").is_empty());
+        let before_failure = store.credentials("project-env", &refs).await.expect("effective card");
+        {
+            let mut tokens = minter.tokens.lock().expect("tokens");
+            tokens.clear();
+            tokens.push_back(Err("mint unavailable".into()));
+        }
+        store
+            .set_github_app_scopes(
+                "project-env",
+                &BTreeMap::from([("github-app".into(), GithubAppScope {
+                    fixed_repositories: BTreeSet::from([second.key()]),
+                    projects: BTreeSet::new(),
+                    permissions: None,
+                })]),
+            )
+            .await;
+        assert_eq!(store.refresh_due_github_app_tokens().await.len(), 1);
+        assert_eq!(store.credentials("project-env", &refs).await.expect("failed refresh card"), before_failure);
+        clock.advance(Duration::hours(2));
+        assert!(store.credentials("project-env", &refs).await.expect("expired grant").is_empty());
     }
 
     type RecordedCall = (String, Vec<String>, Vec<u8>);
@@ -3716,16 +3786,24 @@ interactions:
         let clock = Arc::new(VirtualClock::new(now));
         let minter = Arc::new(FakeGithubAppTokenMinter {
             tokens: StdMutex::new(VecDeque::from([
-                Ok(GithubAppToken { value: "installation-token-one".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken { permissions: None, value: "installation-token-one".to_string(), expires_at: now + Duration::hours(1) }),
                 Err("temporary adoption outage one".to_string()),
                 Err("temporary adoption outage two".to_string()),
                 Err("persistent adoption outage".to_string()),
-                Ok(GithubAppToken { value: "installation-token-two".to_string(), expires_at: now + Duration::hours(2) }),
+                Ok(GithubAppToken { permissions: None, value: "installation-token-two".to_string(), expires_at: now + Duration::hours(2) }),
                 Err("temporary outage one".to_string()),
                 Err("temporary outage two".to_string()),
                 Err("persistent outage".to_string()),
-                Ok(GithubAppToken { value: "installation-token-three".to_string(), expires_at: now + Duration::hours(3) }),
-                Ok(GithubAppToken { value: "installation-token-four".to_string(), expires_at: now + Duration::hours(4) }),
+                Ok(GithubAppToken {
+                    permissions: None,
+                    value: "installation-token-three".to_string(),
+                    expires_at: now + Duration::hours(3),
+                }),
+                Ok(GithubAppToken {
+                    permissions: None,
+                    value: "installation-token-four".to_string(),
+                    expires_at: now + Duration::hours(4),
+                }),
             ])),
             requests: StdMutex::new(Vec::new()),
         });
@@ -4041,8 +4119,8 @@ interactions:
             .expect("credential");
         let minter = Arc::new(FakeGithubAppTokenMinter {
             tokens: StdMutex::new(VecDeque::from([
-                Ok(GithubAppToken { value: "first-token".to_string(), expires_at: now + Duration::hours(1) }),
-                Ok(GithubAppToken { value: "second-token".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken { permissions: None, value: "first-token".to_string(), expires_at: now + Duration::hours(1) }),
+                Ok(GithubAppToken { permissions: None, value: "second-token".to_string(), expires_at: now + Duration::hours(1) }),
             ])),
             requests: StdMutex::new(Vec::new()),
         });
@@ -5513,3 +5591,46 @@ interactions:
 #[cfg(test)]
 #[path = "credential/http_contract.rs"]
 mod http_contract;
+
+#[async_trait]
+impl flotilla_core::crew_capabilities::SessionCapabilitySource for CredentialStore {
+    async fn endpoints(&self, environment: &str) -> Result<BTreeMap<String, String>, String> {
+        Ok(self.capability_endpoints.lock().await.get(environment).cloned().unwrap_or_default())
+    }
+
+    async fn credentials(
+        &self,
+        environment: &str,
+        references: &BTreeSet<String>,
+    ) -> Result<Vec<flotilla_core::crew_capabilities::CredentialCapability>, String> {
+        let names = self
+            .prepared
+            .lock()
+            .await
+            .iter()
+            .filter(|(env, name)| env == environment && references.contains(name))
+            .map(|(_, name)| name.clone())
+            .collect::<BTreeSet<_>>();
+        let scopes = self.capability_scopes.lock().await;
+        let deliveries = self.github_app_deliveries.lock().await;
+        let mut capabilities = Vec::new();
+        for name in names {
+            let delivery = deliveries.get(&(environment.to_string(), name.clone()));
+            if delivery.is_some_and(|delivery| delivery.expires_at <= self.clock.now()) {
+                continue;
+            }
+            capabilities.push(
+                flotilla_core::crew_capabilities::CredentialCapability::builder()
+                    .name(name.clone())
+                    .repositories(
+                        delivery
+                            .map(|delivery| delivery.request.repositories.clone())
+                            .unwrap_or_else(|| scopes.get(&(environment.to_string(), name.clone())).cloned().unwrap_or_default()),
+                    )
+                    .maybe_permissions(delivery.and_then(|delivery| delivery.effective_permissions.clone()))
+                    .build(),
+            );
+        }
+        Ok(capabilities)
+    }
+}

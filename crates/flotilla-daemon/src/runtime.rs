@@ -162,6 +162,55 @@ struct RuntimeOperatorReconciler {
     local_root: String,
 }
 
+struct RuntimeSessionCapabilities {
+    state: std::sync::Weak<ControllerRuntimeState>,
+}
+
+#[async_trait]
+impl flotilla_core::crew_capabilities::SessionCapabilitySource for RuntimeSessionCapabilities {
+    async fn credentials(
+        &self,
+        environment: &str,
+        references: &BTreeSet<String>,
+    ) -> Result<Vec<flotilla_core::crew_capabilities::CredentialCapability>, String> {
+        let state = self.state.upgrade().ok_or("session capability runtime unavailable")?;
+        match &state.credential_store {
+            Some(store) => store.credentials(environment, references).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn endpoints(&self, environment: &str) -> Result<BTreeMap<String, String>, String> {
+        let state = self.state.upgrade().ok_or("session capability runtime unavailable")?;
+        let mut endpoints = match &state.credential_store {
+            Some(store) => store.endpoints(environment).await?,
+            None => BTreeMap::new(),
+        };
+        if environment == state.host_direct_environment_name {
+            if let Some(socket) = state.daemon.daemon_socket_path().await {
+                endpoints.insert("Flotilla daemon".into(), socket.display().to_string());
+            }
+        } else {
+            let record = state
+                .daemon
+                .resource_backend()
+                .including_replicas::<Environment>(&state.namespace)
+                .get(environment)
+                .await
+                .map_err(|error| error.to_string())?
+                .object;
+            if let Some(docker) = record.spec.docker {
+                for (key, value) in &docker.env {
+                    if let Some((destination, address)) = flotilla_core::crew_capabilities::endpoint_for_env(key, value) {
+                        endpoints.insert(destination, address);
+                    }
+                }
+            }
+        }
+        Ok(endpoints)
+    }
+}
+
 struct RuntimeWorkCredentialReconciler {
     state: std::sync::Weak<ControllerRuntimeState>,
 }
@@ -896,6 +945,7 @@ impl DaemonRuntime {
                 daemon.set_work_credential_reconciler(Arc::new(RuntimeWorkCredentialReconciler { state: Arc::downgrade(&state) })),
             )
             .await;
+            daemon.set_session_capability_source(Arc::new(RuntimeSessionCapabilities { state: Arc::downgrade(&state) })).await;
             controller_state = Some(state);
         }
 
@@ -3338,6 +3388,9 @@ fn spawn_credential_refresh_task(daemon: Arc<InProcessDaemon>, namespace: String
         let store = Arc::clone(&store);
         async move {
             let errors = store.refresh_due_github_app_tokens().await;
+            if let Err(error) = daemon.refresh_capability_cards(&namespace).await {
+                warn!(%error, "failed to refresh session capability cards");
+            }
             for error in &errors {
                 warn!(error = %error.message, environment = %error.environment_ref, "failed to refresh GitHub App credential delivery");
             }
@@ -6747,6 +6800,31 @@ impl TerminalRuntime for TerminalControllerRuntime {
                         let runner = self.runner_for_env(&spec.env_ref)?;
                         credential_env = material.crew_environment(&spec.role, &required, &environment, &*runner).await?;
                     }
+                }
+                if let Some(store) = &self.state.credential_store {
+                    use flotilla_core::crew_capabilities::SessionCapabilitySource;
+                    store.record_capability_endpoints(&spec.env_ref, &credential_env).await;
+                    let credentials = store.credentials(&spec.env_ref, &credential_refs).await?;
+                    let card = flotilla_core::crew_capabilities::session_card(
+                        &self.state.daemon.resource_backend(),
+                        &context.namespace,
+                        &context.convoy,
+                        spec,
+                        &credentials,
+                        &RuntimeSessionCapabilities { state: Arc::downgrade(&self.state) }.endpoints(&spec.env_ref).await?,
+                    )
+                    .await?;
+                    let sessions = self.state.daemon.resource_backend().using::<TerminalSession>(&context.namespace);
+                    let session = sessions.get(name).await.map_err(|error| error.to_string())?;
+                    flotilla_core::crew_capabilities::observe_card(
+                        &self.state.daemon.resource_backend(),
+                        &context.namespace,
+                        &session,
+                        &card,
+                    )
+                    .await?;
+                    materialized_brief.content.push_str("\n\n");
+                    materialized_brief.content.push_str(&card);
                 }
                 adapter.prepare_with_vcs(&cwd, &materialized_brief, &credential_env, vcs.as_ref()).await?;
                 for copy_root in &brief.copies {
@@ -17463,7 +17541,7 @@ mod tests {
         let workspace = temp.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
         let env_id = EnvironmentId::new("contained-claude");
-        if private_home {
+        {
             backend
                 .using::<Environment>(NAMESPACE)
                 .create(&empty_meta(env_id.as_str()), &EnvironmentSpec {
@@ -17478,7 +17556,11 @@ mod tests {
                         required_agent_adapters: BTreeSet::from(["claude-code".into()]),
                         pull_policy: Default::default(),
                         mounts: Vec::new(),
-                        env: BTreeMap::from([("FLOTILLA_CREW_SKILLS".into(), "{\"coder\":[],\"reviewer\":[]}".into())]),
+                        env: if private_home {
+                            BTreeMap::from([("FLOTILLA_CREW_SKILLS".into(), "{\"coder\":[],\"reviewer\":[]}".into())])
+                        } else {
+                            BTreeMap::new()
+                        },
                     }),
                 })
                 .await
@@ -17568,6 +17650,26 @@ mod tests {
             ]),
             pool: "fake-terminals".to_string(),
         };
+        // Managed launch cards read durable context, just as the live command does.
+        let backend = daemon.resource_backend();
+        backend
+            .using::<Convoy>(NAMESPACE)
+            .create(&empty_meta("demo"), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+            .await
+            .expect("convoy");
+        backend
+            .using::<Vessel>(NAMESPACE)
+            .create(&empty_meta("demo-work"), &flotilla_resources::VesselSpec {
+                convoy_ref: "demo".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "policy".into(),
+                adopted_checkout_refs: Default::default(),
+            })
+            .await
+            .expect("vessel");
+        let mut terminal_meta = empty_meta("terminal-demo-work-coder");
+        terminal_meta.annotations.insert(flotilla_resources::CREDENTIAL_REFS_ANNOTATION.into(), "[\"claude-max\"]".into());
+        backend.using::<TerminalSession>(NAMESPACE).create(&terminal_meta, &spec).await.expect("terminal context");
         let tags = [flotilla_resources::TerminalSessionTag::new(CREDENTIAL_REF_SESSION_TAG, "claude-max")];
 
         let launched = TerminalControllerRuntime { state }
@@ -17597,6 +17699,12 @@ mod tests {
                     .as_str()),
             "the contained Claude process must receive the config directory owned by its adapter"
         );
+        // The first turn includes the assignment and its capability card, never token material.
+        assert!(launch.command.contains("Implement the issue."));
+        assert!(launch.command.contains("## Your capabilities"));
+        assert!(launch.command.contains("claude-max"));
+        assert!(!launch.command.contains("oauth-secret-material"));
+        assert!(!launch.command.contains("superseded-spec-token"));
         assert_eq!(launch.initial_size, Some(CREW_SESSION_SIZE));
         let crew_id = &launched.crew.expect("contained crew identity").id;
         for (name, expected) in [
@@ -18054,7 +18162,9 @@ mod tests {
         let ensured = pool.ensured.lock().await;
         let coder_launch = ensured.iter().find(|launch| launch.session_name.ends_with("-coder")).expect("coder launch");
         assert!(coder_launch.command.contains("--dangerously-bypass-approvals-and-sandbox"));
-        assert!(!coder_launch.command.contains("without leaking this full brief"));
+        // #2821: the complete rendered brief now appears in the launch prompt.
+        assert!(coder_launch.command.contains("without leaking this full brief"));
+        assert!(coder_launch.command.contains("This is also at"));
         for (name, expected) in [
             ("FLOTILLA_CREW_ID", coder_id.as_str()),
             ("FLOTILLA_CONVOY", context.convoy.as_str()),

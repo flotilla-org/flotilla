@@ -82,7 +82,14 @@ async fn receive(headers: HeaderMap, body: Bytes) -> (StatusCode, String) {
         validate_payload(&body)
     });
     match result {
-        Ok(()) => (StatusCode::CREATED, json!({"token":"stand-in-token", "expires_at":"2026-10-04T01:00:00Z"}).to_string()),
+        Ok(()) => {
+            let payload: Value = serde_json::from_slice(&body).expect("validated payload");
+            let permissions = payload.get("permissions").cloned().unwrap_or_else(|| json!({"contents":"write", "issues":"write"}));
+            (
+                StatusCode::CREATED,
+                json!({"token":"stand-in-token", "expires_at":"2026-10-04T01:00:00Z", "permissions":permissions}).to_string(),
+            )
+        }
         Err(error) => (StatusCode::UNPROCESSABLE_ENTITY, error),
     }
 }
@@ -136,6 +143,8 @@ async fn github_app_mint_satisfies_http_contract() {
         Some(BTreeMap::from([("contents".into(), "read".into())])),
         Some(BTreeMap::from([("contents".into(), "write".into()), ("issues".into(), "read".into())])),
     ] {
+        let expected_permissions =
+            permissions.clone().unwrap_or_else(|| BTreeMap::from([("contents".into(), "write".into()), ("issues".into(), "write".into())]));
         let token = minter
             .mint(&GithubAppMintRequest {
                 installation_id: 9876,
@@ -146,6 +155,8 @@ async fn github_app_mint_satisfies_http_contract() {
             })
             .await
             .expect("stand-in must accept production mint");
+        // Effective permissions come from the successful mint response.
+        assert_eq!(token.permissions, Some(expected_permissions));
         assert_eq!(token.value, "stand-in-token");
         assert_eq!(token.expires_at, "2026-10-04T01:00:00Z".parse::<DateTime<Utc>>().expect("expiry"));
     }
