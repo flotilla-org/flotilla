@@ -10,7 +10,7 @@ use flotilla_resources::{
     CredentialSpecSpec, CrewSource, CrewSpec, CrewWorkPhase, CrewWorkState, DemandStatusPatch, Environment as ResourceEnvironment,
     EnvironmentPhase, EnvironmentSpec as ResourceEnvironmentSpec, EnvironmentStatus as ResourceEnvironmentStatus, Event, FulfilmentFacts,
     FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, HostCondition, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, PlacementPolicy, PlacementPolicySpec, ProjectRepositoryRole,
+    HostDirectPlacementPolicySpec, HostSpec, HostStatus, ImageAcquisitionCost, PlacementPolicy, PlacementPolicySpec, ProjectRepositoryRole,
     ProjectRepositorySpec, RepositoryStatus, Selector, TerminalAttention, TerminalAttentionSource, TerminalAttentionState,
     TerminalSession as ResourceTerminalSession, TerminalSessionPhase as ResourceTerminalSessionPhase, TerminalSessionSource,
     TerminalSessionSpec as ResourceTerminalSessionSpec, TerminalSessionStatus as ResourceTerminalSessionStatus, VesselRequirement,
@@ -851,6 +851,7 @@ fn placement_tiebreak_reserves_scarce_platforms_for_named_needs() {
             },
             free_slots: Some(1),
             host_ready: true,
+            image_cost: ImageAcquisitionCost::Held,
             sleeping_until: None,
         };
         let no_need = BTreeSet::new();
@@ -9771,7 +9772,7 @@ async fn standing_presence_inherits_role_shape_and_delivers_charter_artifact() {
     projects.apply(&test_meta("fleet"), &fleet).await.expect("fleet");
     backend
         .definitions::<FleetDesignation>("flotilla")
-        .apply(&test_meta("fleet"), &FleetDesignationSpec { project: "fleet".into() })
+        .apply(&test_meta("fleet"), &FleetDesignationSpec { project: "fleet".into(), image_cache: None })
         .await
         .expect("fleet designation");
     let mut project = projects.get("standing-project").await.expect("project");

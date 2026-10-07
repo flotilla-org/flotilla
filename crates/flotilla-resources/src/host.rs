@@ -486,7 +486,13 @@ impl StatusPatch<HostStatus> for HostStatusPatch {
                 resource_store,
                 conditions,
             } => {
+                // Image inventory is observed independently of heartbeat gathering.
+                // Preserve its latest value atomically when heartbeat has no update.
+                let image_inventory = status.capabilities.get(crate::IMAGE_DIGESTS_CAPABILITY).cloned();
                 status.capabilities = capabilities.clone();
+                if let Some(inventory) = image_inventory {
+                    status.capabilities.entry(crate::IMAGE_DIGESTS_CAPABILITY.into()).or_insert(inventory);
+                }
                 status.description = description.as_deref().cloned();
                 // Placement capability keys are authoritative; do not persist a second
                 // availability list in the descriptive provider health observations.

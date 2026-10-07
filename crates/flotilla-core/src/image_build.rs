@@ -46,6 +46,62 @@ impl ImageBuildAdmission {
         Self { backend, namespace: namespace.into(), inputs }
     }
 
+    /// Look up a completed pinned chain without authoring demand. Placement
+    /// can compare acquisition costs before selecting a host.
+    pub async fn completed(
+        &self,
+        architecture: &str,
+        composition: &ImageComposition,
+    ) -> Result<Option<flotilla_resources::ResourceObject<ImageBuild>>, String> {
+        let architecture = canonical_image_architecture(architecture);
+        let candidates =
+            self.backend.including_replicas::<ImageBuild>(&self.namespace).list().await.map_err(|error| error.to_string())?.items;
+        let mut parent_key = None;
+        let mut parent_digest: Option<String> = None;
+        let mut result = None;
+        for layer in &composition.layers {
+            let source = self.inputs.resolve(layer, architecture).await?;
+            if source.architecture != architecture {
+                return Err("image input resolver changed target architecture".into());
+            }
+            if source.stability != ImageInputStability::Pinned {
+                return Ok(None);
+            }
+            let digest = match (&parent_digest, &layer.spec.parent) {
+                (Some(digest), _) => digest.clone(),
+                (None, ImageLayerParent::Image(image)) => image.rsplit_once('@').map_or(image.as_str(), |(_, digest)| digest).to_string(),
+                _ => return Ok(None),
+            };
+            let inputs = ResolvedImageInputs::builder()
+                .parent_digest(digest)
+                .maybe_parent_recipe_key(parent_key.clone())
+                .architecture(source.architecture)
+                .content_hashes(source.content_hashes)
+                .args(source.args)
+                .pins(source.pins)
+                .stability(source.stability)
+                .build();
+            let key = inputs.recipe_key()?;
+            let Some(found) = candidates.iter().map(|source| &source.object).find(|build| {
+                build.spec.recipe_key == key
+                    && build.spec.inputs == inputs
+                    && build.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ImageBuildPhase::Built)
+            }) else {
+                return Ok(None);
+            };
+            let found = flotilla_resources::read_image_build(&self.backend, &self.namespace, &found.metadata.name)
+                .await
+                .map_err(|error| error.to_string())?;
+            let Some(status) = found.status.as_ref().filter(|status| status.phase == flotilla_resources::ImageBuildPhase::Built) else {
+                return Ok(None);
+            };
+            parent_digest = Some(status.identity.as_ref().ok_or("built image has no identity")?.local_image_id.clone());
+            parent_key = Some(key);
+            result = Some(found);
+        }
+        Ok(result)
+    }
+
     pub async fn join(&self, placement_host: &str, composition: &ImageComposition) -> Result<Vec<String>, String> {
         if composition.layers.is_empty() {
             return Err("image build requires a composition stage".into());
@@ -68,6 +124,22 @@ impl ImageBuildAdmission {
             .and_then(|summary| summary.system.arch.as_deref())
             .ok_or("image placement host architecture is unknown")?;
         let architecture = canonical_image_architecture(architecture);
+        if let Some(mut completed) = self.completed(architecture, composition).await? {
+            let mut chain = Vec::new();
+            for _ in 0..composition.layers.len() {
+                chain.push(completed.metadata.name.clone());
+                let Some(parent) = &completed.spec.parent_build_ref else {
+                    break;
+                };
+                completed = flotilla_resources::read_image_build(&self.backend, &self.namespace, parent)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            chain.reverse();
+            if chain.len() == composition.layers.len() {
+                return Ok(chain);
+            }
+        }
         let capacity = |host: &flotilla_resources::ResourceObject<Host>| -> Result<Option<ImageBuildCapacity>, String> {
             Ok(host.spec.image_build_capacity.clone())
         };
@@ -143,7 +215,30 @@ impl ImageBuildAdmission {
                     .then(|| format!("{host_ref}:{}", uuid::Uuid::new_v4()))
             });
             let recipe_key = inputs.execution_key(nonce.as_deref())?;
-            let name = format!("image-build-{}-{}", recipe_key.trim_start_matches("sha256:"), host_ref);
+            // A pinned recipe's built execution can serve every same-architecture
+            // host. Unpinned execution keys remain scoped to their original demand.
+            let shared = if inputs.stability == ImageInputStability::Pinned {
+                self.backend
+                    .including_replicas::<ImageBuild>(&self.namespace)
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .items
+                    .into_iter()
+                    .map(|source| source.object)
+                    .filter(|build| {
+                        build.spec.recipe_key == recipe_key
+                            && build.spec.inputs == inputs
+                            && build.status.as_ref().is_some_and(|status| status.phase == flotilla_resources::ImageBuildPhase::Built)
+                    })
+                    .min_by_key(|build| (build.spec.host_ref != placement_host, build.metadata.name.clone()))
+            } else {
+                None
+            };
+            let name = shared
+                .as_ref()
+                .map(|build| build.metadata.name.clone())
+                .unwrap_or_else(|| format!("image-build-{}-{}", recipe_key.trim_start_matches("sha256:"), host_ref));
             let old_inputs = builds
                 .list()
                 .await
@@ -182,15 +277,17 @@ impl ImageBuildAdmission {
                     ]),
                 })
                 .build();
-            match builds.create(&InputMeta::builder().name(name.clone()).build(), &spec).await {
-                Ok(_) => {}
-                Err(ResourceError::Conflict { .. }) => {
-                    let existing = builds.get(&name).await.map_err(|error| error.to_string())?;
-                    if existing.spec.inputs != spec.inputs || existing.spec.recipe_key != spec.recipe_key {
-                        return Err(format!("image build {name} has different immutable inputs"));
+            if shared.is_none() {
+                match builds.create(&InputMeta::builder().name(name.clone()).build(), &spec).await {
+                    Ok(_) => {}
+                    Err(ResourceError::Conflict { .. }) => {
+                        let existing = builds.get(&name).await.map_err(|error| error.to_string())?;
+                        if existing.spec.inputs != spec.inputs || existing.spec.recipe_key != spec.recipe_key {
+                            return Err(format!("image build {name} has different immutable inputs"));
+                        }
                     }
+                    Err(error) => return Err(error.to_string()),
                 }
-                Err(error) => return Err(error.to_string()),
             }
             parent = Some(name.clone());
             parent_key = Some(recipe_key);

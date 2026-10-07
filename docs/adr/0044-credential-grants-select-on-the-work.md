@@ -123,3 +123,19 @@ A crew acts under the human's identity only through a grant that says so, never 
 
 - "Stance first" is replaced by "work first" (§1). The selector keys are project, repositories, role and repository trust; vessel isolation moves to delivery (§2).
 - The migration clause letting trusted crews inherit ambient identity is superseded (§5, §6).
+
+## Amendment: host image actions (#2729)
+
+Registry cache operations are host work, outside a crew's credential context.
+CredentialGrant.selector.host_action selects image-pull or image-push and
+an optional set of canonical Host resource names. It is mutually exclusive with
+the project, repository, role and repository-trust selectors. Image push also
+requires a declared builder with positive build slots. A host-action grant never
+matches a crew or provides a landing credential.
+
+The optional fleet image-cache binding references separate pull and push
+CredentialSpecs. The daemon resolves operator-staged material for each operation
+and gives Docker a private throwaway config; no ambient login or global config
+is used. Work-selected grants remain the only route by which a crew may receive
+registry credentials. This adds host actions alongside work selection; it does
+not make vessel isolation a selector.

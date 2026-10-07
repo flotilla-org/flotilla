@@ -1112,7 +1112,16 @@ impl ConvoyAdmission {
                             continue;
                         }
                     }
-                    candidates.push(KindCandidate { kind, placement, free_slots, host_ready, sleeping_until });
+                    let image_cost = image_placement_cost(
+                        &self.backend,
+                        namespace,
+                        host,
+                        &kind.spec.realisation,
+                        composed.as_deref(),
+                        self.image_build_inputs.read().await.clone(),
+                    )
+                    .await?;
+                    candidates.push(KindCandidate { kind, placement, free_slots, host_ready, sleeping_until, image_cost });
                 }
                 Err(error) => rejected.push(refusal(error)),
             }
@@ -2836,6 +2845,7 @@ pub(super) struct KindCandidate {
     pub(super) free_slots: Option<u32>,
     pub(super) host_ready: bool,
     pub(super) sleeping_until: Option<DateTime<Utc>>,
+    pub(super) image_cost: flotilla_resources::ImageAcquisitionCost,
 }
 
 pub(super) trait PlacementCandidateOrder: Send + Sync {
@@ -2891,6 +2901,7 @@ impl PlacementCandidateOrder for PlacementTieBreak<'_> {
             let policy = candidate.placement.selected.as_ref().expect("candidate has a validated placement policy");
             (
                 !self.available(candidate),
+                candidate.image_cost,
                 candidate.kind.spec.cost_class,
                 Reverse(policy.spec.priority),
                 candidate.kind.metadata.name.clone(),
@@ -3740,6 +3751,68 @@ pub(super) fn parse_ad_hoc_capability_need(value: &str) -> Result<CapabilityNeed
     Ok(need)
 }
 
+/// Image acquisition is a placement cost, after host liveness and before other
+/// economic tie breaks. Host inventories are hints; delivery verifies identity.
+async fn image_placement_cost(
+    backend: &ResourceBackend,
+    namespace: &str,
+    host: Option<&ResourceObject<ResourceHost>>,
+    realisation: &flotilla_resources::FulfilmentRealisation,
+    composition: Option<&flotilla_resources::ImageComposition>,
+    resolver: Option<Arc<dyn crate::image_build::ImageBuildInputResolver>>,
+) -> Result<flotilla_resources::ImageAcquisitionCost, String> {
+    use flotilla_resources::{FleetDesignation, FLEET_DESIGNATION_NAME, IMAGE_DIGESTS_CAPABILITY};
+    let completed = if let (Some(composition), Some(resolver), Some(architecture)) = (
+        composition,
+        resolver,
+        host.and_then(|host| host.status.as_ref())
+            .and_then(|status| status.description.as_ref())
+            .and_then(|description| description.system.arch.as_deref()),
+    ) {
+        crate::image_build::ImageBuildAdmission::new(backend.clone(), namespace, resolver).completed(architecture, composition).await?
+    } else {
+        None
+    };
+    let completed_identity = completed.as_ref().and_then(|build| build.status.as_ref()).and_then(|status| status.identity.as_ref());
+    let image = match realisation {
+        flotilla_resources::FulfilmentRealisation::HostDirect => return Ok(flotilla_resources::ImageAcquisitionCost::Held),
+        flotilla_resources::FulfilmentRealisation::DockerPerVessel { image } => match image {
+            flotilla_resources::DockerImageSource::Literal(image) => Some(image.as_str()),
+            _ => composition
+                .and_then(|composition| composition.identity.as_ref())
+                .or(completed_identity)
+                .map(|identity| identity.local_image_id.as_str()),
+        },
+    };
+    let held = host
+        .and_then(|host| host.status.as_ref())
+        .and_then(|status| status.capabilities.get(IMAGE_DIGESTS_CAPABILITY))
+        .and_then(|value| serde_json::from_value::<BTreeSet<String>>(value.clone()).ok())
+        .unwrap_or_default();
+    if image.is_some_and(|image| held.contains(image) || image.rsplit_once('@').is_some_and(|(_, digest)| held.contains(digest))) {
+        return Ok(flotilla_resources::ImageAcquisitionCost::Held);
+    }
+    let cache = match backend.definitions::<FleetDesignation>(namespace).get(FLEET_DESIGNATION_NAME).await {
+        Ok(fleet) => fleet.spec.image_cache,
+        Err(ResourceError::NotFound { .. }) => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    let published =
+        completed.as_ref().and_then(|build| build.status.as_ref()).and_then(|status| status.availability.registry_ref.as_deref());
+    let registry = cache.as_ref().is_some_and(|cache| {
+        published.or(image).is_some_and(|reference| {
+            reference
+                .rsplit_once('@')
+                .is_some_and(|(repository, digest)| repository == cache.repository && flotilla_resources::is_image_digest(digest))
+        })
+    });
+    Ok(if registry {
+        flotilla_resources::ImageAcquisitionCost::RegistryPull
+    } else {
+        flotilla_resources::ImageAcquisitionCost::BuildOrTransfer
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3934,7 +4007,7 @@ mod tests {
         projects.apply(&InputMeta::builder().name("fleet".into()).build(), &fleet).await.expect("fleet");
         backend
             .definitions::<FleetDesignation>("flotilla")
-            .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec { project: "fleet".into() })
+            .apply(&InputMeta::builder().name("fleet".into()).build(), &FleetDesignationSpec { project: "fleet".into(), image_cache: None })
             .await
             .expect("designation");
         let templates = backend.definitions::<WorkflowTemplate>("flotilla");
@@ -4120,6 +4193,7 @@ mod tests {
                 status: None,
             };
             KindCandidate {
+                image_cost: flotilla_resources::ImageAcquisitionCost::Held,
                 kind: ResourceObject::<FulfilmentKind> {
                     metadata,
                     spec: FulfilmentKindSpec::builder()
@@ -4141,6 +4215,20 @@ mod tests {
                 sleeping_until,
             }
         };
+        // #2729: exact-held beats pull, and pull beats build/transfer even
+        // when another economic class would prefer the more expensive image.
+        for (left_cost, right_cost) in [
+            (flotilla_resources::ImageAcquisitionCost::Held, flotilla_resources::ImageAcquisitionCost::RegistryPull),
+            (flotilla_resources::ImageAcquisitionCost::RegistryPull, flotilla_resources::ImageAcquisitionCost::BuildOrTransfer),
+        ] {
+            let mut left = candidate("left", FulfilmentCostClass::Metered, true, None, Some(1));
+            let mut right = candidate("right", FulfilmentCostClass::OwnedIdle, true, None, Some(1));
+            left.image_cost = left_cost;
+            right.image_cost = right_cost;
+            assert!(placement_tiebreak.compare(&left, &right).is_lt());
+            left.host_ready = false;
+            assert!(placement_tiebreak.compare(&left, &right).is_gt(), "host liveness comes before image cost");
+        }
         let cases = [
             (
                 "owned available beats metered",

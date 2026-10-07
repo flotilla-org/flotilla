@@ -63,9 +63,9 @@ never retry identical inputs. Failure evidence remains available on predecessors
 and produces an infrastructure log and Host health condition.
 
 A local successful build provisions the Environment using its image ID with
-pulling disabled. A remote successful build continues waiting for digest transfer;
-registry publication, host inventory, transfer, and final identity freezing belong
-to #2729. Build garbage collection belongs to #2733.
+pulling disabled. A remote successful build waits for the distribution adapter to
+deliver and verify its digest before provisioning (see Availability and distribution
+below). Build garbage collection belongs to #2733.
 
 Build args and pin values must be non-secret: they appear in Docker argv and may
 appear in build output. Credentials require a separate secret-delivery mechanism;
@@ -92,3 +92,77 @@ Build logs are shared by executions rather than owned by one convoy. Their empty
 `convoy` field deliberately excludes them from convoy-specific lists; unfiltered
 artifact listing and expiry/pinning-based retention still apply. Recovery preserves
 the first immutable execution log and emits a debug diagnostic for that reuse.
+
+## Availability and distribution
+
+Hosts publish full local image IDs and known registry manifest digests under
+Host.status.capabilities.image_digests. Inventories are observations, refreshed
+every 30 seconds independently of asynchronous publication; placement still requires host readiness. Completed
+ImageBuild.status.availability records the hosts holding its exact local ID and
+an optional repository@manifest-digest publication. Availability may change
+after execution completes; identity, inputs, verification and build-log evidence
+remain immutable.
+
+A fleet can opt into a shared cache on its singleton FleetDesignation:
+
+~~~yaml
+spec:
+  project: fleet
+  image_cache:
+    repository: registry.example/fleet/crew-images
+    pull_credential: image-cache-pull
+    push_credential: image-cache-push
+~~~
+
+Each referenced CredentialSpec uses the docker-registry adapter and an
+operator-staged material source. Host permissions are separate from work grants:
+
+~~~yaml
+spec:
+  selector:
+    host_action:
+      action: image-push
+      hosts: [builder-host-resource-name]
+  credentials: [image-cache-push]
+~~~
+
+Use image-pull for vessel hosts (and builders which consume remote parents).
+An empty hosts set selects all eligible hosts; push additionally requires an
+explicit, positive Host.spec.image_build_capacity declaration. A host-action
+selector cannot contain work selectors or landing credentials and never matches
+a crew, even when its work selectors would otherwise be empty. Work grants remain
+the only way to deliver registry material to a crew.
+
+Builders publish through a temporary digest-derived tag, retaining only the
+registry's reported manifest digest as availability. Pulls use that manifest
+digest, then inspect both the registry digest and local image ID. Missing grants,
+missing publication, or mismatched IDs leave the Environment in Provisioning with
+the reason. No older image or tag substitutes for the requested execution.
+
+Without a registry, a destination uses its authenticated resource-mesh route to
+request /image-transfer/sha256:<local-ID>, naming the source node and visited
+nodes in the query. Direct source routes are preferred; sparse meshes forward
+through other resource peers, exclude visited nodes, and refuse routes beyond
+eight hops. Intermediaries copy byte chunks directly without archive spooling.
+The source streams docker save to a
+temporary archive and serves it as a binary HTTP body; the destination streams it
+to a temporary archive and streams that file into docker load. This bounds
+memory independently of image size and leaves process/transport seams injectable.
+Archives and Docker configs are removed on success, errors and cancellation.
+The destination inspects the immutable local ID before provisioning with pulling
+disabled. Transfers run asynchronously so the Environment watch loop remains
+responsive. This uses resource replication's transport, not Plane-A peer merging.
+
+Placement prefers an exact held digest, then a published registry digest, then
+build or mesh transfer, after host liveness. Completed pinned stages can be reused
+across hosts; unpinned inputs never claim a shared recipe. A builder receives a
+shared parent before building the next stage. Environment and Vessel status pin
+the realised local ID and, when pulled, the registry digest; the admitted layer
+revisions remain frozen.
+
+FleetDesignation and CredentialGrant are authored by fleet-ops/project-map;
+Host inventory and ImageBuild availability are daemon-authored. The new fields
+are optional with previous-generation decoder defaults. Existing external
+manifests remain valid; opting into the cache requires authoring the binding,
+registry declarations and host grants together. No workflow or CI registry
+credential is required.

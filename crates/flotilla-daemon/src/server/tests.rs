@@ -5323,3 +5323,75 @@ async fn slow_startup_reconciliation_does_not_delay_listening_or_fleet_health() 
     shutdown.send(true).expect("shutdown");
     task.await.expect("server task").expect("server stops");
 }
+
+// #2729: an image export crosses a sparse resource mesh without a direct
+// consumer-to-builder route. Real resource HTTP handlers decode and forward
+// visited nodes across two relays; the source enforces the byte-stream contract.
+#[tokio::test]
+async fn resource_image_archive_crosses_two_relays_with_bounded_route_metadata() {
+    async fn relay(base: &std::path::Path, name: &str) -> Arc<InProcessDaemon> {
+        let directory = base.join(name);
+        std::fs::create_dir_all(&directory).expect("config");
+        std::fs::write(directory.join("daemon.toml"), format!("machine_id = \"{name}\"\n")).expect("identity");
+        InProcessDaemon::new(vec![], Arc::new(ConfigStore::with_base(directory)), fake_discovery(false), HostName::new(name)).await
+    }
+    async fn serve_one(listener: tokio::net::UnixListener, daemon: Arc<InProcessDaemon>) {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut first = [0_u8; 1];
+        stream.read_exact(&mut first).await.expect("first byte");
+        super::resource_http::serve_resource_http_with_daemon(stream, first[0], daemon.resource_backend(), Some(daemon))
+            .await
+            .expect("resource HTTP");
+    }
+    let directory = TestSocketDir::new();
+    let first = relay(directory.path(), "relay-one").await;
+    let second = relay(directory.path(), "relay-two").await;
+    let first_node = first.node_id().to_string();
+    let second_node = second.node_id().to_string();
+    assert_ne!(first_node, second_node);
+    let builder_path = directory.socket_path("builder.sock");
+    let first_path = directory.socket_path("first.sock");
+    let second_path = directory.socket_path("second.sock");
+    let builder_listener = tokio::net::UnixListener::bind(&builder_path).expect("source listener");
+    let first_listener = tokio::net::UnixListener::bind(&first_path).expect("first listener");
+    let second_listener = tokio::net::UnixListener::bind(&second_path).expect("second listener");
+    first.set_image_peer_socket(&second_node, second_path).await;
+    second.set_image_peer_socket("builder", builder_path).await;
+    let bytes = (0..65536).map(|index| (index % 256) as u8).collect::<Vec<_>>();
+    let expected = bytes.clone();
+    let source = tokio::spawn(async move {
+        let (mut stream, _) = builder_listener.accept().await.expect("source accept");
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(stream.read_u8().await.expect("request byte"));
+        }
+        let text = std::str::from_utf8(&request).expect("request");
+        let target = text.lines().next().expect("request line").split_whitespace().nth(1).expect("GET target");
+        let url = url::Url::parse(&format!("http://localhost{target}")).expect("URL");
+        assert_eq!(url.path(), format!("/image-transfer/sha256:{}", "3".repeat(64)));
+        let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+        assert_eq!(query["source"], "builder");
+        let visited = query["visited"].split(',').collect::<Vec<_>>();
+        assert_eq!(visited, ["consumer", first_node.as_str(), second_node.as_str()]);
+        stream
+            .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).as_bytes())
+            .await
+            .expect("headers");
+        stream.write_all(&bytes).await.expect("binary body");
+    });
+    let first_task = tokio::spawn(serve_one(first_listener, first));
+    let second_task = tokio::spawn(serve_one(second_listener, second));
+    let client = reqwest::Client::builder().unix_socket(first_path).timeout(Duration::from_secs(10)).build().expect("client");
+    let response = client
+        .get(format!("http://localhost/image-transfer/sha256:{}", "3".repeat(64)))
+        .query(&[("source", "builder"), ("visited", "consumer")])
+        .send()
+        .await
+        .expect("sparse mesh request")
+        .error_for_status()
+        .expect("response");
+    assert_eq!(response.bytes().await.expect("archive").as_ref(), expected.as_slice());
+    source.await.expect("source task");
+    first_task.await.expect("first relay");
+    second_task.await.expect("second relay");
+}

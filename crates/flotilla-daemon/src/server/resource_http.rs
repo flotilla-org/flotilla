@@ -48,6 +48,26 @@ pub(super) async fn serve_resource_http_with_daemon(
     }
 
     let (path, raw_query) = target.split_once('?').unwrap_or((target, ""));
+    if let Some(image_id) = path.strip_prefix("/image-transfer/") {
+        if !flotilla_resources::is_image_digest(image_id) {
+            return write_error(&mut stream, 400, "invalid image transfer digest").await;
+        }
+        let Some(daemon) = &daemon else {
+            return write_error(&mut stream, 503, "image transfer unavailable").await;
+        };
+        let query = url::form_urlencoded::parse(raw_query.as_bytes()).into_owned().collect::<BTreeMap<_, _>>();
+        if let Some(source) = query.get("source").filter(|source| source.as_str() != daemon.local_host_identity().node.node_id.as_str()) {
+            let visited = query
+                .get("visited")
+                .map(|visited| visited.split(',').filter(|node| !node.is_empty()).map(String::from).collect())
+                .unwrap_or_default();
+            return crate::image_distribution::relay_image(&mut stream, daemon, source, image_id, visited).await;
+        }
+        let Some(runner) = daemon.local_command_runner() else {
+            return write_error(&mut stream, 503, "image transfer runner unavailable").await;
+        };
+        return crate::image_distribution::serve_image(&mut stream, runner.as_ref(), image_id).await;
+    }
     let observed_path = path == "/observed" || path.starts_with("/observed/");
     let additional_stores = if daemon.is_some() && !observed_path { vec!["/observed"] } else { Vec::new() };
     let (path, backend) = if observed_path {

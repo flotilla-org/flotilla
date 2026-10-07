@@ -292,3 +292,66 @@ fn stages_freeze_realised_parent_identity_before_building(tc: hegel::TestCase) {
         assert_eq!(runner.calls.load(Ordering::SeqCst),stages);
     });
 }
+
+// #2729: a completed pinned execution can serve a non-builder host, while a
+// vessel's provisioning waits for an injected transfer and pins the exact ID.
+#[tokio::test]
+async fn remote_completed_digest_is_reused_and_delivery_freezes_environment_identity() {
+    struct Delivered;
+    #[async_trait]
+    impl DockerEnvironmentRuntime for Delivered {
+        async fn ensure_image(
+            &self,
+            build: &flotilla_resources::ResourceObject<ImageBuild>,
+            host: &str,
+        ) -> Result<Option<PlacedImageIdentity>, String> {
+            assert_eq!(host, "small");
+            Ok(build.status.as_ref().and_then(|status| status.identity.clone()))
+        }
+        async fn provision(&self, name: &str, spec: &DockerEnvironmentSpec) -> Result<DockerProvisioning, String> {
+            Docker.provision(name, spec).await
+        }
+        async fn destroy(&self, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    let backend = ResourceBackend::InMemory(Default::default());
+    host(&backend, "builder", "amd64", None).await;
+    host(&backend, "small", "amd64", Some(ImageBuildCapacity::None)).await;
+    let admission = ImageBuildAdmission::new(backend.clone(), "test", Arc::new(Inputs));
+    let names = admission.join("builder", &composition()).await.expect("build");
+    let runner = Arc::new(Runner { calls: AtomicUsize::new(0), failure: None });
+    let reconciler = ImageBuildReconciler::new(runner.clone(), backend.clone(), "test", "builder");
+    tick(&backend, &reconciler, &names[0]).await;
+    for _ in 0..16 {
+        tick(&backend, &reconciler, &names[0]).await;
+        if backend
+            .using::<ImageBuild>("test")
+            .get(&names[0])
+            .await
+            .expect("build")
+            .status
+            .as_ref()
+            .is_some_and(|status| status.phase == ImageBuildPhase::Built)
+        {
+            break;
+        }
+    }
+    assert_eq!(admission.join("small", &composition()).await.expect("reuse"), names);
+    assert_eq!(backend.using::<ImageBuild>("test").list().await.expect("executions").items.len(), 1);
+    let spec =
+        serde_json::from_value(serde_json::json!({"host_ref":"small", "image":"", "image_build_ref":names[0]})).expect("Docker spec");
+    let environments = backend.using::<Environment>("test");
+    let env = environments
+        .create(&InputMeta::builder().name("remote".into()).build(), &EnvironmentSpec { host_direct: None, docker: Some(spec) })
+        .await
+        .expect("environment");
+    let environment = EnvironmentReconciler::new(Arc::new(Delivered), backend.clone(), "test");
+    let prepared = environment.prepare(&env).await.expect("deliver");
+    let patch = environment.reconcile(&env, &prepared, Utc::now()).patch.expect("ready");
+    apply_status_patch(&environments, "remote", &patch).await.expect("freeze");
+    let ready = environments.get("remote").await.expect("ready").status.expect("status");
+    assert_eq!(ready.phase, EnvironmentPhase::Ready);
+    assert_eq!(ready.local_image_id, Some(format!("sha256:{}", "3".repeat(64))));
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+}
