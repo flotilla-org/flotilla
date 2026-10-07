@@ -5227,8 +5227,8 @@ mod tests {
     #[test]
     fn delivery_failures_are_durable_and_log_once() {
         for kind in 0..5 {
-            // Pending convoy, missing observation, transient hold failure, and timed retry.
-            let permanent = false;
+            // Pending convoy, missing observation, unsupported leaf, timed retry, and missing crew.
+            let permanent = kind == 2;
             let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
             let subscriber = captured_subscriber(logs.clone(), tracing::Level::WARN);
             tracing::subscriber::with_default(subscriber, || {
@@ -5295,7 +5295,7 @@ mod tests {
                             .await
                             .expect("tracing scenario");
                         leaf.address = LeafAddress::Issue { service: "github.com".into(), scope: "team/repo".into(), number: 1 };
-                        leaf.field_path = ".state".into();
+                        leaf.field_path = if permanent { ".unsupported" } else { ".state" }.into();
                         leaf.literal = "closed".into();
                     }
                     for tick in 0..10 {
@@ -6703,12 +6703,19 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn held_source_stays_latched_across_many_new_heads() {
+        for role in ["coder", "reviewer"] {
+            active_checks_scenario(&[false; 12], false, role).await;
+        }
+    }
+
     #[hegel::test]
     fn generated_active_checks_settlement_deduplicates_heads(tc: hegel::TestCase) {
         // Generate pass/fail sequences across the delivery ceiling (3), including
         // coder/reviewer roles, new heads, unknown and pending observations, and duplicate settlement.
         let role = if tc.draw(hegel::generators::booleans()) { "reviewer" } else { "coder" };
-        let count = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(5));
+        let count = tc.draw(hegel::generators::integers::<usize>().min_value(1).max_value(12));
         let outcomes = (0..count).map(|_| tc.draw(hegel::generators::booleans())).collect::<Vec<_>>();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

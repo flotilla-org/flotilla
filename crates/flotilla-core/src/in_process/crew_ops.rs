@@ -2819,7 +2819,7 @@ impl CrewService {
         reason: &str,
     ) -> Result<(), String> {
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&request.namespace);
-        let _ = act; // Every admitted hold is state-only, including previous-generation snapshots.
+        let HoldAct::State = act; // Also covers previous-generation snapshots through the serde alias.
         let attention =
             flotilla_resources::ConvoyAttention { source: request.source.clone(), reason: reason.into(), raised_at: self.clock.now() };
         flotilla_resources::apply_status_patch(
@@ -2898,6 +2898,7 @@ impl CrewService {
         let receiver = policy
             .iter()
             .find_map(|target| match target {
+                // Empty vessel selects the first matching crew in stable vessel-name order.
                 flotilla_resources::SupervisionTarget::ConvoyCrew { vessel, role } => status
                     .crew_work
                     .iter()
@@ -2907,6 +2908,8 @@ impl CrewService {
                             && !(**name == request.vessel && *role == request.role)
                     })
                     .map(|(vessel, _)| crate::leaf_engine::crew_role_address(project, &request.convoy, vessel, role)),
+                // The existing project receiver resolver selects the session for this symbolic role.
+                // Vessel/crew selection belongs to that resolver, not hold delivery.
                 flotilla_resources::SupervisionTarget::ProjectCrew { convoy_role, .. } => Some(format!("{project}/{convoy_role}")),
                 flotilla_resources::SupervisionTarget::Operator => Some("principal:operator".into()),
             })

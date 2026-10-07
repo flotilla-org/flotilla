@@ -367,14 +367,17 @@ pub struct ExplainedDecisionLedger {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_address: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
+    /// Retired projection diagnostic: always false. Remove at the next wire-format change.
     pub projection_missing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Historical projection error only; remove at the next wire-format change.
     pub projection_error: Option<String>,
     pub vessel: String,
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Historical ledger comment only; remove at the next wire-format change.
     pub comment_url: Option<String>,
     pub missing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
