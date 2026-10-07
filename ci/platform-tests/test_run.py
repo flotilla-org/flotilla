@@ -80,8 +80,11 @@ class RunnerTests(unittest.TestCase):
                                        "libraries":str(self.root / "native")})
         cargo_calls = [c for c in commands if c[0] != "execute"]
         # All invocations use the same package/target/feature set.
-        self.assertEqual(cargo_calls[0][:cargo_calls[0].index("--no-run")],
-                         cargo_calls[1][:cargo_calls[0].index("--no-run")])
+        build_only = {"--no-run", "--message-format=json", "--timings"}
+        built = [argument for argument in cargo_calls[0] if argument not in build_only]
+        # This row has one filter and an empty harness tail; strip those from execution.
+        self.assertEqual(cargo_calls[1][-2:], ["same", "--"])
+        self.assertEqual(built, cargo_calls[1][:-2])
 
     @unittest.skipIf(os.name == "nt", "directory aliases are covered by Unix script-contract jobs")
     def test_cargo_context_through_directory_alias(self):
@@ -124,6 +127,14 @@ class RunnerTests(unittest.TestCase):
         result, _ = self.run_job("windows", "windows|--lib selected\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(marker.exists())
+
+    @unittest.skipIf(os.name == "nt", "Unix signal exit convention")
+    def test_signal_failure_keeps_shell_exit_status(self):
+        # Contract: a signal-killed test fails the job as 128 + signal, without running later selectors.
+        self.env["BINARY_SIGNAL"] = "15"
+        result, commands = self.run_job("windows", "windows|--lib first\nwindows|--lib second\n")
+        self.assertEqual(result.returncode, 143, result.stderr)
+        self.assertEqual(len([c for c in commands if c[0] == "execute"]), 1)
 
     def test_checked_in_selectors_are_valid(self):
         # Contract: the checked-in list is accepted for every job without freezing its contents.
@@ -168,8 +179,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(commands, [])
 
-    def test_failure_stops_execution(self):
-        # Contract: a failed test command fails the job without running later selectors.
+    def test_build_failure_stops_execution(self):
+        # Contract: a failed unified build fails the job without launching any selectors.
         result, commands = self.run_job("windows", "windows|--lib first\nwindows|--lib second\n", 7)
         self.assertEqual(result.returncode, 7)
         self.assertEqual(len(commands), 1)

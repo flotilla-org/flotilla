@@ -38,3 +38,11 @@ build instead of silently dropping coverage. Every checked-in row is explicit.
 Windows Git Bash uses `python`; Unix uses `python3`. Cargo dispatch uses the exact
 interpreter already running the selector planner. Keep all Cargo `--config`
 arguments before the `test` subcommand, and identical between build and execution.
+
+Features are also unified across rows: `ssh_adapter` is built with
+`tender/ssh-cleat-proof` because the adjacent `ssh_cleat` row requests it. Selected
+rows specify the job's test coverage; they do not prove each package works with
+its row's features in isolation. Add a separate job only when isolated feature
+coverage is deliberately required. Package and target unions can compile extra
+matching targets in a future selector set; artifact dispatch still limits execution
+to each original row. The current root package has no library target.

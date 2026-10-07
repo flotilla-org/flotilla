@@ -121,4 +121,7 @@ if __name__ == "__main__":
         print(f"invalid selector or Cargo metadata: {error}", file=sys.stderr)
         sys.exit(2)
     except subprocess.CalledProcessError as error:
-        sys.exit(error.returncode)
+        status = error.returncode
+        if status < 0 and os.name == "posix":
+            status = 128 - status
+        sys.exit(status)

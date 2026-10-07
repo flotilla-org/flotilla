@@ -39,6 +39,7 @@ for name in packages:
             '    with open(os.environ["RUNTIME_LOG"], "a") as log:\n'
             '        log.write(json.dumps({"cwd":os.getcwd(), "package":os.environ.get("CARGO_PKG_NAME"), '
             '"version":os.environ.get("CARGO_PKG_VERSION"), "libraries":os.environ.get("LD_LIBRARY_PATH")}) + "\\n")\n'
+            'if os.environ.get("BINARY_SIGNAL"): os.kill(os.getpid(), int(os.environ["BINARY_SIGNAL"]))\n'
             'sys.exit(int(os.environ.get("BINARY_EXIT", "0")))\n')
         binary.chmod(0o755)
         kinds = ["cdylib", "rlib"] if kind == "lib" and os.environ.get("LIBRARY_CRATE_TYPES") else [kind]
