@@ -699,7 +699,11 @@ impl CrewService {
             .into_iter()
             .filter_map(|demand| credential_refresh_alert_for_vessel(&demand, &context.convoy, &context.vessel))
             .collect::<Vec<_>>();
-        let inbox_messages = super::read_projections::crew_message_views(&self.resource_backend, &context.namespace).await?;
+        let mut inbox_messages: HashMap<String, Vec<_>> = HashMap::new();
+        for message in super::read_projections::crew_message_views(&self.resource_backend, &context.namespace).await? {
+            inbox_messages.entry(message.current_receiver.as_ref().unwrap_or(&message.receiver).clone()).or_default().push(message);
+        }
+        let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
         let members = task
             .crew
             .iter()
@@ -718,13 +722,9 @@ impl CrewService {
                 CrewListMember::builder()
                     .messages(
                         inbox_messages
-                            .iter()
-                            .filter(|message| {
-                                let parts: Vec<_> = message.current_receiver.as_deref().unwrap_or(&message.receiver).split('/').collect();
-                                parts.len() == 4 && parts[1] == context.convoy && parts[2] == context.vessel && parts[3] == process.role
-                            })
+                            .get(&format!("{project}/{}/{}/{}", context.convoy, context.vessel, process.role))
                             .cloned()
-                            .collect(),
+                            .unwrap_or_default(),
                     )
                     .role(process.role.clone())
                     .kind(if matches!(process.source, CrewSource::Agent { .. }) { "agent" } else { "tool" }.to_string())
@@ -1694,6 +1694,8 @@ impl CrewService {
             let receiver = format!("{project}/{}/{}/{}", context.convoy, context.vessel, target);
             let address = format!("{project}/{}/{}/{}", context.convoy, context.vessel, context.caller_role);
             let relation = flotilla_resources::MessageRelation::Peer;
+            // Each crew command is a new action, even when its text repeats.
+            // Router retries replay this immutable document with the same ID.
             let name = flotilla_resources::message_record_name(&receiver, &address, &format!("handoff:{}", uuid::Uuid::new_v4()));
             let intent = flotilla_resources::MessageSpec::builder()
                 .sender(address)
@@ -1701,7 +1703,18 @@ impl CrewService {
                 .relation(relation)
                 .body(message.to_string())
                 .build();
-            return self.publish_message_intent(&context.namespace, &name, &intent).await.map(|_| ());
+            return match self.publish_message_intent(&context.namespace, &name, &intent).await {
+                Ok(_) => Ok(()),
+                Err(error) => Err(self
+                    .restore_crew_work_after_delivery_failure(
+                        &convoys,
+                        &context.convoy,
+                        &reopened.metadata.resource_version,
+                        &previous_status,
+                        error,
+                    )
+                    .await),
+            };
         }
         self.reconcile_or_restore_crew_work(
             &context.namespace,
@@ -1987,6 +2000,8 @@ impl CrewService {
                 .body(prompt.to_string())
                 .maybe_supersedes(prior.map(|message| message.object.metadata.name))
                 .build();
+            // This per-command ID survives router retries. The publisher still
+            // returns canonical admission, as it does for subject-based producers.
             let admitted = self.publish_message_intent(namespace, &message_name, &intent).await?;
             if admitted.name == message_name {
                 apply_resource_status_patch(&convoys, name, &ConvoyStatusPatch::QueueMessageFollowUp {
@@ -2006,8 +2021,9 @@ impl CrewService {
                 .including_replicas::<flotilla_resources::Message>(namespace)
                 .get(&reference.name)
                 .await
-                .ok()
-                .map(|source| source.object)
+                .map_err(|error| format!("follow-up Message awaits replication: {error}"))?
+                .object
+                .into()
         } else {
             None
         };
@@ -2045,7 +2061,11 @@ impl CrewService {
         .await
         .map_err(|err| err.to_string())?;
         if matches!(session.provenance, ResourceProvenance::Replica { .. }) {
-            self.publish_message_intent(namespace, &message_name, &resume_intent).await?;
+            if let Err(error) = self.publish_message_intent(namespace, &message_name, &resume_intent).await {
+                return Err(self
+                    .restore_crew_work_after_delivery_failure(&convoys, name, &reopened.metadata.resource_version, status, error)
+                    .await);
+            }
             return Ok(ConvoyResumeOutcome::Queued { displaced });
         }
         let session = session.object;
@@ -2104,47 +2124,75 @@ impl CrewService {
             .collect::<Vec<_>>();
         messages.sort_by_key(|message| message.object.metadata.creation_timestamp);
         let withdrawn = messages.last().map(|message| message.object.spec.body.clone()).or(withdrawn);
+        let mut closed = BTreeSet::new();
         for message in messages {
             let patch = flotilla_resources::MessageStatusPatch::Finish {
                 phase: flotilla_resources::MessagePhase::Expired,
                 reason: "operator withdrew the queued brief".into(),
                 at: self.clock.now(),
             };
-            if matches!(message.provenance, ResourceProvenance::Local) {
-                apply_resource_status_patch(
-                    &self.resource_backend.using::<flotilla_resources::Message>(namespace),
+            let mut next = message.object.status.clone().unwrap_or_default();
+            flotilla_resources::StatusPatch::apply(&patch, &mut next);
+            let replacement = serde_json::to_value(next).expect("message status");
+            let result = if matches!(message.provenance, ResourceProvenance::Local) {
+                flotilla_resources::patch_resource_status_if_version(
+                    &self.resource_backend,
+                    namespace,
+                    "Message",
                     &message.object.metadata.name,
-                    &patch,
+                    replacement,
+                    &message.object.metadata.resource_version,
                 )
                 .await
-                .map_err(|error| error.to_string())?;
+                .map(|_| ())
+                .map_err(|error| error.to_string())
             } else {
-                let mut next = message.object.status.unwrap_or_default();
-                flotilla_resources::StatusPatch::apply(&patch, &mut next);
-                let publisher = self
-                    .resource_intent_publisher
-                    .read()
-                    .expect("publisher lock")
-                    .as_ref()
-                    .and_then(Weak::upgrade)
-                    .ok_or("resource status mutation router unavailable")?;
-                publisher
-                    .patch_status(namespace, "Message", &message.object.metadata.name, serde_json::to_value(next).expect("message status"))
-                    .await?;
+                let publisher = self.resource_intent_publisher.read().expect("publisher lock").as_ref().and_then(Weak::upgrade);
+                match publisher {
+                    Some(publisher) => {
+                        publisher
+                            .patch_status(
+                                namespace,
+                                "Message",
+                                &message.object.metadata.name,
+                                replacement,
+                                &message.object.metadata.resource_version,
+                            )
+                            .await
+                    }
+                    None => Err("resource status mutation router unavailable".into()),
+                }
+            };
+            if let Err(error) = result {
+                return Err(format!(
+                    "withdrawal of {} failed: {error}; already withdrawn: {closed:?}; last queued brief: {withdrawn:?}",
+                    message.object.metadata.name
+                ));
             }
+            closed.insert(message.object.metadata.name);
         }
         let latest = convoys.get(name).await.map_err(|error| error.to_string())?;
         for (vessel, crew) in latest.status.as_ref().into_iter().flat_map(|status| status.crew_work.iter()) {
             for (role, state) in crew {
                 if let Some(reference) = &state.pending_follow_up {
-                    if self
-                        .resource_backend
-                        .including_replicas::<flotilla_resources::Message>(namespace)
-                        .get(&reference.name)
-                        .await
-                        .ok()
-                        .is_some_and(|message| message.object.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
-                    {
+                    let terminal = if closed.contains(&reference.name) {
+                        // Authority acknowledged this guarded close; replica lag
+                        // must not delay clearing its workflow continuation.
+                        true
+                    } else {
+                        self.resource_backend
+                            .including_replicas::<flotilla_resources::Message>(namespace)
+                            .get(&reference.name)
+                            .await
+                            .map_err(|error| {
+                                format!("follow-up Message awaits replication during withdrawal: {error}; last queued brief: {withdrawn:?}")
+                            })?
+                            .object
+                            .status
+                            .as_ref()
+                            .is_some_and(|status| status.phase.is_terminal())
+                    };
+                    if terminal {
                         apply_resource_status_patch(&convoys, name, &ConvoyStatusPatch::QueueMessageFollowUp {
                             vessel: vessel.clone(),
                             role: role.clone(),

@@ -820,3 +820,143 @@ async fn turn_publication_errors_restore_the_owned_activation() {
         }
     }
 }
+
+#[tokio::test]
+async fn resume_and_withdraw_wait_for_follow_up_replication() {
+    for withdraw in [false, true] {
+        let (crew, backend, _, _config) = fixture(CrewWorkPhase::Done).await;
+        let convoys = backend.using::<ResourceConvoy>("flotilla");
+        apply_resource_status_patch(&convoys, "crew", &ConvoyStatusPatch::QueueMessageFollowUp {
+            vessel: "work".into(),
+            role: "coder".into(),
+            message: Some(ResourceRef::new("flotilla.work/v1", "Message", "flotilla", "not-replicated")),
+        })
+        .await
+        .expect("pending continuation");
+        let before = convoys.get("crew").await.expect("before command").status;
+        let error = if withdraw {
+            crew.withdraw_pending_brief("flotilla", "crew").await.expect_err("withdraw awaits replication")
+        } else {
+            crew.resume("flotilla", "crew", "replacement", None, None).await.expect_err("resume awaits replication")
+        };
+        assert!(error.contains("follow-up Message awaits replication"), "{error}");
+        assert_eq!(convoys.get("crew").await.expect("unchanged workflow").status, before);
+        assert!(backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn replica_withdraw_preserves_receiver_submission_on_race() {
+    use crate::leaf_engine::ResourceIntentPublisher;
+    struct SubmissionRace {
+        receiver: ResourceBackend,
+    }
+    #[async_trait]
+    impl ResourceIntentPublisher for SubmissionRace {
+        async fn publish(self: Arc<Self>, _: &str, _: serde_json::Value) -> Result<ResourceRef, String> {
+            panic!("withdraw never publishes intent");
+        }
+        async fn patch_status(
+            self: Arc<Self>,
+            namespace: &str,
+            kind: &str,
+            name: &str,
+            status: serde_json::Value,
+            expected: &str,
+        ) -> Result<(), String> {
+            let messages = self.receiver.using::<flotilla_resources::Message>(namespace);
+            let current = messages.get(name).await.expect("receiver intent");
+            let mut next = current.status.expect("receiver status");
+            next.submission = Some(
+                flotilla_resources::MessageSubmission::builder()
+                    .batch_id("racing-batch".into())
+                    .crew_id("actual-crew".into())
+                    .session("actual-session".into())
+                    .started_at(Utc::now())
+                    .members(vec![name.into()])
+                    .build(),
+            );
+            messages.update_status(name, &current.metadata.resource_version, &next).await.expect("receiver begins submission");
+            flotilla_resources::patch_resource_status_if_version(&self.receiver, namespace, kind, name, status, expected)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+    }
+    let (crew, backend, _, _config) = fixture(CrewWorkPhase::Working).await;
+    let receiver = ResourceBackend::InMemory(InMemoryBackend::default());
+    let spec = flotilla_resources::MessageSpec::builder()
+        .sender("principal:operator".into())
+        .receiver("flotilla/crew/work/coder".into())
+        .relation(flotilla_resources::MessageRelation::Supervisor)
+        .body("retain this brief".into())
+        .build();
+    flotilla_resources::MessageInbox::new(receiver.clone(), "flotilla")
+        .accept(&InputMeta::builder().name("racing-message".into()).build(), &spec, Utc::now())
+        .await
+        .expect("receiver admission");
+    backend
+        .replica_writer::<flotilla_resources::Message>(flotilla_protocol::NodeId::new("receiver"), "flotilla")
+        .replace(&receiver.using::<flotilla_resources::Message>("flotilla").list().await.expect("receiver snapshot"), Utc::now())
+        .await
+        .expect("lagging sender replica");
+    let publisher: Arc<dyn ResourceIntentPublisher> = Arc::new(SubmissionRace { receiver: receiver.clone() });
+    crew.set_resource_intent_publisher(Arc::downgrade(&publisher));
+    let error = crew.withdraw_pending_brief("flotilla", "crew").await.expect_err("stale withdrawal refused");
+    assert!(error.contains("status changed"), "{error}");
+    assert!(error.contains("retain this brief"), "partial failure retains the body: {error}");
+    let retained = receiver.using::<flotilla_resources::Message>("flotilla").get("racing-message").await.expect("retained intent");
+    let status = retained.status.expect("receiver evidence");
+    assert!(!status.phase.is_terminal());
+    assert_eq!(status.submission.expect("submission preserved").session, "actual-session");
+}
+
+#[tokio::test]
+async fn fresh_idle_admission_keeps_completion_and_delivery_evidence_receiver_owned() {
+    for completion_pending in [false, true] {
+        for degraded in [false, true] {
+            let (crew, backend, probe, _config) = fixture(CrewWorkPhase::Working).await;
+            probe.fail.store(false, Ordering::SeqCst);
+            let sessions = backend.using::<ResourceTerminalSession>("flotilla");
+            let holder = sessions.get("session").await.expect("holder");
+            let now = Utc::now();
+            let status = flotilla_resources::TerminalSessionStatus {
+                phase: ResourceTerminalSessionPhase::Running,
+                session_id: Some("actual-session".into()),
+                attention: Some(flotilla_resources::TerminalAttention {
+                    state: TerminalAttentionState::Idle,
+                    as_of: now,
+                    source: flotilla_resources::TerminalAttentionSource::Screen,
+                }),
+                completion_pending: completion_pending.then(|| CrewCompletionPending {
+                    message: Some("previous completion".into()),
+                    disposition: None,
+                    decision_ledger_ref: None,
+                    force: false,
+                    principal_ref: None,
+                    attempted_at: now,
+                    authority: "crew".into(),
+                    last_error: "awaiting settlement".into(),
+                }),
+                degraded: degraded.then(|| flotilla_resources::TerminalSessionDegradedCondition {
+                    reason: flotilla_resources::TERMINAL_DELIVERY_UNCONFIRMED_REASON.into(),
+                    message: "held earlier input".into(),
+                    message_id: Some("earlier".into()),
+                    consecutive_failures: 1,
+                    observed_at: now,
+                }),
+                ..Default::default()
+            };
+            sessions
+                .update_status("session", &holder.metadata.resource_version, &status)
+                .await
+                .expect("fresh idle with legacy obligations");
+            crew.resume("flotilla", "crew", "next admitted brief", None, None).await.expect("admit at idle boundary");
+            assert_eq!(sessions.get("session").await.expect("unchanged receiver evidence").status, Some(status));
+            let records = backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("inbox").items;
+            assert_eq!(records.len(), 1);
+            assert!(records[0].status.as_ref().expect("admission status").resolved_receiver.is_none());
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 1, "workflow resumes but does not deliver");
+        }
+    }
+}

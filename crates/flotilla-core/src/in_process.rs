@@ -5924,19 +5924,34 @@ impl InProcessDaemon {
     }
 
     async fn execute_action_resource_status_patch(&self, id: u64, command: &Command) -> Result<u64, String> {
-        if let flotilla_protocol::CommandAction::ResourceStatusPatch { namespace, kind, name, status } = &command.action {
+        if let flotilla_protocol::CommandAction::ResourceStatusPatch { namespace, kind, name, status, expected_resource_version } =
+            &command.action
+        {
             let empty_identity = self.start_context_free_command(id, command.description().to_string());
-            let result =
-                match flotilla_resources::patch_resource_status(&self.resource_backend, namespace, kind, name, status.clone()).await {
-                    Ok(patched) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
-                        kind: patched.kind,
-                        plural: patched.plural,
-                        namespace: patched.namespace,
-                        value: patched.value,
-                        replica_origin: None,
-                    })),
-                    Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
-                };
+            let patched = match expected_resource_version {
+                Some(expected) => {
+                    flotilla_resources::patch_resource_status_if_version(
+                        &self.resource_backend,
+                        namespace,
+                        kind,
+                        name,
+                        status.clone(),
+                        expected,
+                    )
+                    .await
+                }
+                None => flotilla_resources::patch_resource_status(&self.resource_backend, namespace, kind, name, status.clone()).await,
+            };
+            let result = match patched {
+                Ok(patched) => flotilla_protocol::CommandValue::ResourceObject(Box::new(ResourceJsonResponse {
+                    kind: patched.kind,
+                    plural: patched.plural,
+                    namespace: patched.namespace,
+                    value: patched.value,
+                    replica_origin: None,
+                })),
+                Err(error) => flotilla_protocol::CommandValue::Error { message: error.to_string() },
+            };
             self.finish_context_free_command(id, empty_identity, result);
             return Ok(id);
         }

@@ -100,7 +100,14 @@ pub struct CrewTurnAdmission {
 #[async_trait]
 pub trait ResourceIntentPublisher: Send + Sync {
     async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String>;
-    async fn patch_status(self: Arc<Self>, _namespace: &str, _kind: &str, _name: &str, _status: serde_json::Value) -> Result<(), String> {
+    async fn patch_status(
+        self: Arc<Self>,
+        _namespace: &str,
+        _kind: &str,
+        _name: &str,
+        _status: serde_json::Value,
+        _expected_resource_version: &str,
+    ) -> Result<(), String> {
         Err("resource status mutation router unavailable".into())
     }
 }

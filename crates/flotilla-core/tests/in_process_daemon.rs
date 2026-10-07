@@ -1353,6 +1353,7 @@ async fn deleting_a_replica_from_another_host_refuses_with_its_origin() {
 
     for action in [
         CommandAction::ResourceStatusPatch {
+            expected_resource_version: None,
             namespace: "flotilla".to_string(),
             kind: "convoys".to_string(),
             name: "remote-convoy".to_string(),
@@ -1660,6 +1661,7 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
         .execute(
             Command::builder()
                 .action(CommandAction::ResourceStatusPatch {
+                    expected_resource_version: None,
                     namespace: "flotilla".to_string(),
                     kind: "usages".to_string(),
                     name: name.clone(),
@@ -1677,6 +1679,7 @@ async fn generic_resource_commands_create_usage_and_patch_its_typed_status() {
         .execute(
             Command::builder()
                 .action(CommandAction::ResourceStatusPatch {
+                    expected_resource_version: None,
                     namespace: "flotilla".to_string(),
                     kind: "usages".to_string(),
                     name: name.clone(),
@@ -8007,6 +8010,20 @@ async fn handoff_uses_remote_session_origin_and_refuses_remote_only_anchor() {
         vessel_ref: Some("work-vessel".to_string()),
         role: Some("coder".to_string()),
     };
+    struct FailedHandoffPublisher;
+    #[async_trait::async_trait]
+    impl flotilla_core::leaf_engine::ResourceIntentPublisher for FailedHandoffPublisher {
+        async fn publish(self: Arc<Self>, _: &str, _: serde_json::Value) -> Result<flotilla_protocol::ResourceRef, String> {
+            Err("remote handoff publication unavailable".into())
+        }
+    }
+    let failed: Arc<dyn flotilla_core::leaf_engine::ResourceIntentPublisher> = Arc::new(FailedHandoffPublisher);
+    authority.set_resource_intent_publisher(Arc::downgrade(&failed));
+    let before = convoys.get("handoff-convoy").await.expect("before failed handoff").status;
+    let error = authority.crew_handoff_internal(&context, "reviewer", "Review this").await.expect_err("publication fails");
+    assert!(error.contains("remote handoff publication unavailable"));
+    assert_eq!(convoys.get("handoff-convoy").await.expect("after failed handoff").status, before);
+    authority.set_resource_intent_publisher(Arc::downgrade(&publisher));
     authority.crew_handoff_internal(&context, "reviewer", "Review this").await.expect("queue remote handoff");
     let convoy = convoys.get("handoff-convoy").await.expect("convoy after handoff");
     assert!(convoy.status.expect("convoy status").turn_deliveries.values().all(|delivery| delivery.pending_supervisor_turn.is_none()));
@@ -9254,4 +9271,67 @@ async fn startup_forgejo_discovery_error_preserves_other_repositories() {
         );
         assert!(daemon.discover_repo_for_environment_for_test(&repo, daemon.local_environment_id()).await.is_err());
     }
+}
+
+#[tokio::test]
+async fn message_apply_uses_document_namespace_and_guarded_status_rejects_stale_observation() {
+    let temp = tempfile::tempdir().expect("config");
+    let daemon =
+        InProcessDaemon::new(vec![], test_config_store(temp.path().join("config")), fake_discovery(false), HostName::local()).await;
+    let backend = daemon.resource_backend();
+    backend
+        .using::<ResourceConvoy>("document-namespace")
+        .create(
+            &InputMeta::builder().name("namespace-convoy".into()).build(),
+            &flotilla_resources::ConvoySpec::builder().workflow_ref("workflow".into()).build(),
+        )
+        .await
+        .expect("receiver declaration");
+    let mut events = daemon.subscribe();
+    let id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceApply {
+                    namespace: "request-default".into(),
+                    document: serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message",
+            "metadata":{"name":"namespace-message","namespace":"document-namespace"},
+            "spec":{"sender":"system:test","receiver":"document-namespace/namespace-convoy/work/coder","relation":"system","body":"test"}}),
+                })
+                .build(),
+        )
+        .await
+        .expect("resource envelope");
+    let result = recv_command_finished(&mut events, id).await;
+    assert!(matches!(result, CommandValue::ResourceObject(response) if response.namespace == "document-namespace"));
+    let messages = backend.using::<flotilla_resources::Message>("document-namespace");
+    let observed = messages.get("namespace-message").await.expect("document-scoped admission");
+    assert!(backend.using::<flotilla_resources::Message>("request-default").list().await.expect("default namespace").items.is_empty());
+    let mut next = observed.status.clone().expect("accepted status");
+    next.submission = Some(
+        flotilla_resources::MessageSubmission::builder()
+            .batch_id("batch".into())
+            .crew_id("crew".into())
+            .session("session".into())
+            .started_at(chrono::Utc::now())
+            .members(vec!["namespace-message".into()])
+            .build(),
+    );
+    messages.update_status("namespace-message", &observed.metadata.resource_version, &next).await.expect("receiver records submission");
+    let id = daemon
+        .execute(
+            Command::builder()
+                .action(CommandAction::ResourceStatusPatch {
+                    namespace: "document-namespace".into(),
+                    kind: "Message".into(),
+                    name: "namespace-message".into(),
+                    status: serde_json::to_value(observed.status).expect("stale status"),
+                    expected_resource_version: Some(observed.metadata.resource_version),
+                })
+                .build(),
+        )
+        .await
+        .expect("guarded status command");
+    let result = recv_command_finished(&mut events, id).await;
+    assert!(matches!(result, CommandValue::Error { message } if message.contains("status changed")));
+    assert_eq!(messages.get("namespace-message").await.expect("retained evidence").status, Some(next));
 }
