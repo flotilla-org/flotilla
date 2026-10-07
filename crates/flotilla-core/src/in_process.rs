@@ -3470,7 +3470,7 @@ impl InProcessDaemon {
         }
         for (_, _, provider) in candidates {
             if let Some((id, request)) =
-                provider.find_change_request_by_branch(checkout.spec.branch()).await.map_err(|error| error.to_string())?
+                provider.find_change_request_by_branch_for_admission(checkout.spec.branch()).await.map_err(|error| error.to_string())?
             {
                 return Ok(Some(format!(
                     "checkout branch {} conflicts with {:?} change request #{}; choose a fresh branch name",

@@ -119,6 +119,11 @@ pub trait ChangeRequestTracker: Send + Sync {
     async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, ObservationError> {
         Ok(self.list_change_requests(100).await?.into_iter().find(|(_, request)| request.branch == branch))
     }
+    /// Explicit checkout admission must validate the branch afresh, rather
+    /// than authorizing creation from a cached absence observation.
+    async fn find_change_request_by_branch_for_admission(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, ObservationError> {
+        self.find_change_request_by_branch(branch).await
+    }
     #[allow(dead_code)]
     async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String>;
     /// Resolve the immutable identity required to admit an existing change

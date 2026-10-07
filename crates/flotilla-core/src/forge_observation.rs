@@ -45,6 +45,13 @@ pub async fn project_home(backend: &ResourceBackend, namespace: &str, name: &str
     Ok(homes.into_iter().min().map(|(_, root)| root))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ObserverHealth {
+    Ready,
+    Unknown,
+    Unready,
+}
+
 /// Shared sources elect once, regardless of how many Projects bind them.
 /// Unknown host health preserves the preferred owner during startup; only
 /// positive unready/stale evidence permits fallback to a known ready daemon.
@@ -93,24 +100,34 @@ pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &I
             continue;
         }
         let root = origin(backend, &host.provenance)?;
-        let healthy = host.object.status.as_ref().is_some_and(|status| {
-            status.ready && status.heartbeat_at.is_some_and(|at| Utc::now().signed_duration_since(at) < chrono::Duration::seconds(180))
-        });
         let heartbeat = host.object.status.as_ref().and_then(|status| status.heartbeat_at);
-        let candidate = (heartbeat, !healthy);
+        let health = match host.object.status.as_ref() {
+            None => ObserverHealth::Unknown,
+            Some(status) if !status.ready => ObserverHealth::Unready,
+            Some(_) => match heartbeat {
+                Some(at) if Utc::now().signed_duration_since(at) < chrono::Duration::seconds(180) => ObserverHealth::Ready,
+                Some(_) => ObserverHealth::Unready,
+                None => ObserverHealth::Unknown,
+            },
+        };
+        let candidate = (heartbeat, health);
         let entry = ready.entry(root).or_insert(candidate);
         if candidate > *entry {
             *entry = candidate;
         }
     }
     if let Some(preferred) = preferred {
-        if ready.get(&preferred).map(|(_, unready)| !unready).unwrap_or(true) {
+        if ready.get(&preferred).is_none_or(|(_, health)| *health != ObserverHealth::Unready) {
             return Ok(Some(preferred));
         }
     } else if ready.is_empty() {
         return Ok(None);
     }
-    ready.into_iter().find_map(|(root, (_, unready))| (!unready).then_some(root)).map(Some).ok_or_else(|| "no ready forge observer".into())
+    ready
+        .into_iter()
+        .find_map(|(root, (_, health))| (health == ObserverHealth::Ready).then_some(root))
+        .map(Some)
+        .ok_or_else(|| "no ready forge observer".into())
 }
 
 pub async fn owns_source(backend: &ResourceBackend, namespace: &str, source: &IssueSource) -> Result<bool, String> {
@@ -391,6 +408,9 @@ impl ChangeRequestTracker for ObservedChangeRequestTracker {
             })
             .await
             .map_err(classified_rate_error)
+    }
+    async fn find_change_request_by_branch_for_admission(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, ObservationError> {
+        self.inner.find_change_request_by_branch_for_admission(branch).await
     }
     async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String> {
         self.reads.read(&self.source, ForgeReadRequest::ChangeRequest { id: id.into() }, || self.inner.get_change_request(id)).await

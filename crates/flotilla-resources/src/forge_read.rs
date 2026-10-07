@@ -1,7 +1,7 @@
 //! Replicated demand and last successful result for an external forge read.
 use chrono::{DateTime, Utc};
 use flotilla_protocol::{issue_query::IssueQuery, IssueSource};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{ApiPaths, ReplicationClass, Resource, StatusPatch};
 
@@ -39,9 +39,17 @@ pub struct ForgeReadStatus {
     pub authority: String,
     pub attempted_at: DateTime<Utc>,
     pub observed_at: Option<DateTime<Utc>>,
+    // Missing means no successful observation; null is a successful optional
+    // result (for example, no PR for a branch). Option<Value>'s default decoder
+    // collapses both, so omit None and preserve every present JSON value.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_value")]
     pub value: Option<serde_json::Value>,
     pub error: Option<String>,
     pub retry_at: Option<DateTime<Utc>>,
+}
+
+fn present_value<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 impl StatusPatch<ForgeReadStatus> for ForgeReadStatus {
     fn apply(&self, status: &mut ForgeReadStatus) {
@@ -50,4 +58,35 @@ impl StatusPatch<ForgeReadStatus> for ForgeReadStatus {
 }
 pub fn forge_read_name(source: &IssueSource, request: &ForgeReadRequest) -> String {
     format!("forge-read-{}", crate::content_hash(&serde_json::json!([source, request])).expect("forge read key serializes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A stored result preserves absence versus successful null, and every
+    // other JSON payload shape. Generate absence, null, scalar, array and object.
+    #[hegel::test]
+    fn stored_forge_result_preserves_successful_null(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let value = match tc.draw(gs::integers::<u8>().min_value(0).max_value(4)) {
+            0 => None,
+            1 => Some(serde_json::Value::Null),
+            2 => Some(serde_json::json!(true)),
+            3 => Some(serde_json::json!([0, 1])),
+            _ => Some(serde_json::json!({"issues": []})),
+        };
+        let status = ForgeReadStatus {
+            authority: "owner".into(),
+            attempted_at: "2026-10-07T00:00:00Z".parse().expect("timestamp"),
+            observed_at: value.as_ref().map(|_| "2026-10-07T00:00:00Z".parse().expect("timestamp")),
+            value,
+            error: None,
+            retry_at: None,
+        };
+        let encoded = serde_json::to_value(&status).expect("serialize stored result");
+        assert_eq!(encoded.get("value").is_some(), status.value.is_some());
+        let decoded: ForgeReadStatus = serde_json::from_value(encoded).expect("decode stored result");
+        assert_eq!(decoded, status);
+    }
 }

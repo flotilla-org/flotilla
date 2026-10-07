@@ -34,10 +34,13 @@ impl GitHubIssueProvider {
         let endpoint = format!("repos/{}/issues/{}", reference.source.scope, reference.id);
         let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
         let item: serde_json::Value = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
+        let rest_revision = serde_json::to_string(&(response.etag, &item)).map_err(|e| e.to_string())?;
         let mut cache = self.poll.state.lock().await;
         let state = cache.entry(key.clone()).or_insert(self.poll.load(&key)?);
         let revision = item["updated_at"].as_str().ok_or("issue lacks updated_at")?;
-        if state.issues.revisions.get(&reference.id).is_some_and(|prior| prior == revision) {
+        if state.issues.revisions.get(&reference.id).is_some_and(|prior| prior == revision)
+            && state.issues.check_revisions.get(&reference.id) == Some(&rest_revision)
+        {
             if let Some(detail) = state.issues.details.get(&reference.id) {
                 return Ok((detail.clone(), item));
             }
@@ -51,6 +54,7 @@ impl GitHubIssueProvider {
         let detail = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         let mut next = state.clone();
         next.issues.commit(&item, detail)?;
+        next.issues.check_revisions.insert(reference.id.clone(), rest_revision);
         self.poll.save(&key, &next)?;
         *state = next;
         state.issues.details.get(&reference.id).cloned().map(|detail| (detail, item)).ok_or("issue detail was not cached".into())
@@ -850,6 +854,39 @@ mod tests {
         session.finish();
     }
 
+    // #2868: unchanged native details survive rediscovery, but a new item ETag
+    // invalidates them even when GitHub's second-resolution updated_at is equal.
+    #[tokio::test]
+    async fn issue_detail_etag_invalidates_equal_timestamp_cache() {
+        let item = serde_json::json!({"number":7,"updated_at":"2026-10-07T00:00:00Z"});
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok(format!("HTTP/2 200 OK\r\nETag: initial\r\n\r\n{item}")),
+            Ok(r#"{"closedByPullRequestsReferences":[]}"#.into()),
+            Ok("HTTP/2 304 Not Modified\r\n\r\n".into()),
+            Ok(format!("HTTP/2 200 OK\r\nETag: changed\r\n\r\n{item}")),
+            Ok(r#"{"closedByPullRequestsReferences":[{"number":8}]}"#.into()),
+        ]));
+        let directory = tempfile::tempdir().expect("persistent native details");
+        let make = || {
+            GitHubIssueProvider::new(
+                Arc::new(GhApiClient::new(runner.clone()).with_persistence(directory.path().join("rest"))),
+                runner.clone(),
+                Path::new("/"),
+            )
+            .with_poll_directory(directory.path().join("details"))
+        };
+        let reference = IssueRef { source: source(), id: "7".into() };
+        let provider = make();
+        let (first, _) = provider.issue_detail(&reference, "closedByPullRequestsReferences").await.expect("initial");
+        drop(provider);
+        let provider = make();
+        assert_eq!(provider.issue_detail(&reference, "closedByPullRequestsReferences").await.expect("quiet").0, first);
+        let (changed, _) = provider.issue_detail(&reference, "closedByPullRequestsReferences").await.expect("changed ETag");
+        assert_eq!(changed["closedByPullRequestsReferences"][0]["number"], 8);
+        assert_eq!(runner.calls().len(), 5);
+        assert_eq!(runner.remaining(), 0);
+    }
+
     // Historical full-board replay is replaced by conditional-poll tests: the
     // production adapter now validates REST collections before targeted details.
     #[tokio::test]
@@ -876,9 +913,11 @@ mod tests {
             Ok(unchanged.clone()),
             Ok(unchanged.clone()),
             Ok(response("issues-2", serde_json::json!([issue("2026-10-07T00:01:00Z")]))),
+            Ok(response("delta-2", serde_json::json!([issue("2026-10-07T00:01:00Z")]))),
             Ok(unchanged.clone()),
             Ok(detail("Changed")),
             Ok(response("issues-3", serde_json::json!([issue("2026-10-07T00:02:00Z")]))),
+            Ok(response("delta-3", serde_json::json!([issue("2026-10-07T00:02:00Z")]))),
             Ok(unchanged.clone()),
             Ok("{}".into()),
             Ok(unchanged.clone()),
@@ -905,7 +944,7 @@ mod tests {
         assert_eq!((rest.calls, rest.reported_cost), (6, 2), "quiet and restart polls spend zero primary quota");
         assert_eq!(restarted.dispatch_board(&source).await.expect("single update").issues[0].title, "Changed");
         let calls = runner.calls();
-        assert_eq!(calls.len(), 10);
+        assert_eq!(calls.len(), 11);
         assert_eq!(calls.iter().filter(|(_, args)| args.first().is_some_and(|arg| arg == "issue")).count(), 2);
         for (_, args) in &calls[3..7] {
             assert_eq!(args[0], "api");
@@ -915,7 +954,7 @@ mod tests {
         assert!(restarted.dispatch_board(&source).await.is_err(), "incomplete native detail must not commit a cursor");
         assert_eq!(restarted.poll.load(&source.scope).unwrap().issues.cursor.as_deref(), Some("2026-10-07T00:01:00Z"));
         assert_eq!(restarted.dispatch_board(&source).await.expect("retry cached collection").issues[0].title, "Recovered");
-        assert_eq!(runner.calls().len(), 16);
+        assert_eq!(runner.calls().len(), 18);
         assert_eq!(runner.remaining(), 0);
     }
     // The archived full-board recording pins the same per-item native shape

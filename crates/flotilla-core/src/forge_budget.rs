@@ -1,7 +1,7 @@
 //! Hourly host-identity accounting at the gh subprocess boundary.
 use std::{
     collections::BTreeMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -76,7 +76,7 @@ impl ForgeBudgets {
             document["data"]["rateLimit"]["cost"].as_u64()
         };
         if let Some(cost) = cost {
-            row.reported_cost += cost + 1;
+            row.reported_cost += cost;
         } else {
             row.unreported_calls += 1;
         }
@@ -114,6 +114,21 @@ pub struct BudgetedRunner {
 }
 #[async_trait]
 impl CommandRunner for BudgetedRunner {
+    async fn writable_scratch_base(&self, preferred: Option<&Path>, fallback: &Path) -> Result<PathBuf, String> {
+        self.inner.writable_scratch_base(preferred, fallback).await
+    }
+    async fn writable_config_base(&self, preferred: Option<&Path>, fallback: &Path) -> Result<PathBuf, String> {
+        self.inner.writable_config_base(preferred, fallback).await
+    }
+    async fn ensure_file(&self, path: &Path, content: &str) -> Result<String, String> {
+        self.inner.ensure_file(path, content).await
+    }
+    async fn write_file(&self, path: &Path, content: &str) -> Result<(), String> {
+        self.inner.write_file(path, content).await
+    }
+    async fn write_file_with_mode(&self, path: &Path, content: &str, mode: u32) -> Result<(), String> {
+        self.inner.write_file_with_mode(path, content, mode).await
+    }
     async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
         self.inner.exists(cmd, args).await
     }

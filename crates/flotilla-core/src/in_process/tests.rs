@@ -9621,8 +9621,13 @@ async fn checkout_branch_switch_discovers_actual_request_and_unlink_wins() {
 async fn checkout_creation_does_not_reuse_cached_branch_absence() {
     let fixture = rest_admission_fixture([RestAdmissionReply::Absent; 2], RestAdmissionLookup::Branch).await;
     let provider = Arc::new(FakeChangeRequest::new());
+    let observed = Arc::new(crate::forge_observation::ObservedChangeRequestTracker {
+        inner: provider.clone(),
+        reads: crate::forge_observation::ForgeReads::new(fixture.daemon.resource_backend(), "flotilla".into()),
+        source: flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "team/repo0".into() },
+    });
     fixture.daemon.convoy_admission.repository_change_requests.write().await.get_mut(&fixture.keys[0]).expect("provider").provider =
-        provider.clone();
+        observed.clone();
     assert!(fixture
         .daemon
         .resolve_convoy_change_request(std::slice::from_ref(&fixture.keys[0]), "reused", None)
@@ -9639,6 +9644,9 @@ async fn checkout_creation_does_not_reuse_cached_branch_absence() {
             provider_display_name: "GitHub".into(),
         })])
         .await;
+    // Ordinary observation may reuse the earlier absence; creation must still
+    // inspect the forge anew through the same production observation adapter.
+    assert!(observed.find_change_request_by_branch("reused").await.expect("cached absence").is_none());
     let checkout = fixture
         .daemon
         .resource_backend()
@@ -10424,6 +10432,9 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
     for (index, daemon) in daemons.iter().enumerate() {
         let hosts = daemon.resource_backend().using::<ResourceHost>("flotilla");
         let host = hosts.create(&test_meta(&format!("host-{index}")), &HostSpec::default()).await.unwrap();
+        if index == 0 {
+            continue;
+        }
         hosts
             .update_status(&host.metadata.name, &host.metadata.resource_version, &HostStatus {
                 ready: true,
@@ -10433,6 +10444,25 @@ async fn three_host_forge_observation_has_one_owner_and_replicates_facts() {
             .await
             .unwrap();
     }
+    replicate::<ResourceHost>(&daemons).await;
+    // A declared Host whose first heartbeat has not arrived is unknown, not
+    // positive unready evidence. Ready replicas must not steal its source.
+    for daemon in &daemons {
+        assert_eq!(
+            crate::forge_observation::source_owner(&daemon.resource_backend(), "flotilla", &source).await.unwrap(),
+            Some(daemons[0].resource_backend().local_root().unwrap())
+        );
+    }
+    let hosts = daemons[0].resource_backend().using::<ResourceHost>("flotilla");
+    let host = hosts.get("host-0").await.unwrap();
+    hosts
+        .update_status("host-0", &host.metadata.resource_version, &HostStatus {
+            ready: true,
+            heartbeat_at: Some(Utc::now()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     replicate::<ResourceHost>(&daemons).await;
     for refresher in &refreshers {
         refresher.refresh_once(&subject).await.unwrap();

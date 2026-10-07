@@ -46,7 +46,7 @@ fn deployed_stored_records_still_decode() {
         }
         generation_count += 1;
         // ManifestRoot, CrewDefaults, ImageLayer, ImageBuild (#2728), Message (#2716) and FleetDesignation (#2718) were introduced
-        // after this deployed generation, as were DispatchHold and DispatchDeployment (#2782). Remove their exemptions when the
+        // after this deployed generation, as were DispatchHold and DispatchDeployment (#2782) and ForgeRead (#2868). Remove their exemptions when the
         // corpus is refreshed after the next fleet roll (ADR 0047).
         let expected: BTreeSet<_> = REGISTERED_RESOURCE_KINDS
             .iter()
@@ -61,6 +61,7 @@ fn deployed_stored_records_still_decode() {
                         | "DispatchHold"
                         | "DispatchDeployment"
                         | "Message"
+                        | "ForgeRead"
                 )
             })
             .map(|kind| format!("{}.json", kind.kind))
@@ -83,6 +84,7 @@ fn deployed_stored_records_still_decode() {
                     | "DispatchHold"
                     | "DispatchDeployment"
                     | "Message"
+                    | "ForgeRead"
             )
         }) {
             let file = generation.join(format!("{}.json", kind.kind));
