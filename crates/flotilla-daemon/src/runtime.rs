@@ -29,6 +29,7 @@ use flotilla_core::{
         inspect_convoy_checkout_integration, LANDING_EVIDENCE_TTL,
     },
     config::{ConfigStore, DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY},
+    crew_capabilities::{CredentialCapability, SessionCapabilitySource},
     daemon::DaemonHandle,
     demand_lifecycle::DemandLifecycle,
     in_process::{InProcessDaemon, OperatorReconciler, StandingConvoyBackingInspector, WorkCredentialReconciler},
@@ -57,8 +58,8 @@ use flotilla_resources::{
     HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch, InputDefinition, InputMeta, ManifestRoot, ModelProbeState,
     PlacementPolicy, PlacementPolicySpec, Platform, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository,
     RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalAttentionSource,
-    TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, Vessel, VesselRequirement,
-    VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
+    TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel,
+    VesselRequirement, VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
     CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV,
     CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
     OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, TRANSPORT_CAPABILITY,
@@ -162,8 +163,53 @@ struct RuntimeOperatorReconciler {
     local_root: String,
 }
 
+struct RuntimeSessionCapabilities {
+    state: Weak<ControllerRuntimeState>,
+}
+
+#[async_trait]
+impl SessionCapabilitySource for RuntimeSessionCapabilities {
+    async fn credentials(&self, environment: &str, references: &BTreeSet<String>) -> Result<Vec<CredentialCapability>, String> {
+        let state = self.state.upgrade().ok_or("session capability runtime unavailable")?;
+        match &state.credential_store {
+            Some(store) => store.credentials(environment, references).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn endpoints(&self, environment: &str, session: &str) -> Result<BTreeMap<String, String>, String> {
+        let state = self.state.upgrade().ok_or("session capability runtime unavailable")?;
+        let mut endpoints = match &state.credential_store {
+            Some(store) => store.endpoints(environment, session).await?,
+            None => BTreeMap::new(),
+        };
+        if environment == state.host_direct_environment_name {
+            if let Some(socket) = state.daemon.daemon_socket_path().await {
+                endpoints.insert("Flotilla daemon".into(), socket.display().to_string());
+            }
+        } else {
+            let record = state
+                .daemon
+                .resource_backend()
+                .including_replicas::<Environment>(&state.namespace)
+                .get(environment)
+                .await
+                .map_err(|error| error.to_string())?
+                .object;
+            if let Some(docker) = record.spec.docker {
+                for (key, value) in &docker.env {
+                    if let Some((destination, address)) = flotilla_core::crew_capabilities::endpoint_for_env(key, value) {
+                        endpoints.insert(destination, address);
+                    }
+                }
+            }
+        }
+        Ok(endpoints)
+    }
+}
+
 struct RuntimeWorkCredentialReconciler {
-    state: std::sync::Weak<ControllerRuntimeState>,
+    state: Weak<ControllerRuntimeState>,
 }
 
 #[async_trait]
@@ -896,6 +942,7 @@ impl DaemonRuntime {
                 daemon.set_work_credential_reconciler(Arc::new(RuntimeWorkCredentialReconciler { state: Arc::downgrade(&state) })),
             )
             .await;
+            daemon.set_session_capability_source(Arc::new(RuntimeSessionCapabilities { state: Arc::downgrade(&state) })).await;
             controller_state = Some(state);
         }
 
@@ -3338,6 +3385,9 @@ fn spawn_credential_refresh_task(daemon: Arc<InProcessDaemon>, namespace: String
         let store = Arc::clone(&store);
         async move {
             let errors = store.refresh_due_github_app_tokens().await;
+            if let Err(error) = daemon.refresh_capability_cards(&namespace).await {
+                warn!(%error, "failed to refresh session capability cards");
+            }
             for error in &errors {
                 warn!(error = %error.message, environment = %error.environment_ref, "failed to refresh GitHub App credential delivery");
             }
@@ -6651,7 +6701,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
     async fn cleat_endpoint(
         &self,
         session_id: &str,
-        spec: &flotilla_resources::TerminalSessionSpec,
+        spec: &TerminalSessionSpec,
     ) -> Result<Option<flotilla_protocol::result_set::CleatEndpoint>, String> {
         let pool = self.pool_for_spec(spec)?;
         pool.cleat_endpoint(session_id).await
@@ -6660,7 +6710,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
     async fn ensure_session(
         &self,
         name: &str,
-        spec: &flotilla_resources::TerminalSessionSpec,
+        spec: &TerminalSessionSpec,
         tags: &[flotilla_resources::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         let registry = self.registry_for_env(&spec.env_ref)?;
@@ -6748,6 +6798,41 @@ impl TerminalRuntime for TerminalControllerRuntime {
                         let runner = self.runner_for_env(&spec.env_ref)?;
                         credential_env = material.crew_environment(&spec.role, &required, &environment, &*runner).await?;
                     }
+                }
+                if let Some(store) = &self.state.credential_store {
+                    store.record_capability_endpoints(&spec.env_ref, name, &credential_env).await;
+                    let card = async {
+                        let credentials = store.credentials(&spec.env_ref, &credential_refs).await?;
+                        flotilla_core::crew_capabilities::session_card(
+                            &self.state.daemon.resource_backend(),
+                            &context.namespace,
+                            &context.convoy,
+                            spec,
+                            &credentials,
+                            &RuntimeSessionCapabilities { state: Arc::downgrade(&self.state) }.endpoints(&spec.env_ref, name).await?,
+                        )
+                        .await
+                    }
+                    .await;
+                    let card = match card {
+                        Ok(card) => card,
+                        Err(error) => {
+                            warn!(session = %name, %error, "failed to construct advisory launch capability card");
+                            format!("{}\n\nCapabilities are currently unavailable. Run `flotilla crew capabilities` when unsure or after the service recovers.\n", flotilla_core::crew_capabilities::CAPABILITIES_HEADING.trim_start())
+                        }
+                    };
+                    if let Err(error) = flotilla_core::crew_capabilities::observe_launch_card(
+                        &self.state.daemon.resource_backend(),
+                        &context.namespace,
+                        name,
+                        &card,
+                    )
+                    .await
+                    {
+                        warn!(session = %name, %error, "failed to persist launch capability observation");
+                    }
+                    materialized_brief.content.push_str("\n\n");
+                    materialized_brief.content.push_str(&card);
                 }
                 adapter.prepare_with_vcs(&cwd, &materialized_brief, &credential_env, vcs.as_ref()).await?;
                 for copy_root in &brief.copies {
@@ -6856,7 +6941,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
 
     async fn agent_exit_code(
         &self,
-        spec: &flotilla_resources::TerminalSessionSpec,
+        spec: &TerminalSessionSpec,
         crew: &flotilla_resources::CrewSessionStatus,
     ) -> Result<Option<i32>, String> {
         let runner = self.runner_for_env(&spec.env_ref)?;
@@ -6889,27 +6974,18 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .await
     }
 
-    async fn remove_exit_receipt(&self, spec: &flotilla_resources::TerminalSessionSpec, launch_id: &str) -> Result<(), String> {
+    async fn remove_exit_receipt(&self, spec: &TerminalSessionSpec, launch_id: &str) -> Result<(), String> {
         let runner = self.runner_for_env(&spec.env_ref)?;
         flotilla_core::agent_process::remove_exit_receipt(&*runner, Path::new(&spec.cwd), launch_id).await
     }
 
-    async fn observe_attention(
-        &self,
-        session_id: &str,
-        spec: &flotilla_resources::TerminalSessionSpec,
-    ) -> Result<Option<TerminalObservation>, String> {
+    async fn observe_attention(&self, session_id: &str, spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {
         let pool = self.pool_for_spec(spec)?;
         let adapter = self.adapter_for_spec(spec)?;
         observe_terminal_screen(&*pool, adapter.as_deref(), session_id, Utc::now()).await
     }
 
-    async fn agent_exit_failure(
-        &self,
-        session_id: &str,
-        spec: &flotilla_resources::TerminalSessionSpec,
-        exit_code: i32,
-    ) -> Result<Option<String>, String> {
+    async fn agent_exit_failure(&self, session_id: &str, spec: &TerminalSessionSpec, exit_code: i32) -> Result<Option<String>, String> {
         if exit_code == 0 {
             return Ok(None);
         }
@@ -6978,7 +7054,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
     async fn deliver_message(
         &self,
         session_id: &str,
-        spec: &flotilla_resources::TerminalSessionSpec,
+        spec: &TerminalSessionSpec,
         message: &str,
         readiness: TerminalDeliveryReadiness,
     ) -> Result<TerminalDeliveryOutcome, String> {
@@ -17432,17 +17508,39 @@ mod tests {
 
     #[tokio::test]
     async fn contained_claude_launch_uses_granted_invocation_environment_without_ambient_config() {
-        assert_contained_claude_invocation_home(false).await;
+        assert_contained_claude_invocation_home(false, LaunchObservationRecord::Present).await;
     }
 
     #[tokio::test]
     async fn contained_claude_launch_selects_its_crew_home() {
         // Issue #2672: new environments launch in the role home with the same
         // granted OAuth wiring. The other test covers legacy environments.
-        assert_contained_claude_invocation_home(true).await;
+        assert_contained_claude_invocation_home(true, LaunchObservationRecord::Present).await;
     }
 
-    async fn assert_contained_claude_invocation_home(private_home: bool) {
+    enum LaunchObservationRecord {
+        Present,
+        Missing,
+        MissingConvoy,
+        MissingEnvironment,
+    }
+
+    // Advisory observation failures must not discard the inline card or prevent launch.
+    #[tokio::test]
+    async fn contained_claude_launch_keeps_inline_card_without_session_observation() {
+        assert_contained_claude_invocation_home(false, LaunchObservationRecord::Missing).await;
+    }
+
+    // Capability context and endpoint reads are advisory: the assignment and
+    // delivered credentials must still reach the harness when those reads fail.
+    #[tokio::test]
+    async fn contained_claude_launch_survives_capability_context_read_failures() {
+        for observation in [LaunchObservationRecord::MissingConvoy, LaunchObservationRecord::MissingEnvironment] {
+            assert_contained_claude_invocation_home(false, observation).await;
+        }
+    }
+
+    async fn assert_contained_claude_invocation_home(private_home: bool, observation: LaunchObservationRecord) {
         let temp = TempDir::new().expect("tempdir");
         let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
         fs::create_dir_all(config.base_path()).expect("config directory");
@@ -17464,7 +17562,7 @@ mod tests {
         let workspace = temp.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
         let env_id = EnvironmentId::new("contained-claude");
-        if private_home {
+        if !matches!(observation, LaunchObservationRecord::MissingEnvironment) {
             backend
                 .using::<Environment>(NAMESPACE)
                 .create(&empty_meta(env_id.as_str()), &EnvironmentSpec {
@@ -17479,7 +17577,11 @@ mod tests {
                         required_agent_adapters: BTreeSet::from(["claude-code".into()]),
                         pull_policy: Default::default(),
                         mounts: Vec::new(),
-                        env: BTreeMap::from([("FLOTILLA_CREW_SKILLS".into(), "{\"coder\":[],\"reviewer\":[]}".into())]),
+                        env: if private_home {
+                            BTreeMap::from([("FLOTILLA_CREW_SKILLS".into(), "{\"coder\":[],\"reviewer\":[]}".into())])
+                        } else {
+                            BTreeMap::new()
+                        },
                     }),
                 })
                 .await
@@ -17569,6 +17671,30 @@ mod tests {
             ]),
             pool: "fake-terminals".to_string(),
         };
+        // Managed launch cards read durable context, just as the live command does.
+        let backend = daemon.resource_backend();
+        if !matches!(observation, LaunchObservationRecord::MissingConvoy) {
+            backend
+                .using::<Convoy>(NAMESPACE)
+                .create(&empty_meta("demo"), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+                .await
+                .expect("convoy");
+        }
+        backend
+            .using::<Vessel>(NAMESPACE)
+            .create(&empty_meta("demo-work"), &flotilla_resources::VesselSpec {
+                convoy_ref: "demo".into(),
+                vessel_name: "work".into(),
+                placement_policy_ref: "policy".into(),
+                adopted_checkout_refs: Default::default(),
+            })
+            .await
+            .expect("vessel");
+        let mut terminal_meta = empty_meta("terminal-demo-work-coder");
+        terminal_meta.annotations.insert(flotilla_resources::CREDENTIAL_REFS_ANNOTATION.into(), "[\"claude-max\"]".into());
+        if matches!(observation, LaunchObservationRecord::Present) {
+            backend.using::<TerminalSession>(NAMESPACE).create(&terminal_meta, &spec).await.expect("terminal context");
+        }
         let tags = [flotilla_resources::TerminalSessionTag::new(CREDENTIAL_REF_SESSION_TAG, "claude-max")];
 
         let launched = TerminalControllerRuntime { state }
@@ -17598,6 +17724,17 @@ mod tests {
                     .as_str()),
             "the contained Claude process must receive the config directory owned by its adapter"
         );
+        // The first turn includes the assignment and its capability card, never token material.
+        assert!(launch.command.contains("Implement the issue."));
+        assert!(launch.command.contains("## Your capabilities"));
+        if matches!(observation, LaunchObservationRecord::MissingConvoy | LaunchObservationRecord::MissingEnvironment) {
+            assert!(launch.command.contains("Capabilities are currently unavailable"));
+            assert!(launch.command.contains("flotilla crew capabilities"));
+        } else {
+            assert!(launch.command.contains("claude-max"));
+        }
+        assert!(!launch.command.contains("oauth-secret-material"));
+        assert!(!launch.command.contains("superseded-spec-token"));
         assert_eq!(launch.initial_size, Some(CREW_SESSION_SIZE));
         let crew_id = &launched.crew.expect("contained crew identity").id;
         for (name, expected) in [
@@ -18055,7 +18192,9 @@ mod tests {
         let ensured = pool.ensured.lock().await;
         let coder_launch = ensured.iter().find(|launch| launch.session_name.ends_with("-coder")).expect("coder launch");
         assert!(coder_launch.command.contains("--dangerously-bypass-approvals-and-sandbox"));
-        assert!(!coder_launch.command.contains("without leaking this full brief"));
+        // #2821: the complete rendered brief now appears in the launch prompt.
+        assert!(coder_launch.command.contains("without leaking this full brief"));
+        assert!(coder_launch.command.contains("This is also at"));
         for (name, expected) in [
             ("FLOTILLA_CREW_ID", coder_id.as_str()),
             ("FLOTILLA_CONVOY", context.convoy.as_str()),

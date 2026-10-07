@@ -20,6 +20,7 @@ pub mod config;
 pub mod convert;
 pub mod convoy_branch_refresh;
 pub mod convoy_ensure;
+pub mod crew_capabilities;
 pub mod daemon;
 pub mod data;
 pub mod decision_log;

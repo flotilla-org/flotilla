@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 use crate::{
+    crew_capabilities::CAPABILITIES_HEADING,
     path_context::ExecutionEnvironmentPath,
     providers::{discovery::EnvironmentBag, terminal::TerminalEnvVars, ChannelLabel, CommandRunner},
 };
@@ -608,7 +609,26 @@ pub trait AgentAdapter: Send + Sync {
         Ok(())
     }
     fn deliver_brief(&self, brief: &TerminalBrief) -> String {
-        format!("Read your crew brief at {} and follow it.", brief.path)
+        // Linux limits an individual exec argument to 128 KiB, including its NUL.
+        // Both Claude and Codex receive the prompt as one argument. Leave room
+        // for UTF-8, quoting and harness additions within a conservative 64 KiB.
+        let prompt = format!("{}\n\nThis is also at `{}`; re-read that file after a context compaction.", brief.content, brief.path);
+        if flotilla_protocol::arg::shell_quote(&prompt).len() <= 64 * 1024 {
+            prompt
+        } else {
+            let card = brief
+                .content
+                .rsplit_once(CAPABILITIES_HEADING)
+                .map(|(_, card)| format!("{CAPABILITIES_HEADING}{card}"))
+                .unwrap_or_default();
+            let fallback =
+                format!("Read your crew brief at {} and follow it. Re-read that file after a context compaction.{}", brief.path, card);
+            if flotilla_protocol::arg::shell_quote(&fallback).len() <= 64 * 1024 {
+                fallback
+            } else {
+                format!("Read your crew brief at {} and follow it. Re-read that file after a context compaction. Run `flotilla crew capabilities` for your live capabilities card.", brief.path)
+            }
+        }
     }
     fn classify_screen_attention(&self, _screen: &str) -> Option<TerminalAttentionState> {
         None
@@ -1202,6 +1222,7 @@ mod tests {
             AgentAdapterRegistry, AgentLaunchRequest, CapabilityTable, CrewAssignment, CrewBriefMember, CrewBriefRenderOptions,
             CrewBriefTemplateOverride, CrewBriefTemplateResolver, CLAUDE_MANAGED_SETTINGS_PATH,
         },
+        crew_capabilities::CAPABILITIES_HEADING,
         path_context::ExecutionEnvironmentPath,
         providers::{
             discovery::{factories::git::GitVcsFactory, EnvironmentAssertion, EnvironmentBag, Factory},
@@ -1912,8 +1933,60 @@ mod tests {
         );
     }
 
+    // Both harnesses preserve every byte of a bounded brief and keep oversized
+    // prompts below the single exec-argument limit, including shell quoting.
+    #[hegel::test]
+    fn brief_delivery_obeys_quoted_argument_bound(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        // Cross empty, exact threshold and oversized input with multibyte and
+        // shell metacharacters; the full file remains the canonical fallback.
+        let length = tc.draw(gs::integers::<usize>().min_value(0).max_value(70_000));
+        let unit = ["a", "'", "🛥"][tc.draw(gs::integers::<usize>().min_value(0).max_value(2))];
+        let brief = flotilla_resources::TerminalBrief {
+            path: ".flotilla/briefs/coder.md".into(),
+            content: unit.repeat(length),
+            artifact_digest: None,
+            copies: vec![],
+        };
+        for adapter_id in ["codex", "claude-code"] {
+            let registry = discovered_registry();
+            let adapter = registry.get(adapter_id).expect("adapter");
+            let prompt = adapter.deliver_brief(&brief);
+            assert!(flotilla_protocol::arg::shell_quote(&prompt).len() <= 64 * 1024);
+            assert!(prompt.contains(&brief.path));
+            assert!(prompt.contains("context compaction"));
+            let inline = format!("{}\n\nThis is also at `{}`; re-read that file after a context compaction.", brief.content, brief.path);
+            if flotilla_protocol::arg::shell_quote(&inline).len() <= 64 * 1024 {
+                assert_eq!(prompt, inline);
+            } else {
+                assert!(prompt.starts_with("Read your crew brief at"));
+            }
+        }
+    }
+
+    // Pin the inclusive byte boundary, plus card preservation on file fallback.
+    #[test]
+    fn brief_delivery_includes_exact_bound_and_preserves_fallback_card() {
+        let registry = discovered_registry();
+        let adapter = registry.get("codex").expect("codex");
+        let mut brief =
+            flotilla_resources::TerminalBrief { path: "brief.md".into(), content: String::new(), artifact_digest: None, copies: vec![] };
+        let overhead = flotilla_protocol::arg::shell_quote(&adapter.deliver_brief(&brief)).len();
+        brief.content = "x".repeat(64 * 1024 - overhead);
+        assert!(adapter.deliver_brief(&brief).starts_with(&brief.content));
+        brief.content.push('x');
+        assert!(adapter.deliver_brief(&brief).starts_with("Read your crew brief at"));
+        // Quoted headings in the assignment must not replace the final appended card.
+        brief.content.push_str(&format!("{CAPABILITIES_HEADING}\nQuoted assignment card."));
+        brief.content.push_str(&format!("{CAPABILITIES_HEADING}\nYou can write issues."));
+        let prompt = adapter.deliver_brief(&brief);
+        assert!(prompt.contains("You can write issues."));
+        assert!(!prompt.contains("Quoted assignment card."));
+        assert!(flotilla_protocol::arg::shell_quote(&prompt).len() < 64 * 1024);
+    }
+
     #[tokio::test]
-    async fn adapters_prepare_the_canonical_brief_and_launch_with_only_a_short_pointer() {
+    async fn adapters_prepare_the_canonical_brief_and_launch_with_inline_content() {
         let registry = discovered_registry();
         let cwd = ExecutionEnvironmentPath::new("/workspace");
         let brief = flotilla_resources::TerminalBrief {
@@ -1936,9 +2009,9 @@ mod tests {
             .expect("codex launch plan");
         assert_eq!(
             plan.command,
-            "/tools/codex --dangerously-bypass-approvals-and-sandbox --no-daemon -c 'notify=[\"flotilla\",\"hook\",\"codex\",\"notify\"]' 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
+            "/tools/codex --dangerously-bypass-approvals-and-sandbox --no-daemon -c 'notify=[\"flotilla\",\"hook\",\"codex\",\"notify\"]' 'protocol preamble\n\nImplement the issue.\n\nThis is also at `.flotilla/briefs/coder.md`; re-read that file after a context compaction.'"
         );
-        assert!(!plan.command.contains("Implement the issue"));
+        assert!(plan.command.contains("Implement the issue"));
         assert_eq!(plan.stance, "trusted-implicit");
         let restricted = codex
             .launch(&AgentLaunchRequest {
@@ -1963,9 +2036,9 @@ mod tests {
             .expect("claude launch plan");
         assert_eq!(
             plan.command,
-            "/tools/claude --dangerously-skip-permissions --settings .flotilla/claude-settings.json --model 'opus' 'Read your crew brief at .flotilla/briefs/coder.md and follow it.'"
+            "/tools/claude --dangerously-skip-permissions --settings .flotilla/claude-settings.json --model 'opus' 'protocol preamble\n\nImplement the issue.\n\nThis is also at `.flotilla/briefs/coder.md`; re-read that file after a context compaction.'"
         );
-        assert!(!plan.command.contains("Implement the issue"));
+        assert!(plan.command.contains("Implement the issue"));
 
         // Admission rejects metacharacter models before they reach launch;
         // the sink still shell-quotes so a hostile model can never splice

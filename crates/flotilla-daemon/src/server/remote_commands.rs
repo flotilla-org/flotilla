@@ -1150,7 +1150,8 @@ impl RemoteCommandRouter {
             CommandAction::CrewFail { context, .. }
             | CommandAction::CrewStall { context, .. }
             | CommandAction::CrewHandoff { context, .. }
-            | CommandAction::QueryCrewList { context } => (context, None),
+            | CommandAction::QueryCrewList { context }
+            | CommandAction::QueryCrewCapabilities { context } => (context, None),
             _ => return Ok(None),
         };
         let routing = self.daemon.resolve_crew_routing_context(context).await?;
