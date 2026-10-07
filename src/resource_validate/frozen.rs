@@ -409,10 +409,12 @@ pub(super) async fn check(inventory: &[Value], retired: &BTreeSet<(String, Strin
                         Category::Images,
                         &identity,
                         environment_ref,
-                        Err("vessel's frozen Environment is unavailable".into()),
+                        Err("vessel references a frozen Environment that is missing from the inventory".into()),
                         waiver,
                     );
                 }
+            // No environment_ref is distinct from an unresolved reference:
+            // retained landing vessels can still carry a placed image identity.
             } else if let Some(local) = &status.local_image_id {
                 report.record(
                     Category::Images,
@@ -445,6 +447,9 @@ fn validate_composition(composition: &ImageComposition) -> Result<(), String> {
     if recomposed.layers != composition.layers {
         return Err("candidate cannot reproduce frozen layer composition".into());
     }
+    // compose_image selects frozen layers; it does not build an image or derive
+    // Docker config/manifest digests. Identity is bound by placement and checked
+    // independently for availability by the caller, never inferred from layers.
     if let Some(identity) = &composition.identity {
         identity.validate()?;
     }
@@ -652,6 +657,7 @@ mod tests {
             .apply(&InputMeta::builder().name("bot".into()).build(), &spec)
             .await
             .expect("credential");
+        let credential_index = inventory.len();
         inventory.push(serde_json::to_value(credential.to_k8s_object()).expect("document"));
         let docker: DockerEnvironmentSpec =
             serde_json::from_value(serde_json::json!({"host_ref":"host", "image":"old-tag"})).expect("docker");
@@ -661,6 +667,7 @@ mod tests {
             .create(&InputMeta::builder().name("environment".into()).build(), &EnvironmentSpec { host_direct: None, docker: Some(docker) })
             .await
             .expect("environment");
+        let environment_index = inventory.len();
         inventory.push(serde_json::to_value(environment.to_k8s_object()).expect("document"));
         let vessels = backend.clone().using::<Vessel>("fleet");
         let vessel = vessels
@@ -688,12 +695,13 @@ mod tests {
             )
             .await
             .expect("placed vessel");
+        let vessel_index = inventory.len();
         inventory.push(serde_json::to_value(vessel.to_k8s_object()).expect("document"));
         // A malformed retained Vessel stays actionable against its convoy and
         // cannot be waived; absent namespaces have no invented default scope.
         let mut malformed = inventory.clone();
         malformed[0]["metadata"]["annotations"][READMISSION_ANNOTATION] = Value::String("re-admit".into());
-        malformed[3]["status"]["held_credentials"] = Value::String("invalid".into());
+        malformed[vessel_index]["status"]["held_credentials"] = Value::String("invalid".into());
         let report = check(&malformed, &BTreeSet::new(), &Supply { revision: "1".repeat(40), image_available: true })
             .await
             .expect("actionable decode report");
@@ -715,11 +723,12 @@ mod tests {
         let report = check(&inventory, &BTreeSet::new(), &Supply { image_available: false, ..supply }).await.expect("check");
         assert_eq!(report.images.unsatisfied, 1);
         assert!(report.failures[0].contains(&digest));
-        inventory[1]["metadata"]["namespace"] = Value::String("other".into());
+        inventory[credential_index]["metadata"]["namespace"] = Value::String("other".into());
         let report = check(&inventory, &BTreeSet::new(), &Supply { revision: "1".repeat(40), image_available: true }).await.expect("check");
         assert_eq!(report.grants.unsatisfied, 1);
         assert!(report.failures[0].contains("bot"));
-        inventory[2]["spec"]["docker"]["image_composition"] = serde_json::json!({"selection":{"base":"missing"},"layers":[]});
+        inventory[environment_index]["spec"]["docker"]["image_composition"] =
+            serde_json::json!({"selection":{"base":"missing"},"layers":[]});
         let report = check(&inventory, &BTreeSet::new(), &Supply { revision: "1".repeat(40), image_available: true }).await.expect("check");
         assert_eq!(report.images.unsatisfied, 1);
         assert!(report.failures.iter().any(|failure| failure.contains("composition") && failure.contains("missing")));
