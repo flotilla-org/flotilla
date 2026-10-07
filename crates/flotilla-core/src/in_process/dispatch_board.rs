@@ -14,6 +14,7 @@ use futures::FutureExt;
 use tokio::{sync::Mutex, time::Instant};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+// Allow paginated large-project forge reads several minutes while bounding hung refreshes.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Default)]
