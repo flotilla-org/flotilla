@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Weak},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -19,6 +19,8 @@ use flotilla_resources::{
 use tokio::io::AsyncWriteExt;
 
 use crate::credential::CredentialStore;
+
+const RETRY_COOLDOWN: Duration = Duration::from_secs(300);
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -43,6 +45,8 @@ pub(crate) struct ImageDistributor<I> {
     pub jobs: tokio::sync::Mutex<BTreeMap<String, tokio::task::JoinHandle<Result<PlacedImageIdentity, String>>>>,
     #[builder(default)]
     publications: tokio::sync::Mutex<BTreeMap<String, tokio::task::JoinHandle<Result<String, String>>>>,
+    #[builder(default)]
+    retries: tokio::sync::Mutex<BTreeMap<String, Instant>>,
 }
 
 impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
@@ -54,8 +58,16 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
             if !job.is_finished() {
                 return Err("digest delivery in progress".into());
             }
-            return jobs.remove(&name).expect("finished delivery").await.map_err(|error| error.to_string())?.map(Some);
+            let result = jobs.remove(&name).expect("finished delivery").await.map_err(|error| error.to_string()).and_then(|result| result);
+            if result.is_err() {
+                self.retries.lock().await.insert(format!("delivery:{name}"), Instant::now() + RETRY_COOLDOWN);
+            }
+            return result.map(Some);
         }
+        if !retry_ready(self.retries.lock().await.get(&format!("delivery:{name}")).copied(), Instant::now()) {
+            return Err("digest delivery retry cooldown".into());
+        }
+        self.retries.lock().await.remove(&format!("delivery:{name}"));
         let this = Arc::clone(self);
         let build = build.clone();
         jobs.insert(name, tokio::spawn(async move { this.ensure(&build).await }));
@@ -130,61 +142,87 @@ impl<I: ImageDistributionIo + 'static> ImageDistributor<I> {
             if build.spec.host_ref != self.host {
                 continue;
             }
-            let Some(mut status) = build.status.clone().filter(|status| status.phase == ImageBuildPhase::Built) else {
-                continue;
-            };
-            let identity = status.identity.as_ref().ok_or("built image has no identity")?;
-            status.availability.hosts = inventories
-                .items
-                .iter()
-                .filter_map(|source| {
-                    let object = &source.object;
-                    let digests = object.status.as_ref()?.capabilities.get(IMAGE_DIGESTS_CAPABILITY)?;
-                    let digests: BTreeSet<String> = serde_json::from_value(digests.clone()).ok()?;
-                    digests.contains(&identity.local_image_id).then(|| object.metadata.name.clone())
-                })
-                .collect();
-            if held.contains(&identity.local_image_id) {
-                if let Some(cache) = &cache {
-                    if status
-                        .availability
-                        .registry_ref
-                        .as_ref()
-                        .is_none_or(|reference| validate_registry_reference(cache, reference).is_err())
-                    {
-                        let mut publications = self.publications.lock().await;
-                        if publications.get(&build.metadata.name).is_some_and(|job| job.is_finished()) {
-                            let result = publications
-                                .remove(&build.metadata.name)
-                                .expect("finished publication")
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            match result {
-                                Ok(reference) => {
-                                    validate_registry_reference(cache, &reference)?;
-                                    status.availability.registry_ref = Some(reference);
-                                    status.availability.failure = None;
+            let result: Result<(), String> = async {
+                let Some(mut status) = build.status.clone().filter(|status| status.phase == ImageBuildPhase::Built) else {
+                    return Ok(());
+                };
+                let identity = status.identity.as_ref().ok_or("built image has no identity")?;
+                status.availability.hosts = inventories
+                    .items
+                    .iter()
+                    .filter_map(|source| {
+                        let object = &source.object;
+                        let digests = object.status.as_ref()?.capabilities.get(IMAGE_DIGESTS_CAPABILITY)?;
+                        let digests: BTreeSet<String> = serde_json::from_value(digests.clone()).ok()?;
+                        digests.contains(&identity.local_image_id).then(|| object.metadata.name.clone())
+                    })
+                    .collect();
+                if held.contains(&identity.local_image_id) {
+                    if let Some(cache) = &cache {
+                        if status
+                            .availability
+                            .registry_ref
+                            .as_ref()
+                            .is_none_or(|reference| validate_registry_reference(cache, reference).is_err())
+                        {
+                            let mut publications = self.publications.lock().await;
+                            if publications.get(&build.metadata.name).is_some_and(|job| job.is_finished()) {
+                                let result = publications
+                                    .remove(&build.metadata.name)
+                                    .expect("finished publication")
+                                    .await
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|result| result)
+                                    .and_then(|reference| {
+                                        validate_registry_reference(cache, &reference)?;
+                                        Ok(reference)
+                                    });
+                                match result {
+                                    Ok(reference) => {
+                                        status.availability.registry_ref = Some(reference);
+                                        status.availability.failure = None;
+                                    }
+                                    Err(reason) => {
+                                        status.availability.failure = Some(reason.chars().take(2048).collect());
+                                        self.retries
+                                            .lock()
+                                            .await
+                                            .insert(format!("publication:{}", build.metadata.name), Instant::now() + RETRY_COOLDOWN);
+                                    }
                                 }
-                                Err(reason) => status.availability.failure = Some(reason.chars().take(2048).collect()),
+                            } else if !publications.contains_key(&build.metadata.name)
+                                && retry_ready(
+                                    self.retries.lock().await.get(&format!("publication:{}", build.metadata.name)).copied(),
+                                    Instant::now(),
+                                )
+                            {
+                                let io = Arc::clone(&self.io);
+                                let cache = cache.clone();
+                                let id = identity.local_image_id.clone();
+                                publications.insert(build.metadata.name.clone(), tokio::spawn(async move { io.push(&cache, &id).await }));
                             }
-                        } else if !publications.contains_key(&build.metadata.name) {
-                            let io = Arc::clone(&self.io);
-                            let cache = cache.clone();
-                            let id = identity.local_image_id.clone();
-                            publications.insert(build.metadata.name.clone(), tokio::spawn(async move { io.push(&cache, &id).await }));
                         }
                     }
                 }
+                if build.status.as_ref() != Some(&status) {
+                    builds
+                        .update_status(&build.metadata.name, &build.metadata.resource_version, &status)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok(())
             }
-            if build.status.as_ref() != Some(&status) {
-                builds
-                    .update_status(&build.metadata.name, &build.metadata.resource_version, &status)
-                    .await
-                    .map_err(|error| error.to_string())?;
+            .await;
+            if let Err(reason) = result {
+                tracing::warn!(build = %build.metadata.name, %reason, "image availability refresh failed; continuing with other builds");
             }
         }
         Ok(())
     }
+}
+
+fn retry_ready(deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_none_or(|deadline| now >= deadline)
 }
 
 fn validate_registry_reference(cache: &ImageCacheBinding, reference: &str) -> Result<(), String> {
@@ -219,6 +257,8 @@ impl DockerImageIo {
 impl ImageDistributionIo for DockerImageIo {
     async fn inventory(&self) -> Result<BTreeSet<String>, String> {
         let output = self.run(&["image", "ls", "--no-trunc", "--digests", "--format", "{{.ID}} {{.Digest}}"]).await?;
+        // Docker local IDs and registry manifest digests are distinct namespaces.
+        // Report both because placement checks the corresponding immutable identity.
         Ok(output.split_whitespace().filter(|line| is_image_digest(line)).map(String::from).collect())
     }
 
@@ -348,7 +388,7 @@ pub(crate) async fn relay_image<S: tokio::io::AsyncWrite + Unpin>(
         .write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/x-tar\r\n{length}Connection: close\r\n\r\n").as_bytes())
         .await
         .map_err(|error| error.to_string())?;
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+    while let Some(chunk) = response.chunk().await.map_err(|error| format!("image archive stream interrupted: {error}"))? {
         stream.write_all(&chunk).await.map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -363,7 +403,7 @@ async fn download_archive(client: &reqwest::Client, url: &str, archive: &Path) -
 
 async fn save_response(response: &mut reqwest::Response, archive: &Path) -> Result<(), String> {
     let mut file = tokio::fs::File::create(archive).await.map_err(|error| error.to_string())?;
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+    while let Some(chunk) = response.chunk().await.map_err(|error| format!("image archive stream interrupted: {error}"))? {
         file.write_all(&chunk).await.map_err(|error| error.to_string())?;
     }
     file.flush().await.map_err(|error| error.to_string())
@@ -434,6 +474,7 @@ mod tests {
         manifest: String,
         corrupt: bool,
         corrupt_manifest: bool,
+        fail_push: std::sync::atomic::AtomicBool,
     }
     #[async_trait]
     impl ImageDistributionIo for Docker {
@@ -455,6 +496,9 @@ mod tests {
         async fn push(&self, cache: &ImageCacheBinding, id: &str) -> Result<String, String> {
             assert_eq!(id, self.id);
             self.calls.lock().expect("calls").push("push".into());
+            if self.fail_push.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("registry unavailable".into());
+            }
             Ok(format!("{}@{}", cache.repository, self.manifest))
         }
         async fn pull(&self, _cache: &ImageCacheBinding, reference: &str) -> Result<(), String> {
@@ -554,8 +598,72 @@ mod tests {
             manifest,
             corrupt,
             corrupt_manifest: false,
+            fail_push: std::sync::atomic::AtomicBool::new(false),
         });
         (ImageDistributor::builder().io(io).backend(backend).namespace("test".into()).host("destination".into()).build(), build)
+    }
+
+    #[tokio::test]
+    async fn failed_publication_and_delivery_wait_for_retry_cooldown() {
+        let (mut delivery, build) = setup(true, true, false, 3).await;
+        delivery.host = "builder".into();
+        delivery.io.fail_push.store(true, std::sync::atomic::Ordering::SeqCst);
+        let builds = delivery.backend.using::<ImageBuild>("test");
+        let mut status = build.status.clone().expect("status");
+        status.availability.registry_ref = None;
+        builds.update_status("build", &build.metadata.resource_version, &status).await.expect("unpublished");
+        delivery.refresh().await.expect("queue");
+        tokio::task::yield_now().await;
+        delivery.refresh().await.expect("failure observed");
+        assert_eq!(
+            builds.get("build").await.expect("build").status.expect("status").availability.failure.as_deref(),
+            Some("registry unavailable")
+        );
+        for _ in 0..5 {
+            delivery.refresh().await.expect("cooldown");
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(delivery.io.calls.lock().expect("calls").as_slice(), ["push"]);
+        delivery.retries.lock().await.insert("publication:build".into(), Instant::now());
+        delivery.refresh().await.expect("retry after deadline");
+        tokio::task::yield_now().await;
+        assert_eq!(delivery.io.calls.lock().expect("calls").as_slice(), ["push", "push"]);
+
+        let (delivery, build) = setup(true, false, true, 4).await;
+        let delivery = Arc::new(delivery);
+        assert!(delivery.request(&build).await.is_err());
+        tokio::task::yield_now().await;
+        assert!(delivery.request(&build).await.expect_err("substituted ID").contains("digest"));
+        assert!(delivery.request(&build).await.expect_err("cooldown").contains("cooldown"));
+        assert_eq!(delivery.io.calls.lock().expect("calls").as_slice(), ["pull"]);
+    }
+
+    #[tokio::test]
+    async fn one_bad_publication_does_not_stop_later_builds() {
+        let (mut delivery, build) = setup(true, true, false, 5).await;
+        delivery.host = "builder".into();
+        let builds = delivery.backend.using::<ImageBuild>("test");
+        let later = builds.create(&InputMeta::builder().name("z-later".into()).build(), &build.spec).await.expect("later build");
+        let mut status = build.status.clone().expect("status");
+        status.availability.hosts.clear();
+        builds.update_status("z-later", &later.metadata.resource_version, &status).await.expect("later built");
+        status.availability.registry_ref = None;
+        builds.update_status("build", &build.metadata.resource_version, &status).await.expect("unpublished");
+        let job = tokio::spawn(async { Ok("wrong-repository@invalid".into()) });
+        tokio::task::yield_now().await;
+        delivery.publications.lock().await.insert("build".into(), job);
+        delivery.refresh().await.expect("refresh continues");
+        let status = builds.get("z-later").await.expect("later").status.expect("status");
+        assert!(status.availability.hosts.contains("builder"));
+        assert!(builds.get("build").await.expect("build").status.expect("status").availability.failure.is_some());
+    }
+
+    #[hegel::test]
+    fn retry_deadline_includes_boundary(tc: hegel::TestCase) {
+        let seconds = tc.draw(hegel::generators::integers::<u64>().min_value(0).max_value(600));
+        let start = Instant::now();
+        assert!(retry_ready(None, start));
+        assert_eq!(retry_ready(Some(start + RETRY_COOLDOWN), start + Duration::from_secs(seconds)), seconds >= 300);
     }
 
     // #2729: registry and registry-less paths deliver the same exact local

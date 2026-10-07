@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    os::unix::fs::MetadataExt,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -4481,6 +4482,7 @@ async fn live_daemon_reaps_partial_peer_dial_churn() {
         tokio::task::yield_now().await;
     }
 
+    assert_eq!(std::fs::metadata(&socket_path).expect("socket mode").mode() & 0o777, 0o600);
     let mut stalled_dials = Vec::new();
     for _ in 0..DIAL_COUNT {
         let mut stream = tokio::net::UnixStream::connect(&socket_path).await.expect("dial live daemon");
@@ -5394,4 +5396,32 @@ async fn resource_image_archive_crosses_two_relays_with_bounded_route_metadata()
     source.await.expect("source task");
     first_task.await.expect("first relay");
     second_task.await.expect("second relay");
+}
+
+// #2729: excess exports/relays are refused before Docker or upstream dialing.
+// Dropping a permit makes the capacity reusable (including cancellation).
+#[tokio::test]
+async fn resource_image_archive_refuses_overload_and_releases_capacity() {
+    let (_directory, daemon) = empty_daemon_named("host").await;
+    let first = daemon.try_image_transfer().expect("first");
+    let second = daemon.try_image_transfer().expect("second");
+    assert!(daemon.try_image_transfer().is_err());
+    let (mut client, stream) = tokio::net::UnixStream::pair().expect("pair");
+    let service = Arc::clone(&daemon);
+    let task = tokio::spawn(async move {
+        super::resource_http::serve_resource_http_with_daemon(stream, b'G', service.resource_backend(), Some(service)).await.expect("HTTP");
+    });
+    client
+        .write_all(format!("ET /image-transfer/sha256:{}?source=missing HTTP/1.1\r\nHost: localhost\r\n\r\n", "3".repeat(64)).as_bytes())
+        .await
+        .expect("request");
+    let mut reply = Vec::new();
+    tokio::time::timeout(StdDuration::from_secs(5), client.read_to_end(&mut reply)).await.expect("bounded response").expect("response");
+    assert!(String::from_utf8(reply).expect("HTTP").starts_with("HTTP/1.1 503"));
+    task.await.expect("service");
+    drop(first);
+    let recovered = daemon.try_image_transfer().expect("recovered");
+    assert!(daemon.try_image_transfer().is_err());
+    drop((second, recovered));
+    assert!(daemon.try_image_transfer().is_ok());
 }

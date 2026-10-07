@@ -166,3 +166,31 @@ are optional with previous-generation decoder defaults. Existing external
 manifests remain valid; opting into the cache requires authoring the binding,
 registry declarations and host grants together. No workflow or CI registry
 credential is required.
+
+### Transfer trust and resource limits
+
+Image archives use the same administrative socket trust boundary as resource
+reads: the daemon socket is owner-only (0600), and remote access uses the existing
+authenticated SSH/resource forwarding. Fleet peers and this Unix user are
+trusted to read image contents, which may include secrets, and to supply archive
+metadata. Docker load can restore repository tags from an archive; only the
+post-load immutable-ID inspection admits an Environment.
+
+Each daemon admits at most two image export/relay requests concurrently and
+refuses excess requests with HTTP 503. The permit is held through save and stream
+completion and is released on cancellation. Failed publication and delivery
+attempts cool down for five minutes before retrying; restart clears that
+in-memory cooldown. Refresh failures are isolated per build.
+
+Archives are streamed with bounded memory but Docker endpoints temporarily spool
+one image archive per admitted request. Relays propagate Content-Length when
+available and contextualize upstream stream errors; a lengthless truncated stream
+still must pass Docker load and the immutable-ID check. The production process
+runner sets kill_on_drop on both save/load children, so timeout or cancellation
+does not leave a Docker child running.
+
+Host inventory deliberately includes all held local image IDs and registry
+manifest digests in one set; placement compares each against its corresponding
+identity field. It is not capped, since silently omitting a held digest changes
+placement costs. Large stores therefore increase Host replication payloads;
+a future partitioned inventory can address that without hiding availability.

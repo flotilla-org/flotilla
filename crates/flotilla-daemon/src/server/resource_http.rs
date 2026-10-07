@@ -55,6 +55,10 @@ pub(super) async fn serve_resource_http_with_daemon(
         let Some(daemon) = &daemon else {
             return write_error(&mut stream, 503, "image transfer unavailable").await;
         };
+        let _permit = match daemon.try_image_transfer() {
+            Ok(permit) => permit,
+            Err(reason) => return write_error(&mut stream, 503, &reason).await,
+        };
         let query = url::form_urlencoded::parse(raw_query.as_bytes()).into_owned().collect::<BTreeMap<_, _>>();
         if let Some(source) = query.get("source").filter(|source| source.as_str() != daemon.local_host_identity().node.node_id.as_str()) {
             let visited = query
