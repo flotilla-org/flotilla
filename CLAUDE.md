@@ -42,6 +42,8 @@ scripts/install-cargo-sweep-schedule.sh        # install/verify the daily per-ho
 
 Install the Git check dependency in a virtual environment with `python3 -m venv /tmp/flotilla-git-check` and `/tmp/flotilla-git-check/bin/pip install -r ci/git-boundary/requirements.txt`. Run `/tmp/flotilla-git-check/bin/python ci/git-boundary/check.py` and `/tmp/flotilla-git-check/bin/python -m unittest discover -s ci/git-boundary -p test_check.py`.
 
+Platform test coverage belongs in `ci/platform-tests/selectors.txt`, executed by `ci/platform-tests/run.sh`. Add a CI job only for a new runner type or OS, or for deliberate isolation; otherwise use an existing job on the same runner.
+
 Before pushing, run the Git check and its tests plus the exact CI commands: `cargo +nightly-2026-03-12 fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, and `cargo test --workspace --locked`.
 
 Desk builds keep Cargo incrementals enabled. Crew vessel and CI builds set `CARGO_INCREMENTAL=0`. Each fleet host runs an mtime-based `cargo-sweep --time 3` daily, while `scripts/prune-target.sh` remains a size-cap backstop. See [docs/development.md](docs/development.md) for installation, scope, logs, and thresholds.

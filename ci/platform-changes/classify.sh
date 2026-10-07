@@ -28,7 +28,7 @@ fi
 # Shared inputs: the toolchain, the lockfile, the workflow and this classifier.
 # Crate manifests count too: a new unix-only dependency breaks Windows without
 # touching any Rust source.
-shared='^(Cargo\.(toml|lock)|crates/[^/]+/Cargo\.toml|rust-toolchain\.toml|\.github/workflows/ci\.yml|ci/(platform-changes|toolchain)/)'
+shared='^(Cargo\.(toml|lock)|crates/[^/]+/Cargo\.toml|rust-toolchain\.toml|\.github/workflows/ci\.yml|ci/(platform-changes|platform-tests|toolchain)/)'
 
 # The Windows client job builds and runs `flotilla` and tests its client,
 # transport and Wheelhouse sink. Its platform seams live in these paths, plus

@@ -34,6 +34,8 @@ check "transport change runs both" merge_group false "crates/flotilla-transport/
 check "caller change runs macOS" pull_request false "crates/flotilla-daemon/src/server/caller.rs" "" "windows=false macos=true "
 # The compiler pin and its assertion are shared platform-job inputs.
 check "compiler pin runs both" pull_request false "rust-toolchain.toml" "" "windows=true macos=true "
+check "selector changes run both" pull_request false "ci/platform-tests/selectors.txt" "" "windows=true macos=true "
+check "local Rust action changes run both" pull_request false "ci/toolchain/action/action.yml" "" "windows=true macos=true "
 check "compiler assertion runs both" pull_request false "ci/toolchain/assert.sh" "" "windows=true macos=true "
 check "lockfile runs both" pull_request false "Cargo.lock" "" "windows=true macos=true "
 check "workflow change runs both" pull_request false ".github/workflows/ci.yml" "" "windows=true macos=true "

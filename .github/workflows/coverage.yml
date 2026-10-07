@@ -47,19 +47,9 @@ jobs:
       HEGEL_DEFAULT_PROFILE: nightly
     steps:
       - uses: actions/checkout@v4
-      - name: Read stable compiler pin
+      - name: Set up pinned Rust
         id: rust-pin
-        shell: bash
-        run: |
-          source ci/toolchain/pin.sh
-          echo "version=$(read_rust_pin rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.rust-pin.outputs.version }}
-          components: rustfmt, clippy, llvm-tools-preview
-      - name: Assert compiler pin
-        shell: bash
-        run: ci/toolchain/assert.sh
+        uses: ./ci/toolchain/action
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: actions/cache@v4
         with:
