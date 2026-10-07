@@ -29,6 +29,7 @@ use flotilla_core::{
         inspect_convoy_checkout_integration, LANDING_EVIDENCE_TTL,
     },
     config::{ConfigStore, DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY},
+    crew_capabilities::{CredentialCapability, SessionCapabilitySource},
     daemon::DaemonHandle,
     demand_lifecycle::DemandLifecycle,
     in_process::{InProcessDaemon, OperatorReconciler, StandingConvoyBackingInspector, WorkCredentialReconciler},
@@ -57,8 +58,8 @@ use flotilla_resources::{
     HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch, InputDefinition, InputMeta, ManifestRoot, ModelProbeState,
     PlacementPolicy, PlacementPolicySpec, Platform, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository,
     RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalAttentionSource,
-    TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, Vessel, VesselRequirement,
-    VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
+    TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel,
+    VesselRequirement, VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
     CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV,
     CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
     OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, TRANSPORT_CAPABILITY,
@@ -163,16 +164,12 @@ struct RuntimeOperatorReconciler {
 }
 
 struct RuntimeSessionCapabilities {
-    state: std::sync::Weak<ControllerRuntimeState>,
+    state: Weak<ControllerRuntimeState>,
 }
 
 #[async_trait]
-impl flotilla_core::crew_capabilities::SessionCapabilitySource for RuntimeSessionCapabilities {
-    async fn credentials(
-        &self,
-        environment: &str,
-        references: &BTreeSet<String>,
-    ) -> Result<Vec<flotilla_core::crew_capabilities::CredentialCapability>, String> {
+impl SessionCapabilitySource for RuntimeSessionCapabilities {
+    async fn credentials(&self, environment: &str, references: &BTreeSet<String>) -> Result<Vec<CredentialCapability>, String> {
         let state = self.state.upgrade().ok_or("session capability runtime unavailable")?;
         match &state.credential_store {
             Some(store) => store.credentials(environment, references).await,
@@ -212,7 +209,7 @@ impl flotilla_core::crew_capabilities::SessionCapabilitySource for RuntimeSessio
 }
 
 struct RuntimeWorkCredentialReconciler {
-    state: std::sync::Weak<ControllerRuntimeState>,
+    state: Weak<ControllerRuntimeState>,
 }
 
 #[async_trait]
@@ -6641,7 +6638,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
     async fn cleat_endpoint(
         &self,
         session_id: &str,
-        spec: &flotilla_resources::TerminalSessionSpec,
+        spec: &TerminalSessionSpec,
     ) -> Result<Option<flotilla_protocol::result_set::CleatEndpoint>, String> {
         let pool = self.pool_for_spec(spec)?;
         pool.cleat_endpoint(session_id).await
@@ -6650,7 +6647,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
     async fn ensure_session(
         &self,
         name: &str,
-        spec: &flotilla_resources::TerminalSessionSpec,
+        spec: &TerminalSessionSpec,
         tags: &[flotilla_resources::TerminalSessionTag],
     ) -> Result<TerminalRuntimeState, String> {
         let registry = self.registry_for_env(&spec.env_ref)?;
@@ -6740,7 +6737,6 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     }
                 }
                 if let Some(store) = &self.state.credential_store {
-                    use flotilla_core::crew_capabilities::SessionCapabilitySource;
                     store.record_capability_endpoints(&spec.env_ref, &credential_env).await;
                     let credentials = store.credentials(&spec.env_ref, &credential_refs).await?;
                     let card = flotilla_core::crew_capabilities::session_card(
@@ -6752,15 +6748,16 @@ impl TerminalRuntime for TerminalControllerRuntime {
                         &RuntimeSessionCapabilities { state: Arc::downgrade(&self.state) }.endpoints(&spec.env_ref).await?,
                     )
                     .await?;
-                    let sessions = self.state.daemon.resource_backend().using::<TerminalSession>(&context.namespace);
-                    let session = sessions.get(name).await.map_err(|error| error.to_string())?;
-                    flotilla_core::crew_capabilities::observe_card(
+                    if let Err(error) = flotilla_core::crew_capabilities::observe_launch_card(
                         &self.state.daemon.resource_backend(),
                         &context.namespace,
-                        &session,
+                        name,
                         &card,
                     )
-                    .await?;
+                    .await
+                    {
+                        warn!(session = %name, %error, "failed to persist launch capability observation");
+                    }
                     materialized_brief.content.push_str("\n\n");
                     materialized_brief.content.push_str(&card);
                 }
@@ -6871,7 +6868,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
 
     async fn agent_exit_code(
         &self,
-        spec: &flotilla_resources::TerminalSessionSpec,
+        spec: &TerminalSessionSpec,
         crew: &flotilla_resources::CrewSessionStatus,
     ) -> Result<Option<i32>, String> {
         let runner = self.runner_for_env(&spec.env_ref)?;
@@ -6904,27 +6901,18 @@ impl TerminalRuntime for TerminalControllerRuntime {
             .await
     }
 
-    async fn remove_exit_receipt(&self, spec: &flotilla_resources::TerminalSessionSpec, launch_id: &str) -> Result<(), String> {
+    async fn remove_exit_receipt(&self, spec: &TerminalSessionSpec, launch_id: &str) -> Result<(), String> {
         let runner = self.runner_for_env(&spec.env_ref)?;
         flotilla_core::agent_process::remove_exit_receipt(&*runner, Path::new(&spec.cwd), launch_id).await
     }
 
-    async fn observe_attention(
-        &self,
-        session_id: &str,
-        spec: &flotilla_resources::TerminalSessionSpec,
-    ) -> Result<Option<TerminalObservation>, String> {
+    async fn observe_attention(&self, session_id: &str, spec: &TerminalSessionSpec) -> Result<Option<TerminalObservation>, String> {
         let pool = self.pool_for_spec(spec)?;
         let adapter = self.adapter_for_spec(spec)?;
         observe_terminal_screen(&*pool, adapter.as_deref(), session_id, Utc::now()).await
     }
 
-    async fn agent_exit_failure(
-        &self,
-        session_id: &str,
-        spec: &flotilla_resources::TerminalSessionSpec,
-        exit_code: i32,
-    ) -> Result<Option<String>, String> {
+    async fn agent_exit_failure(&self, session_id: &str, spec: &TerminalSessionSpec, exit_code: i32) -> Result<Option<String>, String> {
         if exit_code == 0 {
             return Ok(None);
         }
@@ -6993,7 +6981,7 @@ impl TerminalRuntime for TerminalControllerRuntime {
     async fn deliver_message(
         &self,
         session_id: &str,
-        spec: &flotilla_resources::TerminalSessionSpec,
+        spec: &TerminalSessionSpec,
         message: &str,
         readiness: TerminalDeliveryReadiness,
     ) -> Result<TerminalDeliveryOutcome, String> {
@@ -17412,17 +17400,28 @@ mod tests {
 
     #[tokio::test]
     async fn contained_claude_launch_uses_granted_invocation_environment_without_ambient_config() {
-        assert_contained_claude_invocation_home(false).await;
+        assert_contained_claude_invocation_home(false, LaunchObservationRecord::Present).await;
     }
 
     #[tokio::test]
     async fn contained_claude_launch_selects_its_crew_home() {
         // Issue #2672: new environments launch in the role home with the same
         // granted OAuth wiring. The other test covers legacy environments.
-        assert_contained_claude_invocation_home(true).await;
+        assert_contained_claude_invocation_home(true, LaunchObservationRecord::Present).await;
     }
 
-    async fn assert_contained_claude_invocation_home(private_home: bool) {
+    enum LaunchObservationRecord {
+        Present,
+        Missing,
+    }
+
+    // Advisory observation failures must not discard the inline card or prevent launch.
+    #[tokio::test]
+    async fn contained_claude_launch_keeps_inline_card_without_session_observation() {
+        assert_contained_claude_invocation_home(false, LaunchObservationRecord::Missing).await;
+    }
+
+    async fn assert_contained_claude_invocation_home(private_home: bool, observation: LaunchObservationRecord) {
         let temp = TempDir::new().expect("tempdir");
         let config = Arc::new(ConfigStore::with_base(temp.path().join("config")));
         fs::create_dir_all(config.base_path()).expect("config directory");
@@ -17444,31 +17443,29 @@ mod tests {
         let workspace = temp.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
         let env_id = EnvironmentId::new("contained-claude");
-        {
-            backend
-                .using::<Environment>(NAMESPACE)
-                .create(&empty_meta(env_id.as_str()), &EnvironmentSpec {
-                    host_direct: None,
-                    docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                        image_composition: None,
-                        image_build_ref: None,
-                        memory_policy: Default::default(),
-                        host_ref: "host-test".into(),
-                        image: "contained-image".into(),
-                        declared_agent_adapters: BTreeSet::from(["claude-code".into()]),
-                        required_agent_adapters: BTreeSet::from(["claude-code".into()]),
-                        pull_policy: Default::default(),
-                        mounts: Vec::new(),
-                        env: if private_home {
-                            BTreeMap::from([("FLOTILLA_CREW_SKILLS".into(), "{\"coder\":[],\"reviewer\":[]}".into())])
-                        } else {
-                            BTreeMap::new()
-                        },
-                    }),
-                })
-                .await
-                .expect("environment");
-        }
+        backend
+            .using::<Environment>(NAMESPACE)
+            .create(&empty_meta(env_id.as_str()), &EnvironmentSpec {
+                host_direct: None,
+                docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                    image_composition: None,
+                    image_build_ref: None,
+                    memory_policy: Default::default(),
+                    host_ref: "host-test".into(),
+                    image: "contained-image".into(),
+                    declared_agent_adapters: BTreeSet::from(["claude-code".into()]),
+                    required_agent_adapters: BTreeSet::from(["claude-code".into()]),
+                    pull_policy: Default::default(),
+                    mounts: Vec::new(),
+                    env: if private_home {
+                        BTreeMap::from([("FLOTILLA_CREW_SKILLS".into(), "{\"coder\":[],\"reviewer\":[]}".into())])
+                    } else {
+                        BTreeMap::new()
+                    },
+                }),
+            })
+            .await
+            .expect("environment");
         // Credential preflight runs through the contained runner, so its
         // scratch directory must be inside the container user's writable
         // world rather than derived from daemon-host paths (#1508).
@@ -17572,7 +17569,9 @@ mod tests {
             .expect("vessel");
         let mut terminal_meta = empty_meta("terminal-demo-work-coder");
         terminal_meta.annotations.insert(flotilla_resources::CREDENTIAL_REFS_ANNOTATION.into(), "[\"claude-max\"]".into());
-        backend.using::<TerminalSession>(NAMESPACE).create(&terminal_meta, &spec).await.expect("terminal context");
+        if matches!(observation, LaunchObservationRecord::Present) {
+            backend.using::<TerminalSession>(NAMESPACE).create(&terminal_meta, &spec).await.expect("terminal context");
+        }
         let tags = [flotilla_resources::TerminalSessionTag::new(CREDENTIAL_REF_SESSION_TAG, "claude-max")];
 
         let launched = TerminalControllerRuntime { state }

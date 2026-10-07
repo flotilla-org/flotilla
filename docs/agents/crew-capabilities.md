@@ -5,6 +5,9 @@ first turn, followed by the location of `.flotilla/briefs/<role>.md` and a remin
 to re-read it after context compaction. The file is still written in the session
 checkout and every declared brief copy. The pinned brief artifact stays intact;
 the host appends the session's capability observation when materializing it.
+The inline brief is process argv and may be visible to local process inspectors
+and terminal-pool launch recordings. Treat brief text as operational context,
+not a place for secret material; credentials remain in their delivery adapters.
 
 The launch adapter measures the UTF-8 prompt **after shell quoting**. Both
 harnesses receive one prompt argument. At most 65,536 quoted bytes are inlined,
@@ -24,7 +27,9 @@ paths, fulfilment grants (including network reach, container runtime and display
 verified image provides, and recorded local service/display/proxy endpoints with their
 destinations. Endpoint observations have a separate runtime port so a tunnel or
 proxy integration can report its actual local address without exposing tokens.
-Proxy URL authentication, paths, queries and fragments are stripped. Unreported
+Proxy URL authentication, paths, queries and fragments are stripped. Forgejo API
+URLs retain their routing path (for example `/api/v1`), while authentication,
+queries and fragments are stripped. Unreported
 permissions and endpoints are explicitly marked as unreported.
 
 Credential observations are restricted to the session's credential references,
@@ -37,16 +42,34 @@ tokens are omitted. Existing admission ceilings and credential delivery policy
 continue to determine what can actually be issued.
 
 A card says that the crew can push workflow changes only for repository scopes
-with both `contents: write` and `workflows: write`. Otherwise it directs the crew
+with both `contents: write` and `workflows: write`. When permissions are known without those grants, it directs the crew
 to supply a fenced diff under **Operator-applied workflow change** in the PR
-body and keep that workflow patch out of commits. Roles never supply defaults.
+body and keep that workflow patch out of commits. Unreported permissions remain
+unknown and produce no workflow push/operator assertion. Roles never supply defaults.
 
 The existing 30-second credential refresh pass compares each running session's
-card with its durable launch observation. Changes publish `system:capabilities`
+card digest with its durable launch observation. Only a fixed 64-byte SHA-256
+hex digest and small revision/message references are stored as annotations;
+full cards live in briefs and Message bodies. Previous full-card annotations
+remain readable and are removed on the next changed observation. Changes publish `system:capabilities`
 Messages with a `capabilities@<revision>` subject and an explicit supersession
 chain. Inbox admission suppresses pending predecessors, and existing transport
 accounting delivers the latest card once at a turn boundary. An unchanged card
-creates no Message. The brief file remains the launch observation; use the live
+creates no Message. Each failed session is logged and collected into an aggregate
+error after all other sessions have been attempted. Launch observation persistence
+is advisory: failures warn while the launch still receives the inline card.
+A changed card on relaunch retains the supersession chain and can appear both
+in the first-turn prompt and as a Message; this preserves durable pending updates
+through restart rather than silently clearing them. An unchanged relaunch creates
+no additional Message.
+
+The periodic reads intentionally reobserve all running sessions: credential
+sources and endpoint ports can change without a resource version change. Caching
+only resource versions would miss those changes. Current cards require a few
+backend reads per session per 30-second tick; optimizing that is deferred until
+measured fleet scale warrants an event-driven observation port.
+
+The brief file remains the launch observation; use the live
 command to refresh capabilities after compaction or when unsure.
 
 ## Operator acceptance on a fleet
