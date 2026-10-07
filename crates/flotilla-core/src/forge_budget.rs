@@ -1,4 +1,8 @@
 //! Hourly host-identity accounting at the gh subprocess boundary.
+//! `host gh login` identifies this host's configured credential slot, not a
+//! resolved GitHub username. Account changes within an hour share that slot.
+//! CLI subcommands can use either API; only explicit `gh api` calls identify a
+//! REST/GraphQL budget. Other gh reads/writes are unclassified CLI attempts.
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -46,7 +50,7 @@ impl ForgeBudgets {
         }
         match args.first().copied()? {
             "api" => Some(("host gh login", if args.contains(&"graphql") { "GraphQL" } else { "REST" })),
-            "pr" | "issue" => Some(("host gh login", "GraphQL")),
+            "pr" | "issue" => Some(("host gh login", "CLI")),
             _ => None,
         }
     }
@@ -88,8 +92,10 @@ impl ForgeBudgets {
             // Conservative attempt accounting: a non-HTTP failure (including
             // spawn/transport errors) may have reached GitHub, so count one.
             Some(if response.status == 304 { 0 } else { 1 })
-        } else {
+        } else if budget == "GraphQL" {
             document["data"]["rateLimit"]["cost"].as_u64()
+        } else {
+            None
         };
         if let Some(cost) = cost {
             row.reported_cost += cost;
@@ -238,7 +244,7 @@ mod tests {
         for _ in 0..count {
             budgets.after("gh", &["api", "graphql"], &raw);
         }
-        budgets.after("gh", &["pr", "view"], "{}");
+        budgets.after("gh", &["api", "graphql"], "{}");
         let rows = budgets.rows("host");
         assert_eq!(rows[0].reported_cost, cost * count);
         assert_eq!(rows[0].calls, count + 1);
@@ -295,5 +301,44 @@ mod tests {
         assert_eq!(budgets.rows("host")[0].calls, 1);
         budgets.after("gh", &["api", "graphql"], "{}");
         assert_eq!(budgets.rows("host")[0].calls, 2);
+    }
+    // CLI subcommands may use REST, GraphQL or both. Their observed attempts
+    // must not fabricate either protocol's reported cost. Generate read/write verbs.
+    #[hegel::test]
+    fn cli_attempts_remain_unclassified(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let verb = tc.draw(gs::integers::<usize>().min_value(0).max_value(6));
+        let verbs = ["view", "list", "create", "close", "edit", "merge", "reopen"];
+        let budgets = ForgeBudgets::default();
+        for entity in ["pr", "issue"] {
+            budgets.after("gh", &[entity, verbs[verb]], "{}");
+        }
+        let rows = budgets.rows("host");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].budget, "CLI");
+        assert_eq!(rows[0].calls, 2);
+        assert_eq!(rows[0].reported_cost, 0);
+        assert_eq!(rows[0].unreported_calls, 2);
+    }
+
+    // Wrappers must explicitly forward every runner operation, including future
+    // methods with defaults. Runtime provisioning tests cover forwarding semantics;
+    // this structural contract catches a newly added default silently bypassed here.
+    #[test]
+    fn runner_wrapper_covers_the_entire_trait() {
+        fn methods(source: &str) -> std::collections::BTreeSet<&str> {
+            source.split("fn ").skip(1).map(|method| method.split('(').next().unwrap().trim()).collect()
+        }
+        let providers = include_str!("providers/mod.rs");
+        let runner = providers
+            .split("pub trait CommandRunner: Send + Sync {")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) fn command_timeout_message")
+            .next()
+            .unwrap();
+        let budget = include_str!("forge_budget.rs");
+        let wrapper = budget.split("impl CommandRunner for BudgetedRunner {").nth(1).unwrap().split("#[cfg(test)]").next().unwrap();
+        assert_eq!(methods(wrapper), methods(runner), "every CommandRunner method needs explicit forwarding");
     }
 }

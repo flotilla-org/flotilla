@@ -139,6 +139,9 @@ pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &I
                 None => unknown_health(host.object.metadata.creation_timestamp, now),
             },
         };
+        // Newer heartbeat evidence wins. For equal timestamps, positive
+        // Unready evidence wins conservatively; a duplicate Ready row must
+        // not resurrect an explicitly unready origin (ADR 0057).
         let candidate = (heartbeat, health);
         let entry = ready.entry(root).or_insert(candidate);
         if candidate > *entry {
@@ -403,7 +406,9 @@ impl crate::in_process::InProcessDaemon {
         let local = backend.using::<ForgeRead>(&namespace);
         for record in local.list().await.map_err(|e| e.to_string())?.items {
             if Utc::now().signed_duration_since(record.spec.demanded_at) >= DEMAND_RETENTION {
-                local.delete(&record.metadata.name).await.map_err(|e| e.to_string())?;
+                if let Err(error) = local.delete(&record.metadata.name).await {
+                    tracing::debug!(name = %record.metadata.name, %error, "idle forge demand cleanup failed");
+                }
             }
         }
         Ok(())
@@ -642,6 +647,19 @@ mod tests {
         silent.items[0].metadata.creation_timestamp -= UNKNOWN_OWNER_GRACE + Duration::seconds(1);
         ready.replica_writer::<Host>(missing.local_root().unwrap(), "flotilla").replace(&silent, Utc::now()).await.unwrap();
         assert_eq!(source_owner(&ready, "flotilla", &source).await.unwrap(), Some(ready.local_root().unwrap()));
+    }
+
+    // Equal-heartbeat contradictions must not revive an explicitly unready
+    // origin. Generate fresh heartbeat ages and both arrival orders.
+    #[hegel::test]
+    fn equal_heartbeat_preserves_positive_unready_evidence(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let age = tc.draw(gs::integers::<i64>().min_value(0).max_value(179));
+        let heartbeat = Some(Utc::now() - Duration::seconds(age));
+        let ready = (heartbeat, ObserverHealth::Ready);
+        let unready = (heartbeat, ObserverHealth::Unready);
+        assert!(ready.max(unready).1 == ObserverHealth::Unready);
+        assert!(unready.max(ready).1 == ObserverHealth::Unready);
     }
 
     // Unknown ownership lasts only through its startup grace, even if no first
