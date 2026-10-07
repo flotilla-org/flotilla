@@ -139,7 +139,9 @@ pub use definition::DefinitionResolver;
 pub use dispatch_hold::{
     DispatchDeployment, DispatchDeploymentSpec, DispatchHold, DispatchHoldSpec, DispatchHoldStatus, DispatchHoldStatusPatch, HoldClearWhen,
 };
-pub use dispatch_observation::{DispatchObservation, DispatchObservationSpec, DISPATCH_RECONCILER_PROVENANCE};
+pub use dispatch_observation::{
+    DispatchObservation, DispatchObservationSpec, DispatchOverlap, DispatchOverlapSpec, DISPATCH_RECONCILER_PROVENANCE,
+};
 pub use environment::{
     host_direct_environment_name, DockerEnvironmentSpec, Environment, EnvironmentMemoryPolicy, EnvironmentMount, EnvironmentMountMode,
     EnvironmentPhase, EnvironmentSpec, EnvironmentStatus, EnvironmentStatusPatch, HostDirectEnvironmentSpec,
@@ -194,8 +196,8 @@ pub use principal_attention::{
 pub use project::{
     normalize_issue_source, normalize_project_spec, resolve_project_issue_sources, DeclarationRefusedCondition, DispatchLane,
     DispatchMission, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, IssueFieldValue, IssueFilter, IssueSource,
-    IssueSourceBindingSpec, IssueSourceResolution, IssueSourceUnavailable, OperationalEntriesCondition, Project, ProjectRepositoryRole,
-    ProjectRepositorySpec, ProjectSpec, ProjectStatus, ProjectStatusPatch, ResolvedIssueSourceBinding,
+    IssueSourceBindingSpec, IssueSourceResolution, IssueSourceUnavailable, OperationalEntriesCondition, OverlapPolicy, Project,
+    ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatus, ProjectStatusPatch, ResolvedIssueSourceBinding,
     DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
 };
 pub use project_hierarchy::ProjectHierarchy;
@@ -269,6 +271,7 @@ macro_rules! for_each_registered_resource {
         $callback::<$crate::DispatchHold>($($argument),*);
         $callback::<$crate::DispatchDeployment>($($argument),*);
         $callback::<$crate::DispatchObservation>($($argument),*);
+        $callback::<$crate::DispatchOverlap>($($argument),*);
         $callback::<$crate::Environment>($($argument),*);
         $callback::<$crate::FleetDesignation>($($argument),*);
         $callback::<$crate::Forge>($($argument),*);

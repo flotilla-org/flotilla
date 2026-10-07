@@ -120,6 +120,7 @@ pub(super) mod tests {
             observed_at: Utc::now(),
             age_seconds: 0,
             refresh_error: None,
+            footprints: None,
             issues: (0..count)
                 .map(|id| {
                     DispatchBoardIssue::builder()

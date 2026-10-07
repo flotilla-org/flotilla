@@ -650,3 +650,6 @@ pub struct RepoDelta {
 #[cfg(test)]
 #[path = "lib/tests.rs"]
 mod tests;
+
+mod footprints;
+pub use footprints::*;

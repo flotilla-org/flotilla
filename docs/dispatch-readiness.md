@@ -169,3 +169,69 @@ the reason; the last queue and readiness clocks remain stored but unavailable
 until a successful reconciliation clears the error. Live-convoy membership uses
 the current board with frozen issue labels, so mission accounting follows current
 ancestry and charter while retaining the admitted label snapshot.
+
+### Footprints and conflict control (#2784)
+
+Opt in on each controlled Project with
+`dispatch_policy.overlap_policy: {land_after_threshold: 100}`. Removing this
+policy stops automatic conflict admission and clears its owned holds. Manual
+holds retain their independently authored relationship. Project policy authors
+remain project-map/ops `project.yaml` and registered charter Project manifests;
+all previous-generation manifests decode without this optional input.
+
+A ticket declares repository-relative paths, directory prefixes or trailing `*`
+globs as bullets in a `## Touches` section. The section ends at the next level-two
+heading. Without it, the first heuristic matches paths and unique basenames in
+the ticket title/body against files seen in recent merges or active work. An
+empty prediction is reported as empty evidence, not a claim of disjointness.
+For a multi-repository Project, declared paths are interpreted conservatively
+in each Project repository; observations and overlap comparisons remain scoped
+to that repository. Forge scope follows RepositorySpec.forge by repository key;
+clone transport mirrors do not redefine the source. Named sub-file areas are deferred.
+
+Live convoys use their frozen ticket text before publication. A pushed remote
+branch comparison replaces the prediction, even before opening a PR; an open PR
+uses its changed-file list. A convoy-associated PR contributes one footprint.
+Renames include both old and new paths. Missing patches conservatively count as
+interface evidence. Public functions/types/traits and serialized shapes count
+four times their ordinary file weight. Rarity is integer `(merges + 1) /
+(file-touching merges + 1)` over the most recent 60 merged PRs, ordered by merge
+time. Each shared file counts once; weights sum with saturation.
+
+Below the configured per-target threshold, summed overlap becomes the last ordering term
+`score.conflict_penalty`. At or above it, the reconciler authors an immutable
+`DispatchHold` with the overlapping paths/weight as its reason and an explicit
+`land_after_work` convoy or PR target. `land_after` remains the candidate issue
+anchor for stored-shape compatibility; explicit work targets take precedence.
+Automatic holds clear when overlap drops, a target leaves flight, or landing is
+observed. Refresh failures retain last-good observations and their age/error;
+an initial missing footprint observation makes this Project unavailable. Manual
+work-addressed holds require positive merged-PR or Landed-convoy evidence.
+
+`flotilla dispatch board --project NAME --json` exposes repository footprint
+observations, `hot_files` (recent merge frequency and active-work count), and
+`merge_order` hints with weighted shared paths. Hints use stable target order to
+avoid cycles and advise which overlapping work should land first; they do not
+merge PRs. Background refreshes own all forge calls. PR file lists are paginated
+and checked against `changed_files`; reaching GitHub's 3,000-file PR cap or
+300-file branch-compare cap is unavailable evidence, never a truncated footprint.
+
+Immutable `DispatchOverlap` records retain candidate/target prediction-vs-actual
+flags, revision, weight, shared paths and observed GitHub merge-conflict evidence
+for tuning. Standalone `outcome: true` records retain the full work footprint and
+merge-conflict evidence even after its overlapping work has landed; pair records
+use `outcome: false` and contain shared paths. `conflicts: true` means a conflict was observed; false means the applicable
+work has confirmed clear mergeability, and null preserves unknown evidence. Their stable content
+identity deduplicates identical passes; changed diffs and conflict evidence add
+records. They are daemon-authored and have no out-of-repo manifest author.
+
+On a candidate host, run `scripts/accept-dispatch-footprints NAME` to inspect
+observations and reports. Use two ready tickets declaring the same rare path,
+admit one convoy and push its branch, then inspect prediction replacement and
+the second ticket's penalty/hold. Push a disjoint diff or land the first work and
+verify the owned hold clears. Local tests use injected tracker observations and
+real in-memory stores; provider request coverage uses recorded authenticated
+GitHub interactions.
+
+Provider limits follow GitHub's [PR files endpoint](https://docs.github.com/en/rest/pulls/pulls#list-pull-requests-files)
+and [compare endpoint](https://docs.github.com/en/rest/commits/commits#compare-two-commits).

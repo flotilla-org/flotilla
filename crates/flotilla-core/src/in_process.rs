@@ -4935,6 +4935,7 @@ impl InProcessDaemon {
         let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
         let mut sources = std::collections::BTreeSet::new();
         let mut mission_issues = std::collections::BTreeSet::new();
+        let mut footprint_projects = BTreeSet::new();
         let mut errors = Vec::new();
         for project in projects {
             if let Some(policy) = &project.spec.dispatch_policy {
@@ -4943,11 +4944,68 @@ impl InProcessDaemon {
             if project_filter.is_some_and(|name| name != project.metadata.name) {
                 continue;
             }
+            if project.spec.dispatch_policy.as_ref().is_some_and(|p| p.enabled && p.overlap_policy.is_some()) {
+                footprint_projects.insert(project.metadata.name.clone());
+            }
             let scope = flotilla_protocol::QueryScope::new(&project.metadata.namespace, &project.metadata.name);
             match self.resolve_issue_source_bindings(&scope).await {
                 Ok(bindings) => sources.extend(bindings.into_iter().map(|binding| binding.source)),
                 Err(error) => errors.push(error),
             }
+        }
+        let mut footprint_sources = BTreeSet::new();
+        let mut footprint_convoys = Vec::new();
+        let mut footprint_repository_sources = BTreeMap::new();
+        let mut branches = BTreeMap::<flotilla_protocol::IssueSource, Vec<flotilla_protocol::BranchFootprintRequest>>::new();
+        if !footprint_projects.is_empty() {
+            let repositories =
+                self.resource_backend.clone().including_replicas::<Repository>(&namespace).list().await.map_err(|e| e.to_string())?;
+            footprint_repository_sources =
+                crate::dispatch_footprints::repository_sources(repositories.items.into_iter().map(|item| item.object));
+            let convoys = self
+                .resource_backend
+                .clone()
+                .including_replicas::<flotilla_resources::Convoy>(&namespace)
+                .list()
+                .await
+                .map_err(|e| e.to_string())?;
+            footprint_convoys = convoys.items.into_iter().map(|item| item.object).collect();
+            for convoy in &footprint_convoys {
+                if convoy.status.as_ref().is_some_and(|s| s.phase.is_terminal()) {
+                    continue;
+                }
+                for repository in &convoy.spec.repositories {
+                    let Some(source) = footprint_repository_sources.get(&repository.repo_ref).cloned() else {
+                        if convoy.spec.project_ref.as_ref().is_some_and(|p| footprint_projects.contains(p)) {
+                            return Err("controlled convoy repository lacks authoritative forge binding".into());
+                        }
+                        continue;
+                    };
+                    if convoy.spec.project_ref.as_ref().is_some_and(|p| footprint_projects.contains(p)) {
+                        footprint_sources.insert(source.clone());
+                    }
+                    if let Some(branch) = &convoy.spec.r#ref {
+                        branches.entry(source).or_default().push(flotilla_protocol::BranchFootprintRequest {
+                            convoy: convoy.metadata.name.clone(),
+                            base: repository.target_ref.clone(),
+                            branch: branch.clone(),
+                        });
+                    }
+                }
+            }
+            // Project repositories matter even when no convoy has been admitted.
+            for project in self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|e| e.to_string())? {
+                if !footprint_projects.contains(&project.metadata.name) {
+                    continue;
+                }
+                for entry in &project.spec.repositories {
+                    let source =
+                        footprint_repository_sources.get(&entry.repo).ok_or("footprint repository lacks authoritative forge binding")?;
+                    footprint_sources.insert(source.clone());
+                }
+            }
+            branches.retain(|source, _| footprint_sources.contains(source));
+            sources.extend(footprint_sources.iter().cloned());
         }
         if project_filter.is_none() && errors.is_empty() {
             self.dispatch_board_cache.retain_sources(&sources).await;
@@ -4957,6 +5015,8 @@ impl InProcessDaemon {
             let daemon = self.self_weak.clone();
             let tracker_source = source.clone();
             let mission_issues = mission_issues.clone();
+            let observe_footprints = footprint_sources.contains(&source);
+            let branches = branches.get(&source).cloned().unwrap_or_default();
             match self
                 .dispatch_board_cache
                 .read(&source, move || async move {
@@ -4978,15 +5038,22 @@ impl InProcessDaemon {
                             issue.mission_fields = provider.mission_fields(&reference).await?;
                         }
                     }
+                    if observe_footprints {
+                        board.footprints = Some(provider.footprints(&tracker_source, &board.pull_requests, &branches).await?);
+                    }
                     Ok(board)
                 })
                 .await
             {
+                Ok(board) if observe_footprints && board.footprints.is_none() => {
+                    errors.push(format!("awaiting footprint refresh for {}", source.scope))
+                }
                 Ok(board) => repositories.push(board),
                 Err(error) => errors.push(error),
             }
         }
         if errors.is_empty() {
+            crate::dispatch_footprints::enrich_reports(&mut repositories, &footprint_convoys, &footprint_repository_sources);
             Ok(repositories)
         } else {
             Err(errors.join("; "))

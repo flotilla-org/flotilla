@@ -48,6 +48,7 @@ pub struct DispatchBoardRepository {
     pub source: IssueSource,
     pub issues: Vec<DispatchBoardIssue>,
     pub pull_requests: Vec<DispatchBoardPullRequest>,
+    pub footprints: Option<crate::FootprintObservation>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct DispatchBoardIssue {

@@ -169,6 +169,9 @@ pub struct ResolvedIssueSourceBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct DispatchPolicy {
+    // ADR 0047: previous policies have no conflict control; opt in per Project.
+    #[serde(default)]
+    pub overlap_policy: Option<OverlapPolicy>,
     // Previous-generation policies omit these (ADR 0047). Defaults also define optional charter inputs and remain after the roll.
     #[builder(default)]
     #[serde(default)]
@@ -545,6 +548,9 @@ pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, Stri
                 }
             }
         }
+        if policy.overlap_policy.as_ref().is_some_and(|overlap| overlap.land_after_threshold == 0) {
+            return Err("overlap threshold must be positive".into());
+        }
         if policy.project_share == 0 || policy.routine_lane.trim().is_empty() {
             return Err("dispatch project_share must be positive and routine_lane nonempty".into());
         }
@@ -726,4 +732,9 @@ mod tests {
         assert!(error.contains("aliases `ghostty` and `ghostty-ops`"), "{error}");
         assert!(error.contains("repository repo-key"), "{error}");
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlapPolicy {
+    pub land_after_threshold: u64,
 }

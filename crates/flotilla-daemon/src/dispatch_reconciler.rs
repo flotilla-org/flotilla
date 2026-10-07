@@ -5,16 +5,20 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use flotilla_core::{dispatch_missions::MissionBoard, in_process::InProcessDaemon};
+use flotilla_core::{
+    dispatch_footprints::{ConflictBoard, ConflictMeasurement},
+    dispatch_missions::MissionBoard,
+    in_process::InProcessDaemon,
+};
 use flotilla_protocol::{
     issue_query::{IssueQuery, READY_ISSUE_LABEL},
     DispatchIssueFacts, Issue, IssueRef, IssueState, QueryScope,
 };
 use flotilla_resources::{
-    apply_status_patch, content_hash, pinned_workflow_ref, Clock, Convoy, ConvoyPhase, DispatchDeployment, DispatchHold,
-    DispatchHoldStatusPatch, DispatchObservation, DispatchObservationSpec, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry,
-    HoldClearWhen, InputMeta, Project, ProjectStatusPatch, ResolvedIssueSourceBinding, ResourceBackend, ResourceError, ResourceObject,
-    SystemClock, WorkflowTemplate, DISPATCH_RECONCILER_PROVENANCE,
+    apply_status_patch, content_hash, pinned_workflow_ref, Clock, Convoy, ConvoyPhase, DispatchDeployment, DispatchHold, DispatchHoldSpec,
+    DispatchHoldStatusPatch, DispatchObservation, DispatchObservationSpec, DispatchOverlap, DispatchOverlapSpec, DispatchPolicy,
+    DispatchQueueAttention, DispatchQueueEntry, HoldClearWhen, InputMeta, Project, ProjectStatusPatch, ResolvedIssueSourceBinding,
+    ResourceBackend, ResourceError, ResourceObject, SystemClock, WorkflowTemplate, DISPATCH_RECONCILER_PROVENANCE,
 };
 use tracing::{info, warn};
 
@@ -151,11 +155,25 @@ impl DispatchReconciler {
         };
 
         let convoys = self.namespace_convoys(project).await?;
-        let held = self.active_holds(project, &convoys, now).await?;
         let existing =
-            convoys.into_iter().filter(|convoy| convoy.spec.project_ref.as_deref() == Some(&project.metadata.name)).collect::<Vec<_>>();
+            convoys.iter().filter(|convoy| convoy.spec.project_ref.as_deref() == Some(&project.metadata.name)).cloned().collect::<Vec<_>>();
         let previous_queue = project.status.as_ref().map(|status| status.dispatch_queue.as_slice()).unwrap_or_default();
         let observations_recorded = self.observe_dispatches(project, previous_queue, &existing, now).await?;
+        let boards = self.issues.boards(project).await?;
+        let held = self.active_holds(project, &convoys, &boards, now).await?;
+        let repository_sources = if policy.overlap_policy.is_some() {
+            let repositories = self
+                .backend
+                .clone()
+                .including_replicas::<flotilla_resources::Repository>(&project.metadata.namespace)
+                .list()
+                .await
+                .map_err(|e| e.to_string())?;
+            flotilla_core::dispatch_footprints::repository_sources(repositories.items.into_iter().map(|item| item.object))
+        } else {
+            BTreeMap::new()
+        };
+        let conflicts = ConflictBoard::new(&boards, &convoys, &repository_sources);
         let dispatched = existing
             .iter()
             .filter(|convoy| !convoy.status.as_ref().is_some_and(|status| status.phase.is_terminal()))
@@ -163,7 +181,10 @@ impl DispatchReconciler {
             .collect::<HashSet<_>>();
         let previous_by_issue = previous_queue.iter().map(|entry| (entry.issue.clone(), entry)).collect::<BTreeMap<_, _>>();
 
-        let board = MissionBoard::new(&self.issues.boards(project).await?)?;
+        let board = MissionBoard::new(&boards)?;
+        if policy.overlap_policy.is_some() && !boards.iter().any(|b| b.footprints.is_some()) {
+            return Err("awaiting a complete footprint observation".into());
+        }
         let live = existing.iter().filter(|convoy| !convoy.status.as_ref().is_some_and(|s| s.phase.is_terminal())).collect::<Vec<_>>();
         let project_active_crews = live.iter().map(|c| active_crew_count(c.status.as_ref())).sum();
         let mut mission_active = BTreeMap::<String, usize>::new();
@@ -179,6 +200,13 @@ impl DispatchReconciler {
                     .provider_name(String::new())
                     .provider_display_name(String::new())
                     .build();
+                if policy.overlap_policy.is_some() {
+                    let mut observed_issue = issue.clone();
+                    observed_issue.body = served.snapshot.body.clone();
+                    let mut measurements = conflicts.measurements(&observed_issue, Some(&convoy.metadata.name));
+                    measurements.extend(conflicts.outcomes(&convoy.metadata.name));
+                    self.record_overlaps(project, &observed_issue, measurements, now).await?;
+                }
                 missions.insert(board.score(&issue, policy)?.mission);
             }
             for mission in missions {
@@ -247,6 +275,72 @@ impl DispatchReconciler {
                 .filter(|entry| entry.issue_as_of == issue.as_of && entry.title == issue.title)
                 .map_or(now, |entry| entry.observed_at);
             let mut score = board.score(&issue, policy)?;
+            if let Some(overlap_policy) = &policy.overlap_policy {
+                let measurements = conflicts.measurements(&issue, None);
+                self.record_overlaps(project, &issue, measurements.clone(), now).await?;
+                let mut desired = BTreeMap::new();
+                for measurement in &measurements {
+                    if measurement.weight >= overlap_policy.land_after_threshold {
+                        let identity = serde_json::json!([
+                            project.metadata.name,
+                            issue.reference,
+                            measurement.source,
+                            measurement.target,
+                            measurement.revision,
+                            measurement.weight,
+                            measurement.files
+                        ]);
+                        let name = format!("overlap-{}", content_hash(&identity).map_err(|e| e.to_string())?);
+                        desired.insert(name, measurement);
+                    } else {
+                        score.conflict_penalty = score.conflict_penalty.saturating_add(measurement.weight);
+                    }
+                }
+                let holds = self.backend.clone().using::<DispatchHold>(&project.metadata.namespace);
+                for hold in holds.list().await.map_err(|e| e.to_string())?.items {
+                    if hold.spec.author == "dispatch-footprints"
+                        && hold.spec.project_ref == project.metadata.name
+                        && hold.spec.issue == issue.reference
+                        && !desired.contains_key(&hold.metadata.name)
+                        && !hold.status.as_ref().is_some_and(|s| s.cleared_at.is_some())
+                    {
+                        apply_status_patch(&holds, &hold.metadata.name, &DispatchHoldStatusPatch::Clear { at: now })
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                let mut automatically_held = false;
+                for (name, measurement) in desired {
+                    match holds.get(&name).await {
+                        Ok(hold) => {
+                            automatically_held |= !hold.status.as_ref().is_some_and(|s| s.cleared_at.is_some());
+                        }
+                        Err(ResourceError::NotFound { .. }) => {
+                            holds
+                                .create(
+                                    &InputMeta::builder().name(name).build(),
+                                    &DispatchHoldSpec::builder()
+                                        .project_ref(project.metadata.name.clone())
+                                        .issue(issue.reference.clone())
+                                        .land_after(issue.reference.clone())
+                                        .land_after_work(measurement.target.clone())
+                                        .reason(format!("rarity-weighted overlap {}: {}", measurement.weight, measurement.files.join(", ")))
+                                        .author("dispatch-footprints".into())
+                                        .clear_when(HoldClearWhen::Landed)
+                                        .build(),
+                                )
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            automatically_held = true;
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                if automatically_held {
+                    blocked += 1;
+                    continue;
+                }
+            }
             score.project_active_crews = project_active_crews;
             score.mission_active_crews = mission_active.get(&score.mission).copied().unwrap_or(0);
             queue.push(DispatchQueueEntry {
@@ -276,10 +370,48 @@ impl DispatchReconciler {
         Ok(ReconcilePass { queued: queue.len(), blocked, observations_recorded, ..ReconcilePass::default() })
     }
 
+    async fn record_overlaps(
+        &self,
+        project: &ResourceObject<Project>,
+        issue: &Issue,
+        measurements: Vec<ConflictMeasurement>,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let observations = self.backend.clone().using::<DispatchOverlap>(&project.metadata.namespace);
+        for measurement in measurements {
+            let spec = DispatchOverlapSpec {
+                outcome: measurement.outcome,
+                project_ref: project.metadata.name.clone(),
+                source: measurement.source,
+                issue: issue.reference.clone(),
+                target: measurement.target,
+                candidate_actual: measurement.candidate_actual,
+                target_actual: measurement.target_actual,
+                revision: measurement.revision,
+                weight: measurement.weight,
+                files: measurement.files,
+                conflicts: measurement.conflicts,
+                observed_at: now,
+            };
+            let mut identity = serde_json::to_value(&spec).map_err(|e| e.to_string())?;
+            identity.as_object_mut().expect("overlap object").remove("observed_at");
+            let name = format!("overlap-{}", content_hash(&identity).map_err(|e| e.to_string())?);
+            match observations.get(&name).await {
+                Ok(_) => {}
+                Err(ResourceError::NotFound { .. }) => {
+                    observations.create(&InputMeta::builder().name(name).build(), &spec).await.map_err(|e| e.to_string())?;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(())
+    }
+
     async fn active_holds(
         &self,
         project: &ResourceObject<Project>,
         convoys: &[ResourceObject<Convoy>],
+        boards: &[flotilla_protocol::DispatchBoardRepository],
         now: DateTime<Utc>,
     ) -> Result<HashSet<IssueRef>, String> {
         let holds =
@@ -296,19 +428,32 @@ impl DispatchReconciler {
             if hold.spec.project_ref != project.metadata.name || hold.status.as_ref().is_some_and(|status| status.cleared_at.is_some()) {
                 continue;
             }
-            let cleared = match &hold.spec.clear_when {
-                HoldClearWhen::Landed => {
-                    let convoy_landed = convoys.iter().any(|convoy| {
-                        convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed)
-                            && convoy.spec.issues.iter().any(|issue| issue.reference == hold.spec.land_after)
-                    });
-                    convoy_landed || self.issues.dispatch_facts(&hold.spec.land_after).await.map(|facts| facts.landed).unwrap_or(false)
+            let cleared = if let Some(target) = &hold.spec.land_after_work {
+                match target {
+                    flotilla_protocol::FootprintTarget::Convoy { name } => convoys
+                        .iter()
+                        .any(|c| &c.metadata.name == name && c.status.as_ref().is_some_and(|s| s.phase == ConvoyPhase::Landed)),
+                    flotilla_protocol::FootprintTarget::PullRequest { url } => {
+                        boards.iter().flat_map(|b| &b.pull_requests).any(|pr| &pr.url == url && pr.merged_at.is_some())
+                    }
                 }
-                HoldClearWhen::Deployed { installation } => deployments.items.iter().any(|deployment| {
-                    deployment.object.spec.issue == hold.spec.land_after && deployment.object.spec.installation == *installation
-                }),
+            } else {
+                match &hold.spec.clear_when {
+                    HoldClearWhen::Landed => {
+                        let convoy_landed = convoys.iter().any(|convoy| {
+                            convoy.status.as_ref().is_some_and(|status| status.phase == ConvoyPhase::Landed)
+                                && convoy.spec.issues.iter().any(|issue| issue.reference == hold.spec.land_after)
+                        });
+                        convoy_landed || self.issues.dispatch_facts(&hold.spec.land_after).await.map(|facts| facts.landed).unwrap_or(false)
+                    }
+                    HoldClearWhen::Deployed { installation } => deployments.items.iter().any(|deployment| {
+                        deployment.object.spec.issue == hold.spec.land_after && deployment.object.spec.installation == *installation
+                    }),
+                }
             };
-            if cleared {
+            let automatic_disabled = hold.spec.author == "dispatch-footprints"
+                && project.spec.dispatch_policy.as_ref().is_none_or(|p| p.overlap_policy.is_none());
+            if cleared || automatic_disabled {
                 // Clear only on the authoring store; replicas can project the satisfied
                 // relationship immediately and receive its durable latch on replication.
                 let local = self.backend.clone().using::<DispatchHold>(&project.metadata.namespace);
@@ -321,7 +466,7 @@ impl DispatchReconciler {
                     Err(ResourceError::NotFound { .. }) => {}
                     Err(error) => return Err(error.to_string()),
                 }
-            } else {
+            } else if hold.spec.author != "dispatch-footprints" {
                 active.insert(hold.spec.issue);
             }
         }
@@ -539,6 +684,7 @@ mod tests {
                 observed_at: Utc::now(),
                 age_seconds: 0,
                 refresh_error: None,
+                footprints: None,
             }])
         }
         async fn ready_issues(&self, project: &ResourceObject<Project>) -> Result<Vec<Issue>, String> {
@@ -699,6 +845,66 @@ mod tests {
 
     // #2783: a mission score survives real in-memory status writes; changing
     // a field re-ranks a proposal without resetting readiness age or attention.
+    // #2784: below threshold adds a score penalty; the boundary creates an
+    // immutable automatic hold, and replacement with a disjoint diff clears it.
+    #[tokio::test]
+    async fn overlap_threshold_logs_and_holds_clear_after_diff_changes() {
+        use flotilla_protocol::{FileFootprint, FootprintObservation, FootprintTarget, WorkFootprint};
+        for threshold in [4, 5, 6] {
+            let mut dispatch_policy = policy(60);
+            dispatch_policy.overlap_policy = Some(flotilla_resources::OverlapPolicy { land_after_threshold: threshold });
+            let (backend, issues, _, reconciler) = harness(
+                vec![issue("1", &[READY_ISSUE_LABEL], Some("## Touches\n- src/rare.rs"), IssueState::Open)],
+                vec![],
+                dispatch_policy,
+            )
+            .await;
+            let projects = backend.using::<Project>(NAMESPACE);
+            let mut boards = issues.boards(&projects.get("widgets").await.expect("project")).await.expect("board");
+            boards[0].footprints = Some(FootprintObservation {
+                history: vec![FileFootprint::default(); 4],
+                work: vec![WorkFootprint {
+                    target: FootprintTarget::PullRequest { url: "https://github.com/acme/widgets/pull/99".into() },
+                    convoy: None,
+                    footprint: FileFootprint { files: BTreeMap::from([("src/rare.rs".into(), false)]) },
+                    actual: true,
+                    revision: "first".into(),
+                    conflicts: Some(false),
+                }],
+                ..Default::default()
+            });
+            *issues.board_override.lock().expect("board") = Some(boards.clone());
+            let outcome = reconciler.reconcile_once().await.expect("overlap pass");
+            assert_eq!(outcome.project_errors, 0);
+            assert_eq!(outcome.blocked, usize::from(threshold <= 5));
+            assert_eq!(outcome.queued, usize::from(threshold > 5));
+            let first = projects.get("widgets").await.expect("project").status.unwrap_or_default();
+            if threshold > 5 {
+                assert_eq!(first.dispatch_queue[0].score.as_ref().expect("score").conflict_penalty, 5);
+            } else {
+                assert!(first.dispatch_queue.is_empty());
+            }
+            let observations = backend.using::<DispatchOverlap>(NAMESPACE);
+            assert_eq!(observations.list().await.expect("observations").items.len(), 1);
+            reconciler.reconcile_once().await.expect("identical pass");
+            assert_eq!(observations.list().await.expect("deduped").items.len(), 1);
+            let work = &mut boards[0].footprints.as_mut().expect("footprints").work[0];
+            work.footprint.files = BTreeMap::from([("src/disjoint.rs".into(), false)]);
+            work.revision = "second".into();
+            work.conflicts = Some(true);
+            *issues.board_override.lock().expect("board") = Some(boards);
+            reconciler.reconcile_once().await.expect("replacement pass");
+            let recovered = projects.get("widgets").await.expect("project").status.expect("status");
+            assert_eq!(recovered.dispatch_queue.len(), 1);
+            assert_eq!(recovered.dispatch_queue[0].score.as_ref().expect("score").conflict_penalty, 0);
+            assert_eq!(observations.list().await.expect("observations").items.len(), 2);
+            assert!(observations.list().await.expect("observations").items.iter().any(|o| o.spec.conflicts == Some(true)));
+            for hold in backend.using::<DispatchHold>(NAMESPACE).list().await.expect("holds").items {
+                assert!(hold.status.expect("status").cleared_at.is_some());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn mission_scores_reconcile_and_retain_readiness_age() {
         use flotilla_resources::DispatchMission;

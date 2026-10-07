@@ -83,6 +83,12 @@ spec:
                 dispatch_policy:
                   type: object
                   properties:
+                    overlap_policy:
+                      type: object
+                      nullable: true
+                      required: [land_after_threshold]
+                      properties:
+                        land_after_threshold: {type: integer, minimum: 1}
                     enabled:
                       type: boolean
                       default: true

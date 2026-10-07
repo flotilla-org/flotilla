@@ -43,3 +43,38 @@ pub struct DispatchObservationSpec {
     pub observed_at: DateTime<Utc>,
     pub provenance: String,
 }
+
+/// Immutable conflict evidence; predicted and actual measurements are retained
+/// independently for tuning rather than overwritten when a branch is pushed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchOverlap;
+impl Resource for DispatchOverlap {
+    type Spec = DispatchOverlapSpec;
+    type Status = ();
+    type StatusPatch = NoStatusPatch;
+    const API_PATHS: ApiPaths = ApiPaths { group: "flotilla.work", version: "v1", plural: "dispatchoverlaps", kind: "DispatchOverlap" };
+    const REPLICATION_CLASS: ReplicationClass = ReplicationClass::Observations;
+    fn validate_spec_update(current: &Self::Spec, requested: &Self::Spec) -> Result<(), ResourceError> {
+        if current == requested {
+            Ok(())
+        } else {
+            Err(ResourceError::invalid("overlap observations are immutable"))
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchOverlapSpec {
+    #[serde(default)]
+    pub outcome: bool,
+    pub project_ref: String,
+    pub source: flotilla_protocol::IssueSource,
+    pub issue: IssueRef,
+    pub target: flotilla_protocol::FootprintTarget,
+    pub candidate_actual: bool,
+    pub target_actual: bool,
+    pub revision: String,
+    pub weight: u64,
+    pub files: Vec<String>,
+    pub conflicts: Option<bool>,
+    pub observed_at: DateTime<Utc>,
+}

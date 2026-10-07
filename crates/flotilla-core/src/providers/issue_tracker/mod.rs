@@ -43,6 +43,15 @@ pub trait IssueProvider: Send + Sync {
     }
 
     /// Normalized optional mission fields. Unsupported sources use labels/charter.
+    async fn footprints(
+        &self,
+        _source: &IssueSource,
+        _pull_requests: &[flotilla_protocol::DispatchBoardPullRequest],
+        _branches: &[flotilla_protocol::BranchFootprintRequest],
+    ) -> Result<flotilla_protocol::FootprintObservation, String> {
+        Err("footprints unavailable for this issue provider".into())
+    }
+
     async fn mission_fields(&self, _reference: &IssueRef) -> Result<flotilla_protocol::MissionFields, String> {
         Ok(Default::default())
     }

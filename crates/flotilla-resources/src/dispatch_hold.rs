@@ -24,12 +24,22 @@ impl Resource for DispatchHold {
     }
 
     fn validate_spec(_meta: &InputMeta, spec: &Self::Spec) -> Result<(), ResourceError> {
-        if spec.issue == spec.land_after
+        if (spec.land_after_work.is_none() && spec.issue == spec.land_after)
             || spec.reason.trim().is_empty()
             || spec.author.trim().is_empty()
             || spec.project_ref.trim().is_empty()
         {
             return Err(ResourceError::invalid("hold requires distinct issues, a project, reason and author"));
+        }
+        if let Some(target) = &spec.land_after_work {
+            if !matches!(spec.clear_when, HoldClearWhen::Landed)
+                || match target {
+                    flotilla_protocol::FootprintTarget::Convoy { name } => name.trim().is_empty(),
+                    flotilla_protocol::FootprintTarget::PullRequest { url } => !(url.starts_with("https://") || url.starts_with("http://")),
+                }
+            {
+                return Err(ResourceError::invalid("work-addressed hold requires a valid target and landed clearing"));
+            }
         }
         if matches!(&spec.clear_when, HoldClearWhen::Deployed { installation } if installation.trim().is_empty()) {
             return Err(ResourceError::invalid("deploy-dependent hold requires an installation"));
@@ -43,6 +53,10 @@ pub struct DispatchHoldSpec {
     pub project_ref: String,
     pub issue: IssueRef,
     pub land_after: IssueRef,
+    // ADR 0047: previous holds address an issue. Explicit work addresses permit
+    // automatic holds for anonymous convoys and PRs; land_after remains the anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub land_after_work: Option<flotilla_protocol::FootprintTarget>,
     pub reason: String,
     pub author: String,
     pub clear_when: HoldClearWhen,

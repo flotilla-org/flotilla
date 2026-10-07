@@ -264,10 +264,109 @@ impl super::IssueProvider for GitHubIssueProvider {
             observed_at: Utc::now(),
             age_seconds: 0,
             refresh_error: None,
+            footprints: None,
             source: source.clone(),
             issues,
             pull_requests,
         })
+    }
+
+    async fn footprints(
+        &self,
+        source: &IssueSource,
+        pull_requests: &[flotilla_protocol::DispatchBoardPullRequest],
+        branches: &[flotilla_protocol::BranchFootprintRequest],
+    ) -> Result<flotilla_protocol::FootprintObservation, String> {
+        use flotilla_protocol::{FootprintObservation, FootprintTarget, WorkFootprint};
+
+        use crate::providers::ChannelLabel;
+        let mut observation = FootprintObservation::default();
+        let mut merged = pull_requests.iter().filter(|pr| pr.merged_at.is_some()).collect::<Vec<_>>();
+        merged.sort_by(|a, b| b.merged_at.cmp(&a.merged_at).then(a.id.cmp(&b.id)));
+        merged.truncate(60);
+        for pr in pull_requests.iter().filter(|pr| pr.state == "open").chain(merged) {
+            let endpoint = format!("repos/{}/pulls/{}", source.scope, pr.id);
+            let raw = gh_api_get!(self.api, &endpoint, &self.host_root)?;
+            let detail: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            let expected = detail["changed_files"].as_u64().ok_or("PR lacks changed_files")?;
+            if expected >= 3000 {
+                return Err("PR footprint reaches GitHub's 3000-file limit".into());
+            }
+            let mut files = Vec::new();
+            for page in 1..=30 {
+                let endpoint = format!("repos/{}/pulls/{}/files?per_page=100&page={page}", source.scope, pr.id);
+                let raw = gh_api_get!(self.api, &endpoint, &self.host_root)?;
+                let batch: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+                let count = batch.len();
+                files.extend(batch);
+                if count < 100 {
+                    break;
+                }
+            }
+            if files.len() as u64 != expected {
+                return Err("PR footprint changed or was truncated during observation".into());
+            }
+            if pr.state == "open" {
+                let raw = gh_api_get!(self.api, &endpoint, &self.host_root)?;
+                let latest: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+                if latest["head"]["sha"] != detail["head"]["sha"] || latest["changed_files"] != detail["changed_files"] {
+                    return Err("PR changed while collecting its footprint".into());
+                }
+            }
+            let footprint = parse_footprint_files(&files)?;
+            if pr.state == "open" {
+                observation.work.push(WorkFootprint {
+                    target: FootprintTarget::PullRequest { url: pr.url.clone() },
+                    convoy: branches
+                        .iter()
+                        .find(|b| {
+                            detail["head"]["ref"].as_str() == Some(b.branch.as_str())
+                                && detail["head"]["repo"]["full_name"]
+                                    .as_str()
+                                    .is_some_and(|repository| repository.eq_ignore_ascii_case(&source.scope))
+                        })
+                        .map(|b| b.convoy.clone()),
+                    footprint,
+                    actual: true,
+                    revision: detail["head"]["sha"].as_str().ok_or("PR lacks head SHA")?.into(),
+                    conflicts: detail["mergeable"].as_bool().map(|mergeable| !mergeable),
+                });
+            } else {
+                observation.history.push(footprint);
+            }
+        }
+        for branch in branches {
+            if observation.work.iter().any(|w| w.convoy.as_deref() == Some(branch.convoy.as_str())) {
+                continue;
+            }
+            let base = url::form_urlencoded::byte_serialize(branch.base.as_bytes()).collect::<String>();
+            let head = url::form_urlencoded::byte_serialize(branch.branch.as_bytes()).collect::<String>();
+            let endpoint = format!("repos/{}/compare/{base}...{head}?per_page=1&page=1", source.scope);
+            let response = self.api.get_classified_response(&endpoint, &self.host_root, &ChannelLabel::GhApi(endpoint.clone())).await;
+            let response = match response {
+                Ok(response) => response,
+                // An unpublished branch has no actual footprint yet.
+                Err(error) if error.response.as_ref().is_some_and(|r| r.status == 404) => continue,
+                Err(error) => return Err(error.error.to_string()),
+            };
+            let comparison: serde_json::Value = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
+            comparison["ahead_by"].as_u64().ok_or("comparison lacks ahead_by")?;
+            let files = comparison["files"].as_array().ok_or("comparison lacks files")?;
+            // Compare files are present only on page 1 and capped at 300.
+            if files.len() >= 300 {
+                return Err("branch footprint reaches GitHub's 300-file comparison limit".into());
+            }
+            observation.work.push(WorkFootprint {
+                target: FootprintTarget::Convoy { name: branch.convoy.clone() },
+                convoy: Some(branch.convoy.clone()),
+                footprint: parse_footprint_files(files)?,
+                actual: true,
+                revision: flotilla_resources::content_hash(&comparison["files"]).map_err(|e| e.to_string())?,
+                conflicts: None,
+            });
+        }
+        crate::dispatch_footprints::reports(&mut observation);
+        Ok(observation)
     }
 
     async fn mission_fields(&self, reference: &IssueRef) -> Result<flotilla_protocol::MissionFields, String> {
@@ -404,6 +503,19 @@ impl super::IssueProvider for GitHubIssueProvider {
         run!(self.runner, "gh", &["issue", "view", &reference.id, "--repo", &reference.source.scope, "--web"], &self.host_root)?;
         Ok(())
     }
+}
+
+fn parse_footprint_files(files: &[serde_json::Value]) -> Result<flotilla_protocol::FileFootprint, String> {
+    let mut footprint = flotilla_protocol::FileFootprint::default();
+    for file in files {
+        let path = file["filename"].as_str().ok_or("diff file lacks filename")?;
+        let interface = file["patch"].as_str().is_none_or(|patch| crate::dispatch_footprints::interface_patch(path, patch));
+        footprint.files.insert(path.into(), interface);
+        if let Some(previous) = file["previous_filename"].as_str() {
+            footprint.files.insert(previous.into(), interface);
+        }
+    }
+    Ok(footprint)
 }
 
 #[cfg(test)]
@@ -815,6 +927,59 @@ mod tests {
 
     // Daemon board facts use the documented gh JSON fields through the same
     // recorded process seam; clients need no tracker credentials of their own.
+    // #2784: missing patches are conservative, renames retain both paths,
+    // and malformed remote file rows are errors rather than empty footprints.
+    #[test]
+    fn footprint_files_preserve_renames_and_interface_uncertainty() {
+        let footprint = parse_footprint_files(&[
+            serde_json::json!({"filename":"src/new.rs","previous_filename":"src/old.rs","patch":"+pub trait Api {}"}),
+            serde_json::json!({"filename":"image.png"}),
+            serde_json::json!({"filename":"src/private.rs","patch":"+fn private() {}"}),
+        ])
+        .expect("files");
+        assert_eq!(footprint.files.len(), 4);
+        assert!(footprint.files["src/new.rs"]);
+        assert!(footprint.files["src/old.rs"]);
+        assert!(footprint.files["image.png"]);
+        assert!(!footprint.files["src/private.rs"]);
+        assert!(parse_footprint_files(&[serde_json::json!({"patch":"+foo"})]).is_err());
+    }
+
+    // #2784 HTTP contract: recorded authenticated PR pagination and branch
+    // comparisons; unpublished branches retain predictions, pushed diffs are actual.
+    #[tokio::test]
+    async fn footprints_record_replay() {
+        use flotilla_protocol::{BranchFootprintRequest, DispatchBoardPullRequest};
+        let session = replay::test_session(&fixture("github_footprints.yaml"), Masks::new());
+        let runner = replay::test_runner(&session);
+        let api = replay::test_gh_api(&session);
+        let provider = GitHubIssueProvider::new(api, runner, Path::new("/"));
+        let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
+        let prs = vec![DispatchBoardPullRequest::builder()
+            .id("2853".into())
+            .url("https://github.com/flotilla-org/flotilla/pull/2853".into())
+            .state("open".into())
+            .ci("pass".into())
+            .build()];
+        let observation = provider.footprints(&source, &prs, &[]).await.expect("PR footprint");
+        assert_eq!(observation.work.len(), 1);
+        assert!(observation.work[0].actual);
+        assert!(observation.work[0].footprint.files.contains_key("crates/flotilla-core/src/dispatch_missions.rs"));
+        let branches = vec![
+            BranchFootprintRequest { convoy: "pushed".into(), base: "main".into(), branch: "convoy/dispatch".into() },
+            BranchFootprintRequest {
+                convoy: "unpublished".into(),
+                base: "main".into(),
+                branch: "flotilla-footprint-unpublished-example".into(),
+            },
+        ];
+        let observation = provider.footprints(&source, &[], &branches).await.expect("branch footprint");
+        assert_eq!(observation.work.len(), 1);
+        assert_eq!(observation.work[0].convoy.as_deref(), Some("pushed"));
+        assert!(observation.work[0].actual);
+        session.finish();
+    }
+
     #[tokio::test]
     async fn dispatch_board_record_replay() {
         let session = replay::test_session(&fixture("github_dispatch_board.yaml"), Masks::new());
