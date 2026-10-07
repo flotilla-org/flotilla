@@ -1194,6 +1194,32 @@ fn push_error(errors: &mut Vec<ValidationError>, error: ValidationError) {
     }
 }
 
+/// Code-owned definitions seeded and reconciled at daemon startup.
+pub fn builtin_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
+    vec![
+        (
+            "scratch",
+            WorkflowTemplateSpec::builder()
+                .exit(ExitDeclaration::standard_table())
+                .inputs(vec![InputDefinition { name: "topic".to_string(), description: Some("Short label for this convoy".into()) }])
+                .vessels(vec![VesselRequirement::builder()
+                    .name("work".to_string())
+                    .crew(vec![CrewSpec::builder()
+                        .role("shell".to_string())
+                        .source(CrewSource::Tool {
+                            command: r#"bash -c 'echo "Convoy {{workflow.name}} ({{inputs.topic}})"; exec bash'"#.to_string(),
+                        })
+                        .build()])
+                    .build()])
+                .build(),
+        ),
+        ("implement-review", implement_review_workflow_spec()),
+        ("interactive-single", interactive_single_workflow_spec()),
+        ("single-agent", single_agent_workflow_spec()),
+        ("single-agent-shepherd", single_agent_shepherd_workflow_spec()),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;

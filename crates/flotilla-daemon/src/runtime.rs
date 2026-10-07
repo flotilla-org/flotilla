@@ -51,18 +51,18 @@ use flotilla_resources::{
     canonical_host_id, canonicalize_repo_url, controller::ControllerLoop, descriptive_repo_slug, home_bound_authorship_collisions,
     host_direct_environment_name, is_prepared_snapshot, watch_resource_kind, watch_resource_kind_including_replicas, ChangeRequest,
     ChangeRequestStatus, Checkout, CheckoutIntegrationStatus, Clone, ClonePhase, CloneSpec, ConditionValue, ControllerRetry,
-    ControllerRetryDisposition, Convoy, ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, CrewSource,
-    CrewSpec, Demand, DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase,
-    EnvironmentSpec, EnvironmentStatusPatch, Forge, ForgeIdentity, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec,
-    FulfilmentRealisation, Host, HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout,
-    HostDirectPlacementPolicySpec, HostSpec, HostStatus, HostStatusPatch, InputDefinition, InputMeta, ManifestRoot, ModelProbeState,
-    PlacementPolicy, PlacementPolicySpec, Platform, Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository,
-    RepositoryTrust, Resource, ResourceBackend, ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalAttentionSource,
-    TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel,
-    VesselRequirement, VesselStatusPatch, WorkflowTemplate, WorkflowTemplateSpec, AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY,
-    CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV, CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV,
-    CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV, CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL,
-    OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY, PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, TRANSPORT_CAPABILITY,
+    ControllerRetryDisposition, Convoy, ConvoyProvisioningState, ConvoyReconciler, ConvoyTeardownRuntime, CredentialExpiry, Demand,
+    DemandKind, DemandSpec, DockerCheckoutStrategy, DockerPerVesselPlacementPolicySpec, Environment, EnvironmentPhase, EnvironmentSpec,
+    EnvironmentStatusPatch, Forge, ForgeIdentity, ForgeSpec, FulfilmentFacts, FulfilmentKind, FulfilmentKindSpec, FulfilmentRealisation,
+    Host, HostCondition, HostConnection, HostDirectEnvironmentSpec, HostDirectPlacementPolicyCheckout, HostDirectPlacementPolicySpec,
+    HostSpec, HostStatus, HostStatusPatch, InputMeta, ManifestRoot, ModelProbeState, PlacementPolicy, PlacementPolicySpec, Platform,
+    Presentation, Project, Regard, ReplicaReadResolver, ReplicationClass, Repository, RepositoryTrust, Resource, ResourceBackend,
+    ResourceError, ResourceObject, RetryBackoff, SystemClock, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy,
+    TerminalSession, TerminalSessionPhase, TerminalSessionSource, TerminalSessionSpec, Vessel, VesselStatusPatch, WorkflowTemplate,
+    AGENTLESS_CAPABILITY, AGENT_ADAPTERS_CAPABILITY, CREDENTIAL_EXPIRY_CAPABILITY, CREDENTIAL_PERMISSIONS_ENV,
+    CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ENV, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ENV,
+    CREDENTIAL_SCOPES_SESSION_TAG, HELD_CREDENTIALS_CAPABILITY, MANAGED_BY_LABEL, OWNING_DAEMON_CAPABILITY, PLACEMENT_CAPABILITY,
+    PLACEMENT_SNAPSHOT_KIND, REGISTERED_RESOURCE_KINDS, TRANSPORT_CAPABILITY,
 };
 use futures::{
     stream::{BoxStream, SelectAll},
@@ -2653,31 +2653,6 @@ async fn register_startup_resources(
     Ok(())
 }
 
-fn builtin_workflow_templates() -> Vec<(&'static str, WorkflowTemplateSpec)> {
-    vec![
-        (
-            "scratch",
-            WorkflowTemplateSpec::builder()
-                .exit(flotilla_resources::ExitDeclaration::standard_table())
-                .inputs(vec![InputDefinition { name: "topic".to_string(), description: Some("Short label for this convoy".into()) }])
-                .vessels(vec![VesselRequirement::builder()
-                    .name("work".to_string())
-                    .crew(vec![CrewSpec::builder()
-                        .role("shell".to_string())
-                        .source(CrewSource::Tool {
-                            command: r#"bash -c 'echo "Convoy {{workflow.name}} ({{inputs.topic}})"; exec bash'"#.to_string(),
-                        })
-                        .build()])
-                    .build()])
-                .build(),
-        ),
-        ("implement-review", flotilla_resources::implement_review_workflow_spec()),
-        ("interactive-single", flotilla_resources::interactive_single_workflow_spec()),
-        ("single-agent", flotilla_resources::single_agent_workflow_spec()),
-        ("single-agent-shepherd", flotilla_resources::single_agent_shepherd_workflow_spec()),
-    ]
-}
-
 fn mark_builtin_managed(mut meta: InputMeta) -> InputMeta {
     meta.labels.insert(MANAGED_BY_LABEL.to_string(), BUILTIN_MANAGED_BY_VALUE.to_string());
     meta
@@ -2687,7 +2662,7 @@ fn mark_builtin_managed(mut meta: InputMeta) -> InputMeta {
 /// manifest loop in https://github.com/flotilla-org/flotilla/issues/1192.
 async fn reconcile_builtin_workflow_templates(backend: &ResourceBackend, namespace: &str) -> Result<(), String> {
     let templates = backend.clone().definitions::<WorkflowTemplate>(namespace);
-    let builtins = builtin_workflow_templates();
+    let builtins = flotilla_resources::builtin_workflow_templates();
     // Ownership follows the current code-owned set. Tombstone retired definitions
     // through the merged resolver so replicas cannot resurrect stale builtins.
     for existing in templates.list().await.map_err(|err| format!("list builtin workflow templates: {err}"))? {

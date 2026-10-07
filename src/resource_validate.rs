@@ -1,3 +1,6 @@
+#[cfg(unix)]
+mod retirement;
+
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::{collections::BTreeMap, sync::Arc};
@@ -76,6 +79,10 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
     let mut failed = false;
     let mut count = 0;
     let mut projects = BTreeMap::<String, Vec<ResourceObject<Project>>>::new();
+    let mut retirement_templates = Vec::new();
+    let mut retirement_projects = Vec::new();
+    let mut retirement_designations = Vec::new();
+    let has_templates = collections.iter().any(|(store, kind, _)| store == base && kind == "workflowtemplates");
     let mut charter_namespaces = std::collections::BTreeSet::new();
     for (store_base, kind, namespaces) in collections {
         let replication = REGISTERED_RESOURCE_KINDS.iter().find(|entry| entry.plural == kind).map(|entry| entry.replication_class);
@@ -127,6 +134,24 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
                     failed = true;
                 }
             }
+            if store_base == base && has_templates && matches!(kind.as_str(), "workflowtemplates" | "projects" | "fleetdesignations") {
+                // Startup reconciles merged definitions, never raw replica provenance.
+                let merged: Value = client
+                    .get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/{kind}?includeReplicas=true"))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                let items = merged.get("items").and_then(Value::as_array).ok_or_else(|| eyre!("{label}: merged list has no items"))?;
+                if kind == "workflowtemplates" {
+                    retirement_templates.extend(items.iter().cloned());
+                } else if kind == "projects" {
+                    retirement_projects.extend(items.iter().cloned());
+                } else {
+                    retirement_designations.extend(items.iter().cloned());
+                }
+            }
             if store_base == base && catalog.is_some() && matches!(kind.as_str(), "projects" | "crewdefaults" | "fleetdesignations") {
                 // Schema validation checks every stored provenance above. Skill
                 // policy must use the merged definition view, just like admission.
@@ -148,6 +173,8 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
             }
         }
     }
+    let preview = retirement::preview(&retirement_templates, &retirement_projects, &retirement_designations)?;
+    println!("workflow retirement preview: {}", serde_json::to_string(&preview)?);
     for namespace in charter_namespaces {
         let response = client.get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/charterinputs")).send().await?;
         if !response.status().is_success() {
