@@ -3148,6 +3148,16 @@ mod tests {
 
     // CLI endpoint selection must choose a viewer SSH hop only for remote
     // daemons, using the resolved session/host rather than the daemon-local plan.
+    // The documented one-way rollback recovery command must remain parseable.
+    #[test]
+    fn workflow_retirement_restoration_command_parses() {
+        let parsed = Cli::try_parse_from(["flotilla", "resource", "apply", "--file", "/path/to/restore-0.json"])
+            .expect("documented restoration command");
+        assert!(matches!(parsed.command, Some(SubCommand::Resource {
+            command: ResourceSubCommand::Apply(ResourceApplyArgs { file, .. })
+        }) if file == Path::new("/path/to/restore-0.json")));
+    }
+
     #[test]
     fn remote_attach_cli_endpoint_selects_viewer_route() {
         use flotilla_protocol::{arg::Arg, commands::AttachMode, AttachBinding, ResolvedAttachAction, ResolvedAttachPlan};

@@ -33,6 +33,20 @@ pub async fn validate_daemon(_socket: &Path, _local_roots: Option<&[PathBuf]>, _
 /// fingerprint deliberately rejects mixed generations during a fleet roll.
 #[cfg(unix)]
 pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, skill_catalog: Option<&Path>) -> Result<usize> {
+    validate_daemon_with_preview(socket, local_roots, skill_catalog, |preview| {
+        println!("workflow retirement preview: {}", serde_json::to_string(preview)?);
+        Ok(())
+    })
+    .await
+}
+
+#[cfg(unix)]
+async fn validate_daemon_with_preview(
+    socket: &Path,
+    local_roots: Option<&[PathBuf]>,
+    skill_catalog: Option<&Path>,
+    mut report: impl FnMut(&retirement::RetirementPreview) -> Result<()>,
+) -> Result<usize> {
     let catalog = skill_catalog.map(load_catalog).transpose()?;
     let mut skill_documents = Vec::new();
     let client = reqwest::Client::builder().unix_socket(socket).build()?;
@@ -82,6 +96,7 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
     let mut retirement_templates = Vec::new();
     let mut retirement_projects = Vec::new();
     let mut retirement_designations = Vec::new();
+    let mut retirement_inventory_failed = false;
     let has_templates = collections.iter().any(|(store, kind, _)| store == base && kind == "workflowtemplates");
     let mut charter_namespaces = std::collections::BTreeSet::new();
     for (store_base, kind, namespaces) in collections {
@@ -91,6 +106,8 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
             if namespace.is_empty() || namespace.contains(['/', '?', '#']) {
                 return Err(eyre!("daemon kind discovery returned invalid namespace {namespace:?} for {kind}"));
             }
+            let retirement_collection =
+                store_base == base && has_templates && matches!(kind.as_str(), "workflowtemplates" | "projects" | "fleetdesignations");
             let label = format!("{store_base}/{namespace}/{kind}");
             let url = format!("{store_base}/apis/flotilla.work/v1/namespaces/{namespace}/{kind}{query}");
             let response = client.get(url).send().await.map_err(|error| eyre!("list {label}: {error}"))?;
@@ -101,11 +118,13 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
                     continue;
                 }
                 eprintln!("{label}: daemon list failed: {message}");
+                retirement_inventory_failed |= retirement_collection;
                 failed = true;
                 continue;
             }
             if !response.status().is_success() {
                 eprintln!("{label}: daemon list failed: {}", response.text().await?);
+                retirement_inventory_failed |= retirement_collection;
                 failed = true;
                 continue;
             }
@@ -134,22 +153,28 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
                     failed = true;
                 }
             }
-            if store_base == base && has_templates && matches!(kind.as_str(), "workflowtemplates" | "projects" | "fleetdesignations") {
+            if retirement_collection {
                 // Startup reconciles merged definitions, never raw replica provenance.
-                let merged: Value = client
-                    .get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/{kind}?includeReplicas=true"))
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?;
-                let items = merged.get("items").and_then(Value::as_array).ok_or_else(|| eyre!("{label}: merged list has no items"))?;
-                if kind == "workflowtemplates" {
-                    retirement_templates.extend(items.iter().cloned());
-                } else if kind == "projects" {
-                    retirement_projects.extend(items.iter().cloned());
-                } else {
-                    retirement_designations.extend(items.iter().cloned());
+                let fetched = async {
+                    let merged: Value = client
+                        .get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/{kind}?includeReplicas=true"))
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json()
+                        .await?;
+                    merged.get("items").and_then(Value::as_array).cloned().ok_or_else(|| eyre!("merged list has no items"))
+                }
+                .await;
+                match fetched {
+                    Ok(items) if kind == "workflowtemplates" => retirement_templates.extend(items),
+                    Ok(items) if kind == "projects" => retirement_projects.extend(items),
+                    Ok(items) => retirement_designations.extend(items),
+                    Err(error) => {
+                        eprintln!("{label}: workflow retirement inventory: {error:#}");
+                        retirement_inventory_failed = true;
+                        failed = true;
+                    }
                 }
             }
             if store_base == base && catalog.is_some() && matches!(kind.as_str(), "projects" | "crewdefaults" | "fleetdesignations") {
@@ -173,8 +198,20 @@ pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, ski
             }
         }
     }
-    let preview = retirement::preview(&retirement_templates, &retirement_projects, &retirement_designations)?;
-    println!("workflow retirement preview: {}", serde_json::to_string(&preview)?);
+    if !retirement_inventory_failed {
+        match retirement::preview(&retirement_templates, &retirement_projects, &retirement_designations) {
+            Ok(preview) => {
+                if let Err(error) = report(&preview) {
+                    eprintln!("workflow retirement report: {error:#}");
+                    failed = true;
+                }
+            }
+            Err(error) => {
+                eprintln!("workflow retirement preview: {error:#}");
+                failed = true;
+            }
+        }
+    }
     for namespace in charter_namespaces {
         let response = client.get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/charterinputs")).send().await?;
         if !response.status().is_success() {
@@ -755,6 +792,132 @@ mod tests {
                 assert_eq!(result.unwrap(), 2);
             }
             server.await.unwrap();
+        }
+    }
+
+    // A strict stand-in at the resource HTTP boundary checks GET-only merged
+    // inventory wiring. Preview errors must not prevent subsequent ops checks.
+    #[tokio::test]
+    async fn retirement_inventory_wiring_and_errors_keep_ops_checks_running() {
+        use flotilla_resources::{WorkflowTemplate, WorkflowTemplateSpec, MANAGED_BY_LABEL};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::UnixListener,
+        };
+        flotilla_core::tls::install_default_provider();
+        for mode in 0..6 {
+            let backend = flotilla_resources::ResourceBackend::InMemory(Default::default());
+            let project = backend
+                .using::<Project>("flotilla")
+                .create(
+                    &InputMeta::builder().name("demo".into()).build(),
+                    &ProjectSpec::builder().display_name("Demo".into()).default_workflow_ref("orphan".into()).build(),
+                )
+                .await
+                .expect("project");
+            let project = serde_json::to_value(project.to_k8s_object()).expect("project document");
+            let mut meta = InputMeta::builder().name("orphan".into()).build();
+            meta.labels.insert(MANAGED_BY_LABEL.into(), "builtin".into());
+            let template = backend
+                .definitions::<WorkflowTemplate>("flotilla")
+                .apply(&meta, &WorkflowTemplateSpec::builder().build())
+                .await
+                .expect("template");
+            let template = serde_json::to_value(template.to_k8s_object()).expect("template document");
+            let socket_dir = TestSocketDir::new();
+            let socket = socket_dir.socket_path("retirement.sock");
+            let listener = UnixListener::bind(&socket).expect("stand-in socket");
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                loop {
+                    let (mut stream, _) = listener.accept().await.expect("accept request");
+                    let mut request = Vec::new();
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let mut buffer = [0; 1024];
+                        let count = stream.read(&mut buffer).await.expect("request");
+                        assert!(count > 0);
+                        request.extend_from_slice(&buffer[..count]);
+                    }
+                    let request = String::from_utf8(request).expect("HTTP text");
+                    let mut words = request.split_whitespace();
+                    assert_eq!(words.next(), Some("GET"), "validation must never mutate the daemon");
+                    let path = words.next().expect("request path").to_string();
+                    requests.push(path.clone());
+                    let mut status = "200 OK";
+                    let body = if path == "/apis/flotilla.work/v1" {
+                        let mut kinds = vec!["projects"];
+                        let mut namespaces = serde_json::json!({"projects":["flotilla"]});
+                        if mode != 0 {
+                            kinds.push("workflowtemplates");
+                            namespaces["workflowtemplates"] = serde_json::json!(["flotilla"]);
+                        }
+                        serde_json::json!({"kinds":kinds,"namespaces":namespaces,"stores":["/observed"]})
+                    } else if path == "/observed/apis/flotilla.work/v1" {
+                        serde_json::json!({"kinds":["workflowtemplates"],"namespaces":{"workflowtemplates":["flotilla"]}})
+                    } else if path.starts_with("/observed/") {
+                        assert!(path.ends_with("workflowtemplates?replicaSources=true"));
+                        serde_json::json!({"items":[template.clone()]})
+                    } else if path.ends_with("/projects?replicaSources=true") {
+                        serde_json::json!({"items":[project.clone()]})
+                    } else if path.ends_with("/projects?includeReplicas=true") {
+                        serde_json::json!({"items": [if mode == 4 { serde_json::json!({"spec":false}) } else {project.clone()}]})
+                    } else if path.ends_with("/workflowtemplates?replicaSources=true") {
+                        // Raw provenance deliberately differs from the merged definition.
+                        if mode == 5 {
+                            status = "500 Internal Server Error";
+                        }
+                        serde_json::json!({"items":[]})
+                    } else if path.ends_with("/workflowtemplates?includeReplicas=true") {
+                        match mode {
+                            2 => {
+                                status = "500 Internal Server Error";
+                                serde_json::json!({"error":"inventory refused"})
+                            }
+                            3 => serde_json::json!({}),
+                            _ => serde_json::json!({"items":[template.clone()]}),
+                        }
+                    } else {
+                        assert!(path.ends_with("/operationalentries"), "unexpected request {path}");
+                        serde_json::json!({"entries":[],"unavailable":[]})
+                    };
+                    let body = body.to_string();
+                    stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes())
+                        .await.expect("response");
+                    if path.ends_with("/operationalentries") {
+                        return requests;
+                    }
+                }
+            });
+            let mut reports = Vec::new();
+            let result = super::validate_daemon_with_preview(&socket, Some(&[]), None, |report| {
+                reports.push(serde_json::to_value(report)?);
+                Ok(())
+            })
+            .await;
+            assert_eq!(result.is_err(), mode >= 2, "mode {mode}");
+            let requests = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .expect("preview failures must still reach ops")
+                .expect("stand-in completed ops check");
+            assert!(requests.last().expect("requests").ends_with("/operationalentries"));
+            assert_eq!(
+                requests.iter().filter(|p| p.contains("includeReplicas=true")).count(),
+                if mode == 0 {
+                    0
+                } else if mode == 5 {
+                    1
+                } else {
+                    2
+                }
+            );
+            if mode >= 2 {
+                assert!(reports.is_empty(), "an incomplete preview must never appear complete");
+            }
+            if mode <= 1 {
+                assert_eq!(reports.len(), 1);
+                assert_eq!(reports[0]["definitions"].as_array().expect("definitions").len(), usize::from(mode == 1));
+                assert_eq!(reports[0]["references"].as_array().expect("references").len(), usize::from(mode == 1));
+            }
         }
     }
 

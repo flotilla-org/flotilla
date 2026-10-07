@@ -12,6 +12,7 @@ use serde_json::Value;
 /// retain authoring metadata and specs, but omit status and server-owned identity.
 #[derive(Debug, Serialize)]
 pub(super) struct RetirementPreview {
+    pub restoration_note: &'static str,
     pub definitions: Vec<Value>,
     pub references: Vec<Value>,
 }
@@ -44,6 +45,22 @@ pub(super) fn preview(templates: &[Value], projects: &[Value], designations: &[V
         .iter()
         .map(|document| Ok(ResourceObject::from_k8s_object(serde_json::from_value::<K8sResourceObject<Project>>(document.clone())?)?))
         .collect::<Result<Vec<_>>>()?;
+    let mut hierarchies = BTreeMap::new();
+    for namespace in retired.iter().map(|(namespace, _)| namespace).collect::<BTreeSet<_>>() {
+        // FleetDesignation is a singleton named `fleet`; the merged resolver
+        // returns one definition per name (FleetDesignation::validate_spec).
+        let fleet = designations
+            .iter()
+            .find(|d| d["metadata"]["namespace"] == *namespace && d["metadata"]["name"] == flotilla_resources::FLEET_DESIGNATION_NAME)
+            .and_then(|d| d["spec"]["project"].as_str())
+            .map(str::to_string);
+        let declared = projects
+            .iter()
+            .filter(|p| p.metadata.namespace == *namespace)
+            .map(|p| (p.metadata.name.clone(), p.spec.parent.clone()))
+            .collect();
+        hierarchies.insert(namespace.clone(), flotilla_resources::ProjectHierarchy::new(declared, fleet)?);
+    }
     let mut references = Vec::new();
     for project in &projects {
         let name = &project.spec.default_workflow_ref;
@@ -51,17 +68,7 @@ pub(super) fn preview(templates: &[Value], projects: &[Value], designations: &[V
             continue;
         }
         let namespace = &project.metadata.namespace;
-        let fleet = designations
-            .iter()
-            .find(|d| d["metadata"]["namespace"] == *namespace)
-            .and_then(|d| d["spec"]["project"].as_str())
-            .map(str::to_string);
-        let declared: BTreeMap<_, _> = projects
-            .iter()
-            .filter(|p| p.metadata.namespace == *namespace)
-            .map(|p| (p.metadata.name.clone(), p.spec.parent.clone()))
-            .collect();
-        let hierarchy = flotilla_resources::ProjectHierarchy::new(declared, fleet)?;
+        let hierarchy = &hierarchies[namespace];
         let mut owners = vec![project.metadata.name.clone()];
         owners.extend(hierarchy.ancestors(&project.metadata.name)?);
         let scoped = owners.iter().map(|owner| flotilla_core::ops_entry::materialized_workflow_name(owner, name)).find(|scoped| {
@@ -85,7 +92,12 @@ pub(super) fn preview(templates: &[Value], projects: &[Value], designations: &[V
     }
     definitions.sort_by_key(Value::to_string);
     references.sort_by_key(Value::to_string);
-    Ok(RetirementPreview { definitions, references })
+    Ok(RetirementPreview {
+        restoration_note:
+            "Restore only after daemon rollback: these manifests retain managed-by=builtin; candidate startup will retire them again.",
+        definitions,
+        references,
+    })
 }
 
 #[cfg(test)]
@@ -128,6 +140,19 @@ mod tests {
             .map(|object| serde_json::to_value(object.to_k8s_object()).expect("document"))
             .collect();
         let report = preview(&documents, &projects, &[]).expect("preview");
+        // Reserved aliases still resolve when no retired record is stored;
+        // those references have no retirement effect to report.
+        let without_aliases: Vec<_> = documents
+            .iter()
+            .filter(|d| !matches!(d["metadata"]["name"].as_str(), Some("single-agent-contained" | "single-agent-trusted")))
+            .cloned()
+            .collect();
+        let no_alias_records = preview(&without_aliases, &projects, &[]).expect("missing alias records");
+        assert_eq!(no_alias_records.references.len(), 1);
+        for alias in ["single-agent-contained", "single-agent-trusted"] {
+            assert_eq!(current_builtin_workflow_name(alias), "single-agent");
+        }
+
         assert_eq!(report.definitions.len(), 3);
         assert_eq!(report.references.len(), 3);
         assert_eq!(report.references.iter().filter(|r| r["resolution"] == "supported-retired-name-alias").count(), 2);
