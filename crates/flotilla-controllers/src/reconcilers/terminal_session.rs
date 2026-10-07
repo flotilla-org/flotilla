@@ -7,13 +7,12 @@ use flotilla_resources::{
     api_version,
     controller::{Actuation, ReconcileErrorExhaustion, ReconcileErrorPolicy, ReconcileFailure, ReconcileOutcome, Reconciler},
     Convoy, ConvoyPhase, CrewMessageDelivery, Demand, DemandAddressee, DemandKind, DemandSpec, Environment, EnvironmentPhase, InputMeta,
-    LifecycleAuthority, Message, OwnerReference, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject,
-    ResourceProvenance, TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession,
-    TerminalSessionPhase, TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, Vessel,
-    ACTUATOR_HOST_REF_ANNOTATION, ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION,
-    CREDENTIAL_PERMISSIONS_SESSION_TAG, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION,
-    CREDENTIAL_SCOPES_SESSION_TAG, TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON,
-    TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
+    LifecycleAuthority, OwnerReference, ReplicaReadResolver, Resource, ResourceBackend, ResourceError, ResourceObject, ResourceProvenance,
+    TerminalAttention, TerminalAttentionSource, TerminalAttentionState, TerminalOccupancy, TerminalSession, TerminalSessionPhase,
+    TerminalSessionSource, TerminalSessionStatusPatch, TerminalSessionTag, TypedResolver, Vessel, ACTUATOR_HOST_REF_ANNOTATION,
+    ACTUATOR_SOURCE_ROOT_ANNOTATION, CONVOY_LABEL, CREDENTIAL_PERMISSIONS_ANNOTATION, CREDENTIAL_PERMISSIONS_SESSION_TAG,
+    CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_REF_SESSION_TAG, CREDENTIAL_SCOPES_ANNOTATION, CREDENTIAL_SCOPES_SESSION_TAG,
+    TERMINAL_DELIVERY_EXPIRED_REASON, TERMINAL_DELIVERY_NOT_SUBMITTED_REASON, TERMINAL_DELIVERY_UNCONFIRMED_REASON, VESSEL_REF_LABEL,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
@@ -79,10 +78,6 @@ const RECEIPT_RETIREMENT_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 #[async_trait]
 pub trait TerminalRuntime: Send + Sync {
-    /// Adopt stored input before any old queue can reach transport.
-    async fn adopt_legacy_messages(&self, _obj: &ResourceObject<TerminalSession>) -> Result<bool, ResourceError> {
-        Ok(false)
-    }
     /// Re-verify the convoy's teardown gate before reclaiming a retained
     /// terminal convoy's session at its actuator. Refuse without a verifier.
     async fn verify_reclaim(&self, _convoy: &ResourceObject<Convoy>) -> Result<(), String> {
@@ -171,7 +166,6 @@ pub struct TerminalSessionReconciler<R> {
     environments: TypedResolver<Environment>,
     vessels: TypedResolver<Vessel>,
     demands: TypedResolver<Demand>,
-    messages: TypedResolver<Message>,
     local_host_ref: Option<CanonicalHostId>,
     additional_host_refs: std::collections::BTreeSet<CanonicalHostId>,
 }
@@ -185,7 +179,6 @@ impl<R> TerminalSessionReconciler<R> {
             federated_convoys: None,
             environments: backend.clone().using::<Environment>(namespace),
             vessels: backend.clone().using::<Vessel>(namespace),
-            messages: backend.clone().using::<Message>(namespace),
             demands: backend.using::<Demand>(namespace),
             local_host_ref: None,
             additional_host_refs: Default::default(),
@@ -396,9 +389,6 @@ where
         if !self.actuates(obj) {
             return Ok(TerminalPrepared::None);
         }
-        if self.runtime.adopt_legacy_messages(obj).await? {
-            return Ok(TerminalPrepared::None);
-        }
         let environment = match self.environments.get(&obj.spec.env_ref).await {
             Ok(environment) => environment,
             Err(ResourceError::NotFound { .. }) => {
@@ -491,33 +481,6 @@ where
             }
             if let flotilla_resources::TerminalSessionSource::Agent { message: Some(head), .. } = &obj.spec.source {
                 if let Some(message) = head.next_after(obj.status.as_ref().and_then(|status| status.delivered_message_id.as_deref())) {
-                    // A durable Message submission owns this incarnation's
-                    // transport until its receipt resolves, including restart.
-                    // This full scan is limited to sessions with a legacy queue;
-                    // migration removes that path in the next stack stage.
-                    let message_in_flight = self.messages.list().await?.items.iter().any(|message| {
-                        message.status.as_ref().is_some_and(|status| {
-                            !status.phase.is_terminal()
-                                && status.resolved_receiver.is_none()
-                                && status.submission.as_ref().is_some_and(|submission| {
-                                    submission.session == session_id
-                                        && obj
-                                            .status
-                                            .as_ref()
-                                            .and_then(|status| status.crew.as_ref())
-                                            .is_some_and(|crew| crew.id == submission.crew_id)
-                                })
-                        })
-                    });
-                    if message_in_flight {
-                        return self
-                            .runtime
-                            .observe_attention(session_id, &obj.spec)
-                            .await
-                            .map(|observation| observation.map_or(TerminalPrepared::MessageDeliveryPending, TerminalPrepared::Attention))
-                            .map_err(ResourceError::other);
-                    }
-
                     if obj.status.as_ref().and_then(|status| status.degraded.as_ref()).is_some_and(|condition| {
                         condition.message_id.as_deref() == Some(message.id.as_str())
                             && (condition.reason == TERMINAL_DELIVERY_UNCONFIRMED_REASON

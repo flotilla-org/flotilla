@@ -437,7 +437,7 @@ async fn message_admission_accepts_opaque_and_large_kubernetes_versions() {
             .build();
         let object = serde_json::json!({"apiVersion":"flotilla.work/v1","kind":"Message",
             "metadata":{"name":"partial","namespace":"flotilla","resourceVersion":version,"creationTimestamp":"2026-04-13T12:00:00Z"},"spec":intent});
-        // HTTP boundary stand-in enforces the point-read, collection-read and
+        // HTTP boundary stand-in enforces the point-read, active-receiver query and
         // status-CAS requests used to recover a created-but-unadmitted record.
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
@@ -474,7 +474,10 @@ async fn message_admission_accepts_opaque_and_large_kubernetes_versions() {
                         object.clone()
                     }
                     1 => {
-                        assert!(request.starts_with("GET /apis/flotilla.work/v1/namespaces/flotilla/messages "));
+                        assert!(request.starts_with("GET /apis/flotilla.work/v1/namespaces/flotilla/messages?messageQuery="));
+                        assert!(request.contains("%22active%22"));
+                        assert!(request.contains("flotilla%2Fgovernor"));
+                        assert!(request.contains("includeReplicas=false"));
                         serde_json::json!({"metadata":{"resourceVersion":version},"items":[object]})
                     }
                     _ => {
@@ -502,4 +505,25 @@ async fn message_admission_accepts_opaque_and_large_kubernetes_versions() {
         assert!(message.status.expect("admission status").accepted_sequence.is_none());
         assert_eq!(timeout(Duration::from_secs(5), server).await.expect("server completed").expect("HTTP contract").len(), 3);
     }
+}
+
+// Process-boundary stand-in enforces the owned resource API's query contract;
+// query filters travel to the authority instead of filtering a full HTTP list.
+#[tokio::test]
+#[cfg_attr(feature = "skip-no-sandbox-tests", ignore = "excluded by `skip-no-sandbox-tests`; run without that feature to include")]
+async fn message_queries_encode_filter_and_replica_visibility() {
+    use flotilla_resources::{Message, MessageQuery};
+    let (base_url, request_rx) = spawn_one_shot_server(response("200 OK", r#"{"metadata":{"resourceVersion":"0"},"items":[]}"#)).await;
+    let backend = ResourceBackend::Http(HttpBackend::new(flotilla_resources::tls::client(), base_url));
+    assert!(backend
+        .using::<Message>("flotilla")
+        .query(&MessageQuery::Active { receiver: Some("project/role".into()) })
+        .await
+        .unwrap()
+        .is_empty());
+    let request = request_rx.await.unwrap();
+    assert!(request.starts_with("GET /apis/flotilla.work/v1/namespaces/flotilla/messages?messageQuery="));
+    assert!(request.contains("%22active%22"));
+    assert!(request.contains("project%2Frole"));
+    assert!(request.contains("includeReplicas=false"));
 }

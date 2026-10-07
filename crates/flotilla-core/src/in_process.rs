@@ -86,9 +86,8 @@ use flotilla_resources::{
 #[cfg(test)]
 use flotilla_resources::{
     CheckoutIntegrationStatus, ConditionValue, ConvoyEnsureHoldReason, ConvoyEnsureSpec, ConvoyPhase, CrewCompletionRefusalCause,
-    CrewMessageDelivery, Demand as ResourceDemand, DemandKind, DemandSpec, HoldAct, IntegrationCondition,
-    Presentation as ResourcePresentation, TerminalCrewMessage, TerminalSessionIdentity, Vessel, CREDENTIAL_REFS_ANNOTATION,
-    CREDENTIAL_SCOPES_ANNOTATION, DRIVER_ADMISSION_CONDITION_TYPE,
+    Demand as ResourceDemand, DemandKind, DemandSpec, HoldAct, IntegrationCondition, Presentation as ResourcePresentation,
+    TerminalSessionIdentity, Vessel, CREDENTIAL_REFS_ANNOTATION, CREDENTIAL_SCOPES_ANNOTATION, DRIVER_ADMISSION_CONDITION_TYPE,
 };
 use futures::{FutureExt, StreamExt};
 use project_ops::{is_declaration_backed_project, validate_project_name};
@@ -5864,6 +5863,7 @@ impl InProcessDaemon {
                 let (change_request, issue) = self.crew_ops.message_observation_staleness();
                 flotilla_resources::MessageInbox::new(self.resource_backend.clone(), namespace)
                     .with_observation_staleness(change_request, issue)
+                    .with_audit_retention_days(self.config.load_daemon_config().unwrap_or_default().message_audit_retention_days)
             })
             .clone()
     }

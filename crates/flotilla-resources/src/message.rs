@@ -89,6 +89,8 @@ pub struct MessageSpec {
     pub receiver: String,
     pub relation: MessageRelation,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_digest: Option<String>,
     #[serde(default)]
     #[builder(default)]
     pub references: Vec<MessageReference>,
@@ -224,31 +226,8 @@ impl Default for MessageStatus {
     }
 }
 
-/// Payload-free previous-generation receipt. Missing sender/receiver identity
-/// remains uncertainty, never permission to associate it with a newer holder.
-/// Remove this shim one fleet roll after queue adoption.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyMessageReceipt {
-    pub sender: Option<String>,
-    pub receiver: Option<ResolvedMessageReceiver>,
-}
-
-/// Witness for a previous-generation launch whose session identity was not
-/// persisted yet. Remove this shim one fleet roll after queue adoption.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyMessageLaunch {
-    pub terminal: String,
-    pub terminal_created_at: DateTime<Utc>,
-    /// A known attempt start prevents binding the same terminal after restart.
-    #[serde(default)]
-    pub terminal_started_at: Option<DateTime<Utc>>,
-    pub content: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct MessageSubmission {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub legacy_launch: Option<LegacyMessageLaunch>,
     pub batch_id: String,
     pub crew_id: String,
     pub session: String,
@@ -322,4 +301,26 @@ pub fn message_record_name(receiver: &str, sender: &str, producer_key: &str) -> 
         hash.update(component.as_bytes());
     }
     format!("message-{:x}", hash.finalize())
+}
+
+impl MessageSpec {
+    pub fn same_intent(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        let mut left = self.clone();
+        let mut right = other.clone();
+        let digest = |spec: &Self| spec.body_digest.clone().unwrap_or_else(|| message_body_digest(&spec.body));
+        let same_body = digest(&left) == digest(&right);
+        left.body.clear();
+        left.body_digest = None;
+        right.body.clear();
+        right.body_digest = None;
+        same_body && left == right
+    }
+}
+
+pub(crate) fn message_body_digest(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(body.as_bytes()))
 }

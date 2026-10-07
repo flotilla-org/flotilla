@@ -318,6 +318,9 @@ impl HostsConfig {
 /// Loaded from `~/.config/flotilla/daemon.toml`.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DaemonConfig {
+    /// Compact terminal Message bodies after this many days; zero disables compaction.
+    #[serde(default = "default_message_audit_retention_days")]
+    pub message_audit_retention_days: u64,
     #[serde(default)]
     pub machine_id: Option<String>,
     pub host_name: Option<String>,
@@ -351,6 +354,7 @@ pub const DEFAULT_CHECKOUT_REMOVAL_CONCURRENCY: NonZeroUsize = NonZeroUsize::new
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            message_audit_retention_days: default_message_audit_retention_days(),
             machine_id: None,
             host_name: None,
             admission: AdmissionConfig::default(),
@@ -365,6 +369,10 @@ impl Default for DaemonConfig {
             checkout_removal_concurrency: default_checkout_removal_concurrency(),
         }
     }
+}
+
+fn default_message_audit_retention_days() -> u64 {
+    30
 }
 
 fn default_checkout_archive_retention_days() -> u64 {

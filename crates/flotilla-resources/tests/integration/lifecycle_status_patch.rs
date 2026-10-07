@@ -733,7 +733,6 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
                     retired_launches: Default::default(),
                     launch_command: Some("bash".to_string()),
                     delivered_message_id: None,
-                    legacy_message_receipts: Default::default(),
                     attention: None,
                     occupancy: Default::default(),
                     completion_pending: None,

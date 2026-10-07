@@ -126,6 +126,25 @@ impl HttpBackend {
         Self::decode_response(response, None).await
     }
 
+    pub(crate) async fn query_messages(
+        &self,
+        namespace: &str,
+        query: &crate::MessageQuery,
+        include_replicas: bool,
+    ) -> Result<Vec<ReadResourceObject<crate::Message>>, ResourceError> {
+        let url = self.namespaced_url(crate::Message::API_PATHS, namespace, None, false);
+        let query = serde_json::to_string(query).map_err(|error| ResourceError::other(error.to_string()))?;
+        let response = self
+            .http
+            .get(url)
+            .query(&[("messageQuery", query.as_str()), ("includeReplicas", if include_replicas { "true" } else { "false" })])
+            .send()
+            .await
+            .map_err(|error| ResourceError::other(format!("query Message inbox: {error}")))?;
+        let list: K8sResourceList<crate::Message> = Self::decode_response(response, None).await?;
+        list.items.into_iter().map(ResourceObject::from_k8s_object).map(|object| object.and_then(read_resource_object)).collect()
+    }
+
     pub(crate) async fn list_typed<T: Resource>(&self, namespace: &str) -> Result<ResourceList<T>, ResourceError> {
         let url = self.namespaced_url(T::API_PATHS, namespace, None, false);
         let response = self.http.get(url).send().await.map_err(|err| ResourceError::other(format!("LIST resources: {err}")))?;

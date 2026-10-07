@@ -47,6 +47,7 @@ struct ReplicaState {
 
 #[derive(Debug, Default)]
 struct ReplicaPartition {
+    messages: crate::message_query::MessageIndex,
     objects: HashMap<String, Value>,
     digest: crate::digest::DigestIndex,
     // Retained for deleted names as a tombstone so an older relayed write
@@ -57,6 +58,7 @@ struct ReplicaPartition {
 
 #[derive(Debug)]
 struct ResourceStore {
+    messages: crate::message_query::MessageIndex,
     objects: HashMap<String, Value>,
     digest: crate::digest::DigestIndex,
     tombstones: HashMap<String, ResourceTombstone>,
@@ -93,6 +95,7 @@ impl ResourceStore {
 
     fn push_event(&mut self, event: StoredEvent, max_events: usize) {
         let name = event.object["metadata"]["name"].as_str().expect("encoded event name");
+        self.messages.update(name, (!matches!(event.kind, StoredEventKind::Deleted)).then_some(&event.object));
         let version = event.version.to_string();
         self.digest.set(name, (!matches!(event.kind, StoredEventKind::Deleted)).then_some(version.as_str()));
         let excess = self.event_log.len().saturating_add(1).saturating_sub(max_events);
@@ -110,6 +113,7 @@ impl ResourceStore {
 impl Default for ResourceStore {
     fn default() -> Self {
         Self {
+            messages: Default::default(),
             objects: HashMap::new(),
             digest: crate::digest::DigestIndex::default(),
             tombstones: HashMap::new(),
@@ -122,6 +126,49 @@ impl Default for ResourceStore {
 }
 
 impl InMemoryBackend {
+    pub(crate) async fn query_messages(
+        &self,
+        namespace: &str,
+        query: &crate::MessageQuery,
+        include_replicas: bool,
+    ) -> Result<Vec<ReadResourceObject<crate::Message>>, ResourceError> {
+        let key = Self::store_key::<crate::Message>(namespace);
+        let mut items = Vec::new();
+        {
+            let stores = self.stores.lock().await;
+            if let Some(store) = stores.get(&key) {
+                for name in store.messages.names(query) {
+                    items.push(ReadResourceObject {
+                        object: Self::decode_object(store.objects[&name].clone())?,
+                        provenance: ResourceProvenance::Local,
+                    });
+                }
+            }
+        }
+        if include_replicas {
+            if let Some(backend) = &self.durable_replicas {
+                items.extend(backend.query_message_replicas(namespace, query).await?);
+            } else {
+                let replicas = self.replicas.lock().await;
+                for ((origin_root, partition_key), partition) in &replicas.partitions {
+                    if partition_key != &key {
+                        continue;
+                    }
+                    for name in partition.messages.names(query) {
+                        items.push(ReadResourceObject {
+                            object: Self::decode_object(partition.objects[&name].clone())?,
+                            provenance: ResourceProvenance::Replica {
+                                origin_root: origin_root.clone(),
+                                last_synced_at: partition.synced_at_by_name[&name],
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        Ok(items)
+    }
+
     pub fn observed() -> Self {
         Self {
             stores: Arc::default(),
@@ -399,6 +446,7 @@ impl InMemoryBackend {
         let mut state = self.replicas.lock().await;
         let mut old = state.partitions.remove(&replica_key).unwrap_or_default();
         let mut digest = std::mem::take(&mut old.digest);
+        let mut messages = std::mem::take(&mut old.messages);
         // Move the unaffected map intact. Only the selected leaf is compared,
         // cloned, decoded or notified; sparse repair never scans other bodies.
         let mut objects = if let Some(bucket) = bucket {
@@ -419,6 +467,7 @@ impl InMemoryBackend {
             let name = &object.metadata.name;
             let encoded = Self::encode_object(object)?;
             let unchanged = old.objects.get(name) == Some(&encoded);
+            messages.update(name, Some(&encoded));
             objects.insert(name.clone(), encoded);
             digest.set(name, Some(&object.metadata.resource_version));
             if !unchanged {
@@ -442,6 +491,7 @@ impl InMemoryBackend {
         for (name, value) in old.objects {
             if !objects.contains_key(&name) {
                 // Fence stale relays as well as removing the visible replica.
+                messages.update(&name, None);
                 digest.set(&name, None);
                 synced_at_by_name.insert(name, synced_at);
                 events.push(StoredReplicaEvent {
@@ -453,6 +503,7 @@ impl InMemoryBackend {
             }
         }
         state.partitions.insert(replica_key, ReplicaPartition {
+            messages,
             objects,
             digest,
             synced_at_by_name,
@@ -509,11 +560,13 @@ impl InMemoryBackend {
         }
         match kind {
             StoredReplicaEventKind::Added | StoredReplicaEventKind::Modified => {
+                partition.messages.update(&object.metadata.name, Some(&encoded));
                 partition.objects.insert(object.metadata.name.clone(), encoded.clone());
                 partition.digest.set(&object.metadata.name, Some(&object.metadata.resource_version));
                 partition.synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
             }
             StoredReplicaEventKind::Deleted => {
+                partition.messages.update(&object.metadata.name, None);
                 partition.objects.remove(&object.metadata.name);
                 partition.digest.set(&object.metadata.name, None);
                 partition.synced_at_by_name.insert(object.metadata.name.clone(), synced_at);
@@ -551,6 +604,7 @@ impl InMemoryBackend {
         if unchanged {
             return Ok(());
         }
+        partition.messages.update(&tombstone.name, None);
         partition.objects.remove(&tombstone.name);
         partition.digest.set(&tombstone.name, None);
         partition.synced_at_by_name.insert(tombstone.name.clone(), synced_at);

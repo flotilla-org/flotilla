@@ -387,7 +387,6 @@ pub async fn create_stopped_terminal(
             retired_launches: Default::default(),
             launch_command: Some(fixture.command),
             delivered_message_id: None,
-            legacy_message_receipts: Default::default(),
             attention: None,
             last_tool_activity_at: None,
             last_output_digest: None,

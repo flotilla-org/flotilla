@@ -1009,6 +1009,26 @@ impl StartupRestoration {
                 }
             },
         )));
+        let audit_daemon = Arc::clone(daemon);
+        controller_tasks.push(AbortOnDropHandle::new(spawn_periodic_task(
+            Duration::from_secs(60 * 60),
+            PeriodicTaskStart::Immediate,
+            move || {
+                let daemon = Arc::clone(&audit_daemon);
+                async move {
+                    match daemon.resource_backend().local_namespaces::<flotilla_resources::Message>().await {
+                        Ok(namespaces) => {
+                            for namespace in namespaces {
+                                if let Err(error) = daemon.message_inbox(&namespace).await.compact_audit(Utc::now()).await {
+                                    warn!(%error, %namespace, "Message audit retention sweep failed");
+                                }
+                            }
+                        }
+                        Err(error) => warn!(%error, "Message retention namespace inventory failed"),
+                    }
+                }
+            },
+        )));
         controller_tasks.push(AbortOnDropHandle::new(spawn_dispatch_reconciler_task(
             Arc::clone(daemon),
             options.namespace.clone(),
@@ -6128,9 +6148,8 @@ impl<R: Resource> flotilla_resources::controller::SecondaryWatch for MessageDepe
             loop {
                 if let Some(message) = backend
                     .using::<flotilla_resources::Message>(&namespace)
-                    .list()
+                    .query(&flotilla_resources::MessageQuery::active())
                     .await?
-                    .items
                     .into_iter()
                     .filter(|message| message.status.as_ref().is_none_or(|status| !status.phase.is_terminal()))
                     .min_by(|left, right| left.metadata.name.cmp(&right.metadata.name))
@@ -6156,9 +6175,31 @@ impl flotilla_resources::controller::Reconciler for MessageController {
     type Resource = flotilla_resources::Message;
     type Prepared = Option<std::time::Duration>;
     async fn prepare(&self, obj: &ResourceObject<Self::Resource>) -> Result<Self::Prepared, ResourceError> {
+        if obj.status.as_ref().is_some_and(|status| status.phase.is_terminal()) {
+            let batch = obj.status.as_ref().and_then(|status| status.submission.as_ref()).map(|submission| submission.batch_id.as_str());
+            let tracked = batch.is_some_and(|batch| {
+                self.state
+                    .terminal_deliveries
+                    .lock()
+                    .expect("terminal deliveries lock poisoned")
+                    .values()
+                    .any(|delivery| delivery.message_batch.as_deref() == Some(batch))
+            });
+            if tracked {
+                flotilla_resources::MessageTransport::release_closed(&TerminalControllerRuntime { state: Arc::clone(&self.state) }, &[])
+                    .await;
+            }
+            return Ok(None);
+        }
         let inbox = self.state.daemon.message_inbox(&self.namespace).await;
         inbox.reconcile_delivery(&TerminalControllerRuntime { state: Arc::clone(&self.state) }, Utc::now()).await?;
-        let messages = self.state.daemon.resource_backend().using::<flotilla_resources::Message>(&self.namespace).list().await?.items;
+        let messages = self
+            .state
+            .daemon
+            .resource_backend()
+            .using::<flotilla_resources::Message>(&self.namespace)
+            .query(&flotilla_resources::MessageQuery::active())
+            .await?;
         let active: Vec<_> =
             messages.iter().filter(|message| message.status.as_ref().is_none_or(|status| !status.phase.is_terminal())).collect();
         // Only the lexicographically first active record owns the inbox deadline.
@@ -6246,10 +6287,9 @@ impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
                 None
             }
         });
-        let legacy_pending = matches!(&current.spec.source, TerminalSessionSource::Agent { message: Some(message), .. } if message.next_after(status.delivered_message_id.as_deref()).is_some());
         let other_delivery = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned").contains_key(session);
         Ok(flotilla_resources::MessageObservation {
-            ready: !legacy_pending && !other_delivery && attention.is_some_and(|attention| attention.state == TerminalAttentionState::Idle),
+            ready: !other_delivery && attention.is_some_and(|attention| attention.state == TerminalAttentionState::Idle),
             working: attention.is_some_and(|attention| {
                 attention.state == TerminalAttentionState::Working
                     && submission.is_some_and(|submission| attention.as_of > submission.started_at)
@@ -6259,7 +6299,32 @@ impl flotilla_resources::MessageTransport for TerminalControllerRuntime {
             waiting_reason: Some("waiting for a fresh idle holder observation".into()),
         })
     }
-    async fn release_closed(&self, messages: &[ResourceObject<flotilla_resources::Message>]) {
+    async fn release_closed(&self, _messages: &[ResourceObject<flotilla_resources::Message>]) {
+        let batches: Vec<_> = self
+            .state
+            .terminal_deliveries
+            .lock()
+            .expect("terminal deliveries lock poisoned")
+            .values()
+            .filter_map(|delivery| delivery.message_batch.clone())
+            .collect();
+        let mut messages = Vec::new();
+        let Ok(namespaces) = self.state.daemon.resource_backend().local_namespaces::<flotilla_resources::Message>().await else { return };
+        for namespace in namespaces {
+            for id in &batches {
+                let Ok(members) = self
+                    .state
+                    .daemon
+                    .resource_backend()
+                    .using::<flotilla_resources::Message>(&namespace)
+                    .query(&flotilla_resources::MessageQuery::Batch { id: id.clone() })
+                    .await
+                else {
+                    continue;
+                };
+                messages.extend(members);
+            }
+        }
         let mut deliveries = self.state.terminal_deliveries.lock().expect("terminal deliveries lock poisoned");
         let closed: Vec<_> = deliveries
             .iter()
@@ -6568,9 +6633,6 @@ fn terminal_liveness_for_source(source: &TerminalSessionSource, liveness: Termin
 
 #[async_trait]
 impl TerminalRuntime for TerminalControllerRuntime {
-    async fn adopt_legacy_messages(&self, obj: &ResourceObject<TerminalSession>) -> Result<bool, ResourceError> {
-        self.state.daemon.resource_backend().using::<TerminalSession>(&obj.metadata.namespace).adopt_legacy_messages(obj, Utc::now()).await
-    }
     async fn verify_reclaim(&self, convoy: &ResourceObject<Convoy>) -> Result<(), String> {
         let backend = self.state.daemon.resource_backend();
         let records = backend.including_replicas::<Checkout>(&convoy.metadata.namespace).list().await.map_err(|error| error.to_string())?;
@@ -15050,7 +15112,11 @@ mod tests {
                     (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
                     (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
                 ]);
-                session = sessions.update(&meta, &session.metadata.resource_version, &spec).await.expect("queue old turns");
+                let mut stored_spec = spec.clone();
+                if let TerminalSessionSource::Agent { message, .. } = &mut stored_spec.source {
+                    *message = None;
+                }
+                session = sessions.update(&meta, &session.metadata.resource_version, &stored_spec).await.expect("new-only holder");
                 let mut status = session.status.clone().expect("status");
                 status.crew = Some(flotilla_resources::CrewSessionStatus {
                     id: "crew-id".into(),
@@ -15060,7 +15126,7 @@ mod tests {
                 });
                 status.session_id = Some(ID.into());
                 status.delivered_message_id = Some("initial-brief".into());
-                session = sessions.update_status(ID, &session.metadata.resource_version, &status).await.expect("running status");
+                sessions.update_status(ID, &session.metadata.resource_version, &status).await.expect("running status");
                 let runtime = Arc::new(TerminalControllerRuntime {
                     state: Arc::new(ControllerRuntimeState::new(
                         daemon,
@@ -15074,7 +15140,13 @@ mod tests {
                 });
                 // Upgrade keeps the three distinct producer identities but
                 // Message owns one batch and one evidence-backed receipt per record.
-                assert!(sessions.adopt_legacy_messages(&session, Utc::now()).await.expect("adopt old queue"));
+                let inbox = runtime.state.daemon.message_inbox(NAMESPACE).await;
+                let TerminalSessionSource::Agent { message: Some(head), .. } = &spec.source else { unreachable!() };
+                for input in std::iter::once(head).chain(head.following.iter()) {
+                    let intent = flotilla_resources::legacy_message_spec("flotilla/hookless/work/coder", input);
+                    let name = flotilla_resources::message_record_name(&intent.receiver, &intent.sender, &input.id);
+                    inbox.accept(&empty_meta(&name), &intent, Utc::now()).await.expect("new Message intent");
+                }
                 let inbox = runtime.state.daemon.message_inbox(NAMESPACE).await;
                 for screen in [
                     "• Working (10m • esc to interrupt)\n› Ask Codex to do anything",
@@ -15232,7 +15304,11 @@ mod tests {
             (flotilla_resources::VESSEL_LABEL.into(), "work".into()),
             (flotilla_resources::ROLE_LABEL.into(), "coder".into()),
         ]);
-        session = sessions.update(&meta, &session.metadata.resource_version, &spec).await.expect("queue turn");
+        let mut stored_spec = spec.clone();
+        if let TerminalSessionSource::Agent { message, .. } = &mut stored_spec.source {
+            *message = None;
+        }
+        session = sessions.update(&meta, &session.metadata.resource_version, &stored_spec).await.expect("new-only holder");
         let mut status = session.status.clone().expect("status");
         status.session_id = Some("agent".into());
         status.crew = Some(flotilla_resources::CrewSessionStatus {
@@ -15273,7 +15349,28 @@ mod tests {
         // that real observation so changed output has a comparison witness.
         refresh_message_test_attention(&runtime, &backend, "agent").await;
         session = sessions.get("agent").await.expect("legacy held baseline");
-        assert!(sessions.adopt_legacy_messages(&session, Utc::now()).await.expect("adopt held delivery"));
+        let inbox = runtime.state.daemon.message_inbox(NAMESPACE).await;
+        let intent = flotilla_resources::MessageSpec::builder()
+            .sender("system:test".into())
+            .receiver("flotilla/held-pool/work/coder".into())
+            .relation(flotilla_resources::MessageRelation::System)
+            .body("wake".into())
+            .build();
+        inbox.accept(&empty_meta("held-turn"), &intent, Utc::now()).await.expect("new Message intent");
+        let messages = backend.using::<flotilla_resources::Message>(NAMESPACE);
+        let record = messages.get("held-turn").await.expect("held message");
+        let mut held = record.status.clone().expect("message status");
+        held.submission = Some(
+            flotilla_resources::MessageSubmission::builder()
+                .batch_id("held-turn".into())
+                .crew_id("held-crew".into())
+                .session("agent".into())
+                .started_at(Utc::now())
+                .members(vec!["held-turn".into()])
+                .maybe_output_digest(session.status.as_ref().and_then(|status| status.last_output_digest.clone()))
+                .build(),
+        );
+        messages.update_status("held-turn", &record.metadata.resource_version, &held).await.expect("submission evidence");
         let inbox = runtime.state.daemon.message_inbox(NAMESPACE).await;
         refresh_message_test_attention(&runtime, &backend, "agent").await;
         inbox.reconcile_delivery(&*runtime, Utc::now()).await.expect("observe idle while held");

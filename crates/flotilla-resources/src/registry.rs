@@ -839,6 +839,52 @@ pub fn resource_document_spec_hash(document: &Value) -> Result<String, ResourceE
     dispatch_resource_kind!(lookup_resource_kind(kind)?.resource, typed_spec_hash(spec))
 }
 
+/// Fail the pre-roll gate before retired fields can be dropped by typed decoding.
+/// Inspect raw inventory from every authority and replica, including observed stores.
+pub fn validate_message_migration_complete(document: &Value) -> Result<(), ResourceError> {
+    let mut witnesses = Vec::new();
+    if document["kind"] == "TerminalSession" {
+        if document.pointer("/spec/source/message").is_some_and(|value| !value.is_null()) {
+            witnesses.push("legacy authority queue at spec.source.message");
+        }
+        if document
+            .pointer("/status/legacy_message_receipts")
+            .is_some_and(|value| value.as_object().is_none_or(|receipts| !receipts.is_empty()))
+        {
+            witnesses.push("legacy receipts at status.legacy_message_receipts");
+        }
+    }
+    if document["kind"] == "Convoy" {
+        if let Some(deliveries) = document.pointer("/status/turn_deliveries").and_then(Value::as_object) {
+            for delivery in deliveries.values() {
+                if ["pending_brief", "pending_supervisor_turn"]
+                    .iter()
+                    .any(|field| delivery.get(field).is_some_and(|value| !value.is_null()))
+                {
+                    witnesses.push("legacy authority queue at status.turn_deliveries");
+                }
+            }
+        }
+    }
+    let resolved_launch = document.pointer("/status/resolved_receiver").is_some_and(|value| !value.is_null())
+        || (document.pointer("/status/phase").and_then(Value::as_str) == Some("dead_lettered")
+            && document
+                .pointer("/status/reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason.starts_with("operator failed batch:")));
+    if document["kind"] == "Message"
+        && !resolved_launch
+        && document.pointer("/status/submission/legacy_launch").is_some_and(|value| !value.is_null())
+    {
+        witnesses.push("unresolved legacy launch at status.submission.legacy_launch");
+    }
+    if witnesses.is_empty() {
+        Ok(())
+    } else {
+        Err(ResourceError::invalid(format!("Message migration incomplete: {}", witnesses.join(", "))))
+    }
+}
+
 /// Decode a complete resource document against this binary's registered types.
 /// Manifests without a status remain valid inputs.
 pub fn validate_resource_document(document: &Value) -> Result<(), ResourceError> {
@@ -1412,7 +1458,7 @@ fn object_value<T: Resource>(object: &ResourceObject<T>) -> Result<Value, Resour
     Ok(value)
 }
 
-fn read_object_value<T: Resource>(object: &crate::ReadResourceObject<T>) -> Result<Value, ResourceError> {
+pub(crate) fn read_object_value<T: Resource>(object: &crate::ReadResourceObject<T>) -> Result<Value, ResourceError> {
     let mut value = object_value(&object.object)?;
     let annotations = value["metadata"]["annotations"]
         .as_object_mut()

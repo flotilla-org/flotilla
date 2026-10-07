@@ -159,6 +159,36 @@ pub(super) async fn serve_resource_http_with_daemon(
         return write_error(&mut stream, 400, "allProvenances requires a resource name").await;
     }
 
+    if let Some(encoded) = query.get("messageQuery") {
+        if kind != "messages" || watch || replica_sources {
+            return write_error(&mut stream, 400, "messageQuery requires a Message collection read").await;
+        }
+        let filter: flotilla_resources::MessageQuery = match serde_json::from_str(encoded) {
+            Ok(filter) => filter,
+            Err(error) => return write_error(&mut stream, 400, &format!("invalid Message query: {error}")).await,
+        };
+        let items = if include_replicas {
+            backend.query_messages(namespace, &filter).await
+        } else {
+            backend.using::<flotilla_resources::Message>(namespace).query(&filter).await.map(|items| {
+                items
+                    .into_iter()
+                    .map(|object| flotilla_resources::ReadResourceObject {
+                        object,
+                        provenance: flotilla_resources::ResourceProvenance::Local,
+                    })
+                    .collect()
+            })
+        };
+        return match items {
+            Ok(items) => {
+                let document = flotilla_resources::message_query_document(&items).map_err(|error| error.to_string())?;
+                write_json(&mut stream, 200, &document).await
+            }
+            Err(error) => write_resource_error(&mut stream, error).await,
+        };
+    }
+
     if !watch {
         let listed = if replica_sources {
             list_resource_kind_replica_sources(&backend, namespace, kind).await

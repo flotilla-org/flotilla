@@ -6,8 +6,8 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 
 use crate::{
-    apply_status_patch, InputMeta, Message, MessageExpectation, MessagePhase, MessageSpec, MessageStatusPatch, Resource, ResourceBackend,
-    ResourceError, ResourceObject, TypedResolver,
+    apply_status_patch, InputMeta, Message, MessageExpectation, MessagePhase, MessageQuery, MessageSpec, MessageStatusPatch, Resource,
+    ResourceBackend, ResourceError, ResourceObject, TypedResolver,
 };
 
 /// Creation context for convoy-relative role addresses.
@@ -85,6 +85,7 @@ pub enum MessageAdmission {
 pub struct MessageInbox {
     pub(crate) backend: ResourceBackend,
     pub(crate) namespace: String,
+    pub(crate) audit_retention_days: u64,
     pub(crate) change_request_stale_after: std::time::Duration,
     pub(crate) issue_stale_after: std::time::Duration,
     pub(crate) messages: TypedResolver<Message>,
@@ -98,11 +99,17 @@ impl MessageInbox {
             messages: backend.using::<Message>(namespace),
             backend,
             namespace: namespace.into(),
+            audit_retention_days: 30,
             admission: Arc::new(Mutex::new(())),
             delivery: Arc::new(Mutex::new(())),
             change_request_stale_after: std::time::Duration::from_secs(300),
             issue_stale_after: std::time::Duration::from_secs(300),
         }
+    }
+
+    pub fn with_audit_retention_days(mut self, days: u64) -> Self {
+        self.audit_retention_days = days;
+        self
     }
 
     pub fn with_observation_staleness(mut self, change_request: std::time::Duration, issue: std::time::Duration) -> Self {
@@ -141,7 +148,7 @@ impl MessageInbox {
     ) -> Result<MessageAdmission, ResourceError> {
         Message::validate_spec(meta, spec)?;
         let partial = match self.messages.get(&meta.name).await {
-            Ok(existing) if existing.spec == *spec => {
+            Ok(existing) if existing.spec.same_intent(spec) => {
                 // Status is written only after predecessor cleanup. A missing
                 // status is an unfinished admission, so replay must repair it.
                 if let Some(reference) = existing.status.as_ref().and_then(|status| status.canonical_predecessor.as_ref()) {
@@ -160,12 +167,16 @@ impl MessageInbox {
             Err(ResourceError::NotFound { .. }) => None,
             Err(error) => return Err(error),
         };
-        let existing = self.messages.list().await?.items;
+        let mut existing = self.messages.query(&MessageQuery::Active { receiver: Some(spec.receiver.clone()) }).await?;
         if let Some(id) = &spec.supersedes {
-            let _predecessor = existing
-                .iter()
-                .find(|message| message.metadata.name == *id)
-                .ok_or_else(|| ResourceError::invalid(format!("superseded message `{id}` is absent from the receiver's store")))?;
+            if !existing.iter().any(|message| message.metadata.name == *id) {
+                existing.push(self.messages.get(id).await.map_err(|error| match error {
+                    ResourceError::NotFound { .. } => {
+                        ResourceError::invalid(format!("superseded message `{id}` is absent from the receiver's store"))
+                    }
+                    error => error,
+                })?);
+            }
         }
         let predecessors: Vec<_> = existing
             .iter()

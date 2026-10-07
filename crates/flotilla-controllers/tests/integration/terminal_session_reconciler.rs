@@ -3133,13 +3133,12 @@ async fn unchanged_attention_decisions_log_once() {
     assert!(output.contains("attention_source=Some(Screen)"));
 }
 
-// Durable ownership survives an adapter restart, but does not fence another incarnation.
+// New-only terminals never deliver Message-owned input; the inbox retains
+// transport ownership across every receiver incarnation and adapter restart.
 #[tokio::test]
-async fn message_submission_fences_legacy_input_for_its_original_incarnation() {
+async fn terminal_reconciliation_leaves_message_submissions_to_the_inbox() {
     use flotilla_resources::{Message, MessagePhase, MessageRelation, MessageSpec, MessageStatus, MessageSubmission};
-    for (crew, session_id, fenced) in
-        [("current-crew", "cleat-session", true), ("older-crew", "cleat-session", false), ("current-crew", "older-session", false)]
-    {
+    for (crew, session_id) in [("current-crew", "cleat-session"), ("older-crew", "cleat-session"), ("current-crew", "older-session")] {
         let backend = ResourceBackend::InMemory(Default::default());
         create_ready_environment(&backend, "env-a").await;
         create_convoy_with_single_task(&backend, "flotilla", "demo", "review", "https://github.com/flotilla-org/flotilla", "main").await;
@@ -3161,14 +3160,7 @@ async fn message_submission_fences_legacy_input_for_its_original_incarnation() {
                         convoy: "demo".into(),
                         vessel_ref: "demo-review".into(),
                     }),
-                    message: Some(flotilla_resources::TerminalCrewMessage {
-                        id: "message-new".into(),
-                        text: "Review the amended commit".into(),
-                        sender: Default::default(),
-                        delivery: Default::default(),
-                        acknowledged: Default::default(),
-                        following: Vec::new(),
-                    }),
+                    message: None,
                 },
                 cwd: "/workspace".to_string(),
                 env: Default::default(),
@@ -3233,9 +3225,7 @@ async fn message_submission_fences_legacy_input_for_its_original_incarnation() {
         let runtime = Arc::new(DeliveringTerminalRuntime::default());
         let reconciler = TerminalSessionReconciler::new(runtime.clone(), backend, "flotilla");
         let prepared = reconciler.prepare(&session).await.unwrap();
-        assert_eq!(runtime.delivered.lock().unwrap().len(), usize::from(!fenced));
-        if fenced {
-            assert!(matches!(prepared, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
-        }
+        assert!(runtime.delivered.lock().unwrap().is_empty());
+        assert!(matches!(prepared, flotilla_controllers::reconcilers::terminal_session::TerminalPrepared::Attention(_)));
     }
 }
