@@ -5,6 +5,7 @@ export FLEET_INSTALL_SKIP_CANARY=1
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 installer="$repo_root/scripts/fleet-install"
+python3 -m unittest discover -s "$repo_root/ci/fleet-candidates" -p "test_bootstrap_*.py"
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/fleet-install-test.XXXXXX")"
 cleanup() {
   chmod -R u+w "$test_root" 2>/dev/null || true
@@ -19,7 +20,7 @@ fail() {
 
 # An incomplete installer/module deployment refuses before creating fleet state,
 # for both download selection and mutations (including rollback).
-for operation in latest 20260815T210000Z-r1-f111111111111-caaaaaaaaaaaa rollback; do
+for operation in latest 20260815T210000Z-r1-f111111111111-caaaaaaaaaaaa rollback --prune; do
   if FLEET_INSTALL_ROOT="$test_root/missing-validator-root" \
     FLEET_GENERATION_VALIDATOR="$test_root/missing-validator.py" \
     bash "$installer" "$operation" >"$test_root/missing-validator.log" 2>&1; then
@@ -31,22 +32,11 @@ for operation in latest 20260815T210000Z-r1-f111111111111-caaaaaaaaaaaa rollback
 done
 
 file_sha256() {
-  python3 - "$1" <<'PY'
-import hashlib
-import sys
-
-print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
-PY
+  python3 "$repo_root/ci/fleet-candidates/generation_validation.py" sha256 -- "$1"
 }
 
 file_mode() {
-  python3 - "$1" <<'PY'
-import os
-import stat
-import sys
-
-print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))
-PY
+  python3 "$repo_root/ci/fleet-candidates/generation_validation.py" mode -- "$1"
 }
 
 link_generation() {
@@ -143,81 +133,14 @@ EOF
   chmod 0755 "$bundle/install.sh" "$bundle/generation_validation.py"
   add_test_skills "$bundle" "$skill_revision" "$skill_repository"
   add_test_codex_home "$bundle"
-TEST_BUNDLE="$bundle" TEST_PLATFORM="$platform" TEST_PROTOCOL="$protocol" TEST_CORRUPT_INNER="$corrupt_inner" python3 - <<'PY'
-import hashlib
-import json
-import os
-import re
-from pathlib import Path
-
-bundle = Path(os.environ["TEST_BUNDLE"])
-identity = re.fullmatch(r".+-f([0-9a-f]{12})-c([0-9a-f]{12})", bundle.parent.name.removeprefix("bundle-"))
-sources = {
-    "flotilla": identity.group(1) + "1" * 28,
-    "cleat": identity.group(2) + "a" * 28,
-    "mattpocock-skills": "2" * 40,
-    "rjw-skills": "b" * 40,
-}
-files = []
-for path in sorted(bundle.rglob("*")):
-    if path.is_file():
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if os.environ["TEST_CORRUPT_INNER"] == "yes" and path.name == "cleat":
-            digest = "0" * 64
-        files.append({"path": str(path.relative_to(bundle)), "sha256": digest, "size_bytes": path.stat().st_size})
-(bundle / "manifest.json").write_text(json.dumps({
-    "schema_version": 1,
-    "kind": "unsigned-fleet-candidate",
-    "platform": os.environ["TEST_PLATFORM"],
-    "sources": sources,
-    "peer_protocol_version": int(os.environ["TEST_PROTOCOL"]),
-    "signed": False,
-    "files": files,
-}, sort_keys=True) + "\n")
-PY
+TEST_BUNDLE="$bundle" TEST_PLATFORM="$platform" TEST_PROTOCOL="$protocol" TEST_CORRUPT_INNER="$corrupt_inner" python3 "$repo_root/scripts/fleet_install_test_support.py" linux-release
   local artifact="fleet-candidate-linux-x86_64-gnu2.36.tar.gz"
   COPYFILE_DISABLE=1 tar -C "$(dirname "$bundle")" -czf "$directory/$artifact" "$(basename "$bundle")"
   local digest
   digest="$(file_sha256 "$directory/$artifact")"
   local size
-  size="$(python3 - "$directory/$artifact" <<'PY'
-import os
-import sys
-
-print(os.path.getsize(sys.argv[1]))
-PY
-)"
-  TEST_GENERATION="$generation" TEST_PROTOCOL="$protocol" TEST_PLATFORM="$platform" TEST_ARTIFACT="$artifact" TEST_DIGEST="$digest" TEST_SIZE="$size" TEST_DIRECTORY="$directory" python3 - <<'PY'
-import json
-import os
-import re
-from pathlib import Path
-
-identity = re.fullmatch(r".+-f([0-9a-f]{12})-c([0-9a-f]{12})", os.environ["TEST_GENERATION"])
-sources = {
-    "flotilla": identity.group(1) + "1" * 28,
-    "cleat": identity.group(2) + "a" * 28,
-    "mattpocock-skills": "2" * 40,
-    "rjw-skills": "b" * 40,
-}
-manifest = {
-    "schema_version": 1,
-    "kind": "internal-promoted-fleet-generation",
-    "generation": os.environ["TEST_GENERATION"],
-    "sources": sources,
-    "peer_protocol_version": int(os.environ["TEST_PROTOCOL"]),
-    "platforms": {
-        os.environ["TEST_PLATFORM"]: {
-            "artifact": os.environ["TEST_ARTIFACT"],
-            "sha256": os.environ["TEST_DIGEST"],
-            "size_bytes": int(os.environ["TEST_SIZE"]),
-            "signed": False,
-            "state": "installable-internal",
-        }
-    },
-}
-(Path(os.environ["TEST_DIRECTORY"]) / "generation.json").write_text(json.dumps(manifest, sort_keys=True) + "\n")
-PY
+  size="$(python3 "$repo_root/ci/fleet-candidates/generation_validation.py" size -- "$directory/$artifact")"
+  TEST_GENERATION="$generation" TEST_PROTOCOL="$protocol" TEST_PLATFORM="$platform" TEST_ARTIFACT="$artifact" TEST_DIGEST="$digest" TEST_SIZE="$size" TEST_DIRECTORY="$directory" python3 "$repo_root/scripts/fleet_install_test_support.py" linux-generation
 }
 
 add_darwin_derivative() {
@@ -252,99 +175,14 @@ SH
   chmod 0755 "$bundle/install.sh" "$bundle/generation_validation.py"
   add_test_skills "$bundle"
   add_test_codex_home "$bundle"
-  TEST_BUNDLE="$bundle" TEST_GENERATION="$generation" TEST_SOURCE_GENERATION="$source_generation" TEST_PROTOCOL="$protocol" python3 - <<'PY'
-import hashlib
-import json
-import os
-from pathlib import Path
-
-bundle = Path(os.environ["TEST_BUNDLE"])
-sources = {
-    "flotilla": os.environ["TEST_GENERATION"].split("-f", 1)[1].split("-c", 1)[0] + "1" * 28,
-    "cleat": os.environ["TEST_GENERATION"].rsplit("-c", 1)[1] + "a" * 28,
-    "mattpocock-skills": "2" * 40,
-    "rjw-skills": "b" * 40,
-}
-files = [
-    {
-        "path": str(path.relative_to(bundle)),
-        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        "size_bytes": path.stat().st_size,
-    }
-    for path in sorted(bundle.rglob("*"))
-    if path.is_file()
-]
-signing = {
-    "identity": "Apple Development: Robert Wittams (DYYMCPD885)",
-    "team_id": "973L4GV58R",
-    "certificate_sha256": "d" * 64,
-    "entitlements_sha256": "e" * 64,
-    "options": ["runtime", "timestamp=none"],
-}
-(bundle / "manifest.json").write_text(json.dumps({
-    "schema_version": 1,
-    "kind": "signed-fleet-derivative",
-    "platform": "darwin-aarch64",
-    "sources": sources,
-    "build_profile": "release",
-    "peer_protocol_version": int(os.environ["TEST_PROTOCOL"]),
-    "signed": True,
-    "source_generation": os.environ["TEST_SOURCE_GENERATION"],
-    "source_artifact_sha256": "c" * 64,
-    "signing": signing,
-    "files": files,
-}, sort_keys=True) + "\n")
-PY
+  TEST_BUNDLE="$bundle" TEST_GENERATION="$generation" TEST_SOURCE_GENERATION="$source_generation" TEST_PROTOCOL="$protocol" python3 "$repo_root/scripts/fleet_install_test_support.py" darwin-release
   local artifact="fleet-signed-darwin-aarch64.tar.gz"
   COPYFILE_DISABLE=1 tar -C "$(dirname "$bundle")" -czf "$directory/$artifact" "$(basename "$bundle")"
   local digest size
   digest="$(file_sha256 "$directory/$artifact")"
-  size="$(python3 - "$directory/$artifact" <<'PY'
-import os
-import sys
-
-print(os.path.getsize(sys.argv[1]))
-PY
-)"
+  size="$(python3 "$repo_root/ci/fleet-candidates/generation_validation.py" size -- "$directory/$artifact")"
   TEST_GENERATION="$generation" TEST_SOURCE_GENERATION="$source_generation" TEST_ARTIFACT="$artifact" \
-    TEST_DIGEST="$digest" TEST_SIZE="$size" TEST_DIRECTORY="$directory" python3 - <<'PY'
-import json
-import os
-from pathlib import Path
-
-path = Path(os.environ["TEST_DIRECTORY"]) / "generation.json"
-manifest = json.loads(path.read_text())
-signing = {
-    "identity": "Apple Development: Robert Wittams (DYYMCPD885)",
-    "team_id": "973L4GV58R",
-    "certificate_sha256": "d" * 64,
-    "entitlements_sha256": "e" * 64,
-    "options": ["runtime", "timestamp=none"],
-}
-manifest["source_generation"] = os.environ["TEST_SOURCE_GENERATION"]
-manifest["central_signing"] = {
-    "derivative_package": "lab-signing/flotilla-fleet-darwin-signed",
-    "derivative_version": os.environ["TEST_SOURCE_GENERATION"],
-    "attestation": "darwin-signing-attestation.json",
-    "attestation_sha256": "f" * 64,
-    "cms": "darwin-signing-attestation.cms",
-    "cms_sha256": "1" * 64,
-    "certificate": "darwin-signing-certificate.pem",
-    "certificate_sha256": signing["certificate_sha256"],
-    "signing": signing,
-}
-manifest["platforms"]["darwin-aarch64"] = {
-    "artifact": os.environ["TEST_ARTIFACT"],
-    "sha256": os.environ["TEST_DIGEST"],
-    "size_bytes": int(os.environ["TEST_SIZE"]),
-    "signed": True,
-    "state": "installable-internal",
-    "source_artifact": "fleet-candidate-darwin-aarch64.tar.gz",
-    "source_artifact_sha256": "c" * 64,
-    "signing": signing,
-}
-path.write_text(json.dumps(manifest, sort_keys=True) + "\n")
-PY
+    TEST_DIGEST="$digest" TEST_SIZE="$size" TEST_DIRECTORY="$directory" python3 "$repo_root/scripts/fleet_install_test_support.py" darwin-generation
 }
 
 make_generation "$generation_one" 20
@@ -985,35 +823,7 @@ test "$(grep -c -- '--verify' "$test_root/codesign.log")" = 8 \
 test "$(grep -c -- '--entitlements' "$test_root/codesign.log")" = 8 \
   || fail 'Darwin upgrade did not verify every Mach-O entitlement set before and after handoff'
 launch_agent="$darwin_home/Library/LaunchAgents/work.flotilla.flotillad.plist"
-python3 - "$launch_agent" "$darwin_home" <<'PY' || fail 'Darwin launchd agent content is incorrect'
-import plistlib
-import sys
-
-with open(sys.argv[1], "rb") as source:
-    agent = plistlib.load(source)
-home = sys.argv[2]
-assert agent["Label"] == "work.flotilla.flotillad"
-assert agent["ProgramArguments"] == [
-    f"{home}/.local/opt/flotilla-fleet/tcc/bin/flotillad",
-    "--timeout",
-    "0",
-    "--config-dir",
-    f"{home}/.config/flotilla",
-    "--state-dir",
-    f"{home}/.local/state/flotilla",
-    "--socket",
-    f"{home}/.config/flotilla/run/flotilla.sock",
-]
-assert agent["EnvironmentVariables"]["PATH"].split(":")[0] == f"{home}/.local/bin"
-assert agent["EnvironmentVariables"]["FLOTILLA_SKILLS_DIR"] == f"{home}/.local/opt/flotilla-fleet/current/share/flotilla/skills"
-assert agent["EnvironmentVariables"]["FLOTILLA_CODEX_HOME_TEMPLATE"] == f"{home}/.local/opt/flotilla-fleet/current/share/flotilla/codex-home"
-assert "/usr/sbin" in agent["EnvironmentVariables"]["PATH"].split(":")
-assert "/sbin" in agent["EnvironmentVariables"]["PATH"].split(":")
-assert agent["StandardErrorPath"] == f"{home}/Library/Logs/flotilla/flotillad.stderr.log"
-assert agent["StandardOutPath"] == f"{home}/Library/Logs/flotilla/flotillad.stdout.log"
-assert agent["RunAtLoad"] is True
-assert agent["KeepAlive"] is True
-PY
+python3 "$repo_root/scripts/fleet_install_test_support.py" assert-launchd "$launch_agent" "$darwin_home" || fail 'Darwin launchd agent content is incorrect'
 test -d "$darwin_home/Library/Logs/flotilla" \
   || fail 'Darwin install did not create the launchd log directory'
 grep -Eq "^bootout gui/[0-9]+/work\\.flotilla\\.flotillad\\|releases/$generation_one$" "$test_root/launchctl.log" \
@@ -1067,15 +877,7 @@ test ! -e "$darwin_fail_home/.local/opt/flotilla-fleet/releases/$generation_two"
   || fail 'Darwin signature failure published a release'
 
 cp "$fixture_root/$generation_two/generation.json" "$test_root/generation-two-good.json"
-python3 - "$fixture_root/$generation_two/generation.json" <<'PY'
-import json
-import sys
-
-path = sys.argv[1]
-manifest = json.load(open(path))
-manifest["central_signing"]["signing"]["team_id"] = "ATTACKERTEAM"
-open(path, "w").write(json.dumps(manifest) + "\n")
-PY
+python3 "$repo_root/scripts/fleet_install_test_support.py" corrupt-outer-source "$fixture_root/$generation_two/generation.json"
 darwin_team_home="$test_root/darwin-team-home"
 mkdir -p "$darwin_team_home/.config/flotilla"
 cp "$test_root/home/.config/flotilla/fleet-reader-token" "$darwin_team_home/.config/flotilla/fleet-reader-token"
@@ -1088,14 +890,7 @@ mv "$test_root/generation-two-good.json" "$fixture_root/$generation_two/generati
 
 bad_digest="20260815T230000Z-r3-f333333333333-ccccccccccccc"
 make_generation "$bad_digest" 21
-python3 - "$fixture_root/$bad_digest/generation.json" <<'PY'
-import json
-import sys
-path = sys.argv[1]
-manifest = json.load(open(path))
-manifest["platforms"]["linux-x86_64-gnu2.36"]["sha256"] = "0" * 64
-open(path, "w").write(json.dumps(manifest) + "\n")
-PY
+python3 "$repo_root/scripts/fleet_install_test_support.py" corrupt-outer-digest "$fixture_root/$bad_digest/generation.json"
 if run_installer "$bad_digest" >"$test_root/digest.out" 2>&1; then
   fail 'outer digest mismatch was accepted'
 fi
@@ -1156,28 +951,6 @@ grep -Fq -- '--keep-others 0' "$prune_log" || fail 'prune lost retention argumen
 grep -Fq -- '--keep-others 9 --dry-run' "$prune_log" || fail 'dry-run lost arguments'
 grep -Fq '/current/bin/flotilla|' "$prune_log" || fail 'prune did not use active binary'
 
-# Exercise the production copy boundary with a nested library and stale payload.
-python3 - "$installer" <<'PYTHON'
-from pathlib import Path
-import sys
-import tempfile
-script = Path(sys.argv[1]).read_text()
-marker = "python3 - \"$CURRENT_LINK\" \"$DARWIN_TCC_ROOT\" <<'PYTHON'\n"
-body = script.split(marker, 1)[1].split('\nPYTHON', 1)[0]
-with tempfile.TemporaryDirectory() as root:
-    source, destination = Path(root) / "source", Path(root) / "destination"
-    (source / "bin").mkdir(parents=True)
-    for name in ("flotilla", "flotillad", "cleat"):
-        (source / "bin" / name).write_text(name)
-    (source / "lib" / "nested").mkdir(parents=True)
-    (source / "lib" / "nested" / "data").write_text("nested")
-    (destination / "lib").mkdir(parents=True)
-    (destination / "lib" / "obsolete").write_text("stale")
-    sys.argv = ["refresh", str(source), str(destination)]
-    exec(compile(body, "fleet-install copy boundary", "exec"))
-    assert (destination / "lib" / "nested" / "data").read_text() == "nested"
-    assert not (destination / "lib" / "obsolete").exists()
-PYTHON
-
+# The module unit tests cover Darwin copy policy through its public function.
 "$repo_root/scripts/test-fleet-canary.sh"
 echo 'fleet-install contract passed'

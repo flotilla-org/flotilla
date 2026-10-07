@@ -7,7 +7,9 @@ import json
 import os
 import plistlib
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -641,6 +643,104 @@ def protocol_version(path):
         pass
 
 
+# Bootstrap/recovery glue intentionally stays outside the generation CLI:
+# first install has no selected CLI, rollback targets can predate new commands,
+# and recovery must not require the candidate's health gate to have passed.
+# Keep these commands in the existing synced validator file so neither local
+# bootstrap nor the SSH canary needs another payload/deployment boundary.
+def release_install_lock(path, owner):
+    """Release only the bootstrap lock owned by this invocation (or stale owner)."""
+    try:
+        if os.path.islink(path) and os.readlink(path) == owner:
+            os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def bootstrap_nonce():
+    print(secrets.token_hex(8))
+
+
+def file_mode(path):
+    print(format(stat.S_IMODE(os.stat(path).st_mode), "o"))
+
+
+def real_path(path):
+    print(os.path.realpath(path))
+
+
+def replace_link(source, destination):
+    """Atomically replace the selection link without following its directory target."""
+    os.replace(source, destination)
+
+
+def systemd_path(path, home):
+    if "\n" in path or "\r" in path:
+        raise ValidationError("systemd path contains a line break")
+    if path == home:
+        print("%h")
+    elif path.startswith(home + os.sep):
+        relative = path[len(home) + 1 :].replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+        print(f"%h/{relative}")
+    else:
+        print(path.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%"))
+
+
+def write_launchd_agent(destination, label, daemon, path, skills, codex_home, config_dir, state_dir, socket, stderr_path, stdout_path):
+    content = {
+        "Label": label,
+        "ProgramArguments": [
+            daemon,
+            "--timeout",
+            "0",
+            "--config-dir",
+            config_dir,
+            "--state-dir",
+            state_dir,
+            "--socket",
+            socket,
+        ],
+        "EnvironmentVariables": {"PATH": path, "FLOTILLA_SKILLS_DIR": skills, "FLOTILLA_CODEX_HOME_TEMPLATE": codex_home},
+        "StandardErrorPath": stderr_path,
+        "StandardOutPath": stdout_path,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+    }
+    with open(destination, "wb") as output:
+        plistlib.dump(content, output, sort_keys=False)
+
+
+def refresh_darwin_payload(source, destination):
+    source, destination = Path(source), Path(destination)
+    files = [Path("bin") / name for name in ("flotilla", "flotillad", "cleat")]
+    files += [path.relative_to(source) for path in (source / "lib").rglob("*") if path.is_file()]
+    expected = set(files)
+    for stale in (destination / "lib").rglob("*"):
+        if (stale.is_file() or stale.is_symlink()) and stale.relative_to(destination) not in expected:
+            stale.unlink()
+    for relative in files:
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".fleet-install-", dir=target.parent)
+        os.close(fd)
+        try:
+            shutil.copy2(source / relative, temporary)
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def disarm_confirmation(path, token):
+    try:
+        with open(path) as source:
+            armed = any(line.rstrip("\n") == f"token={token}" for line in source)
+        if armed:
+            os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -692,9 +792,58 @@ def main():
     helper.add_argument("relative")
     helper = sub.add_parser("protocol")
     helper.add_argument("path")
+    helper = sub.add_parser("release-lock")
+    helper.add_argument("path")
+    helper.add_argument("owner")
+    sub.add_parser("nonce")
+    for command in ("mode", "realpath"):
+        helper = sub.add_parser(command)
+        helper.add_argument("path")
+    helper = sub.add_parser("replace-link")
+    helper.add_argument("source")
+    helper.add_argument("destination")
+    helper = sub.add_parser("systemd-path")
+    helper.add_argument("path")
+    helper.add_argument("home")
+    helper = sub.add_parser("launchd-agent")
+    helper.add_argument("destination")
+    helper.add_argument("label")
+    helper.add_argument("daemon")
+    helper.add_argument("path")
+    helper.add_argument("skills")
+    helper.add_argument("codex_home")
+    helper.add_argument("config_dir")
+    helper.add_argument("state_dir")
+    helper.add_argument("socket")
+    helper.add_argument("stderr_path")
+    helper.add_argument("stdout_path")
+    helper = sub.add_parser("darwin-payload")
+    helper.add_argument("source")
+    helper.add_argument("destination")
+    helper = sub.add_parser("disarm-confirmation")
+    helper.add_argument("path")
+    helper.add_argument("token")
     args = parser.parse_args()
     try:
-        if args.command == "fixture":
+        if args.command == "release-lock":
+            release_install_lock(args.path, args.owner)
+        elif args.command == "nonce":
+            bootstrap_nonce()
+        elif args.command == "mode":
+            file_mode(args.path)
+        elif args.command == "realpath":
+            real_path(args.path)
+        elif args.command == "replace-link":
+            replace_link(args.source, args.destination)
+        elif args.command == "systemd-path":
+            systemd_path(args.path, args.home)
+        elif args.command == "launchd-agent":
+            write_launchd_agent(args.destination, args.label, args.daemon, args.path, args.skills, args.codex_home, args.config_dir, args.state_dir, args.socket, args.stderr_path, args.stdout_path)
+        elif args.command == "darwin-payload":
+            refresh_darwin_payload(args.source, args.destination)
+        elif args.command == "disarm-confirmation":
+            disarm_confirmation(args.path, args.token)
+        elif args.command == "fixture":
             validate_fixture(args.path)
         elif args.command == "skill-sources":
             validate_skill_source_paths(json.loads(Path(args.manifest).read_text()), args.catalog_output)

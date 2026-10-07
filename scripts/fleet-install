@@ -69,17 +69,7 @@ cleanup() {
   fi
   [[ -z "$WORK_DIR" ]] || rm -rf -- "$WORK_DIR"
   if ((INSTALL_LOCK_HELD)); then
-    python3 - "$INSTALL_LOCK_PATH" "$INSTALL_LOCK_OWNER" <<'PY'
-import os
-import sys
-
-path, owner = sys.argv[1:]
-try:
-    if os.path.islink(path) and os.readlink(path) == owner:
-        os.unlink(path)
-except FileNotFoundError:
-    pass
-PY
+    python3 "$GENERATION_VALIDATOR" release-lock -- "$INSTALL_LOCK_PATH" "$INSTALL_LOCK_OWNER"
   fi
   [[ -z "$CONFIRMATION_DONE" ]] || touch -- "$CONFIRMATION_DONE"
   exit "$status"
@@ -114,14 +104,10 @@ make_work_dir() {
 }
 
 acquire_install_lock() {
+  require_generation_validator
   mkdir -p "$FLEET_ROOT"
   INSTALL_LOCK_PATH="$FLEET_ROOT/.install.lock"
-  INSTALL_LOCK_OWNER="$$-$(python3 - <<'PY'
-import secrets
-
-print(secrets.token_hex(8))
-PY
-)"
+  INSTALL_LOCK_OWNER="$$-$(python3 "$GENERATION_VALIDATOR" nonce)"
   if ! ln -s "$INSTALL_LOCK_OWNER" "$INSTALL_LOCK_PATH" 2>/dev/null; then
     local owner pid
     owner="$(readlink "$INSTALL_LOCK_PATH" 2>/dev/null)" \
@@ -132,17 +118,7 @@ PY
     if kill -0 "$pid" 2>/dev/null; then
       die "another fleet-install mutation is already running (pid $pid)"
     fi
-    python3 - "$INSTALL_LOCK_PATH" "$owner" <<'PY'
-import os
-import sys
-
-path, stale_owner = sys.argv[1:]
-try:
-    if os.path.islink(path) and os.readlink(path) == stale_owner:
-        os.unlink(path)
-except FileNotFoundError:
-    pass
-PY
+    python3 "$GENERATION_VALIDATOR" release-lock -- "$INSTALL_LOCK_PATH" "$owner"
     ln -s "$INSTALL_LOCK_OWNER" "$INSTALL_LOCK_PATH" 2>/dev/null \
       || die "another fleet-install mutation acquired the lock while reclaiming a stale owner"
   fi
@@ -153,14 +129,7 @@ prepare_auth() {
   [[ -n "$AUTH_HEADER_FILE" ]] && return
   [[ -f "$FLEET_TOKEN_FILE" && ! -L "$FLEET_TOKEN_FILE" ]] || die "package token is missing: $FLEET_TOKEN_FILE"
   local mode
-  mode="$(python3 - "$FLEET_TOKEN_FILE" <<'PY'
-import os
-import stat
-import sys
-
-print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))
-PY
-)"
+  mode="$(python3 "$GENERATION_VALIDATOR" mode -- "$FLEET_TOKEN_FILE")"
   [[ "$mode" == 600 ]] || die "package token must have mode 0600: $FLEET_TOKEN_FILE (has $mode)"
   make_work_dir
   AUTH_HEADER_FILE="$WORK_DIR/authorization.header"
@@ -407,20 +376,8 @@ ensure_launchers_and_path() {
     resolved="$( (unset PATH; "$login_shell" -l -c "command -v $name") 2>/dev/null || true)"
     [[ -n "$resolved" ]] \
       || die "$name is not reachable through the login shell; add $FLEET_BIN_DIR to PATH in $init_file before installing"
-    expected="$(python3 - "$FLEET_BIN_DIR/$name" <<'PY'
-import os
-import sys
-
-print(os.path.realpath(sys.argv[1]))
-PY
-)"
-    resolved="$(python3 - "$resolved" <<'PY'
-import os
-import sys
-
-print(os.path.realpath(sys.argv[1]))
-PY
-)"
+    expected="$(python3 "$GENERATION_VALIDATOR" realpath -- "$FLEET_BIN_DIR/$name")"
+    resolved="$(python3 "$GENERATION_VALIDATOR" realpath -- "$resolved")"
     [[ "$resolved" == "$expected" ]] \
       || die "the login shell PATH shadows the fleet launcher for $name: $resolved; put $FLEET_BIN_DIR first in $init_file"
   done
@@ -464,21 +421,7 @@ UNIT
 }
 
 systemd_path() {
-  python3 - "$1" "$HOME" <<'PY'
-import os
-import sys
-
-path, home = sys.argv[1:]
-if "\n" in path or "\r" in path:
-    raise SystemExit("systemd path contains a line break")
-if path == home:
-    print("%h")
-elif path.startswith(home + os.sep):
-    relative = path[len(home) + 1 :].replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
-    print(f"%h/{relative}")
-else:
-    print(path.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%"))
-PY
+  python3 "$GENERATION_VALIDATOR" systemd-path -- "$1" "$HOME"
 }
 
 prepare_linux_daemon_service() {
@@ -527,34 +470,8 @@ write_launchd_agent() {
   stdout_path="$LAUNCH_LOG_DIR/flotillad.stdout.log"
   mkdir -p "$LAUNCH_AGENT_DIR" "$LAUNCH_LOG_DIR"
   temporary="$(mktemp "$LAUNCH_AGENT_DIR/.$LAUNCH_AGENT_LABEL.plist.fleet-install.XXXXXX")"
-  python3 - "$temporary" "$LAUNCH_AGENT_LABEL" "$daemon_path" "$daemon_path_value" "$skills_path" "$codex_home_path" \
-    "$DAEMON_CONFIG_DIR" "$DAEMON_STATE_DIR" "$DAEMON_SOCKET" "$stderr_path" "$stdout_path" <<'PY'
-import plistlib
-import sys
-
-destination, label, daemon, path, skills, codex_home, config_dir, state_dir, socket, stderr_path, stdout_path = sys.argv[1:]
-content = {
-    "Label": label,
-    "ProgramArguments": [
-        daemon,
-        "--timeout",
-        "0",
-        "--config-dir",
-        config_dir,
-        "--state-dir",
-        state_dir,
-        "--socket",
-        socket,
-    ],
-    "EnvironmentVariables": {"PATH": path, "FLOTILLA_SKILLS_DIR": skills, "FLOTILLA_CODEX_HOME_TEMPLATE": codex_home},
-    "StandardErrorPath": stderr_path,
-    "StandardOutPath": stdout_path,
-    "RunAtLoad": True,
-    "KeepAlive": True,
-}
-with open(destination, "wb") as output:
-    plistlib.dump(content, output, sort_keys=False)
-PY
+  python3 "$GENERATION_VALIDATOR" launchd-agent -- "$temporary" "$LAUNCH_AGENT_LABEL" "$daemon_path" "$daemon_path_value" "$skills_path" "$codex_home_path" \
+    "$DAEMON_CONFIG_DIR" "$DAEMON_STATE_DIR" "$DAEMON_SOCKET" "$stderr_path" "$stdout_path"
   chmod 0644 "$temporary"
   mv -f "$temporary" "$plist"
 }
@@ -586,32 +503,7 @@ prepare_darwin_daemon_service() {
 refresh_darwin_tcc_payload() {
   [[ "$PLATFORM" == darwin-* ]] || return 0
   [[ -n "$(current_generation)" ]] || return 0
-  python3 - "$CURRENT_LINK" "$DARWIN_TCC_ROOT" <<'PYTHON'
-import os
-from pathlib import Path
-import shutil
-import sys
-import tempfile
-
-source, destination = map(Path, sys.argv[1:])
-files = [Path("bin") / name for name in ("flotilla", "flotillad", "cleat")]
-files += [path.relative_to(source) for path in (source / "lib").rglob("*") if path.is_file()]
-expected = set(files)
-for stale in (destination / "lib").rglob("*"):
-    if (stale.is_file() or stale.is_symlink()) and stale.relative_to(destination) not in expected:
-        stale.unlink()
-for relative in files:
-    target = destination / relative
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".fleet-install-", dir=target.parent)
-    os.close(fd)
-    try:
-        shutil.copy2(source / relative, temporary)
-        os.replace(temporary, target)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-PYTHON
+  python3 "$GENERATION_VALIDATOR" darwin-payload -- "$CURRENT_LINK" "$DARWIN_TCC_ROOT"
 }
 
 restart_darwin_daemon_service() {
@@ -676,19 +568,7 @@ confirmation_is_armed() {
 
 disarm_health_confirmation() {
   local token="$1"
-  python3 - "$PENDING_CONFIRMATION" "$token" <<'PY'
-import os
-import sys
-
-path, token = sys.argv[1:]
-try:
-    with open(path) as source:
-        armed = any(line.rstrip("\n") == f"token={token}" for line in source)
-    if armed:
-        os.unlink(path)
-except FileNotFoundError:
-    pass
-PY
+  python3 "$GENERATION_VALIDATOR" disarm-confirmation -- "$PENDING_CONFIRMATION" "$token"
 }
 
 automatic_rollback() {
@@ -814,12 +694,7 @@ atomic_link() {
   local temporary
   temporary="$FLEET_ROOT/.$(basename "$link").new.$$"
   ln -s "$target" "$temporary"
-  python3 - "$temporary" "$link" <<'PY'
-import os
-import sys
-
-os.replace(sys.argv[1], sys.argv[2])
-PY
+  python3 "$GENERATION_VALIDATOR" replace-link -- "$temporary" "$link"
 }
 
 switch_to() {
@@ -977,12 +852,7 @@ install_generation() {
     fi
   fi
   [[ "$rollback_generation" != "$generation" ]] || rollback_generation=""
-  confirmation_token="$$-$(python3 - <<'PY'
-import secrets
-
-print(secrets.token_hex(8))
-PY
-)"
+  confirmation_token="$$-$(python3 "$GENERATION_VALIDATOR" nonce)"
   printf 'fleet-install: %s -> %s\n' "${old:-<none>}" "$generation"
   if [[ -d "$RELEASES_DIR/$generation" ]]; then
     make_work_dir
