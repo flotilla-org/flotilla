@@ -115,7 +115,9 @@ impl HostSessionArchive {
         log_path: Option<&str>,
         delivered_brief: Option<&str>,
     ) -> Result<Option<String>, String> {
-        // Hook dispatch and metadata observation may use different adapter instances.
+        // One daemon owns each host. Hook dispatch and metadata observation may
+        // use different adapter instances within that process; this is not an
+        // interprocess lock for multiple daemons sharing a managed home.
         static REGISTRATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _guard = REGISTRATION.lock().await;
         let TerminalSessionSource::Agent { context, brief, .. } = &spec.source else { return Ok(None) };
