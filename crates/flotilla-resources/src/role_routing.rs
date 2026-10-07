@@ -123,6 +123,8 @@ pub async fn topic_contacts(
                 {
                     continue;
                 }
+                // Shape inherits, presence stays local: an inherited owner
+                // principal must not invent a recipient in every child Project.
                 if definition.principal.is_some()
                     && object.spec.role_definitions.get(role).and_then(|role| role.principal.as_ref()).is_none()
                 {
