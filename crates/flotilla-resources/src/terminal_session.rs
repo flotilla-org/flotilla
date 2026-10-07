@@ -317,7 +317,7 @@ pub struct TerminalSessionStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_message_id: Option<String>,
     /// Payload-free upgrade receipts let replicated old authority queues retire
-    /// without retyping acknowledged input. Remove one fleet roll after Message adoption.
+    /// without retyping acknowledged input. Remove one fleet roll after Message adoption (#2849).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub legacy_message_receipts: BTreeMap<String, crate::LegacyMessageReceipt>,
     /// A fresh observation of what the terminal's harness appears to be doing.

@@ -1175,7 +1175,7 @@ async fn patch_status_typed<T: Resource>(
     for _ in 0..3 {
         let current = resolver.get(name).await?;
         if expected_resource_version.is_some_and(|expected| expected != current.metadata.resource_version) {
-            return Err(ResourceError::conflict(name, "status changed since the caller's observation"));
+            return Err(ResourceError::conflict(name, "guarded status patch refused: status changed since the caller's observation"));
         }
         match resolver.update_status(name, &current.metadata.resource_version, &status).await {
             Ok(object) => {
@@ -1187,6 +1187,12 @@ async fn patch_status_typed<T: Resource>(
                 });
             }
             Err(ResourceError::Conflict { .. }) if expected_resource_version.is_none() => continue,
+            Err(error @ ResourceError::Conflict { .. }) => {
+                return Err(ResourceError::conflict(
+                    name,
+                    format!("guarded status patch refused: status changed during the update; {error}"),
+                ));
+            }
             Err(error) => return Err(error),
         }
     }
