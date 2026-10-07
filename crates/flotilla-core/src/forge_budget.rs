@@ -16,7 +16,29 @@ use crate::providers::{
 };
 
 #[derive(Clone, Default)]
-pub struct ForgeBudgets(Arc<Mutex<BTreeMap<String, ForgeBudgetRow>>>, Arc<Mutex<BTreeMap<String, tokio::time::Instant>>>);
+pub struct ForgeBudgets {
+    state: Arc<Mutex<BudgetState>>,
+}
+#[derive(Default)]
+struct BudgetState {
+    rows: BTreeMap<String, ForgeBudgetRow>,
+    deadlines: BTreeMap<String, tokio::time::Instant>,
+}
+impl BudgetState {
+    fn expire_cooldowns(&mut self) {
+        let now = Utc::now();
+        let monotonic_now = tokio::time::Instant::now();
+        self.deadlines.retain(|key, deadline| {
+            let active = *deadline > monotonic_now && self.rows.get(key).and_then(|row| row.retry_at).is_some_and(|at| at > now);
+            if !active {
+                if let Some(row) = self.rows.get_mut(key) {
+                    row.retry_at = None;
+                }
+            }
+            active
+        });
+    }
+}
 impl ForgeBudgets {
     fn key(cmd: &str, args: &[&str]) -> Option<(&'static str, &'static str)> {
         if cmd != "gh" {
@@ -30,27 +52,19 @@ impl ForgeBudgets {
     }
     fn before(&self, cmd: &str, args: &[&str]) -> Result<(), String> {
         let Some((identity, budget)) = Self::key(cmd, args) else { return Ok(()) };
-        let rows = self.0.lock().expect("forge budget lock poisoned");
-        if let Some(row) = rows.get(&format!("{identity}/{budget}")) {
-            if let Some(reset) = row.retry_at.filter(|at| {
-                *at > Utc::now()
-                    && self
-                        .1
-                        .lock()
-                        .expect("forge cooldown lock poisoned")
-                        .get(&format!("{identity}/{budget}"))
-                        .is_none_or(|deadline| *deadline > tokio::time::Instant::now())
-            }) {
-                return Err(format!("github rate limited (budget={budget}, identity={identity}, reset_at={})", reset.to_rfc3339()));
-            }
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.expire_cooldowns();
+        if let Some(reset) = state.rows.get(&format!("{identity}/{budget}")).and_then(|row| row.retry_at) {
+            return Err(format!("github rate limited (budget={budget}, identity={identity}, reset_at={})", reset.to_rfc3339()));
         }
         Ok(())
     }
     fn after(&self, cmd: &str, args: &[&str], raw: &str) {
         let Some((identity, budget)) = Self::key(cmd, args) else { return };
         let now = Utc::now();
-        let mut rows = self.0.lock().expect("forge budget lock poisoned");
-        let row = rows.entry(format!("{identity}/{budget}")).or_insert_with(|| ForgeBudgetRow {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.expire_cooldowns();
+        let row = state.rows.entry(format!("{identity}/{budget}")).or_insert_with(|| ForgeBudgetRow {
             host: String::new(),
             identity: identity.into(),
             budget: budget.into(),
@@ -71,6 +85,8 @@ impl ForgeBudgets {
         let response = parse_gh_api_response(raw);
         let document: serde_json::Value = serde_json::from_str(if response.status == 0 { raw } else { &response.body }).unwrap_or_default();
         let cost = if budget == "REST" {
+            // Conservative attempt accounting: a non-HTTP failure (including
+            // spawn/transport errors) may have reached GitHub, so count one.
             Some(if response.status == 304 { 0 } else { 1 })
         } else {
             document["data"]["rateLimit"]["cost"].as_u64()
@@ -88,17 +104,15 @@ impl ForgeBudgets {
             row.retry_at = limit.retry_at.or(Some(now + chrono::Duration::minutes(1)));
             if let Some(reset) = row.retry_at {
                 let delay = reset.signed_duration_since(now).to_std().unwrap_or_default();
-                self.1
-                    .lock()
-                    .expect("forge cooldown lock poisoned")
-                    .insert(format!("{identity}/{budget}"), tokio::time::Instant::now() + delay);
+                state.deadlines.insert(format!("{identity}/{budget}"), tokio::time::Instant::now() + delay);
             }
         }
     }
     pub fn rows(&self, host: &str) -> Vec<ForgeBudgetRow> {
-        self.0
-            .lock()
-            .expect("forge budget lock poisoned")
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.expire_cooldowns();
+        state
+            .rows
             .values()
             .cloned()
             .map(|mut row| {
@@ -209,7 +223,7 @@ mod tests {
         let rows = budgets.rows("host");
         assert_eq!(rows[0].calls, 1);
         assert_eq!(rows[0].retry_at.unwrap().timestamp(), reset.timestamp());
-        budgets.0.lock().unwrap().values_mut().next().unwrap().retry_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        budgets.state.lock().unwrap().rows.values_mut().next().unwrap().retry_at = Some(Utc::now() - chrono::Duration::seconds(1));
         assert!(budgets.before("gh", &["api", "graphql"]).is_ok());
     }
     // Reported GraphQL points and calls without reported cost are distinct.
@@ -232,11 +246,54 @@ mod tests {
         assert_eq!(rows[0].host, "host");
         budgets.after("gh", &["api", "repos/org/repo"], "HTTP/2 304 Not Modified\r\n\r\n");
         assert_eq!(budgets.rows("host")[1].reported_cost, 0);
-        for row in budgets.0.lock().unwrap().values_mut() {
+        for row in budgets.state.lock().unwrap().rows.values_mut() {
             row.window_start -= chrono::Duration::hours(1);
         }
         budgets.after("gh", &["api", "graphql"], &raw);
         assert_eq!(budgets.rows("host")[0].calls, 1);
         assert_eq!(budgets.rows("host")[0].reported_cost, cost);
+    }
+    // REST diagnostics conservatively count attempts, including HTTP failures
+    // and failures whose transport result cannot prove that no request arrived.
+    #[hegel::test]
+    fn rest_failure_attempt_accounting(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let status = tc.draw(gs::integers::<u16>().min_value(400).max_value(599));
+        let budgets = ForgeBudgets::default();
+        budgets.after("gh", &["api", "repos/org/repo"], &format!("HTTP/2 {status} Error\r\n\r\n{{}}"));
+        budgets.after("gh", &["api", "repos/org/repo"], "failed to spawn gh");
+        budgets.after("gh", &["api", "repos/org/repo"], "connection reset by peer");
+        let row = &budgets.rows("host")[0];
+        assert_eq!(row.calls, 3);
+        assert_eq!(row.reported_cost, 3);
+        assert_eq!(row.unreported_calls, 0);
+    }
+
+    // Expired reset deadlines disappear from fleet health even without another
+    // command or hourly reset; a recovered poisoned diagnostic lock stays usable.
+    #[test]
+    fn expired_cooldown_is_removed_from_health() {
+        let budgets = ForgeBudgets::default();
+        budgets.after(
+            "gh",
+            &["api", "graphql"],
+            "HTTP/2 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\n\r\n{\"message\":\"API rate limit exceeded\"}",
+        );
+        {
+            let mut state = budgets.state.lock().unwrap();
+            let key = state.rows.keys().next().unwrap().clone();
+            state.deadlines.insert(key, tokio::time::Instant::now() - Duration::from_secs(1));
+        }
+        assert!(budgets.rows("host")[0].retry_at.is_none());
+        assert!(budgets.before("gh", &["api", "graphql"]).is_ok());
+        let state = budgets.state.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = state.lock().unwrap();
+            panic!("diagnostic writer interrupted");
+        })
+        .join();
+        assert_eq!(budgets.rows("host")[0].calls, 1);
+        budgets.after("gh", &["api", "graphql"], "{}");
+        assert_eq!(budgets.rows("host")[0].calls, 2);
     }
 }

@@ -2,7 +2,7 @@
 use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use flotilla_protocol::{
     issue_query::{IssueQuery, IssueResultPage},
     Issue, IssueChangeset, IssueRef, IssueSource, NodeId,
@@ -20,6 +20,26 @@ use crate::providers::{
     issue_tracker::IssueProvider,
     types::ChangeRequest,
 };
+
+const HEARTBEAT_MAX_AGE: Duration = Duration::seconds(180);
+const UNKNOWN_OWNER_GRACE: Duration = Duration::seconds(180);
+const READ_FRESHNESS: Duration = Duration::seconds(60);
+const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const DEMAND_MAX_AGE: Duration = Duration::seconds(180);
+const DEMAND_RETENTION: Duration = Duration::seconds(3600);
+const STATUS_WRITE_ATTEMPTS: usize = 8;
+
+fn latest_status(statuses: impl IntoIterator<Item = ForgeReadStatus>) -> Option<ForgeReadStatus> {
+    statuses.into_iter().max_by_key(|status| (status.attempted_at, status.authority.clone()))
+}
+
+fn unknown_health(declared_at: DateTime<Utc>, now: DateTime<Utc>) -> ObserverHealth {
+    if now.signed_duration_since(declared_at) < UNKNOWN_OWNER_GRACE {
+        ObserverHealth::Unknown
+    } else {
+        ObserverHealth::Unready
+    }
+}
 
 fn canonical_source(source: &IssueSource) -> IssueSource {
     let mut source = normalize_issue_source(source);
@@ -54,7 +74,7 @@ enum ObserverHealth {
 
 /// Shared sources elect once, regardless of how many Projects bind them.
 /// Unknown host health preserves the preferred owner during startup; only
-/// positive unready/stale evidence permits fallback to a known ready daemon.
+/// unready/stale evidence or expiry of the startup grace permits fallback.
 pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &IssueSource) -> Result<Option<NodeId>, String> {
     let mut source = canonical_source(source);
     for forge in backend.definitions::<flotilla_resources::Forge>(namespace).list().await.map_err(|e| e.to_string())? {
@@ -64,18 +84,27 @@ pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &I
         }
     }
     let source = normalize_issue_source(&source);
+    let now = Utc::now();
+    // Recover every declaration home in one store listing, rather than listing
+    // every Project's replica sources again for each binding and repository.
+    let mut project_homes = BTreeMap::new();
+    for record in backend.including_replicas::<Project>(namespace).list_replica_sources().await.map_err(|e| e.to_string())?.items {
+        let candidate = (record.object.metadata.creation_timestamp, origin(backend, &record.provenance)?);
+        let entry = project_homes.entry(record.object.metadata.name).or_insert_with(|| candidate.clone());
+        *entry = candidate.min(entry.clone());
+    }
     let mut homes = Vec::new();
     let repositories = backend.including_replicas::<Repository>(namespace);
     for project in backend.definitions::<Project>(namespace).list().await.map_err(|e| e.to_string())? {
         if project.spec.issue_source_bindings.iter().any(|binding| !binding.exclude && canonical_source(&binding.source) == source) {
-            if let Some(home) = project_home(backend, namespace, &project.metadata.name).await? {
-                homes.push((project.metadata.creation_timestamp, home));
+            if let Some(home) = project_homes.get(&project.metadata.name) {
+                homes.push(home.clone());
             }
         }
         if let IssueSourceResolution::Available { bindings } = resolve_project_issue_sources(&repositories, &project.spec).await {
             if bindings.iter().any(|binding| canonical_source(&binding.source) == source) {
-                if let Some(home) = project_home(backend, namespace, &project.metadata.name).await? {
-                    homes.push((project.metadata.creation_timestamp, home));
+                if let Some(home) = project_homes.get(&project.metadata.name) {
+                    homes.push(home.clone());
                 }
             }
         }
@@ -86,14 +115,14 @@ pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &I
                 if repository.object.spec.forge().is_some_and(|forge| {
                     normalize_issue_source(&IssueSource { service: forge.service_url.clone(), scope: forge.repository.clone() }) == source
                 }) {
-                    if let Some(home) = project_home(backend, namespace, &project.metadata.name).await? {
-                        homes.push((project.metadata.creation_timestamp, home));
+                    if let Some(home) = project_homes.get(&project.metadata.name) {
+                        homes.push(home.clone());
                     }
                 }
             }
         }
     }
-    let preferred = homes.into_iter().min().map(|(_, root)| root);
+    let preferred = homes.into_iter().min();
     let mut ready = BTreeMap::new();
     for host in backend.including_replicas::<Host>(namespace).list_replica_sources().await.map_err(|e| e.to_string())?.items {
         if !matches!(host.object.spec.connection, flotilla_resources::HostConnection::Daemon) {
@@ -102,12 +131,12 @@ pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &I
         let root = origin(backend, &host.provenance)?;
         let heartbeat = host.object.status.as_ref().and_then(|status| status.heartbeat_at);
         let health = match host.object.status.as_ref() {
-            None => ObserverHealth::Unknown,
+            None => unknown_health(host.object.metadata.creation_timestamp, now),
             Some(status) if !status.ready => ObserverHealth::Unready,
             Some(_) => match heartbeat {
-                Some(at) if Utc::now().signed_duration_since(at) < chrono::Duration::seconds(180) => ObserverHealth::Ready,
+                Some(at) if now.signed_duration_since(at) < HEARTBEAT_MAX_AGE => ObserverHealth::Ready,
                 Some(_) => ObserverHealth::Unready,
-                None => ObserverHealth::Unknown,
+                None => unknown_health(host.object.metadata.creation_timestamp, now),
             },
         };
         let candidate = (heartbeat, health);
@@ -116,8 +145,8 @@ pub async fn source_owner(backend: &ResourceBackend, namespace: &str, source: &I
             *entry = candidate;
         }
     }
-    if let Some(preferred) = preferred {
-        if ready.get(&preferred).is_none_or(|(_, health)| *health != ObserverHealth::Unready) {
+    if let Some((declared_at, preferred)) = preferred {
+        if ready.get(&preferred).map_or_else(|| unknown_health(declared_at, now), |(_, health)| *health) != ObserverHealth::Unready {
             return Ok(Some(preferred));
         }
     } else if ready.is_empty() {
@@ -164,7 +193,7 @@ impl ForgeReads {
         let spec = ForgeReadSpec { source: source.clone(), request, demanded_at: now };
         let current = match records.get(&name).await {
             Ok(current) => {
-                if self.touch_demand && now.signed_duration_since(current.spec.demanded_at).num_seconds() >= 60 {
+                if self.touch_demand && now.signed_duration_since(current.spec.demanded_at) >= READ_FRESHNESS {
                     records
                         .update(&InputMeta::from(&current.metadata), &current.metadata.resource_version, &spec)
                         .await
@@ -179,38 +208,27 @@ impl ForgeReads {
             Err(e) => return Err(e.to_string()),
         };
         let statuses = self.backend.including_replicas::<ForgeRead>(&self.namespace).get_all(&name).await.map_err(|e| e.to_string())?;
-        let previous = statuses
-            .items
-            .into_iter()
-            .filter_map(|record| record.object.status)
-            .max_by_key(|status| (status.attempted_at, status.authority.clone()));
+        let previous = latest_status(statuses.items.into_iter().filter_map(|record| record.object.status));
         let owner = owns_source(&self.backend, &self.namespace, &source).await?;
         let fresh = previous.as_ref().is_some_and(|status| {
-            now.signed_duration_since(status.attempted_at).num_seconds() < 60 || status.retry_at.is_some_and(|at| at > now)
+            now.signed_duration_since(status.attempted_at) < READ_FRESHNESS || status.retry_at.is_some_and(|at| at > now)
         });
         if !owner || fresh {
             return previous
                 .ok_or_else(|| "forge observation pending at source owner".to_string())
                 .and_then(|status| decode(status, self.allow_stale));
         }
-        let pending = ForgeReadStatus {
-            authority: self.backend.local_root().map_err(|e| e.to_string())?.to_string(),
-            attempted_at: now,
-            observed_at: previous.as_ref().and_then(|status| status.observed_at),
-            value: previous.as_ref().and_then(|status| status.value.clone()),
-            error: Some("forge observation in progress".into()),
-            retry_at: Some(now + chrono::Duration::seconds(300)),
-        };
-        records.update_status(&name, &current.metadata.resource_version, &pending).await.map_err(|e| e.to_string())?;
-        let result = tokio::time::timeout(std::time::Duration::from_secs(300), load())
-            .await
-            .unwrap_or_else(|_| Err("forge observation timed out".into()));
+        // The shared per-request lock coalesces local work. Do not persist a
+        // transient pending claim: cancellation or handoff must leave the last
+        // completed observation usable and must never delay the next owner.
+        let result = tokio::time::timeout(LOAD_TIMEOUT, load()).await.unwrap_or_else(|_| Err("forge observation timed out".into()));
         // Handoff during a slow read cannot publish facts from the former owner.
         if !owns_source(&self.backend, &self.namespace, &source).await? {
             return Err("forge observer changed during read".into());
         }
+        let completed_at = Utc::now();
         let (value, observed_at, error, retry_at) = match result {
-            Ok(value) => (Some(serde_json::to_value(value).map_err(|e| e.to_string())?), Some(now), None, None),
+            Ok(value) => (Some(serde_json::to_value(value).map_err(|e| e.to_string())?), Some(completed_at), None, None),
             Err(error) => (
                 previous.as_ref().and_then(|s| s.value.clone()),
                 previous.as_ref().and_then(|s| s.observed_at),
@@ -220,15 +238,28 @@ impl ForgeReads {
         };
         let status = ForgeReadStatus {
             authority: self.backend.local_root().map_err(|e| e.to_string())?.to_string(),
-            attempted_at: Utc::now(),
+            attempted_at: completed_at,
             value,
             observed_at,
             error,
             retry_at,
         };
-        let current = records.get(&name).await.map_err(|e| e.to_string())?;
-        records.update_status(&name, &current.metadata.resource_version, &status).await.map_err(|e| e.to_string())?;
+        self.publish_status(&name, current.metadata.resource_version, &status).await?;
         decode(status, self.allow_stale)
+    }
+    async fn publish_status(&self, name: &str, mut version: String, status: &ForgeReadStatus) -> Result<(), String> {
+        let records = self.backend.using::<ForgeRead>(&self.namespace);
+        for attempt in 0..STATUS_WRITE_ATTEMPTS {
+            match records.update_status(name, &version, status).await {
+                Ok(_) => return Ok(()),
+                Err(ResourceError::Conflict { .. }) if attempt + 1 < STATUS_WRITE_ATTEMPTS => {
+                    version = records.get(name).await.map_err(|e| e.to_string())?.metadata.resource_version;
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        unreachable!("status writes have a bounded nonempty retry loop")
     }
 }
 fn decode<T: DeserializeOwned>(status: ForgeReadStatus, allow_stale: bool) -> Result<T, String> {
@@ -275,11 +306,10 @@ impl IssueProvider for ObservedIssueProvider {
             .reads
             .backend
             .including_replicas::<ForgeRead>(&self.reads.namespace)
-            .get_all(&forge_read_name(&normalize_issue_source(source), &ForgeReadRequest::Board))
+            .get_all(&forge_read_name(&canonical_source(source), &ForgeReadRequest::Board))
             .await
             .map_err(|e| e.to_string())?;
-        if let Some(status) = statuses.items.into_iter().filter_map(|record| record.object.status).max_by_key(|status| status.attempted_at)
-        {
+        if let Some(status) = latest_status(statuses.items.into_iter().filter_map(|record| record.object.status)) {
             if let Some(at) = status.observed_at {
                 board.observed_at = at;
             }
@@ -315,7 +345,7 @@ impl crate::in_process::InProcessDaemon {
         let namespace = self.provisioning_namespace_for_forge().await;
         let mut requests = BTreeMap::new();
         for record in backend.including_replicas::<ForgeRead>(&namespace).list().await.map_err(|e| e.to_string())?.items {
-            if Utc::now().signed_duration_since(record.object.spec.demanded_at).num_seconds() < 180 {
+            if Utc::now().signed_duration_since(record.object.spec.demanded_at) < DEMAND_MAX_AGE {
                 requests.insert(record.object.metadata.name, record.object.spec);
             }
         }
@@ -372,7 +402,7 @@ impl crate::in_process::InProcessDaemon {
         // Retire only this root's idle requests; replicas follow tombstones.
         let local = backend.using::<ForgeRead>(&namespace);
         for record in local.list().await.map_err(|e| e.to_string())?.items {
-            if Utc::now().signed_duration_since(record.spec.demanded_at).num_seconds() >= 3600 {
+            if Utc::now().signed_duration_since(record.spec.demanded_at) >= DEMAND_RETENTION {
                 local.delete(&record.metadata.name).await.map_err(|e| e.to_string())?;
             }
         }
@@ -432,5 +462,196 @@ impl ChangeRequestTracker for ObservedChangeRequestTracker {
     }
     async fn merge_change_request(&self, id: &str) -> Result<(), String> {
         self.inner.merge_change_request(id).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use flotilla_resources::{HostSpec, HostStatus, InMemoryBackend, IssueSourceBindingSpec, ProjectSpec, Resource};
+
+    use super::*;
+
+    fn backend(root: &str) -> ResourceBackend {
+        ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new(root))
+    }
+    fn source() -> IssueSource {
+        IssueSource { service: "https://github.com".into(), scope: "org/shared".into() }
+    }
+    fn meta(name: &str) -> InputMeta {
+        InputMeta::builder().name(name.into()).build()
+    }
+    async fn replicate<T: Resource>(from: &ResourceBackend, to: &ResourceBackend) {
+        let list = from.using::<T>("flotilla").list().await.unwrap();
+        to.replica_writer::<T>(from.local_root().unwrap(), "flotilla").replace(&list, Utc::now()).await.unwrap();
+    }
+
+    // Cancellation must release local coalescing and leave no replicated claim
+    // that prevents the very next caller from obtaining a completed result.
+    #[tokio::test]
+    async fn cancelled_read_does_not_delay_next_read() {
+        let reads = ForgeReads::new(backend("owner"), "flotilla".into());
+        let source = source();
+        let (entered, mut started) = tokio::sync::oneshot::channel();
+        let mut first = Box::pin(reads.read(&source, ForgeReadRequest::Board, || async {
+            entered.send(()).unwrap();
+            std::future::pending::<Result<u64, String>>().await
+        }));
+        tokio::select! {
+            result = &mut first => panic!("unexpected completion: {result:?}"),
+            _ = &mut started => {}
+        }
+        drop(first);
+        assert_eq!(reads.read(&source, ForgeReadRequest::Board, || async { Ok(42_u64) }).await.unwrap(), 42);
+    }
+
+    // A concurrent demand touch may conflict with the final status write.
+    // Retrying must preserve the loaded value and stamp its completion time.
+    #[tokio::test]
+    async fn demand_touch_during_load_keeps_completed_result() {
+        let reads = ForgeReads::new(backend("owner"), "flotilla".into());
+        let source = source();
+        let name = forge_read_name(&source, &ForgeReadRequest::Board);
+        let completed = Arc::new(Mutex::new(None));
+        let result = reads
+            .read(&source, ForgeReadRequest::Board, || async {
+                let records = reads.backend.using::<ForgeRead>("flotilla");
+                let record = records.get(&name).await.unwrap();
+                let mut spec = record.spec;
+                spec.demanded_at = Utc::now();
+                records.update(&InputMeta::from(&record.metadata), &record.metadata.resource_version, &spec).await.unwrap();
+                *completed.lock().await = Some(Utc::now());
+                Ok(42_u64)
+            })
+            .await
+            .unwrap();
+        assert_eq!(result, 42);
+        let status = reads.backend.using::<ForgeRead>("flotilla").get(&name).await.unwrap().status.unwrap();
+        assert_eq!(status.value, Some(serde_json::json!(42)));
+        assert!(status.observed_at.unwrap() >= completed.lock().await.unwrap());
+        assert!(status.observed_at.unwrap() >= status.attempted_at);
+    }
+
+    // A former owner must not publish its in-flight result. After handoff the
+    // new owner can read immediately, without inheriting a five-minute claim.
+    #[tokio::test]
+    async fn handoff_during_load_leaves_new_owner_free_to_read() {
+        let first = backend("first");
+        let second = backend("second");
+        let source = source();
+        let spec = ProjectSpec::builder()
+            .display_name("Shared".into())
+            .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(source.clone()).alias("shared".into()).build()])
+            .build();
+        first.using::<Project>("flotilla").create(&meta("shared"), &spec).await.unwrap();
+        replicate::<Project>(&first, &second).await;
+        for backend in [&first, &second] {
+            let hosts = backend.using::<Host>("flotilla");
+            let host = hosts.create(&meta("host"), &HostSpec::default()).await.unwrap();
+            hosts
+                .update_status("host", &host.metadata.resource_version, &HostStatus {
+                    ready: true,
+                    heartbeat_at: Some(Utc::now()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        replicate::<Host>(&second, &first).await;
+        let reads = ForgeReads::new(first.clone(), "flotilla".into());
+        let result = reads
+            .read(&source, ForgeReadRequest::Board, || async {
+                let hosts = first.using::<Host>("flotilla");
+                let host = hosts.get("host").await.unwrap();
+                hosts
+                    .update_status("host", &host.metadata.resource_version, &HostStatus {
+                        ready: false,
+                        heartbeat_at: Some(Utc::now()),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                Ok(1_u64)
+            })
+            .await;
+        assert_eq!(result.unwrap_err(), "forge observer changed during read");
+        replicate::<Host>(&first, &second).await;
+        replicate::<ForgeRead>(&first, &second).await;
+        let new_reads = ForgeReads::new(second, "flotilla".into());
+        assert_eq!(new_reads.read(&source, ForgeReadRequest::Board, || async { Ok(2_u64) }).await.unwrap(), 2);
+        assert!(first
+            .using::<ForgeRead>("flotilla")
+            .get(&forge_read_name(&source, &ForgeReadRequest::Board))
+            .await
+            .unwrap()
+            .status
+            .is_none());
+    }
+
+    // Replication arrival order cannot change the selected status, including
+    // exact timestamp ties. Generate distinct authorities and duplicate rows.
+    #[hegel::test]
+    fn status_selection_is_independent_of_arrival_order(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let index = tc.draw(gs::integers::<u32>().min_value(0).max_value(1000));
+        let now = Utc::now();
+        let status = |authority: String| ForgeReadStatus {
+            authority,
+            attempted_at: now,
+            observed_at: Some(now),
+            value: Some(serde_json::json!(index)),
+            error: None,
+            retry_at: None,
+        };
+        let lower = status(format!("a-{index}"));
+        let higher = status(format!("b-{index}"));
+        assert_eq!(latest_status([lower.clone(), higher.clone(), lower.clone()]), Some(higher.clone()));
+        assert_eq!(latest_status([higher.clone(), lower.clone(), lower]), Some(higher));
+    }
+
+    // A preferred origin that never publishes a Host must eventually yield to
+    // a ready replica. Exercise expiry through real replicated declarations.
+    #[tokio::test]
+    async fn never_reporting_owner_yields_after_startup_grace() {
+        let missing = backend("missing");
+        let ready = backend("ready");
+        let source = source();
+        let spec = ProjectSpec::builder()
+            .display_name("Shared".into())
+            .issue_source_bindings(vec![IssueSourceBindingSpec::builder().source(source.clone()).alias("shared".into()).build()])
+            .build();
+        missing.using::<Project>("flotilla").create(&meta("shared"), &spec).await.unwrap();
+        replicate::<Project>(&missing, &ready).await;
+        let hosts = ready.using::<Host>("flotilla");
+        let host = hosts.create(&meta("host"), &HostSpec::default()).await.unwrap();
+        hosts
+            .update_status("host", &host.metadata.resource_version, &HostStatus {
+                ready: true,
+                heartbeat_at: Some(Utc::now()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(source_owner(&ready, "flotilla", &source).await.unwrap(), Some(missing.local_root().unwrap()));
+        // The replica boundary supplies aged declarations without wall-clock sleeps.
+        let mut projects = missing.using::<Project>("flotilla").list().await.unwrap();
+        projects.items[0].metadata.creation_timestamp -= UNKNOWN_OWNER_GRACE + Duration::seconds(1);
+        ready.replica_writer::<Project>(missing.local_root().unwrap(), "flotilla").replace(&projects, Utc::now()).await.unwrap();
+        assert_eq!(source_owner(&ready, "flotilla", &source).await.unwrap(), Some(ready.local_root().unwrap()));
+        missing.using::<Host>("flotilla").create(&meta("silent"), &HostSpec::default()).await.unwrap();
+        let mut silent = missing.using::<Host>("flotilla").list().await.unwrap();
+        silent.items[0].metadata.creation_timestamp -= UNKNOWN_OWNER_GRACE + Duration::seconds(1);
+        ready.replica_writer::<Host>(missing.local_root().unwrap(), "flotilla").replace(&silent, Utc::now()).await.unwrap();
+        assert_eq!(source_owner(&ready, "flotilla", &source).await.unwrap(), Some(ready.local_root().unwrap()));
+    }
+
+    // Unknown ownership lasts only through its startup grace, even if no first
+    // heartbeat ever arrives. Generate ages on both sides and at the boundary.
+    #[hegel::test]
+    fn unknown_owner_grace_is_bounded(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let age = tc.draw(gs::integers::<i64>().min_value(0).max_value(360));
+        let now = Utc::now();
+        assert_eq!(unknown_health(now - Duration::seconds(age), now) == ObserverHealth::Unknown, age < UNKNOWN_OWNER_GRACE.num_seconds());
+        assert!(unknown_health(now - UNKNOWN_OWNER_GRACE, now) == ObserverHealth::Unready);
     }
 }
