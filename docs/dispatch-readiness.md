@@ -65,3 +65,107 @@ Each repository reports `observed_at`, `age_seconds`, and `refresh_error`; a fai
 A board is complete for its selected sources: partial repositories are not served when any selected source has no successful observation. Other Projects with healthy sources remain queryable. Removed sources are evicted after a successful complete source-inventory pass; re-adding one starts a new observation. Loader panics are reported as refresh errors and retried after backoff.
 
 The runtime flotilla Project policy was enabled as part of #2782. Its live record is managed by whole-repository project materialisation, which preserves an existing dispatch policy. If an external charter later owns that field, carry the enabled policy into that charter; this change does not author an out-of-scope charter repository. New DispatchHold and DispatchDeployment specs have no existing out-of-repo manifest authors. Project's new unavailable condition is daemon-authored status, with one-generation decoder compatibility.
+
+## Missions, lanes and ordering
+
+Ready rows carry a `score` with normalized mission attributes, the source of each
+attribute, membership reason, unique DAG descendant count, conflict penalty, and
+admission inputs. CLI JSON and `DispatchReady` snapshots use the same global
+lexicographic order: expedite/standard/background, descending mission value,
+descending descendant count, oldest continuously observed readiness, then lowest
+conflict penalty. Namespace, Project and source-qualified issue break exact ties.
+The conflict term starts at zero; #2784 supplies it. Deltas carry changed scores;
+clients apply them by row identity and use the shared comparator to materialize
+order. Attention uses the oldest readiness clock, independent of priority.
+
+Native map ancestry (nearest map, including nested sub-issues) takes precedence
+over the first matching charter lane. A map is identified by its Map issue type
+or a label whose final colon-separated segment is `map` (case-insensitive).
+This follows the same reserved ideation-label convention as readiness. Lane rules require all their labels and preserve
+charter declaration order. An empty label set is an intentional catch-all; place
+it after more specific lanes. Unmatched work belongs to `routine_lane`, default
+`routine`. A mission may reference a tracking issue or use charter attributes
+alone. Map missions without a charter name use the source-qualified map identity.
+
+Author the policy in `project.yaml` or Project's `spec.dispatch_policy`:
+
+```yaml
+dispatch_policy:
+  enabled: true
+  project_share: 2
+  routine_lane: routine
+  missions:
+    - name: stability
+      issue:
+        source: {service: 'https://github.com', scope: flotilla-org/flotilla}
+        id: '<stability-lane-issue-number>'
+      attributes: {value: 5, class_of_service: standard, crew_limit: 2}
+    - name: routine
+      attributes: {value: 1, class_of_service: background}
+  lanes:
+    - mission: stability
+      labels: [bug]
+```
+
+Each attribute resolves independently from the tracking issue's native field,
+then `value:N`, `cos:expedite|standard|background`, or `crew-limit:N` label, then
+charter defaults (value 0, standard, unlimited). Value is a finite number and may
+be fractional or negative. Crew limit is a nonnegative u32; zero pauses future
+admission. Duplicate or invalid explicit attributes in a published scoring snapshot make
+readiness unavailable. A failed field observation retains the last-good snapshot
+and exposes its refresh error, as other board observations do.
+A present native field overrides its label, even if that label is stale. Native
+fields with null values fall back. Tracking issues must be in the observed sources.
+
+GitHub fields use the [documented issue-field-values endpoint](https://docs.github.com/en/rest/issues/issue-field-values)
+with pagination and exact field names `Value`, `Class of service`, and `Crew limit`.
+Unsupported/not-present (404/410) responses permit fallback; authentication,
+rate-limit and server failures retain their error. Native parents and issue types
+come from the recorded `gh issue list` board. Field reads are part of that shared
+background refresh, including every Project's declared tracking issues; ready
+reads never query mission fields. Re-ranking becomes visible after the next
+successful board refresh and dispatch reconciliation. Last-good observations
+remain available during a failed refresh, with the board's age/error evidence.
+
+Fair share is a positive per-Project relative weight, separate from the work
+ordering terms. Scores expose it alongside the Project's live crew count and the
+mission's live crew count/limit for #2785 whole-convoy admission. Counts include
+replicated live convoys and count crew roles once per convoy. Pending, Working, Interrupted and Stalled roles count;
+Done, HandedBack and Failed roles release their share even before landing. A live convoy that
+has not published crew state contributes one provisional crew. A batch spanning
+missions contributes to each mission it serves, without duplicating a convoy
+within one mission. Terminal convoys contribute zero. This PR supplies inputs;
+reservation, quota/borrowing and admission enforcement belong to #2785.
+
+### Companion owner actions
+
+In the flotilla-org organization, define `Value` as a number, `Class of service`
+as a single select with `expedite`, `standard`, `background`, and `Crew limit` as
+a number containing nonnegative integers. These are organization owner actions;
+no organization settings are changed by this PR. Create tracking issues titled
+`Lane: stability` and `Lane: routine`, label them `dispatch:lane` (never `ready`),
+and wire their returned numbers into the flotilla Project charter as above.
+Labels or charter-only attributes work before those owner actions.
+
+Project specs are authored outside this repository by project-map/ops
+`project.yaml` declarations and registered charter Project manifests. The new
+policy inputs are optional; old declarations retain the existing materialized
+policy and need no companion migration. Owners add the shown fields to the
+flotilla charter when selecting lanes. Queue scores are daemon-authored status;
+previous-generation records decode with `score: None` and preserve old FIFO
+semantics until the next successful reconciliation. The stored golden corpus
+is unchanged.
+
+On a host running the candidate with configured lanes and ready work, run
+`scripts/accept-dispatch-missions` for a read-only check of the global ordering
+and score breakdown. Change a mission field/label, wait for the next successful
+background refresh and reconciler pass, and rerun to inspect the updated rank.
+The container tests use injected tracker collaborators and in-memory stores;
+this operator check needs a running daemon, without Docker requirements.
+
+Malformed mission attributes, parent cycles, malformed blocker URLs or missing
+tracking sources fail the Project closed. `status.dispatch_queue_error` exposes
+the reason; the last queue and readiness clocks remain stored but unavailable
+until a successful reconciliation clears the error. Live-convoy membership uses
+the current board with frozen issue labels, so mission accounting follows current
+ancestry and charter while retaining the admitted label snapshot.

@@ -1940,6 +1940,7 @@ impl Aggregator {
                         .ready_observed_at(entry.ready_observed_at)
                         .age_seconds(chrono::Utc::now().signed_duration_since(entry.ready_observed_at).num_seconds().max(0) as u64)
                         .attention(attention)
+                        .maybe_score(entry.score.clone())
                         .provenance(entry.provenance.clone())
                         .build()
                 })

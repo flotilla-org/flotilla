@@ -24,6 +24,7 @@ pub mod daemon;
 pub mod data;
 pub mod decision_log;
 pub mod demand_lifecycle;
+pub mod dispatch_missions;
 mod dispatch_ready;
 pub mod environment_manager;
 pub mod event_sink;

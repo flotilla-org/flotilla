@@ -1,3 +1,5 @@
+pub mod dispatch;
+pub use dispatch::{compare_dispatch_rows, ClassOfService, DispatchScore, MissionAttributes, MissionFields, MissionValue};
 pub mod arg;
 pub mod attach_plan;
 pub mod commands;

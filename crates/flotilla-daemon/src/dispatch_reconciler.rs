@@ -5,7 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use flotilla_core::in_process::InProcessDaemon;
+use flotilla_core::{dispatch_missions::MissionBoard, in_process::InProcessDaemon};
 use flotilla_protocol::{
     issue_query::{IssueQuery, READY_ISSUE_LABEL},
     DispatchIssueFacts, Issue, IssueRef, IssueState, QueryScope,
@@ -22,6 +22,7 @@ const ISSUE_PAGE_SIZE: usize = 100;
 
 #[async_trait]
 pub(crate) trait DispatchIssueSource: Send + Sync {
+    async fn boards(&self, project: &ResourceObject<Project>) -> Result<Vec<flotilla_protocol::DispatchBoardRepository>, String>;
     async fn ready_issues(&self, project: &ResourceObject<Project>) -> Result<Vec<Issue>, String>;
     async fn fetch_issue(&self, reference: &IssueRef) -> Result<Issue, String>;
     async fn dispatch_facts(&self, reference: &IssueRef) -> Result<DispatchIssueFacts, String>;
@@ -39,6 +40,9 @@ impl DaemonDispatchIssueSource {
 
 #[async_trait]
 impl DispatchIssueSource for DaemonDispatchIssueSource {
+    async fn boards(&self, project: &ResourceObject<Project>) -> Result<Vec<flotilla_protocol::DispatchBoardRepository>, String> {
+        self.daemon.dispatch_board_repositories_internal(Some(&project.metadata.name)).await
+    }
     async fn ready_issues(&self, project: &ResourceObject<Project>) -> Result<Vec<Issue>, String> {
         let scope = QueryScope::new(&project.metadata.namespace, &project.metadata.name);
         let bindings = self.daemon.resolve_issue_source_bindings(&scope).await?;
@@ -159,6 +163,28 @@ impl DispatchReconciler {
             .collect::<HashSet<_>>();
         let previous_by_issue = previous_queue.iter().map(|entry| (entry.issue.clone(), entry)).collect::<BTreeMap<_, _>>();
 
+        let board = MissionBoard::new(&self.issues.boards(project).await?)?;
+        let live = existing.iter().filter(|convoy| !convoy.status.as_ref().is_some_and(|s| s.phase.is_terminal())).collect::<Vec<_>>();
+        let project_active_crews = live.iter().map(|c| active_crew_count(c.status.as_ref())).sum();
+        let mut mission_active = BTreeMap::<String, usize>::new();
+        for convoy in &live {
+            let mut missions = HashSet::new();
+            for served in &convoy.spec.issues {
+                let issue = Issue::builder()
+                    .reference(served.reference.clone())
+                    .title(served.snapshot.title.clone())
+                    .labels(served.snapshot.labels.clone())
+                    .state(served.snapshot.state)
+                    .as_of(served.snapshot.as_of)
+                    .provider_name(String::new())
+                    .provider_display_name(String::new())
+                    .build();
+                missions.insert(board.score(&issue, policy)?.mission);
+            }
+            for mission in missions {
+                *mission_active.entry(mission).or_default() += active_crew_count(convoy.status.as_ref());
+            }
+        }
         let mut ready = self.issues.ready_issues(project).await?;
         ready.retain(|issue| issue.state == IssueState::Open && issue.labels.iter().any(|label| label == READY_ISSUE_LABEL));
         ready.sort_by(|left, right| left.reference.cmp(&right.reference).then_with(|| right.as_of.cmp(&left.as_of)));
@@ -220,7 +246,11 @@ impl DispatchReconciler {
             let observed_at = previous
                 .filter(|entry| entry.issue_as_of == issue.as_of && entry.title == issue.title)
                 .map_or(now, |entry| entry.observed_at);
+            let mut score = board.score(&issue, policy)?;
+            score.project_active_crews = project_active_crews;
+            score.mission_active_crews = mission_active.get(&score.mission).copied().unwrap_or(0);
             queue.push(DispatchQueueEntry {
+                score: Some(score),
                 issue: issue.reference,
                 title: issue.title,
                 issue_as_of: issue.as_of,
@@ -398,13 +428,38 @@ impl DispatchReconciler {
     }
 }
 
+/// A settled role releases mission share even while its convoy awaits landing.
+/// Before publication of any role state, reserve one provisional crew.
+fn active_crew_count(status: Option<&flotilla_resources::ConvoyStatus>) -> usize {
+    if status.is_some_and(|status| status.phase.is_terminal()) {
+        return 0;
+    }
+    let Some(status) = status.filter(|status| status.crew_work.values().any(|crew| !crew.is_empty())) else {
+        return 1;
+    };
+    status
+        .crew_work
+        .values()
+        .flat_map(|crew| crew.values())
+        .filter(|state| {
+            matches!(
+                state.phase,
+                flotilla_resources::CrewWorkPhase::Pending
+                    | flotilla_resources::CrewWorkPhase::Working
+                    | flotilla_resources::CrewWorkPhase::Interrupted
+                    | flotilla_resources::CrewWorkPhase::Stalled
+            )
+        })
+        .count()
+}
+
 fn dispatch_queue_attention(
     queue: &[DispatchQueueEntry],
     policy: &DispatchPolicy,
     previous: Option<&DispatchQueueAttention>,
     now: DateTime<Utc>,
 ) -> Option<DispatchQueueAttention> {
-    let oldest = queue.first()?.ready_observed_at;
+    let oldest = queue.iter().map(|entry| entry.ready_observed_at).min()?;
     let threshold = i64::try_from(policy.stale_after_seconds).unwrap_or(i64::MAX);
     let stale_since = oldest.checked_add_signed(Duration::seconds(threshold)).unwrap_or(DateTime::<Utc>::MAX_UTC);
     (now >= stale_since).then(|| {
@@ -430,7 +485,9 @@ mod tests {
 
     const NAMESPACE: &str = "flotilla";
 
+    // Stands in for the external tracker; storage/reconciliation remain real.
     struct FakeIssues {
+        board_override: Mutex<Option<Vec<flotilla_protocol::DispatchBoardRepository>>>,
         ready: Mutex<Vec<Issue>>,
         by_ref: Mutex<HashMap<IssueRef, Issue>>,
         ready_calls: Mutex<usize>,
@@ -441,6 +498,49 @@ mod tests {
 
     #[async_trait]
     impl DispatchIssueSource for FakeIssues {
+        async fn boards(&self, _project: &ResourceObject<Project>) -> Result<Vec<flotilla_protocol::DispatchBoardRepository>, String> {
+            if let Some(boards) = &*self.board_override.lock().expect("board") {
+                return Ok(boards.clone());
+            }
+            let facts = self.facts.lock().expect("facts");
+            let issues = self
+                .ready
+                .lock()
+                .expect("ready")
+                .iter()
+                .chain(self.by_ref.lock().expect("by_ref").values())
+                .map(|issue| {
+                    flotilla_protocol::DispatchBoardIssue::builder()
+                        .id(issue.reference.id.clone())
+                        .title(issue.title.clone())
+                        .state(issue.state)
+                        .url(format!("https://github.com/{}/issues/{}", issue.reference.source.scope, issue.reference.id))
+                        .updated_at(issue.as_of.to_rfc3339())
+                        .labels(issue.labels.clone())
+                        .blocked_by(
+                            facts
+                                .get(&issue.reference)
+                                .into_iter()
+                                .flat_map(|f| &f.blockers)
+                                .map(|b| flotilla_protocol::DispatchBoardDependency {
+                                    url: format!("https://github.com/{}/issues/{}", b.source.scope, b.id),
+                                    state: IssueState::Open,
+                                })
+                                .collect(),
+                        )
+                        .pull_requests(vec![])
+                        .build()
+                })
+                .collect();
+            Ok(vec![flotilla_protocol::DispatchBoardRepository {
+                source: source(),
+                issues,
+                pull_requests: vec![],
+                observed_at: Utc::now(),
+                age_seconds: 0,
+                refresh_error: None,
+            }])
+        }
         async fn ready_issues(&self, project: &ResourceObject<Project>) -> Result<Vec<Issue>, String> {
             if self.failing_projects.lock().expect("failing projects lock").contains(&project.metadata.name) {
                 return Err("issue source unavailable".to_string());
@@ -535,6 +635,7 @@ mod tests {
             .await
             .expect("project");
         let issues = Arc::new(FakeIssues {
+            board_override: Mutex::new(None),
             ready: Mutex::new(ready),
             by_ref: Mutex::new(blockers.into_iter().map(|issue| (issue.reference.clone(), issue)).collect()),
             ready_calls: Mutex::new(0),
@@ -561,6 +662,82 @@ mod tests {
 
     fn policy(stale_after_seconds: u64) -> DispatchPolicy {
         DispatchPolicy::builder().stale_after_seconds(stale_after_seconds).build()
+    }
+
+    // #2783 admission inputs count unsettled roles, not completed obligations.
+    // Exhaustive finite enum mapping: every phase, unknown publication, terminal
+    // convoy, and mixed roles. No process boundary or random interleaving exists.
+    #[test]
+    fn settled_roles_release_share_before_the_convoy_lands() {
+        use flotilla_resources::{ConvoyStatus, CrewWorkPhase, CrewWorkState};
+        assert_eq!(active_crew_count(None), 1);
+        assert_eq!(active_crew_count(Some(&ConvoyStatus::default())), 1);
+        for (phase, unsettled) in [
+            (CrewWorkPhase::Pending, true),
+            (CrewWorkPhase::Working, true),
+            (CrewWorkPhase::Interrupted, true),
+            (CrewWorkPhase::Stalled, true),
+            (CrewWorkPhase::Done, false),
+            (CrewWorkPhase::HandedBack, false),
+            (CrewWorkPhase::Failed, false),
+        ] {
+            let mut status = ConvoyStatus::default();
+            status.crew_work.insert(
+                "work".into(),
+                BTreeMap::from([
+                    ("coder".into(), CrewWorkState::builder().phase(phase).build()),
+                    ("reviewer".into(), CrewWorkState::builder().phase(CrewWorkPhase::Working).build()),
+                ]),
+            );
+            assert_eq!(active_crew_count(Some(&status)), 1 + usize::from(unsettled));
+            status.crew_work.get_mut("work").expect("work").remove("reviewer");
+            assert_eq!(active_crew_count(Some(&status)), usize::from(unsettled));
+            status.phase = ConvoyPhase::Landed;
+            assert_eq!(active_crew_count(Some(&status)), 0);
+        }
+    }
+
+    // #2783: a mission score survives real in-memory status writes; changing
+    // a field re-ranks a proposal without resetting readiness age or attention.
+    #[tokio::test]
+    async fn mission_scores_reconcile_and_retain_readiness_age() {
+        use flotilla_resources::DispatchMission;
+        let mut policy = policy(60);
+        policy.project_share = 3;
+        policy.missions =
+            vec![DispatchMission::builder().name("routine".into()).issue(IssueRef { source: source(), id: "99".into() }).build()];
+        let (backend, issues, clock, reconciler) =
+            harness(vec![issue("1", &[READY_ISSUE_LABEL], None, IssueState::Open)], vec![], policy).await;
+        let tracking = flotilla_protocol::DispatchBoardIssue::builder()
+            .id("99".into())
+            .title("Routine".into())
+            .state(IssueState::Open)
+            .url("https://github.com/acme/widgets/issues/99".into())
+            .updated_at(String::new())
+            .labels(vec!["value:2".into(), "crew-limit:0".into()])
+            .blocked_by(vec![])
+            .pull_requests(vec![])
+            .build();
+        let mut boards = issues.boards(&backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project")).await.expect("board");
+        boards[0].issues.push(tracking);
+        *issues.board_override.lock().expect("board") = Some(boards.clone());
+        reconciler.reconcile_once().await.expect("first pass");
+        let first = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
+        let score = first.dispatch_queue[0].score.as_ref().expect("score");
+        assert_eq!(f64::from(score.attributes.value), 2.0);
+        assert_eq!(score.attributes.crew_limit, Some(0));
+        assert_eq!(score.project_share, 3);
+        assert_eq!(score.project_active_crews, 0);
+        boards[0].issues.last_mut().expect("tracking").mission_fields.value = Some(7.5.try_into().expect("value"));
+        *issues.board_override.lock().expect("board") = Some(boards);
+        clock.advance(Duration::seconds(60));
+        reconciler.reconcile_once().await.expect("re-rank pass");
+        let second = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
+        assert_eq!(second.dispatch_queue[0].ready_observed_at, first.dispatch_queue[0].ready_observed_at);
+        let score = second.dispatch_queue[0].score.as_ref().expect("score");
+        assert_eq!(f64::from(score.attributes.value), 7.5);
+        assert_eq!(score.attribute_sources["value"], "issue_field");
+        assert!(second.dispatch_queue_attention.is_some());
     }
 
     #[tokio::test]
@@ -772,6 +949,8 @@ mod tests {
         assert_eq!(outcome.observations_recorded, 0);
         let status = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status");
         assert_eq!(status.dispatch_queue.iter().map(|entry| &entry.issue).collect::<Vec<_>>(), vec![&waiting.reference]);
+        assert_eq!(status.dispatch_queue[0].score.as_ref().expect("score").project_active_crews, 1);
+        assert_eq!(status.dispatch_queue[0].score.as_ref().expect("score").mission_active_crews, 1);
         assert_eq!(status.dispatch_queue_attention.expect("stale attention").count, 1);
     }
 
@@ -816,6 +995,48 @@ mod tests {
 
         let second = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project");
         assert_eq!(second.metadata.resource_version, first.metadata.resource_version);
+    }
+
+    #[tokio::test]
+    async fn malformed_mission_publishes_error_preserves_queue_and_recovers() {
+        use flotilla_resources::DispatchMission;
+        let mut dispatch_policy = policy(60);
+        dispatch_policy.missions =
+            vec![DispatchMission::builder().name("routine".into()).issue(IssueRef { source: source(), id: "2".into() }).build()];
+        let (backend, issues, _, reconciler) =
+            harness(vec![issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open)], vec![], dispatch_policy).await;
+        let projects = backend.using::<Project>(NAMESPACE);
+        reconciler.reconcile_once().await.expect("initial pass");
+        let before = projects.get("widgets").await.expect("project").status.expect("status");
+        let mut boards = issues.boards(&projects.get("widgets").await.expect("project")).await.expect("board");
+        boards[0].issues[0].labels.push("value:abc".into());
+        *issues.board_override.lock().expect("board") = Some(boards);
+        assert_eq!(reconciler.reconcile_once().await.expect("invalid pass").project_errors, 1);
+        let failed = projects.get("widgets").await.expect("project").status.expect("status");
+        assert_eq!(failed.dispatch_queue, before.dispatch_queue);
+        assert!(failed.dispatch_queue_error.as_deref().expect("visible error").contains("value"));
+        *issues.board_override.lock().expect("board") = None;
+        reconciler.reconcile_once().await.expect("recovery");
+        let recovered = projects.get("widgets").await.expect("project").status.expect("status");
+        assert_eq!(recovered.dispatch_queue, before.dispatch_queue);
+        assert!(recovered.dispatch_queue_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn attention_uses_oldest_entry_even_when_it_is_not_first() {
+        let (backend, _, _, reconciler) = harness(
+            vec![issue("1", &[READY_ISSUE_LABEL], None, IssueState::Open), issue("2", &[READY_ISSUE_LABEL], None, IssueState::Open)],
+            vec![],
+            policy(60),
+        )
+        .await;
+        reconciler.reconcile_once().await.expect("queue");
+        let mut queue = backend.using::<Project>(NAMESPACE).get("widgets").await.expect("project").status.expect("status").dispatch_queue;
+        queue[1].ready_observed_at -= Duration::seconds(120);
+        let oldest = queue[1].ready_observed_at;
+        let attention = dispatch_queue_attention(&queue, &policy(60), None, queue[0].ready_observed_at).expect("stale");
+        assert_eq!(attention.oldest_ready_observed_at, oldest);
+        assert_eq!(attention.count, 2);
     }
 
     #[tokio::test]

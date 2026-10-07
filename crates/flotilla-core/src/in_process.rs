@@ -4917,25 +4917,29 @@ impl InProcessDaemon {
 
     pub async fn dispatch_board_internal(&self, project_filter: Option<&str>) -> Result<flotilla_protocol::DispatchBoardResponse, String> {
         let readiness = self.dispatch_queue_internal(project_filter).await?;
-        let repositories = self.dispatch_board_repositories(project_filter).await?;
+        let repositories = self.dispatch_board_repositories_internal(project_filter).await?;
         Ok(flotilla_protocol::DispatchBoardResponse { readiness, repositories })
     }
 
     /// Schedule tracker observations without waiting for the forge or coupling
     /// board freshness to the availability of dispatch readiness evidence.
     pub async fn refresh_dispatch_boards_internal(&self) -> Result<(), String> {
-        self.dispatch_board_repositories(None).await.map(|_| ())
+        self.dispatch_board_repositories_internal(None).await.map(|_| ())
     }
 
-    async fn dispatch_board_repositories(
+    pub async fn dispatch_board_repositories_internal(
         &self,
         project_filter: Option<&str>,
     ) -> Result<Vec<flotilla_protocol::DispatchBoardRepository>, String> {
         let namespace = self.provisioning_namespace().await;
         let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
         let mut sources = std::collections::BTreeSet::new();
+        let mut mission_issues = std::collections::BTreeSet::new();
         let mut errors = Vec::new();
         for project in projects {
+            if let Some(policy) = &project.spec.dispatch_policy {
+                mission_issues.extend(policy.missions.iter().filter_map(|mission| mission.issue.clone()));
+            }
             if project_filter.is_some_and(|name| name != project.metadata.name) {
                 continue;
             }
@@ -4952,11 +4956,29 @@ impl InProcessDaemon {
         for source in sources {
             let daemon = self.self_weak.clone();
             let tracker_source = source.clone();
+            let mission_issues = mission_issues.clone();
             match self
                 .dispatch_board_cache
                 .read(&source, move || async move {
                     let daemon = daemon.upgrade().ok_or("daemon stopped")?;
-                    daemon.issue_provider_for_source(&tracker_source).await?.dispatch_board(&tracker_source).await
+                    let provider = daemon.issue_provider_for_source(&tracker_source).await?;
+                    let mut board = provider.dispatch_board(&tracker_source).await?;
+                    for issue in &mut board.issues {
+                        let reference = flotilla_protocol::IssueRef { source: tracker_source.clone(), id: issue.id.clone() };
+                        if mission_issues.iter().any(|mission| {
+                            mission.id == reference.id
+                                && mission.source.scope.eq_ignore_ascii_case(&reference.source.scope)
+                                && matches!(mission.source.service.trim_end_matches('/'), "github" | "github.com" | "https://github.com")
+                        }) || issue.issue_type.as_ref().is_some_and(|kind| kind.eq_ignore_ascii_case("map"))
+                            || issue
+                                .labels
+                                .iter()
+                                .any(|label| label.rsplit(':').next().is_some_and(|kind| kind.eq_ignore_ascii_case("map")))
+                        {
+                            issue.mission_fields = provider.mission_fields(&reference).await?;
+                        }
+                    }
+                    Ok(board)
                 })
                 .await
             {

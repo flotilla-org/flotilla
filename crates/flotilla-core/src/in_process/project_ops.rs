@@ -512,7 +512,9 @@ impl ProjectService<'_> {
             supervision: existing_project.as_ref().and_then(|project| project.spec.supervision.clone()),
             issue_source_bindings: Vec::new(),
             repositories: members,
-            dispatch_policy: existing_project.as_ref().and_then(|project| project.spec.dispatch_policy.clone()),
+            dispatch_policy: declaration
+                .dispatch_policy
+                .or_else(|| existing_project.as_ref().and_then(|project| project.spec.dispatch_policy.clone())),
         })?;
         let mut meta = existing_project
             .as_ref()

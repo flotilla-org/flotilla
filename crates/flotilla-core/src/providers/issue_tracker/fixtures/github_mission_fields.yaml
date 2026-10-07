@@ -1,0 +1,9 @@
+rounds:
+- interactions:
+  - channel: gh_api
+    method: GET
+    endpoint: repos/flotilla-org/flotilla/issues/2783/issue-field-values?per_page=100&page=1
+    status: 200
+    body: '[]'
+    headers:
+      etag: '"f3d6f94d62d78fb036487111e8c663b0d55e0ee7f2edeb0382cc2324a351a6c0"'
