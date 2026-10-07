@@ -594,6 +594,106 @@ fn resolve_frozen_sources(sources: &[SkillSource], selected: &[flotilla_resource
     Ok(resolved.into_values().collect())
 }
 
+/// Validate all frozen crews aboard one vessel with provisioning's combined
+/// source authority, then stage each crew separately to retain name isolation.
+pub async fn validate_frozen_vessel_skills(
+    source: &Path,
+    crews: &BTreeMap<String, Vec<flotilla_resources::SkillCatalogEntry>>,
+    declared_credentials: &BTreeMap<String, flotilla_resources::CredentialSpecSpec>,
+    credential_tokens: &BTreeMap<String, PathBuf>,
+    runner: &dyn CommandRunner,
+) -> Result<(), String> {
+    let all = crews.values().flatten().cloned().collect::<Vec<_>>();
+    let sources = resolve_frozen_sources(&inspect_skill_sources(source)?.sources, &all)?;
+    authorize_frozen_sources(&sources, declared_credentials)?;
+    for (crew, selected) in crews {
+        if !selected.is_empty() {
+            validate_frozen_skills(source, selected, declared_credentials, credential_tokens, runner)
+                .await
+                .map_err(|error| format!("crew {crew}: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn authorize_frozen_sources(
+    sources: &[SkillSource],
+    declared_credentials: &BTreeMap<String, flotilla_resources::CredentialSpecSpec>,
+) -> Result<(), String> {
+    let mut credential_repositories = BTreeMap::new();
+    for source in sources {
+        if let Some(credential) = &source.credential {
+            let spec = declared_credentials.get(credential).ok_or_else(|| {
+                format!("skill source {} revision {}: credential {credential} has no declared CredentialSpec", source.name, source.revision)
+            })?;
+            crate::credential::skill_source_repository(credential, spec, &source.repository)
+                .map_err(|error| format!("skill source {} revision {}: {error}", source.name, source.revision))?;
+            if credential_repositories.insert(credential, &source.repository).is_some_and(|previous| previous != &source.repository) {
+                return Err(format!(
+                    "skill source {} credential {credential}: one credential cannot be narrowed to multiple source repositories",
+                    source.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Candidate-side pre-roll probe. Uses the same supply authorization and exact
+/// revision staging as provisioning, without touching a crew's staged skills.
+/// Token files are explicit operator inputs, keyed by the declared credential;
+/// ambient Git credentials are disabled by the staging implementation.
+async fn validate_frozen_skills(
+    source: &Path,
+    selected: &[flotilla_resources::SkillCatalogEntry],
+    declared_credentials: &BTreeMap<String, flotilla_resources::CredentialSpecSpec>,
+    credential_tokens: &BTreeMap<String, PathBuf>,
+    runner: &dyn CommandRunner,
+) -> Result<(), String> {
+    let sources = resolve_frozen_sources(&inspect_skill_sources(source)?.sources, selected)?;
+    authorize_frozen_sources(&sources, declared_credentials)?;
+    let scratch = tempfile::tempdir().map_err(|error| format!("create frozen-skill probe directory: {error}"))?;
+    let mut args = vec![
+        "flotilla-stage-skills".into(),
+        format!("json:{}", serde_json::json!({"schema_version": 5, "sources": sources})),
+        scratch.path().join("selected").to_string_lossy().into_owned(),
+        "false".into(),
+        scratch.path().join("cache").to_string_lossy().into_owned(),
+    ];
+    for source in &sources {
+        let token = if let Some(credential) = &source.credential {
+            let path = credential_tokens.get(credential).ok_or_else(|| {
+                format!(
+                    "skill source {} revision {}: credential {credential} requires an explicit probe token file",
+                    source.name, source.revision
+                )
+            })?;
+            // Staging deletes tokens after failed probes; protect the operator's
+            // original by supplying a private, disposable copy.
+            let copy = scratch.path().join(format!("token-{}", source.name));
+            std::fs::copy(path, &copy).map_err(|error| format!("copy probe token for {credential}: {error}"))?;
+            copy.to_string_lossy().into_owned()
+        } else {
+            String::new()
+        };
+        args.extend([
+            source.name.clone(),
+            source.repository.clone(),
+            source.revision.clone(),
+            token,
+            source.credential.clone().unwrap_or_default(),
+            source.paths.len().to_string(),
+        ]);
+        args.extend(source.paths.clone());
+        let entries = selected.iter().filter(|entry| entry.source == source.name).collect::<Vec<_>>();
+        args.push(entries.len().to_string());
+        for entry in entries {
+            args.extend([entry.name.clone(), entry.path.clone()]);
+        }
+    }
+    stage_git_skill_sources(runner, &args).await.map(|_| ())
+}
+
 fn default_skill_source_paths() -> Vec<String> {
     vec!["skills".to_string()]
 }
@@ -2326,6 +2426,52 @@ esac
             name: name.into(),
             path: path.into(),
         }
+    }
+
+    // Candidate probing preserves the governor's old revision while using the
+    // current supply authority. Missing authority/tokens and a remote serving
+    // another revision refuse; failed staging must preserve operator token files.
+    #[tokio::test]
+    async fn pre_roll_skill_probe_checks_authority_pin_and_preserves_operator_tokens() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path());
+        let bundle = registry.skills.source.as_ref().expect("source");
+        std::fs::write(bundle.join(SKILL_BUNDLE_MANIFEST), r#"{"schema_version":5,"sources":[{"name":"private-skills","repository":"https://github.com/example/private-skills.git","revision":"2222222222222222222222222222222222222222","credential":"private-skills"}]}"#).expect("new supply");
+        // Subprocess-boundary stand-in enforces the Git staging CLI, supplies
+        // lazy blobs and records the exact revision fetched without networking.
+        let runner = promisor_runner(temp.path());
+        let selected = vec![crew_skill("private-source", "skills/private-folder")];
+        let spec = serde_json::from_value(serde_json::json!({"consumer":{"adapter":"github-app","installation_id":1},"source":{"kind":"github-app","app_id_path":"/test/app-id","private_key_path":"/test/key"},"lifecycle":"refreshable"})).expect("credential spec");
+        let declared = BTreeMap::from([("private-skills".into(), spec)]);
+        let missing = validate_frozen_skills(bundle, &selected, &BTreeMap::new(), &BTreeMap::new(), &runner)
+            .await
+            .expect_err("undeclared credential");
+        assert!(missing.contains("no declared CredentialSpec"));
+        let missing = validate_frozen_skills(bundle, &selected, &declared, &BTreeMap::new(), &runner).await.expect_err("token required");
+        assert!(missing.contains("explicit probe token"));
+        let token = temp.path().join("operator-token");
+        std::fs::write(&token, "test-token").expect("token");
+        let tokens = BTreeMap::from([("private-skills".into(), token.clone())]);
+        let mut invalid = declared.clone();
+        invalid.get_mut("private-skills").expect("spec").lifecycle = flotilla_resources::CredentialLifecycle::Static;
+        assert!(validate_frozen_skills(bundle, &selected, &invalid, &tokens, &runner)
+            .await
+            .expect_err("candidate cannot mint static App credentials")
+            .contains("refreshable"));
+        let crews = BTreeMap::from([("coder".into(), selected.clone()), ("reviewer".into(), selected.clone())]);
+        validate_frozen_vessel_skills(bundle, &crews, &declared, &tokens, &runner).await.expect("shared names remain isolated by crew");
+        let mut incompatible = crews.clone();
+        incompatible.get_mut("reviewer").expect("reviewer")[0].revision = "3".repeat(40);
+        assert!(validate_frozen_vessel_skills(bundle, &incompatible, &declared, &tokens, &runner)
+            .await
+            .expect_err("incompatible shared source pins")
+            .contains("two revisions"));
+        validate_frozen_skills(bundle, &selected, &declared, &tokens, &runner).await.expect("old pin remains satisfiable");
+        assert_eq!(std::fs::read_to_string(&token).expect("operator token"), "test-token");
+        std::fs::write(temp.path().join("fetches.wrong-revision"), "").expect("remote serves wrong pin");
+        let error = validate_frozen_skills(bundle, &selected, &declared, &tokens, &runner).await.expect_err("exact revision required");
+        assert!(error.contains("revision"), "{error}");
+        assert_eq!(std::fs::read_to_string(token).expect("operator token survives refusal"), "test-token");
     }
 
     // #2875: failures before the Git script carry the same named context and

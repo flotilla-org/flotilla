@@ -30,6 +30,7 @@ else
   GENERATION_VALIDATOR="$FLEET_INSTALL_SCRIPT_DIR/../ci/fleet-candidates/generation_validation.py"
 fi
 readonly GENERATION_VALIDATOR
+readonly SKILL_PROBE_TOKENS="${FLEET_INSTALL_SKILL_PROBE_TOKENS:-}"
 readonly CONFIRM_TIMEOUT_SECONDS="${FLEET_INSTALL_CONFIRM_TIMEOUT_SECONDS:-30}"
 PLATFORM=""
 AUTH_HEADER_FILE=""
@@ -733,8 +734,12 @@ activate_staged_generation() {
   run_generation_canary "$generation"
   if [[ -n "$(current_generation)" ]]; then
     printf 'fleet-install: validating live stored records with candidate generation %s\n' "$generation"
-    "$release/bin/flotilla" --socket "$DAEMON_SOCKET" resource validate --from-daemon \
-      || die "candidate generation $generation cannot decode the running daemon's stored records"
+    local validation_args=(--skill-sources "$release/share/flotilla/skills" --skill-catalog "$release/share/flotilla/skills/.flotilla-skill-catalog.json")
+    if [[ -n "$SKILL_PROBE_TOKENS" ]]; then
+      validation_args+=(--skill-probe-tokens "$SKILL_PROBE_TOKENS")
+    fi
+    "$release/bin/flotilla" --socket "$DAEMON_SOCKET" resource validate --from-daemon "${validation_args[@]}" \
+      || die "candidate generation $generation failed live-store or frozen-reference validation"
   fi
   # Verification is the only activation step that needs this process's work
   # directory. Release it before service mutation so interruption cannot leak

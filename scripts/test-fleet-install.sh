@@ -114,6 +114,9 @@ make_generation() {
     printf '#!/usr/bin/env bash\nif [[ "${1:-}" == daemon && "${2:-}" == stop ]]; then echo "daemon stop requested"; exit "${STOP_FAIL:-0}"; fi\n' >"$bundle/bin/$name"
     if [[ "$name" == flotilla ]]; then
       cat >>"$bundle/bin/$name" <<EOF
+if [[ "\${1:-}" == --socket && "\${3:-}" == resource && "\${4:-}" == validate && -n "\${FLEET_VALIDATION_LOG:-}" ]]; then
+  printf '%s\\n' "\$@" >>"\$FLEET_VALIDATION_LOG"
+fi
 if [[ "\${1:-}" == --socket && "\${3:-}" == resource && "\${4:-}" == validate && "\${5:-}" == --from-daemon && "\${FLEET_VALIDATE_FAIL_FOR:-}" == "$generation" ]]; then
   exit 1
 fi
@@ -584,10 +587,17 @@ test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = 
 "$test_root/home/.local/opt/flotilla-fleet/current/bin/flotilla" --socket "$test_root/home/.config/flotilla/run/flotilla.sock" fleet check >/dev/null \
   || fail 'handoff failure did not leave the old generation restartable'
 
-if FLEET_VALIDATE_FAIL_FOR="$generation_two" run_installer "$generation_two" >"$test_root/validation.out" 2>&1; then
+if FLEET_VALIDATION_LOG="$test_root/frozen-arguments.log" FLEET_INSTALL_SKILL_PROBE_TOKENS="$test_root/probe-tokens.json" FLEET_VALIDATE_FAIL_FOR="$generation_two" run_installer "$generation_two" >"$test_root/validation.out" 2>&1; then
   fail 'candidate with incompatible stored records was installed'
 fi
-grep -Fq 'cannot decode the running daemon' "$test_root/validation.out" \
+# The activation gate receives the candidate supply, never current-generation
+# skills, and forwards the operator's explicit credential probe map.
+for expected in --skill-sources --skill-catalog --skill-probe-tokens "$test_root/probe-tokens.json"; do
+  grep -Fxq -- "$expected" "$test_root/frozen-arguments.log" || fail "missing frozen-reference argument: $expected"
+done
+grep -Fxq "$test_root/home/.local/opt/flotilla-fleet/releases/$generation_two/share/flotilla/skills" "$test_root/frozen-arguments.log" \
+  || fail 'frozen-reference gate did not use candidate skill supply'
+grep -Fq 'failed live-store or frozen-reference validation' "$test_root/validation.out" \
   || fail 'candidate validation failure was not reported'
 test "$(link_generation "$test_root/home/.local/opt/flotilla-fleet/current")" = "$generation_one" \
   || fail 'candidate validation failure switched current'
