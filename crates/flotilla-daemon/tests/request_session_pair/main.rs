@@ -3767,11 +3767,13 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
         );
         let message = &messages.items[0];
         assert_eq!(message.spec.relation, flotilla_resources::MessageRelation::Supervisor);
-        assert_eq!(message.spec.sender, "system:stall-judge");
+        assert_eq!(message.spec.sender, "project/stalled-work/work/coder");
         assert!(message.spec.body.starts_with("Escalated from coder@work in coder@project:"), "{}", message.spec.body);
         assert!(message.spec.body.contains("Supervise stalled crew coder@work in convoy coder@project (resource ref: stalled-work)"));
         assert!(message.spec.body.contains("--convoy 'stalled-work' --vessel 'work' --role 'coder' resume"));
     }
+    let escalation_name =
+        b_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("governor inbox").items[0].metadata.name.clone();
     // The governor may issue supervision from B: route back to A and
     // validate B's replicated identity at the stalled convoy's home.
     apply_convoy_replica_feed(b, "flotilla", "stalled-work", a.host_name().clone()).await;
@@ -3811,6 +3813,9 @@ async fn cross_host_supervision_scenario(scenario: SupervisionScenario) {
     let status = convoys.get("stalled-work").await.expect("source").status.expect("status");
     assert!(status.stalled.is_none());
     assert_eq!(status.crew_work["work"]["coder"].phase, CrewWorkPhase::Working);
+    // Reply identity does not depend on the escalation replicating back from B.
+    let replies = a_backend.using::<flotilla_resources::Message>("flotilla").list().await.expect("source replies");
+    assert!(replies.items.iter().any(|message| message.spec.in_reply_to.as_deref() == Some(escalation_name.as_str())));
 }
 
 #[tokio::test]
