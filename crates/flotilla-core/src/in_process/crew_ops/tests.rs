@@ -1063,7 +1063,7 @@ async fn capabilities_use_live_deliveries_and_supersede_changed_cards() {
             assert_eq!(references, &BTreeSet::from(["github".into()]));
             Ok(self.0.read().await.clone())
         }
-        async fn endpoints(&self, _: &str) -> Result<BTreeMap<String, String>, String> {
+        async fn endpoints(&self, _: &str, _: &str) -> Result<BTreeMap<String, String>, String> {
             Ok(self.1.read().await.clone())
         }
     }

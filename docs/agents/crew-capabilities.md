@@ -56,8 +56,11 @@ Messages with a `capabilities@<revision>` subject and an explicit supersession
 chain. Inbox admission suppresses pending predecessors, and existing transport
 accounting delivers the latest card once at a turn boundary. An unchanged card
 creates no Message. Each failed session is logged and collected into an aggregate
-error after all other sessions have been attempted. Launch observation persistence
-is advisory: failures warn while the launch still receives the inline card.
+error after all other sessions have been attempted. Launch capability construction and observation persistence
+are advisory: read failures warn and append an unavailable-facts card with the
+live command, while persistence failures retain the constructed inline card.
+Endpoint observations are keyed by environment and TerminalSession so a launch
+or relaunch cannot overwrite another session's endpoints in a shared environment.
 A changed card on relaunch retains the supersession chain and can appear both
 in the first-turn prompt and as a Message; this preserves durable pending updates
 through restart rather than silently clearing them. An unchanged relaunch creates

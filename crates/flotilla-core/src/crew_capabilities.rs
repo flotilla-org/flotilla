@@ -26,7 +26,8 @@ pub struct CredentialCapability {
 #[async_trait]
 pub trait SessionCapabilitySource: Send + Sync {
     async fn credentials(&self, environment: &str, references: &BTreeSet<String>) -> Result<Vec<CredentialCapability>, String>;
-    async fn endpoints(&self, _environment: &str) -> Result<BTreeMap<String, String>, String> {
+    /// Reports environment-wide endpoints plus this session's delivered endpoints.
+    async fn endpoints(&self, _environment: &str, _session: &str) -> Result<BTreeMap<String, String>, String> {
         Ok(BTreeMap::new())
     }
 }
@@ -342,9 +343,15 @@ async fn refresh_session_card(
 ) -> Result<(), String> {
     let TerminalSessionSource::Agent { context, .. } = &session.spec.source else { return Ok(()) };
     let credentials = source.credentials(&session.spec.env_ref, &credential_references(session)?).await?;
-    let card =
-        session_card(backend, namespace, &context.convoy, &session.spec, &credentials, &source.endpoints(&session.spec.env_ref).await?)
-            .await?;
+    let card = session_card(
+        backend,
+        namespace,
+        &context.convoy,
+        &session.spec,
+        &credentials,
+        &source.endpoints(&session.spec.env_ref, &session.metadata.name).await?,
+    )
+    .await?;
     observe_card(backend, namespace, session, &card).await
 }
 

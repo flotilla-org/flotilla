@@ -265,7 +265,7 @@ pub(crate) struct CredentialStore {
     prepared: Mutex<BTreeSet<(String, String)>>,
     work_deliveries: Mutex<BTreeMap<String, BTreeSet<String>>>,
     capability_scopes: Mutex<BTreeMap<(String, String), Vec<String>>>,
-    capability_endpoints: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
+    capability_endpoints: Mutex<BTreeMap<(String, String), BTreeMap<String, String>>>,
     ledger_delivery_environment: Mutex<BTreeMap<String, LedgerDeliveryRecord>>,
     materials: Mutex<BTreeMap<(String, String), String>>,
     git_config_fragments: Mutex<BTreeMap<String, BTreeMap<String, Fragment>>>,
@@ -869,6 +869,8 @@ impl CredentialStore {
                 let paths = delivery_paths.as_ref().expect("GitHub App adapter resolves delivery paths");
                 self.github_app_deliveries.lock().await.insert(cache_key.clone(), GithubAppDelivery {
                     generation: uuid::Uuid::new_v4(),
+                    // A successful mint accepts the explicit requested permission ceiling.
+                    // Without a response or an explicit request, permissions stay unknown.
                     effective_permissions: effective_permissions.or_else(|| request.permissions.clone()),
                     request,
                     runner: Arc::clone(&runner),
@@ -933,11 +935,13 @@ impl CredentialStore {
         // Retain only paths and endpoint metadata, keyed by credential so a
         // redelivery can replace its own path without disturbing another grant.
         self.ledger_delivery_environment.lock().await.entry(environment_ref.to_string()).or_default().extend(ledger_deliveries);
+        let mut scopes = self.capability_scopes.lock().await;
         for key in &prepared_cache_keys {
             let repositories =
                 credential_scopes.get(&key.1).map(|scope| scope.iter().map(ToString::to_string).collect()).unwrap_or_default();
-            self.capability_scopes.lock().await.insert(key.clone(), repositories);
+            scopes.insert(key.clone(), repositories);
         }
+        drop(scopes);
         self.prepared.lock().await.extend(prepared_cache_keys);
         Ok(env.into_iter().collect())
     }
@@ -1248,7 +1252,7 @@ impl CredentialStore {
     pub(crate) async fn forget_environment(&self, environment_ref: &str) -> Result<(), String> {
         self.work_deliveries.lock().await.remove(environment_ref);
         self.ledger_delivery_environment.lock().await.remove(environment_ref);
-        self.capability_endpoints.lock().await.remove(environment_ref);
+        self.capability_endpoints.lock().await.retain(|(environment, _), _| environment != environment_ref);
         self.capability_scopes.lock().await.retain(|(environment, _), _| environment != environment_ref);
         self.cleaned_delivery_environments.lock().await.remove(environment_ref);
         self.prepared.lock().await.retain(|(cached_environment, _)| cached_environment != environment_ref);
@@ -1311,9 +1315,9 @@ impl CredentialStore {
         Ok(())
     }
 
-    pub(crate) async fn record_capability_endpoints(&self, environment: &str, env: &[(String, String)]) {
+    pub(crate) async fn record_capability_endpoints(&self, environment: &str, session: &str, env: &[(String, String)]) {
         let endpoints = env.iter().filter_map(|(key, value)| flotilla_core::crew_capabilities::endpoint_for_env(key, value)).collect();
-        self.capability_endpoints.lock().await.insert(environment.to_string(), endpoints);
+        self.capability_endpoints.lock().await.insert((environment.to_string(), session.to_string()), endpoints);
     }
 
     pub(crate) async fn tracked_work_deliveries(&self) -> BTreeMap<String, BTreeSet<String>> {
@@ -1504,6 +1508,8 @@ impl CredentialStore {
                 current.issued_at = self.clock.now();
                 current.refresh_failures = 0;
                 current.next_refresh_attempt_at = None;
+                // Successful remints accept the explicit request when the response omits it;
+                // no request and no response still means unknown.
                 current.effective_permissions = token.permissions.or_else(|| request.permissions.clone());
                 current.request = request;
             }
@@ -3254,6 +3260,28 @@ mod tests {
             Arc::new(RecordingRunner::default()),
             PathBuf::from("/tmp/flotilla-test-state"),
         )
+    }
+
+    // Session endpoint observations must not leak or overwrite one another in
+    // shared environments. Relaunch replaces only that session's delivered facts.
+    #[tokio::test]
+    async fn capability_endpoints_isolate_sessions_in_shared_environments() {
+        use flotilla_core::crew_capabilities::SessionCapabilitySource;
+        let store = store_with_env(BTreeMap::new());
+        let first = vec![("HTTPS_PROXY".into(), "https://first:secret@127.0.0.1:7001/private".into())];
+        let second = vec![("DISPLAY".into(), ":2".into())];
+        store.record_capability_endpoints("shared", "first", &first).await;
+        let baseline = store.endpoints("shared", "first").await.unwrap();
+        store.record_capability_endpoints("shared", "second", &second).await;
+        assert_eq!(store.endpoints("shared", "first").await.unwrap(), baseline);
+        assert_eq!(store.endpoints("shared", "second").await.unwrap(), BTreeMap::from([("GUI display".into(), ":2".into())]));
+        assert!(store.endpoints("shared", "unknown").await.unwrap().is_empty());
+        assert!(store.endpoints("other", "first").await.unwrap().is_empty());
+        store.record_capability_endpoints("shared", "second", &[]).await;
+        assert!(store.endpoints("shared", "second").await.unwrap().is_empty());
+        assert_eq!(store.endpoints("shared", "first").await.unwrap(), baseline);
+        store.forget_environment("shared").await.unwrap();
+        assert!(store.endpoints("shared", "first").await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -5594,8 +5622,8 @@ mod http_contract;
 
 #[async_trait]
 impl flotilla_core::crew_capabilities::SessionCapabilitySource for CredentialStore {
-    async fn endpoints(&self, environment: &str) -> Result<BTreeMap<String, String>, String> {
-        Ok(self.capability_endpoints.lock().await.get(environment).cloned().unwrap_or_default())
+    async fn endpoints(&self, environment: &str, session: &str) -> Result<BTreeMap<String, String>, String> {
+        Ok(self.capability_endpoints.lock().await.get(&(environment.to_string(), session.to_string())).cloned().unwrap_or_default())
     }
 
     async fn credentials(
@@ -5611,7 +5639,7 @@ impl flotilla_core::crew_capabilities::SessionCapabilitySource for CredentialSto
             .filter(|(env, name)| env == environment && references.contains(name))
             .map(|(_, name)| name.clone())
             .collect::<BTreeSet<_>>();
-        let scopes = self.capability_scopes.lock().await;
+        let scopes = self.capability_scopes.lock().await.clone();
         let deliveries = self.github_app_deliveries.lock().await;
         let mut capabilities = Vec::new();
         for name in names {

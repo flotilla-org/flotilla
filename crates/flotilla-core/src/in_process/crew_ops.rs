@@ -626,7 +626,7 @@ impl CrewService {
             &context.convoy,
             &session.spec,
             &credentials,
-            &source.endpoints(&session.spec.env_ref).await?,
+            &source.endpoints(&session.spec.env_ref, &session.metadata.name).await?,
         )
         .await
     }

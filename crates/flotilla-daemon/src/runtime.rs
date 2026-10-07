@@ -177,10 +177,10 @@ impl SessionCapabilitySource for RuntimeSessionCapabilities {
         }
     }
 
-    async fn endpoints(&self, environment: &str) -> Result<BTreeMap<String, String>, String> {
+    async fn endpoints(&self, environment: &str, session: &str) -> Result<BTreeMap<String, String>, String> {
         let state = self.state.upgrade().ok_or("session capability runtime unavailable")?;
         let mut endpoints = match &state.credential_store {
-            Some(store) => store.endpoints(environment).await?,
+            Some(store) => store.endpoints(environment, session).await?,
             None => BTreeMap::new(),
         };
         if environment == state.host_direct_environment_name {
@@ -6799,17 +6799,27 @@ impl TerminalRuntime for TerminalControllerRuntime {
                     }
                 }
                 if let Some(store) = &self.state.credential_store {
-                    store.record_capability_endpoints(&spec.env_ref, &credential_env).await;
-                    let credentials = store.credentials(&spec.env_ref, &credential_refs).await?;
-                    let card = flotilla_core::crew_capabilities::session_card(
-                        &self.state.daemon.resource_backend(),
-                        &context.namespace,
-                        &context.convoy,
-                        spec,
-                        &credentials,
-                        &RuntimeSessionCapabilities { state: Arc::downgrade(&self.state) }.endpoints(&spec.env_ref).await?,
-                    )
-                    .await?;
+                    store.record_capability_endpoints(&spec.env_ref, name, &credential_env).await;
+                    let card = async {
+                        let credentials = store.credentials(&spec.env_ref, &credential_refs).await?;
+                        flotilla_core::crew_capabilities::session_card(
+                            &self.state.daemon.resource_backend(),
+                            &context.namespace,
+                            &context.convoy,
+                            spec,
+                            &credentials,
+                            &RuntimeSessionCapabilities { state: Arc::downgrade(&self.state) }.endpoints(&spec.env_ref, name).await?,
+                        )
+                        .await
+                    }
+                    .await;
+                    let card = match card {
+                        Ok(card) => card,
+                        Err(error) => {
+                            warn!(session = %name, %error, "failed to construct advisory launch capability card");
+                            format!("{}\n\nCapabilities are currently unavailable. Run `flotilla crew capabilities` when unsure or after the service recovers.\n", flotilla_core::crew_capabilities::CAPABILITIES_HEADING.trim_start())
+                        }
+                    };
                     if let Err(error) = flotilla_core::crew_capabilities::observe_launch_card(
                         &self.state.daemon.resource_backend(),
                         &context.namespace,
@@ -17510,12 +17520,23 @@ mod tests {
     enum LaunchObservationRecord {
         Present,
         Missing,
+        MissingConvoy,
+        MissingEnvironment,
     }
 
     // Advisory observation failures must not discard the inline card or prevent launch.
     #[tokio::test]
     async fn contained_claude_launch_keeps_inline_card_without_session_observation() {
         assert_contained_claude_invocation_home(false, LaunchObservationRecord::Missing).await;
+    }
+
+    // Capability context and endpoint reads are advisory: the assignment and
+    // delivered credentials must still reach the harness when those reads fail.
+    #[tokio::test]
+    async fn contained_claude_launch_survives_capability_context_read_failures() {
+        for observation in [LaunchObservationRecord::MissingConvoy, LaunchObservationRecord::MissingEnvironment] {
+            assert_contained_claude_invocation_home(false, observation).await;
+        }
     }
 
     async fn assert_contained_claude_invocation_home(private_home: bool, observation: LaunchObservationRecord) {
@@ -17540,29 +17561,31 @@ mod tests {
         let workspace = temp.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace");
         let env_id = EnvironmentId::new("contained-claude");
-        backend
-            .using::<Environment>(NAMESPACE)
-            .create(&empty_meta(env_id.as_str()), &EnvironmentSpec {
-                host_direct: None,
-                docker: Some(flotilla_resources::DockerEnvironmentSpec {
-                    image_composition: None,
-                    image_build_ref: None,
-                    memory_policy: Default::default(),
-                    host_ref: "host-test".into(),
-                    image: "contained-image".into(),
-                    declared_agent_adapters: BTreeSet::from(["claude-code".into()]),
-                    required_agent_adapters: BTreeSet::from(["claude-code".into()]),
-                    pull_policy: Default::default(),
-                    mounts: Vec::new(),
-                    env: if private_home {
-                        BTreeMap::from([("FLOTILLA_CREW_SKILLS".into(), "{\"coder\":[],\"reviewer\":[]}".into())])
-                    } else {
-                        BTreeMap::new()
-                    },
-                }),
-            })
-            .await
-            .expect("environment");
+        if !matches!(observation, LaunchObservationRecord::MissingEnvironment) {
+            backend
+                .using::<Environment>(NAMESPACE)
+                .create(&empty_meta(env_id.as_str()), &EnvironmentSpec {
+                    host_direct: None,
+                    docker: Some(flotilla_resources::DockerEnvironmentSpec {
+                        image_composition: None,
+                        image_build_ref: None,
+                        memory_policy: Default::default(),
+                        host_ref: "host-test".into(),
+                        image: "contained-image".into(),
+                        declared_agent_adapters: BTreeSet::from(["claude-code".into()]),
+                        required_agent_adapters: BTreeSet::from(["claude-code".into()]),
+                        pull_policy: Default::default(),
+                        mounts: Vec::new(),
+                        env: if private_home {
+                            BTreeMap::from([("FLOTILLA_CREW_SKILLS".into(), "{\"coder\":[],\"reviewer\":[]}".into())])
+                        } else {
+                            BTreeMap::new()
+                        },
+                    }),
+                })
+                .await
+                .expect("environment");
+        }
         // Credential preflight runs through the contained runner, so its
         // scratch directory must be inside the container user's writable
         // world rather than derived from daemon-host paths (#1508).
@@ -17649,11 +17672,13 @@ mod tests {
         };
         // Managed launch cards read durable context, just as the live command does.
         let backend = daemon.resource_backend();
-        backend
-            .using::<Convoy>(NAMESPACE)
-            .create(&empty_meta("demo"), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
-            .await
-            .expect("convoy");
+        if !matches!(observation, LaunchObservationRecord::MissingConvoy) {
+            backend
+                .using::<Convoy>(NAMESPACE)
+                .create(&empty_meta("demo"), &ConvoySpec::builder().workflow_ref("workflow".into()).build())
+                .await
+                .expect("convoy");
+        }
         backend
             .using::<Vessel>(NAMESPACE)
             .create(&empty_meta("demo-work"), &flotilla_resources::VesselSpec {
@@ -17701,7 +17726,12 @@ mod tests {
         // The first turn includes the assignment and its capability card, never token material.
         assert!(launch.command.contains("Implement the issue."));
         assert!(launch.command.contains("## Your capabilities"));
-        assert!(launch.command.contains("claude-max"));
+        if matches!(observation, LaunchObservationRecord::MissingConvoy | LaunchObservationRecord::MissingEnvironment) {
+            assert!(launch.command.contains("Capabilities are currently unavailable"));
+            assert!(launch.command.contains("flotilla crew capabilities"));
+        } else {
+            assert!(launch.command.contains("claude-max"));
+        }
         assert!(!launch.command.contains("oauth-secret-material"));
         assert!(!launch.command.contains("superseded-spec-token"));
         assert_eq!(launch.initial_size, Some(CREW_SESSION_SIZE));
