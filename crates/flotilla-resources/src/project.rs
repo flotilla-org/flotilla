@@ -370,18 +370,34 @@ pub fn normalize_issue_source(source: &IssueSource) -> IssueSource {
 }
 
 pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Repository>, project: &ProjectSpec) -> IssueSourceResolution {
+    let mut inventory = BTreeMap::new();
+    for member in &project.repositories {
+        inventory.insert(member.repo.to_string(), repositories.get(&member.repo.to_string()).await.map(|record| record.object));
+    }
+    resolve_project_issue_sources_from_inventory(&inventory, project)
+}
+
+/// Resolve authoritative Repository declarations from a pass-wide inventory.
+/// Clone mirrors never supply issue-source identity.
+pub fn resolve_project_issue_sources_from_inventory(
+    repositories: &BTreeMap<String, Result<ResourceObject<Repository>, ResourceError>>,
+    project: &ProjectSpec,
+) -> IssueSourceResolution {
     let mut bindings = Vec::new();
     for project_repository in &project.repositories {
-        let repository = match repositories.get(&project_repository.repo.to_string()).await {
-            Ok(repository) => repository,
-            Err(error) => {
+        let repository = match repositories.get(&project_repository.repo.to_string()) {
+            Some(Ok(repository)) => repository,
+            error => {
                 return IssueSourceResolution::Unavailable(IssueSourceUnavailable::RepositoryUnavailable {
                     repository: project_repository.repo.clone(),
-                    message: error.to_string(),
+                    message: match error {
+                        Some(Err(error)) => error.to_string(),
+                        _ => "repository absent from inventory".into(),
+                    },
                 });
             }
         };
-        if let Some(forge) = repository.object.spec.issue_source_forge() {
+        if let Some(forge) = repository.spec.issue_source_forge() {
             let source = normalize_issue_source(&IssueSource { service: forge.service_url, scope: forge.repository });
             let declaration = project.issue_source_bindings.iter().find(|binding| binding.source == source);
             if declaration.is_some_and(|binding| binding.exclude) {
@@ -395,7 +411,7 @@ pub async fn resolve_project_issue_sources(repositories: &ReplicaReadResolver<Re
                 alias: declaration
                     .and_then(|binding| binding.alias.clone())
                     .or_else(|| project_repository.alias.clone())
-                    .unwrap_or_else(|| repository.object.spec.leaf_slug()),
+                    .unwrap_or_else(|| repository.spec.leaf_slug()),
                 filter: declaration.map_or_else(IssueFilter::default, |binding| binding.filter.clone()),
                 create_with: declaration.map_or_else(BTreeMap::new, |binding| binding.create_with.clone()),
                 creatable: declaration.and_then(|binding| binding.creatable).unwrap_or(true),

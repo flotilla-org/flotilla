@@ -4,14 +4,20 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     panic::AssertUnwindSafe,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
+#[cfg(test)]
 use chrono::Utc;
 use flotilla_protocol::{DispatchBoardRepository, IssueSource};
 use futures::FutureExt;
 use tokio::{sync::Mutex, time::Instant};
+
+static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 // Allow paginated large-project forge reads several minutes while bounding hung refreshes.
@@ -19,7 +25,8 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Default)]
 struct Entry {
-    board: Option<DispatchBoardRepository>,
+    board: Option<Arc<DispatchBoardRepository>>,
+    revision: u64,
     last_attempt: Option<Instant>,
     refreshing: bool,
     error: Option<String>,
@@ -28,7 +35,10 @@ struct Entry {
 type SharedEntry = Arc<Mutex<Entry>>;
 
 #[derive(Clone, Default)]
-pub(super) struct DispatchBoardCache(Arc<Mutex<BTreeMap<IssueSource, SharedEntry>>>);
+pub(super) struct DispatchBoardCache(
+    Arc<Mutex<BTreeMap<IssueSource, SharedEntry>>>,
+    #[cfg(test)] pub(in crate::in_process) Arc<std::sync::atomic::AtomicUsize>,
+);
 
 impl DispatchBoardCache {
     /// Only a complete source inventory may retire entries. An old refresh owns
@@ -37,11 +47,26 @@ impl DispatchBoardCache {
         self.0.lock().await.retain(|source, _| sources.contains(source));
     }
 
+    #[cfg(test)]
     pub(super) async fn read<F, Fut>(&self, source: &IssueSource, load: F) -> Result<DispatchBoardRepository, String>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<DispatchBoardRepository, String>> + Send,
     {
+        self.read_snapshot(source, load).await.map(|(_, board)| {
+            let mut board = (*board).clone();
+            board.age_seconds = Utc::now().signed_duration_since(board.observed_at).num_seconds().max(0) as u64;
+            board
+        })
+    }
+
+    pub(super) async fn read_snapshot<F, Fut>(&self, source: &IssueSource, load: F) -> Result<(u64, Arc<DispatchBoardRepository>), String>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<DispatchBoardRepository, String>> + Send,
+    {
+        #[cfg(test)]
+        self.1.fetch_add(1, Ordering::Relaxed);
         let entry = self.0.lock().await.entry(source.clone()).or_default().clone();
         let mut entry_state = entry.lock().await;
         let state = &mut *entry_state;
@@ -64,25 +89,29 @@ impl DispatchBoardCache {
                 entry.last_attempt = Some(Instant::now());
                 match result {
                     Ok(board) => {
-                        entry.board = Some(board);
+                        if entry.board.as_ref().is_none_or(|previous| previous.issues != board.issues) {
+                            entry.revision = NEXT_REVISION.fetch_add(1, Ordering::Relaxed);
+                        }
+                        entry.board = Some(Arc::new(board));
                         entry.error = None;
                     }
-                    Err(error) => entry.error = Some(error),
+                    Err(error) => {
+                        if let Some(board) = &mut entry.board {
+                            Arc::make_mut(board).refresh_error = Some(error.clone());
+                        }
+                        entry.error = Some(error);
+                    }
                 }
             });
         }
-        let Some(mut board) = state.board.clone() else {
+        let Some(board) = state.board.clone() else {
             return Err(format!(
                 "board facts unavailable for {}: {}",
                 source.scope,
                 state.error.as_deref().unwrap_or("initial observation in progress; retry shortly")
             ));
         };
-        board.age_seconds = Utc::now().signed_duration_since(board.observed_at).num_seconds().max(0) as u64;
-        if state.error.is_some() {
-            board.refresh_error = state.error.clone();
-        }
-        Ok(board)
+        Ok((state.revision, board))
     }
 }
 
@@ -195,7 +224,7 @@ pub(super) mod tests {
         assert!(cache.read(&source, move || async { Ok(snapshot) }).await.is_err());
         settled(&cache, &source).await;
         // Make the observation old without using real-time sleeps.
-        cache.0.lock().await.get(&source).expect("entry").lock().await.board.as_mut().expect("board").observed_at -=
+        cache.0.lock().await.get(&source).expect("entry").lock().await.board.as_mut().map(Arc::make_mut).expect("board").observed_at -=
             chrono::Duration::seconds(120);
         tokio::time::advance(REFRESH_INTERVAL).await;
         let cached = cache.read(&source, || async { Err("forge offline".into()) }).await.expect("stale board");
@@ -288,6 +317,43 @@ pub(super) mod tests {
                 assert!(snapshot.refresh_error.is_none());
             }
         }
+    }
+
+    // #2859: cache revisions describe issue deltas, not polling time or refresh
+    // errors. Failed refreshes retain item-local observation timestamps; eviction
+    // and re-addition cannot reuse a cursor and hide replacement facts.
+    #[tokio::test(start_paused = true)]
+    async fn revisions_ignore_refresh_metadata_and_survive_readdition() {
+        let cache = DispatchBoardCache::default();
+        let source = source("org/revisions");
+        let original = board(&source, 2);
+        let initial = original.clone();
+        assert!(cache.read_snapshot(&source, move || async { Ok(initial) }).await.is_err());
+        settled(&cache, &source).await;
+        let (revision, snapshot) = cache.read_snapshot(&source, || async { panic!("cached") }).await.expect("snapshot");
+        let (_, duplicate) = cache.read_snapshot(&source, || async { panic!("cached") }).await.expect("duplicate");
+        assert!(Arc::ptr_eq(&snapshot, &duplicate));
+        tokio::time::advance(REFRESH_INTERVAL).await;
+        let mut refreshed = original.clone();
+        refreshed.observed_at += chrono::Duration::seconds(60);
+        cache.read_snapshot(&source, move || async { Ok(refreshed) }).await.expect("last good");
+        settled(&cache, &source).await;
+        assert_eq!(cache.read_snapshot(&source, || async { panic!("cached") }).await.expect("metadata refresh").0, revision);
+        tokio::time::advance(REFRESH_INTERVAL).await;
+        cache.read_snapshot(&source, || async { Err("offline".into()) }).await.expect("last good");
+        settled(&cache, &source).await;
+        let (stale_revision, stale) = cache.read_snapshot(&source, || async { panic!("backoff") }).await.expect("stale");
+        assert_eq!(stale_revision, revision);
+        assert_eq!(stale.issues, original.issues);
+        assert_eq!(stale.refresh_error.as_deref(), Some("offline"));
+        cache.retain_sources(&BTreeSet::new()).await;
+        let replaced = board(&source, 1);
+        assert!(cache.read_snapshot(&source, move || async { Ok(replaced) }).await.is_err());
+        settled(&cache, &source).await;
+        let (next_revision, replaced) = cache.read_snapshot(&source, || async { panic!("cached") }).await.expect("readded");
+        assert_ne!(next_revision, revision);
+        assert_eq!(replaced.issues.len(), 1);
+        assert!(replaced.refresh_error.is_none());
     }
 
     // Removed sources are forgotten. Completion of an old in-flight observation

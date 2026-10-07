@@ -1371,6 +1371,11 @@ impl crate::vcs::CheckoutVcsResolver for InProcessDaemon {
     }
 }
 
+pub type DispatchBoardInputs = BTreeMap<
+    String,
+    Result<(Vec<flotilla_resources::ResolvedIssueSourceBinding>, Vec<crate::dispatch_missions::MissionSourceSnapshot>), String>,
+>;
+
 pub struct InProcessDaemon {
     repos: Arc<RwLock<HashMap<flotilla_protocol::RepoIdentity, RepoState>>>,
     repo_order: RwLock<Vec<flotilla_protocol::RepoIdentity>>,
@@ -4990,33 +4995,74 @@ impl InProcessDaemon {
     ) -> Result<Vec<flotilla_protocol::DispatchBoardRepository>, String> {
         let namespace = self.provisioning_namespace().await;
         let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let projects =
+            projects.into_iter().filter(|project| project_filter.is_none_or(|name| name == project.metadata.name)).collect::<Vec<_>>();
+        let snapshot = self.collect_dispatch_board_inputs(&projects).await?;
+        if project_filter.is_none() && snapshot.values().all(Result::is_ok) {
+            let sources = snapshot
+                .values()
+                .filter_map(|input| input.as_ref().ok())
+                .flat_map(|(bindings, _)| bindings.iter().map(|binding| binding.source.clone()))
+                .collect();
+            self.dispatch_board_cache.retain_sources(&sources).await;
+        }
+        let mut repositories = BTreeMap::new();
+        let mut errors = Vec::new();
+        for input in snapshot.into_values() {
+            match input {
+                Ok((_, boards)) => {
+                    for (_, board) in boards {
+                        repositories.insert(board.source.clone(), board);
+                    }
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+        if errors.is_empty() {
+            Ok(repositories
+                .into_values()
+                .map(|board| {
+                    let mut board = (*board).clone();
+                    board.age_seconds = Utc::now().signed_duration_since(board.observed_at).num_seconds().max(0) as u64;
+                    board
+                })
+                .collect())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// One immutable source snapshot per pass, with failures isolated to bindings
+    /// that use the unavailable source. Repository declarations are read once.
+    pub async fn collect_dispatch_board_inputs(&self, projects: &[ResourceObject<Project>]) -> Result<DispatchBoardInputs, String> {
+        let namespace = self.provisioning_namespace().await;
+        let inventory =
+            self.resource_backend.including_replicas::<Repository>(&namespace).list().await.map_err(|error| error.to_string())?;
+        let inventory = inventory.items.into_iter().map(|record| (record.object.metadata.name.clone(), Ok(record.object))).collect();
+        let mut bindings_by_project = BTreeMap::new();
         let mut sources = std::collections::BTreeSet::new();
         let mut mission_issues = std::collections::BTreeSet::new();
-        let mut errors = Vec::new();
         for project in projects {
             if let Some(policy) = &project.spec.dispatch_policy {
                 mission_issues.extend(policy.missions.iter().filter_map(|mission| mission.issue.clone()));
             }
-            if project_filter.is_some_and(|name| name != project.metadata.name) {
-                continue;
-            }
-            let scope = flotilla_protocol::QueryScope::new(&project.metadata.namespace, &project.metadata.name);
-            match self.resolve_issue_source_bindings(&scope).await {
-                Ok(bindings) => sources.extend(bindings.into_iter().map(|binding| binding.source)),
-                Err(error) => errors.push(error),
-            }
+            let bindings = match flotilla_resources::resolve_project_issue_sources_from_inventory(&inventory, &project.spec) {
+                IssueSourceResolution::Available { bindings } => {
+                    sources.extend(bindings.iter().map(|binding| binding.source.clone()));
+                    Ok(bindings)
+                }
+                IssueSourceResolution::Unavailable(error) => Err(format!("project {}: {error:?}", project.metadata.name)),
+            };
+            bindings_by_project.insert(project.metadata.name.clone(), bindings);
         }
-        if project_filter.is_none() && errors.is_empty() {
-            self.dispatch_board_cache.retain_sources(&sources).await;
-        }
-        let mut repositories = Vec::new();
+        let mut repositories = BTreeMap::new();
         for source in sources {
             let daemon = self.self_weak.clone();
             let tracker_source = source.clone();
             let mission_issues = mission_issues.clone();
-            match self
+            let result = self
                 .dispatch_board_cache
-                .read(&source, move || async move {
+                .read_snapshot(&source, move || async move {
                     let daemon = daemon.upgrade().ok_or("daemon stopped")?;
                     let provider = daemon.issue_provider_for_source(&tracker_source).await?;
                     let mut board = provider.dispatch_board(&tracker_source).await?;
@@ -5037,17 +5083,19 @@ impl InProcessDaemon {
                     }
                     Ok(board)
                 })
-                .await
-            {
-                Ok(board) => repositories.push(board),
-                Err(error) => errors.push(error),
-            }
+                .await;
+            repositories.insert(source, result);
         }
-        if errors.is_empty() {
-            Ok(repositories)
-        } else {
-            Err(errors.join("; "))
-        }
+        Ok(bindings_by_project
+            .into_iter()
+            .map(|(name, bindings)| {
+                let input = bindings.and_then(|bindings| {
+                    let boards = bindings.iter().map(|binding| repositories[&binding.source].clone()).collect::<Result<Vec<_>, _>>()?;
+                    Ok((bindings, boards))
+                });
+                (name, input)
+            })
+            .collect())
     }
 
     pub async fn dispatch_queue_internal(&self, project_filter: Option<&str>) -> Result<DispatchQueueResponse, String> {

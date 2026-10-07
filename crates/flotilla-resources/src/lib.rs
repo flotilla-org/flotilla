@@ -196,11 +196,11 @@ pub use principal_attention::{
     Regard, RegardExpiryPolicy, RegardSource, RegardSpec, RegardStatus, RegardStatusPatch,
 };
 pub use project::{
-    normalize_issue_source, normalize_project_spec, resolve_project_issue_sources, DeclarationRefusedCondition, DispatchLane,
-    DispatchMission, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry, IssueFieldValue, IssueFilter, IssueSource,
-    IssueSourceBindingSpec, IssueSourceResolution, IssueSourceUnavailable, OperationalEntriesCondition, Project, ProjectRepositoryRole,
-    ProjectRepositorySpec, ProjectSpec, ProjectStatus, ProjectStatusPatch, ResolvedIssueSourceBinding,
-    DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
+    normalize_issue_source, normalize_project_spec, resolve_project_issue_sources, resolve_project_issue_sources_from_inventory,
+    DeclarationRefusedCondition, DispatchLane, DispatchMission, DispatchPolicy, DispatchQueueAttention, DispatchQueueEntry,
+    IssueFieldValue, IssueFilter, IssueSource, IssueSourceBindingSpec, IssueSourceResolution, IssueSourceUnavailable,
+    OperationalEntriesCondition, Project, ProjectRepositoryRole, ProjectRepositorySpec, ProjectSpec, ProjectStatus, ProjectStatusPatch,
+    ResolvedIssueSourceBinding, DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS,
 };
 pub use project_hierarchy::ProjectHierarchy;
 pub use provisioning_identity::{canonicalize_repo_url, clone_key, descriptive_repo_slug, forge_clone_key, forge_repo_key, repo_key};
