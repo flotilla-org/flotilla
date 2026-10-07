@@ -38,6 +38,11 @@ pub struct DispatchBoardResponse {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchBoardRepository {
+    /// Completion time of the last successful tracker observation.
+    pub observed_at: DateTime<Utc>,
+    pub age_seconds: u64,
+    /// A failed refresh does not discard previously observed facts.
+    pub refresh_error: Option<String>,
     pub source: IssueSource,
     pub issues: Vec<DispatchBoardIssue>,
     pub pull_requests: Vec<DispatchBoardPullRequest>,
