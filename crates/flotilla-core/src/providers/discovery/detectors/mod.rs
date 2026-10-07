@@ -7,12 +7,14 @@ pub mod git;
 use generic::{parse_first_dotted_version, CommandDetector, EnvVarDetector};
 
 use super::{HostDetector, RepoDetector};
-use crate::providers::{terminal::environment::HOST_ENVIRONMENT_KEYS, vcs::detection::git_binary_detector};
+use crate::providers::{
+    container::docker::docker_binary_detector, terminal::environment::HOST_ENVIRONMENT_KEYS, vcs::detection::git_binary_detector,
+};
 
 pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
     let mut detectors: Vec<Box<dyn HostDetector>> = vec![
         Box::new(git_binary_detector()),
-        Box::new(CommandDetector::new("docker", &["--version"], parse_first_dotted_version).with_resolved_path()),
+        Box::new(docker_binary_detector()),
         Box::new(CommandDetector::new("curl", &["--version"], parse_first_dotted_version)),
         Box::new(CommandDetector::new("gh", &["--version"], parse_first_dotted_version)),
         Box::new(claude::ClaudeDetector),

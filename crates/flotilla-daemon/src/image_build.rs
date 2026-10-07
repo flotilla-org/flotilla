@@ -223,7 +223,7 @@ impl HostImageBuildRunner {
         let mut build_args = spec.layer.spec.args.clone();
         build_args.extend(spec.layer.spec.pins.iter().map(|(name, pin)| (name.clone(), pin.value.clone())));
         build_args.insert("BASE".into(), base);
-        if self.images.inspect(operation, &tag).await.is_err() {
+        if self.images.inspect(operation, &tag).await.map_err(transient)?.is_none() {
             let platform = format!("linux/{architecture}");
             let output = self
                 .images
@@ -247,7 +247,8 @@ impl HostImageBuildRunner {
                 return Err(ImageBuildFailure { class, reason });
             }
         }
-        let identity = self.images.inspect(operation, &tag).await.map_err(transient)?;
+        let identity =
+            self.images.inspect(operation, &tag).await.map_err(transient)?.ok_or_else(|| transient("built image is absent".into()))?;
         identity.validate().map_err(deterministic)?;
         let mut verified = BTreeSet::new();
         for provide in &spec.layer.spec.provides {
@@ -513,6 +514,7 @@ mod runner_contract {
         removed: std::sync::atomic::AtomicUsize,
         build_failure: Option<CommandOutput>,
         probe_failure: Option<CommandOutput>,
+        inspect_error: bool,
         hang_build: bool,
         hang_probe: bool,
     }
@@ -541,6 +543,11 @@ mod runner_contract {
             assert_eq!(args[0], "--config");
             assert!(Path::new(args[1]).file_name().expect("config directory").to_str().expect("UTF-8").starts_with("config-"));
             match args[2] {
+                "image" if self.inspect_error => Err("daemon unavailable".into()),
+                "image" => match self.run(cmd, args, _cwd, _label).await {
+                    Ok(stdout) => Ok(CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) }),
+                    Err(_) => Ok(CommandOutput { stdout: String::new(), stderr: "No such image: build tag".into(), exit_code: Some(1) }),
+                },
                 "buildx" => {
                     self.builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     assert_eq!(args[3], "build");
@@ -667,6 +674,16 @@ mod runner_contract {
             .reason(ImageBuildReason { description: "demand".into(), old_inputs: BTreeMap::new(), new_inputs: BTreeMap::new() })
             .build();
         (temp, builder, spec)
+    }
+
+    #[tokio::test]
+    async fn inspection_failure_retries_without_starting_a_build() {
+        let processes = Arc::new(DockerProcess { inspect_error: true, ..Default::default() });
+        let (_temp, builder, spec) = fixture(processes.clone()).await;
+        let result = builder.build("inspect-failure", &spec, &spec.inputs.parent_digest).await.expect("failure outcome");
+        let ImageBuildResult::Failed { failure, .. } = result else { panic!("transient failure expected") };
+        assert_eq!(failure.class, ImageBuildFailureClass::Transient);
+        assert_eq!(processes.builds.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

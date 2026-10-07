@@ -7,6 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use bytes::Bytes;
 use http::{Method, StatusCode};
 use sha2::{Digest, Sha256};
@@ -53,11 +54,12 @@ pub trait RegistryClient: Send + Sync {
 pub struct OciRegistryClient {
     http: Arc<dyn HttpClient>,
     credentials: Arc<dyn RegistryCredentials>,
-    builder: reqwest::Client,
 }
 impl OciRegistryClient {
+    /// The injected transport must return redirects without following them;
+    /// production uses ReqwestHttpClient::without_redirects.
     pub fn new(http: Arc<dyn HttpClient>, credentials: Arc<dyn RegistryCredentials>) -> Self {
-        Self { http, credentials, builder: crate::tls::client_builder().build().expect("registry request builder") }
+        Self { http, credentials }
     }
     fn endpoint(repository: &RegistryRepository, suffix: &str) -> Result<Url, String> {
         if !matches!(repository.origin.scheme(), "https" | "http")
@@ -90,13 +92,15 @@ impl OciRegistryClient {
     ) -> Result<http::Response<Bytes>, String> {
         let auth = self.credentials.resolve(&repository.credential, repository, action).await?;
         let send = |token: Option<&str>| {
-            let request = self.builder.request(method.clone(), url.clone()).header("Accept", ACCEPT);
-            match token {
-                Some(token) => request.bearer_auth(token),
-                None => request,
+            let mut request = reqwest::Request::new(method.clone(), url.clone());
+            request.headers_mut().insert(http::header::ACCEPT, http::HeaderValue::from_static(ACCEPT));
+            if let Some(token) = token {
+                request.headers_mut().insert(
+                    http::header::AUTHORIZATION,
+                    http::HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| "invalid registry token".to_string())?,
+                );
             }
-            .build()
-            .map_err(|_| "invalid registry request".to_string())
+            Ok::<_, String>(request)
         };
         let label = ChannelLabel::http_from_url(url.as_str());
         let response = self.http.execute(send(None)?, &label).await?;
@@ -123,6 +127,7 @@ impl OciRegistryClient {
             RegistryAction::Read => "pull",
             RegistryAction::Delete => "delete",
         });
+        // Refuse challenge scope expansion rather than silently granting a superset.
         if fields.get("scope").is_some_and(|requested| requested != &scope) {
             return Err("registry requested an undeclared token scope".into());
         }
@@ -135,12 +140,12 @@ impl OciRegistryClient {
             }
             query.append_pair("scope", &scope);
         }
-        let token_request = self
-            .builder
-            .get(realm.clone())
-            .basic_auth(&auth.username, Some(&auth.password))
-            .build()
-            .map_err(|_| "invalid registry token request")?;
+        let mut token_request = reqwest::Request::new(Method::GET, realm.clone());
+        token_request.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(&format!("Basic {}", STANDARD.encode(format!("{}:{}", auth.username, auth.password))))
+                .map_err(|_| "invalid registry credentials")?,
+        );
         let token_response = self
             .http
             .execute(token_request, &ChannelLabel::http_from_url(realm.as_str()))
@@ -230,7 +235,9 @@ impl RegistryClient for OciRegistryClient {
         if response.status() != StatusCode::OK {
             return Err(format!("registry manifest GET returned {}", response.status()));
         }
-        Self::verify_header(&response, digest)?;
+        if response.headers().contains_key("docker-content-digest") {
+            Self::verify_header(&response, digest)?;
+        }
         if format!("sha256:{:x}", Sha256::digest(response.body())) != digest {
             return Err("registry manifest content does not match requested digest".into());
         }
@@ -309,6 +316,9 @@ mod tests {
         calls: Mutex<Vec<String>>,
         corrupt: bool,
         foreign_realm: bool,
+        foreign_page: bool,
+        expanded_scope: bool,
+        omit_get_digest: bool,
     }
     const MANIFEST: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
     fn digest() -> String {
@@ -347,7 +357,10 @@ mod tests {
                     .status(401)
                     .header(
                         "www-authenticate",
-                        format!("Bearer realm=\"{realm}\",service=\"registry.test\",scope=\"repository:team/images:{action}\""),
+                        format!(
+                            "Bearer realm=\"{realm}\",service=\"registry.test\",scope=\"repository:team/images:{}\"",
+                            if self.expanded_scope { "pull,push" } else { action }
+                        ),
                     )
                     .body(body)
                     .expect("challenge"));
@@ -357,7 +370,14 @@ mod tests {
                 if last {
                     body = Bytes::from_static(br#"{"name":"team/images","tags":["second","first"]}"#);
                 } else {
-                    response = response.header("link", "</v2/team/images/tags/list?n=100&last=first>; rel=\"next\"");
+                    response = response.header(
+                        "link",
+                        if self.foreign_page {
+                            "<https://foreign.test/v2/team/images/tags/list?n=100>; rel=\"next\""
+                        } else {
+                            "</v2/team/images/tags/list?n=100&last=first>; rel=\"next\""
+                        },
+                    );
                     body = Bytes::from_static(br#"{"name":"team/images","tags":["first"]}"#);
                 }
                 return Ok(response.status(200).body(body).expect("tags"));
@@ -381,6 +401,9 @@ mod tests {
                         .status(200)
                         .header("docker-content-digest", digest())
                         .header("content-type", "application/vnd.oci.image.manifest.v1+json");
+                    if self.omit_get_digest {
+                        response.headers_mut().expect("headers").remove("docker-content-digest");
+                    }
                     body = if self.corrupt { Bytes::from_static(b"corrupt") } else { Bytes::from_static(MANIFEST) };
                 }
                 _ => {
@@ -393,6 +416,7 @@ mod tests {
     #[derive(Default)]
     struct Credentials {
         actions: Mutex<Vec<RegistryAction>>,
+        trust_foreign: bool,
     }
     #[async_trait]
     impl RegistryCredentials for Credentials {
@@ -401,7 +425,11 @@ mod tests {
                 return Err("credential scope refused".into());
             }
             self.actions.lock().expect("actions").push(action);
-            Ok(RegistryAuth { username: "user".into(), password: "secret".into(), token_origin: None })
+            Ok(RegistryAuth {
+                username: "user".into(),
+                password: "secret".into(),
+                token_origin: self.trust_foreign.then(|| Url::parse("https://untrusted.test").expect("issuer")),
+            })
         }
     }
     fn repository() -> RegistryRepository {
@@ -465,6 +493,27 @@ mod tests {
         assert_eq!(credentials.actions.lock().expect("actions").len(), usize::from(valid));
         if !valid {
             assert!(registry.calls.lock().expect("calls").is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn metadata_interop_and_scope_contracts() {
+        let client = OciRegistryClient::new(
+            Arc::new(Distribution { omit_get_digest: true, ..Default::default() }),
+            Arc::new(Credentials::default()),
+        );
+        assert_eq!(client.get(&repository(), &digest()).await.expect("header optional"), Some(Bytes::from_static(MANIFEST)));
+        let client = OciRegistryClient::new(
+            Arc::new(Distribution { foreign_realm: true, ..Default::default() }),
+            Arc::new(Credentials { trust_foreign: true, ..Default::default() }),
+        );
+        assert!(client.head(&repository(), &digest()).await.expect("declared issuer"));
+        for registry in
+            [Distribution { expanded_scope: true, ..Default::default() }, Distribution { foreign_page: true, ..Default::default() }]
+        {
+            let registry = Arc::new(registry);
+            let client = OciRegistryClient::new(registry.clone(), Arc::new(Credentials::default()));
+            assert!(client.tags(&repository()).await.is_err());
+            assert!(!registry.calls.lock().expect("calls").iter().any(|call| call.contains("foreign.test")));
         }
     }
 }

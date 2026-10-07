@@ -36,7 +36,7 @@ pub struct ImageBuildOptions<'a> {
 #[async_trait]
 pub trait ImageStore: Send + Sync {
     async fn build(&self, operation: ImageOperation<'_>, options: ImageBuildOptions<'_>) -> Result<CommandOutput, String>;
-    async fn inspect(&self, operation: ImageOperation<'_>, reference: &str) -> Result<PlacedImageIdentity, String>;
+    async fn inspect(&self, operation: ImageOperation<'_>, reference: &str) -> Result<Option<PlacedImageIdentity>, String>;
     async fn inventory(&self, operation: ImageOperation<'_>) -> Result<BTreeSet<String>, String>;
     async fn tag(&self, operation: ImageOperation<'_>, image: &str, reference: &str) -> Result<(), String>;
     async fn pull(&self, operation: ImageOperation<'_>, reference: &str) -> Result<String, String>;

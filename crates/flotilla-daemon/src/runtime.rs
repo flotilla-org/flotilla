@@ -858,10 +858,10 @@ impl DaemonRuntime {
                         .io(Arc::new(
                             crate::image_distribution::ProviderImageIo::builder()
                                 .images(Arc::clone(&images))
-                                .registry(
-                                    credential_store
-                                        .registry_client(&profile.host_id, Arc::new(flotilla_core::providers::ReqwestHttpClient::new())),
-                                )
+                                .registry(credential_store.registry_client(
+                                    &profile.host_id,
+                                    Arc::new(flotilla_core::providers::ReqwestHttpClient::without_redirects()),
+                                ))
                                 .credentials(Arc::clone(&credential_store))
                                 .host(profile.host_id.clone())
                                 .build(),

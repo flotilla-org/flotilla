@@ -812,6 +812,15 @@ impl ReqwestHttpClient {
         let client = crate::tls::client_builder().timeout(REQUEST_TIMEOUT).build().expect("build HTTP client");
         Self { client }
     }
+    /// Registry secrets must never follow a redirect to an undeclared endpoint.
+    pub fn without_redirects() -> Self {
+        let client = crate::tls::client_builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build registry HTTP client");
+        Self { client }
+    }
 }
 
 impl Default for ReqwestHttpClient {

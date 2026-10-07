@@ -239,7 +239,10 @@ impl ImageDistributionIo for ProviderImageIo {
     }
     async fn inspect(&self, reference: &str) -> Result<PlacedImageIdentity, String> {
         let config = tempfile::tempdir().map_err(|error| error.to_string())?;
-        self.images.inspect(ImageOperation { directory: config.path(), context: Path::new("/") }, reference).await
+        self.images
+            .inspect(ImageOperation { directory: config.path(), context: Path::new("/") }, reference)
+            .await?
+            .ok_or_else(|| "image is absent".into())
     }
 
     async fn push(&self, cache: &ImageCacheBinding, image_id: &str) -> Result<String, String> {
@@ -265,7 +268,10 @@ impl ImageDistributionIo for ProviderImageIo {
             .credential(cache.pull_credential.clone())
             .build();
         let digest = reference.rsplit_once('@').ok_or("cache reference has no digest")?.1;
-        if !self.registry.head(&repository, digest).await? {
+        // Metadata is advisory for interoperability: the content adapter still
+        // enforces the declared pull grant and immutable reference. A definite
+        // 404 is authoritative; auth/transport incompatibilities defer to pull.
+        if matches!(self.registry.head(&repository, digest).await, Ok(false)) {
             return Err("declared cache has no requested manifest".into());
         }
         self.credentials
@@ -341,6 +347,121 @@ mod tests {
             Ok(())
         }
     }
+    // Advisory metadata failures defer to the scoped content adapter; a definite
+    // missing manifest never logs in or starts a transfer.
+    #[tokio::test]
+    async fn provider_pull_handles_preflight_errors_and_missing_manifests() {
+        use flotilla_core::providers::{
+            container::docker::DockerImageStore,
+            discovery::{test_support::TestEnvVars, EnvironmentAssertion, EnvironmentBag},
+            ChannelLabel, CommandOutput, CommandRunner,
+        };
+        use flotilla_resources::{
+            CredentialConsumer, CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, CredentialLifecycle, CredentialSource,
+            CredentialSpec, CredentialSpecSpec, HostActionSelector,
+        };
+        struct Metadata(bool);
+        #[async_trait]
+        impl RegistryClient for Metadata {
+            async fn head(&self, _: &RegistryRepository, _: &str) -> Result<bool, String> {
+                if self.0 {
+                    Err("unsupported registry auth scheme".into())
+                } else {
+                    Ok(false)
+                }
+            }
+            async fn get(&self, _: &RegistryRepository, _: &str) -> Result<Option<bytes::Bytes>, String> {
+                panic!("unexpected GET")
+            }
+            async fn delete(&self, _: &RegistryRepository, _: &str) -> Result<(), String> {
+                panic!("unexpected DELETE")
+            }
+            async fn tags(&self, _: &RegistryRepository) -> Result<Vec<String>, String> {
+                panic!("unexpected tags")
+            }
+        }
+        #[derive(Default)]
+        struct Transfers(Mutex<Vec<String>>);
+        #[async_trait]
+        impl CommandRunner for Transfers {
+            async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+                self.run(cmd, args, cwd, label).await.map(|stdout| CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) })
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                true
+            }
+            async fn run(&self, _: &str, args: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+                self.0.lock().expect("calls").push(args[2].into());
+                Ok(String::new())
+            }
+            async fn run_with_input(
+                &self,
+                cmd: &str,
+                args: &[&str],
+                cwd: &Path,
+                label: &ChannelLabel,
+                input: &[u8],
+            ) -> Result<String, String> {
+                assert_eq!(input, b"secret");
+                self.run(cmd, args, cwd, label).await
+            }
+        }
+        for fail in [false, true] {
+            let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+            backend
+                .definitions::<CredentialSpec>("test")
+                .create(&InputMeta::builder().name("pull".into()).build(), &CredentialSpecSpec {
+                    consumer: CredentialConsumer::DockerRegistry { registry: "registry.test".into(), username: "user".into() },
+                    source: CredentialSource::Env { name: "REGISTRY_SECRET".into() },
+                    lifecycle: CredentialLifecycle::Static,
+                    placement: Default::default(),
+                })
+                .await
+                .expect("credential");
+            backend
+                .definitions::<CredentialGrant>("test")
+                .create(
+                    &InputMeta::builder().name("pull".into()).build(),
+                    &CredentialGrantSpec::builder()
+                        .selector(
+                            CredentialGrantSelector::builder()
+                                .host_action(HostActionSelector::builder().action(HostImageAction::ImagePull).build())
+                                .build(),
+                        )
+                        .credentials(BTreeSet::from(["pull".into()]))
+                        .build(),
+                )
+                .await
+                .expect("grant");
+            let runner = Arc::new(Transfers::default());
+            let directory = tempfile::tempdir().expect("state");
+            let credentials = Arc::new(CredentialStore::new(
+                backend,
+                "test",
+                Arc::new(TestEnvVars::new([("REGISTRY_SECRET", "secret")])),
+                EnvironmentBag::new().with(EnvironmentAssertion::binary("docker", "/test/docker")),
+                runner.clone(),
+                directory.path().into(),
+            ));
+            let io = ProviderImageIo {
+                images: Arc::new(DockerImageStore::new(runner.clone())),
+                registry: Arc::new(Metadata(fail)),
+                credentials,
+                host: "host".into(),
+            };
+            let reference = format!("{}@sha256:{}", cache().repository, "a".repeat(64));
+            let result = io.pull(&cache(), &reference).await;
+            let calls = runner.0.lock().expect("calls");
+            if fail {
+                assert!(result.is_ok(), "{result:?}");
+                assert_eq!(*calls, ["login", "pull"]);
+            } else {
+                assert!(result.is_err());
+                assert!(calls.is_empty());
+            }
+        }
+    }
+
     fn cache() -> ImageCacheBinding {
         ImageCacheBinding {
             repository: "registry.test/fleet/images".into(),

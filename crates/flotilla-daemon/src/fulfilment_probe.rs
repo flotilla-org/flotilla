@@ -5,7 +5,7 @@ use flotilla_core::providers::{
     container::{ContainerProbe, ImageOperation, ImageStore, ProbeDirectory},
     discovery::EnvVars,
     environment::ContainerRuntime,
-    ChannelLabel, CommandRunner,
+    ChannelLabel, CommandOutput, CommandRunner,
 };
 use flotilla_resources::{
     CachedModelProbe, FulfilmentFacts, FulfilmentGrant, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, ModelFact,
@@ -55,7 +55,7 @@ async fn run_in_realisation(
     binary: &str,
     args: &[&str],
     scratch: &Path,
-) -> Result<flotilla_core::providers::CommandOutput, String> {
+) -> Result<CommandOutput, String> {
     let cwd = scratch;
     let label = ChannelLabel::Default;
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -207,7 +207,8 @@ pub(crate) async fn probe_kind(
             .and_then(Result::ok),
             None => None,
         };
-        facts.image_present = Some(inspected.is_some());
+        facts.image_present = inspected.as_ref().map(Option::is_some);
+        let inspected = inspected.flatten();
         local_image_id = inspected.as_ref().map(|identity| identity.local_image_id.clone());
         if let Some(image) = facts.image.as_mut() {
             image.local_image_id = local_image_id.clone();
@@ -328,7 +329,37 @@ pub(crate) async fn probe_kind(
 mod tests {
     use std::sync::Arc;
 
-    use flotilla_core::providers::{container::docker::DockerImageStore, environment::docker::DockerEnvironmentProvider};
+    use flotilla_core::providers::{container::docker::DockerImageStore, environment::docker::DockerEnvironmentProvider, CommandOutput};
+    // This fulfilment collaborator models command responses independently of
+    // generated process names; adapter tests enforce naming and cleanup argv.
+    struct ProbeResponses<R>(Arc<R>);
+    impl<R> ProbeResponses<R> {
+        fn args<'a>(args: &'a [&'a str]) -> Vec<&'a str> {
+            let mut filtered = Vec::new();
+            let mut index = 0;
+            while index < args.len() {
+                if args[index] == "--name" && args.get(index + 1).is_some_and(|name| name.starts_with("flotilla-probe-")) {
+                    index += 2;
+                } else {
+                    filtered.push(args[index]);
+                    index += 1;
+                }
+            }
+            filtered
+        }
+    }
+    #[async_trait::async_trait]
+    impl<R: CommandRunner> CommandRunner for ProbeResponses<R> {
+        async fn exists(&self, cmd: &str, args: &[&str]) -> bool {
+            self.0.exists(cmd, args).await
+        }
+        async fn run(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<String, String> {
+            self.0.run(cmd, &Self::args(args), cwd, label).await
+        }
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+            self.0.run_output(cmd, &Self::args(args), cwd, label).await
+        }
+    }
     async fn probe_kind<R: CommandRunner + 'static>(
         spec: &FulfilmentKindSpec,
         image: Option<&str>,
@@ -338,8 +369,9 @@ mod tests {
         scratch: &Path,
         state: &mut ModelProbeState,
     ) -> Result<FulfilmentFacts, String> {
-        let images = DockerImageStore::new(runner.clone());
-        let runtime = DockerEnvironmentProvider::new(runner.clone());
+        let responses = Arc::new(ProbeResponses(runner.clone()));
+        let images = DockerImageStore::new(responses.clone());
+        let runtime = DockerEnvironmentProvider::new(responses);
         super::probe_kind(
             &ProbeContext {
                 containers: ContainerProviders { images: Some(&images), runtime: Some(&runtime) },
@@ -416,8 +448,16 @@ mod tests {
 
     #[tokio::test]
     async fn missing_image_is_a_fact_and_does_not_pull() {
-        let runner =
-            Arc::new(DiscoveryMockRunner::builder().on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new())).build());
+        let runner = Arc::new(
+            DiscoveryMockRunner::builder()
+                .on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new()))
+                .on_run(
+                    "docker",
+                    &["--config", "/tmp/flotilla-probe-test/registry-auth", "image", "inspect", "--format", "{{json .}}", "crew:missing"],
+                    Err("No such image: crew:missing".into()),
+                )
+                .build(),
+        );
         let env = TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]);
         let facts = probe_kind(
             &docker_kind(),
@@ -433,6 +473,64 @@ mod tests {
         assert_eq!(facts.image.as_ref().map(|image| image.image_ref.as_str()), Some("crew:missing"));
         assert_eq!(facts.image_present, Some(false));
         assert!(facts.harnesses.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inspection_timeout_remains_unknown() {
+        struct HangingInspection;
+        #[async_trait::async_trait]
+        impl CommandRunner for HangingInspection {
+            async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, label: &ChannelLabel) -> Result<CommandOutput, String> {
+                self.run(cmd, args, cwd, label).await.map(|stdout| CommandOutput { stdout, stderr: String::new(), exit_code: Some(0) })
+            }
+            async fn exists(&self, _: &str, _: &[&str]) -> bool {
+                true
+            }
+            async fn run(&self, cmd: &str, _: &[&str], _: &Path, _: &ChannelLabel) -> Result<String, String> {
+                if cmd == "docker" {
+                    std::future::pending::<()>().await;
+                }
+                Ok(String::new())
+            }
+        }
+        let runner = Arc::new(HangingInspection);
+        let env = TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]);
+        let facts = probe_kind(
+            &docker_kind(),
+            Some("crew:test"),
+            true,
+            &runner,
+            &env,
+            Path::new("/tmp/flotilla-probe-timeout"),
+            &mut ModelProbeState::default(),
+        )
+        .await
+        .expect("facts");
+        assert_eq!(facts.image_present, None);
+    }
+
+    #[tokio::test]
+    async fn unavailable_store_and_failed_inspection_remain_unknown() {
+        let scratch = Path::new("/tmp/flotilla-probe-test");
+        let runner =
+            Arc::new(DiscoveryMockRunner::builder().on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new())).build());
+        let env = TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]);
+        let failed = probe_kind(&docker_kind(), Some("crew:test"), true, &runner, &env, scratch, &mut ModelProbeState::default())
+            .await
+            .expect("facts");
+        assert_eq!(failed.image_present, None);
+        let runner =
+            Arc::new(DiscoveryMockRunner::builder().on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new())).build());
+        let absent = super::probe_kind(
+            &ProbeContext { containers: ContainerProviders { images: None, runtime: None }, runner: runner.as_ref(), env: &env, scratch },
+            &docker_kind(),
+            Some("crew:test"),
+            true,
+            &mut ModelProbeState::default(),
+        )
+        .await
+        .expect("facts");
+        assert_eq!(absent.image_present, None);
     }
 
     #[tokio::test]
@@ -581,13 +679,7 @@ mod tests {
             Err("unused".into())
         }
 
-        async fn run_output(
-            &self,
-            cmd: &str,
-            args: &[&str],
-            cwd: &Path,
-            _label: &ChannelLabel,
-        ) -> Result<flotilla_core::providers::CommandOutput, String> {
+        async fn run_output(&self, cmd: &str, args: &[&str], cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
             let stdout = match (cmd, args.first().copied()) {
                 ("mkdir", _) => String::new(),
                 ("claude", Some("--version")) => {

@@ -136,6 +136,11 @@ class GitBoundaryTests(unittest.TestCase):
             self.assertEqual(check.violations(f'fn a() {{ run!(runner, "{command}", args); }}', 'src/a.rs'), [1])
         self.assertEqual(check.violations('fn a() { runner.run("docker-compose", args); }', 'src/a.rs'), [])
 
+    def test_container_detector_lives_inside_adapter(self):
+        source = 'fn detector() { CommandDetector::new("docker", &["--version"], parse_first_dotted_version).with_resolved_path(); }'
+        self.assertEqual(check.violations(source, check.VCS + 'providers/discovery/detectors/mod.rs'), [1])
+        self.assertEqual(check.violations(source, check.VCS + 'providers/container/docker.rs'), [])
+
     # Every workspace member must opt into the shared lint or the Clippy gate
     # would silently stop enforcing the crate-relative path rule for that member.
     def test_workspace_lint_inheritance(self):
