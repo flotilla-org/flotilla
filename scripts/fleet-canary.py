@@ -92,12 +92,15 @@ def verify_baseline(report):
     env = report['environment']
     if env.get('RUSTUP_HOME') != '/usr/local/rustup':
         raise CanaryFailure('baseline RUSTUP_HOME missing or incorrect')
-    expected = {'user.name': 'flotilla-crew[bot]',
-                'user.email': '309902803+flotilla-crew[bot]@users.noreply.github.com',
-                'push.default': 'current'}
-    for key, value in expected.items():
-        if report['git'].get(key) != value:
-            raise CanaryFailure(f'baseline git config {key} missing or incorrect')
+    expected_identity = 'flotilla-crew[bot] <309902803+flotilla-crew[bot]@users.noreply.github.com>'
+    # git var reflects the identity Git will actually use, including injected
+    # GIT_AUTHOR_* / GIT_COMMITTER_* overrides. The timestamp is not policy.
+    for key in ('GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT'):
+        identity = report['git'].get(key)
+        if not isinstance(identity, str) or not identity.startswith(expected_identity + ' '):
+            raise CanaryFailure(f'baseline git identity {key} missing or incorrect')
+    if report['git'].get('push.default') != 'current':
+        raise CanaryFailure('baseline git config push.default missing or incorrect')
     if 'testing/SKILL.md' not in report['skills']:
         raise CanaryFailure('baseline crew skills missing')
     for key, value in env.items():
