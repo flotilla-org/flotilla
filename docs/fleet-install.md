@@ -131,3 +131,51 @@ and daemon and runs the production setup through convoy admission against
 them, then stops without waiting for Docker. Real feta/Docker runs
 are the operator's acceptance after merge. This gate replaces the manual
 post-roll "does a fresh crew launch" check.
+
+## Bootstrap helpers and synchronization
+
+The bootstrap must work before a healthy, trusted generation exists and when
+rolling back to an older generation without new installer subcommands. Its
+lock-owner release, secure nonce, token-mode inspection, launcher realpath
+check, atomic selection-link replacement, service-file rendering, Darwin
+fixed-path copying and confirmation disarming are commands in the existing
+`generation_validation.py` module. They must remain available independently
+of candidate daemon health and of the previous generation's CLI interface.
+Sync **both** `fleet-install` and `generation_validation.py` beside one another;
+do not deploy either alone. The incoming installer sends this same pair to
+feta for the canary gate. There is no additional bootstrap module or required
+generation payload path.
+
+Before crossing a payload boundary, stage the reviewed bootstrap/validator pair
+on every consumer, including feta. Keep the validator compatible with the
+retained rollback generations: rollback re-verifies the previous release using
+the installed validator, so rolling the binaries back does not repair an
+incompatible validator. Pruning does not synchronize or roll back that module.
+The old-generation fixtures in `ci/fleet-candidates/test-generation-validation.sh`
+exercise this rule.
+
+This extraction removes all twelve remaining Python heredocs from
+`fleet-install`: lock cleanup and stale-owner release, two nonces, token mode,
+two realpath checks, atomic link replacement, systemd path escaping, launchd
+plist rendering, Darwin fixed-path copying and confirmation disarming.
+The shell test's Python fixtures and assertions are ordinary functions in
+`scripts/fleet_install_test_support.py`; it no longer extracts and executes
+source text from the installer. Pruning, fleet diagnostics, health checks and
+post-install Cleat turnover already delegate to the selected generation's CLI.
+The shell retains download, verification, selection, service control and handoff.
+
+Run `ci/fleet-candidates/test-generation-validation.sh` and
+`scripts/test-fleet-install.sh` for local acceptance. The helper unit tests
+inject filesystem and entropy boundaries; the shell suite exercises bootstrap
+and handoff with fixture commands, and includes the canary contracts. For live
+operator acceptance on feta after merge, stage the reviewed pair beside one another, then run:
+
+```bash
+scripts/fleet-bootstrap-acceptance.sh /path/to/fleet-install <generation>
+```
+
+This operator script selects the adjacent validator and clears any inherited
+emergency canary bypass before invoking `--canary`. It runs the finalized
+generation's Docker canary without changing `current`; inspect retained
+diagnostics on failure before proceeding with a normal install. No Docker or
+live fleet is needed for the local tests.
