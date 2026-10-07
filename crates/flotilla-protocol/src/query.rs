@@ -20,6 +20,8 @@ pub struct DispatchQueueResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct DispatchQueueRow {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<crate::DispatchScore>,
     pub namespace: String,
     pub project: String,
     pub issue: crate::IssueRef,
@@ -54,6 +56,10 @@ pub struct DispatchBoardIssue {
     pub state: crate::IssueState,
     pub url: String,
     pub updated_at: String,
+    pub parent: Option<crate::IssueRef>,
+    pub issue_type: Option<String>,
+    #[builder(default)]
+    pub mission_fields: crate::MissionFields,
     pub closed_at: Option<String>,
     pub labels: Vec<String>,
     pub blocked_by: Vec<DispatchBoardDependency>,
@@ -76,7 +82,7 @@ pub struct DispatchBoardPullRequest {
 
 /// A result-row identity must retain Project scope even when two Projects
 /// contain the same external issue.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DispatchReadyKey {
     pub namespace: String,
     pub project: String,

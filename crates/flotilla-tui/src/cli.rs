@@ -323,11 +323,21 @@ fn format_dispatch_queue_human(response: &flotilla_protocol::DispatchQueueRespon
     }
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Project", "Issue", "Ready For", "Attention", "Title"]);
+    table.set_header(vec!["Project", "Issue", "Mission", "Priority", "Ready For", "Attention", "Title"]);
     for entry in &response.entries {
         table.add_row(vec![
             Cell::new(format!("{}/{}", entry.namespace, entry.project)),
             Cell::new(format!("{}#{}", entry.issue.source.scope, entry.issue.id)),
+            Cell::new(entry.score.as_ref().map_or("unranked", |score| score.mission.as_str())),
+            Cell::new(entry.score.as_ref().map_or_else(String::new, |score| {
+                format!(
+                    "{:?} value={} unblocks={} conflict={}",
+                    score.attributes.class_of_service,
+                    f64::from(score.attributes.value),
+                    score.unblock_count,
+                    score.conflict_penalty
+                )
+            })),
             Cell::new(format!("{}s", entry.age_seconds)),
             Cell::new(if entry.attention { "! stale" } else { "" }),
             Cell::new(&entry.title),

@@ -13,6 +13,9 @@ pub const DECLARATION_FILE_ANNOTATION: &str = "flotilla.work/project-declaration
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectDeclaration {
+    // Previous-generation charters omit dispatch policy (ADR 0047).
+    #[serde(default)]
+    pub dispatch_policy: Option<flotilla_resources::DispatchPolicy>,
     pub name: String,
     #[serde(default)]
     pub parent: Option<String>,
@@ -89,6 +92,18 @@ mod tests {
     use flotilla_resources::CapabilityNeed;
 
     use super::{parse_project_declaration, ProjectRepositoryRole};
+
+    // Glue: authored policy passes through the charter parser into typed inputs.
+    #[test]
+    fn parses_dispatch_policy_with_lanes_and_fractional_value() {
+        let declaration = parse_project_declaration("name: widgets\ndispatch_policy:\n  project_share: 2\n  missions:\n    - name: routine\n      attributes: {value: 3.5, crew_limit: 0}\n  lanes:\n    - mission: routine\n      labels: [bug]\nmembers:\n  - alias: widgets\n    url: https://github.com/org/widgets\n    roles: [code]\n").expect("charter policy");
+        let policy = declaration.dispatch_policy.expect("policy");
+        assert_eq!(policy.project_share, 2);
+        assert_eq!(f64::from(policy.missions[0].attributes.value), 3.5);
+        assert_eq!(policy.missions[0].attributes.crew_limit, Some(0));
+        assert_eq!(policy.lanes[0].labels, std::collections::BTreeSet::from(["bug".into()]));
+        assert_eq!(policy.routine_lane, "routine");
+    }
 
     #[test]
     fn parses_multi_role_members_as_a_set() {

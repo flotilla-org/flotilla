@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Read-only real-host acceptance after installing the candidate and configuring lanes.
+set -euo pipefail
+snapshot=$(mktemp)
+trap 'rm -f "$snapshot"' EXIT
+flotilla dispatch ready --json > "$snapshot"
+python3 - "$snapshot" <<'PY'
+import datetime
+import json
+import sys
+
+with open(sys.argv[1]) as source:
+    rows = json.load(source)["entries"]
+assert rows, "configure a ready ticket in a controlled Project first"
+classes = {"expedite": 0, "standard": 1, "background": 2}
+def key(row):
+    score = row["score"]
+    attributes = score["attributes"]
+    assert score["project_share"] > 0
+    assert set(score["attribute_sources"]) == {"value", "class_of_service", "crew_limit"}
+    return (classes[attributes["class_of_service"]], -attributes["value"],
+            -score["unblock_count"], datetime.datetime.fromisoformat(row["ready_observed_at"].replace("Z", "+00:00")),
+            score["conflict_penalty"], row["namespace"], row["project"],
+            row["issue"]["source"]["service"], row["issue"]["source"]["scope"], row["issue"]["id"])
+assert rows == sorted(rows, key=key), "ready work is not in the ruling order"
+for row in rows:
+    print(f'{row["project"]} #{row["issue"]["id"]}: {row["score"]}')
+print(f"Verified mission breakdown and global ordering for {len(rows)} ready tickets")
+PY

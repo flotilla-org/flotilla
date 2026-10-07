@@ -31,7 +31,7 @@ impl DispatchReadyProjection {
         }
         let (seq, rows, state) = self.sets.get(scope).expect("dispatch ready set inserted");
         let mut rows = rows.values().cloned().collect::<Vec<_>>();
-        rows.sort_by(|left, right| (&left.namespace, &left.project, &left.issue).cmp(&(&right.namespace, &right.project, &right.issue)));
+        rows.sort_by(flotilla_protocol::compare_dispatch_rows);
         ResultSet { seq: *seq, rows: Rows::DispatchReady { scope: scope.clone(), rows }, state: state.clone() }
     }
 

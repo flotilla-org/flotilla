@@ -10180,6 +10180,7 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
             .update_status(name, &project.metadata.resource_version, &ProjectStatus {
                 dispatch_queue: (0..400)
                     .map(|id| DispatchQueueEntry {
+                        score: None,
                         issue: flotilla_protocol::IssueRef { source: source.clone(), id: id.to_string() },
                         title: format!("Issue {id}"),
                         issue_as_of: now,

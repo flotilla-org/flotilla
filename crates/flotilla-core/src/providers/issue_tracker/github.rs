@@ -160,7 +160,7 @@ impl super::IssueProvider for GitHubIssueProvider {
                 "--limit",
                 &DISPATCH_BOARD_LIMIT.to_string(),
                 "--json",
-                "number,title,state,url,updatedAt,closedAt,labels,blockedBy,closedByPullRequestsReferences"
+                "number,title,state,url,updatedAt,closedAt,labels,blockedBy,closedByPullRequestsReferences,parent,issueType"
             ],
             &self.host_root
         )?;
@@ -207,6 +207,8 @@ impl super::IssueProvider for GitHubIssueProvider {
                     })
                     .url(string("url")?)
                     .updated_at(string("updatedAt")?)
+                    .maybe_issue_type(issue["issueType"]["name"].as_str().map(str::to_string))
+                    .maybe_parent(issue["parent"]["url"].as_str().map(crate::dispatch_missions::issue_ref_from_url).transpose()?)
                     .maybe_closed_at(issue["closedAt"].as_str().map(str::to_string))
                     .labels(
                         issue["labels"]
@@ -266,6 +268,34 @@ impl super::IssueProvider for GitHubIssueProvider {
             issues,
             pull_requests,
         })
+    }
+
+    async fn mission_fields(&self, reference: &IssueRef) -> Result<flotilla_protocol::MissionFields, String> {
+        use crate::providers::ChannelLabel;
+        let mut values = Vec::new();
+        for page in 1.. {
+            let endpoint = format!("repos/{}/issues/{}/issue-field-values?per_page=100&page={page}", reference.source.scope, reference.id);
+            let response = self.api.get_classified_response(&endpoint, &self.host_root, &ChannelLabel::GhApi(endpoint.clone())).await;
+            let response = match response {
+                Ok(response) => response,
+                // GitHub documents unsupported/not present fields as 404/410. Authentication,
+                // budgets and server errors remain unavailable evidence, never empty fields.
+                Err(error) if page == 1 && error.response.as_ref().is_some_and(|r| matches!(r.status, 404 | 410)) => {
+                    return Ok(Default::default())
+                }
+                Err(error) => return Err(error.error.to_string()),
+            };
+            let batch: Vec<serde_json::Value> = serde_json::from_str(&response.body).map_err(|error| error.to_string())?;
+            let count = batch.len();
+            values.extend(batch);
+            if count < 100 {
+                break;
+            }
+            if page >= 100 {
+                return Err("mission field window is truncated".into());
+            }
+        }
+        crate::dispatch_missions::parse_mission_fields(&values)
     }
 
     async fn dispatch_facts(&self, reference: &IssueRef) -> Result<flotilla_protocol::DispatchIssueFacts, String> {
@@ -765,6 +795,24 @@ mod tests {
         assert!(!landed.has_open_pull_request);
         session.finish();
     }
+    // The authenticated REST field request is recorded at the process seam;
+    // pure normalization tests cover the documented numeric/select payloads.
+    #[tokio::test]
+    async fn mission_fields_record_replay() {
+        let session = replay::test_session(&fixture("github_mission_fields.yaml"), Masks::new());
+        let (api, runner) = build_api_and_runner(&session);
+        let provider = GitHubIssueProvider::new(api, runner, Path::new("/"));
+        let fields = provider
+            .mission_fields(&IssueRef {
+                source: IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() },
+                id: "2783".into(),
+            })
+            .await
+            .expect("mission fields or documented unsupported fallback");
+        assert_eq!(fields, flotilla_protocol::MissionFields::default());
+        session.finish();
+    }
+
     // Daemon board facts use the documented gh JSON fields through the same
     // recorded process seam; clients need no tracker credentials of their own.
     #[tokio::test]
@@ -775,6 +823,8 @@ mod tests {
         let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
         let board = provider.dispatch_board(&source).await.expect("board facts");
         let dependent = board.issues.iter().find(|issue| issue.id == "2783").expect("dependent");
+        assert_eq!(dependent.issue_type.as_deref(), Some("Task"));
+        assert!(board.issues.iter().any(|issue| issue.parent.is_some()), "recorded native map ancestry must survive adapter decoding");
         assert!(dependent.blocked_by.iter().any(|blocker| blocker.url.ends_with("/issues/2782")));
         let landed = board.pull_requests.iter().find(|pr| pr.id == "1387").expect("landed PR");
         assert_eq!(landed.state, "merged");

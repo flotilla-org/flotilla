@@ -42,6 +42,11 @@ pub trait IssueProvider: Send + Sync {
         Err("board facts unavailable for this issue provider".into())
     }
 
+    /// Normalized optional mission fields. Unsupported sources use labels/charter.
+    async fn mission_fields(&self, _reference: &IssueRef) -> Result<flotilla_protocol::MissionFields, String> {
+        Ok(Default::default())
+    }
+
     async fn dispatch_facts(&self, _reference: &IssueRef) -> Result<flotilla_protocol::DispatchIssueFacts, String> {
         Err("native dispatch facts unavailable for this issue provider".into())
     }

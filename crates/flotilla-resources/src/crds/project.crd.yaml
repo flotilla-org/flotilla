@@ -86,6 +86,49 @@ spec:
                     enabled:
                       type: boolean
                       default: true
+                    project_share:
+                      type: integer
+                      minimum: 1
+                      default: 1
+                    routine_lane:
+                      type: string
+                      minLength: 1
+                      default: routine
+                    lanes:
+                      type: array
+                      items:
+                        type: object
+                        required: [mission, labels]
+                        properties:
+                          mission:
+                            type: string
+                          labels:
+                            type: array
+                            items: {type: string}
+                    missions:
+                      type: array
+                      items:
+                        type: object
+                        required: [name]
+                        properties:
+                          name:
+                            type: string
+                            minLength: 1
+                          issue:
+                            type: object
+                            nullable: true
+                            x-kubernetes-preserve-unknown-fields: true
+                          attributes:
+                            type: object
+                            properties:
+                              value: {type: number}
+                              class_of_service:
+                                type: string
+                                enum: [expedite, standard, background]
+                              crew_limit:
+                                type: integer
+                                nullable: true
+                                minimum: 0
                     stale_after_seconds:
                       type: integer
                       minimum: 1
@@ -156,6 +199,10 @@ spec:
                     type: object
                     required: [issue, title, issue_as_of, ready_observed_at, observed_at, provenance]
                     properties:
+                      score:
+                        type: object
+                        nullable: true
+                        x-kubernetes-preserve-unknown-fields: true
                       issue:
                         type: object
                         x-kubernetes-preserve-unknown-fields: true

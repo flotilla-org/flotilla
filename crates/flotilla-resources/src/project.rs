@@ -169,12 +169,48 @@ pub struct ResolvedIssueSourceBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
 pub struct DispatchPolicy {
+    // Previous-generation policies omit these (ADR 0047). Defaults also define optional charter inputs and remain after the roll.
+    #[builder(default)]
+    #[serde(default)]
+    pub missions: Vec<DispatchMission>,
+    #[builder(default)]
+    #[serde(default)]
+    pub lanes: Vec<DispatchLane>,
+    #[builder(default = "routine".into())]
+    #[serde(default = "default_routine_lane")]
+    pub routine_lane: String,
+    #[builder(default = 1)]
+    #[serde(default = "default_project_share")]
+    pub project_share: u32,
     #[builder(default = true)]
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[builder(default = DEFAULT_DISPATCH_QUEUE_STALE_AFTER_SECONDS)]
     #[serde(default = "default_dispatch_queue_stale_after_seconds")]
     pub stale_after_seconds: u64,
+}
+
+fn default_routine_lane() -> String {
+    "routine".into()
+}
+fn default_project_share() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+pub struct DispatchMission {
+    pub name: String,
+    pub issue: Option<flotilla_protocol::IssueRef>,
+    #[builder(default)]
+    #[serde(default)]
+    pub attributes: flotilla_protocol::MissionAttributes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchLane {
+    pub mission: String,
+    /// All labels must match. Empty rules deliberately catch all remaining work.
+    pub labels: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +245,9 @@ pub struct OperationalEntriesCondition {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchQueueEntry {
+    // Previous-generation status omits the score; remove after one roll (ADR 0047).
+    #[serde(default)]
+    pub score: Option<flotilla_protocol::DispatchScore>,
     pub issue: flotilla_protocol::IssueRef,
     pub title: String,
     pub issue_as_of: DateTime<Utc>,
@@ -494,7 +533,36 @@ pub fn normalize_project_spec(mut spec: ProjectSpec) -> Result<ProjectSpec, Stri
             pair[0].repo
         ));
     }
-    if let Some(policy) = &spec.dispatch_policy {
+    if let Some(policy) = &mut spec.dispatch_policy {
+        for mission in &mut policy.missions {
+            if let Some(reference) = &mut mission.issue {
+                reference.source = normalize_issue_source(&reference.source);
+                if reference.source.service == "github" {
+                    reference.source.service = "https://github.com".into();
+                }
+                if reference.source.service == "https://github.com" {
+                    reference.source.scope = reference.source.scope.to_ascii_lowercase();
+                }
+            }
+        }
+        if policy.project_share == 0 || policy.routine_lane.trim().is_empty() {
+            return Err("dispatch project_share must be positive and routine_lane nonempty".into());
+        }
+        let mut names = BTreeSet::new();
+        let mut issues = BTreeSet::new();
+        for mission in &policy.missions {
+            if mission.issue.as_ref().is_some_and(|issue| {
+                issue.id.trim().is_empty() || issue.source.service.trim().is_empty() || issue.source.scope.trim().is_empty()
+            }) || mission.name.trim().is_empty()
+                || !names.insert(&mission.name)
+                || mission.issue.as_ref().is_some_and(|i| !issues.insert(i))
+            {
+                return Err("dispatch mission names and tracking issues must be unique and nonempty".into());
+            }
+        }
+        if policy.lanes.iter().any(|lane| !names.contains(&lane.mission)) {
+            return Err("dispatch lane must name a declared mission".into());
+        }
         if policy.stale_after_seconds == 0 {
             return Err("dispatch policy stale_after_seconds must be at least 1".to_string());
         }

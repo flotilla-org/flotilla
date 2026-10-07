@@ -252,19 +252,13 @@ impl ReadProjections<'_> {
                         .ready_observed_at(entry.ready_observed_at)
                         .age_seconds(observed_at.signed_duration_since(entry.ready_observed_at).num_seconds().max(0) as u64)
                         .attention(attention)
+                        .maybe_score(entry.score.clone())
                         .provenance(entry.provenance)
                         .build(),
                 );
             }
         }
-        entries.sort_by(|left, right| {
-            (&left.namespace, &left.project, left.ready_observed_at, &left.issue).cmp(&(
-                &right.namespace,
-                &right.project,
-                right.ready_observed_at,
-                &right.issue,
-            ))
-        });
+        entries.sort_by(flotilla_protocol::compare_dispatch_rows);
         Ok(DispatchQueueResponse { observed_at, entries })
     }
 
@@ -2613,6 +2607,7 @@ mod tests {
             .using::<Project>("flotilla")
             .update_status("app", &current.metadata.resource_version, &ProjectStatus {
                 dispatch_queue: vec![DispatchQueueEntry {
+                    score: None,
                     issue: issue.clone(),
                     title: "Fix query".into(),
                     issue_as_of: earlier,
