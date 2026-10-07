@@ -124,7 +124,7 @@ class Refusals(unittest.TestCase):
 
     # Repair/rollback use flushed files and atomic replacements. A failure at
     # the second replacement restores both originals and cleans owned temps.
-    def test_atomic_durable_restore(self):
+    def test_atomic_durable_restore(self, fail_restore=False):
         with tempfile.TemporaryDirectory() as directory:
             paths = [Path(directory) / n for n in ['fleet-install', 'generation_validation.py']]
             for p in paths:
@@ -132,7 +132,7 @@ class Refusals(unittest.TestCase):
             events = Path(directory) / 'events.jsonl'
             # Fake only the OS write boundary to fail the second replacement
             # and observe atomic replacement/fsync; all file I/O remains real.
-            prelude = "import os, json\nevents_path = " + repr(str(events)) + "\n" + r'''
+            prelude = "import os, json\nevents_path = " + repr(str(events)) + "\nfail_restore = " + repr(fail_restore) + "\n" + r'''
 replace_real, fsync_real = os.replace, os.fsync
 def event(data):
     with open(events_path, 'a') as f:
@@ -141,6 +141,8 @@ def replace(source, destination):
     event(['replace', str(source), str(destination)])
     if '.new-' in str(source) and str(destination).endswith('generation_validation.py'):
         raise OSError('injected second replacement failure')
+    if fail_restore and '.restore-' in str(source) and str(destination).endswith('fleet-install'):
+        raise OSError('injected rollback failure')
     return replace_real(source, destination)
 def fsync(fd):
     event(['fsync'])
@@ -152,13 +154,25 @@ os.replace, os.fsync = replace, fsync
             payload = base64.b64encode(json.dumps(request).encode()).decode()
             result = subprocess.run(['python3', '-', payload], input=prelude + preroll.REMOTE, text=True, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
-            self.assertEqual([p.read_bytes() for p in paths], [b'old', b'old'])
+            self.assertEqual([p.read_bytes() for p in paths], [b'new' if fail_restore else b'old', b'old'])
+            if fail_restore:
+                self.assertIn('injected second replacement failure', result.stderr)
+                self.assertIn('rollback incomplete', result.stderr)
+                self.assertIn('injected rollback failure', result.stderr)
+                for p in paths:
+                    self.assertIn(str(p) + '.pre-gen-1', result.stderr)
+                    self.assertEqual(Path(str(p) + '.pre-gen-1').read_bytes(), b'old')
             recorded = [json.loads(line) for line in events.read_text().splitlines()]
             restores = [e for e in recorded if e[0] == 'replace' and '.restore-' in e[1]]
             self.assertEqual([e[2] for e in restores], [str(p) for p in paths])
             self.assertEqual(sum(e[0] == 'fsync' for e in recorded), 6)
             self.assertFalse(any(Path(directory).glob('*.new-*')))
             self.assertFalse(any(Path(directory).glob('*.restore-*')))
+
+    # A restore failure must preserve the original error and identify BOTH
+    # recovery backups, while still attempting the other member's restoration.
+    def test_failed_rollback_reports_backups(self):
+        self.test_atomic_durable_restore(fail_restore=True)
 
     # Repair refuses a missing or symlinked installed member before backing up
     # or writing either file; the other member remains unchanged.

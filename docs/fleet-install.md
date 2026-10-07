@@ -249,3 +249,7 @@ in `scripts/test-fleet-install.sh`. `--host-command /path/to/executable` injects
 the process boundary: it receives `HOST COMMAND` as two arguments, a Python
 program on stdin, and returns a JSON array of hashes on stdout. Production
 uses batch-mode SSH and Proxmox guest-exec; tests use no SSH or live fleet.
+Every target needs `python3` on its non-interactive SSH/guest-exec PATH,
+including comte on macOS; an interactive shell-only PATH setup is insufficient.
+A failed rollback names the original failure, each unrestored file, and both
+retained backups for operator recovery.

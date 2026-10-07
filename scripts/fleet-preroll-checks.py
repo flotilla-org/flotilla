@@ -29,6 +29,8 @@ if 'contents' in request:
             os.fchmod(f.fileno(), mode)
             f.flush()
             os.fsync(f.fileno())
+    # File contents are fsynced, but parent directory entries are not: a power
+    # loss can lose a rename. Retained backups support operator recovery.
     created_temporaries = []
     try:
         for p, data, mode in zip(paths, request['contents'], modes):
@@ -40,17 +42,25 @@ if 'contents' in request:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(temporary, p)
-    except BaseException:
+    except BaseException as original_error:
         # Restore with atomic replacement; retain the original backups.
+        restore_errors = []
         for p, b, mode in zip(paths, backups, modes):
-            with tempfile.NamedTemporaryFile(dir=p.parent, prefix=p.name + '.restore-', delete=False) as f:
-                restore = pathlib.Path(f.name)
-                created_temporaries.append(restore)
-                f.write(b.read_bytes())
-                os.fchmod(f.fileno(), mode)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(restore, p)
+            try:
+                with tempfile.NamedTemporaryFile(dir=p.parent, prefix=p.name + '.restore-', delete=False) as f:
+                    restore = pathlib.Path(f.name)
+                    created_temporaries.append(restore)
+                    f.write(b.read_bytes())
+                    os.fchmod(f.fileno(), mode)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(restore, p)
+            except Exception as error:
+                restore_errors.append(str(p) + ': ' + str(error))
+        if restore_errors:
+            raise RuntimeError('repair failed: ' + str(original_error) +
+                               '; rollback incomplete: ' + '; '.join(restore_errors) +
+                               '; recover BOTH files from backups: ' + ', '.join(map(str, backups))) from original_error
         raise
     finally:
         # Never remove another run's pre-existing collision file.
