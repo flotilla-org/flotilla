@@ -105,10 +105,12 @@ define_patch_kinds! {
     ConvoyQueueMessageFollowUp => DUPLICATE,
     ConvoyBeginMessageFollowUp => CONTINUATION,
     ConvoyRecordTurnDelivery => CONTINUATION,
+    ConvoyHoldTurnDelivery => NONE,
     ConvoyRefuseTurnDelivery => NONE,
     ConvoyFailTurnDelivery => NONE,
     ConvoyObserveQueuedTurnDeliveries => NONE,
     ConvoyRollUpWork => DUPLICATE_CONTINUATION_RESETTLEMENT,
+    TerminalHoldTurnDelivery => NONE,
     TerminalMarkStarting => NEW_ATTEMPT,
     TerminalClearRetiredLaunches => NONE,
     TerminalMarkRunning => DUPLICATE,
@@ -142,6 +144,7 @@ define_patch_kinds! {
 
 fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
     match patch {
+        ConvoyStatusPatch::HoldTurnDelivery { .. } => PatchKind::ConvoyHoldTurnDelivery,
         ConvoyStatusPatch::RestoreTurnActivation { .. } => PatchKind::ConvoyRestoreTurnActivation,
         ConvoyStatusPatch::RecordEnsureAdmission { .. }
         | ConvoyStatusPatch::DiscoverSubjects { .. }
@@ -193,6 +196,7 @@ fn convoy_patch_kind(patch: &ConvoyStatusPatch) -> PatchKind {
 
 fn terminal_session_patch_kind(patch: &TerminalSessionStatusPatch) -> PatchKind {
     match patch {
+        TerminalSessionStatusPatch::HoldTurnDelivery { .. } => PatchKind::TerminalHoldTurnDelivery,
         TerminalSessionStatusPatch::MarkStarting => PatchKind::TerminalMarkStarting,
         TerminalSessionStatusPatch::ClearRetiredLaunches => PatchKind::TerminalClearRetiredLaunches,
         TerminalSessionStatusPatch::MarkRunning { .. } => PatchKind::TerminalMarkRunning,
@@ -705,6 +709,7 @@ fn duplicate_lifecycle_transitions_do_not_restamp_timestamps() {
             exercise: || {
                 let mut status = TerminalSessionStatus {
                     configured_limits: None,
+                    turn_delivery_hold: None,
                     last_tool_activity_at: None,
                     last_output_digest: None,
                     last_output_activity_at: None,

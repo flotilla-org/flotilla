@@ -3325,7 +3325,7 @@ async fn completion_claim_observation_case(rate_limited: bool, missing_artifact:
                                 "Rebase onto the current base branch and file a fresh settlement claim; the previous claim is superseded."
                                     .to_string(),
                             )
-                            .hold(flotilla_resources::HoldAct::ChangeRequestComment { body: "paused".to_string() })
+                            .hold(flotilla_resources::HoldAct::State)
                             .build(),
                     )]),
                     vessels: vec![VesselRequirement::builder().name("work".to_string()).crew(vec![coder, bosun]).build()],

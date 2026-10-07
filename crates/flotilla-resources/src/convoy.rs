@@ -791,6 +791,24 @@ pub struct DiscoveredSubject {
 }
 
 impl ConvoyStatus {
+    /// Durable holds, including previous-generation refusal episodes that predate
+    /// the explicit state field. Surfaces share this projection without inventing policy.
+    pub fn turn_delivery_holds(&self) -> Vec<ConvoyAttention> {
+        self.turn_deliveries
+            .iter()
+            .filter_map(|(source, delivery)| {
+                delivery.hold.clone().or_else(|| {
+                    delivery.episodes.iter().rev().find_map(|episode| match &episode.outcome {
+                        TurnDeliveryOutcome::Refused { reason, refused_at, .. } => {
+                            Some(ConvoyAttention { source: source.clone(), reason: reason.clone(), raised_at: *refused_at })
+                        }
+                        _ => None,
+                    })
+                })
+            })
+            .collect()
+    }
+
     pub fn produces(&self, subject: &Subject) -> bool {
         self.subjects.iter().any(|entry| &entry.subject == subject && entry.relationship == Relationship::Produces)
     }
@@ -1112,6 +1130,9 @@ pub struct WorkflowSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TurnDeliveryStatus {
+    /// State-only automatic delivery hold. Remove the decoder default one roll after #2758.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<ConvoyAttention>,
     /// Remove this decoder default one fleet roll after delivery failures are stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<TurnDeliveryFailure>,
@@ -1468,6 +1489,10 @@ pub struct PlacementStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConvoyStatusPatch {
+    HoldTurnDelivery {
+        source: String,
+        hold: ConvoyAttention,
+    },
     /// Restore only a speculative turn activation still owned by this attempt.
     RestoreTurnActivation {
         vessel: String,
@@ -1716,6 +1741,11 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
             return;
         }
         match self {
+            Self::HoldTurnDelivery { source, hold } => {
+                let delivery = status.turn_deliveries.entry(source.clone()).or_default();
+                delivery.hold.get_or_insert_with(|| hold.clone());
+                status.attention = delivery.hold.clone();
+            }
             Self::RestoreTurnActivation { vessel, role, activated, previous } => {
                 let owned = activated.crew_work.get(vessel).and_then(|crew| crew.get(role));
                 let current = status.crew_work.get(vessel).and_then(|crew| crew.get(role));
@@ -2189,6 +2219,26 @@ impl StatusPatch<ConvoyStatus> for ConvoyStatusPatch {
                 }
             }
             Self::ResumeCrewWork { vessel, role, resumed_at, prompt, brief_id } => {
+                let held_sources: Vec<_> = status
+                    .workflow_snapshot
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|snapshot| &snapshot.turn_delivery)
+                    .filter(|(_, rule)| rule.to.vessel == *vessel && rule.to.role == *role)
+                    .filter(|(source, _)| {
+                        status.turn_deliveries.get(*source).is_some_and(|delivery| {
+                            delivery.hold.is_some()
+                                || delivery.episodes.iter().any(|episode| matches!(episode.outcome, TurnDeliveryOutcome::Refused { .. }))
+                        })
+                    })
+                    .map(|(source, _)| source.clone())
+                    .collect();
+                for source in held_sources {
+                    status.turn_deliveries.remove(&source);
+                    if status.attention.as_ref().is_some_and(|attention| attention.source == source) {
+                        status.attention = None;
+                    }
+                }
                 status.phase = ConvoyPhase::Active;
                 status.finished_at = None;
                 if let Some(work) = status.work.get_mut(vessel) {
@@ -3107,5 +3157,61 @@ mod subject_tests {
         status.discover_subject(subject, Relationship::Supersedes, SubjectDiscoverySource::Operator, later);
         assert_eq!(status.subjects.len(), 1);
         assert!(status.unlinked_subjects.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod hold_state_tests {
+    use super::*;
+    // #2758: repeat hold writes preserve the episode identity; resuming another
+    // crew leaves it intact, while resuming its target clears hold and attention.
+    #[hegel::test]
+    fn hold_is_stable_until_target_resume(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let repeats = tc.draw(gs::integers::<u32>().min_value(1).max_value(5));
+        let workflow = crate::single_agent_workflow_spec();
+        let mut status = ConvoyStatus {
+            workflow_snapshot: Some(WorkflowSnapshot {
+                cascade: None,
+                exit: workflow.exit,
+                turn_delivery: workflow.turn_delivery,
+                vessels: workflow.vessels,
+                stall_nudges: workflow.stall_nudges,
+                supervision: workflow.supervision,
+            }),
+            ..Default::default()
+        };
+        let at = DateTime::<Utc>::UNIX_EPOCH;
+        for index in 0..repeats {
+            ConvoyStatusPatch::HoldTurnDelivery {
+                source: "checks-settled".into(),
+                hold: ConvoyAttention {
+                    source: "checks-settled".into(),
+                    reason: "episode limit".into(),
+                    raised_at: at + chrono::Duration::seconds(i64::from(index)),
+                },
+            }
+            .apply(&mut status);
+            assert_eq!(status.turn_deliveries["checks-settled"].hold.as_ref().expect("hold").raised_at, at);
+        }
+        ConvoyStatusPatch::ResumeCrewWork {
+            vessel: "work".into(),
+            role: "reviewer".into(),
+            resumed_at: at,
+            prompt: "continue".into(),
+            brief_id: None,
+        }
+        .apply(&mut status);
+        assert!(status.turn_deliveries["checks-settled"].hold.is_some());
+        ConvoyStatusPatch::ResumeCrewWork {
+            vessel: "work".into(),
+            role: "coder".into(),
+            resumed_at: at,
+            prompt: "continue".into(),
+            brief_id: None,
+        }
+        .apply(&mut status);
+        assert!(!status.turn_deliveries.contains_key("checks-settled"));
+        assert!(status.attention.is_none());
     }
 }

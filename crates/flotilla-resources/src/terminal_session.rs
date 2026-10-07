@@ -320,6 +320,9 @@ pub struct TerminalSessionStatus {
     /// This deliberately does not participate in the session lifecycle phase.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<TerminalAttention>,
+    /// Automatic turn delivery hold. Remove the decoder default one roll after #2758.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_delivery_hold: Option<crate::ConvoyAttention>,
     /// Actual tool activity survives coalesced Working/Stop observations.
     /// Remove the decoder default one fleet roll after this field lands (ADR 0047).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -489,6 +492,9 @@ pub struct CrewSessionStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalSessionStatusPatch {
+    HoldTurnDelivery {
+        hold: crate::ConvoyAttention,
+    },
     /// Starts a new attempt after a stopped session by clearing the previous attempt's status.
     /// Failed-session retry is not currently a legal controller transition.
     MarkStarting,
@@ -561,13 +567,15 @@ pub enum TerminalSessionStatusPatch {
 impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
     fn apply(&self, status: &mut TerminalSessionStatus) {
         match self {
+            Self::HoldTurnDelivery { hold } => status.turn_delivery_hold = Some(hold.clone()),
             Self::MarkStarting => {
                 let completion_pending = status.completion_pending.take();
+                let turn_delivery_hold = status.turn_delivery_hold.take();
                 let mut retired_launches = std::mem::take(&mut status.retired_launches);
                 if let Some(crew) = status.crew.take() {
                     retired_launches.insert(crew.id);
                 }
-                *status = TerminalSessionStatus { completion_pending, retired_launches, ..Default::default() };
+                *status = TerminalSessionStatus { completion_pending, turn_delivery_hold, retired_launches, ..Default::default() };
             }
             Self::ClearRetiredLaunches => status.retired_launches.clear(),
             Self::ObserveCleatEndpoint { endpoint } => status.cleat_endpoint = endpoint.clone(),
@@ -582,9 +590,13 @@ impl StatusPatch<TerminalSessionStatus> for TerminalSessionStatusPatch {
                 status.crew = crew.clone();
                 status.launch_command = Some(launch_command.clone());
                 status.delivered_message_id = delivered_message_id.clone();
+                if delivered_message_id.is_some() {
+                    status.turn_delivery_hold = None;
+                }
                 status.degraded = None;
             }
             Self::MarkMessageDelivered { message_id } => {
+                status.turn_delivery_hold = None;
                 status.delivered_message_id = Some(message_id.clone());
                 status.message = None;
                 status.degraded = None;
@@ -1017,6 +1029,51 @@ mod tests {
         }
         TerminalSessionStatusPatch::MarkMessageDelivered { message_id: "message".into() }.apply(&mut status);
         assert!(status.degraded.is_none());
+    }
+
+    // #2758: a terminal restart retains the automatic hold until a continuation
+    // is delivered. Generate repeated resets and both continuation delivery paths.
+    #[hegel::test]
+    fn hold_survives_terminal_restart_until_continuation(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let restarts = tc.draw(gs::integers::<usize>().min_value(1).max_value(5));
+        let launch_delivery = tc.draw(gs::booleans());
+        let hold = crate::ConvoyAttention {
+            source: "checks-settled".into(),
+            reason: "episode limit".into(),
+            raised_at: chrono::DateTime::<Utc>::UNIX_EPOCH,
+        };
+        let mut status = TerminalSessionStatus::default();
+        TerminalSessionStatusPatch::HoldTurnDelivery { hold: hold.clone() }.apply(&mut status);
+        for _ in 0..restarts {
+            TerminalSessionStatusPatch::MarkStarting.apply(&mut status);
+            TerminalSessionStatusPatch::MarkRunning {
+                configured_limits: None,
+                session_id: "session".into(),
+                pid: None,
+                started_at: hold.raised_at,
+                crew: None,
+                launch_command: "agent".into(),
+                delivered_message_id: None,
+            }
+            .apply(&mut status);
+            assert_eq!(status.turn_delivery_hold.as_ref(), Some(&hold));
+        }
+        let continuation = if launch_delivery {
+            TerminalSessionStatusPatch::MarkRunning {
+                configured_limits: None,
+                session_id: "session".into(),
+                pid: None,
+                started_at: hold.raised_at,
+                crew: None,
+                launch_command: "agent".into(),
+                delivered_message_id: Some("resume".into()),
+            }
+        } else {
+            TerminalSessionStatusPatch::MarkMessageDelivered { message_id: "resume".into() }
+        };
+        continuation.apply(&mut status);
+        assert!(status.turn_delivery_hold.is_none());
     }
 
     #[test]

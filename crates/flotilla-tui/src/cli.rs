@@ -895,6 +895,9 @@ pub(crate) fn format_convoy_explanation_human(explanation: &flotilla_protocol::C
         .map(|cascade| format!("\nResolved defaults:\n{}\n", serde_json::to_string_pretty(cascade).expect("serialize cascade")))
         .unwrap_or_default();
     let mut output = format!("Convoy: {}/{}\nPhase: {}\n", explanation.namespace, explanation.convoy, explanation.phase);
+    for hold in &explanation.holds {
+        let _ = writeln!(output, "Turn delivery: {} held since={}: {}", hold.source, hold.raised_at, hold.reason);
+    }
     for mutation in &explanation.lifecycle_mutations {
         let _ = writeln!(output, "{} by {} at {}", mutation.action, mutation.caller, mutation.at);
     }

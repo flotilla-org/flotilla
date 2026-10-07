@@ -362,3 +362,10 @@ pub const KEY_CONVOY_MINIMAL_ALTERNATIVES: &str = "flotilla.convoy.minimal_alter
 
 /// Resolved Project parent entity, including the implicit fleet parent.
 pub const KEY_PROJECT_PARENT: &str = "parent";
+
+/// Raw convoy inbox facts, shared by all presentation surfaces.
+pub const KEY_CONVOY_HELD: &str = "flotilla.convoy.held";
+pub const KEY_CONVOY_HOLDS: &str = "flotilla.convoy.holds";
+pub const KEY_CONVOY_LEDGER: &str = "flotilla.convoy.latest_ledger";
+pub const KEY_CONVOY_PENDING_MESSAGES: &str = "flotilla.convoy.pending_messages";
+pub const KEY_CONVOY_STUCK_MESSAGES: &str = "flotilla.convoy.stuck_messages";

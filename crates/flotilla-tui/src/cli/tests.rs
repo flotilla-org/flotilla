@@ -191,6 +191,7 @@ fn fulfilment_list_distinguishes_image_and_host_model_support() {
 #[test]
 fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     let explanation = ConvoyExplanation {
+        holds: Vec::new(),
         cascade: None,
         environment_observations: Default::default(),
         stalled: None,
@@ -297,6 +298,14 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
     ));
     // #2677: the human display names durable artifact evidence with no PR comment;
     // a failed bound projection is a separate flag, never a missing ledger.
+    // #2758: hold reason and timestamp are visible independently of settlement.
+    let mut held = explanation.clone();
+    held.holds.push(flotilla_protocol::commands::ExplainedTurnDeliveryHold {
+        source: "checks-settled".into(),
+        reason: "episode limit".into(),
+        raised_at: "2026-10-07T12:00:00Z".into(),
+    });
+    assert!(format_convoy_explanation_human(&held).contains("checks-settled held since=2026-10-07T12:00:00Z: episode limit"));
     let mut artifact_only = explanation;
     artifact_only.decision_ledgers = vec![artifact_only.decision_ledgers[1].clone()];
     artifact_only.decision_ledgers[0].comment_url = None;
@@ -314,6 +323,7 @@ fn convoy_explanation_renders_linked_and_missing_decision_ledgers() {
 #[test]
 fn convoy_explanation_shows_reserved_platform_fallback_without_escalation() {
     let explanation = ConvoyExplanation {
+        holds: Vec::new(),
         cascade: None,
         environment_observations: Default::default(),
         namespace: "flotilla".into(),

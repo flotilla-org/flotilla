@@ -4487,7 +4487,7 @@ mod tests {
             .on("$cr.mergeable == conflicting".parse().expect("leaf"))
             .to(flotilla_resources::TurnDeliveryTarget::builder().vessel("verify".to_string()).role("verify".to_string()).build())
             .brief("Verify the result".to_string())
-            .hold(HoldAct::ChangeRequestComment { body: "Verification needed".to_string() })
+            .hold(HoldAct::State)
             .build();
         let mut workflow = WorkflowTemplateSpec::builder().turn_delivery(indexmap::IndexMap::from([("verify".to_string(), rule)])).build();
         let error = allocate_roles(&mut workflow, &roles).expect_err("ambiguous delivery must refuse");

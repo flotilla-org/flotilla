@@ -2414,24 +2414,18 @@ async fn artifact_environment_reference_contract() {
             .expect("put ledger");
         topology.client.artifact_get(address.clone(), "result.bin".into()).await.expect("get ledger");
         if two_repositories {
-            // #2527: both repositories receive the convoy ledger; retry cannot duplicate comments.
-            assert_eq!(
-                comments.lock().expect("comments").keys().cloned().collect::<Vec<_>>(),
-                vec!["repos/acme/first/issues/42/comments", "repos/acme/second/issues/43/comments"]
-            );
+            // #2758: retries and multiple PR bindings never write forge comments.
+            assert!(comments.lock().expect("comments").is_empty());
             topology
                 .client
                 .artifact_put("decision-ledger".into(), String::new(), BTreeMap::new(), "text/markdown".into(), "ledger.md".into())
                 .await
                 .expect("retry ledger put");
-            assert_eq!(comments.lock().expect("comments").len(), 2);
+            assert!(comments.lock().expect("comments").is_empty());
             let artifacts = leader.resource_backend().using::<Artifact>(namespace).list().await.expect("artifacts");
             let artifact = artifacts.items.iter().find(|artifact| artifact.spec.kind == "decision-ledger").expect("stored ledger");
             assert_eq!(artifact.spec.subject, convoy);
-            assert_eq!(artifact.spec.summary["projection_count"], 2);
-            for comment in comments.lock().expect("comments").values() {
-                assert!(comment["body"].as_str().expect("body").starts_with(std::str::from_utf8(ledger).expect("UTF-8")));
-            }
+            assert!(artifact.spec.summary.is_empty());
         }
         // #2498: a connected operator reads crew artifacts without a calling crew session.
         let operator = spawn_in_memory_request_topology_stateful_with_caller_and_blob_store(

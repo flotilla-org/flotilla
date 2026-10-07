@@ -26,13 +26,54 @@ output to an absolute path in the operator's local environment. Unqualified
 `artifact/<name>` references use the daemon's provisioning namespace. Crew reads
 continue to use their calling session's environment and cannot cross namespaces.
 
-Decision ledgers belong to the convoy and producer role. Putting a ledger
-projects its complete contents onto every distinct bound change request, across
-repositories and supported forges. A digest marker makes each projection
-retryable: after a partial failure, retrying finds existing comments before
-posting the missing ones. The artifact records the number of projected PRs in
-`summary.projection_count` and retains `summary.comment_url` as the first URL
-for existing readers. This keeps the summary within its fixed scalar size
-budget regardless of the number of projections. A put checks current bindings even when the ledger digest has
-not changed, so newly bound change requests receive it too. Completion checks
-the stored convoy artifact, independently of the number of bound PRs.
+Decision ledgers belong to the convoy and producer role. Putting a ledger validates
+and stores its complete contents as an artifact. Completion checks the stored
+convoy artifact, independently of forge comments or the number of bound PRs.
+
+Automatic turn-delivery holds persist on the convoy and crew session. A hold
+admits one plain Message to the supervisor role; it does not write to a forge.
+`convoy explain` and attention views expose the hold and its reason. Resume clears
+the held rules for the resumed crew; new observations alone do not release a hold.
+
+The presentation catalog watches replicated Convoy, Artifact and Message resources.
+Per convoy it publishes `flotilla.convoy.held`, `flotilla.convoy.holds`,
+`flotilla.convoy.latest_ledger`, `flotilla.convoy.pending_messages`, and
+`flotilla.convoy.stuck_messages`. Holds and messages are lists of JSON records
+preserving their source/reason/timestamps and sender/receiver/phase/reason/references/
+expectation facts. Pending includes every nonterminal Message; stuck includes
+waiting messages with a reason, messages with transport retries, and dead letters. Ledger references use the stable
+`artifact/<name>` address and select the latest recorded ledger for that convoy.
+Deleted records retract their facts. Review observations already published on
+linked change-request entities remain available; no new obligation tracker is added.
+
+## Live operator acceptance
+
+Use a candidate fleet with its real crew environments and a disposable PR. The
+script is read-only against the daemon and forge; it writes evidence beneath the
+supplied directory and temporarily runs a PM connector against an HTTP-over-Unix
+capture endpoint. It needs Python 3, the candidate `flotilla` binary, and injected
+GitHub credentials. Run it from the same daemon environment as the operator CLI.
+No Docker is required for the script itself.
+
+```sh
+python3 scripts/accept-hold-inbox.py baseline CONVOY PR_NUMBER /tmp/hold-inbox-evidence --bin /path/to/candidate/flotilla
+```
+
+Have the test crew shepherd four distinct settled-check episodes on the disposable
+PR, each with fresh head evidence and a completed prior turn. The stock episode
+limit admits three turns and holds the fourth. Keep the PR quiet during acceptance.
+Once `convoy explain` shows the hold, publish another observation and reconnect the
+daemon to exercise retry/restart deduplication, then run:
+
+```sh
+python3 scripts/accept-hold-inbox.py hold CONVOY PR_NUMBER /tmp/hold-inbox-evidence --bin /path/to/candidate/flotilla
+```
+
+It requires one persisted hold, a session hold and exactly one plain supervisor
+Message, and captures the actual catalog patches. Resume the crew with the operator
+CLI, wait for the resume Message to be delivered, and run the script with `resumed`.
+Have the crew submit its ledger artifact and complete after a clean shepherd
+snapshot, then run it with `settled`. That phase requires a Done claim with ledger
+digest evidence and the catalog's latest ledger reference. Every verification
+phase compares all PR comments against the baseline. Preserve the JSON snapshots,
+connector log and received patches as operator evidence.
