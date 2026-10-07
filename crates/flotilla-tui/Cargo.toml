@@ -41,6 +41,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 libc = "0.2"
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3.22", features = ["json"] }
 async-trait = { workspace = true }
 flotilla-core = { path = "../flotilla-core", features = ["test-support"] }
 flotilla-protocol = { path = "../flotilla-protocol", features = ["test-support"] }
