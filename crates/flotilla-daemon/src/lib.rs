@@ -33,3 +33,5 @@ pub mod supervisor;
 pub(crate) const DAEMON_SOCKET_DISCOVERY_RELATIVE_PATH: &str = "run/socket-path";
 
 mod image_distribution;
+
+pub use agent_material::validate_frozen_vessel_skills;

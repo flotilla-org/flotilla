@@ -1,4 +1,6 @@
 #[cfg(unix)]
+pub(crate) mod frozen;
+#[cfg(unix)]
 mod retirement;
 
 use std::path::{Path, PathBuf};
@@ -31,9 +33,19 @@ pub async fn validate_daemon(_socket: &Path, _local_roots: Option<&[PathBuf]>, _
 
 /// Query JSON directly over the daemon's resource socket. The command protocol's
 /// fingerprint deliberately rejects mixed generations during a fleet roll.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub async fn validate_daemon(socket: &Path, local_roots: Option<&[PathBuf]>, skill_catalog: Option<&Path>) -> Result<usize> {
-    validate_daemon_with_preview(socket, local_roots, skill_catalog, |preview| {
+    validate_daemon_with_options(socket, local_roots, skill_catalog, &frozen::ProbeOptions::default()).await
+}
+
+#[cfg(unix)]
+pub async fn validate_daemon_with_options(
+    socket: &Path,
+    local_roots: Option<&[PathBuf]>,
+    skill_catalog: Option<&Path>,
+    probes: &frozen::ProbeOptions,
+) -> Result<usize> {
+    validate_daemon_with_preview(socket, local_roots, skill_catalog, probes, |preview| {
         println!("workflow retirement preview: {}", serde_json::to_string(preview)?);
         Ok(())
     })
@@ -45,6 +57,7 @@ async fn validate_daemon_with_preview(
     socket: &Path,
     local_roots: Option<&[PathBuf]>,
     skill_catalog: Option<&Path>,
+    probes: &frozen::ProbeOptions,
     mut report: impl FnMut(&retirement::RetirementPreview) -> Result<()>,
 ) -> Result<usize> {
     let catalog = skill_catalog.map(load_catalog).transpose()?;
@@ -93,6 +106,9 @@ async fn validate_daemon_with_preview(
     let mut failed = false;
     let mut count = 0;
     let mut projects = BTreeMap::<String, Vec<ResourceObject<Project>>>::new();
+    let mut frozen_inventory = Vec::new();
+    let mut frozen_inventory_failed = false;
+    let mut retired = std::collections::BTreeSet::new();
     let mut retirement_templates = Vec::new();
     let mut retirement_projects = Vec::new();
     let mut retirement_designations = Vec::new();
@@ -119,12 +135,14 @@ async fn validate_daemon_with_preview(
                 }
                 eprintln!("{label}: daemon list failed: {message}");
                 retirement_inventory_failed |= retirement_collection;
+                frozen_inventory_failed = true;
                 failed = true;
                 continue;
             }
             if !response.status().is_success() {
                 eprintln!("{label}: daemon list failed: {}", response.text().await?);
                 retirement_inventory_failed |= retirement_collection;
+                frozen_inventory_failed = true;
                 failed = true;
                 continue;
             }
@@ -153,8 +171,16 @@ async fn validate_daemon_with_preview(
                     failed = true;
                 }
             }
-            if retirement_collection {
-                // Startup reconciles merged definitions, never raw replica provenance.
+            let frozen_collection = store_base == base
+                && matches!(
+                    kind.as_str(),
+                    "convoys" | "vessels" | "environments" | "credentialspecs" | "hosts" | "imagebuilds" | "workflowtemplates"
+                );
+            let skill_collection =
+                store_base == base && catalog.is_some() && matches!(kind.as_str(), "projects" | "crewdefaults" | "fleetdesignations");
+            if retirement_collection || frozen_collection || skill_collection {
+                // All semantic gates use one merged view, as startup and admission
+                // do. Raw provenance was independently decoded above.
                 let fetched = async {
                     let merged: Value = client
                         .get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/{kind}?includeReplicas=true"))
@@ -167,40 +193,40 @@ async fn validate_daemon_with_preview(
                 }
                 .await;
                 match fetched {
-                    Ok(items) if kind == "workflowtemplates" => retirement_templates.extend(items),
-                    Ok(items) if kind == "projects" => retirement_projects.extend(items),
-                    Ok(items) => retirement_designations.extend(items),
+                    Ok(items) => {
+                        if frozen_collection {
+                            frozen_inventory.extend(items.iter().cloned());
+                        }
+                        if skill_collection {
+                            skill_documents.extend(items.iter().cloned());
+                        }
+                        if retirement_collection {
+                            match kind.as_str() {
+                                "workflowtemplates" => retirement_templates.extend(items),
+                                "projects" => retirement_projects.extend(items),
+                                _ => retirement_designations.extend(items),
+                            }
+                        }
+                    }
                     Err(error) => {
-                        eprintln!("{label}: workflow retirement inventory: {error:#}");
-                        retirement_inventory_failed = true;
+                        eprintln!("{label}: merged validation inventory: {error:#}");
+                        retirement_inventory_failed |= retirement_collection;
+                        frozen_inventory_failed |= frozen_collection;
                         failed = true;
                     }
                 }
-            }
-            if store_base == base && catalog.is_some() && matches!(kind.as_str(), "projects" | "crewdefaults" | "fleetdesignations") {
-                // Schema validation checks every stored provenance above. Skill
-                // policy must use the merged definition view, just like admission.
-                let merged: Value = client
-                    .get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/{kind}?includeReplicas=true"))
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?;
-                skill_documents.extend(
-                    merged
-                        .get("items")
-                        .and_then(Value::as_array)
-                        .ok_or_else(|| eyre!("{label}: merged list has no items"))?
-                        .iter()
-                        .cloned(),
-                );
             }
         }
     }
     if !retirement_inventory_failed {
         match retirement::preview(&retirement_templates, &retirement_projects, &retirement_designations) {
             Ok(preview) => {
+                retired.extend(preview.definitions.iter().map(|definition| {
+                    (
+                        definition["metadata"]["namespace"].as_str().unwrap_or("flotilla").to_string(),
+                        definition["metadata"]["name"].as_str().unwrap_or("<unnamed>").to_string(),
+                    )
+                }));
                 if let Err(error) = report(&preview) {
                     eprintln!("workflow retirement report: {error:#}");
                     failed = true;
@@ -212,6 +238,18 @@ async fn validate_daemon_with_preview(
             }
         }
     }
+    let mut frozen_report = frozen::check(
+        &frozen_inventory,
+        &retired,
+        &frozen::CandidateProbes { options: probes, inventory: &frozen_inventory, runner: &ProcessCommandRunner },
+    )
+    .await?;
+    frozen_report.inventory_complete &= !frozen_inventory_failed && !retirement_inventory_failed;
+    println!("frozen-reference satisfiability: {}", serde_json::to_string(&frozen_report)?);
+    for error in &frozen_report.failures {
+        eprintln!("{error}");
+    }
+    failed |= !frozen_report.failures.is_empty();
     for namespace in charter_namespaces {
         let response = client.get(format!("{base}/apis/flotilla.work/v1/namespaces/{namespace}/charterinputs")).send().await?;
         if !response.status().is_success() {
@@ -889,7 +927,7 @@ mod tests {
                 }
             });
             let mut reports = Vec::new();
-            let result = super::validate_daemon_with_preview(&socket, Some(&[]), None, |report| {
+            let result = super::validate_daemon_with_preview(&socket, Some(&[]), None, &super::frozen::ProbeOptions::default(), |report| {
                 reports.push(serde_json::to_value(report)?);
                 Ok(())
             })
@@ -962,6 +1000,14 @@ mod tests {
             )
             .await
             .expect("create project outside default namespace");
+        for namespace in ["flotilla", "replicas"] {
+            backend
+                .clone()
+                .definitions::<flotilla_resources::WorkflowTemplate>(namespace)
+                .apply(&InputMeta::builder().name("default".into()).build(), &flotilla_resources::WorkflowTemplateSpec::builder().build())
+                .await
+                .expect("satisfiable pending workflow");
+        }
         let replicas = backend.using::<Convoy>("replicas");
         replicas
             .create(
@@ -1500,5 +1546,72 @@ mod tests {
         assert!(super::validate_skill_documents(&catalog, &[defaults.clone(), good.clone()]).is_ok());
         let error = super::validate_skill_documents(&catalog, &[defaults, good, bad]).expect_err("every registered project is checked");
         assert!(error.to_string().contains("second") && error.to_string().contains("missing"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod frozen_reference_regression {
+    use flotilla_resources::{ConvoySpec, ConvoyStatus};
+    use flotilla_test_support::TestSocketDir;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::UnixListener,
+    };
+
+    // #2901/#2875: a schema-valid admitted governor with frozen skill pins must
+    // refuse when the candidate cannot resolve/authorize its skill supply.
+    // The true resource HTTP boundary is injected; records use the real decoder.
+    #[tokio::test]
+    async fn candidate_refuses_schema_valid_unresolvable_governor_pin() {
+        flotilla_core::tls::install_default_provider();
+        let mut status = serde_json::to_value(ConvoyStatus::default()).expect("status");
+        status["phase"] = serde_json::json!("Active");
+        status["workflow_snapshot"] = serde_json::json!({"vessels":[{"name":"work","crew":[{
+            "role":"governor", "selector":{"capability":"cli.agent"},
+            "skills":{"selected":[{"source":"sdlc", "repository":"owner/skills", "revision":"1111111111111111111111111111111111111111", "name":"research", "path":"skills/research"}],"provenance":[]}
+        }]}]});
+        let document = serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Convoy",
+            "metadata":{"name":"governor","namespace":"fleet","resourceVersion":"1","creationTimestamp":"2026-10-07T00:00:00Z"},
+            "spec":ConvoySpec::builder().workflow_ref("single-agent".into()).build(), "status":status});
+        super::validate_resource_document(&document).expect("previous decode-only gate accepts this pin");
+        let directory = TestSocketDir::new();
+        let socket = directory.socket_path("frozen.sock");
+        let listener = UnixListener::bind(&socket).expect("stand-in socket");
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut request = Vec::new();
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut bytes = [0; 1024];
+                    let count = stream.read(&mut bytes).await.expect("read");
+                    assert!(count > 0);
+                    request.extend_from_slice(&bytes[..count]);
+                }
+                let request = String::from_utf8(request).expect("HTTP text");
+                let mut words = request.split_whitespace();
+                assert_eq!(words.next(), Some("GET"));
+                let path = words.next().expect("path");
+                let body = if path == "/apis/flotilla.work/v1" {
+                    serde_json::json!({"kinds":["convoys"],"namespaces":{"convoys":["fleet"]}})
+                } else {
+                    assert!(path.starts_with("/apis/flotilla.work/v1/namespaces/fleet/convoys?"));
+                    serde_json::json!({"items":[document.clone()]})
+                }
+                .to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("response");
+            }
+        });
+        let result = super::validate_daemon(&socket, Some(&[]), None).await;
+        server.abort();
+        assert!(result.is_err(), "a schema-valid frozen skill pin without resolvable candidate supply must refuse");
     }
 }

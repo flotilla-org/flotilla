@@ -567,6 +567,12 @@ enum ResourceSubCommand {
         /// Resolve every CrewDefaults role and Project against this candidate skill catalog
         #[arg(long)]
         skill_catalog: Option<PathBuf>,
+        /// Candidate skill supply directory containing .flotilla-sources.json
+        #[arg(long, requires = "from_daemon")]
+        skill_sources: Option<PathBuf>,
+        /// JSON map of declared credential names to operator-supplied probe token files
+        #[arg(long, requires = "from_daemon")]
+        skill_probe_tokens: Option<PathBuf>,
         /// Read a peer's forwarded resource socket instead of the local daemon
         #[arg(long, requires = "from_daemon")]
         host: Option<String>,
@@ -2115,7 +2121,7 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
     reset_sigpipe();
     let explain = matches!(&command, ResourceSubCommand::Explain(_));
     match command {
-        ResourceSubCommand::Validate { path, from_daemon, host, skill_catalog } => {
+        ResourceSubCommand::Validate { path, from_daemon, host, skill_catalog, skill_sources, skill_probe_tokens } => {
             if from_daemon {
                 let paths = cli.client_paths().map_err(|error| color_eyre::eyre::eyre!(error))?;
                 let local_roots = if host.is_none() {
@@ -2139,9 +2145,27 @@ async fn run_resource_command(cli: &Cli, command: ResourceSubCommand, format: Ou
                 } else {
                     paths.socket_path
                 };
-                resource_validate::validate_daemon(&socket, local_roots.as_deref(), skill_catalog.as_deref()).await.map(|_| ()).map_err(
-                    |error| color_eyre::eyre::eyre!("resource validation on {}: {error:#}", host.as_deref().unwrap_or("local host")),
+                #[cfg(unix)]
+                let result = resource_validate::validate_daemon_with_options(
+                    &socket,
+                    local_roots.as_deref(),
+                    skill_catalog.as_deref(),
+                    &resource_validate::frozen::ProbeOptions {
+                        sources: skill_sources.or_else(|| skill_catalog.as_ref().and_then(|path| path.parent().map(Path::to_path_buf))),
+                        credential_tokens: resource_validate::frozen::load_tokens(skill_probe_tokens.as_deref())?,
+                    },
                 )
+                .await;
+                #[cfg(not(unix))]
+                let result = {
+                    if skill_sources.is_some() || skill_probe_tokens.is_some() {
+                        return Err(color_eyre::eyre::eyre!("frozen-reference daemon validation requires Unix"));
+                    }
+                    resource_validate::validate_daemon(&socket, local_roots.as_deref(), skill_catalog.as_deref()).await
+                };
+                result.map(|_| ()).map_err(|error| {
+                    color_eyre::eyre::eyre!("resource validation on {}: {error:#}", host.as_deref().unwrap_or("local host"))
+                })
             } else {
                 resource_validate::validate_path(&path.expect("clap requires path without --from-daemon"), skill_catalog.as_deref())
             }

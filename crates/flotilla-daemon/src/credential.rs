@@ -27,6 +27,39 @@ use crate::vessel_config::{
     agent_environment_fragment, compose, crew_gitconfig_fragments, Fragment, GitConfigKey, Merge, Provenance, TargetId, TargetKey,
 };
 
+/// Shared, side-effect-free authority check for skill staging and the candidate
+/// pre-roll probe. Returns the repository name used to narrow the App token.
+pub(crate) fn skill_source_repository(credential_name: &str, spec: &CredentialSpecSpec, repository: &str) -> Result<String, String> {
+    let (CredentialConsumer::GithubApp { installation_id, installation_repository, .. }, CredentialSource::GithubApp { .. }) =
+        (&spec.consumer, &spec.source)
+    else {
+        return Err(bounded_adapter_error(
+            credential_name,
+            spec.consumer.adapter_name(),
+            "skill-source credentials must use the github-app adapter and source",
+        ));
+    };
+    if spec.lifecycle != CredentialLifecycle::Refreshable {
+        return Err(bounded_adapter_error(credential_name, "github-app", "GitHub App credentials must use the refreshable lifecycle"));
+    }
+    match (installation_id, installation_repository) {
+        (Some(_), None) | (None, Some(_)) => {}
+        (Some(_), Some(_)) => return Err("declare either `installation_id` or `installation_repository`, not both".into()),
+        (None, None) => return Err("declare either `installation_id` or `installation_repository`".into()),
+    }
+    let parsed = Url::parse(repository)
+        .map_err(|error| bounded_adapter_error(credential_name, "github-app", &format!("invalid repository URL: {error}")))?;
+    if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") {
+        return Err(bounded_adapter_error(credential_name, "github-app", "skill source repository must be an HTTPS github.com URL"));
+    }
+    let path = parsed.path().trim_matches('/');
+    let components = path.strip_suffix(".git").unwrap_or(path).split('/').collect::<Vec<_>>();
+    if components.len() != 2 || components.iter().any(|component| component.is_empty()) {
+        return Err(bounded_adapter_error(credential_name, "github-app", "skill source repository must identify one owner/repository"));
+    }
+    Ok(components[1].to_string())
+}
+
 async fn prune_abandoned_skill_source_tokens(runner: &dyn CommandRunner, root: &Path) -> Result<(), String> {
     const SCRIPT: &str = r#"[ -d "$1" ] || exit 0
 find "$1" -type f -name 'token-*' ! -name '*.in-use.*' -exec sh -c '
@@ -1192,34 +1225,14 @@ impl CredentialStore {
         runner: &dyn CommandRunner,
     ) -> Result<PathBuf, String> {
         let spec = self.spec(credential_name).await?;
+        let repository_name = skill_source_repository(credential_name, &spec, repository)?;
         let (
             CredentialConsumer::GithubApp { installation_id, installation_repository, permissions, .. },
             CredentialSource::GithubApp { app_id_path, private_key_path },
         ) = (&spec.consumer, &spec.source)
         else {
-            return Err(bounded_adapter_error(
-                credential_name,
-                spec.consumer.adapter_name(),
-                "skill-source credentials must use the github-app adapter and source",
-            ));
+            return Err(bounded_adapter_error(credential_name, "github-app", "skill source requires a GitHub App consumer and source"));
         };
-        if spec.lifecycle != CredentialLifecycle::Refreshable {
-            return Err(bounded_adapter_error(
-                credential_name,
-                spec.consumer.adapter_name(),
-                "GitHub App credentials must use the refreshable lifecycle",
-            ));
-        }
-        let parsed = Url::parse(repository)
-            .map_err(|error| bounded_adapter_error(credential_name, "github-app", &format!("invalid repository URL: {error}")))?;
-        if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") {
-            return Err(bounded_adapter_error(credential_name, "github-app", "skill source repository must be an HTTPS github.com URL"));
-        }
-        let components =
-            parsed.path().trim_matches('/').strip_suffix(".git").unwrap_or(parsed.path().trim_matches('/')).split('/').collect::<Vec<_>>();
-        if components.len() != 2 || components.iter().any(|component| component.is_empty()) {
-            return Err(bounded_adapter_error(credential_name, "github-app", "skill source repository must identify one owner/repository"));
-        }
         let installation_id = match (installation_id, installation_repository) {
             (Some(id), None) => *id,
             (None, Some(installation_repository)) => {
@@ -1232,7 +1245,7 @@ impl CredentialStore {
             installation_id,
             app_id_path: app_id_path.clone(),
             private_key_path: private_key_path.clone(),
-            repositories: vec![components[1].to_string()],
+            repositories: vec![repository_name],
             permissions: permissions.clone(),
         };
         let token = self
