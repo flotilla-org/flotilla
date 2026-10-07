@@ -36,7 +36,6 @@ REPORT = {'environment': {
     'skills': ['testing/SKILL.md']}
 
 
-
 class Process:
     def poll(self):
         return None
@@ -317,6 +316,13 @@ class Contract(unittest.TestCase):
     # The real stub must dump its terminal environment before claiming completion,
     # and may claim only after the installer releases its handshake marker.
     def test_real_stub_reports_and_waits_before_completion(self):
+        self.run_real_stub()
+
+    # Missing injection must still produce a report, so baseline validation can name the refusal.
+    def test_real_stub_reports_missing_identity(self):
+        self.run_real_stub(missing_identity=True)
+
+    def run_real_stub(self, missing_identity=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             home = root / 'crew-home'
@@ -330,10 +336,16 @@ class Contract(unittest.TestCase):
             cli.chmod(0o755)
             subprocess.check_call(['git', '-C', str(root), 'init', '-q'])
             completion = root / 'completion'
+            # HOME excludes user global config; NOSYSTEM excludes system config.
             environment = {'PATH': f'{bin_dir}:/usr/local/bin:/usr/bin:/bin', 'HOME': str(root),
                            'CLAUDE_CONFIG_DIR': str(home), 'RUSTUP_HOME': '/usr/local/rustup',
                            'CANARY_COMPLETE_LOG': str(completion), 'GIT_CONFIG_NOSYSTEM': '1',
                            **REPORT['environment']}
+            if missing_identity:
+                for key in ('GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL'):
+                    environment.pop(key)
+                # Refuse Git's guessed identity so the real git var failure is exercised.
+                environment.update(GIT_CONFIG_COUNT='4', GIT_CONFIG_KEY_3='user.useConfigOnly', GIT_CONFIG_VALUE_3='true')
             stub = Path(__file__).with_name('fleet-canary-agent.sh')
             process = subprocess.Popen(['bash', str(stub), str(root)], cwd=root, env=environment,
                                        start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -349,6 +361,13 @@ class Contract(unittest.TestCase):
                 self.assertIsNotNone(report, 'stub must dump environment')
                 self.assertEqual(report['git']['user.name'], '')
                 self.assertEqual(report['git']['user.email'], '')
+                if missing_identity:
+                    self.assertEqual(report['git']['GIT_AUTHOR_IDENT'], '')
+                    self.assertEqual(report['git']['GIT_COMMITTER_IDENT'], '')
+                    with self.assertRaisesRegex(canary.CanaryFailure, 'baseline git identity GIT_AUTHOR_IDENT'):
+                        canary.verify_baseline(report)
+                    self.assertFalse(completion.exists(), 'invalid identity must not claim completion')
+                    return
                 canary.verify_baseline(report)
                 self.assertFalse(completion.exists(), 'completion must wait for Running/baseline checks')
                 (root / 'fleet-canary-continue').touch()

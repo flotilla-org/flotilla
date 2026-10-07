@@ -15,7 +15,7 @@ print(json.dumps({
     'environment': dict(os.environ),
     'git': {key: subprocess.run(['git', 'config', '--get', key], capture_output=True, text=True).stdout.strip()
             for key in ['user.name', 'user.email', 'push.default']} | {
-                key: subprocess.run(['git', 'var', key], check=True, capture_output=True, text=True).stdout.strip()
+                key: subprocess.run(['git', 'var', key], capture_output=True, text=True).stdout.strip()
                 for key in ['GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT']},
     'skills': sorted(str(path.relative_to(home / 'skills'))
                      for path in (home / 'skills').rglob('SKILL.md')),
