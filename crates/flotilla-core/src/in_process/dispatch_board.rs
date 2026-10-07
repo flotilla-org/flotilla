@@ -1,9 +1,16 @@
 //! Slow tracker observations outlive interactive requests. One refresh per source
 //! serves all Projects, retaining the last successful snapshot during outages.
-use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    panic::AssertUnwindSafe,
+    sync::Arc,
+    time::Duration,
+};
 
 use chrono::Utc;
 use flotilla_protocol::{DispatchBoardRepository, IssueSource};
+use futures::FutureExt;
 use tokio::{sync::Mutex, time::Instant};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
@@ -17,27 +24,40 @@ struct Entry {
     error: Option<String>,
 }
 
+type SharedEntry = Arc<Mutex<Entry>>;
+
 #[derive(Clone, Default)]
-pub(super) struct DispatchBoardCache(Arc<Mutex<BTreeMap<IssueSource, Entry>>>);
+pub(super) struct DispatchBoardCache(Arc<Mutex<BTreeMap<IssueSource, SharedEntry>>>);
 
 impl DispatchBoardCache {
+    /// Only a complete source inventory may retire entries. An old refresh owns
+    /// its retired entry, so its completion cannot overwrite a re-added source.
+    pub(super) async fn retain_sources(&self, sources: &BTreeSet<IssueSource>) {
+        self.0.lock().await.retain(|source, _| sources.contains(source));
+    }
+
     pub(super) async fn read<F, Fut>(&self, source: &IssueSource, load: F) -> Result<DispatchBoardRepository, String>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<DispatchBoardRepository, String>> + Send,
     {
-        let mut entries = self.0.lock().await;
-        let entry = entries.entry(source.clone()).or_default();
-        if !entry.refreshing && entry.last_attempt.is_none_or(|at| at.elapsed() >= REFRESH_INTERVAL) {
-            entry.refreshing = true;
-            entry.last_attempt = Some(Instant::now());
-            let cache = self.clone();
-            let source = source.clone();
+        let entry = self.0.lock().await.entry(source.clone()).or_default().clone();
+        let mut entry_state = entry.lock().await;
+        let state = &mut *entry_state;
+        if !state.refreshing && state.last_attempt.is_none_or(|at| at.elapsed() >= REFRESH_INTERVAL) {
+            state.refreshing = true;
+            state.last_attempt = Some(Instant::now());
+            let refresh_entry = entry.clone();
             tokio::spawn(async move {
-                let result =
-                    tokio::time::timeout(REFRESH_TIMEOUT, load()).await.unwrap_or_else(|_| Err("board tracker refresh timed out".into()));
-                let mut entries = cache.0.lock().await;
-                let entry = entries.get_mut(&source).expect("refresh entry");
+                // Catch panics both while constructing and polling the future.
+                // Treat them as an observation failure so the source can retry.
+                let result = match tokio::time::timeout(REFRESH_TIMEOUT, AssertUnwindSafe(async move { load().await }).catch_unwind()).await
+                {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) => Err("board tracker refresh panicked".into()),
+                    Err(_) => Err("board tracker refresh timed out".into()),
+                };
+                let mut entry = refresh_entry.lock().await;
                 entry.refreshing = false;
                 // Retry backoff starts on completion, including a slow failure.
                 entry.last_attempt = Some(Instant::now());
@@ -51,15 +71,15 @@ impl DispatchBoardCache {
                 }
             });
         }
-        let Some(mut board) = entry.board.clone() else {
+        let Some(mut board) = state.board.clone() else {
             return Err(format!(
                 "board facts unavailable for {}: {}",
                 source.scope,
-                entry.error.as_deref().unwrap_or("initial observation in progress; retry shortly")
+                state.error.as_deref().unwrap_or("initial observation in progress; retry shortly")
             ));
         };
         board.age_seconds = Utc::now().signed_duration_since(board.observed_at).num_seconds().max(0) as u64;
-        board.refresh_error = entry.error.clone();
+        board.refresh_error = state.error.clone();
         Ok(board)
     }
 }
@@ -71,6 +91,23 @@ pub(super) mod tests {
     use flotilla_protocol::{DispatchBoardIssue, DispatchBoardPullRequest, IssueState};
 
     use super::*;
+
+    async fn settled(cache: &DispatchBoardCache, source: &IssueSource) {
+        let entry = cache.0.lock().await.get(source).expect("entry").clone();
+        settled_entry(entry).await;
+    }
+
+    async fn settled_entry(entry: SharedEntry) {
+        // Bounded scheduler polling also catches wedged entries under paused
+        // time, where an always-ready polling loop cannot advance a timeout.
+        for _ in 0..1000 {
+            if !entry.lock().await.refreshing {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("refresh did not settle");
+    }
 
     fn source(scope: &str) -> IssueSource {
         IssueSource { service: "https://github.com".into(), scope: scope.into() }
@@ -129,10 +166,15 @@ pub(super) mod tests {
                 .expect_err("cold observation")
                 .contains("in progress"));
         }
-        tokio::task::yield_now().await;
+        for _ in 0..1000 {
+            if calls.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         tokio::time::advance(Duration::from_secs(20)).await;
-        tokio::task::yield_now().await;
+        settled(&cache, &source).await;
         for _ in 0..400 {
             let snapshot = cache.read(&source, || async { panic!("cached reads must not call forge") }).await.expect("cached board");
             assert_eq!(snapshot.issues.len(), 400);
@@ -149,20 +191,21 @@ pub(super) mod tests {
         let source = source("org/small");
         let snapshot = board(&source, 0);
         assert!(cache.read(&source, move || async { Ok(snapshot) }).await.is_err());
-        tokio::task::yield_now().await;
+        settled(&cache, &source).await;
         // Make the observation old without using real-time sleeps.
-        cache.0.lock().await.get_mut(&source).expect("entry").board.as_mut().expect("board").observed_at -= chrono::Duration::seconds(120);
+        cache.0.lock().await.get(&source).expect("entry").lock().await.board.as_mut().expect("board").observed_at -=
+            chrono::Duration::seconds(120);
         tokio::time::advance(REFRESH_INTERVAL).await;
         let cached = cache.read(&source, || async { Err("forge offline".into()) }).await.expect("stale board");
         assert!(cached.age_seconds >= 120);
-        tokio::task::yield_now().await;
+        settled(&cache, &source).await;
         let cached = cache.read(&source, || async { panic!("failure backoff") }).await.expect("last successful board");
         assert_eq!(cached.refresh_error.as_deref(), Some("forge offline"));
         assert!(cached.issues.is_empty());
         tokio::time::advance(REFRESH_INTERVAL).await;
         let recovered = board(&source, 1);
         cache.read(&source, move || async { Ok(recovered) }).await.expect("old facts during recovery");
-        tokio::task::yield_now().await;
+        settled(&cache, &source).await;
         let cached = cache.read(&source, || async { panic!("fresh observation") }).await.expect("recovered");
         assert_eq!(cached.issues.len(), 1);
         assert!(cached.refresh_error.is_none());
@@ -172,7 +215,7 @@ pub(super) mod tests {
             })
             .await
             .is_err());
-        tokio::task::yield_now().await;
+        settled(&cache, &IssueSource { service: "https://github.com".into(), scope: "org/other".into() }).await;
         assert_eq!(
             cache.read(&source, || async { panic!("source isolation") }).await.expect("original source").refresh_error,
             cached.refresh_error
@@ -195,12 +238,84 @@ pub(super) mod tests {
                 let expected = board(&source, count + id);
                 let observation = expected.clone();
                 assert!(cache.read(&source, move || async { Ok(observation) }).await.is_err());
-                tokio::task::yield_now().await;
+                settled(&cache, &source).await;
                 let actual = cache.read(&source, || async { panic!("fresh source") }).await.expect("snapshot");
                 assert_eq!(actual.source, expected.source);
                 assert_eq!(actual.issues, expected.issues);
                 assert_eq!(actual.pull_requests, expected.pull_requests);
             }
         });
+    }
+    // A tracker panic, during construction or polling, is a visible failure;
+    // cold and last-good sources both become retryable after backoff.
+    #[tokio::test(start_paused = true)]
+    async fn loader_panics_release_refresh_and_recover() {
+        fn construction_panic() -> std::future::Ready<Result<DispatchBoardRepository, String>> {
+            panic!("tracker construction panic");
+        }
+        for cached in [false, true] {
+            for construction in [false, true] {
+                let cache = DispatchBoardCache::default();
+                let source = source("org/panic");
+                if cached {
+                    let snapshot = board(&source, 2);
+                    assert!(cache.read(&source, move || async { Ok(snapshot) }).await.is_err());
+                    settled(&cache, &source).await;
+                    tokio::time::advance(REFRESH_INTERVAL).await;
+                }
+                if construction {
+                    let _ = cache.read(&source, construction_panic).await;
+                } else {
+                    let _ = cache.read(&source, || async { panic!("tracker polling panic") }).await;
+                }
+                settled(&cache, &source).await;
+                let result = cache.read(&source, || async { panic!("backoff must prevent another observation") }).await;
+                if cached {
+                    let snapshot = result.expect("last-good snapshot");
+                    assert_eq!(snapshot.issues.len(), 2);
+                    assert_eq!(snapshot.refresh_error.as_deref(), Some("board tracker refresh panicked"));
+                } else {
+                    assert!(result.expect_err("cold failure").contains("refresh panicked"));
+                }
+                tokio::time::advance(REFRESH_INTERVAL).await;
+                let snapshot = board(&source, 3);
+                let _ = cache.read(&source, move || async { Ok(snapshot) }).await;
+                settled(&cache, &source).await;
+                let snapshot = cache.read(&source, || async { panic!("fresh observation") }).await.expect("recovered");
+                assert_eq!(snapshot.issues.len(), 3);
+                assert!(snapshot.refresh_error.is_none());
+            }
+        }
+    }
+
+    // Removed sources are forgotten. Completion of an old in-flight observation
+    // must not recreate an evicted entry or overwrite a newly added source.
+    #[tokio::test]
+    async fn eviction_isolates_readded_source_from_old_refresh() {
+        let cache = DispatchBoardCache::default();
+        let source = source("org/readded");
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let old = board(&source, 1);
+        let old_release = release.clone();
+        assert!(cache
+            .read(&source, move || async move {
+                old_release.acquire().await.expect("release old observation").forget();
+                Ok(old)
+            })
+            .await
+            .is_err());
+        let retired = cache.0.lock().await.get(&source).expect("old entry").clone();
+        cache.retain_sources(&BTreeSet::new()).await;
+        assert!(cache.0.lock().await.is_empty());
+        let new = board(&source, 2);
+        assert!(cache.read(&source, move || async { Ok(new) }).await.is_err());
+        settled(&cache, &source).await;
+        release.add_permits(1);
+        settled_entry(retired).await;
+        let snapshot = cache.read(&source, || async { panic!("new source stays fresh") }).await.expect("new snapshot");
+        assert_eq!(snapshot.issues.len(), 2);
+        assert_eq!(cache.0.lock().await.len(), 1);
+        cache.retain_sources(&BTreeSet::from([source.clone()])).await;
+        assert_eq!(cache.read(&source, || async { panic!("retained source") }).await.expect("retained").issues, snapshot.issues);
     }
 }

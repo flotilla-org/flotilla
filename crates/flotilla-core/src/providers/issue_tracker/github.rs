@@ -256,6 +256,8 @@ impl super::IssueProvider for GitHubIssueProvider {
                     .build())
             })
             .collect::<Result<Vec<_>, String>>()?;
+        // Direct adapter observations have a completion timestamp; the daemon
+        // cache owns serving age/error and stamps its own completed observation.
         Ok(DispatchBoardRepository {
             observed_at: Utc::now(),
             age_seconds: 0,

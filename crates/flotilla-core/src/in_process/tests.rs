@@ -10211,4 +10211,18 @@ async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
     assert_eq!(board.repositories[0].pull_requests.len(), 400);
     assert_eq!(daemon.dispatch_board_internal(None).await.expect("shared board").readiness.entries.len(), 800);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    // A complete board never silently omits a selected cold source, while a
+    // healthy Project remains available independently of that other source.
+    let mut cold_binding = binding;
+    cold_binding.source.scope = "org/cold".into();
+    cold_binding.alias = Some("cold".into());
+    projects
+        .create(
+            &test_meta("cold"),
+            &ProjectSpec::builder().display_name("Cold".to_string()).issue_source_bindings(vec![cold_binding]).build(),
+        )
+        .await
+        .expect("cold project");
+    assert!(daemon.dispatch_board_internal(None).await.expect_err("complete source board").contains("initial observation"));
+    assert_eq!(daemon.dispatch_board_internal(Some("large")).await.expect("healthy project").repositories[0].issues.len(), 400);
 }

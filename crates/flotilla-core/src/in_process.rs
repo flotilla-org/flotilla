@@ -4943,6 +4943,9 @@ impl InProcessDaemon {
                 Err(error) => errors.push(error),
             }
         }
+        if project_filter.is_none() && errors.is_empty() {
+            self.dispatch_board_cache.retain_sources(&sources).await;
+        }
         let mut repositories = Vec::new();
         for source in sources {
             let daemon = self.self_weak.clone();
