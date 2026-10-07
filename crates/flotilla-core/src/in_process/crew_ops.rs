@@ -638,6 +638,22 @@ impl CrewService {
         .await
     }
 
+    pub(super) async fn message_contacts_internal(
+        &self,
+        requested: &CrewCommandContext,
+    ) -> Result<flotilla_resources::CrewAddressBook, String> {
+        let context = self.resolve_crew_context(requested).await?;
+        let convoy = self
+            .resource_backend
+            .using::<ResourceConvoy>(&context.namespace)
+            .get(&context.convoy)
+            .await
+            .map_err(|error| error.to_string())?;
+        let project = convoy.spec.project_ref.as_deref().unwrap_or(&context.namespace);
+        let address = format!("{project}/{}/{}/{}", context.convoy, context.vessel, context.caller_role);
+        flotilla_resources::crew_address_book(&self.resource_backend, &context.namespace, &address).await.map_err(|error| error.to_string())
+    }
+
     pub(super) async fn crew_list_internal(&self, requested: &CrewCommandContext) -> Result<CrewListResponse, String> {
         let context = self.resolve_crew_context(requested).await?;
         let convoys = self.resource_backend.clone().using::<ResourceConvoy>(&context.namespace);
@@ -1206,40 +1222,43 @@ impl CrewService {
         } else {
             format!("principal:{}", principal.expect("authenticated operator").name)
         };
-        let in_reply_to = self
-            .resource_backend
-            .including_replicas::<flotilla_resources::Message>(namespace)
-            .list()
-            .await
-            .map_err(|error| error.to_string())?
-            .items
-            .into_iter()
-            .filter(|record| {
-                record.object.spec.receiver == sender
-                    && record.object.spec.sender == receiver
-                    && record.object.spec.expectation == flotilla_resources::MessageExpectation::Reply
-                    && record.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
-                    && record.object.spec.references.iter().any(|reference| {
-                        matches!(reference, flotilla_resources::MessageReference::ControlRecord { resource, .. }
+        let in_reply_to = if let Some(reference) = &stalled.supervision_message {
+            Some(reference.name.clone())
+        } else {
+            self.resource_backend
+                .including_replicas::<flotilla_resources::Message>(namespace)
+                .list()
+                .await
+                .map_err(|error| error.to_string())?
+                .items
+                .into_iter()
+                .filter(|record| {
+                    record.object.spec.receiver == sender
+                        && record.object.spec.sender == receiver
+                        && record.object.spec.expectation == flotilla_resources::MessageExpectation::Reply
+                        && record.object.status.as_ref().is_none_or(|status| !status.phase.is_terminal())
+                        && record.object.spec.references.iter().any(|reference| {
+                            matches!(reference, flotilla_resources::MessageReference::ControlRecord { resource, .. }
                     if resource.kind == "Convoy" && resource.name == convoy_name && resource.namespace == namespace)
-                    })
-            })
-            .max_by_key(|record| record.object.metadata.creation_timestamp)
-            .map(|record| record.object.metadata.name)
-            .or_else(|| {
-                stalled.supervision_index.filter(|_| actor_crew_id.is_some()).map(|index| {
-                    // The escalation is receiver-homed and may not have replicated
-                    // back to this authority. Use judge_stalls' immutable producer key.
-                    flotilla_resources::message_record_name(
-                        &sender,
-                        &receiver,
-                        &crate::leaf_engine::turn_message_producer_key(
-                            &crate::leaf_engine::supervision_message_source(convoy_name, index),
-                            &stalled.began_at.timestamp_micros().to_string(),
-                        ),
-                    )
+                        })
                 })
-            });
+                .max_by_key(|record| record.object.metadata.creation_timestamp)
+                .map(|record| record.object.metadata.name)
+                .or_else(|| {
+                    stalled.supervision_index.filter(|_| actor_crew_id.is_some()).map(|index| {
+                        // The escalation is receiver-homed and may not have replicated
+                        // back to this authority. Use judge_stalls' immutable producer key.
+                        flotilla_resources::message_record_name(
+                            &sender,
+                            &receiver,
+                            &crate::leaf_engine::turn_message_producer_key(
+                                &crate::leaf_engine::supervision_message_source(convoy_name, index),
+                                &stalled.began_at.timestamp_micros().to_string(),
+                            ),
+                        )
+                    })
+                })
+        };
         // Persist the ruling before mutating workflow state: a failed authority CAS
         // must not erase the supervisor's durable decision. Fail/Escalate Messages
         // are notifications (no expectation and no resume/activation); delivery
@@ -1934,6 +1953,14 @@ impl CrewService {
                     render_options.has_credential_scope = !task.credential_scopes.is_empty();
                     let mut brief =
                         handoff_crew_brief(&context, &convoy, target, prompt.as_deref(), &current.members, task, &render_options)?;
+                    if let Some(project) = convoy.spec.project_ref.as_deref() {
+                        let address = format!("{project}/{}/{}/{target}", context.convoy, context.vessel);
+                        let book = flotilla_resources::crew_address_book(&self.resource_backend, &context.namespace, &address)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        brief.content.push('\n');
+                        brief.content.push_str(&book.render());
+                    }
                     if let Some(writer) = self.brief_artifact_writer.read().await.clone() {
                         let subject = format!("{}/handoff/{}", context.convoy, uuid::Uuid::new_v4().simple());
                         brief.artifact_digest = Some(
@@ -2383,11 +2410,104 @@ impl CrewService {
         self.leaf_subscriptions.reconcile_stalls_once(namespace).await
     }
 
+    async fn deliver_addressed_turn(
+        &self,
+        request: &crate::leaf_engine::CrewTurnIntent,
+        receiver: &str,
+    ) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
+        let intent = flotilla_resources::MessageSpec::builder()
+            .sender(request.sender.clone())
+            .receiver(receiver.to_string())
+            .relation(request.relation)
+            .body(request.brief.clone())
+            .references(request.references.clone())
+            .maybe_subject(request.message_subject.clone())
+            .expectation(request.expectation.clone())
+            .build();
+        let name = flotilla_resources::message_record_name(
+            receiver,
+            &request.sender,
+            &crate::leaf_engine::turn_message_producer_key(&request.source, &request.subject_revision),
+        );
+        match self.resource_backend.including_replicas::<flotilla_resources::Message>(&request.namespace).get(&name).await {
+            Ok(existing) if existing.object.spec.same_intent(&intent) => {
+                return Ok(crate::leaf_engine::CrewTurnAdmission {
+                    new_turn: false,
+                    rung: TurnDeliveryRung::WarmSession,
+                    message: existing
+                        .object
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.canonical_predecessor.clone())
+                        .unwrap_or_else(|| ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, &name)),
+                });
+            }
+            Ok(_) => return Err("message producer ID already names different intent".into()),
+            Err(ResourceError::NotFound { .. }) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        let holder = flotilla_resources::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
+            .await
+            .map_err(|error| error.to_string())?;
+        let publisher = self.resource_intent_publisher.read().expect("resource intent publisher lock").as_ref().and_then(Weak::upgrade);
+        let (message, new_turn) = if let Some(publisher) = publisher {
+            let document = serde_json::json!({"apiVersion":"flotilla.work/v1", "kind":"Message", "metadata":{"name":name,"namespace":request.namespace}, "spec":intent});
+            let reference = publisher.publish(&request.namespace, document).await?;
+            (reference, true)
+        } else {
+            if holder.as_ref().is_some_and(|holder| matches!(holder.provenance, ResourceProvenance::Replica { .. })) {
+                return Err("receiver-home resource mutation router unavailable".into());
+            }
+            let inbox = self
+                .message_inboxes
+                .lock()
+                .await
+                .entry(request.namespace.clone())
+                .or_insert_with(|| flotilla_resources::MessageInbox::new(self.resource_backend.clone(), &request.namespace))
+                .clone();
+            let existing = self.resource_backend.using::<flotilla_resources::Message>(&request.namespace).get(&name).await.is_ok();
+            let admission = inbox
+                .accept(&InputMeta::builder().name(name).build(), &intent, self.clock.now())
+                .await
+                .map_err(|error| error.to_string())?;
+            let object = match admission {
+                flotilla_resources::MessageAdmission::Accepted(object) => object,
+                flotilla_resources::MessageAdmission::Suppressed { predecessor } => predecessor,
+            };
+            (ResourceRef::new("flotilla.work/v1", "Message", &request.namespace, object.metadata.name), !existing)
+        };
+        Ok(crate::leaf_engine::CrewTurnAdmission { message, new_turn, rung: TurnDeliveryRung::WarmSession })
+    }
+
     pub(super) async fn deliver_turn(
         &self,
         request: &crate::leaf_engine::CrewTurnIntent,
     ) -> Result<crate::leaf_engine::CrewTurnAdmission, String> {
         use flotilla_resources::MessageSpec;
+        let managed_request;
+        let request = if let Some(receiver) = &request.receiver {
+            let holder = flotilla_resources::resolve_message_receiver(&self.resource_backend, &request.namespace, receiver)
+                .await
+                .map_err(|error| error.to_string())?;
+            if holder.as_ref().is_none_or(|holder| {
+                holder.object.metadata.annotations.get(flotilla_resources::ROLE_ADDRESS_ANNOTATION) == Some(receiver)
+                    || !holder.object.metadata.labels.contains_key(CONVOY_LABEL)
+            }) {
+                return self.deliver_addressed_turn(request, receiver).await;
+            }
+            // A managed subscriber still needs workflow activation and staged
+            // credentials; an externally adopted holder owns its own lifecycle.
+            let holder = holder.expect("managed holder checked above");
+            let mut resolved = request.clone();
+            resolved.receiver = None;
+            resolved.convoy = holder.object.metadata.labels.get(CONVOY_LABEL).cloned().ok_or("holder has no convoy")?;
+            resolved.vessel = holder.object.metadata.labels.get(VESSEL_LABEL).cloned().ok_or("holder has no vessel")?;
+            resolved.role = holder.object.metadata.labels.get(ROLE_LABEL).cloned().ok_or("holder has no role")?;
+            managed_request = resolved;
+            &managed_request
+        } else {
+            request
+        };
         let target = self
             .resource_backend
             .including_replicas::<ResourceConvoy>(&request.namespace)
@@ -2911,6 +3031,7 @@ impl CrewService {
                 // The existing project receiver resolver selects the session for this symbolic role.
                 // Vessel/crew selection belongs to that resolver, not hold delivery.
                 flotilla_resources::SupervisionTarget::ProjectCrew { convoy_role, .. } => Some(format!("{project}/{convoy_role}")),
+                flotilla_resources::SupervisionTarget::Address { address } => Some(address.clone()),
                 flotilla_resources::SupervisionTarget::Operator => Some("principal:operator".into()),
             })
             .unwrap_or_else(|| "principal:operator".into());

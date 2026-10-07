@@ -117,6 +117,7 @@ impl InProcessDaemon {
             | A::QueryFulfilmentList { .. }
             | A::QueryFleetList { .. }
             | A::QueryCrewStalls { .. }
+            | A::QueryMessageContacts { .. }
             | A::QueryCrewList { .. }
             | A::QueryDaemonLogs { .. }
             | A::QueryExplainConvoy { .. }

@@ -1951,6 +1951,29 @@ impl ConvoyAdmission {
                     &repository_refs,
                     &requirement.credential_scopes,
                 );
+                if let Some(project) = spec.project_ref.as_deref() {
+                    let address = format!("{project}/{name}/{}/{}", requirement.name, process.role);
+                    let mut book = flotilla_resources::crew_address_book(&self.backend, namespace, &address)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    for peer_vessel in &workflow.vessels {
+                        for peer in &peer_vessel.crew {
+                            let peer_address = format!("{project}/{name}/{}/{}", peer_vessel.name, peer.role);
+                            if peer_address != address {
+                                book.contacts.push(flotilla_resources::RoleContact {
+                                    address: peer_address,
+                                    relation: flotilla_resources::MessageRelation::Peer,
+                                    project: project.into(),
+                                    terminal: None,
+                                });
+                            }
+                        }
+                    }
+                    book.contacts.sort_by(|a, b| a.address.cmp(&b.address));
+                    book.contacts.dedup_by(|a, b| a.address == b.address);
+                    brief.content.push('\n');
+                    brief.content.push_str(&book.render());
+                }
                 writer.put_brief(namespace, name, &process.role, name, brief.content.as_bytes(), options.charter_commit.as_deref()).await?;
             }
         }

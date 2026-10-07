@@ -1075,6 +1075,9 @@ pub enum CommandAction {
     QueryCrewCapabilities {
         context: CrewCommandContext,
     },
+    QueryMessageContacts {
+        context: CrewCommandContext,
+    },
     QueryCrewList {
         context: CrewCommandContext,
     },
@@ -1182,6 +1185,7 @@ impl CommandAction {
                 | CommandAction::QueryFleetList { .. }
                 | CommandAction::QueryCrewStalls { .. }
                 | CommandAction::QueryCrewCapabilities { .. }
+                | CommandAction::QueryMessageContacts { .. }
                 | CommandAction::QueryCrewList { .. }
                 | CommandAction::QueryDaemonLogs { .. }
                 | CommandAction::QueryExplainConvoy { .. }
@@ -1262,6 +1266,7 @@ impl Command {
             CommandAction::QueryFleetList { .. } => "query fleet list",
             CommandAction::QueryCrewStalls { .. } => "query crew stalls",
             CommandAction::QueryCrewCapabilities { .. } => "query crew capabilities",
+            CommandAction::QueryMessageContacts { .. } => "query message contacts",
             CommandAction::QueryCrewList { .. } => "query crew list",
             CommandAction::QueryDaemonLogs { .. } => "query daemon logs",
             CommandAction::QueryExplainConvoy { .. } => "explain convoy",
@@ -1431,6 +1436,10 @@ pub enum CommandValue {
         card: String,
     },
     CrewList(Box<CrewListResponse>),
+    MessageContacts {
+        book: serde_json::Value,
+        text: String,
+    },
     DaemonLogs {
         /// Complete JSON-lines records, oldest first.
         lines: Vec<String>,

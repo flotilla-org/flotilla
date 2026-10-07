@@ -10,6 +10,10 @@ use crate::{
     ResourceBackend, ResourceError, ResourceObject, TypedResolver,
 };
 
+/// Adoption controllers claim a live terminal for an adoptable Project role.
+/// Removing the claim or stopping the terminal retires that local presence.
+pub const ROLE_ADDRESS_ANNOTATION: &str = "flotilla.work/role-address";
+
 /// Creation context for convoy-relative role addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageAddressContext {
@@ -24,6 +28,9 @@ pub struct MessageAddressContext {
 pub fn validate_message_address(address: &str) -> Result<(), ResourceError> {
     if address.is_empty() || address.chars().any(|character| character.is_whitespace() || character.is_control()) {
         return Err(ResourceError::invalid(format!("invalid message address `{address}`")));
+    }
+    if address.starts_with("topic:") {
+        return if crate::parse_topic_address(address).is_some() { Ok(()) } else { Err(ResourceError::invalid("invalid topic address")) };
     }
     if let Some(principal) = address.strip_prefix("principal:").or_else(|| address.strip_prefix("system:")) {
         return if !principal.is_empty() && !principal.contains('/') {
@@ -90,6 +97,7 @@ pub struct MessageInbox {
     pub(crate) messages: TypedResolver<Message>,
     pub(crate) admission: Arc<Mutex<()>>,
     pub(crate) delivery: Arc<Mutex<()>>,
+    pub(crate) charter_notifications: Arc<Mutex<()>>,
 }
 
 impl MessageInbox {
@@ -101,6 +109,7 @@ impl MessageInbox {
             audit_retention_days: 30,
             admission: Arc::new(Mutex::new(())),
             delivery: Arc::new(Mutex::new(())),
+            charter_notifications: Arc::new(Mutex::new(())),
             change_request_stale_after: std::time::Duration::from_secs(300),
             issue_stale_after: std::time::Duration::from_secs(300),
         }
@@ -269,11 +278,35 @@ pub async fn resolve_message_receiver(
     let convoys = backend.including_replicas::<Convoy>(namespace).list().await?.items;
     let (project, convoy, vessel, role) = match parts.as_slice() {
         [project, convoy, vessel, role] => (*project, Some(*convoy), Some(*vessel), *role),
-        [project, role] if *project != "fleet" => (*project, None, None, *role),
-        // Fleet and principal holders will be declared by #2658. Until then,
-        // an address with no declared holder waits; never guess a terminal.
+        [project, role] => (*project, None, None, *role),
+        // Principal and system addresses never guess an agent terminal.
         _ => return Ok(None),
     };
+    if convoy.is_none() {
+        let adopted = backend
+            .including_replicas::<TerminalSession>(namespace)
+            .list()
+            .await?
+            .items
+            .into_iter()
+            .filter(|holder| {
+                holder.object.metadata.annotations.get(ROLE_ADDRESS_ANNOTATION).is_some_and(|claimed| claimed == address)
+                    && holder.object.status.as_ref().is_some_and(|status| status.phase == crate::TerminalSessionPhase::Running)
+                    && matches!(holder.object.spec.source, TerminalSessionSource::Agent { .. })
+            })
+            .collect::<Vec<_>>();
+        if !adopted.is_empty() {
+            let declaration = backend.definitions::<crate::Project>(namespace).get(project).await?;
+            let cascade = crate::ResolvedCascade::load(backend, namespace, project, &declaration.spec).await?;
+            if !cascade.roles.get(role).is_some_and(|definition| definition.adoptable == Some(true)) {
+                return Err(ResourceError::invalid("terminal claims a role that is not adoptable"));
+            }
+            if adopted.len() != 1 {
+                return Err(ResourceError::invalid("adoptable role has multiple current terminal claims"));
+            }
+            return Ok(adopted.into_iter().next());
+        }
+    }
     let declared_convoy = if convoy.is_none() {
         let declarations = backend.including_replicas::<crate::ConvoyEnsure>(namespace).list().await?.items;
         let mut holders = declarations

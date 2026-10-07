@@ -1059,6 +1059,7 @@ impl Reconciler for ConvoyReconciler {
                     began_at: prior.filter(|stalled| stalled.cause == Some(StallCause::Capacity)).map_or(now, |stalled| stalled.began_at),
                     rung: StallRung::Operator,
                     supervisor: None,
+                    supervision_message: None,
                     supervision_index: None,
                     supervision_exhausted: false,
                     reason: None,

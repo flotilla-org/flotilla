@@ -20,12 +20,49 @@ pub struct RoleDefinition {
     pub workflow: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brief_template: Option<String>,
+    /// Topic addresses are local to the declaring Project. Shape inherits, but
+    /// subscribers exist only where a role holder is declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscriptions: Option<Vec<RoleSubscription>>,
+    /// An adoptable holder is supplied by the session adoption controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoptable: Option<bool>,
+    /// A principal-backed role terminates the automated supervision chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+}
+
+/// Lower priorities receive supervision first; ties use address order.
+/// Subtree subscriptions also receive topics originating in descendants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
+#[serde(deny_unknown_fields)]
+pub struct RoleSubscription {
+    pub topic: String,
+    #[serde(default)]
+    #[builder(default)]
+    pub subtree: bool,
+    #[serde(default)]
+    #[builder(default)]
+    pub priority: u32,
 }
 
 pub fn validate_role_definitions(roles: &BTreeMap<String, RoleDefinition>) -> Result<(), ResourceError> {
     for (role, definition) in roles {
         if role.trim().is_empty() {
             return Err(ResourceError::invalid("role name must be nonempty"));
+        }
+        if let Some(subscriptions) = &definition.subscriptions {
+            for subscription in subscriptions {
+                if crate::validate_message_address(&format!("topic:project/{}", subscription.topic)).is_err() {
+                    return Err(ResourceError::invalid("subscription topic must be a nonempty local topic name"));
+                }
+            }
+        }
+        if let Some(principal) = &definition.principal {
+            crate::validate_message_address(principal)?;
+            if !principal.starts_with("principal:") {
+                return Err(ResourceError::invalid("principal-backed role requires a principal address"));
+            }
         }
         for value in [&definition.agent, &definition.model, &definition.workflow, &definition.brief_template].into_iter().flatten() {
             if value.trim().is_empty() {
@@ -97,6 +134,15 @@ impl ResolvedCascade {
                             .insert(format!("roles.{role}.{field}"), ResolvedSetting { value: value.clone(), layer: layer.name.clone() });
                     }
                 }
+                if let Some(subscriptions) = &definition.subscriptions {
+                    effective.subscriptions = Some(subscriptions.clone());
+                }
+                if let Some(adoptable) = definition.adoptable {
+                    effective.adoptable = Some(adoptable);
+                }
+                if let Some(principal) = &definition.principal {
+                    effective.principal = Some(principal.clone());
+                }
             }
             let ordered_skills =
                 layer.skills.get_key_value("*").into_iter().chain(layer.skills.iter().filter(|(role, _)| role.as_str() != "*"));
@@ -139,15 +185,7 @@ impl ResolvedCascade {
     ) -> Result<Self, ResourceError> {
         let objects = backend.definitions::<Project>(namespace).list().await?;
         // Freeze local content and its revision from the same definition read.
-        let charter_commit = objects.iter().find(|object| object.metadata.name == project_name).and_then(|object| {
-            object
-                .metadata
-                .annotations
-                .get("flotilla.work/source-commit")
-                .or_else(|| object.metadata.annotations.get("flotilla.work/project-bootstrap-commit"))
-                .or_else(|| object.metadata.annotations.get("flotilla.work/manifest-revision"))
-                .cloned()
-        });
+        let charter_commit = objects.iter().find(|object| object.metadata.name == project_name).and_then(project_charter_revision);
         let fleet = match backend.definitions::<crate::FleetDesignation>(namespace).get(crate::FLEET_DESIGNATION_NAME).await {
             Ok(designation) => Some(designation.spec.project),
             Err(ResourceError::NotFound { .. }) => None,
@@ -267,6 +305,17 @@ pub fn validate_cascade_skills(
     Ok(())
 }
 
+pub(crate) fn project_charter_revision(object: &crate::ResourceObject<crate::Project>) -> Option<String> {
+    object
+        .metadata
+        .annotations
+        .get("flotilla.work/charter-revision")
+        .or_else(|| object.metadata.annotations.get("flotilla.work/source-commit"))
+        .or_else(|| object.metadata.annotations.get("flotilla.work/project-bootstrap-commit"))
+        .or_else(|| object.metadata.annotations.get("flotilla.work/manifest-revision"))
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use hegel::generators as gs;
@@ -289,6 +338,7 @@ mod tests {
                     model: Some("fleet".into()),
                     workflow: Some("govern".into()),
                     brief_template: Some("fleet template".into()),
+                    ..Default::default()
                 },
             )]),
         }];
@@ -330,6 +380,7 @@ mod tests {
                     model: Some("fleet".into()),
                     workflow: Some("govern".into()),
                     brief_template: Some("fleet template".into()),
+                    ..Default::default()
                 },
             )]))
             .charter_prose(BTreeMap::from([("*".into(), "Fleet-only prose".into())]))

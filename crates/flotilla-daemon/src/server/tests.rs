@@ -1900,18 +1900,18 @@ async fn crew_completion_partition_is_persisted_and_names_the_unreachable_author
     );
 
     peer_manager.lock().await.register_sender(node("feta"), Arc::new(FailingPeerSender));
-    let query_error = router
-        .dispatch_query(
-            Command::builder()
-                .action(CommandAction::QueryCrewList {
-                    context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() },
-                })
-                .build(),
-            uuid::Uuid::nil(),
-        )
-        .await
-        .expect_err("partitioned follower query should name the authority");
-    assert_eq!(query_error, "authority unreachable for stranded at feta: outbound channel closed");
+    // Both live crew queries route to the authority and report partitions;
+    // contacts must not silently answer from a stale follower projection.
+    for action in [
+        CommandAction::QueryCrewList { context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() } },
+        CommandAction::QueryMessageContacts { context: CrewCommandContext { crew_id: Some("crew-coder".into()), ..Default::default() } },
+    ] {
+        let query_error = router
+            .dispatch_query(Command::builder().action(action).build(), uuid::Uuid::nil())
+            .await
+            .expect_err("partitioned follower query should name the authority");
+        assert_eq!(query_error, "authority unreachable for stranded at feta: outbound channel closed");
+    }
 }
 
 async fn assert_remote_placement_admission_routes_to_the_actuator(caller: Option<flotilla_protocol::CommandCaller>) {

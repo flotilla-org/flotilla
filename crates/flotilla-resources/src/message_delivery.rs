@@ -87,7 +87,7 @@ impl MessageInbox {
         let mut groups: BTreeMap<String, (ResourceObject<TerminalSession>, Vec<ResourceObject<Message>>)> = BTreeMap::new();
         // Reuse a receiver lookup within this pass, never across passes: holder
         // evidence must refresh even while a submission is held.
-        let mut receivers: BTreeMap<String, Option<ReadResourceObject<TerminalSession>>> = BTreeMap::new();
+        let mut receivers: BTreeMap<(String, String), Option<ReadResourceObject<TerminalSession>>> = BTreeMap::new();
         for message in &messages {
             let phase = message.status.as_ref().map_or(MessagePhase::Accepted, |status| status.phase);
             if phase.is_terminal() {
@@ -183,11 +183,12 @@ impl MessageInbox {
             if phase == MessagePhase::WaitingOnReferences {
                 continue;
             }
-            let holder = if let Some(holder) = receivers.get(&message.spec.receiver) {
+            let receiver_key = (message.spec.receiver.clone(), message.spec.sender.clone());
+            let holder = if let Some(holder) = receivers.get(&receiver_key) {
                 holder.clone()
             } else {
-                let holder = resolve_message_receiver(&self.backend, &self.namespace, &message.spec.receiver).await?;
-                receivers.insert(message.spec.receiver.clone(), holder.clone());
+                let holder = self.resolve_receiver(message).await?;
+                receivers.insert(receiver_key, holder.clone());
                 holder
             };
             match holder {
@@ -267,9 +268,50 @@ impl MessageInbox {
         self.clear_signal(&message).await
     }
 
+    async fn delivered_role_address(
+        &self,
+        message: &ResourceObject<Message>,
+        holder: &ResourceObject<TerminalSession>,
+    ) -> Result<Option<String>, ResourceError> {
+        if let Some(address) = holder.metadata.annotations.get(crate::ROLE_ADDRESS_ANNOTATION) {
+            return Ok(Some(address.clone()));
+        }
+        let labels = &holder.metadata.labels;
+        let (Some(convoy), Some(vessel), Some(role)) =
+            (labels.get(crate::CONVOY_LABEL), labels.get(crate::VESSEL_LABEL), labels.get(crate::ROLE_LABEL))
+        else {
+            return Ok(None);
+        };
+        let project = if message.spec.receiver.starts_with("topic:") {
+            self.backend.including_replicas::<crate::Convoy>(&self.namespace).get(convoy).await?.object.spec.project_ref
+        } else {
+            message.spec.receiver.split('/').next().map(str::to_string)
+        };
+        Ok(project.map(|project| format!("{project}/{convoy}/{vessel}/{role}")))
+    }
+
+    async fn resolve_receiver(
+        &self,
+        message: &ResourceObject<Message>,
+    ) -> Result<Option<ReadResourceObject<TerminalSession>>, ResourceError> {
+        if message.spec.receiver.starts_with("topic:") {
+            crate::resolve_topic_receiver(&self.backend, &self.namespace, &message.spec.receiver, &message.spec.sender).await
+        } else {
+            resolve_message_receiver(&self.backend, &self.namespace, &message.spec.receiver).await
+        }
+    }
+
     async fn reply_sender_matches(&self, message: &ResourceObject<Message>, sender: &str) -> Result<bool, ResourceError> {
         if sender == message.spec.receiver {
             return Ok(true);
+        }
+        if message.spec.receiver.starts_with("topic:") {
+            return Ok(message
+                .status
+                .as_ref()
+                .and_then(|status| status.resolved_receiver.as_ref())
+                .and_then(|receiver| receiver.role_address.as_deref())
+                == Some(sender));
         }
         let request: Vec<_> = message.spec.receiver.split('/').collect();
         let reply: Vec<_> = sender.split('/').collect();
@@ -391,7 +433,7 @@ impl MessageInbox {
                     self.accepted(
                         &members,
                         &ResolvedMessageReceiver::builder()
-                            .maybe_role_address(delivered_role_address(&members[0], holder))
+                            .maybe_role_address(self.delivered_role_address(&members[0], holder).await?)
                             .crew_id(submission.crew_id.clone())
                             .session(submission.session.clone())
                             .delivered_at(now)
@@ -517,7 +559,7 @@ impl MessageInbox {
                 self.accepted(
                     members,
                     &ResolvedMessageReceiver::builder()
-                        .maybe_role_address(delivered_role_address(&members[0], holder))
+                        .maybe_role_address(self.delivered_role_address(&members[0], holder).await?)
                         .crew_id(submission.crew_id.clone())
                         .session(submission.session.clone())
                         .delivered_at(now)
@@ -667,7 +709,7 @@ impl MessageInbox {
             .collect();
         let mut retained = std::collections::BTreeSet::new();
         for message in active {
-            if let Some(holder) = resolve_message_receiver(&self.backend, &self.namespace, &message.spec.receiver).await? {
+            if let Some(holder) = self.resolve_receiver(&message).await? {
                 retained.insert(delivery_demand_name(&holder.object));
             }
         }
@@ -684,7 +726,7 @@ impl MessageInbox {
     }
 
     async fn signal(&self, message: &ResourceObject<Message>, now: DateTime<Utc>) -> Result<(), ResourceError> {
-        let Some(holder) = resolve_message_receiver(&self.backend, &self.namespace, &message.spec.receiver).await? else {
+        let Some(holder) = self.resolve_receiver(message).await? else {
             return Ok(());
         };
         let demands = self.backend.using::<Demand>(&self.namespace);
@@ -700,7 +742,7 @@ impl MessageInbox {
     }
 
     async fn clear_signal(&self, message: &ResourceObject<Message>) -> Result<(), ResourceError> {
-        let Some(holder) = resolve_message_receiver(&self.backend, &self.namespace, &message.spec.receiver).await? else {
+        let Some(holder) = self.resolve_receiver(message).await? else {
             return Ok(());
         };
         let demands = self.backend.using::<Demand>(&self.namespace);
@@ -709,12 +751,6 @@ impl MessageInbox {
             Err(error) => Err(error),
         }
     }
-}
-
-fn delivered_role_address(message: &ResourceObject<Message>, holder: &ResourceObject<TerminalSession>) -> Option<String> {
-    let project = message.spec.receiver.split('/').next()?;
-    let labels = &holder.metadata.labels;
-    Some(format!("{project}/{}/{}/{}", labels.get(crate::CONVOY_LABEL)?, labels.get(crate::VESSEL_LABEL)?, labels.get(crate::ROLE_LABEL)?))
 }
 
 fn status_for(message: &ResourceObject<Message>) -> MessageStatus {

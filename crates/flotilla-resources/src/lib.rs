@@ -80,6 +80,7 @@ mod repository;
 mod resource;
 mod retention;
 mod review_bundle;
+mod role_routing;
 mod sqlite;
 mod status_patch;
 mod terminal_session;
@@ -297,7 +298,7 @@ pub use message::{
 pub use message_delivery::{MessageBatch, MessageObservation, MessageTransport, MessageTransportOutcome};
 pub use message_inbox::{
     message_expectation_open, message_supersedes, qualify_message_address, qualify_message_spec, resolve_message_receiver,
-    validate_message_address, MessageAddressContext, MessageAdmission, MessageInbox,
+    validate_message_address, MessageAddressContext, MessageAdmission, MessageInbox, ROLE_ADDRESS_ANNOTATION,
 };
 pub use message_migration::{legacy_message_sender, legacy_message_spec};
 pub use message_query::{message_query_document, MessageQuery};
@@ -313,4 +314,5 @@ pub mod role_cascade;
 pub use credential::{HostActionSelector, HostImageAction};
 pub use fleet_designation::ImageCacheBinding;
 pub use image_build::{is_image_digest, ImageAcquisitionCost, ImageAvailability, IMAGE_DIGESTS_CAPABILITY};
-pub use role_cascade::{ResolvedCascade, ResolvedSetting, RoleCascadeLayer, RoleDefinition};
+pub use role_cascade::{ResolvedCascade, ResolvedSetting, RoleCascadeLayer, RoleDefinition, RoleSubscription};
+pub use role_routing::*;

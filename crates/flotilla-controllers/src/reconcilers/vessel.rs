@@ -78,6 +78,7 @@ pub trait WorktreeMetadataResolver: Send + Sync {
 
 #[derive(bon::Builder)]
 pub struct VesselReconciler {
+    backend: ResourceBackend,
     convoys: TypedResolver<Convoy>,
     repositories: TypedResolver<Repository>,
     placement_policies: TypedResolver<PlacementPolicy>,
@@ -102,6 +103,7 @@ pub struct VesselReconciler {
 impl VesselReconciler {
     pub fn new(backend: ResourceBackend, namespace: &str) -> Self {
         Self {
+            backend: backend.clone(),
             convoys: backend.clone().using::<Convoy>(namespace),
             repositories: backend.clone().using::<Repository>(namespace),
             placement_policies: backend.clone().using::<PlacementPolicy>(namespace),
@@ -1237,6 +1239,14 @@ impl Reconciler for VesselReconciler {
                                 checkout_paths.values().map(PathBuf::from),
                                 fork_stance,
                             );
+                            render_options.apply_cascade(
+                                convoy
+                                    .status
+                                    .as_ref()
+                                    .and_then(|status| status.workflow_snapshot.as_ref())
+                                    .and_then(|workflow| workflow.cascade.as_deref()),
+                                &process.role,
+                            );
                             render_options.has_credential_scope = !requirement.credential_scopes.is_empty();
                             let mut brief = if convoy.metadata.annotations.contains_key(BRIEF_ARTIFACTS_ANNOTATION) {
                                 let name = artifact_record_name(&context.convoy, &process.role, "brief", &context.convoy);
@@ -1272,6 +1282,12 @@ impl Reconciler for VesselReconciler {
                                     Err(message) => return Ok(VesselPrepared::failed(message)),
                                 };
                                 append_convoy_work_context(&mut brief.content, &convoy, &repository_refs, &requirement.credential_scopes);
+                                if let Some(project) = convoy.spec.project_ref.as_deref() {
+                                    let address = format!("{project}/{}/{}/{}", convoy.metadata.name, obj.spec.vessel_name, process.role);
+                                    let book = flotilla_resources::crew_address_book(&self.backend, &self.namespace, &address).await?;
+                                    brief.content.push('\n');
+                                    brief.content.push_str(&book.render());
+                                }
                                 brief
                             };
                             brief.copies = brief_copies.clone();
@@ -1284,6 +1300,15 @@ impl Reconciler for VesselReconciler {
                         }
                     };
                     let mut terminal_meta = identity.input_meta();
+                    if let Some(revision) = convoy
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.workflow_snapshot.as_ref())
+                        .and_then(|workflow| workflow.cascade.as_ref())
+                        .and_then(|cascade| cascade.charter_commit.as_ref())
+                    {
+                        terminal_meta.annotations.insert(flotilla_resources::BRIEF_CHARTER_REVISION_ANNOTATION.into(), revision.clone());
+                    }
                     terminal_meta.annotations.extend(actuator_annotations(obj));
                     if !requirement.credential_refs.is_empty() {
                         terminal_meta.annotations.insert(

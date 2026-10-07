@@ -82,6 +82,7 @@ pub enum SupervisionTarget {
     ConvoyCrew { vessel: String, role: String },
     ProjectCrew { convoy_role: String, vessel: String, role: String },
     Operator,
+    Address { address: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
