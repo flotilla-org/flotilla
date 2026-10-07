@@ -730,6 +730,7 @@ fn static_ssh_environment_id(config_key: &str) -> EnvironmentId {
     EnvironmentId::new(format!("static-ssh-{suffix}"))
 }
 
+mod dispatch_board;
 mod read_projections;
 #[cfg(test)]
 mod repository_lifecycle_tests;
@@ -1380,6 +1381,7 @@ pub struct InProcessDaemon {
     /// provider detection, both at startup and for later repo additions.
     discovery: Arc<DiscoveryRuntime>,
     issue_query_port: Arc<dyn IssueQueryPort>,
+    dispatch_board_cache: dispatch_board::DispatchBoardCache,
     /// VCS capabilities are selected once for each checkout in its execution environment.
     checkout_providers: Arc<CheckoutProviders>,
     repository_providers: Mutex<HashMap<(String, RepositoryKey), Arc<repository_operations::RepositoryProviderLease>>>,
@@ -1852,6 +1854,7 @@ impl InProcessDaemon {
                 .build(),
         );
         let daemon = Arc::new_cyclic(|self_weak| Self {
+            dispatch_board_cache: dispatch_board::DispatchBoardCache::default(),
             repos: Arc::clone(&repos),
             repo_order: RwLock::new(order),
             event_source,
@@ -4914,21 +4917,58 @@ impl InProcessDaemon {
 
     pub async fn dispatch_board_internal(&self, project_filter: Option<&str>) -> Result<flotilla_protocol::DispatchBoardResponse, String> {
         let readiness = self.dispatch_queue_internal(project_filter).await?;
+        let repositories = self.dispatch_board_repositories(project_filter).await?;
+        Ok(flotilla_protocol::DispatchBoardResponse { readiness, repositories })
+    }
+
+    /// Schedule tracker observations without waiting for the forge or coupling
+    /// board freshness to the availability of dispatch readiness evidence.
+    pub async fn refresh_dispatch_boards_internal(&self) -> Result<(), String> {
+        self.dispatch_board_repositories(None).await.map(|_| ())
+    }
+
+    async fn dispatch_board_repositories(
+        &self,
+        project_filter: Option<&str>,
+    ) -> Result<Vec<flotilla_protocol::DispatchBoardRepository>, String> {
         let namespace = self.provisioning_namespace().await;
         let projects = self.resource_backend.definitions::<Project>(&namespace).list().await.map_err(|error| error.to_string())?;
         let mut sources = std::collections::BTreeSet::new();
+        let mut errors = Vec::new();
         for project in projects {
             if project_filter.is_some_and(|name| name != project.metadata.name) {
                 continue;
             }
             let scope = flotilla_protocol::QueryScope::new(&project.metadata.namespace, &project.metadata.name);
-            sources.extend(self.resolve_issue_source_bindings(&scope).await?.into_iter().map(|binding| binding.source));
+            match self.resolve_issue_source_bindings(&scope).await {
+                Ok(bindings) => sources.extend(bindings.into_iter().map(|binding| binding.source)),
+                Err(error) => errors.push(error),
+            }
+        }
+        if project_filter.is_none() && errors.is_empty() {
+            self.dispatch_board_cache.retain_sources(&sources).await;
         }
         let mut repositories = Vec::new();
         for source in sources {
-            repositories.push(self.issue_provider_for_source(&source).await?.dispatch_board(&source).await?);
+            let daemon = self.self_weak.clone();
+            let tracker_source = source.clone();
+            match self
+                .dispatch_board_cache
+                .read(&source, move || async move {
+                    let daemon = daemon.upgrade().ok_or("daemon stopped")?;
+                    daemon.issue_provider_for_source(&tracker_source).await?.dispatch_board(&tracker_source).await
+                })
+                .await
+            {
+                Ok(board) => repositories.push(board),
+                Err(error) => errors.push(error),
+            }
         }
-        Ok(flotilla_protocol::DispatchBoardResponse { readiness, repositories })
+        if errors.is_empty() {
+            Ok(repositories)
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     pub async fn dispatch_queue_internal(&self, project_filter: Option<&str>) -> Result<DispatchQueueResponse, String> {

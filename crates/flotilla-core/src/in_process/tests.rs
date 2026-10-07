@@ -10109,3 +10109,150 @@ async fn message_apply_retries_only_conflicts_with_a_finite_budget() {
     assert!(result.is_err());
     assert_eq!(attempts, 1);
 }
+
+// Tracker boundary: deliberately suspend native forge observations so the board
+// scenario can prove interactive reads never wait for remote work.
+struct SuspendedBoardProvider {
+    calls: AtomicUsize,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait]
+impl IssueProvider for SuspendedBoardProvider {
+    fn supports(&self, _: &flotilla_protocol::IssueSource) -> bool {
+        true
+    }
+    async fn query(
+        &self,
+        _: &flotilla_protocol::IssueSource,
+        _: &flotilla_protocol::issue_query::IssueQuery,
+        _: u32,
+        _: usize,
+    ) -> Result<flotilla_protocol::issue_query::IssueResultPage, String> {
+        unreachable!("board uses native facts")
+    }
+    async fn fetch_by_id(&self, _: &flotilla_protocol::IssueRef) -> Result<flotilla_protocol::Issue, String> {
+        unreachable!("no per-issue fetch")
+    }
+    async fn list_changed_since(
+        &self,
+        _: &flotilla_protocol::IssueSource,
+        _: &str,
+        _: usize,
+    ) -> Result<flotilla_protocol::IssueChangeset, String> {
+        unreachable!("no incremental fetch")
+    }
+    async fn open_in_browser(&self, _: &flotilla_protocol::IssueRef) -> Result<(), String> {
+        unreachable!("no browser")
+    }
+    async fn dispatch_board(&self, source: &flotilla_protocol::IssueSource) -> Result<flotilla_protocol::DispatchBoardRepository, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.release.acquire().await.expect("release observation").forget();
+        Ok(super::dispatch_board::tests::board(source, 400))
+    }
+}
+
+// #2842: realistic Project status and 400 serving convoys must not turn a
+// board read into per-issue forge calls or wait on an unfinished bulk fetch.
+#[tokio::test]
+async fn large_dispatch_board_reads_projection_without_waiting_for_forge() {
+    use flotilla_resources::{DispatchQueueEntry, ProjectStatus};
+    let temp = tempfile::tempdir().expect("config");
+    std::fs::write(temp.path().join("daemon.toml"), "machine_id = \"dispatch-board-test\"\n").expect("daemon config");
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let source = flotilla_protocol::IssueSource { service: "https://github.com".into(), scope: "org/large".into() };
+    let provider = Arc::new(SuspendedBoardProvider { calls: AtomicUsize::new(0), release: tokio::sync::Semaphore::new(0) });
+    let projects = backend.using::<Project>("flotilla");
+    let mut binding = flotilla_resources::IssueSourceBindingSpec::from(source.clone());
+    binding.alias = Some("large".into());
+    let now = Utc::now();
+    for name in ["large", "shared"] {
+        projects
+            .create(
+                &test_meta(name),
+                &ProjectSpec::builder().display_name(name.to_string()).issue_source_bindings(vec![binding.clone()]).build(),
+            )
+            .await
+            .expect("project");
+        let project = projects.get(name).await.expect("current project");
+        projects
+            .update_status(name, &project.metadata.resource_version, &ProjectStatus {
+                dispatch_queue: (0..400)
+                    .map(|id| DispatchQueueEntry {
+                        issue: flotilla_protocol::IssueRef { source: source.clone(), id: id.to_string() },
+                        title: format!("Issue {id}"),
+                        issue_as_of: now,
+                        ready_observed_at: now,
+                        observed_at: now,
+                        provenance: "test".into(),
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .await
+            .expect("readiness projection");
+    }
+    for id in 0..400 {
+        backend
+            .using::<ResourceConvoy>("flotilla")
+            .create(
+                &test_meta(&format!("convoy-{id}")),
+                &ConvoySpec::builder().workflow_ref("workflow".to_string()).project_ref("large".to_string()).build(),
+            )
+            .await
+            .expect("convoy");
+    }
+    let daemon = InProcessDaemon::new_with_resource_backend(
+        Vec::new(),
+        Arc::new(ConfigStore::with_base(temp.path())),
+        fake_discovery_with_provider_set(FakeDiscoveryProviders::default().with_issue_tracker(provider.clone())),
+        HostName::new("test-host"),
+        backend.clone(),
+    )
+    .await;
+    let cold = tokio::time::timeout(Duration::from_secs(1), daemon.dispatch_board_internal(Some("large")))
+        .await
+        .expect("interactive read must not wait for forge");
+    assert!(cold.expect_err("cold facts fail closed").contains("initial observation"));
+    // Background warming and another Project must share the same source flight.
+    assert!(daemon.refresh_dispatch_boards_internal().await.is_err());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while provider.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background fetch started");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    provider.release.add_permits(1);
+    let board = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(board) = daemon.dispatch_board_internal(Some("large")).await {
+                break board;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("observation published");
+    assert_eq!(board.readiness.entries.len(), 400);
+    assert_eq!(board.repositories.len(), 1);
+    assert_eq!(board.repositories[0].issues.len(), 400);
+    assert_eq!(board.repositories[0].pull_requests.len(), 400);
+    assert_eq!(daemon.dispatch_board_internal(None).await.expect("shared board").readiness.entries.len(), 800);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    // A complete board never silently omits a selected cold source, while a
+    // healthy Project remains available independently of that other source.
+    let mut cold_binding = binding;
+    cold_binding.source.scope = "org/cold".into();
+    cold_binding.alias = Some("cold".into());
+    projects
+        .create(
+            &test_meta("cold"),
+            &ProjectSpec::builder().display_name("Cold".to_string()).issue_source_bindings(vec![cold_binding]).build(),
+        )
+        .await
+        .expect("cold project");
+    assert!(daemon.dispatch_board_internal(None).await.expect_err("complete source board").contains("initial observation"));
+    assert_eq!(daemon.dispatch_board_internal(Some("large")).await.expect("healthy project").repositories[0].issues.len(), 400);
+}

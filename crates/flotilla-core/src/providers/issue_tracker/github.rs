@@ -256,7 +256,16 @@ impl super::IssueProvider for GitHubIssueProvider {
                     .build())
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(DispatchBoardRepository { source: source.clone(), issues, pull_requests })
+        // Direct adapter observations have a completion timestamp; the daemon
+        // cache owns serving age/error and stamps its own completed observation.
+        Ok(DispatchBoardRepository {
+            observed_at: Utc::now(),
+            age_seconds: 0,
+            refresh_error: None,
+            source: source.clone(),
+            issues,
+            pull_requests,
+        })
     }
 
     async fn dispatch_facts(&self, reference: &IssueRef) -> Result<flotilla_protocol::DispatchIssueFacts, String> {
