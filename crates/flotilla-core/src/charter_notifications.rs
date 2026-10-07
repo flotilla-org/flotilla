@@ -3,8 +3,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use flotilla_resources::{
-    CharterBriefInput, CharterBriefRenderer, CharterProseRenderer, CrewSource, ResolvedCascade, ResourceBackend, ResourceError,
-    TerminalSessionSource, VESSEL_LABEL,
+    CharterBriefInput, CharterBriefRenderer, CharterProseRenderer, CrewSource, ResourceBackend, ResourceError, TerminalSessionSource,
+    VESSEL_LABEL,
 };
 
 use crate::{
@@ -43,8 +43,7 @@ impl CharterBriefRenderer for LiveCharterBriefRenderer {
             Some(CrewSource::Agent { prompt, brief_template, .. }) => (prompt.as_deref(), brief_template.as_deref()),
             _ => (None, None),
         };
-        let mut cascade =
-            ResolvedCascade::load(&self.backend, &context.namespace, &input.project.metadata.name, &input.project.spec).await?;
+        let mut cascade = input.cascade.clone();
         // The notification's local content and revision come from the same read.
         cascade.charter = input.project.spec.charter_prose.clone();
         cascade.charter_commit = Some(input.revision.to_string());

@@ -1307,7 +1307,7 @@ impl Reconciler for VesselReconciler {
                         .and_then(|workflow| workflow.cascade.as_ref())
                         .and_then(|cascade| cascade.charter_commit.as_ref())
                     {
-                        terminal_meta.annotations.insert("flotilla.work/brief-charter-revision".into(), revision.clone());
+                        terminal_meta.annotations.insert(flotilla_resources::BRIEF_CHARTER_REVISION_ANNOTATION.into(), revision.clone());
                     }
                     terminal_meta.annotations.extend(actuator_annotations(obj));
                     if !requirement.credential_refs.is_empty() {

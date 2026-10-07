@@ -1961,3 +1961,118 @@ async fn adoptable_role_uses_a_unique_running_terminal_claim() {
     }
     assert!(resolve_message_receiver(&backend, "flotilla", "root/attended").await.expect("retired").is_none());
 }
+
+// Bad claims are isolated to their terminal; the healthy holder still receives
+// its revision on the same pass, including after a reconciler restart.
+#[tokio::test]
+async fn malformed_adopted_claim_does_not_block_healthy_charter_notifications() {
+    use flotilla_resources::*;
+    for claim in ["root/guide/extra", "root/", "missing-slash", "unknown/guide", "root/undeclared"] {
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        routing_project(&backend, "root", None).await;
+        routing_holder(&backend, "root", "one").await;
+        let projects = backend.definitions::<Project>("flotilla");
+        let project = projects.get("root").await.expect("project");
+        let mut meta = InputMeta::from(&project.metadata);
+        meta.annotations.insert("flotilla.work/charter-revision".into(), "new".into());
+        projects.apply(&meta, &project.spec).await.expect("revision");
+        let terminals = backend.using::<TerminalSession>("flotilla");
+        let invalid = terminals
+            .create(
+                &InputMeta::builder()
+                    .name("a-invalid".into())
+                    .annotations(std::collections::BTreeMap::from([(ROLE_ADDRESS_ANNOTATION.into(), claim.into())]))
+                    .build(),
+                &holder_spec("external"),
+            )
+            .await
+            .expect("invalid claim fixture");
+        terminals
+            .update_status(
+                "a-invalid",
+                &invalid.metadata.resource_version,
+                &TerminalSessionStatus { phase: TerminalSessionPhase::Running, ..Default::default() },
+            )
+            .await
+            .expect("running");
+        for _ in 0..2 {
+            reconcile_charter_notifications(&MessageInbox::new(backend.clone(), "flotilla"), at(10)).await.expect("healthy notification");
+        }
+        let messages = backend.using::<Message>("flotilla").list().await.expect("messages");
+        assert_eq!(messages.items.len(), 1, "claim {claim}");
+        assert_eq!(messages.items[0].spec.receiver, "root/root-one/work/guide");
+    }
+}
+
+// Structured revision evidence suppresses the initial revision; prose cannot
+// suppress a changed revision. Rendering may admit unrelated input, and repeated
+// passes do not call a custom renderer again even if it omits revision text.
+#[tokio::test]
+async fn custom_charter_renderer_uses_structured_revision_and_does_not_lock_admission() {
+    use flotilla_resources::*;
+    struct Renderer {
+        inbox: MessageInbox,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl CharterBriefRenderer for Renderer {
+        async fn render(&self, _: CharterBriefInput<'_>) -> Result<String, ResourceError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inbox
+                .accept(
+                    &InputMeta::builder().name("render-witness".into()).build(),
+                    &MessageSpec::builder()
+                        .sender("system:renderer".into())
+                        .receiver("system:observer".into())
+                        .relation(MessageRelation::System)
+                        .body("independent admission".into())
+                        .build(),
+                    at(10),
+                )
+                .await?;
+            Ok("Custom template without revision marker".into())
+        }
+    }
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    routing_project(&backend, "root", None).await;
+    routing_holder(&backend, "root", "one").await;
+    let terminals = backend.using::<TerminalSession>("flotilla");
+    let terminal = terminals.get("terminal-root-one").await.expect("holder");
+    let mut meta = InputMeta::from(&terminal.metadata);
+    meta.annotations.insert(BRIEF_CHARTER_REVISION_ANNOTATION.into(), "initial".into());
+    let mut terminal_spec = terminal.spec;
+    let TerminalSessionSource::Agent { brief, .. } = &mut terminal_spec.source else { panic!("agent") };
+    brief.content = "User prose: Charter revision: `changed`".into();
+    terminals.update(&meta, &terminal.metadata.resource_version, &terminal_spec).await.expect("initial evidence");
+    let inbox = MessageInbox::new(backend.clone(), "flotilla");
+    let renderer = Renderer { inbox: inbox.clone(), calls: Default::default() };
+    let projects = backend.definitions::<Project>("flotilla");
+    for revision in ["initial", "changed", "changed"] {
+        let project = projects.get("root").await.expect("project");
+        let mut meta = InputMeta::from(&project.metadata);
+        meta.annotations.insert("flotilla.work/charter-revision".into(), revision.into());
+        projects.apply(&meta, &project.spec).await.expect("revision");
+        tokio::time::timeout(std::time::Duration::from_secs(2), reconcile_charter_notifications_with_renderer(&inbox, &renderer, at(10)))
+            .await
+            .expect("render does not hold admission lock")
+            .expect("notification");
+    }
+    assert_eq!(renderer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let messages = backend.using::<Message>("flotilla").list().await.expect("messages");
+    let notifications: Vec<_> = messages.items.iter().filter(|message| message.spec.sender == FLEET_STORE_SENDER).collect();
+    assert_eq!(notifications.len(), 1);
+    assert!(notifications[0].spec.body.contains("Custom template without revision marker"));
+    assert!(matches!(&notifications[0].spec.subject, Some(MessageReference::ControlRecord { revision, .. }) if revision == "changed"));
+}
+
+// An unknown Project is a configuration error, distinct from an empty but valid
+// subscription path. It must never be presented as an unoccupied supervisor.
+#[tokio::test]
+async fn unknown_project_contact_query_reports_configuration_error() {
+    use flotilla_resources::*;
+    let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+    let book = crew_address_book(&backend, "flotilla", "missing/task/work/coder").await.expect("diagnostic projection");
+    assert_eq!(book.routing_issue.as_deref(), Some("unknown Project `missing`"));
+    assert!(book.render().contains("unknown Project `missing`"));
+    assert!(!book.render().contains("No current subscriber"));
+}

@@ -185,16 +185,7 @@ impl ResolvedCascade {
     ) -> Result<Self, ResourceError> {
         let objects = backend.definitions::<Project>(namespace).list().await?;
         // Freeze local content and its revision from the same definition read.
-        let charter_commit = objects.iter().find(|object| object.metadata.name == project_name).and_then(|object| {
-            object
-                .metadata
-                .annotations
-                .get("flotilla.work/charter-revision")
-                .or_else(|| object.metadata.annotations.get("flotilla.work/source-commit"))
-                .or_else(|| object.metadata.annotations.get("flotilla.work/project-bootstrap-commit"))
-                .or_else(|| object.metadata.annotations.get("flotilla.work/manifest-revision"))
-                .cloned()
-        });
+        let charter_commit = objects.iter().find(|object| object.metadata.name == project_name).and_then(project_charter_revision);
         let fleet = match backend.definitions::<crate::FleetDesignation>(namespace).get(crate::FLEET_DESIGNATION_NAME).await {
             Ok(designation) => Some(designation.spec.project),
             Err(ResourceError::NotFound { .. }) => None,
@@ -312,6 +303,17 @@ pub fn validate_cascade_skills(
         }
     }
     Ok(())
+}
+
+pub(crate) fn project_charter_revision(object: &crate::ResourceObject<crate::Project>) -> Option<String> {
+    object
+        .metadata
+        .annotations
+        .get("flotilla.work/charter-revision")
+        .or_else(|| object.metadata.annotations.get("flotilla.work/source-commit"))
+        .or_else(|| object.metadata.annotations.get("flotilla.work/project-bootstrap-commit"))
+        .or_else(|| object.metadata.annotations.get("flotilla.work/manifest-revision"))
+        .cloned()
 }
 
 #[cfg(test)]

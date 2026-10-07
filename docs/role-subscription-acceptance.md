@@ -46,7 +46,8 @@ excluded. `topic:PROJECT/supervision` addresses this resolver directly; other
 local topics receive ancestor subscriptions only when `subtree` is true.
 
 First-turn brief artifacts include an address book. `flotilla message contacts`
-refreshes it without re-briefing. Fleet roles and subtree subscribers see crews
+refreshes it without re-briefing. An unknown Project is reported as a routing
+configuration diagnostic, distinct from a valid Project with no subscriber. Fleet roles and subtree subscribers see crews
 in descendants. The current baseline has no Project dependency declarations
 (#2724 owns that graph), so no dependency or dependee contacts are invented.
 Applied charter revisions produce system notifications regarding the Project
