@@ -10,22 +10,196 @@ use flotilla_protocol::{
 use crate::providers::{
     gh_api_get, gh_api_get_with_headers,
     github_api::{clamp_per_page, GhApi},
+    github_poll::PollCache,
     run, CommandRunner,
 };
 
 const INCREMENTAL_PAGE_SIZE: usize = 100;
-const DISPATCH_BOARD_LIMIT: usize = 10_000;
 
 pub struct GitHubIssueProvider {
     api: Arc<dyn GhApi>,
     runner: Arc<dyn CommandRunner>,
     host_root: Box<Path>,
+    poll: PollCache,
 }
 
 impl GitHubIssueProvider {
-    pub fn new(api: Arc<dyn GhApi>, runner: Arc<dyn CommandRunner>, host_root: impl Into<Box<Path>>) -> Self {
-        Self { api, runner, host_root: host_root.into() }
+    pub fn with_poll_directory(mut self, directory: std::path::PathBuf) -> Self {
+        self.poll = self.poll.with_directory(directory);
+        self
     }
+
+    async fn issue_detail(&self, reference: &IssueRef, fields: &str) -> Result<(serde_json::Value, serde_json::Value), String> {
+        let key = format!("{}/issue/{}/{}", reference.source.scope, reference.id, fields);
+        let endpoint = format!("repos/{}/issues/{}", reference.source.scope, reference.id);
+        let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
+        let item: serde_json::Value = serde_json::from_str(&response.body).map_err(|e| e.to_string())?;
+        let rest_revision = serde_json::to_string(&(response.etag, &item)).map_err(|e| e.to_string())?;
+        let mut cache = self.poll.state.lock().await;
+        let state = cache.entry(key.clone()).or_insert(self.poll.load(&key)?);
+        let revision = item["updated_at"].as_str().ok_or("issue lacks updated_at")?;
+        if state.issues.revisions.get(&reference.id).is_some_and(|prior| prior == revision)
+            && state.issues.check_revisions.get(&reference.id) == Some(&rest_revision)
+        {
+            if let Some(detail) = state.issues.details.get(&reference.id) {
+                return Ok((detail.clone(), item));
+            }
+        }
+        let raw = run!(
+            self.runner,
+            "gh",
+            &["issue", "view", &reference.id, "--repo", &reference.source.scope, "--json", fields],
+            &self.host_root
+        )?;
+        let detail = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        let mut next = state.clone();
+        next.issues.commit(&item, detail)?;
+        next.issues.check_revisions.insert(reference.id.clone(), rest_revision);
+        self.poll.save(&key, &next)?;
+        *state = next;
+        state.issues.details.get(&reference.id).cloned().map(|detail| (detail, item)).ok_or("issue detail was not cached".into())
+    }
+
+    async fn poll_board(&self, source: &IssueSource) -> Result<flotilla_protocol::DispatchBoardRepository, String> {
+        let mut cache = self.poll.state.lock().await;
+        let existing = cache.entry(source.scope.clone()).or_insert(self.poll.load(&source.scope)?);
+        let mut next = existing.clone();
+        let issues = next.issues.changes(self.api.as_ref(), &self.host_root, &source.scope, "issues").await?;
+        let pulls = next.pulls.changes(self.api.as_ref(), &self.host_root, &source.scope, "pulls").await?;
+        let mut pull_jobs = pulls.into_iter().map(|item| (item["number"].to_string(), item)).collect::<std::collections::BTreeMap<_, _>>();
+        let mut pull_items = next.pulls.items.clone();
+        pull_items.extend(pull_jobs.clone());
+        for (id, item) in pull_items {
+            if item["state"] != "open" {
+                continue;
+            }
+            let Some(sha) = item["head"]["sha"].as_str() else {
+                continue;
+            };
+            let mut checks = Vec::new();
+            for suffix in [format!("commits/{sha}/status"), format!("commits/{sha}/check-runs?per_page=100")] {
+                let endpoint = format!("repos/{}/{suffix}", source.scope);
+                let response = gh_api_get_with_headers!(self.api, &endpoint, &self.host_root)?;
+                checks.push((response.etag, response.body));
+            }
+            let revision = serde_json::to_string(&checks).map_err(|e| e.to_string())?;
+            if next.pulls.check_revisions.get(&id) != Some(&revision) {
+                pull_jobs.insert(id.clone(), item);
+                next.pulls.check_revisions.insert(id, revision);
+            }
+        }
+        for (kind, items) in [("issue", issues), ("pr", pull_jobs.into_values().collect())] {
+            for item in items {
+                let id = item["number"].as_u64().ok_or("poll item lacks number")?.to_string();
+                let fields = if kind == "issue" {
+                    "number,title,state,url,updatedAt,closedAt,labels,blockedBy,closedByPullRequestsReferences,parent,issueType"
+                } else {
+                    "number,state,url,mergedAt,mergeStateStatus,statusCheckRollup"
+                };
+                // GraphQL is limited to fields REST cannot provide, for this revision.
+                let raw = run!(self.runner, "gh", &[kind, "view", &id, "--repo", &source.scope, "--json", fields], &self.host_root)?;
+                let detail = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+                let collection = if kind == "issue" { &mut next.issues } else { &mut next.pulls };
+                collection.commit(&item, detail)?;
+            }
+        }
+        // Validate native completeness before committing cursor advancement.
+        let board = parse_board(source, next.issues.details.values().cloned().collect(), next.pulls.details.values().cloned().collect())?;
+        self.poll.save(&source.scope, &next)?;
+        *existing = next;
+        Ok(board)
+    }
+
+    pub fn new(api: Arc<dyn GhApi>, runner: Arc<dyn CommandRunner>, host_root: impl Into<Box<Path>>) -> Self {
+        Self { api, runner, host_root: host_root.into(), poll: Default::default() }
+    }
+}
+
+fn parse_board(
+    source: &IssueSource,
+    issues: Vec<serde_json::Value>,
+    prs: Vec<serde_json::Value>,
+) -> Result<flotilla_protocol::DispatchBoardRepository, String> {
+    use flotilla_protocol::{DispatchBoardDependency, DispatchBoardIssue, DispatchBoardPullRequest, DispatchBoardRepository};
+    let issues = issues
+        .iter()
+        .map(|issue| {
+            let string = |field: &str| issue[field].as_str().map(str::to_string).ok_or_else(|| format!("board issue lacks {field}"));
+            let blockers = issue["blockedBy"]["nodes"].as_array().ok_or("board lacks native dependencies")?;
+            if issue["blockedBy"]["totalCount"].as_u64().is_none_or(|count| count != blockers.len() as u64) {
+                return Err("board dependency window is truncated".into());
+            }
+            let blocked_by = blockers
+                .iter()
+                .map(|blocker| {
+                    Ok(DispatchBoardDependency {
+                        url: blocker["url"].as_str().ok_or("board blocker lacks URL")?.into(),
+                        state: match blocker["state"].as_str() {
+                            Some("OPEN") => IssueState::Open,
+                            Some("CLOSED") => IssueState::Closed,
+                            _ => return Err("board blocker lacks state".to_string()),
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let prs = issue["closedByPullRequestsReferences"].as_array().ok_or("board issue lacks PR references")?;
+            if prs.len() >= 100 {
+                return Err("board PR references may be truncated".into());
+            }
+            let pull_requests = prs
+                .iter()
+                .map(|pr| pr["url"].as_str().map(str::to_string).ok_or("board PR lacks URL".to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(DispatchBoardIssue::builder()
+                .id(issue["number"].as_u64().ok_or("board issue lacks number")?.to_string())
+                .title(string("title")?)
+                .state(match string("state")?.as_str() {
+                    "OPEN" => IssueState::Open,
+                    "CLOSED" => IssueState::Closed,
+                    _ => return Err("unknown issue state".into()),
+                })
+                .url(string("url")?)
+                .updated_at(string("updatedAt")?)
+                .maybe_issue_type(issue["issueType"]["name"].as_str().map(str::to_string))
+                .maybe_parent(issue["parent"]["url"].as_str().map(crate::dispatch_missions::issue_ref_from_url).transpose()?)
+                .maybe_closed_at(issue["closedAt"].as_str().map(str::to_string))
+                .labels(
+                    issue["labels"]
+                        .as_array()
+                        .ok_or("board issue lacks labels")?
+                        .iter()
+                        .filter_map(|label| label["name"].as_str().map(str::to_string))
+                        .collect(),
+                )
+                .blocked_by(blocked_by)
+                .pull_requests(pull_requests)
+                .build())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let pull_requests = prs
+        .iter()
+        .map(|pr| {
+            let string = |field: &str| pr[field].as_str().map(str::to_string).ok_or_else(|| format!("board PR lacks {field}"));
+            Ok(DispatchBoardPullRequest::builder()
+                .id(pr["number"].as_u64().ok_or("board PR lacks number")?.to_string())
+                .url(string("url")?)
+                .state(string("state")?.to_ascii_lowercase())
+                .maybe_merged_at(pr["mergedAt"].as_str().map(str::to_string))
+                .maybe_merge_state(pr["mergeStateStatus"].as_str().map(str::to_ascii_lowercase))
+                .ci(board_check_state(&pr["statusCheckRollup"]))
+                .build())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    // Direct adapter observations have a completion timestamp; the daemon
+    // cache owns serving age/error and stamps its own completed observation.
+    Ok(DispatchBoardRepository {
+        observed_at: Utc::now(),
+        age_seconds: 0,
+        refresh_error: None,
+        source: source.clone(),
+        issues,
+        pull_requests,
+    })
 }
 
 fn is_github_source(source: &IssueSource) -> bool {
@@ -146,128 +320,7 @@ impl super::IssueProvider for GitHubIssueProvider {
     }
 
     async fn dispatch_board(&self, source: &IssueSource) -> Result<flotilla_protocol::DispatchBoardRepository, String> {
-        use flotilla_protocol::{DispatchBoardDependency, DispatchBoardIssue, DispatchBoardPullRequest, DispatchBoardRepository};
-        let raw = run!(
-            self.runner,
-            "gh",
-            &[
-                "issue",
-                "list",
-                "--repo",
-                &source.scope,
-                "--state",
-                "all",
-                "--limit",
-                &DISPATCH_BOARD_LIMIT.to_string(),
-                "--json",
-                "number,title,state,url,updatedAt,closedAt,labels,blockedBy,closedByPullRequestsReferences,parent,issueType"
-            ],
-            &self.host_root
-        )?;
-        let issues: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
-        if issues.len() >= DISPATCH_BOARD_LIMIT {
-            return Err("board issue window is truncated".into());
-        }
-        let issues = issues
-            .iter()
-            .map(|issue| {
-                let string = |field: &str| issue[field].as_str().map(str::to_string).ok_or_else(|| format!("board issue lacks {field}"));
-                let blockers = issue["blockedBy"]["nodes"].as_array().ok_or("board lacks native dependencies")?;
-                if issue["blockedBy"]["totalCount"].as_u64().is_none_or(|count| count != blockers.len() as u64) {
-                    return Err("board dependency window is truncated".into());
-                }
-                let blocked_by = blockers
-                    .iter()
-                    .map(|blocker| {
-                        Ok(DispatchBoardDependency {
-                            url: blocker["url"].as_str().ok_or("board blocker lacks URL")?.into(),
-                            state: match blocker["state"].as_str() {
-                                Some("OPEN") => IssueState::Open,
-                                Some("CLOSED") => IssueState::Closed,
-                                _ => return Err("board blocker lacks state".to_string()),
-                            },
-                        })
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                let prs = issue["closedByPullRequestsReferences"].as_array().ok_or("board issue lacks PR references")?;
-                if prs.len() >= 100 {
-                    return Err("board PR references may be truncated".into());
-                }
-                let pull_requests = prs
-                    .iter()
-                    .map(|pr| pr["url"].as_str().map(str::to_string).ok_or("board PR lacks URL".to_string()))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(DispatchBoardIssue::builder()
-                    .id(issue["number"].as_u64().ok_or("board issue lacks number")?.to_string())
-                    .title(string("title")?)
-                    .state(match string("state")?.as_str() {
-                        "OPEN" => IssueState::Open,
-                        "CLOSED" => IssueState::Closed,
-                        _ => return Err("unknown issue state".into()),
-                    })
-                    .url(string("url")?)
-                    .updated_at(string("updatedAt")?)
-                    .maybe_issue_type(issue["issueType"]["name"].as_str().map(str::to_string))
-                    .maybe_parent(issue["parent"]["url"].as_str().map(crate::dispatch_missions::issue_ref_from_url).transpose()?)
-                    .maybe_closed_at(issue["closedAt"].as_str().map(str::to_string))
-                    .labels(
-                        issue["labels"]
-                            .as_array()
-                            .ok_or("board issue lacks labels")?
-                            .iter()
-                            .filter_map(|label| label["name"].as_str().map(str::to_string))
-                            .collect(),
-                    )
-                    .blocked_by(blocked_by)
-                    .pull_requests(pull_requests)
-                    .build())
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let raw = run!(
-            self.runner,
-            "gh",
-            &[
-                "pr",
-                "list",
-                "--repo",
-                &source.scope,
-                "--state",
-                "all",
-                "--limit",
-                &DISPATCH_BOARD_LIMIT.to_string(),
-                "--json",
-                "number,state,url,mergedAt,mergeStateStatus,statusCheckRollup"
-            ],
-            &self.host_root
-        )?;
-        let prs: Vec<serde_json::Value> = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
-        if prs.len() >= DISPATCH_BOARD_LIMIT {
-            return Err("board PR window is truncated".into());
-        }
-        let pull_requests = prs
-            .iter()
-            .map(|pr| {
-                let string = |field: &str| pr[field].as_str().map(str::to_string).ok_or_else(|| format!("board PR lacks {field}"));
-                Ok(DispatchBoardPullRequest::builder()
-                    .id(pr["number"].as_u64().ok_or("board PR lacks number")?.to_string())
-                    .url(string("url")?)
-                    .state(string("state")?.to_ascii_lowercase())
-                    .maybe_merged_at(pr["mergedAt"].as_str().map(str::to_string))
-                    .maybe_merge_state(pr["mergeStateStatus"].as_str().map(str::to_ascii_lowercase))
-                    .ci(board_check_state(&pr["statusCheckRollup"]))
-                    .build())
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        // Direct adapter observations have a completion timestamp; the daemon
-        // cache owns serving age/error and stamps its own completed observation.
-        Ok(DispatchBoardRepository {
-            observed_at: Utc::now(),
-            age_seconds: 0,
-            refresh_error: None,
-            source: source.clone(),
-            issues,
-            pull_requests,
-        })
+        self.poll_board(source).await
     }
 
     async fn mission_fields(&self, reference: &IssueRef) -> Result<flotilla_protocol::MissionFields, String> {
@@ -299,20 +352,7 @@ impl super::IssueProvider for GitHubIssueProvider {
     }
 
     async fn dispatch_facts(&self, reference: &IssueRef) -> Result<flotilla_protocol::DispatchIssueFacts, String> {
-        // Deliberately uncached until #2806 supplies bulk native facts with
-        // dependency/PR freshness guarantees; issue updatedAt alone is insufficient.
-        // Closing PR references use the injected gh runner. Native dependencies
-        // use the paginated REST seam, including cross-repository identities.
-        let raw = run!(
-            self.runner,
-            "gh",
-            &["issue", "view", &reference.id, "--repo", &reference.source.scope, "--json", "closedByPullRequestsReferences"],
-            &self.host_root
-        )?;
-        let relations: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
-        let endpoint = format!("repos/{}/issues/{}", reference.source.scope, reference.id);
-        let raw = gh_api_get!(self.api, &endpoint, &self.host_root)?;
-        let issue: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+        let (relations, issue) = self.issue_detail(reference, "closedByPullRequestsReferences").await?;
         let mut facts =
             flotilla_protocol::DispatchIssueFacts { issue_type: issue["type"]["name"].as_str().map(str::to_string), ..Default::default() };
         let mut page = 1;
@@ -344,15 +384,16 @@ impl super::IssueProvider for GitHubIssueProvider {
             return Err("closing PR window may be truncated".into());
         }
         for pr in prs {
-            let raw = run!(
-                self.runner,
-                "gh",
-                &["pr", "view", pr["url"].as_str().ok_or("closing PR lacks URL")?, "--json", "state,mergedAt"],
-                &self.host_root
-            )?;
+            let url = url::Url::parse(pr["url"].as_str().ok_or("closing PR lacks URL")?).map_err(|e| e.to_string())?;
+            let parts = url.path_segments().ok_or("closing PR lacks path")?.collect::<Vec<_>>();
+            let [owner, repo, "pull", id] = parts.as_slice() else {
+                return Err("invalid closing PR URL".into());
+            };
+            let endpoint = format!("repos/{owner}/{repo}/pulls/{id}");
+            let raw = gh_api_get!(self.api, &endpoint, &self.host_root)?;
             let pr: serde_json::Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
-            facts.has_open_pull_request |= pr["state"] == "OPEN";
-            facts.landed |= pr["mergedAt"].as_str().is_some();
+            facts.has_open_pull_request |= pr["state"] == "open";
+            facts.landed |= pr["merged_at"].as_str().is_some();
         }
         Ok(facts)
     }
@@ -779,8 +820,7 @@ mod tests {
         assert_eq!(changeset.updated.len(), 1);
         assert!(changeset.has_more, "should escalate when page has issues and more pages exist");
     }
-    // The request contract is captured from the authenticated tracker, including
-    // native dependencies and merge evidence. Fixtures are never hand-authored.
+    // Authenticated native dependency and closing-PR REST evidence.
     #[tokio::test]
     async fn dispatch_facts_record_replay() {
         let session = replay::test_session(&fixture("github_dispatch_facts.yaml"), Masks::new());
@@ -795,6 +835,7 @@ mod tests {
         assert!(!landed.has_open_pull_request);
         session.finish();
     }
+
     // The authenticated REST field request is recorded at the process seam;
     // pure normalization tests cover the documented numeric/select payloads.
     #[tokio::test]
@@ -813,18 +854,156 @@ mod tests {
         session.finish();
     }
 
-    // Daemon board facts use the documented gh JSON fields through the same
-    // recorded process seam; clients need no tracker credentials of their own.
+    // #2868: unchanged native details survive rediscovery, but a new item ETag
+    // invalidates them even when GitHub's second-resolution updated_at is equal.
     #[tokio::test]
-    async fn dispatch_board_record_replay() {
+    async fn issue_detail_etag_invalidates_equal_timestamp_cache() {
+        let item = serde_json::json!({"number":7,"updated_at":"2026-10-07T00:00:00Z"});
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok(format!("HTTP/2 200 OK\r\nETag: initial\r\n\r\n{item}")),
+            Ok(r#"{"closedByPullRequestsReferences":[]}"#.into()),
+            Ok("HTTP/2 304 Not Modified\r\n\r\n".into()),
+            Ok(format!("HTTP/2 200 OK\r\nETag: changed\r\n\r\n{item}")),
+            Ok(r#"{"closedByPullRequestsReferences":[{"number":8}]}"#.into()),
+        ]));
+        let directory = tempfile::tempdir().expect("persistent native details");
+        let make = || {
+            GitHubIssueProvider::new(
+                Arc::new(GhApiClient::new(runner.clone()).with_persistence(directory.path().join("rest"))),
+                runner.clone(),
+                Path::new("/"),
+            )
+            .with_poll_directory(directory.path().join("details"))
+        };
+        let reference = IssueRef { source: source(), id: "7".into() };
+        let provider = make();
+        let (first, _) = provider.issue_detail(&reference, "closedByPullRequestsReferences").await.expect("initial");
+        drop(provider);
+        let provider = make();
+        assert_eq!(provider.issue_detail(&reference, "closedByPullRequestsReferences").await.expect("quiet").0, first);
+        let (changed, _) = provider.issue_detail(&reference, "closedByPullRequestsReferences").await.expect("changed ETag");
+        assert_eq!(changed["closedByPullRequestsReferences"][0]["number"], 8);
+        assert_eq!(runner.calls().len(), 5);
+        assert_eq!(runner.remaining(), 0);
+    }
+
+    // Historical full-board replay is replaced by conditional-poll tests: the
+    // production adapter now validates REST collections before targeted details.
+    #[tokio::test]
+    async fn board_quiet_poll_restart_and_single_revision_only_fetch_changed_details() {
+        fn response(etag: &str, body: serde_json::Value) -> String {
+            format!("HTTP/2 200 OK\r\nETag: {etag}\r\n\r\n{body}")
+        }
+        fn issue(revision: &str) -> serde_json::Value {
+            serde_json::json!({"number": 7, "updated_at": revision})
+        }
+        fn detail(title: &str) -> String {
+            serde_json::json!({"number":7,"title":title,"state":"OPEN","url":"https://github.com/team/repo/issues/7",
+                "updatedAt":"2026-10-07T00:00:00Z","closedAt":null,"labels":[],"blockedBy":{"totalCount":0,"nodes":[]},
+                "closedByPullRequestsReferences":[],"parent":null,"issueType":{"name":"Task"}})
+            .to_string()
+        }
+        let unchanged = "HTTP/2 304 Not Modified\r\n\r\n".to_string();
+        let runner = Arc::new(MockRunner::new(vec![
+            Ok(response("issues-1", serde_json::json!([issue("2026-10-07T00:00:00Z")]))),
+            Ok(response("pulls-1", serde_json::json!([]))),
+            Ok(detail("Initial")),
+            Ok(unchanged.clone()),
+            Ok(unchanged.clone()),
+            Ok(unchanged.clone()),
+            Ok(unchanged.clone()),
+            Ok(response("issues-2", serde_json::json!([issue("2026-10-07T00:01:00Z")]))),
+            Ok(response("delta-2", serde_json::json!([issue("2026-10-07T00:01:00Z")]))),
+            Ok(unchanged.clone()),
+            Ok(detail("Changed")),
+            Ok(response("issues-3", serde_json::json!([issue("2026-10-07T00:02:00Z")]))),
+            Ok(response("delta-3", serde_json::json!([issue("2026-10-07T00:02:00Z")]))),
+            Ok(unchanged.clone()),
+            Ok("{}".into()),
+            Ok(unchanged.clone()),
+            Ok(unchanged.clone()),
+            Ok(detail("Recovered")),
+        ]));
+        let directory = tempfile::tempdir().expect("poll directory");
+        let budgets = crate::forge_budget::ForgeBudgets::default();
+        let metered = Arc::new(crate::forge_budget::BudgetedRunner { inner: runner.clone(), budgets: budgets.clone() });
+        let make = || {
+            let api = Arc::new(GhApiClient::new(metered.clone()).with_persistence(directory.path().join("rest")));
+            GitHubIssueProvider::new(api, metered.clone(), Path::new("/")).with_poll_directory(directory.path().join("board"))
+        };
+        let source = IssueSource { service: "https://github.com".into(), scope: "team/repo".into() };
+        let provider = make();
+        assert_eq!(provider.dispatch_board(&source).await.expect("initial").issues[0].title, "Initial");
+        assert_eq!(runner.calls().len(), 3);
+        assert_eq!(provider.dispatch_board(&source).await.expect("quiet").issues[0].title, "Initial");
+        drop(provider);
+        let restarted = make();
+        assert_eq!(restarted.dispatch_board(&source).await.expect("restart").issues[0].title, "Initial");
+        assert_eq!(runner.calls().len(), 7);
+        let rest = budgets.rows("test").into_iter().find(|row| row.budget == "REST").expect("REST budget");
+        assert_eq!((rest.calls, rest.reported_cost), (6, 2), "quiet and restart polls spend zero primary quota");
+        assert_eq!(restarted.dispatch_board(&source).await.expect("single update").issues[0].title, "Changed");
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 11);
+        assert_eq!(calls.iter().filter(|(_, args)| args.first().is_some_and(|arg| arg == "issue")).count(), 2);
+        for (_, args) in &calls[3..7] {
+            assert_eq!(args[0], "api");
+            assert!(args.iter().any(|arg| arg.starts_with("If-None-Match:")), "quiet requests must be conditional: {args:?}");
+        }
+        assert!(calls.iter().all(|(_, args)| !args.contains(&"list".to_string())));
+        assert!(restarted.dispatch_board(&source).await.is_err(), "incomplete native detail must not commit a cursor");
+        assert_eq!(restarted.poll.load(&source.scope).unwrap().issues.cursor.as_deref(), Some("2026-10-07T00:01:00Z"));
+        assert_eq!(restarted.dispatch_board(&source).await.expect("retry cached collection").issues[0].title, "Recovered");
+        assert_eq!(runner.calls().len(), 18);
+        assert_eq!(runner.remaining(), 0);
+    }
+    // The archived full-board recording pins the same per-item native shape
+    // consumed by targeted detail reads. Production never uses these list calls.
+    #[tokio::test]
+    async fn historical_board_detail_decoder_record_replay() {
         let session = replay::test_session(&fixture("github_dispatch_board.yaml"), Masks::new());
-        let (api, runner) = build_api_and_runner(&session);
-        let provider = GitHubIssueProvider::new(api, runner, Path::new("/"));
+        let (_api, runner) = build_api_and_runner(&session);
         let source = IssueSource { service: "https://github.com".into(), scope: "flotilla-org/flotilla".into() };
-        let board = provider.dispatch_board(&source).await.expect("board facts");
+        let issues = run!(
+            runner,
+            "gh",
+            &[
+                "issue",
+                "list",
+                "--repo",
+                &source.scope,
+                "--state",
+                "all",
+                "--limit",
+                "10000",
+                "--json",
+                "number,title,state,url,updatedAt,closedAt,labels,blockedBy,closedByPullRequestsReferences,parent,issueType"
+            ],
+            Path::new("/")
+        )
+        .expect("archived issue detail shapes");
+        let pulls = run!(
+            runner,
+            "gh",
+            &[
+                "pr",
+                "list",
+                "--repo",
+                &source.scope,
+                "--state",
+                "all",
+                "--limit",
+                "10000",
+                "--json",
+                "number,state,url,mergedAt,mergeStateStatus,statusCheckRollup"
+            ],
+            Path::new("/")
+        )
+        .expect("archived PR detail shapes");
+        let board = parse_board(&source, serde_json::from_str(&issues).unwrap(), serde_json::from_str(&pulls).unwrap()).unwrap();
         let dependent = board.issues.iter().find(|issue| issue.id == "2783").expect("dependent");
         assert_eq!(dependent.issue_type.as_deref(), Some("Task"));
-        assert!(board.issues.iter().any(|issue| issue.parent.is_some()), "recorded native map ancestry must survive adapter decoding");
+        assert!(board.issues.iter().any(|issue| issue.parent.is_some()));
         assert!(dependent.blocked_by.iter().any(|blocker| blocker.url.ends_with("/issues/2782")));
         let landed = board.pull_requests.iter().find(|pr| pr.id == "1387").expect("landed PR");
         assert_eq!(landed.state, "merged");

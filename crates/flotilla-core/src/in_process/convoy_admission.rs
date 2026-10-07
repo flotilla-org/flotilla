@@ -2756,7 +2756,13 @@ pub(super) async fn discover_repository_change_request_with(
     let mut unmet = Vec::new();
     for factory in &discovery.factories.change_requests {
         match factory.probe(&bag, config, &probe_root, Arc::clone(&discovery.runner)).await {
-            Ok(provider) => return Ok(provider),
+            Ok(provider) => {
+                return Ok(Arc::new(crate::forge_observation::ObservedChangeRequestTracker {
+                    inner: provider,
+                    reads: crate::forge_observation::ForgeReads::new(resource_backend.clone(), namespace.into()),
+                    source: flotilla_protocol::IssueSource { service: identity.service_url.clone(), scope: identity.repository.clone() },
+                }))
+            }
             Err(requirements) => unmet.extend(requirements.into_iter().map(|requirement| format!("{requirement:?}"))),
         }
     }

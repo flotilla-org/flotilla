@@ -63,8 +63,7 @@ impl DispatchBoardCache {
                 // Retry backoff starts on completion, including a slow failure.
                 entry.last_attempt = Some(Instant::now());
                 match result {
-                    Ok(mut board) => {
-                        board.observed_at = Utc::now();
+                    Ok(board) => {
                         entry.board = Some(board);
                         entry.error = None;
                     }
@@ -80,7 +79,9 @@ impl DispatchBoardCache {
             ));
         };
         board.age_seconds = Utc::now().signed_duration_since(board.observed_at).num_seconds().max(0) as u64;
-        board.refresh_error = state.error.clone();
+        if state.error.is_some() {
+            board.refresh_error = state.error.clone();
+        }
         Ok(board)
     }
 }

@@ -301,6 +301,17 @@ impl IssueRefresher {
     }
 
     async fn owns_record(&self, subject: &IssueRef, allow_takeover: bool, create_missing: bool) -> Result<bool, String> {
+        let source = flotilla_protocol::IssueSource { service: subject.service.clone(), scope: subject.scope.clone() };
+        if let Some(owner) = crate::forge_observation::source_owner(&self.inner.backend, &subject.namespace, &source).await? {
+            if owner.to_string() != self.inner.authority {
+                return Ok(false);
+            }
+            if !create_missing {
+                return Ok(self.inner.backend.using::<Issue>(&subject.namespace).get(&subject.record_name()).await.is_ok());
+            }
+            self.get_or_create_record(subject, &subject.record_name()).await?;
+            return Ok(true);
+        }
         let name = subject.record_name();
         let records = self.inner.backend.including_replicas::<Issue>(&subject.namespace);
         // A former owner can still hold its local copy after another host has

@@ -69,8 +69,9 @@ impl Factory for GitHubChangeRequestFactory {
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn ChangeRequestTracker>, Vec<UnmetRequirement>> {
         let repo_slug = github_repo_slug(env)?;
-        let api = Arc::new(GhApiClient::new(runner.clone()));
-        let mut provider = GitHubChangeRequest::new("github".into(), repo_slug, api, runner);
+        let api = Arc::new(GhApiClient::new(runner.clone()).with_persistence(config.state_dir().as_path().join("forge-cache/github/rest")));
+        let mut provider = GitHubChangeRequest::new("github".into(), repo_slug, api, runner)
+            .with_poll_directory(config.state_dir().as_path().join("forge-cache/github/observations"));
         let settings = config.load_config_for_probe().await.map_err(|error| vec![UnmetRequirement::MissingConfig(error)])?.change_request;
         if let Some(login) = settings.review_bot_login {
             provider = provider.with_review_bot_login(login);
@@ -107,8 +108,11 @@ impl Factory for GitHubIssueProviderFactory {
         if env.find_binary("gh").is_none() {
             return Err(vec![UnmetRequirement::MissingBinary("gh".into())]);
         }
-        let api = Arc::new(GhApiClient::new(runner.clone()));
-        Ok(Arc::new(GitHubIssueProvider::new(api, runner, config.base_path().as_path())))
+        let api = Arc::new(GhApiClient::new(runner.clone()).with_persistence(config.state_dir().as_path().join("forge-cache/github/rest")));
+        Ok(Arc::new(
+            GitHubIssueProvider::new(api, runner, config.base_path().as_path())
+                .with_poll_directory(config.state_dir().as_path().join("forge-cache/github/boards")),
+        ))
     }
 }
 

@@ -4134,6 +4134,7 @@ async fn apply_host_heartbeat_with_credentials(
     if let Some(snapshot) = crate::resource_limits::io_pressure_snapshot().await {
         capabilities.insert("io_pressure".to_string(), snapshot);
     }
+    capabilities.insert("forge_budgets".into(), serde_json::to_value(daemon.forge_budget_rows()).expect("forge budgets serialize"));
     let ready = !conditions.iter().any(HostCondition::blocks_readiness);
     flotilla_resources::apply_status_patch(&hosts, &profile.host_id, &HostStatusPatch::Heartbeat {
         description: Some(Box::new(summary)),

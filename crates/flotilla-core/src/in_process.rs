@@ -266,6 +266,7 @@ struct HostIssueProviderLease {
 }
 
 struct ProviderIssueQueryPort {
+    forge_reads: crate::forge_observation::ForgeReads,
     host_providers: Mutex<HashMap<flotilla_protocol::IssueSource, HostIssueProviderLease>>,
     backend: ResourceBackend,
     config: Arc<ConfigStore>,
@@ -378,6 +379,14 @@ impl IssueQueryPort for ProviderIssueQueryPort {
         for factory in &self.discovery.factories.issue_trackers {
             if let Ok(provider) = factory.probe(&bag, &self.config, &probe_root, Arc::clone(&runner)).await {
                 if provider.supports(&source) {
+                    let provider: Arc<dyn IssueProvider> = Arc::new(crate::forge_observation::ObservedIssueProvider {
+                        inner: provider,
+                        reads: {
+                            let mut reads = self.forge_reads.clone();
+                            reads.namespace = namespace.clone();
+                            reads
+                        },
+                    });
                     host_providers.insert(
                         source.clone(),
                         HostIssueProviderLease::builder()
@@ -1381,6 +1390,8 @@ pub struct InProcessDaemon {
     /// provider detection, both at startup and for later repo additions.
     discovery: Arc<DiscoveryRuntime>,
     issue_query_port: Arc<dyn IssueQueryPort>,
+    forge_budgets: crate::forge_budget::ForgeBudgets,
+    pub(crate) forge_demand_refresh: Mutex<()>,
     dispatch_board_cache: dispatch_board::DispatchBoardCache,
     /// VCS capabilities are selected once for each checkout in its execution environment.
     checkout_providers: Arc<CheckoutProviders>,
@@ -1573,6 +1584,9 @@ impl InProcessDaemon {
     ) -> Arc<Self> {
         use crate::providers::discovery::DiscoveryResult;
 
+        let mut discovery = discovery;
+        let forge_budgets = crate::forge_budget::ForgeBudgets::default();
+        discovery.runner = Arc::new(crate::forge_budget::BudgetedRunner { inner: discovery.runner, budgets: forge_budgets.clone() });
         let discovery = Arc::new(discovery);
         let (event_tx, _) = broadcast::channel(256);
         let event_source = Arc::new(BroadcastEventSink::new(event_tx));
@@ -1796,6 +1810,7 @@ impl InProcessDaemon {
             tracing::warn!(%error, "garbage collect orphaned change request observations at startup failed");
         }
         let issue_query_port: Arc<dyn IssueQueryPort> = Arc::new(ProviderIssueQueryPort {
+            forge_reads: crate::forge_observation::ForgeReads::new(resource_backend.clone(), DEFAULT_PROVISIONING_NAMESPACE.into()),
             host_providers: Mutex::new(HashMap::new()),
             backend: resource_backend.clone(),
             config: Arc::clone(&config),
@@ -1874,6 +1889,8 @@ impl InProcessDaemon {
             cleat_roll_report: Mutex::new(None),
             discovery: Arc::clone(&discovery),
             issue_query_port: Arc::clone(&issue_query_port),
+            forge_budgets,
+            forge_demand_refresh: Mutex::new(()),
             checkout_providers: Arc::clone(&checkout_providers),
             checkout_namespace_changes: tokio::sync::watch::channel(()).0,
             repository_providers: Mutex::new(HashMap::new()),
@@ -2537,7 +2554,7 @@ impl InProcessDaemon {
     }
 
     pub async fn fetch_issue_by_ref(&self, reference: &flotilla_protocol::IssueRef) -> Result<flotilla_protocol::Issue, String> {
-        self.issue_query_port.fetch_issue_by_ref(reference).await
+        self.issue_provider_for_source(&reference.source).await?.fetch_by_id(reference).await
     }
 
     /// Resolve a portable issue source to a provider capability installed on
@@ -3452,7 +3469,7 @@ impl InProcessDaemon {
         }
         for (_, _, provider) in candidates {
             if let Some((id, request)) =
-                provider.find_change_request_by_branch(checkout.spec.branch()).await.map_err(|error| error.to_string())?
+                provider.find_change_request_by_branch_for_admission(checkout.spec.branch()).await.map_err(|error| error.to_string())?
             {
                 return Ok(Some(format!(
                     "checkout branch {} conflicts with {:?} change request #{}; choose a fresh branch name",
@@ -4922,7 +4939,48 @@ impl InProcessDaemon {
 
     /// Schedule tracker observations without waiting for the forge or coupling
     /// board freshness to the availability of dispatch readiness evidence.
+    pub(crate) async fn service_change_request_demand(
+        &self,
+        namespace: &str,
+        spec: &flotilla_resources::ForgeReadSpec,
+    ) -> Result<(), String> {
+        use flotilla_resources::ForgeReadRequest;
+        let repository = RepositorySpec::remote(format!("{}/{}", spec.source.service.trim_end_matches('/'), spec.source.scope))?;
+        let provider = discover_repository_change_request_with(
+            &self.resource_backend,
+            &self.config,
+            &self.discovery,
+            &self.environment_manager,
+            &self.local_environment_id,
+            namespace,
+            &repository,
+        )
+        .await?;
+        let provider = provider.for_background_refresh().unwrap_or(provider);
+        match &spec.request {
+            ForgeReadRequest::Branch { branch } => {
+                provider.find_change_request_by_branch(branch).await.map(|_| ()).map_err(|e| e.to_string())
+            }
+            ForgeReadRequest::ChangeRequests { limit } => provider.list_change_requests(*limit).await.map(|_| ()),
+            ForgeReadRequest::ChangeRequest { id } => provider.get_change_request(id).await.map(|_| ()),
+            ForgeReadRequest::MergedBranches { limit } => provider.list_merged_branch_names(*limit).await.map(|_| ()),
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) async fn provisioning_namespace_for_forge(&self) -> String {
+        self.provisioning_namespace().await
+    }
+
     pub async fn refresh_dispatch_boards_internal(&self) -> Result<(), String> {
+        let daemon = self.self_weak.clone();
+        tokio::spawn(async move {
+            if let Some(daemon) = daemon.upgrade() {
+                if let Err(error) = daemon.refresh_forge_read_demands().await {
+                    tracing::debug!(%error, "forge demand refresh unavailable");
+                }
+            }
+        });
         self.dispatch_board_repositories_internal(None).await.map(|_| ())
     }
 
@@ -5007,12 +5065,27 @@ impl InProcessDaemon {
         self.read_projections().fulfilment_list(&self.provisioning_namespace().await).await
     }
 
+    pub fn forge_budget_rows(&self) -> Vec<flotilla_protocol::ForgeBudgetRow> {
+        self.forge_budgets.rows(self.host_name().as_str())
+    }
+
     pub async fn fleet_health_internal(&self) -> Result<FleetHealthResponse, String> {
         let now = Utc::now();
         let namespace = self.provisioning_namespace().await;
         let host_list = self.list_hosts_internal().await?;
         let rows = self.fleet.rows(&namespace, &self.host_registry).await?;
-        self.read_projections().fleet_health(&namespace, host_list, rows, self.local_host_id().map(|id| id.to_string()), now).await
+        let mut response =
+            self.read_projections().fleet_health(&namespace, host_list, rows, self.local_host_id().map(|id| id.to_string()), now).await?;
+        for host in self.resource_backend.including_replicas::<ResourceHost>(&namespace).list().await.map_err(|e| e.to_string())?.items {
+            if let Some(value) = host.object.status.and_then(|status| status.capabilities.get("forge_budgets").cloned()) {
+                if let Ok(rows) = serde_json::from_value::<Vec<flotilla_protocol::ForgeBudgetRow>>(value) {
+                    response.forge_budgets.extend(rows);
+                }
+            }
+        }
+        response.forge_budgets.retain(|row| row.host != self.host_name().as_str());
+        response.forge_budgets.extend(self.forge_budget_rows());
+        Ok(response)
     }
 
     /// Raw bound fleet manifests at the current source head, for candidate-side

@@ -63,6 +63,10 @@ pub type CrewGithubLoginsByRequest = BTreeMap<u64, Vec<String>>;
 
 #[async_trait]
 pub trait ChangeRequestTracker: Send + Sync {
+    /// Background servicing must not renew the demand that scheduled it.
+    fn for_background_refresh(&self) -> Option<std::sync::Arc<dyn ChangeRequestTracker>> {
+        None
+    }
     /// Observe bound requests together. The default uses individual provider
     /// reads and reports state and title; GitHub overrides this with one query
     /// that also includes checks, review, mergeability, and head SHA. Feedback
@@ -114,6 +118,11 @@ pub trait ChangeRequestTracker: Send + Sync {
     /// inherits the visibility of [`Self::list_change_requests`].
     async fn find_change_request_by_branch(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, ObservationError> {
         Ok(self.list_change_requests(100).await?.into_iter().find(|(_, request)| request.branch == branch))
+    }
+    /// Explicit checkout admission must validate the branch afresh, rather
+    /// than authorizing creation from a cached absence observation.
+    async fn find_change_request_by_branch_for_admission(&self, branch: &str) -> Result<Option<(String, ChangeRequest)>, ObservationError> {
+        self.find_change_request_by_branch(branch).await
     }
     #[allow(dead_code)]
     async fn get_change_request(&self, id: &str) -> Result<(String, ChangeRequest), String>;
