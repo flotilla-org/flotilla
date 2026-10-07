@@ -205,10 +205,6 @@ pub async fn session_card(
     Ok(text)
 }
 
-// ADR 0047 shim introduced 2026-10-07: read previous-generation full cards
-// for comparison. Remove this read one fleet roll after the digest change deploys.
-// A calendar removal date depends on the operator's roll date.
-const CARD_ANNOTATION: &str = "flotilla.work/capabilities-card";
 const DIGEST_ANNOTATION: &str = "flotilla.work/capabilities-digest";
 const REVISION_ANNOTATION: &str = "flotilla.work/capabilities-revision";
 const MESSAGE_ANNOTATION: &str = "flotilla.work/capabilities-message";
@@ -226,12 +222,7 @@ pub async fn observe_card(
     session: &ResourceObject<TerminalSession>,
     card: &str,
 ) -> Result<(), String> {
-    let previous = session
-        .metadata
-        .annotations
-        .get(DIGEST_ANNOTATION)
-        .cloned()
-        .or_else(|| session.metadata.annotations.get(CARD_ANNOTATION).map(|card| card_digest(card)));
+    let previous = session.metadata.annotations.get(DIGEST_ANNOTATION).cloned();
     if previous.as_ref().is_some_and(|previous| previous == &card_digest(card)) {
         return Ok(());
     }
@@ -252,7 +243,6 @@ pub async fn observe_card(
     } else {
         card.to_string()
     };
-    meta.annotations.remove(CARD_ANNOTATION);
     meta.annotations.insert(DIGEST_ANNOTATION.into(), card_digest(&observed_card));
     meta.annotations.insert(REVISION_ANNOTATION.into(), revision.to_string());
     backend
