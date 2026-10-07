@@ -8,6 +8,7 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use flotilla_core::providers::{
+    container::{docker::DockerImageStore, ImageOperation, ImageStore},
     discovery::{EnvVars, EnvironmentBag},
     environment::PreparedEnvironmentAuth,
     ChannelLabel, CommandRunner, HttpClient, ReqwestHttpClient,
@@ -247,6 +248,49 @@ struct AmbientClaudeOauthMetadata {
     refresh_token_expires_at: Option<i64>,
 }
 
+struct HostRegistryCredentials {
+    store: Arc<CredentialStore>,
+    host: String,
+}
+#[async_trait]
+impl flotilla_core::providers::container::registry::RegistryCredentials for HostRegistryCredentials {
+    async fn resolve(
+        &self,
+        reference: &str,
+        repository: &flotilla_core::providers::container::registry::RegistryRepository,
+        action: flotilla_core::providers::container::registry::RegistryAction,
+    ) -> Result<flotilla_core::providers::container::registry::RegistryAuth, String> {
+        use flotilla_core::providers::container::registry::{RegistryAction, RegistryAuth};
+        use flotilla_resources::{CredentialGrant, HostImageAction};
+        let action = match action {
+            RegistryAction::Read => HostImageAction::ImagePull,
+            RegistryAction::Delete => HostImageAction::ImageDelete,
+        };
+        let grants =
+            self.store.backend.definitions::<CredentialGrant>(&self.store.namespace).list().await.map_err(|error| error.to_string())?;
+        if !grants
+            .iter()
+            .any(|grant| grant.spec.credentials.contains(reference) && grant.spec.selector.matches_host_action(&self.host, action, false))
+        {
+            return Err(format!("host {} has no {action:?} grant for credential {reference}", self.host));
+        }
+        let spec = self.store.spec(reference).await?;
+        let CredentialConsumer::DockerRegistry { registry, username } = &spec.consumer else {
+            return Err("registry HTTP credential must use the docker-registry adapter".into());
+        };
+        // Repository names are scoped by the operation; the admitted consumer
+        // fixes the registry origin. RegistryRepository must use this origin.
+        let origin = url::Url::parse(&format!("https://{registry}")).map_err(|_| "invalid declared registry")?;
+        if repository.origin.origin() != origin.origin() {
+            return Err("registry origin does not match declared credential consumer".into());
+        }
+        let material = self.store.resolve_for_adapter(reference, &spec, None, None).await?;
+        let password = material.value.trim_end().to_string();
+        validate_scalar_material(reference, "docker-registry", &password)?;
+        Ok(RegistryAuth { username: username.clone(), password, token_origin: Some(origin) })
+    }
+}
+
 type LedgerDeliveryRecord = BTreeMap<String, BTreeMap<String, String>>;
 type GithubAppDeliveryLocks = BTreeMap<(String, String), Weak<Mutex<()>>>;
 
@@ -256,6 +300,7 @@ pub(crate) struct CredentialStore {
     env: Arc<dyn EnvVars>,
     host_bag: EnvironmentBag,
     host_runner: Arc<dyn CommandRunner>,
+    images: Arc<dyn ImageStore>,
     clock: Arc<dyn Clock>,
     github_app_minter: Arc<dyn GithubAppTokenMinter>,
     state_dir: PathBuf,
@@ -483,6 +528,11 @@ impl CredentialStore {
         Ok(())
     }
 
+    pub(crate) fn with_image_store(mut self, images: Arc<dyn ImageStore>) -> Self {
+        self.images = images;
+        self
+    }
+
     pub(crate) fn new(
         backend: ResourceBackend,
         namespace: &str,
@@ -529,6 +579,11 @@ impl CredentialStore {
             backend,
             namespace: namespace.to_string(),
             env,
+            images: flotilla_core::providers::discovery::factories::docker::DockerImageStoreFactory::create(
+                &host_bag,
+                Arc::clone(&host_runner),
+            )
+            .unwrap_or_else(|_| Arc::new(DockerImageStore::unavailable())),
             host_bag,
             host_runner,
             clock: github_app.clock,
@@ -1016,22 +1071,20 @@ impl CredentialStore {
         action: flotilla_resources::HostImageAction,
         credential: &str,
         repository: &str,
-        arguments: &[&str],
+        reference: &str,
     ) -> Result<String, String> {
         use flotilla_resources::{CredentialGrant, Host, HostImageAction, ImageBuildCapacity};
-        let verb = match action {
-            HostImageAction::ImagePush => "push",
-            HostImageAction::ImagePull => "pull",
-        };
-        if arguments.len() != 2 || arguments[0] != verb || !image_registry_matches(arguments[1], repository.split('/').next().unwrap_or(""))
-        {
+        if action == HostImageAction::ImageDelete {
+            return Err("registry metadata deletion belongs to RegistryClient".into());
+        }
+        if !image_registry_matches(reference, repository.split('/').next().unwrap_or("")) {
             return Err("host image action requires its declared registry operation".into());
         }
-        if !arguments[1].strip_prefix(repository).is_some_and(|suffix| suffix.starts_with('@') || suffix.starts_with(':')) {
+        if !reference.strip_prefix(repository).is_some_and(|suffix| suffix.starts_with('@') || suffix.starts_with(':')) {
             return Err("host image operation does not target the declared repository".into());
         }
         if action == HostImageAction::ImagePull
-            && !arguments[1].rsplit_once('@').is_some_and(|(_, digest)| flotilla_resources::is_image_digest(digest))
+            && !reference.rsplit_once('@').is_some_and(|(_, digest)| flotilla_resources::is_image_digest(digest))
         {
             return Err("host image pull requires a manifest digest".into());
         }
@@ -1061,20 +1114,14 @@ impl CredentialStore {
         // TempDir removes the config on cancellation as well as every return path.
         let config = tempfile::Builder::new().prefix("operation-").tempdir_in(root).map_err(|error| error.to_string())?;
         tokio::fs::set_permissions(config.path(), std::fs::Permissions::from_mode(0o700)).await.map_err(|error| error.to_string())?;
-        let directory = config.path().to_string_lossy();
         let operation = async {
-            self.host_runner
-                .run_with_input(
-                    "docker",
-                    &["--config", &directory, "login", "--username", username, "--password-stdin", registry],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                    material.as_bytes(),
-                )
-                .await?;
-            let mut args = vec!["--config", directory.as_ref()];
-            args.extend_from_slice(arguments);
-            self.host_runner.run("docker", &args, Path::new("/"), &ChannelLabel::Default).await
+            let operation = ImageOperation { directory: config.path(), context: Path::new("/") };
+            self.images.login(operation, registry, username, material.as_bytes()).await?;
+            match action {
+                HostImageAction::ImagePush => self.images.push(operation, reference).await,
+                HostImageAction::ImagePull => self.images.pull(operation, reference).await,
+                HostImageAction::ImageDelete => Err("registry metadata deletion belongs to RegistryClient".into()),
+            }
         };
         let output = tokio::time::timeout(std::time::Duration::from_secs(30 * 60), operation)
             .await
@@ -1082,6 +1129,19 @@ impl CredentialStore {
             .map_err(|error| bounded_adapter_error(credential, "docker-registry", &error.replace(material, "[redacted]")))?;
         // Return only Docker's non-secret operation output, never login output.
         Ok(output.replace(material, "[redacted]"))
+    }
+
+    /// HTTP registry access remains subject to the same explicit host-action
+    /// grants as content transfers. A push grant never authorizes deletion.
+    pub(crate) fn registry_client(
+        self: &Arc<Self>,
+        host: &str,
+        http: Arc<dyn HttpClient>,
+    ) -> Arc<dyn flotilla_core::providers::container::registry::RegistryClient> {
+        Arc::new(flotilla_core::providers::container::registry::OciRegistryClient::new(
+            http,
+            Arc::new(HostRegistryCredentials { store: Arc::clone(self), host: host.into() }),
+        ))
     }
 
     pub(crate) async fn prepare_registry_pull(
@@ -1132,20 +1192,14 @@ impl CredentialStore {
         tokio::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700))
             .await
             .map_err(|error| bounded_adapter_error(&name, "docker-registry", &format!("protect cache directory: {error}")))?;
-        let config = config_dir.to_string_lossy();
         let operation = async {
-            self.host_runner
-                .run_with_input(
-                    "docker",
-                    &["--config", &config, "login", "--username", username, "--password-stdin", registry],
-                    Path::new("/"),
-                    &ChannelLabel::Default,
-                    material.as_bytes(),
-                )
+            let operation = ImageOperation { directory: &config_dir, context: Path::new("/") };
+            self.images
+                .login(operation, registry, username, material.as_bytes())
                 .await
                 .map_err(|error| format!("login preflight failed: {}", error.replace(material, "[redacted]")))?;
-            self.host_runner
-                .run("docker", &["--config", &config, "pull", image], Path::new("/"), &ChannelLabel::Default)
+            self.images
+                .pull(operation, image)
                 .await
                 .map_err(|error| format!("pull preflight failed: {}", error.replace(material, "[redacted]")))
         }
@@ -2917,6 +2971,8 @@ mod tests {
                 Ok("/usr/bin/gh\n".to_string())
             } else if cmd == "sh" && args.contains(&"printf '%s' \"$PATH\"") {
                 Ok("/usr/bin:/bin".to_string())
+            } else if cmd == "docker" && args.get(2) == Some(&"push") {
+                Ok(format!("digest: sha256:{} size: 123", "3".repeat(64)))
             } else {
                 Ok(String::new())
             }
@@ -5303,15 +5359,18 @@ interactions:
             backend.clone(),
             "flotilla",
             Arc::new(TestEnv(BTreeMap::from([("TEST_REGISTRY_TOKEN".into(), "test-secret".into())]))),
-            EnvironmentBag::new(),
+            EnvironmentBag::new().with(flotilla_core::providers::discovery::EnvironmentAssertion::binary("docker", "/test/bin/docker")),
             runner.clone(),
             state.path().into(),
         );
         let operation = || {
-            store.image_registry_operation("builder", HostImageAction::ImagePush, "registry", "registry.example/images", &[
-                "push",
+            store.image_registry_operation(
+                "builder",
+                HostImageAction::ImagePush,
+                "registry",
+                "registry.example/images",
                 "registry.example/images:label",
-            ])
+            )
         };
         assert!(operation().await.expect_err("no grant").contains("no ImagePush grant"));
         backend
@@ -5353,6 +5412,86 @@ interactions:
         }
     }
 
+    // Registry HTTP requests retain host-action grants and declared registry
+    // origins. Pull and push grants never authorize deletion or a foreign host.
+    #[tokio::test]
+    async fn registry_http_credentials_require_the_exact_action_and_origin() {
+        use flotilla_core::providers::container::registry::{RegistryAction, RegistryCredentials, RegistryRepository};
+        use flotilla_resources::{CredentialGrant, CredentialGrantSelector, CredentialGrantSpec, HostActionSelector, HostImageAction};
+        let backend = ResourceBackend::InMemory(InMemoryBackend::default());
+        backend
+            .definitions::<CredentialSpec>("flotilla")
+            .create(&InputMeta::builder().name("registry".into()).build(), &CredentialSpecSpec {
+                consumer: CredentialConsumer::DockerRegistry { registry: "registry.example".into(), username: "host".into() },
+                source: CredentialSource::Env { name: "TEST_REGISTRY_TOKEN".into() },
+                lifecycle: CredentialLifecycle::Static,
+                placement: Default::default(),
+            })
+            .await
+            .expect("credential");
+        let state = tempfile::tempdir().expect("state");
+        let runner = Arc::new(RecordingRunner::default());
+        let store = Arc::new(CredentialStore::new(
+            backend.clone(),
+            "flotilla",
+            Arc::new(TestEnv(BTreeMap::from([("TEST_REGISTRY_TOKEN".into(), "secret".into())]))),
+            EnvironmentBag::new(),
+            runner.clone(),
+            state.path().into(),
+        ));
+        let credentials = HostRegistryCredentials { store, host: "host".into() };
+        let mut repository = RegistryRepository::builder()
+            .origin(url::Url::parse("https://registry.example").expect("origin"))
+            .name("team/images".into())
+            .credential("registry".into())
+            .build();
+        assert!(credentials.resolve("registry", &repository, RegistryAction::Read).await.is_err());
+        for action in [HostImageAction::ImagePull, HostImageAction::ImagePush] {
+            backend
+                .definitions::<CredentialGrant>("flotilla")
+                .create(
+                    &InputMeta::builder().name(format!("{action:?}")).build(),
+                    &CredentialGrantSpec::builder()
+                        .selector(
+                            CredentialGrantSelector::builder()
+                                .host_action(HostActionSelector::builder().action(action).hosts(BTreeSet::from(["host".into()])).build())
+                                .build(),
+                        )
+                        .credentials(BTreeSet::from(["registry".into()]))
+                        .build(),
+                )
+                .await
+                .expect("grant");
+        }
+        assert_eq!(credentials.resolve("registry", &repository, RegistryAction::Read).await.expect("read grant").password, "secret");
+        assert!(credentials.resolve("registry", &repository, RegistryAction::Delete).await.is_err());
+        backend
+            .definitions::<CredentialGrant>("flotilla")
+            .create(
+                &InputMeta::builder().name("delete".into()).build(),
+                &CredentialGrantSpec::builder()
+                    .selector(
+                        CredentialGrantSelector::builder()
+                            .host_action(
+                                HostActionSelector::builder()
+                                    .action(HostImageAction::ImageDelete)
+                                    .hosts(BTreeSet::from(["host".into()]))
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .credentials(BTreeSet::from(["registry".into()]))
+                    .build(),
+            )
+            .await
+            .expect("delete grant");
+        assert!(credentials.resolve("registry", &repository, RegistryAction::Delete).await.is_ok());
+        repository.origin = url::Url::parse("https://foreign.example").expect("foreign origin");
+        assert!(credentials.resolve("registry", &repository, RegistryAction::Read).await.is_err());
+        assert!(credentials.resolve("registry", &repository, RegistryAction::Delete).await.is_err());
+        assert!(runner.calls.lock().expect("calls").is_empty(), "HTTP credentials never log in to a container CLI");
+    }
+
     // Cancellation while login is in flight removes the config and never
     // starts a pull; cleanup does not rely on the operation reaching a return.
     #[tokio::test]
@@ -5391,16 +5530,19 @@ interactions:
             backend,
             "flotilla",
             Arc::new(TestEnv(BTreeMap::from([("TEST_REGISTRY_TOKEN".into(), "test-secret".into())]))),
-            EnvironmentBag::new(),
+            EnvironmentBag::new().with(flotilla_core::providers::discovery::EnvironmentAssertion::binary("docker", "/test/bin/docker")),
             runner.clone(),
             state.path().into(),
         ));
         let task = tokio::spawn(async move {
             store
-                .image_registry_operation("host", HostImageAction::ImagePull, "registry", "registry.example/images", &[
-                    "pull",
+                .image_registry_operation(
+                    "host",
+                    HostImageAction::ImagePull,
+                    "registry",
+                    "registry.example/images",
                     "registry.example/images@sha256:3333333333333333333333333333333333333333333333333333333333333333",
-                ])
+                )
                 .await
         });
         gate.0.notified().await;
@@ -5430,8 +5572,14 @@ interactions:
         let gate = Arc::new((tokio::sync::Notify::new(), tokio::sync::Semaphore::new(0)));
         let runner = Arc::new(RecordingRunner { registry_login_gate: Some(Arc::clone(&gate)), ..RecordingRunner::default() });
         let state = tempfile::tempdir().expect("create state directory");
-        let store =
-            Arc::new(CredentialStore::new(backend, "flotilla", env, EnvironmentBag::new(), runner.clone(), state.path().to_path_buf()));
+        let store = Arc::new(CredentialStore::new(
+            backend,
+            "flotilla",
+            env,
+            EnvironmentBag::new().with(flotilla_core::providers::discovery::EnvironmentAssertion::binary("docker", "/test/bin/docker")),
+            runner.clone(),
+            state.path().to_path_buf(),
+        ));
 
         let preparing = {
             let store = Arc::clone(&store);
@@ -5493,7 +5641,7 @@ interactions:
             ResourceBackend::InMemory(InMemoryBackend::default()).with_local_root(NodeId::new("root-a")),
             "flotilla",
             Arc::new(TestEnv::default()),
-            EnvironmentBag::new(),
+            EnvironmentBag::new().with(flotilla_core::providers::discovery::EnvironmentAssertion::binary("docker", "/test/bin/docker")),
             Arc::new(RecordingRunner::default()),
             state.path().to_path_buf(),
         );

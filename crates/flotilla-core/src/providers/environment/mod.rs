@@ -214,7 +214,17 @@ pub struct EnvironmentBacking {
 
 /// Manages lifecycle of sandbox environments: image building, creation, and listing.
 #[async_trait]
-pub trait EnvironmentProvider: Send + Sync {
+pub trait ContainerRuntime: Send + Sync {
+    /// Run a bounded, isolated verification container. Unsupported adapters
+    /// report unavailable rather than falling back to a host process.
+    async fn probe(
+        &self,
+        _operation: super::container::ImageOperation<'_>,
+        _probe: super::container::ContainerProbe<'_>,
+    ) -> Result<super::CommandOutput, String> {
+        Err("container verification unavailable".into())
+    }
+
     async fn ensure_image(&self, spec: &EnvironmentSpec, repo_root: &Path) -> Result<ImageId, String>;
     async fn create(&self, id: EnvironmentId, image: &ImageId, opts: CreateOpts) -> Result<EnvironmentHandle, String>;
     async fn list(&self) -> Result<Vec<EnvironmentHandle>, String>;
@@ -265,3 +275,6 @@ pub trait ProvisionedEnvironment: Send + Sync {
     fn runner(&self) -> Arc<dyn CommandRunner>;
     async fn destroy(&self) -> Result<(), String>;
 }
+
+/// Compatibility name for sandbox environment callers.
+pub use ContainerRuntime as EnvironmentProvider;

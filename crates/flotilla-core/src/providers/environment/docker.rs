@@ -14,7 +14,10 @@ use super::{
     EnvironmentToolAssetKind, EnvironmentVariableUpdate, ImagePullPolicy, PreparedEnvironmentAuth, ProvisionedEnvironment,
     ProvisionedMount, ProvisionedMountMode,
 };
-use crate::providers::{ChannelLabel, CommandRunner};
+use crate::providers::{
+    container::{docker::DockerImageStore, ContainerProbe, ImageOperation},
+    ChannelLabel, CommandOutput, CommandRunner,
+};
 
 /// Bump this when the short-term Dockerfile image fingerprint inputs change.
 const DOCKERFILE_IMAGE_TAG_VERSION: &str = "v1";
@@ -45,27 +48,38 @@ fn host_user() -> String {
 
 #[async_trait]
 impl EnvironmentProvider for DockerEnvironmentProvider {
+    async fn probe(&self, operation: ImageOperation<'_>, probe: ContainerProbe<'_>) -> Result<CommandOutput, String> {
+        DockerImageStore::new(Arc::clone(&self.inner.runner)).probe(operation, probe).await
+    }
+
     // TODO: This fingerprints the Dockerfile contents plus the spec path only.
     // It intentionally ignores the broader build context for now, so a version
     // bump may be needed if that approximation proves too weak in practice.
     async fn ensure_image(&self, spec: &EnvironmentSpec, repo_root: &Path) -> Result<ImageId, String> {
+        let private = tempfile::Builder::new().prefix("flotilla-container-noauth-").tempdir().map_err(|error| error.to_string())?;
+        let config = private.path().to_string_lossy();
         match &spec.image {
             ImageSource::Dockerfile(path) => {
                 let abs_path = if path.is_relative() { repo_root.join(path) } else { path.clone() };
                 let tag = dockerfile_image_tag(path, &abs_path)?;
-                if self.inner.image_exists(&tag, repo_root).await? {
+                if self.inner.image_exists(&tag, repo_root, &config).await? {
                     return Ok(ImageId::new(tag));
                 }
                 let context_dir = abs_path.parent().unwrap_or(repo_root).to_string_lossy().into_owned();
                 let path_str = abs_path.to_string_lossy().into_owned();
                 self.inner
                     .runner
-                    .run("docker", &["build", "-t", &tag, "-f", &path_str, &context_dir], repo_root, &ChannelLabel::Default)
+                    .run(
+                        "docker",
+                        &["--config", &config, "build", "-t", &tag, "-f", &path_str, &context_dir],
+                        repo_root,
+                        &ChannelLabel::Default,
+                    )
                     .await?;
                 Ok(ImageId::new(tag))
             }
             ImageSource::Registry(image) => {
-                self.inner.runner.run("docker", &["pull", image], repo_root, &ChannelLabel::Default).await?;
+                self.inner.runner.run("docker", &["--config", &config, "pull", image], repo_root, &ChannelLabel::Default).await?;
                 Ok(ImageId::new(image.clone()))
             }
         }
@@ -91,8 +105,16 @@ impl EnvironmentProvider for DockerEnvironmentProvider {
         let requested_mounts = opts.provisioned_mounts;
         let mut provisioned_mounts = Vec::new();
         let mut tokens = opts.tokens;
+        let private = match &opts.prepared_auth {
+            PreparedEnvironmentAuth::NoRegistryCredential => {
+                Some(tempfile::Builder::new().prefix("flotilla-container-noauth-").tempdir().map_err(|error| error.to_string())?)
+            }
+            PreparedEnvironmentAuth::RegistryConfig { .. } => None,
+        };
         let docker_config = match &opts.prepared_auth {
-            PreparedEnvironmentAuth::NoRegistryCredential => None,
+            PreparedEnvironmentAuth::NoRegistryCredential => {
+                private.as_ref().map(|directory| directory.path().to_string_lossy().into_owned())
+            }
             PreparedEnvironmentAuth::RegistryConfig { directory } => Some(directory.to_string()),
         };
         let mut pull_policy = opts.image_pull_policy.docker_value();
@@ -376,8 +398,8 @@ impl DockerEnvironmentProviderInner {
         Self { runner }
     }
 
-    async fn image_exists(&self, tag: &str, cwd: &Path) -> Result<bool, String> {
-        match self.runner.run("docker", &["image", "inspect", tag], cwd, &ChannelLabel::Default).await {
+    async fn image_exists(&self, tag: &str, cwd: &Path, config: &str) -> Result<bool, String> {
+        match self.runner.run("docker", &["--config", config, "image", "inspect", tag], cwd, &ChannelLabel::Default).await {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
         }

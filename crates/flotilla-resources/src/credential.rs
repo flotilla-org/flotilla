@@ -350,6 +350,8 @@ pub enum RepositoryTrust {
 pub enum HostImageAction {
     ImagePull,
     ImagePush,
+    /// Registry manifest deletion requires its own explicit host grant.
+    ImageDelete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, bon::Builder)]
@@ -687,15 +689,16 @@ mod tests {
 mod host_action_tests {
     use super::*;
 
-    // #2729: host actions cannot leak to crews. Generate both actions, explicit
+    // Host actions cannot leak to crews or authorize a different action. Generate all actions, explicit
     // and wildcard host sets, builder/vessel hosts, and wrong host identities.
     #[hegel::test]
     fn host_grants_are_disjoint_from_work(tc: hegel::TestCase) {
-        let push = tc.draw(hegel::generators::booleans());
+        let actions = [HostImageAction::ImagePull, HostImageAction::ImagePush, HostImageAction::ImageDelete];
+        let action = actions[tc.draw(hegel::generators::integers::<usize>().min_value(0).max_value(2))];
+        let push = action == HostImageAction::ImagePush;
         let builder = tc.draw(hegel::generators::booleans());
         let wildcard = tc.draw(hegel::generators::booleans());
         let matching_host = tc.draw(hegel::generators::booleans());
-        let action = if push { HostImageAction::ImagePush } else { HostImageAction::ImagePull };
         let selector = CredentialGrantSelector::builder()
             .host_action(
                 HostActionSelector::builder()
@@ -708,8 +711,9 @@ mod host_action_tests {
         assert_eq!(selector.matches_host_action(host, action, builder), (wildcard || matching_host) && (!push || builder));
         assert!(!selector.matches(Some("fleet"), &BTreeMap::new(), "coder"));
         assert!(!selector.overlaps(&CredentialGrantSelector::builder().build()));
-        let other = if push { HostImageAction::ImagePull } else { HostImageAction::ImagePush };
-        assert!(!selector.matches_host_action(host, other, true));
+        for other in actions.into_iter().filter(|other| *other != action) {
+            assert!(!selector.matches_host_action(host, other, true));
+        }
     }
 
     // Previous-generation work grants omit host_action and retain their behavior.

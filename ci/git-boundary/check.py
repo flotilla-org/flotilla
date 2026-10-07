@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject literal Git invocations outside the checkout-scoped VCS boundary."""
+"""Reject literal Git/container invocations outside their provider implementations."""
 import argparse
 import os
 from pathlib import Path
@@ -9,7 +9,7 @@ import subprocess
 from ast_grep_py import SgRoot
 
 
-RUN_METHODS = {"run", "run_output", "run_with_input"}
+RUN_METHODS = {"run", "run_output", "run_with_input", "run_with_timeout", "run_output_with_timeout", "exists", "spawn_long_lived", "run_to_file", "run_from_file"}
 RUN_MACROS = {"run", "run_output"}
 VCS = "crates/flotilla-core/src/"
 
@@ -73,29 +73,33 @@ def test_attribute(node):
     )
 
 
-def git_literal(node):
+def command_literal(node, commands):
     # Like the old lint, inspect a string literal's decoded content, not substrings.
     if node.kind() == "raw_string_literal":
         content = node.find(kind="string_content")
-        return node.text().startswith("r") and content is not None and content.text() == "git"
+        return node.text().startswith("r") and content is not None and content.text() in commands
     if node.kind() != "string_literal":
         return False
     text = node.text()[1:-1]
     text = re.sub(r"\\\s*\n\s*", "", text)
     text = re.sub(r"\\x([0-9a-fA-F]{2})|\\u\{([0-9a-fA-F_]+)\}",
                   lambda m: chr(int((m[1] or m[2]).replace("_", ""), 16)), text)
-    return text == "git"
+    return text in commands
+
+
+def git_literal(node):
+    return command_literal(node, {"git"})
 
 
 def named(node):
     return [c for c in node.children() if c.is_named() and c.kind() not in {"line_comment", "block_comment"}]
 
 
-def raw_git(node):
+def raw_command(node, commands):
     if node.kind() == "call_expression":
         function = node.field("function")
         args = named(node.field("arguments"))
-        if not args or not git_literal(args[0]):
+        if not args or not command_literal(args[0], commands):
             return False
         if function.kind() == "generic_function":
             function = function.field("function")
@@ -116,8 +120,23 @@ def raw_git(node):
                 groups.append([])
             elif token.kind() not in {"line_comment", "block_comment"}:
                 groups[-1].append(token)
-        return len(groups) >= 3 and len(groups[1]) == 1 and git_literal(groups[1][0])
+        return len(groups) >= 3 and len(groups[1]) == 1 and command_literal(groups[1][0], commands)
     return False
+
+
+def raw_git(node):
+    return raw_command(node, {"git"})
+
+
+def container_exempt(path, production=False):
+    return (
+        (integration_test_path(path) and not production)
+        or Path(path).name == "build.rs"
+        or path == "crates/build_identity.rs"
+        or path.startswith(VCS + "providers/container/")
+        or path.startswith(VCS + "providers/environment/")
+        or path == VCS + "providers/discovery/test_support.rs"
+    )
 
 
 def test_modules(source, path, production=False):
@@ -163,13 +182,13 @@ def test_modules(source, path, production=False):
 
 
 def violations(source, path, production=False):
-    if exempt(path, production):
-        return []
+    git_exempt = exempt(path, production)
+    containers_exempt = container_exempt(path, production)
     root = SgRoot(source, "rust").root()
     found = []
 
     def visit(node):
-        if raw_git(node):
+        if (not git_exempt and raw_git(node)) or (not containers_exempt and raw_command(node, {"docker", "podman", "skopeo", "nerdctl"})):
             found.append(node.range().start.line + 1)
         skip = False
         for child in node.children():
@@ -243,7 +262,7 @@ def main():
         return 1
     for file, lines in results.items():
         for line in lines:
-            print(f"{file}:{line}: invoke Git through the checkout-scoped Vcs trait instead of a raw command")
+            print(f"{file}:{line}: invoke Git/container tools through Vcs or ContainerRuntime/ImageStore instead of a raw command")
             failed = True
     return int(failed)
 

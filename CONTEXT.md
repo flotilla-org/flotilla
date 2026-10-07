@@ -833,3 +833,13 @@ base and harness; newly needed capabilities extend the frozen selection.
 The identity of resolved build inputs and their parent chain for one target
 architecture. Equal pinned inputs share a key across hosts; the key is distinct
 from the actual built image identity.
+
+
+**Local Image ID**:
+The immutable content identity of an image's configuration as held on a host.
+It is distinct from the registry manifest that describes the configuration and layers.
+_Avoid_: image tag (a mutable name).
+
+**Registry Manifest Digest**:
+The immutable content identity of a published image manifest. It selects exact
+registry content and is distinct from both a local image ID and a mutable tag.

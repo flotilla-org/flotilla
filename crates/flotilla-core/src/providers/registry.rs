@@ -158,6 +158,7 @@ pub struct ProviderRegistry {
     pub ai_utilities: ProviderSet<dyn AiUtility>,
     pub presentation_managers: ProviderSet<dyn PresentationManager>,
     pub terminal_pools: ProviderSet<dyn TerminalPool>,
+    pub image_stores: ProviderSet<dyn super::container::ImageStore>,
     pub environment_providers: ProviderSet<dyn EnvironmentProvider>,
 }
 
@@ -174,6 +175,7 @@ impl ProviderRegistry {
             presentation_managers: ProviderSet::new(),
             terminal_pools: ProviderSet::new(),
             environment_providers: ProviderSet::new(),
+            image_stores: ProviderSet::new(),
         }
     }
 }
@@ -207,6 +209,7 @@ impl ProviderRegistry {
         collect(&mut infos, &self.presentation_managers);
         collect(&mut infos, &self.terminal_pools);
         collect(&mut infos, &self.environment_providers);
+        collect(&mut infos, &self.image_stores);
         infos
     }
 }

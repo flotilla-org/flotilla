@@ -635,14 +635,23 @@ impl DaemonRuntime {
         }
         let ssh_profiles = phase("discover_agentless_ssh_profiles", discover_agentless_ssh_profiles(&daemon, &config)).await;
         daemon.set_admission_free_space_path(PathBuf::from(&profile.repo_default_dir));
-        let credential_store = Arc::new(CredentialStore::new(
-            daemon.resource_backend(),
-            &options.namespace,
-            Arc::clone(&daemon.discovery_runtime().env),
-            daemon.local_environment_bag().ok_or_else(|| "local environment bag unavailable".to_string())?,
-            daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?,
-            config.state_dir().as_path().to_path_buf(),
-        ));
+        let credential_store = Arc::new(
+            CredentialStore::new(
+                daemon.resource_backend(),
+                &options.namespace,
+                Arc::clone(&daemon.discovery_runtime().env),
+                daemon.local_environment_bag().ok_or_else(|| "local environment bag unavailable".to_string())?,
+                daemon.local_command_runner().ok_or_else(|| "local command runner unavailable".to_string())?,
+                config.state_dir().as_path().to_path_buf(),
+            )
+            .with_image_store(
+                local_registry
+                    .image_stores
+                    .preferred()
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(flotilla_core::providers::container::docker::DockerImageStore::unavailable())),
+            ),
+        );
         // Cleanup must precede admitting commands that can mint new staging files.
         if let Err(error) = phase("cleanup_stale_github_app_token_files", credential_store.cleanup_stale_github_app_token_files()).await {
             warn!(%error, "failed to clean up stale GitHub App token staging files");
@@ -839,11 +848,20 @@ impl DaemonRuntime {
                     Arc::clone(&runner),
                     GitCheckoutStrategy::Worktree(Box::new(GitWorktreeStrategy::new(".".into(), Arc::clone(&runner)))),
                 ));
+                let images = local_registry
+                    .image_stores
+                    .preferred()
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(flotilla_core::providers::container::docker::DockerImageStore::unavailable()));
                 let distributor = Arc::new(
                     crate::image_distribution::ImageDistributor::builder()
                         .io(Arc::new(
-                            crate::image_distribution::DockerImageIo::builder()
-                                .runner(Arc::clone(&runner))
+                            crate::image_distribution::ProviderImageIo::builder()
+                                .images(Arc::clone(&images))
+                                .registry(
+                                    credential_store
+                                        .registry_client(&profile.host_id, Arc::new(flotilla_core::providers::ReqwestHttpClient::new())),
+                                )
                                 .credentials(Arc::clone(&credential_store))
                                 .host(profile.host_id.clone())
                                 .build(),
@@ -853,9 +871,10 @@ impl DaemonRuntime {
                         .host(profile.host_id.clone())
                         .build(),
                 );
-                Arc::new(crate::image_build::BuildxRunner {
+                Arc::new(crate::image_build::HostImageBuildRunner {
                     distributor: Some(distributor),
-                    runner,
+                    images,
+                    runtime: local_registry.environment_providers.preferred().cloned(),
                     vcs,
                     directory,
                     backend: daemon.resource_backend(),
@@ -1536,8 +1555,8 @@ struct ControllerRuntimeState {
     credential_store: Option<Arc<CredentialStore>>,
     agent_material: Option<Arc<AgentMaterialRegistry>>,
     blob_store: Option<Arc<TieredBlobStore>>,
-    image_build_runner: Option<Arc<crate::image_build::BuildxRunner>>,
-    image_distributor: Option<Arc<crate::image_distribution::ImageDistributor<crate::image_distribution::DockerImageIo>>>,
+    image_build_runner: Option<Arc<crate::image_build::HostImageBuildRunner>>,
+    image_distributor: Option<Arc<crate::image_distribution::ImageDistributor<crate::image_distribution::ProviderImageIo>>>,
     provisioned_environments: Mutex<HashMap<String, ActiveProvisionedEnvironment>>,
     /// Latched after one complete post-startup local Docker adoption pass.
     /// A fresh provider listing is still required for each absence judgement.
@@ -1748,7 +1767,7 @@ impl ControllerRuntimeState {
         self
     }
 
-    fn with_image_build_runner(mut self, runner: Arc<crate::image_build::BuildxRunner>) -> Self {
+    fn with_image_build_runner(mut self, runner: Arc<crate::image_build::HostImageBuildRunner>) -> Self {
         self.image_distributor = runner.distributor.clone();
         self.image_build_runner = Some(runner);
         self
@@ -2989,11 +3008,7 @@ async fn migrate_listed_placement_policies(
     Ok(())
 }
 
-struct FulfilmentProbeContext<'a> {
-    runner: &'a dyn CommandRunner,
-    env: &'a dyn EnvVars,
-    scratch: &'a Path,
-}
+use crate::fulfilment_probe::ProbeContext as FulfilmentProbeContext;
 
 async fn observe_fulfilment_facts(
     backend: &ResourceBackend,
@@ -3050,15 +3065,7 @@ async fn observe_fulfilment_facts(
             Some(current) => Some(current),
             None => match tokio::time::timeout_at(
                 deadline.min(tokio::time::Instant::now() + Duration::from_secs(45)),
-                crate::fulfilment_probe::probe_kind(
-                    &kind.spec,
-                    image.as_deref(),
-                    pool_available,
-                    probe.runner,
-                    probe.env,
-                    probe.scratch,
-                    model_probes,
-                ),
+                crate::fulfilment_probe::probe_kind(&probe, &kind.spec, image.as_deref(), pool_available, model_probes),
             )
             .await
             {
@@ -3196,13 +3203,23 @@ fn spawn_local_fulfilment_probe_task(
             let status = hosts.get(&profile.host_id).await.ok().and_then(|host| host.status).unwrap_or_default();
             let previous = status.fulfilment_facts;
             let mut model_probes = status.model_probes.clone();
+            let bag = daemon.local_environment_bag().unwrap_or_default();
+            let (images, runtime) = discovery
+                .factories
+                .probe_containers(&bag, &daemon.config_store(), &ExecutionEnvironmentPath::new(&scratch), Arc::clone(&discovery.runner))
+                .await;
             match observe_fulfilment_facts(
                 &daemon.resource_backend(),
                 &namespace,
                 &profile.host_id,
                 &profile.available_pools,
                 &previous,
-                FulfilmentProbeContext { runner: discovery.runner.as_ref(), env: discovery.env.as_ref(), scratch: &scratch },
+                FulfilmentProbeContext {
+                    containers: crate::fulfilment_probe::ContainerProviders { images: images.as_deref(), runtime: runtime.as_deref() },
+                    runner: discovery.runner.as_ref(),
+                    env: discovery.env.as_ref(),
+                    scratch: &scratch,
+                },
                 &mut model_probes,
             )
             .await
@@ -3242,13 +3259,23 @@ fn spawn_ssh_fulfilment_probe_task(daemon: Arc<InProcessDaemon>, namespace: Stri
                     return;
                 }
             };
+            let (images, runtime) = daemon
+                .discovery_runtime()
+                .factories
+                .probe_containers(&ssh.env_bag, &daemon.config_store(), &ExecutionEnvironmentPath::new(&scratch), Arc::clone(&ssh.runner))
+                .await;
             match observe_fulfilment_facts(
                 &daemon.resource_backend(),
                 &namespace,
                 &ssh.provisioning.host_id,
                 &ssh.provisioning.available_pools,
                 &previous,
-                FulfilmentProbeContext { runner: ssh.runner.as_ref(), env: &BagEnvVars(&ssh.env_bag), scratch: &scratch },
+                FulfilmentProbeContext {
+                    containers: crate::fulfilment_probe::ContainerProviders { images: images.as_deref(), runtime: runtime.as_deref() },
+                    runner: ssh.runner.as_ref(),
+                    env: &BagEnvVars(&ssh.env_bag),
+                    scratch: &scratch,
+                },
                 &mut model_probes,
             )
             .await
@@ -10207,7 +10234,9 @@ mod tests {
                 daemon.resource_backend(),
                 NAMESPACE,
                 Arc::new(TestEnvVars::new([("HOME", home.display().to_string()), ("TEST_REGISTRY_TOKEN", "registry-secret".to_string())])),
-                EnvironmentBag::new(),
+                // Image storage is a separately declared host capability even
+                // when the vessel lifecycle uses a non-Docker provider.
+                EnvironmentBag::new().with(flotilla_core::providers::discovery::EnvironmentAssertion::binary("docker", "/test/bin/docker")),
                 registry_runner.clone(),
                 config.state_dir().as_path().to_path_buf(),
             ));
@@ -16429,6 +16458,7 @@ mod tests {
                 &probe_pools,
                 &BTreeMap::new(),
                 FulfilmentProbeContext {
+                    containers: crate::fulfilment_probe::ContainerProviders { images: None, runtime: None },
                     runner: &probe_runner,
                     env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
                     scratch: Path::new("/tmp/flotilla-probe-test"),
@@ -16488,6 +16518,7 @@ mod tests {
             &profile.available_pools,
             &previous,
             FulfilmentProbeContext {
+                containers: crate::fulfilment_probe::ContainerProviders { images: None, runtime: None },
                 runner: &failing_runner,
                 env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
                 scratch: Path::new("/tmp/flotilla-probe-test"),
@@ -16851,6 +16882,7 @@ mod tests {
             &["cleat".to_string()],
             &previous,
             FulfilmentProbeContext {
+                containers: crate::fulfilment_probe::ContainerProviders { images: None, runtime: None },
                 runner: &runner,
                 env: &TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]),
                 scratch: Path::new("/tmp/flotilla-probe-test"),

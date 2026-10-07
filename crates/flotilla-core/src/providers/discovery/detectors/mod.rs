@@ -12,6 +12,7 @@ use crate::providers::{terminal::environment::HOST_ENVIRONMENT_KEYS, vcs::detect
 pub fn default_host_detectors() -> Vec<Box<dyn HostDetector>> {
     let mut detectors: Vec<Box<dyn HostDetector>> = vec![
         Box::new(git_binary_detector()),
+        Box::new(CommandDetector::new("docker", &["--version"], parse_first_dotted_version).with_resolved_path()),
         Box::new(CommandDetector::new("curl", &["--version"], parse_first_dotted_version)),
         Box::new(CommandDetector::new("gh", &["--version"], parse_first_dotted_version)),
         Box::new(claude::ClaudeDetector),

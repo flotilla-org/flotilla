@@ -63,7 +63,20 @@ impl RecordingRunner {
     }
 
     fn calls(&self) -> Vec<(String, Vec<String>, PathBuf)> {
-        self.calls.lock().expect("calls mutex").clone()
+        self.calls
+            .lock()
+            .expect("calls mutex")
+            .clone()
+            .into_iter()
+            .map(|(command, mut args, cwd)| {
+                if args.first().map(String::as_str) == Some("--config")
+                    && args.get(1).is_some_and(|path| path.contains("flotilla-container-noauth-"))
+                {
+                    args.drain(..2);
+                }
+                (command, args, cwd)
+            })
+            .collect()
     }
 }
 
@@ -78,6 +91,11 @@ impl CommandRunner for RecordingRunner {
                 .unwrap_or_else(|| Ok(r#"{"MemTotal":68719476736,"MemoryLimit":true,"SwapLimit":true}"#.into()));
         }
         self.calls.lock().expect("calls mutex").push((cmd.to_string(), args.iter().map(|a| a.to_string()).collect(), cwd.to_path_buf()));
+        let args = if args.first() == Some(&"--config") && args.get(1).is_some_and(|path| path.contains("flotilla-container-noauth-")) {
+            &args[2..]
+        } else {
+            args
+        };
         if cmd == "docker" && args.starts_with(&["inspect", "--format", "{{.Image}}"]) {
             return Ok("sha256:test-image-digest\n".to_string());
         }
@@ -178,7 +196,20 @@ impl QueuedRunner {
     }
 
     fn calls(&self) -> Vec<(String, Vec<String>, PathBuf)> {
-        self.calls.lock().expect("calls mutex").clone()
+        self.calls
+            .lock()
+            .expect("calls mutex")
+            .clone()
+            .into_iter()
+            .map(|(command, mut args, cwd)| {
+                if args.first().map(String::as_str) == Some("--config")
+                    && args.get(1).is_some_and(|path| path.contains("flotilla-container-noauth-"))
+                {
+                    args.drain(..2);
+                }
+                (command, args, cwd)
+            })
+            .collect()
     }
 }
 
@@ -297,6 +328,11 @@ async fn ensure_image_pulls_registry() {
     let (cmd, args, _) = &calls[0];
     assert_eq!(cmd, "docker");
     assert_eq!(args, &["pull", "ubuntu:22.04"]);
+    // Anonymous image operations must never use the host-global Docker config.
+    let raw = runner.calls.lock().expect("raw calls");
+    assert_eq!(raw[0].1[0], "--config");
+    assert!(raw[0].1[1].contains("flotilla-container-noauth-"));
+    assert!(!Path::new(&raw[0].1[1]).exists(), "anonymous auth artifact removed on return");
 }
 
 #[tokio::test]

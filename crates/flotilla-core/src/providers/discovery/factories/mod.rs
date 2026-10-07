@@ -39,6 +39,7 @@ impl FactoryRegistry {
             presentation_managers: presentation_factories(),
             terminal_pools: terminal_pool_factories(),
             environment_providers: vec![Box::new(docker::DockerEnvironmentFactory)],
+            image_stores: vec![Box::new(docker::DockerImageStoreFactory)],
         }
     }
 }

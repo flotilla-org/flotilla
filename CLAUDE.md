@@ -199,6 +199,14 @@ Use the checkout-scoped `flotilla_core::vcs::Vcs` trait for Git and other VCS op
 
 Do not invoke `git` directly through `CommandRunner` methods or `run!`, or through `std::process::Command::new("git")`, outside the VCS implementation. The ast-grep Git boundary check runs in the format job on every PR. Build scripts and build tooling are exempt because they run before a `CommandRunner` exists; tests may use Git to construct fixtures.
 
+### Container operation boundary
+
+Use the host-scoped `ContainerRuntime` (also exported as `EnvironmentProvider` for environment callers) and `ImageStore` traits in `crates/flotilla-core/src/providers/container/` for container lifecycle, verification, and local image operations. Docker is the first adapter, selected through the host detector and factory `EnvironmentBag` path. An absent binary means the capability is unavailable. Adapters run only through the host's injected `CommandRunner`.
+
+Registry metadata uses `RegistryClient` over OCI distribution HTTP: HEAD/GET/DELETE address manifest digests, and tag listing follows scoped pagination. Image content pull/push stays in `ImageStore`. Resolve declared credential references per operation; use private configuration artifacts and never the host's global Docker login. Registry deletion needs an explicit `image-delete` host-action grant, separate from pull and push.
+
+The existing ast-grep check in `ci/git-boundary/` also rejects literal `docker`, `podman`, `nerdctl`, and `skopeo` calls through runners, run macros, or process constructors outside the container/environment provider implementations. Tests and build tooling retain the Git rule's exemptions. Add typed operations to the traits when a new caller needs capability; do not bypass them. See ADR 0057.
+
 ### Observed resources and aggregation
 
 Provider refreshes publish discovered checkout facts into the daemon's ephemeral observed-resource backend. Durable resources remain authoritative for desired and adopted state. The Aggregator watches both stores, applies durable-over-observed precedence where a resource is present in both, and emits named-query result sets and deltas for surfaces.

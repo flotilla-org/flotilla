@@ -1,4 +1,4 @@
-//! Host-local Buildx adapter. Lifecycle policy lives in the controller and
+//! Host-local image build coordinator. Lifecycle policy lives in the controller and
 //! source acquisition stays behind the checkout-scoped VCS seam.
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -13,7 +13,10 @@ use chrono::Utc;
 use flotilla_controllers::reconcilers::{ImageBuildResult, ImageBuildRunner};
 use flotilla_core::{
     image_build::{ImageBuildInputResolver, ImageBuildSourceInputs},
-    providers::{ChannelLabel, CommandRunner},
+    providers::{
+        container::{ContainerProbe, ImageBuildOptions, ImageOperation, ImageStore, ProbeNetwork},
+        environment::ContainerRuntime,
+    },
     vcs::Vcs,
 };
 use flotilla_resources::{
@@ -24,9 +27,11 @@ use sha2::{Digest, Sha256};
 
 use crate::blob_store::{BlobStore, TieredBlobStore};
 
-pub(crate) struct BuildxRunner {
-    pub distributor: Option<Arc<crate::image_distribution::ImageDistributor<crate::image_distribution::DockerImageIo>>>,
-    pub runner: Arc<dyn CommandRunner>,
+#[derive(bon::Builder)]
+pub(crate) struct HostImageBuildRunner {
+    pub distributor: Option<Arc<crate::image_distribution::ImageDistributor<crate::image_distribution::ProviderImageIo>>>,
+    pub images: Arc<dyn ImageStore>,
+    pub runtime: Option<Arc<dyn ContainerRuntime>>,
     pub vcs: Arc<dyn Vcs>,
     pub directory: PathBuf,
     pub backend: ResourceBackend,
@@ -100,7 +105,6 @@ fn hash_layer_inputs_blocking(context: &Path, layer: &FrozenImageLayer) -> Resul
 
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
-const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REASON_CHARS: usize = 2048;
 
 async fn hash_layer_inputs(context: &Path, layer: &FrozenImageLayer) -> Result<Vec<String>, String> {
@@ -148,18 +152,7 @@ fn classify_build_failure(exit_code: Option<i32>, reason: &str) -> ImageBuildFai
     }
 }
 
-impl BuildxRunner {
-    async fn output_with_timeout(
-        &self,
-        args: &[&str],
-        context: &Path,
-        timeout: Duration,
-    ) -> Result<flotilla_core::providers::CommandOutput, String> {
-        tokio::time::timeout(timeout, self.runner.run_output("docker", args, context, &ChannelLabel::Default))
-            .await
-            .map_err(|_| format!("Docker process exceeded wall-clock deadline of {} seconds", timeout.as_secs()))?
-    }
-
+impl HostImageBuildRunner {
     async fn context(&self, layer: &FrozenImageLayer) -> Result<PathBuf, String> {
         let directory =
             self.directory.join(format!("source-{:x}", Sha256::digest(format!("{}\0{}", layer.spec.repository, layer.spec.revision))));
@@ -209,29 +202,13 @@ impl BuildxRunner {
         }
         let config = self.directory.join(format!("config-{:x}", Sha256::digest(name)));
         tokio::fs::create_dir_all(&config).await.map_err(|error| transient(error.to_string()))?;
-        let config_arg = config.to_str().ok_or_else(|| deterministic("Docker config path is not UTF-8".into()))?;
         let architecture = match spec.inputs.architecture.as_str() {
             "x86_64" | "amd64" => "amd64",
             "aarch64" | "arm64" => "arm64",
             other => other,
         };
         let tag = format!("flotilla-build:{:x}", Sha256::digest(format!("{name}\0{}", spec.recipe_key)));
-        let mut args = vec![
-            "--config".into(),
-            config_arg.into(),
-            "buildx".into(),
-            "build".into(),
-            "--builder".into(),
-            "default".into(),
-            "--load".into(),
-            "--progress=plain".into(),
-            "--platform".into(),
-            format!("linux/{architecture}"),
-            "--tag".into(),
-            tag.clone(),
-            "--file".into(),
-            spec.layer.spec.fragment.clone(),
-        ];
+        let operation = ImageOperation { directory: &config, context: &context };
         let base = match &spec.layer.spec.parent {
             ImageLayerParent::Image(image) => image.clone(),
             _ => {
@@ -239,33 +216,29 @@ impl BuildxRunner {
                 // store. Give the exact local ID a content-derived label for FROM;
                 // record the ID, never this label, as the parent identity.
                 let label = format!("flotilla-parent:{:x}", Sha256::digest(parent_digest));
-                self.runner
-                    .run_with_timeout(
-                        "docker",
-                        &["--config", config_arg, "image", "tag", parent_digest, &label],
-                        &context,
-                        &ChannelLabel::Default,
-                        CLI_TIMEOUT,
-                    )
-                    .await
-                    .map_err(transient)?;
+                self.images.tag(operation, parent_digest, &label).await.map_err(transient)?;
                 label
             }
         };
         let mut build_args = spec.layer.spec.args.clone();
         build_args.extend(spec.layer.spec.pins.iter().map(|(name, pin)| (name.clone(), pin.value.clone())));
         build_args.insert("BASE".into(), base);
-        for (name, value) in build_args {
-            args.extend(["--build-arg".into(), format!("{name}={value}")]);
-        }
-        args.push(".".into());
-        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let cached = self
-            .output_with_timeout(&["--config", config_arg, "image", "inspect", "--format", "{{.Id}}", &tag], &context, CLI_TIMEOUT)
-            .await
-            .map_err(transient)?;
-        if !cached.success() {
-            let output = self.output_with_timeout(&args, &context, BUILD_TIMEOUT).await.map_err(transient)?;
+        if self.images.inspect(operation, &tag).await.is_err() {
+            let platform = format!("linux/{architecture}");
+            let output = self
+                .images
+                .build(
+                    operation,
+                    ImageBuildOptions::builder()
+                        .tag(&tag)
+                        .file(&spec.layer.spec.fragment)
+                        .platform(&platform)
+                        .args(&build_args)
+                        .timeout(BUILD_TIMEOUT)
+                        .build(),
+                )
+                .await
+                .map_err(transient)?;
             log.push_str(&output.stdout);
             log.push_str(&output.stderr);
             if !output.success() {
@@ -274,18 +247,7 @@ impl BuildxRunner {
                 return Err(ImageBuildFailure { class, reason });
             }
         }
-        let identity = self
-            .runner
-            .run_with_timeout(
-                "docker",
-                &["--config", config_arg, "image", "inspect", "--format", "{{.Id}}", &tag],
-                &context,
-                &ChannelLabel::Default,
-                CLI_TIMEOUT,
-            )
-            .await
-            .map_err(transient)?;
-        let identity = PlacedImageIdentity { local_image_id: identity.trim().into(), registry_digest: None };
+        let identity = self.images.inspect(operation, &tag).await.map_err(transient)?;
         identity.validate().map_err(deterministic)?;
         let mut verified = BTreeSet::new();
         for provide in &spec.layer.spec.provides {
@@ -297,50 +259,30 @@ impl BuildxRunner {
                 .filter(|command| !command.is_empty())
                 .ok_or_else(|| deterministic(format!("no verification probe declared for {provide}")))?;
             let probe_name = format!("flotilla-probe-{:x}", Sha256::digest(format!("{name}\0{provide}")));
-            let cpus = spec.reservation.cpu.to_string();
             // Positional arguments preserve arbitrary probe argv without shell
             // interpolation. Preludes and the probe share their export scope.
             let script = flotilla_core::agent_process::with_preludes("exec \"$@\"");
-            let mut args = vec![
-                "--config",
-                config_arg,
-                "run",
-                "--rm",
-                "--name",
-                &probe_name,
-                "--cpus",
-                &cpus,
-                "--memory",
-                "512m",
-                "--pids-limit",
-                "128",
-                "--pull=never",
-                "--network=none",
-                "--entrypoint",
-                "sh",
-                &identity.local_image_id,
-                "-c",
-                &script,
-                "flotilla-provide-probe",
-            ];
-            args.extend(command.iter().map(String::as_str));
-            let output = match self.output_with_timeout(&args, &context, PROBE_TIMEOUT).await {
-                Ok(output) => output,
-                Err(reason) => {
-                    // Dropping the Docker CLI alone does not stop its container.
-                    let _ = self
-                        .runner
-                        .run_with_timeout(
-                            "docker",
-                            &["--config", config_arg, "rm", "--force", &probe_name],
-                            &context,
-                            &ChannelLabel::Default,
-                            CLI_TIMEOUT,
-                        )
-                        .await;
-                    return Err(transient(reason));
-                }
-            };
+            let mut argv = vec!["sh".into(), "-c".into(), script, "flotilla-provide-probe".into()];
+            argv.extend(command.iter().cloned());
+            let output = self
+                .runtime
+                .as_ref()
+                .ok_or_else(|| transient("container runtime unavailable".into()))?
+                .probe(
+                    operation,
+                    ContainerProbe::builder()
+                        .image(&identity.local_image_id)
+                        .name(&probe_name)
+                        .command(&argv)
+                        .cpu(spec.reservation.cpu)
+                        .memory_bytes(512 * 1024 * 1024)
+                        .pids_limit(128)
+                        .network(ProbeNetwork::Isolated)
+                        .timeout(PROBE_TIMEOUT)
+                        .build(),
+                )
+                .await
+                .map_err(transient)?;
             log.push_str(&output.stdout);
             log.push_str(&output.stderr);
             if !output.success() {
@@ -364,7 +306,7 @@ impl BuildxRunner {
 }
 
 #[async_trait]
-impl ImageBuildInputResolver for BuildxRunner {
+impl ImageBuildInputResolver for HostImageBuildRunner {
     async fn resolve(&self, layer: &FrozenImageLayer, architecture: &str) -> Result<ImageBuildSourceInputs, String> {
         let context = self.context(layer).await?;
         Ok(ImageBuildSourceInputs::builder()
@@ -378,7 +320,7 @@ impl ImageBuildInputResolver for BuildxRunner {
 }
 
 #[async_trait]
-impl ImageBuildRunner for BuildxRunner {
+impl ImageBuildRunner for HostImageBuildRunner {
     async fn build(&self, name: &str, spec: &ImageBuildSpec, parent_digest: &str) -> Result<ImageBuildResult, String> {
         let mut log = String::new();
         let mut result = self.execute(name, spec, parent_digest, &mut log).await;
@@ -553,7 +495,7 @@ mod tests {
 mod runner_contract {
     use flotilla_core::{
         path_context::ExecutionEnvironmentPath,
-        providers::{vcs::git_worktree::GitWorktreeStrategy, CommandOutput},
+        providers::{vcs::git_worktree::GitWorktreeStrategy, ChannelLabel, CommandOutput, CommandRunner},
         vcs::{FlotillaVcs, GitCheckoutStrategy},
     };
     use flotilla_resources::{
@@ -587,9 +529,12 @@ mod runner_contract {
                 self.removed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 return Ok(String::new());
             }
-            assert_eq!(&args[2..6], &["image", "inspect", "--format", "{{.Id}}"]);
+            assert_eq!(&args[2..6], &["image", "inspect", "--format", "{{json .}}"]);
             assert_eq!(args[0], "--config");
-            Ok(format!("sha256:{}\n", "3".repeat(64)))
+            if self.builds.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err("image not found".into());
+            }
+            Ok(serde_json::json!({"Id": format!("sha256:{}", "3".repeat(64)), "RepoDigests": []}).to_string())
         }
         async fn run_output(&self, cmd: &str, args: &[&str], _cwd: &Path, _label: &ChannelLabel) -> Result<CommandOutput, String> {
             assert_eq!(cmd, "docker");
@@ -616,15 +561,6 @@ mod runner_contract {
                     }
                     Ok(CommandOutput { stdout: "build log\n".into(), stderr: String::new(), exit_code: Some(0) })
                 }
-                "image" => {
-                    assert_eq!(&args[2..6], &["image", "inspect", "--format", "{{.Id}}"]);
-                    let built = self.builds.load(std::sync::atomic::Ordering::SeqCst) > 0;
-                    Ok(CommandOutput {
-                        stdout: if built { format!("sha256:{}", "3".repeat(64)) } else { String::new() },
-                        stderr: String::new(),
-                        exit_code: Some(if built { 0 } else { 1 }),
-                    })
-                }
                 "run" => {
                     assert!(args.windows(2).any(|window| window == ["--entrypoint", "sh"]));
                     let shell = args.iter().position(|arg| *arg == "-c").expect("probe shell");
@@ -632,7 +568,7 @@ mod runner_contract {
                     assert_eq!(args[shell + 2], "flotilla-provide-probe");
                     assert!(args.contains(&"--pull=never"));
                     assert!(args.contains(&"--network=none"));
-                    for pair in [["--cpus", "1"], ["--memory", "512m"], ["--pids-limit", "128"]] {
+                    for pair in [["--cpus", "1"], ["--memory", "536870912"], ["--pids-limit", "128"]] {
                         assert!(args.windows(2).any(|window| window == pair));
                     }
                     if self.hang_probe {
@@ -674,7 +610,7 @@ mod runner_contract {
 
     // Buildx loads the host-local image without a registry, overrides arbitrary
     // image ENTRYPOINTs to run each declared probe, and stores the actual log.
-    async fn fixture(processes: Arc<DockerProcess>) -> (tempfile::TempDir, BuildxRunner, ImageBuildSpec) {
+    async fn fixture(processes: Arc<DockerProcess>) -> (tempfile::TempDir, HostImageBuildRunner, ImageBuildSpec) {
         let temp = tempfile::tempdir().expect("state directory");
         let directory = temp.path().join("image-builds");
         let layer = FrozenImageLayer {
@@ -702,9 +638,10 @@ mod runner_contract {
         ));
         let backend = ResourceBackend::InMemory(Default::default());
         let blobs = Arc::new(TieredBlobStore::new(temp.path(), vec![("memory".into(), Arc::new(MemoryBlobStore::default()))]));
-        let builder = BuildxRunner {
+        let builder = HostImageBuildRunner {
             distributor: None,
-            runner,
+            images: Arc::new(flotilla_core::providers::container::docker::DockerImageStore::new(runner.clone())),
+            runtime: Some(Arc::new(flotilla_core::providers::environment::docker::DockerEnvironmentProvider::new(runner))),
             vcs,
             directory,
             backend: backend.clone(),

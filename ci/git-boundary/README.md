@@ -1,7 +1,10 @@
-# Git boundary check
+# Git and container boundary check
 
 This check uses ast-grep's Rust parser to reject literal Git invocations outside
-`flotilla_core::vcs::Vcs` implementations. It runs without compiling Rust.
+`flotilla_core::vcs::Vcs` implementations, and literal Docker, podman, nerdctl,
+or skopeo invocations outside container/environment providers. Container
+callers use `ContainerRuntime`/`ImageStore`; registry metadata uses OCI HTTP
+`RegistryClient`. It runs without compiling Rust.
 
 With `uv` (available in crew images, which lack `ensurepip`), run it in one line; `uv` caches the pinned package:
 
@@ -20,8 +23,8 @@ python3 -m venv /tmp/flotilla-git-check
 ```
 
 The checker scans tracked Rust sources, not diffs. It matches associated
-`new("git")` calls (including constructor aliases), the `run`, `run_output`, and
-`run_with_input` methods, and `run!`/`run_output!` invocations. Comments, string
+`new("git")` calls (including constructor aliases), runner execution methods (including deadlines, stdin, binary file I/O and
+long-lived processes), and `run!`/`run_output!` invocations. Comments, string
 contents, nested receiver expressions and raw strings are parsed structurally.
 Like the former early-AST lint, this is a literal-call guard, not name resolution
 or data-flow analysis: variable command names and arbitrary macro wrappers are
@@ -34,7 +37,8 @@ A production module imported from an integration-test directory remains checked;
 `src/tests/` has no blanket exemption. Any parser ERROR node in a tracked Rust
 file fails the scan, including fixture and build files. The pinned parser is
 0.45.3: 0.39.5 misparsed ordinary identifiers named `raw`.
-Only the exact core VCS implementation paths are exempt from production checks.
+Only the exact core VCS implementation paths are exempt from production Git checks.
+Container checks exempt the core `providers/container/` and `providers/environment/` implementations.
 
 CI's format job installs the pinned parser and runs
 both commands in the existing every-PR Format job. Workflow changes are applied

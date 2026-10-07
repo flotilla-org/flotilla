@@ -1,7 +1,12 @@
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use chrono::Utc;
-use flotilla_core::providers::{discovery::EnvVars, ChannelLabel, CommandRunner};
+use flotilla_core::providers::{
+    container::{ContainerProbe, ImageOperation, ImageStore, ProbeDirectory},
+    discovery::EnvVars,
+    environment::ContainerRuntime,
+    ChannelLabel, CommandRunner,
+};
 use flotilla_resources::{
     CachedModelProbe, FulfilmentFacts, FulfilmentGrant, FulfilmentKindSpec, FulfilmentRealisation, HarnessFacts, ModelFact,
     ModelFactSource, ModelProbeState, Platform,
@@ -28,7 +33,22 @@ fn declared_models(env: &dyn EnvVars) -> Vec<String> {
     models
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ContainerProviders<'a> {
+    pub images: Option<&'a dyn ImageStore>,
+    pub runtime: Option<&'a dyn ContainerRuntime>,
+}
+
+#[derive(Clone, Copy, bon::Builder)]
+pub(crate) struct ProbeContext<'a> {
+    pub containers: ContainerProviders<'a>,
+    pub runner: &'a dyn CommandRunner,
+    pub env: &'a dyn EnvVars,
+    pub scratch: &'a Path,
+}
+
 async fn run_in_realisation(
+    containers: &ContainerProviders<'_>,
     runner: &dyn CommandRunner,
     realisation: &FulfilmentRealisation,
     image: Option<&str>,
@@ -43,9 +63,21 @@ async fn run_in_realisation(
             FulfilmentRealisation::HostDirect => runner.run_output(binary, args, cwd, &label).await,
             FulfilmentRealisation::DockerPerVessel { .. } => {
                 let image = image.ok_or("docker image is unresolved")?;
-                let mut command = vec!["run", "--rm", "--pull=never", "--workdir", "/probe", "--tmpfs", "/probe", image, binary];
-                command.extend_from_slice(args);
-                runner.run_output("docker", &command, cwd, &label).await
+                let mut command = vec![binary.to_string()];
+                command.extend(args.iter().map(|arg| arg.to_string()));
+                containers
+                    .runtime
+                    .ok_or("container runtime unavailable")?
+                    .probe(
+                        ImageOperation { directory: &scratch.join("registry-auth"), context: scratch },
+                        ContainerProbe::builder()
+                            .image(image)
+                            .directory(ProbeDirectory::Temporary)
+                            .command(&command)
+                            .timeout(Duration::from_secs(15))
+                            .build(),
+                    )
+                    .await
             }
         }
     })
@@ -141,14 +173,13 @@ fn harness_version(stdout: &str) -> String {
 }
 
 pub(crate) async fn probe_kind(
+    context: &ProbeContext<'_>,
     spec: &FulfilmentKindSpec,
     image: Option<&str>,
     pool_available: bool,
-    runner: &dyn CommandRunner,
-    env: &dyn EnvVars,
-    scratch: &Path,
     model_probes: &mut ModelProbeState,
 ) -> Result<FulfilmentFacts, String> {
+    let ProbeContext { containers, runner, env, scratch } = *context;
     let mut facts =
         FulfilmentFacts { image: image.map(|image| image.to_string().into()), observed_at: Utc::now(), ..FulfilmentFacts::default() };
     // This daemon-owned directory has no checkout. Never let a harness
@@ -166,28 +197,21 @@ pub(crate) async fn probe_kind(
     let mut local_image_id = None;
     if matches!(spec.realisation, FulfilmentRealisation::DockerPerVessel { .. }) {
         let Some(image) = image else { return Ok(facts) };
-        let inspected = tokio::time::timeout(
-            Duration::from_secs(15),
-            runner.run_output("docker", &["image", "inspect", image], scratch, &ChannelLabel::Default),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok);
-        facts.image_present = inspected.as_ref().map(|output| output.success());
-        local_image_id = inspected.as_ref().and_then(|output| {
-            serde_json::from_str::<serde_json::Value>(&output.stdout).ok()?.get(0)?.get("Id")?.as_str().map(ToString::to_string)
-        });
+        let inspected = match containers.images {
+            Some(images) => tokio::time::timeout(
+                Duration::from_secs(15),
+                images.inspect(ImageOperation { directory: &scratch.join("registry-auth"), context: scratch }, image),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok),
+            None => None,
+        };
+        facts.image_present = Some(inspected.is_some());
+        local_image_id = inspected.as_ref().map(|identity| identity.local_image_id.clone());
         if let Some(image) = facts.image.as_mut() {
             image.local_image_id = local_image_id.clone();
-            image.registry_digest = inspected.as_ref().and_then(|output| {
-                serde_json::from_str::<serde_json::Value>(&output.stdout)
-                    .ok()?
-                    .get(0)?
-                    .get("RepoDigests")?
-                    .get(0)?
-                    .as_str()
-                    .map(str::to_owned)
-            });
+            image.registry_digest = inspected.as_ref().and_then(|identity| identity.registry_digest.clone());
         }
         if facts.image_present != Some(true) {
             return Ok(facts);
@@ -198,13 +222,20 @@ pub(crate) async fn probe_kind(
         if !facts.gui_session_logged_in && spec.grants.contains(&FulfilmentGrant::platform(Platform::Macos.to_string())) {
             // Aqua does not advertise a display variable. A logged-in user's
             // launchd GUI domain is the host-native signal for that session.
-            if let Ok(output) = run_in_realisation(runner, &spec.realisation, image, "id", &["-u"], scratch).await {
+            if let Ok(output) = run_in_realisation(&containers, runner, &spec.realisation, image, "id", &["-u"], scratch).await {
                 let uid = output.stdout.trim();
                 if output.success() && uid.parse::<u32>().is_ok() {
-                    facts.gui_session_logged_in =
-                        run_in_realisation(runner, &spec.realisation, image, "launchctl", &["print", &format!("gui/{uid}")], scratch)
-                            .await
-                            .is_ok_and(|session| session.success());
+                    facts.gui_session_logged_in = run_in_realisation(
+                        &containers,
+                        runner,
+                        &spec.realisation,
+                        image,
+                        "launchctl",
+                        &["print", &format!("gui/{uid}")],
+                        scratch,
+                    )
+                    .await
+                    .is_ok_and(|session| session.success());
                 }
             }
         }
@@ -213,7 +244,7 @@ pub(crate) async fn probe_kind(
     // None means unbounded; an unavailable pool has zero usable slots.
     facts.free_vessel_slots = (!pool_available).then_some(0);
     for tool in TOOLCHAINS {
-        if let Ok(output) = run_in_realisation(runner, &spec.realisation, image, tool, &["--version"], scratch).await {
+        if let Ok(output) = run_in_realisation(&containers, runner, &spec.realisation, image, tool, &["--version"], scratch).await {
             if output.success() {
                 let version = output.stdout.lines().next().or_else(|| output.stderr.lines().next()).unwrap_or_default().trim();
                 if !version.is_empty() {
@@ -223,7 +254,9 @@ pub(crate) async fn probe_kind(
         }
     }
     for (harness, binary) in HARNESSES {
-        let Ok(output) = run_in_realisation(runner, &spec.realisation, image, binary, &["--version"], scratch).await else { continue };
+        let Ok(output) = run_in_realisation(&containers, runner, &spec.realisation, image, binary, &["--version"], scratch).await else {
+            continue;
+        };
         if !output.success() {
             continue;
         }
@@ -259,6 +292,7 @@ pub(crate) async fn probe_kind(
                 // current credentials together. Failed process launches are
                 // left unknown; an explicit CLI rejection is unusable.
                 if let Ok(result) = run_in_realisation(
+                    &containers,
                     runner,
                     &spec.realisation,
                     image,
@@ -292,6 +326,35 @@ pub(crate) async fn probe_kind(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use flotilla_core::providers::{container::docker::DockerImageStore, environment::docker::DockerEnvironmentProvider};
+    async fn probe_kind<R: CommandRunner + 'static>(
+        spec: &FulfilmentKindSpec,
+        image: Option<&str>,
+        pool: bool,
+        runner: &Arc<R>,
+        env: &dyn EnvVars,
+        scratch: &Path,
+        state: &mut ModelProbeState,
+    ) -> Result<FulfilmentFacts, String> {
+        let images = DockerImageStore::new(runner.clone());
+        let runtime = DockerEnvironmentProvider::new(runner.clone());
+        super::probe_kind(
+            &ProbeContext {
+                containers: ContainerProviders { images: Some(&images), runtime: Some(&runtime) },
+                runner: runner.as_ref(),
+                env,
+                scratch,
+            },
+            spec,
+            image,
+            pool,
+            state,
+        )
+        .await
+    }
+
     #[test]
     fn harness_version_takes_the_first_numeric_token() {
         assert_eq!(super::harness_version("2.1.283 (Claude Code)\n"), "2.1.283");
@@ -312,10 +375,12 @@ mod tests {
         let minor = tc.draw(hegel::generators::integers::<u32>().min_value(150).max_value(170));
         let valid = tc.draw(hegel::generators::booleans());
         let version = if valid { format!("codex-cli 0.{minor}.0") } else { "codex-cli unknown".into() };
-        let runner = DiscoveryMockRunner::builder()
-            .on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new()))
-            .on_run("codex", &["--version"], Ok(version))
-            .build();
+        let runner = Arc::new(
+            DiscoveryMockRunner::builder()
+                .on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new()))
+                .on_run("codex", &["--version"], Ok(version))
+                .build(),
+        );
         let kind = FulfilmentKindSpec::builder()
             .host_ref("host".into())
             .pool("cleat".into())
@@ -351,7 +416,8 @@ mod tests {
 
     #[tokio::test]
     async fn missing_image_is_a_fact_and_does_not_pull() {
-        let runner = DiscoveryMockRunner::builder().on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new())).build();
+        let runner =
+            Arc::new(DiscoveryMockRunner::builder().on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new())).build());
         let env = TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]);
         let facts = probe_kind(
             &docker_kind(),
@@ -373,56 +439,81 @@ mod tests {
     async fn image_and_host_versions_probe_different_model_availability() {
         let model = "claude-new-model";
         let env = TestEnvVars::new([("FLOTILLA_PROBE_MODELS", model), ("DISPLAY", ":0")]);
-        let image = DiscoveryMockRunner::builder()
-            .on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new()))
-            .on_run("docker", &["image", "inspect", "crew:test"], Ok(r#"[{"Id":"sha256:image-a"}]"#.into()))
-            .on_run(
-                "docker",
-                &["run", "--rm", "--pull=never", "--workdir", "/probe", "--tmpfs", "/probe", "crew:test", "claude", "--version"],
-                Ok("2.1.280 (Claude Code)".into()),
-            )
-            .on_run(
-                "docker",
-                &[
-                    "run",
-                    "--rm",
-                    "--pull=never",
-                    "--workdir",
-                    "/probe",
-                    "--tmpfs",
-                    "/probe",
-                    "crew:test",
+        let image = Arc::new(
+            DiscoveryMockRunner::builder()
+                .on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new()))
+                .on_run(
+                    "docker",
+                    &["--config", "/tmp/flotilla-probe-test/registry-auth", "image", "inspect", "--format", "{{json .}}", "crew:test"],
+                    Ok(serde_json::json!({"Id": format!("sha256:{}", "a".repeat(64))}).to_string()),
+                )
+                .on_run(
+                    "docker",
+                    &[
+                        "--config",
+                        "/tmp/flotilla-probe-test/registry-auth",
+                        "run",
+                        "--rm",
+                        "--pull=never",
+                        "--workdir",
+                        "/probe",
+                        "--tmpfs",
+                        "/probe",
+                        "--entrypoint",
+                        "claude",
+                        "crew:test",
+                        "--version",
+                    ],
+                    Ok("2.1.280 (Claude Code)".into()),
+                )
+                .on_run(
+                    "docker",
+                    &[
+                        "--config",
+                        "/tmp/flotilla-probe-test/registry-auth",
+                        "run",
+                        "--rm",
+                        "--pull=never",
+                        "--workdir",
+                        "/probe",
+                        "--tmpfs",
+                        "/probe",
+                        "--entrypoint",
+                        "claude",
+                        "crew:test",
+                        "--model",
+                        model,
+                        "--print",
+                        "OK",
+                        "--max-turns",
+                        "1",
+                        "--tools",
+                        "",
+                        "--setting-sources",
+                        "user",
+                    ],
+                    Err("model unsupported".into()),
+                )
+                .build(),
+        );
+        let host = Arc::new(
+            DiscoveryMockRunner::builder()
+                .on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new()))
+                .on_run("rustc", &["--version"], Ok("rustc 1.94.1".into()))
+                .on_run("claude", &["--version"], Ok("2.1.282 (Claude Code)".into()))
+                .on_run(
                     "claude",
-                    "--model",
-                    model,
-                    "--print",
-                    "OK",
-                    "--max-turns",
-                    "1",
-                    "--tools",
-                    "",
-                    "--setting-sources",
-                    "user",
-                ],
-                Err("model unsupported".into()),
-            )
-            .build();
-        let host = DiscoveryMockRunner::builder()
-            .on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new()))
-            .on_run("rustc", &["--version"], Ok("rustc 1.94.1".into()))
-            .on_run("claude", &["--version"], Ok("2.1.282 (Claude Code)".into()))
-            .on_run(
-                "claude",
-                &["--model", model, "--print", "OK", "--max-turns", "1", "--tools", "", "--setting-sources", "user"],
-                Ok("OK".into()),
-            )
-            .build();
+                    &["--model", model, "--print", "OK", "--max-turns", "1", "--tools", "", "--setting-sources", "user"],
+                    Ok("OK".into()),
+                )
+                .build(),
+        );
         let mut image_probes = ModelProbeState::default();
         let docker_facts =
             probe_kind(&docker_kind(), Some("crew:test"), true, &image, &env, Path::new("/tmp/flotilla-probe-test"), &mut image_probes)
                 .await
                 .expect("probe succeeds");
-        assert!(image_probes.entries.keys().any(|key| key.contains("sha256:image-a:image-contained")));
+        assert!(image_probes.entries.keys().any(|key| key.contains(&format!("sha256:{}:image-contained", "a".repeat(64)))));
         let direct = FulfilmentKindSpec::builder()
             .host_ref("kiwi".to_string())
             .pool("cleat".to_string())
@@ -450,16 +541,20 @@ mod tests {
             .realisation(FulfilmentRealisation::HostDirect)
             .build();
         let env = TestEnvVars::new([("FLOTILLA_PROBE_MODELS", "")]);
-        let logged_in = DiscoveryMockRunner::builder()
-            .on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new()))
-            .on_run("id", &["-u"], Ok("501".into()))
-            .on_run("launchctl", &["print", "gui/501"], Ok("gui/501 = { ... }".into()))
-            .build();
-        let logged_out = DiscoveryMockRunner::builder()
-            .on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new()))
-            .on_run("id", &["-u"], Ok("501".into()))
-            .on_run("launchctl", &["print", "gui/501"], Err("domain absent".into()))
-            .build();
+        let logged_in = Arc::new(
+            DiscoveryMockRunner::builder()
+                .on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new()))
+                .on_run("id", &["-u"], Ok("501".into()))
+                .on_run("launchctl", &["print", "gui/501"], Ok("gui/501 = { ... }".into()))
+                .build(),
+        );
+        let logged_out = Arc::new(
+            DiscoveryMockRunner::builder()
+                .on_run("mkdir", &["-p", "/tmp/flotilla-probe-test"], Ok(String::new()))
+                .on_run("id", &["-u"], Ok("501".into()))
+                .on_run("launchctl", &["print", "gui/501"], Err("domain absent".into()))
+                .build(),
+        );
         assert!(
             probe_kind(&spec, None, true, &logged_in, &env, Path::new("/tmp/flotilla-probe-test"), &mut ModelProbeState::default())
                 .await
@@ -516,7 +611,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_requests_are_cached_by_version_and_run_only_in_scratch() {
-        let runner = CountingRunner::default();
+        let runner = Arc::new(CountingRunner::default());
         *runner.version.lock().expect("version lock") = "2.1.282 (Claude Code)".into();
         let env = TestEnvVars::new([("ANTHROPIC_API_KEY", "credential-a")]);
         let spec = FulfilmentKindSpec::builder()
@@ -553,7 +648,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_request_ceiling_bounds_repeated_version_changes() {
-        let runner = CountingRunner::default();
+        let runner = Arc::new(CountingRunner::default());
         let env = TestEnvVars::new([("ANTHROPIC_API_KEY", "credential-a")]);
         let spec = FulfilmentKindSpec::builder()
             .host_ref("kiwi".to_string())
@@ -572,7 +667,7 @@ mod tests {
     }
     #[tokio::test]
     async fn scratch_failure_never_launches_a_harness() {
-        let runner = CountingRunner::default();
+        let runner = Arc::new(CountingRunner::default());
         let env = TestEnvVars::new([("HOME", "/tmp/operator-home")]);
         let spec = FulfilmentKindSpec::builder()
             .host_ref("kiwi".to_string())
@@ -582,7 +677,7 @@ mod tests {
         for scratch in [Path::new("/"), Path::new("/tmp/operator-home")] {
             assert!(probe_kind(&spec, None, true, &runner, &env, scratch, &mut ModelProbeState::default()).await.is_err());
         }
-        let missing = DiscoveryMockRunner::builder().build();
+        let missing = Arc::new(DiscoveryMockRunner::builder().build());
         assert!(probe_kind(&spec, None, true, &missing, &env, Path::new("/tmp/flotilla-probe-test"), &mut ModelProbeState::default())
             .await
             .is_err());
@@ -592,16 +687,16 @@ mod tests {
     #[tokio::test]
     async fn account_identity_ignores_rotating_oauth_tokens_and_expiry() {
         let path = "/tmp/probe-home/.claude/.credentials.json";
-        let runner = DiscoveryMockRunner::builder()
+        let runner = Arc::new(DiscoveryMockRunner::builder()
             .on_run("cat", &[path], Ok(r#"{"claudeAiOauth":{"accessToken":"first","refreshToken":"old","refreshTokenExpiresAt":2000,"subscriptionType":"max","accountUuid":"account-a"}}"#.into()))
             .on_run("cat", &[path], Ok(r#"{"claudeAiOauth":{"accessToken":"second","refreshToken":"new","refreshTokenExpiresAt":3000,"subscriptionType":"max","accountUuid":"account-a"}}"#.into()))
             .on_run("cat", &[path], Ok(r#"{"claudeAiOauth":{"accessToken":"third","refreshToken":"other","refreshTokenExpiresAt":3000,"subscriptionType":"max","accountUuid":"account-b"}}"#.into()))
-            .build();
+            .build());
         let env = TestEnvVars::new([("HOME", "/tmp/probe-home")]);
         let scratch = Path::new("/tmp/flotilla-state/probe-cwd");
-        let first = credential_fingerprint(&runner, &env, scratch).await;
-        let refreshed = credential_fingerprint(&runner, &env, scratch).await;
-        let changed = credential_fingerprint(&runner, &env, scratch).await;
+        let first = credential_fingerprint(runner.as_ref(), &env, scratch).await;
+        let refreshed = credential_fingerprint(runner.as_ref(), &env, scratch).await;
+        let changed = credential_fingerprint(runner.as_ref(), &env, scratch).await;
         assert_eq!(first, refreshed);
         assert_ne!(first, changed);
     }

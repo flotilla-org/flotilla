@@ -7,7 +7,7 @@
 
 use futures::StreamExt;
 
-use crate::providers::environment::EnvironmentProvider;
+use crate::providers::{container::ImageStore, environment::EnvironmentProvider};
 pub mod detectors;
 pub mod factories;
 
@@ -293,10 +293,11 @@ pub enum ProviderCategory {
     WorkspaceManager,
     TerminalPool,
     EnvironmentProvider,
+    ImageStore,
 }
 
 impl ProviderCategory {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Vcs,
         Self::ChangeRequest,
         Self::IssueProvider,
@@ -305,6 +306,7 @@ impl ProviderCategory {
         Self::WorkspaceManager,
         Self::TerminalPool,
         Self::EnvironmentProvider,
+        Self::ImageStore,
     ];
 
     pub fn slug(&self) -> &'static str {
@@ -317,6 +319,7 @@ impl ProviderCategory {
             Self::WorkspaceManager => "workspace_manager",
             Self::TerminalPool => "terminal_pool",
             Self::EnvironmentProvider => "environment_provider",
+            Self::ImageStore => "image_store",
         }
     }
 
@@ -330,6 +333,7 @@ impl ProviderCategory {
             Self::WorkspaceManager => "Workspace Manager",
             Self::TerminalPool => "Terminal Pool",
             Self::EnvironmentProvider => "Environment Provider",
+            Self::ImageStore => "Image Store",
         }
     }
 }
@@ -450,6 +454,7 @@ pub type AiUtilityFactory = ProviderFactory<dyn AiUtility>;
 pub type PresentationManagerFactory = ProviderFactory<dyn PresentationManager>;
 pub type TerminalPoolFactory = ProviderFactory<dyn TerminalPool>;
 pub type EnvironmentProviderFactory = ProviderFactory<dyn EnvironmentProvider>;
+pub type ImageStoreFactory = ProviderFactory<dyn ImageStore>;
 
 // ---------------------------------------------------------------------------
 // Factory registry
@@ -464,9 +469,40 @@ pub struct FactoryRegistry {
     pub presentation_managers: Vec<Box<PresentationManagerFactory>>,
     pub terminal_pools: Vec<Box<TerminalPoolFactory>>,
     pub environment_providers: Vec<Box<EnvironmentProviderFactory>>,
+    pub image_stores: Vec<Box<ImageStoreFactory>>,
+}
+
+async fn probe_category<T: ?Sized + Send + Sync + 'static>(
+    factories: &[Box<dyn Factory<Descriptor = ProviderDescriptor, Output = T>>],
+    env: &EnvironmentBag,
+    config: &ConfigStore,
+    repo_root: &ExecutionEnvironmentPath,
+    runner: &Arc<dyn CommandRunner>,
+) -> Vec<(ProviderDescriptor, Arc<T>)> {
+    let mut results = Vec::new();
+    for factory in factories {
+        if let Ok(provider) = probe_factory(factory.as_ref(), env, config, repo_root, runner.clone()).await {
+            results.push((factory.descriptor(), provider));
+        }
+    }
+    results
 }
 
 impl FactoryRegistry {
+    /// Probe only host container capabilities using registered adapters.
+    pub async fn probe_containers(
+        &self,
+        env: &EnvironmentBag,
+        config: &ConfigStore,
+        root: &ExecutionEnvironmentPath,
+        runner: Arc<dyn CommandRunner>,
+    ) -> (Option<Arc<dyn ImageStore>>, Option<Arc<dyn EnvironmentProvider>>) {
+        let images = probe_category(&self.image_stores, env, config, root, &runner).await.into_iter().next().map(|(_, provider)| provider);
+        let runtime =
+            probe_category(&self.environment_providers, env, config, root, &runner).await.into_iter().next().map(|(_, provider)| provider);
+        (images, runtime)
+    }
+
     /// Probe all factory categories against an environment bag and return a
     /// populated `ProviderRegistry`. Used for environment-internal discovery
     /// where detectors have already run and the bag is pre-built.
@@ -477,22 +513,6 @@ impl FactoryRegistry {
         repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> ProviderRegistry {
-        async fn probe_category<T: ?Sized + Send + Sync + 'static>(
-            factories: &[Box<dyn Factory<Descriptor = ProviderDescriptor, Output = T>>],
-            env: &EnvironmentBag,
-            config: &ConfigStore,
-            repo_root: &ExecutionEnvironmentPath,
-            runner: &Arc<dyn CommandRunner>,
-        ) -> Vec<(ProviderDescriptor, Arc<T>)> {
-            let mut results = Vec::new();
-            for factory in factories {
-                if let Ok(provider) = probe_factory(factory.as_ref(), env, config, repo_root, runner.clone()).await {
-                    results.push((factory.descriptor(), provider));
-                }
-            }
-            results
-        }
-
         let mut registry = ProviderRegistry::new();
         registry.agent_adapters = AgentAdapterRegistry::discover(env, Arc::clone(&runner));
 
@@ -519,6 +539,9 @@ impl FactoryRegistry {
         }
         for (desc, p) in probe_category(&self.environment_providers, env, config, repo_root, &runner).await {
             registry.environment_providers.insert(desc.implementation.clone(), desc, p);
+        }
+        for (desc, p) in probe_category(&self.image_stores, env, config, repo_root, &runner).await {
+            registry.image_stores.insert(desc.implementation.clone(), desc, p);
         }
 
         registry
@@ -556,6 +579,7 @@ pub(crate) struct HostRegistry {
     pub(crate) presentation_managers: Vec<(ProviderDescriptor, Arc<dyn PresentationManager>)>,
     pub(crate) terminal_pools: Vec<(ProviderDescriptor, Arc<dyn TerminalPool>)>,
     pub(crate) environment_providers: Vec<(ProviderDescriptor, Arc<dyn EnvironmentProvider>)>,
+    pub(crate) image_stores: Vec<(ProviderDescriptor, Arc<dyn ImageStore>)>,
 }
 
 #[derive(Clone, Default)]
@@ -589,6 +613,9 @@ impl HostScopedDiscovery {
         }
         for (descriptor, provider) in &self.registry.environment_providers {
             registry.environment_providers.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
+        }
+        for (descriptor, provider) in &self.registry.image_stores {
+            registry.image_stores.insert(descriptor.implementation.clone(), descriptor.clone(), Arc::clone(provider));
         }
         unmet.extend(self.unmet.iter().cloned());
     }
@@ -664,6 +691,9 @@ impl HostScopedProviderCache {
             let (environment_providers, environment_provider_unmet) =
                 probe_host_category(&factories.environment_providers, host_bag, config, probe_root, &runner, |provider| provider).await;
             unmet.extend(environment_provider_unmet);
+            let (image_stores, image_store_unmet) =
+                probe_host_category(&factories.image_stores, host_bag, config, probe_root, &runner, |provider| provider).await;
+            unmet.extend(image_store_unmet);
 
             HostScopedDiscovery {
                 registry: HostRegistry::builder()
@@ -673,6 +703,7 @@ impl HostScopedProviderCache {
                     .presentation_managers(presentation_managers)
                     .terminal_pools(terminal_pools)
                     .environment_providers(environment_providers)
+                    .image_stores(image_stores)
                     .build(),
                 unmet,
             }
@@ -924,6 +955,10 @@ async fn discover_providers_inner(
             registry.environment_providers.insert(desc.implementation.clone(), desc, provider);
         })
         .await;
+        probe_all(&factories.image_stores, &combined, config, repo_root, &runner, &mut unmet, |desc, provider| {
+            registry.image_stores.insert(desc.implementation.clone(), desc, provider);
+        })
+        .await;
     }
 
     if let Some(host_scoped) = host_scoped {
@@ -1150,6 +1185,7 @@ mod orchestrator_tests {
             presentation_managers: vec![],
             terminal_pools: vec![],
             environment_providers: vec![],
+            image_stores: vec![],
         };
 
         let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;
@@ -1178,6 +1214,7 @@ mod orchestrator_tests {
             presentation_managers: vec![],
             terminal_pools: vec![],
             environment_providers: vec![],
+            image_stores: vec![],
         };
 
         let result = discover_providers(&host_bag, &repo_root, &repo_dets, &fact_reg, &config, runner, &TestEnvVars::default()).await;

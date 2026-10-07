@@ -194,6 +194,7 @@ fn provider_category_slug_round_trip() {
         "workspace_manager",
         "terminal_pool",
         "environment_provider",
+        "image_store",
     ];
     assert_eq!(ProviderCategory::ALL.map(|category| category.slug()), expected);
 }
@@ -336,6 +337,7 @@ fn factories_with_presentation(factory: CountingPresentationFactory) -> FactoryR
         presentation_managers: vec![Box::new(factory)],
         terminal_pools: vec![],
         environment_providers: vec![],
+        image_stores: vec![],
     }
 }
 

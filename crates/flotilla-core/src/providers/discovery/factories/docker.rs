@@ -1,6 +1,6 @@
 //! Environment provider factory for Docker.
 
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -8,9 +8,10 @@ use crate::{
     config::ConfigStore,
     path_context::ExecutionEnvironmentPath,
     providers::{
+        container::{docker::DockerImageStore, ImageStore},
         discovery::{EnvironmentBag, Factory, ProviderCategory, ProviderDescriptor, UnmetRequirement},
         environment::{docker::DockerEnvironmentProvider, EnvironmentProvider},
-        ChannelLabel, CommandRunner,
+        CommandRunner,
     },
 };
 
@@ -32,15 +33,39 @@ impl Factory for DockerEnvironmentFactory {
         _repo_root: &ExecutionEnvironmentPath,
         runner: Arc<dyn CommandRunner>,
     ) -> Result<Arc<dyn EnvironmentProvider>, Vec<UnmetRequirement>> {
-        // Check EnvironmentBag first (preferred pattern)
-        if env.find_binary("docker").is_some() {
-            return Ok(Arc::new(DockerEnvironmentProvider::new(runner)));
+        if env.find_binary("docker").is_none() {
+            return Err(vec![UnmetRequirement::MissingBinary("docker".into())]);
         }
-        // Fallback: try running docker directly
-        match runner.run("docker", &["--version"], Path::new("/"), &ChannelLabel::Default).await {
-            Ok(_) => Ok(Arc::new(DockerEnvironmentProvider::new(runner))),
-            Err(_) => Err(vec![UnmetRequirement::MissingBinary("docker".into())]),
+        Ok(Arc::new(DockerEnvironmentProvider::new(runner)))
+    }
+}
+
+/// Images share Docker detection but remain a separate host capability.
+pub struct DockerImageStoreFactory;
+impl DockerImageStoreFactory {
+    /// Shared construction path for composition roots that initialize synchronously.
+    pub fn create(env: &EnvironmentBag, runner: Arc<dyn CommandRunner>) -> Result<Arc<dyn ImageStore>, Vec<UnmetRequirement>> {
+        if env.find_binary("docker").is_none() {
+            return Err(vec![UnmetRequirement::MissingBinary("docker".into())]);
         }
+        Ok(Arc::new(DockerImageStore::new(runner)))
+    }
+}
+#[async_trait]
+impl Factory for DockerImageStoreFactory {
+    type Descriptor = ProviderDescriptor;
+    type Output = dyn ImageStore;
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor::named(ProviderCategory::ImageStore, "docker")
+    }
+    async fn probe(
+        &self,
+        env: &EnvironmentBag,
+        _config: &ConfigStore,
+        _repo_root: &ExecutionEnvironmentPath,
+        runner: Arc<dyn CommandRunner>,
+    ) -> Result<Arc<Self::Output>, Vec<UnmetRequirement>> {
+        Self::create(env, runner)
     }
 }
 
@@ -66,14 +91,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn docker_factory_succeeds_via_fallback_run() {
+    async fn docker_factory_does_not_probe_an_undeclared_binary() {
         let bag = EnvironmentBag::new(); // no binary in bag
         let dir = tempfile::tempdir().expect("tempdir");
         let config = ConfigStore::with_base(dir.path());
         // Runner returns success for `docker --version`
         let runner = Arc::new(DiscoveryMockRunner::builder().on_run("docker", &["--version"], Ok("Docker version 24.0.0".into())).build());
         let result = DockerEnvironmentFactory.probe(&bag, &config, &ExecutionEnvironmentPath::new("/repo"), runner).await;
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 
     #[tokio::test]

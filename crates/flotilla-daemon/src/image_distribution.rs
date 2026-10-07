@@ -8,7 +8,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use flotilla_core::providers::{ChannelLabel, CommandRunner};
+use flotilla_core::providers::container::{
+    registry::{RegistryClient, RegistryRepository},
+    ImageOperation, ImageStore,
+};
 use flotilla_resources::{
     is_image_digest, FleetDesignation, Host, HostImageAction, ImageBuild, ImageBuildPhase, ImageCacheBinding, PlacedImageIdentity,
     ResourceBackend, ResourceError, ResourceObject, FLEET_DESIGNATION_NAME, IMAGE_DIGESTS_CAPABILITY,
@@ -221,71 +224,52 @@ fn validate_registry_reference(cache: &ImageCacheBinding, reference: &str) -> Re
 }
 
 #[derive(bon::Builder)]
-pub(crate) struct DockerImageIo {
-    pub runner: Arc<dyn CommandRunner>,
+pub(crate) struct ProviderImageIo {
+    pub images: Arc<dyn ImageStore>,
+    pub registry: Arc<dyn RegistryClient>,
     pub credentials: Arc<CredentialStore>,
     pub host: String,
 }
 
-impl DockerImageIo {
-    async fn run(&self, args: &[&str]) -> Result<String, String> {
-        // Even inventory/save/load never consult the host's global Docker config.
-        let config = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let directory = config.path().to_string_lossy();
-        let mut private = vec!["--config", &directory];
-        private.extend_from_slice(args);
-        self.runner.run_with_timeout("docker", &private, Path::new("/"), &ChannelLabel::Default, Duration::from_secs(30)).await
-    }
-}
-
 #[async_trait]
-impl ImageDistributionIo for DockerImageIo {
+impl ImageDistributionIo for ProviderImageIo {
     async fn inventory(&self) -> Result<BTreeSet<String>, String> {
-        let output = self.run(&["image", "ls", "--no-trunc", "--digests", "--format", "{{.ID}} {{.Digest}}"]).await?;
-        // Docker local IDs and registry manifest digests are distinct namespaces.
-        // Report both because placement checks the corresponding immutable identity.
-        Ok(output.split_whitespace().filter(|line| is_image_digest(line)).map(String::from).collect())
+        let config = tempfile::tempdir().map_err(|error| error.to_string())?;
+        self.images.inventory(ImageOperation { directory: config.path(), context: Path::new("/") }).await
     }
-
     async fn inspect(&self, reference: &str) -> Result<PlacedImageIdentity, String> {
-        let output = self.run(&["image", "inspect", "--format", "{{json .}}", reference]).await?;
-        let value: serde_json::Value = serde_json::from_str(&output).map_err(|error| error.to_string())?;
-        let local_image_id =
-            value["Id"].as_str().filter(|id| is_image_digest(id)).ok_or("Docker inspect has no valid image ID")?.to_string();
-        let registry_digest = value["RepoDigests"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|value| value.as_str())
-            .find(|digest| *digest == reference)
-            .and_then(|reference| reference.rsplit_once('@'))
-            .map(|(_, digest)| digest.to_string());
-        Ok(PlacedImageIdentity { local_image_id, registry_digest })
+        let config = tempfile::tempdir().map_err(|error| error.to_string())?;
+        self.images.inspect(ImageOperation { directory: config.path(), context: Path::new("/") }, reference).await
     }
 
     async fn push(&self, cache: &ImageCacheBinding, image_id: &str) -> Result<String, String> {
         // This tag is only a temporary publication handle. Consumers use the
         // manifest digest returned by Docker; no tag enters a frozen identity.
         let tag = format!("{}:flotilla-{}", cache.repository, image_id.trim_start_matches("sha256:"));
-        self.run(&["image", "tag", image_id, &tag]).await?;
+        let config = tempfile::tempdir().map_err(|error| error.to_string())?;
+        self.images.tag(ImageOperation { directory: config.path(), context: Path::new("/") }, image_id, &tag).await?;
         let output = self
             .credentials
-            .image_registry_operation(&self.host, HostImageAction::ImagePush, &cache.push_credential, &cache.repository, &["push", &tag])
+            .image_registry_operation(&self.host, HostImageAction::ImagePush, &cache.push_credential, &cache.repository, &tag)
             .await?;
-        let digest = output
-            .split_once("digest:")
-            .and_then(|(_, tail)| tail.split_whitespace().next())
-            .filter(|word| is_image_digest(word))
-            .ok_or("registry push did not report a manifest digest")?;
+        let digest = output;
         Ok(format!("{}@{digest}", cache.repository))
     }
 
     async fn pull(&self, cache: &ImageCacheBinding, reference: &str) -> Result<(), String> {
         validate_registry_reference(cache, reference)?;
+        let (host, name) = cache.repository.split_once('/').ok_or("cache repository has no registry host")?;
+        let repository = RegistryRepository::builder()
+            .origin(url::Url::parse(&format!("https://{host}")).map_err(|_| "invalid registry host")?)
+            .name(name.into())
+            .credential(cache.pull_credential.clone())
+            .build();
+        let digest = reference.rsplit_once('@').ok_or("cache reference has no digest")?.1;
+        if !self.registry.head(&repository, digest).await? {
+            return Err("declared cache has no requested manifest".into());
+        }
         self.credentials
-            .image_registry_operation(&self.host, HostImageAction::ImagePull, &cache.pull_credential, &cache.repository, &[
-                "pull", reference,
-            ])
+            .image_registry_operation(&self.host, HostImageAction::ImagePull, &cache.pull_credential, &cache.repository, reference)
             .await?;
         Ok(())
     }

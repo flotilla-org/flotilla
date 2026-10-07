@@ -1,6 +1,7 @@
 pub mod ai_utility;
 pub mod change_request;
 pub mod coding_agent;
+pub mod container;
 pub mod discovery;
 pub mod environment;
 pub mod github_api;

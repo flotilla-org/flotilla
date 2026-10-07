@@ -120,6 +120,22 @@ class GitBoundaryTests(unittest.TestCase):
         source = 'fn a() { let raw = "git"; consume(&raw); runner.run("git", args); }'
         self.assertEqual(check.scan_sources({'src/lib.rs': source}), {'src/lib.rs': [1]})
 
+    # Container tools follow the same AST forms and test exemptions as Git.
+    # Nearby provider paths must not accidentally exempt callers.
+    def test_container_matrix(self):
+        for command in ["docker", "podman", "skopeo", "nerdctl"]:
+            for literal in [f'"{command}"', f'r##"{command}"##', f'"{command[:1]}\\x{ord(command[1]):02x}{command[2:]}"']:
+                for callee in ["runner.run", "runner.run_output", "runner.run_with_input", "runner.run_with_timeout", "runner.spawn_long_lived", "runner.run_to_file", "runner.run_from_file", "std::process::Command::new", "Launcher::new"]:
+                    with self.subTest(command=command, literal=literal, callee=callee):
+                        source = f'fn a() {{ {callee}({literal}, args); }}'
+                        self.assertEqual(check.violations(source, 'src/a.rs'), [1])
+                        self.assertEqual(check.violations(source, check.VCS + 'providers/container/docker.rs'), [])
+                        self.assertEqual(check.violations(source, check.VCS + 'providers/environment/runner.rs'), [])
+                        self.assertEqual(check.violations(source, check.VCS + 'providers/container_extra.rs'), [1])
+                        self.assertEqual(check.violations('#[cfg(test)] ' + source, 'src/a.rs'), [])
+            self.assertEqual(check.violations(f'fn a() {{ run!(runner, "{command}", args); }}', 'src/a.rs'), [1])
+        self.assertEqual(check.violations('fn a() { runner.run("docker-compose", args); }', 'src/a.rs'), [])
+
     # Every workspace member must opt into the shared lint or the Clippy gate
     # would silently stop enforcing the crate-relative path rule for that member.
     def test_workspace_lint_inheritance(self):
