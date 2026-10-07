@@ -272,6 +272,37 @@ daemon without that inventory endpoint requires validation on its own host,
 where the candidate reads committed ops sources through its VCS interface.
 Missing or ambiguous ops checkouts fail validation.
 
+Candidate validation also prints a `workflow retirement preview: ` JSON report
+from the merged durable definitions, using the same builtin catalogue as startup.
+It lists builtin-labelled templates outside the candidate set, apply-ready copies
+of their definitions, and affected Projects' explicit `default_workflow_ref`
+values. References distinguish the two supported retired-name aliases (both map
+to `single-agent`), surviving Project/ancestor-scoped definitions, and global
+references that will no longer resolve. This report is advisory; schema and ops
+validation still determine the gate's exit status. Preview inventory or decoding
+errors fail the gate with diagnostics, while remaining ops and charter checks
+still run; incomplete retirement reports are suppressed. Observed resources and raw
+replica provenance do not drive retirement. Existing Convoy frozen snapshots are
+unaffected.
+
+The operator script requires Bash and Python 3 on each host. For live operator
+acceptance, run with the candidate binary before installing it:
+
+```bash
+scripts/preview-workflow-retirement.sh /path/to/candidate /path/to/new-backup-directory
+```
+
+Review `retirement.json`, verify expected aliases and unsupported references,
+and retain the output outside daemon state. Confirm the live definitions remain
+unchanged after validation. The script exports `restore-*.json` manifests with
+specs, names, namespaces, labels and annotations, without server-owned identities
+or statuses. Startup retirement creates causal tombstones: rolling back the
+binary alone does not restore these definitions. After rollback, explicitly
+restore a reviewed definition with `flotilla resource apply --file /path/to/restore-0.json`.
+Applying it while the candidate is still installed will let startup retire it
+again. Update unsupported Project defaults or provide a Project-scoped replacement
+before the roll. Live acceptance requires an operator on a fleet host.
+
 ## Git in contained host worktrees
 
 Contained host-worktree vessels receive process-scoped tracking settings for their
