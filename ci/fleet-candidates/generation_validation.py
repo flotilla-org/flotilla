@@ -838,7 +838,10 @@ def main():
         elif args.command == "systemd-path":
             systemd_path(args.path, args.home)
         elif args.command == "launchd-agent":
-            write_launchd_agent(args.destination, args.label, args.daemon, args.path, args.skills, args.codex_home, args.config_dir, args.state_dir, args.socket, args.stderr_path, args.stdout_path)
+            write_launchd_agent(
+                args.destination, args.label, args.daemon, args.path, args.skills, args.codex_home,
+                args.config_dir, args.state_dir, args.socket, args.stderr_path, args.stdout_path,
+            )
         elif args.command == "darwin-payload":
             refresh_darwin_payload(args.source, args.destination)
         elif args.command == "disarm-confirmation":

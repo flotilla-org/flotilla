@@ -108,6 +108,18 @@ class BootstrapHelperTests(unittest.TestCase):
                 self.assertIn("generation validation:", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
 
+    # Invalid service paths must refuse at the actual CLI boundary with a
+    # concise stderr diagnostic, no stdout, and no Python traceback.
+    def test_systemd_cli_refuses_line_breaks(self):
+        for path in ("/home/operator\n", "/home/operator/child\r", "/opt/child\r\n"):
+            result = subprocess.run(
+                [sys.executable, validation.__file__, "systemd-path", "--", path, "/home/operator"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(result.stderr, "generation validation: systemd path contains a line break\n")
+
     # Real OS coverage complements the injected boundary: a directory symlink is
     # replaced, its old target survives, and the temporary link is consumed.
     def test_replace_directory_symlink(self):
