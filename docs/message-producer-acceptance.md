@@ -14,7 +14,13 @@ cargo test -p flotilla-commands --locked handoff_carries_typed_references
 cargo test -p flotilla-resources --locked --test integration stored_corpus
 ```
 
-The generated producer scenarios cover qualified and convoy-relative targets in another vessel, local and remote inbox publication, repeated handoffs, typed carries, invalid addresses, and empty input. Governor ruling scenarios exercise resume, conversion to failed, and escalation. Legacy queue adoption retains attribution and continuation intent and is idempotent.
+The generated producer scenarios cover qualified and convoy-relative targets in another vessel, local and remote inbox publication, repeated handoffs, typed carries, invalid addresses, and empty input. Cross-vessel publication failures restore the latent receiver’s prior workflow state. Governor ruling scenarios exercise resume, conversion to failed, escalation, and missing escalation/index correlation. Legacy queue adoption retains attribution and continuation intent and is idempotent.
+
+## Boundaries
+
+The local daemon uses the existing trusted operator principal model; this change adds no convoy ACL. Principal attribution comes from command dispatch, and named crew supervision still checks ownership of the assigned rung. Typed carries store identity and revision, not payloads or access grants. Reference visibility before delivery is the separate #2711 contract; fleet acceptance of carries requires that delivery gate to be deployed.
+
+Fail and Escalate rulings are durable notifications to the original crew, with no reply expectation or workflow activation. Publication precedes the authority patch so a failed patch cannot erase the decision. The command reports a patch error; a supervisor can retry the workflow mutation while the Message preserves the decision. A delivered notification does not itself perform that mutation.
 
 ## Operator live acceptance
 

@@ -1243,16 +1243,23 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
 
     use crate::leaf_engine::ResourceIntentPublisher;
     let remote = tc.draw(gs::booleans());
+    let publication_fails = tc.draw(gs::booleans());
     let repeats = tc.draw(gs::integers::<usize>().min_value(1).max_value(3));
     // Stand-in for the cross-host resource mutation endpoint; admission uses the real inbox.
-    struct ReceiverHome(MessageInbox);
+    struct ReceiverHome {
+        inbox: MessageInbox,
+        fail: bool,
+    }
     #[async_trait]
     impl ResourceIntentPublisher for ReceiverHome {
         async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<ResourceRef, String> {
+            if self.fail {
+                return Err("receiver publication unavailable".into());
+            }
             assert_eq!(document["kind"], "Message");
             let spec: MessageSpec = serde_json::from_value(document["spec"].clone()).expect("Message intent");
             let admission = self
-                .0
+                .inbox
                 .accept(
                     &InputMeta::builder().name(document["metadata"]["name"].as_str().expect("message name").into()).build(),
                     &spec,
@@ -1292,8 +1299,9 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
             .insert("review".into(), BTreeMap::from([("reviewer".into(), CrewWorkState::builder().phase(CrewWorkPhase::Pending).build())]));
         convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("second vessel");
         let home = if remote { ResourceBackend::InMemory(Default::default()) } else { backend.clone() };
-        let publisher: Arc<dyn ResourceIntentPublisher> = Arc::new(ReceiverHome(MessageInbox::new(home.clone(), "flotilla")));
-        if remote {
+        let publisher: Arc<dyn ResourceIntentPublisher> =
+            Arc::new(ReceiverHome { inbox: MessageInbox::new(home.clone(), "flotilla"), fail: publication_fails });
+        if remote || publication_fails {
             crew.set_resource_intent_publisher(Arc::downgrade(&publisher));
         }
         let context = CrewCommandContext::builder().convoy("crew".into()).vessel_ref("vessel".into()).role("coder".into()).build();
@@ -1301,6 +1309,17 @@ fn cross_vessel_handoff_publishes_typed_messages(tc: hegel::TestCase) {
             resource: ResourceRef::new("flotilla.work/v1", "Convoy", "flotilla", "crew"),
             revision: convoy.metadata.resource_version.clone(),
         };
+        if publication_fails {
+            let before = convoys.get("crew").await.expect("before handoff").status;
+            for _ in 0..repeats {
+                crew.handoff_with_carries(&context, "crew/review/reviewer", "review this", vec![carry.clone()])
+                    .await
+                    .expect_err("receiver publication fails");
+                assert_eq!(convoys.get("crew").await.expect("restored authority").status, before);
+                assert!(home.using::<Message>("flotilla").list().await.expect("inbox").items.is_empty());
+            }
+            return;
+        }
         for index in 0..repeats {
             let target = if index % 2 == 0 { "crew/review/reviewer" } else { "flotilla/crew/review/reviewer" };
             crew.handoff_with_carries(&context, target, "review this", vec![carry.clone()]).await.expect("handoff");
@@ -1389,6 +1408,7 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
         Message, MessageExpectation, MessageInbox, MessageReference, MessageRelation, MessageSpec, StallRung, StallSupervisor,
     };
     use hegel::generators as gs;
+    let escalation_visible = tc.draw(gs::booleans());
     // Exercise resume, conversion to failed, and escalation, including their distinct workflow effects.
     let action = match tc.draw(gs::integers::<usize>().min_value(0).max_value(2)) {
         0 => CrewSupervisionAction::Resume,
@@ -1468,10 +1488,14 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
                 revision: convoy.metadata.resource_version,
             }])
             .build();
-        MessageInbox::new(backend.clone(), "flotilla")
-            .accept(&InputMeta::builder().name("source-escalation".into()).build(), &escalation, Utc::now())
-            .await
-            .expect("escalation");
+        if escalation_visible {
+            MessageInbox::new(backend.clone(), "flotilla")
+                .accept(&InputMeta::builder().name("source-escalation".into()).build(), &escalation, Utc::now())
+                .await
+                .expect("escalation");
+        }
+        // No visible escalation and no supervision index must produce an unlinked ruling,
+        // rather than inventing a record ID.
         crew.supervise(CrewSupervisionRequest {
             namespace: "flotilla",
             convoy_name: "crew",
@@ -1485,11 +1509,11 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
         .await
         .expect("governor ruling");
         let records = backend.using::<Message>("flotilla").list().await.expect("messages").items;
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 1 + usize::from(escalation_visible));
         let reply = records.iter().find(|record| record.metadata.name != "source-escalation").expect("ruling Message");
         assert_eq!(reply.spec.sender, "flotilla/governor/watch/governor");
         assert_eq!(reply.spec.receiver, "flotilla/crew/work/coder");
-        assert_eq!(reply.spec.in_reply_to.as_deref(), Some("source-escalation"));
+        assert_eq!(reply.spec.in_reply_to.as_deref(), escalation_visible.then_some("source-escalation"));
         assert_eq!(reply.spec.relation, MessageRelation::Supervisor);
         let status = convoys.get("crew").await.expect("convoy").status.expect("status");
         match action {
@@ -1498,4 +1522,72 @@ fn governor_rulings_reply_to_the_source_escalation(tc: hegel::TestCase) {
             CrewSupervisionAction::Escalate => assert_eq!(status.stalled.expect("escalated stall").rung, StallRung::Operator),
         }
     });
+}
+
+// A durable ruling survives an authority mutation failure as a notification;
+// Message delivery never applies Fail/Escalate workflow transitions itself.
+#[tokio::test]
+async fn supervisor_decision_survives_authority_disappearing_after_publication() {
+    use flotilla_resources::{Message, MessageInbox, MessageSpec};
+
+    use crate::leaf_engine::ResourceIntentPublisher;
+    // Boundary stand-in: the receiver admits intent, then a concurrent authority
+    // teardown removes the convoy before the supervisor's state patch can read it.
+    struct ReceiverAndTeardown(ResourceBackend);
+    #[async_trait]
+    impl ResourceIntentPublisher for ReceiverAndTeardown {
+        async fn publish(self: Arc<Self>, namespace: &str, document: serde_json::Value) -> Result<ResourceRef, String> {
+            let name = document["metadata"]["name"].as_str().expect("name").to_string();
+            let spec: MessageSpec = serde_json::from_value(document["spec"].clone()).expect("intent");
+            MessageInbox::new(self.0.clone(), namespace)
+                .accept(&InputMeta::builder().name(name.clone()).build(), &spec, Utc::now())
+                .await
+                .map_err(|error| error.to_string())?;
+            self.0.using::<ResourceConvoy>(namespace).delete("crew").await.map_err(|error| error.to_string())?;
+            Ok(ResourceRef::new("flotilla.work/v1", "Message", namespace, name))
+        }
+    }
+    for action in [flotilla_protocol::CrewSupervisionAction::Fail, flotilla_protocol::CrewSupervisionAction::Escalate] {
+        let (crew, backend, _probe, _config) = fixture(CrewWorkPhase::Working).await;
+        apply_resource_status_patch(
+            &backend.using::<ResourceConvoy>("flotilla"),
+            "crew",
+            &convoy_external_patches::mark_crew_stalled(
+                "crew".into(),
+                "work".into(),
+                "coder".into(),
+                Utc::now(),
+                flotilla_protocol::StallReason::Scope,
+                None,
+                "blocked".into(),
+            ),
+        )
+        .await
+        .expect("stall");
+        let convoys = backend.using::<ResourceConvoy>("flotilla");
+        let convoy = convoys.get("crew").await.expect("source");
+        let mut status = convoy.status.expect("status");
+        status.stalled.as_mut().expect("stall").rung = flotilla_resources::StallRung::Governor;
+        convoys.update_status("crew", &convoy.metadata.resource_version, &status).await.expect("governor rung");
+        let publisher: Arc<dyn ResourceIntentPublisher> = Arc::new(ReceiverAndTeardown(backend.clone()));
+        crew.set_resource_intent_publisher(Arc::downgrade(&publisher));
+        let principal = PrincipalRef::implicit_for_namespace("flotilla");
+        crew.supervise(CrewSupervisionRequest {
+            namespace: "flotilla",
+            convoy_name: "crew",
+            vessel: "work",
+            role: "coder",
+            operation: action,
+            message: "durable ruling",
+            actor_crew_id: None,
+            principal: Some(&principal),
+        })
+        .await
+        .expect_err("authority patch cannot read removed convoy");
+        let records = backend.using::<Message>("flotilla").list().await.expect("decisions").items;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].spec.body, "durable ruling");
+        assert_eq!(records[0].spec.receiver, "flotilla/crew/work/coder");
+        assert_eq!(records[0].spec.expectation, flotilla_resources::MessageExpectation::None);
+    }
 }

@@ -66,6 +66,7 @@ pub fn legacy_message_spec(receiver: &str, message: &TerminalCrewMessage) -> Mes
 impl TypedResolver<TerminalSession> {
     /// Test-only fixture entry point for previous-generation sender envelopes.
     /// Production producers construct MessageSpec directly.
+    /// Remove after the first fleet roll deploying #2710.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn accept_crew_message(
         &self,
